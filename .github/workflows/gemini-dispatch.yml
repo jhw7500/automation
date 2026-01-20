@@ -149,6 +149,254 @@ jobs:
             --body "${MESSAGE}" \
             --repo "${REPOSITORY}"
 
+  review:
+    needs: dispatch
+    if: needs.dispatch.outputs.command == 'review' && needs.dispatch.outputs.review_enabled != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup authentication
+        id: auth
+        uses: jhw7500/automation/.github/actions/setup-gemini-auth@v1.1
+        with:
+          app-id: '${{ vars.APP_ID }}'
+          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
+          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+
+      - name: Run Gemini pull request review
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
+          ISSUE_TITLE: '${{ github.event.pull_request.title || github.event.issue.title }}'
+          ISSUE_BODY: '${{ github.event.pull_request.body || github.event.issue.body }}'
+          PULL_REQUEST_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          REPOSITORY: '${{ github.repository }}'
+          ADDITIONAL_CONTEXT: '${{ needs.dispatch.outputs.additional_context }}'
+        with:
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
+          gemini_model: '${{ vars.GEMINI_MODEL }}'
+          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
+          workflow_name: 'gemini-review'
+          settings: |-
+            {
+              "model": { "maxSessionTurns": 25 },
+              "telemetry": { "enabled": true, "target": "local", "outfile": ".gemini/telemetry.log" },
+              "tools": {
+                "core": [
+                  "run_shell_command(cat)",
+                  "run_shell_command(echo)",
+                  "run_shell_command(grep)",
+                  "run_shell_command(head)",
+                  "run_shell_command(tail)"
+                ]
+              }
+            }
+          prompt: |-
+            Start your response with:
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+            Reviewer: Gemini Dispatch (Broad Review)
+
+            You are performing a deep, professional review that goes BEYOND the current diff.
+            Focus on missing improvements, latent risks, and hardening opportunities in areas touched by this PR.
+            Do NOT repeat change-specific findings that a diff-focused review would cover.
+            Exclude CI/CD commentary.
+
+            Provide:
+            1. Broader risks or gaps not addressed by this PR
+            2. Improvements that should be scheduled soon (not necessarily in this PR)
+            3. Any architectural or operational concerns related to the affected areas
+
+            Keep the response concise and structured with clear headings.
+
+  triage:
+    needs: dispatch
+    if: needs.dispatch.outputs.command == 'triage' && needs.dispatch.outputs.triage_enabled != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Get repository labels
+        id: get_labels
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        with:
+          script: |-
+            const labels = [];
+            for await (const response of github.paginate.iterator(github.rest.issues.listLabelsForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            })) {
+              labels.push(...response.data);
+            }
+
+            if (!labels || labels.length === 0) {
+              core.setFailed('There are no issue labels in this repository.')
+            }
+
+            const labelNames = labels.map(label => label.name).sort();
+            core.setOutput('available_labels', labelNames.join(','));
+            core.info(`Found ${labelNames.length} labels: ${labelNames.join(', ')}`);
+            return labelNames;
+
+      - name: Run Gemini issue analysis
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          GITHUB_TOKEN: ''
+          ISSUE_TITLE: '${{ github.event.issue.title }}'
+          ISSUE_BODY: '${{ github.event.issue.body }}'
+          AVAILABLE_LABELS: '${{ steps.get_labels.outputs.available_labels }}'
+        with:
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
+          gemini_model: '${{ vars.GEMINI_MODEL }}'
+          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
+          workflow_name: 'gemini-triage'
+          settings: |-
+            {
+              "model": { "maxSessionTurns": 25 },
+              "telemetry": { "enabled": true, "target": "local", "outfile": ".gemini/telemetry.log" },
+              "tools": { "core": ["run_shell_command(echo)"] }
+            }
+          prompt: '/gemini-triage'
+
+      - name: Checkout for actions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Setup authentication
+        id: auth
+        uses: jhw7500/automation/.github/actions/setup-gemini-auth@v1.1
+        with:
+          app-id: '${{ vars.APP_ID }}'
+          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
+          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+
+      - name: Apply labels
+        env:
+          ISSUE_NUMBER: '${{ github.event.issue.number }}'
+          AVAILABLE_LABELS: '${{ steps.get_labels.outputs.available_labels }}'
+          SELECTED_LABELS: '${{ env.SELECTED_LABELS }}'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        with:
+          github-token: '${{ steps.auth.outputs.token }}'
+          script: |-
+            const availableLabels = (process.env.AVAILABLE_LABELS || '').split(',')
+              .map((label) => label.trim())
+              .sort();
+
+            const selectedLabels = (process.env.SELECTED_LABELS || '').split(',')
+              .map((label) => label.trim())
+              .filter((label) => availableLabels.includes(label))
+              .sort();
+
+            const issueNumber = process.env.ISSUE_NUMBER;
+            if (selectedLabels && selectedLabels.length > 0) {
+              await github.rest.issues.setLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: selectedLabels,
+              });
+              core.info(`Successfully set labels: ${selectedLabels.join(',')}`);
+            } else {
+              core.info('No valid labels selected.');
+            }
+
+  invoke:
+    needs: dispatch
+    if: needs.dispatch.outputs.command == 'invoke' && needs.dispatch.outputs.invoke_enabled != 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Setup authentication
+        id: auth
+        uses: jhw7500/automation/.github/actions/setup-gemini-auth@v1.1
+        with:
+          app-id: '${{ vars.APP_ID }}'
+          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
+          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+
+      - name: Run Gemini CLI
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          TITLE: '${{ github.event.pull_request.title || github.event.issue.title }}'
+          DESCRIPTION: '${{ github.event.pull_request.body || github.event.issue.body }}'
+          EVENT_NAME: '${{ github.event_name }}'
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
+          IS_PULL_REQUEST: '${{ !!github.event.pull_request }}'
+          ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          REPOSITORY: '${{ github.repository }}'
+          ADDITIONAL_CONTEXT: '${{ needs.dispatch.outputs.additional_context }}'
+        with:
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
+          gemini_model: '${{ vars.GEMINI_MODEL }}'
+          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
+          workflow_name: 'gemini-invoke'
+          settings: |-
+            {
+              "model": { "maxSessionTurns": 25 },
+              "telemetry": { "enabled": true, "target": "local", "outfile": ".gemini/telemetry.log" },
+              "tools": {
+                "core": [
+                  "run_shell_command(cat)",
+                  "run_shell_command(echo)",
+                  "run_shell_command(grep)",
+                  "run_shell_command(head)",
+                  "run_shell_command(tail)"
+                ]
+              }
+            }
+          prompt: '/gemini-invoke'
+
   skipped:
     name: Workflow Skipped
     needs: check-enabled
