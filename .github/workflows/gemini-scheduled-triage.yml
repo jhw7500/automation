@@ -1,4 +1,4 @@
-name: '4cb Gemini Scheduled Issue Triage'
+name: 'Gemini Scheduled Issue Triage'
 
 on:
   workflow_call:
