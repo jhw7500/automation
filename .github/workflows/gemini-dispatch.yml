@@ -35,7 +35,7 @@ jobs:
   debugger:
     needs: check-enabled
     if: |-
-      needs.check-enabled.outputs.enabled == 'true' && fromJSON(vars.GEMINI_DEBUG || vars.ACTIONS_STEP_DEBUG || false)
+      needs.check-enabled.outputs.enabled == 'true' && (vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true')
     runs-on: 'ubuntu-latest'
     permissions:
       contents: 'read'
