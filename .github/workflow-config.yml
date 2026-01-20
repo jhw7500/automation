@@ -1,0 +1,66 @@
+# GitHub Actions Workflow Configuration
+# This file centralizes the enable/disable state and settings for each workflow.
+#
+# Usage:
+#   - Set `enabled: false` to skip a workflow.
+#   - A workflow can be force-run via workflow_dispatch with `force_run=true`.
+
+workflows:
+  # === CI/CD Workflows ===
+  shellcheck:
+    enabled: false
+    description: "Shell script static analysis"
+
+  build-test:
+    enabled: false
+    description: "Build and test the package"
+
+  # === Gemini AI Workflows ===
+  gemini-dispatch:
+    enabled: true
+    description: "Central dispatcher for Gemini commands"
+
+  gemini-invoke:
+    enabled: true
+    description: "General Gemini CLI invocation"
+    cancel_in_progress: false  # 대화형 봇이므로 false 유지 권장
+
+  gemini-review:
+    enabled: true
+    description: "PR code review with Gemini"
+    timeout_minutes: 7
+
+  gemini-triage:
+    enabled: true
+    description: "Issue triage and labeling"
+    timeout_minutes: 7
+
+  # === Claude AI Workflows ===
+  claude:
+    enabled: true
+    description: "Claude AI integration"
+
+  claude-code-review:
+    enabled: true
+    description: "Claude code review"
+
+  # === Automation Workflows ===
+  auto-rereview-request:
+    enabled: true
+    description: "Auto-notify reviewers when review feedback is addressed"
+
+# === Shared Settings ===
+gemini:
+  model: "gemini-2.0-flash-exp"
+  max_session_turns: 25
+  # Docker image with digest pinning for supply chain security
+  # To update: docker pull <image>:<tag> && docker inspect --format='{{index .RepoDigests 0}}' <image>:<tag>
+  mcp_server_image: "ghcr.io/github/github-mcp-server:v0.18.0@sha256:6aa543f565bc98d96106fdd80a0abdc0c7147c8ca7f4663a814ceecef1ccc6d3"
+  telemetry:
+    enabled: true
+    target: "local"
+    outfile: ".gemini/telemetry.log"
+
+notifications:
+  on_failure: true
+  mention_actor: true

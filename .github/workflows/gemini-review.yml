@@ -1,0 +1,145 @@
+name: '🔎 Gemini Review'
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: 'string'
+        description: 'Pull request number (optional; defaults to event PR number)'
+        required: false
+      issue_title:
+        type: 'string'
+        description: 'Issue/PR title (optional; defaults to event title)'
+        required: false
+      issue_body:
+        type: 'string'
+        description: 'Issue/PR body (optional; defaults to event body)'
+        required: false
+      additional_context:
+        type: 'string'
+        description: 'Any additional context from the request'
+        required: false
+
+concurrency:
+  group: '${{ github.workflow }}-review-${{ github.event_name }}-${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}'
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: 'bash'
+
+jobs:
+  review:
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 7
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      issues: 'write'
+      pull-requests: 'write'
+    steps:
+      - name: 'Checkout repository'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+
+      - name: 'Setup authentication'
+        id: 'auth'
+        uses: 'jhw7500/automation/.github/actions/setup-gemini-auth@v1'
+        with:
+          app-id: '${{ vars.APP_ID }}'
+          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
+          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+
+      - name: 'Run Gemini pull request review'
+        uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
+        id: 'gemini_pr_review'
+        env:
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
+          ISSUE_TITLE: '${{ inputs.issue_title || github.event.pull_request.title || github.event.issue.title }}'
+          ISSUE_BODY: '${{ inputs.issue_body || github.event.pull_request.body || github.event.issue.body }}'
+          PULL_REQUEST_NUMBER: '${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}'
+          REPOSITORY: '${{ github.repository }}'
+          ADDITIONAL_CONTEXT: '${{ inputs.additional_context }}'
+        with:
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gemini_debug: '${{ fromJSON(vars.GEMINI_DEBUG || vars.ACTIONS_STEP_DEBUG || false) }}'
+          gemini_model: '${{ vars.GEMINI_MODEL }}'
+          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
+          workflow_name: 'gemini-review'
+          settings: |-
+            {
+              "model": {
+                "maxSessionTurns": 25
+              },
+              "telemetry": {
+                "enabled": true,
+                "target": "local",
+                "outfile": ".gemini/telemetry.log"
+              },
+              "mcpServers": {
+                "github": {
+                  "command": "docker",
+                  "args": [
+                    "run",
+                    "-i",
+                    "--rm",
+                    "-e",
+                    "GITHUB_PERSONAL_ACCESS_TOKEN",
+                    "ghcr.io/github/github-mcp-server:v0.18.0@sha256:6aa543f565bc98d96106fdd80a0abdc0c7147c8ca7f4663a814ceecef1ccc6d3"
+                  ],
+                  "includeTools": [
+                    "add_comment_to_pending_review",
+                    "create_pending_pull_request_review",
+                    "pull_request_read",
+                    "submit_pending_pull_request_review"
+                  ],
+                  "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+                  }
+                }
+              },
+              "tools": {
+                "core": [
+                  "run_shell_command(cat)",
+                  "run_shell_command(echo)",
+                  "run_shell_command(grep)",
+                  "run_shell_command(head)",
+                  "run_shell_command(tail)"
+                ]
+              }
+            }
+          prompt: |-
+            Start your response with:
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+            Reviewer: Gemini Dispatch (Broad Review)
+
+            You are performing a deep, professional review that goes BEYOND the current diff.
+            Focus on missing improvements, latent risks, and hardening opportunities in areas touched by this PR.
+            Do NOT repeat change-specific findings that a diff-focused review would cover.
+            Exclude CI/CD commentary.
+
+            Provide:
+            1. Broader risks or gaps not addressed by this PR
+            2. Improvements that should be scheduled soon (not necessarily in this PR)
+            3. Any architectural or operational concerns related to the affected areas
+
+            Keep the response concise and structured with clear headings.
+
+      - name: 'Notify on failure'
+        if: failure()
+        env:
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
+          ISSUE_NUMBER: '${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}'
+          REPOSITORY: '${{ github.repository }}'
+        run: |-
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body "Review encountered an error. Please [check the logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details." \
+            --repo "${REPOSITORY}"

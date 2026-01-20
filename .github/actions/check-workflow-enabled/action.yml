@@ -1,0 +1,72 @@
+name: 'Check Workflow Enabled'
+description: 'Check if a workflow is enabled in workflow-config.yml'
+
+inputs:
+  workflow-name:
+    description: 'Name of the workflow to check (e.g., shellcheck, build-test)'
+    required: true
+  force-run:
+    description: 'Force run even if disabled'
+    required: false
+    default: 'false'
+
+outputs:
+  enabled:
+    description: 'Whether the workflow is enabled'
+    value: ${{ steps.check.outputs.enabled }}
+  config:
+    description: 'Full workflow config as JSON'
+    value: ${{ steps.check.outputs.config }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check workflow status
+      id: check
+      shell: bash
+      run: |
+        CONFIG_FILE=".github/workflow-config.yml"
+        WORKFLOW_NAME="${{ inputs.workflow-name }}"
+        FORCE_RUN="${{ inputs.force-run }}"
+
+        # force_run이 true면 무조건 enabled
+        if [[ "$FORCE_RUN" == "true" ]]; then
+          echo "enabled=true" >> $GITHUB_OUTPUT
+          echo "config={}" >> $GITHUB_OUTPUT
+          echo "::notice::Workflow forced to run"
+          exit 0
+        fi
+
+        # 설정 파일 확인
+        if [[ ! -f "$CONFIG_FILE" ]]; then
+          echo "::warning::Config file not found, defaulting to enabled"
+          echo "enabled=true" >> $GITHUB_OUTPUT
+          echo "config={}" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # yq로 설정 읽기 (없으면 grep/sed로 fallback)
+        if command -v yq &> /dev/null; then
+          # Use bracket notation to safely handle names with dashes.
+          ENABLED=$(yq ".workflows[\"${WORKFLOW_NAME}\"].enabled // true" "$CONFIG_FILE")
+          CONFIG_JSON=$(yq -o=json ".workflows[\"${WORKFLOW_NAME}\"] // {}" "$CONFIG_FILE")
+        else
+          # yq가 없으면 간단한 grep으로 처리
+          echo "::warning::yq command not found. The 'config' output will be empty."
+          ENABLED=$(grep -A1 "^  ${WORKFLOW_NAME}:" "$CONFIG_FILE" | grep "enabled:" | sed 's/.*enabled: *//' | tr -d ' ')
+          if [[ -z "$ENABLED" ]]; then
+            ENABLED="true"
+          fi
+          CONFIG_JSON="{}"
+        fi
+
+        echo "enabled=$ENABLED" >> $GITHUB_OUTPUT
+        echo "config<<EOF" >> $GITHUB_OUTPUT
+        echo "$CONFIG_JSON" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+        if [[ "$ENABLED" == "false" ]]; then
+          echo "::notice::Workflow '$WORKFLOW_NAME' is disabled in config"
+        else
+          echo "::notice::Workflow '$WORKFLOW_NAME' is enabled"
+        fi

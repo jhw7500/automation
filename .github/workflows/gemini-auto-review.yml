@@ -1,0 +1,190 @@
+name: Gemini Auto PR Review
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: 'Pull request number (optional; defaults to event PR number)'
+        type: string
+        required: false
+      force_run:
+        description: 'Run even if disabled in workflow-config.yml'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  check-enabled:
+    name: Check if enabled
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Check workflow config
+        id: check
+        uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1
+        with:
+          workflow-name: gemini-auto-review
+          force-run: ${{ inputs.force_run && 'true' || 'false' }}
+
+  gemini-review:
+    needs: check-enabled
+    if: needs.check-enabled.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR details
+        id: pr-details
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
+
+          # Save PR details directly to files (safer than variables for large content)
+          gh pr diff $PR_NUMBER > pr_diff.txt || echo "No diff available" > pr_diff.txt
+          echo "${{ github.event.pull_request.title }}" > pr_title.txt
+          echo "$PR_NUMBER" > pr_number.txt
+          cat > pr_body.txt << 'EOF'
+          ${{ github.event.pull_request.body }}
+          EOF
+
+      - name: Run Gemini Code Review
+        id: gemini-review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          # Install dependencies
+          pip install -q google-generativeai
+
+          # Create Python script for Gemini review
+          cat > gemini_review.py << 'PYTHON_EOF'
+          import os
+          import google.generativeai as genai
+
+          # Configure Gemini
+          api_key = os.environ.get('GEMINI_API_KEY')
+          if not api_key:
+              print("ERROR: GEMINI_API_KEY not set")
+              exit(1)
+
+          genai.configure(api_key=api_key)
+          model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
+          # Read PR details
+          with open('pr_title.txt', 'r') as f:
+              pr_title = f.read().strip()
+          with open('pr_body.txt', 'r') as f:
+              pr_body = f.read().strip()
+          with open('pr_number.txt', 'r') as f:
+              pr_number = f.read().strip()
+          with open('pr_diff.txt', 'r') as f:
+              pr_diff = f.read()
+
+          # Create review prompt
+          prompt = f"""REPO: {os.environ.get('GITHUB_REPOSITORY', '')}
+          PR NUMBER: {pr_number}
+
+          You are reviewing a pull request. Focus ONLY on the changes in the diff.
+
+
+          PR Title: {pr_title}
+
+
+          PR Description:
+          {pr_body}
+
+          Code Changes:
+          ```diff
+          {pr_diff[:50000]}  # Limit to 50k chars to avoid token limits
+          ```
+
+          Provide a strong, professional review focused on:
+          1. Side effects, regressions, and hidden risks introduced by the changes
+          2. Missing validations or error handling in the modified code
+          3. Behavioral changes that should be documented
+          4. Tests or checks that should be added specifically for these changes
+
+          Exclude CI/CD commentary and avoid unrelated refactors or style nits.
+          Format in GitHub-flavored Markdown with clear, concise sections."""
+
+          # Get review from Gemini
+          try:
+              response = model.generate_content(prompt)
+              review_text = response.text
+
+              # Save review to file
+              with open('gemini_review.md', 'w') as f:
+                  f.write(review_text)
+
+              print("Review generated successfully")
+          except Exception as e:
+              print(f"Error generating review: {e}")
+              with open('gemini_review.md', 'w') as f:
+                  f.write(f"⚠️ Failed to generate Gemini review: {str(e)}")
+              exit(1)
+          PYTHON_EOF
+
+          # Run the review script
+          python gemini_review.py
+
+      - name: Post review comment
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
+
+          cat > final_review.md << EOF
+          REPO: ${{ github.repository }}
+          PR NUMBER: ${PR_NUMBER}
+          Reviewer: Gemini Auto (Diff Focus)
+          ## 🔎 Gemini Code Review
+
+          EOF
+
+          cat gemini_review.md >> final_review.md
+
+          # Add footer
+          cat >> final_review.md << 'EOF'
+
+          ---
+          *Reviewed by Gemini 3 Flash*
+          EOF
+
+          # Post as PR comment
+          gh pr comment $PR_NUMBER --body-file final_review.md
+
+      - name: Handle review failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
+          gh pr comment $PR_NUMBER --body "⚠️ Gemini auto-review failed. Please check the workflow logs for details."
+
+  skipped:
+    name: Workflow Skipped
+    needs: check-enabled
+    if: needs.check-enabled.outputs.enabled != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notice
+        run: |
+          echo "::notice::Gemini Auto PR Review workflow is disabled in .github/workflow-config.yml"
+          echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "Gemini Auto PR Review is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY

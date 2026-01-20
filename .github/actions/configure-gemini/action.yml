@@ -1,0 +1,108 @@
+name: 'Configure Gemini'
+description: 'Generate Gemini CLI settings with MCP server and telemetry configuration'
+
+inputs:
+  github-token:
+    description: 'GitHub token for MCP server'
+    required: true
+  mcp-image:
+    description: 'MCP server Docker image with digest'
+    required: true
+  mcp-tools:
+    description: 'Comma-separated list of MCP tools to include'
+    required: false
+    default: ''
+  enable-mcp:
+    description: 'Enable MCP server'
+    required: false
+    default: 'true'
+  max-session-turns:
+    description: 'Maximum session turns'
+    required: false
+    default: '25'
+  core-tools:
+    description: 'Comma-separated list of core shell tools'
+    required: false
+    default: 'cat,echo,grep,head,tail'
+
+outputs:
+  settings:
+    description: 'Generated settings JSON'
+    value: ${{ steps.generate.outputs.settings }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Generate settings'
+      id: 'generate'
+      shell: bash
+      env:
+        GITHUB_TOKEN: '${{ inputs.github-token }}'
+        MCP_IMAGE: '${{ inputs.mcp-image }}'
+        MCP_TOOLS: '${{ inputs.mcp-tools }}'
+        ENABLE_MCP: '${{ inputs.enable-mcp }}'
+        MAX_TURNS: '${{ inputs.max-session-turns }}'
+        CORE_TOOLS: '${{ inputs.core-tools }}'
+      run: |
+        # Build core tools array
+        CORE_TOOLS_JSON="[]"
+        if [[ -n "$CORE_TOOLS" ]]; then
+          CORE_TOOLS_JSON=$(echo "$CORE_TOOLS" | tr ',' '\n' | while read tool; do
+            echo "\"run_shell_command($tool)\""
+          done | jq -s '.')
+        fi
+
+        # Build MCP tools array
+        MCP_TOOLS_JSON="[]"
+        if [[ -n "$MCP_TOOLS" ]]; then
+          MCP_TOOLS_JSON=$(echo "$MCP_TOOLS" | tr ',' '\n' | jq -R . | jq -s '.')
+        fi
+
+        # Generate base settings (always present)
+        SETTINGS=$(jq -n \
+          --argjson maxTurns "$MAX_TURNS" \
+          --argjson coreTools "$CORE_TOOLS_JSON" \
+          '{
+            "model": {
+              "maxSessionTurns": $maxTurns
+            },
+            "telemetry": {
+              "enabled": true,
+              "target": "local",
+              "outfile": ".gemini/telemetry.log"
+            },
+            "tools": {
+              "core": $coreTools
+            }
+          }')
+
+        # Conditionally add MCP server settings
+        if [[ "$ENABLE_MCP" == "true" && -n "$MCP_TOOLS" ]]; then
+          SETTINGS=$(echo "$SETTINGS" | jq \
+            --argjson mcpTools "$MCP_TOOLS_JSON" \
+            --arg mcpImage "$MCP_IMAGE" \
+            --arg githubToken "$GITHUB_TOKEN" \
+            '. + {
+              "mcpServers": {
+                "github": {
+                  "command": "docker",
+                  "args": [
+                    "run", "-i", "--rm",
+                    "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+                    $mcpImage
+                  ],
+                  "includeTools": $mcpTools,
+                  "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": $githubToken
+                  }
+                }
+              }
+            }')
+        fi
+
+        # Output settings (escape for GitHub Actions)
+        echo "settings<<EOF" >> $GITHUB_OUTPUT
+        echo "$SETTINGS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+        echo "::notice::Generated Gemini settings with MCP=$ENABLE_MCP"

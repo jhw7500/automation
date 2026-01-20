@@ -1,0 +1,44 @@
+name: 'Setup Gemini Auth'
+description: 'Mint GitHub App token for Gemini workflows'
+
+inputs:
+  app-id:
+    description: 'GitHub App ID'
+    required: false
+  private-key:
+    description: 'GitHub App Private Key'
+    required: false
+  fallback-token:
+    description: 'Fallback token if App credentials not provided'
+    required: false
+
+outputs:
+  token:
+    description: 'Generated or fallback token'
+    value: ${{ steps.resolve.outputs.token }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Mint identity token'
+      id: 'mint_token'
+      if: ${{ inputs.app-id != '' }}
+      uses: 'actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b' # ratchet:actions/create-github-app-token@v2
+      with:
+        app-id: '${{ inputs.app-id }}'
+        private-key: '${{ inputs.private-key }}'
+        permission-contents: 'read'
+        permission-issues: 'write'
+        permission-pull-requests: 'write'
+
+    - name: 'Resolve token'
+      id: 'resolve'
+      shell: bash
+      run: |
+        if [[ -n "${{ steps.mint_token.outputs.token }}" ]]; then
+          echo "token=${{ steps.mint_token.outputs.token }}" >> $GITHUB_OUTPUT
+          echo "::notice::Using GitHub App token"
+        else
+          echo "token=${{ inputs.fallback-token }}" >> $GITHUB_OUTPUT
+          echo "::notice::Using fallback token"
+        fi

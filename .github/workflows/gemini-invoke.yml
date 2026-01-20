@@ -1,0 +1,154 @@
+name: '▶️ Gemini Invoke'
+
+on:
+  workflow_call:
+    inputs:
+      item_number:
+        type: 'string'
+        description: 'Issue or pull request number (optional; defaults to event item number)'
+        required: false
+      item_title:
+        type: 'string'
+        description: 'Issue or pull request title (optional; defaults to event title)'
+        required: false
+      item_body:
+        type: 'string'
+        description: 'Issue or pull request body (optional; defaults to event body)'
+        required: false
+      event_name:
+        type: 'string'
+        description: 'Caller event name (optional; defaults to github.event_name)'
+        required: false
+      is_pull_request:
+        type: 'boolean'
+        description: 'Whether the caller event is for a pull request (optional; defaults from event)'
+        required: false
+      additional_context:
+        type: 'string'
+        description: 'Any additional context from the request'
+        required: false
+
+concurrency:
+  group: '${{ github.workflow }}-invoke-${{ inputs.event_name || github.event_name }}-${{ inputs.item_number || github.event.pull_request.number || github.event.issue.number }}'
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: 'bash'
+
+jobs:
+  invoke:
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      issues: 'write'
+      pull-requests: 'write'
+    steps:
+      - name: 'Checkout repository'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          sparse-checkout: .github
+
+      - name: 'Setup authentication'
+        id: 'auth'
+        uses: 'jhw7500/automation/.github/actions/setup-gemini-auth@v1'
+        with:
+          app-id: '${{ vars.APP_ID }}'
+          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
+          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+
+      - name: 'Run Gemini CLI'
+        id: 'run_gemini'
+        uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
+        env:
+          TITLE: '${{ inputs.item_title || github.event.pull_request.title || github.event.issue.title }}'
+          DESCRIPTION: '${{ inputs.item_body || github.event.pull_request.body || github.event.issue.body }}'
+          EVENT_NAME: '${{ inputs.event_name || github.event_name }}'
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
+          IS_PULL_REQUEST: '${{ inputs.is_pull_request || !!github.event.pull_request }}'
+          ISSUE_NUMBER: '${{ inputs.item_number || github.event.pull_request.number || github.event.issue.number }}'
+          REPOSITORY: '${{ github.repository }}'
+          ADDITIONAL_CONTEXT: '${{ inputs.additional_context }}'
+        with:
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gemini_debug: '${{ fromJSON(vars.GEMINI_DEBUG || vars.ACTIONS_STEP_DEBUG || false) }}'
+          gemini_model: '${{ vars.GEMINI_MODEL }}'
+          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
+          workflow_name: 'gemini-invoke'
+          settings: |-
+            {
+              "model": {
+                "maxSessionTurns": 25
+              },
+              "telemetry": {
+                "enabled": true,
+                "target": "local",
+                "outfile": ".gemini/telemetry.log"
+              },
+              "mcpServers": {
+                "github": {
+                  "command": "docker",
+                  "args": [
+                    "run",
+                    "-i",
+                    "--rm",
+                    "-e",
+                    "GITHUB_PERSONAL_ACCESS_TOKEN",
+                    "ghcr.io/github/github-mcp-server:v0.18.0@sha256:6aa543f565bc98d96106fdd80a0abdc0c7147c8ca7f4663a814ceecef1ccc6d3"
+                  ],
+                  "includeTools": [
+                    "add_issue_comment",
+                    "get_issue",
+                    "get_issue_comments",
+                    "list_issues",
+                    "search_issues",
+                    "create_pull_request",
+                    "pull_request_read",
+                    "list_pull_requests",
+                    "search_pull_requests",
+                    "create_branch",
+                    "create_or_update_file",
+                    "delete_file",
+                    "fork_repository",
+                    "get_commit",
+                    "get_file_contents",
+                    "list_commits",
+                    "push_files",
+                    "search_code"
+                  ],
+                  "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+                  }
+                }
+              },
+              "tools": {
+                "core": [
+                  "run_shell_command(cat)",
+                  "run_shell_command(echo)",
+                  "run_shell_command(grep)",
+                  "run_shell_command(head)",
+                  "run_shell_command(tail)"
+                ]
+              }
+            }
+          prompt: '/gemini-invoke'
+
+      - name: 'Notify on failure'
+        if: failure()
+        env:
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
+          ISSUE_NUMBER: '${{ inputs.item_number || github.event.pull_request.number || github.event.issue.number }}'
+          REPOSITORY: '${{ github.repository }}'
+        run: |-
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body "I encountered an error while processing your request. Please [check the logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details." \
+            --repo "${REPOSITORY}"
