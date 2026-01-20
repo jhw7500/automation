@@ -52,7 +52,7 @@ jobs:
 
       - name: 'Setup authentication'
         id: 'auth'
-        uses: 'jhw7500/automation/.github/actions/setup-gemini-auth@v1'
+        uses: 'jhw7500/automation/.github/actions/setup-gemini-auth@v1.1'
         with:
           app-id: '${{ vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'

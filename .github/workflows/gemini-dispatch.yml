@@ -27,7 +27,7 @@ jobs:
 
       - name: Check workflow config
         id: check
-        uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1
+        uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1.1
         with:
           workflow-name: gemini-dispatch
           force-run: ${{ inputs.force_run && 'true' || 'false' }}
@@ -166,7 +166,7 @@ jobs:
     needs: 'dispatch'
     if: |-
       ${{ needs.dispatch.outputs.command == 'review' && needs.dispatch.outputs.review_enabled != 'false' }}
-    uses: './.github/workflows/gemini-review.yml'
+    uses: 'jhw7500/automation/.github/workflows/gemini-review.yml@v1.1'
     permissions:
       contents: 'read'
       id-token: 'write'
@@ -180,7 +180,7 @@ jobs:
     needs: 'dispatch'
     if: |-
       ${{ needs.dispatch.outputs.command == 'triage' && needs.dispatch.outputs.triage_enabled != 'false' }}
-    uses: './.github/workflows/gemini-triage.yml'
+    uses: 'jhw7500/automation/.github/workflows/gemini-triage.yml@v1.1'
     permissions:
       contents: 'read'
       id-token: 'write'
@@ -194,7 +194,7 @@ jobs:
     needs: 'dispatch'
     if: |-
       ${{ needs.dispatch.outputs.command == 'invoke' && needs.dispatch.outputs.invoke_enabled != 'false' }}
-    uses: './.github/workflows/gemini-invoke.yml'
+    uses: 'jhw7500/automation/.github/workflows/gemini-invoke.yml@v1.1'
     permissions:
       contents: 'read'
       id-token: 'write'
