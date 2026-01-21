@@ -95,11 +95,29 @@ jobs:
           with open('pr_diff.txt', 'r') as f:
               pr_diff = f.read()
 
+          def strip_outer_code_fence(text: str) -> str:
+              """Remove a single outer ```...``` wrapper if present."""
+              t = (text or "").strip()
+              if not t.startswith("```"):
+                  return t
+
+              lines = t.splitlines()
+              if len(lines) < 2:
+                  return t
+
+              # Find the closing fence. We only strip if the *entire* response is fenced.
+              if lines[-1].strip() != "```":
+                  return t
+
+              # Drop first fence line (``` or ```markdown, etc.) and last fence line.
+              return "\n".join(lines[1:-1]).strip()
+
           # Create review prompt
           prompt = f"""REPO: {os.environ.get('GITHUB_REPOSITORY', '')}
           PR NUMBER: {pr_number}
 
           You are reviewing a pull request. Focus ONLY on the changes in the diff.
+          IMPORTANT: Do NOT wrap your response in triple backticks. Write plain GitHub-flavored Markdown.
 
 
           PR Title: {pr_title}
@@ -125,7 +143,7 @@ jobs:
           # Get review from Gemini
           try:
               response = model.generate_content(prompt)
-              review_text = response.text
+              review_text = strip_outer_code_fence(response.text)
 
               # Save review to file
               with open('gemini_review.md', 'w') as f:
