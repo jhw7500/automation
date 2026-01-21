@@ -31,7 +31,7 @@ defaults:
 jobs:
   review:
     runs-on: 'ubuntu-latest'
-    timeout-minutes: 7
+    timeout-minutes: 15
     permissions:
       contents: 'read'
       id-token: 'write'
@@ -49,10 +49,11 @@ jobs:
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
           fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
 
-      - name: 'Run Gemini pull request review'
+      - name: 'Run Gemini pull request review (primary, attempt 1)'
         uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
-        id: 'gemini_pr_review'
-        env:
+        id: 'gemini_pr_review_1'
+        continue-on-error: true
+        env: &gemini_review_env
           GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
           ISSUE_TITLE: '${{ inputs.issue_title || github.event.pull_request.title || github.event.issue.title }}'
           ISSUE_BODY: '${{ inputs.issue_body || github.event.pull_request.body || github.event.issue.body }}'
@@ -73,7 +74,7 @@ jobs:
           use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
           upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
           workflow_name: 'gemini-review'
-          settings: |-
+          settings: &gemini_review_settings |-
             {
               "model": {
                 "maxSessionTurns": 25
@@ -115,7 +116,7 @@ jobs:
                 ]
               }
             }
-          prompt: |-
+          prompt: &gemini_review_prompt |-
             Start your response with:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
@@ -133,8 +134,70 @@ jobs:
 
             Keep the response concise and structured with clear headings.
 
+      - name: 'Backoff before retry'
+        if: steps.gemini_pr_review_1.outcome != 'success'
+        run: sleep 20
+
+      - name: 'Run Gemini pull request review (primary, attempt 2)'
+        if: steps.gemini_pr_review_1.outcome != 'success'
+        uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
+        id: 'gemini_pr_review_2'
+        continue-on-error: true
+        env: *gemini_review_env
+        with:
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
+          gemini_model: '${{ vars.GEMINI_MODEL }}'
+          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
+          workflow_name: 'gemini-review'
+          settings: *gemini_review_settings
+          prompt: *gemini_review_prompt
+
+      - name: 'Backoff before fallback'
+        if: steps.gemini_pr_review_1.outcome != 'success' && steps.gemini_pr_review_2.outcome != 'success'
+        run: sleep 20
+
+      - name: 'Run Gemini pull request review (fallback model)'
+        if: steps.gemini_pr_review_1.outcome != 'success' && steps.gemini_pr_review_2.outcome != 'success'
+        uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
+        id: 'gemini_pr_review_fallback'
+        continue-on-error: true
+        env: *gemini_review_env
+        with:
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
+          gemini_model: "${{ vars.GEMINI_FALLBACK_MODEL || 'gemini-3-flash-preview' }}"
+          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
+          workflow_name: 'gemini-review'
+          settings: *gemini_review_settings
+          prompt: *gemini_review_prompt
+
+      - name: 'Fail job if all review attempts failed'
+        if: always()
+        run: |-
+          if [ "${{ steps.gemini_pr_review_1.outcome }}" = 'success' ]; then exit 0; fi
+          if [ "${{ steps.gemini_pr_review_2.outcome }}" = 'success' ]; then exit 0; fi
+          if [ "${{ steps.gemini_pr_review_fallback.outcome }}" = 'success' ]; then exit 0; fi
+          exit 1
+
       - name: 'Notify on failure'
-        if: failure()
+        if: always() && steps.gemini_pr_review_1.outcome != 'success' && steps.gemini_pr_review_2.outcome != 'success' && steps.gemini_pr_review_fallback.outcome != 'success'
         env:
           GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
           ISSUE_NUMBER: '${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}'
