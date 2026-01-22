@@ -38,8 +38,29 @@ jobs:
       issues: 'write'
       pull-requests: 'write'
     steps:
-      - name: 'Checkout repository'
+      - name: 'Checkout repository (sparse)'
+        if: vars.GEMINI_SPARSE_CHECKOUT == 'true' && vars.GEMINI_SPARSE_CHECKOUT_PATTERNS != ''
         uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          fetch-depth: 1
+          lfs: false
+          submodules: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |-
+            ${{ vars.GEMINI_SPARSE_CHECKOUT_PATTERNS }}
+
+      - name: 'Checkout repository'
+        if: vars.GEMINI_SPARSE_CHECKOUT != 'true'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          fetch-depth: 1
+          lfs: false
+          submodules: false
+
+      - name: 'Setup safe shell wrappers'
+        run: |-
+          set -euo pipefail
+          ./.github/scripts/setup-gemini-safe-bin.sh
 
       - name: 'Setup authentication'
         id: 'auth'
@@ -55,6 +76,8 @@ jobs:
         timeout-minutes: 4
         continue-on-error: true
         env: &gemini_review_env
+          PATH: '${{ github.workspace }}/.gemini/safe-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+          GEMINI_MAX_READ_BYTES: '${{ vars.GEMINI_MAX_READ_BYTES || 200000 }}'
           GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
           ISSUE_TITLE: '${{ inputs.issue_title || github.event.pull_request.title || github.event.issue.title }}'
           ISSUE_BODY: '${{ inputs.issue_body || github.event.pull_request.body || github.event.issue.body }}'
@@ -139,6 +162,17 @@ jobs:
         if: steps.gemini_pr_review_1.outcome != 'success'
         run: sleep 20
 
+      - name: 'Reset Gemini workspace before retry'
+        if: steps.gemini_pr_review_1.outcome != 'success'
+        run: |-
+          rm -rf .gemini
+
+      - name: 'Setup safe shell wrappers (retry)'
+        if: steps.gemini_pr_review_1.outcome != 'success'
+        run: |-
+          set -euo pipefail
+          ./.github/scripts/setup-gemini-safe-bin.sh
+
       - name: 'Run Gemini pull request review (primary, attempt 2)'
         if: steps.gemini_pr_review_1.outcome != 'success'
         uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
@@ -166,6 +200,17 @@ jobs:
       - name: 'Backoff before fallback'
         if: steps.gemini_pr_review_1.outcome != 'success' && steps.gemini_pr_review_2.outcome != 'success'
         run: sleep 20
+
+      - name: 'Reset Gemini workspace before fallback'
+        if: steps.gemini_pr_review_1.outcome != 'success' && steps.gemini_pr_review_2.outcome != 'success'
+        run: |-
+          rm -rf .gemini
+
+      - name: 'Setup safe shell wrappers (fallback)'
+        if: steps.gemini_pr_review_1.outcome != 'success' && steps.gemini_pr_review_2.outcome != 'success'
+        run: |-
+          set -euo pipefail
+          ./.github/scripts/setup-gemini-safe-bin.sh
 
       - name: 'Run Gemini pull request review (fallback model)'
         if: steps.gemini_pr_review_1.outcome != 'success' && steps.gemini_pr_review_2.outcome != 'success'
