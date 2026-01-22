@@ -338,12 +338,84 @@ jobs:
           exit 1
 
       - name: 'Notify on failure'
-        if: always() && steps.gemini_pr_review_1.outcome != 'success' && steps.gemini_pr_review_2.outcome != 'success' && steps.gemini_pr_review_fallback.outcome != 'success'
+        if: always()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
-          GH_TOKEN: '${{ github.token }}'
           ISSUE_NUMBER: '${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}'
-          REPOSITORY: '${{ github.repository }}'
-        run: |-
-          gh issue comment "${ISSUE_NUMBER}" \
-            --body "Review encountered an error. Please [check the logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details." \
-            --repo "${REPOSITORY}"
+          RUN_URL: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          MODEL_PRIMARY: '${{ vars.GEMINI_MODEL }}'
+          MODEL_FALLBACK: "${{ vars.GEMINI_FALLBACK_MODEL || 'gemini-3-flash-preview' }}"
+          OUTCOME_1: '${{ steps.gemini_pr_review_1.outcome }}'
+          RESP_1: '${{ steps.gemini_pr_review_1.outputs.gemini_response }}'
+          ERR_1: '${{ steps.gemini_pr_review_1.outputs.gemini_errors }}'
+          OUTCOME_2: '${{ steps.gemini_pr_review_2.outcome }}'
+          RESP_2: '${{ steps.gemini_pr_review_2.outputs.gemini_response }}'
+          ERR_2: '${{ steps.gemini_pr_review_2.outputs.gemini_errors }}'
+          OUTCOME_FB: '${{ steps.gemini_pr_review_fallback.outcome }}'
+          RESP_FB: '${{ steps.gemini_pr_review_fallback.outputs.gemini_response }}'
+          ERR_FB: '${{ steps.gemini_pr_review_fallback.outputs.gemini_errors }}'
+        with:
+          github-token: '${{ github.token }}'
+          script: |
+            const marker = '<!-- automation:gemini-review -->';
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            const runUrl = process.env.RUN_URL;
+
+            const maxLen = 60000;
+            const trim = (s) => {
+              const t = (s || '').trim();
+              if (t.length <= maxLen) return t;
+              return t.slice(0, maxLen) + `\n\n...(truncated, ${t.length - maxLen} chars omitted)`;
+            };
+
+            const pick = () => {
+              if ((process.env.OUTCOME_1 || '').toLowerCase() === 'success') {
+                return { ok: true, model: process.env.MODEL_PRIMARY || '', response: process.env.RESP_1 || '', error: '' };
+              }
+              if ((process.env.OUTCOME_2 || '').toLowerCase() === 'success') {
+                return { ok: true, model: process.env.MODEL_PRIMARY || '', response: process.env.RESP_2 || '', error: '' };
+              }
+              if ((process.env.OUTCOME_FB || '').toLowerCase() === 'success') {
+                return { ok: true, model: process.env.MODEL_FALLBACK || '', response: process.env.RESP_FB || '', error: '' };
+              }
+
+              // Prefer the fallback error if present; otherwise take the first non-empty.
+              const err = process.env.ERR_FB || process.env.ERR_2 || process.env.ERR_1 || '';
+              return { ok: false, model: process.env.MODEL_PRIMARY || '', response: '', error: err };
+            };
+
+            const summarizeError = (raw) => {
+              const t = (raw || '').trim();
+              if (!t) return '';
+              const lines = t.split('\n').slice(0, 30).join('\n');
+              return trim(lines);
+            };
+
+            const result = pick();
+            const header = `## Gemini Review (latest)\n${marker}`;
+            const meta = [
+              `- Status: ${result.ok ? 'success' : 'failure'}`,
+              result.model ? `- Model: ${result.model}` : null,
+              `- Run: ${runUrl}`,
+            ].filter(Boolean).join('\n');
+
+            const content = result.ok
+              ? `\n\n${trim(result.response) || `(No response captured. Check run logs: ${runUrl})`}`
+              : `\n\n### Error\n\n\`\`\`\n${summarizeError(result.error) || '(no error text captured)'}\n\`\`\`\n\n(See run logs: ${runUrl})`;
+
+            const body = `${header}\n\n${meta}${content}`;
+
+            const { owner, repo } = context.repo;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+
+            const existing = comments.find((c) => (c.body || '').includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
+            }

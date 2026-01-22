@@ -188,7 +188,9 @@ jobs:
           fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
 
       - name: Run Gemini pull request review
+        id: gemini_review
         uses: google-github-actions/run-gemini-cli@v0
+        continue-on-error: true
         env:
           GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
           ISSUE_TITLE: '${{ github.event.pull_request.title || github.event.issue.title }}'
@@ -241,6 +243,87 @@ jobs:
             3. Any architectural or operational concerns related to the affected areas
 
             Keep the response concise and structured with clear headings.
+
+      - name: Upsert PR comment (Gemini Review)
+        if: always()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
+        env:
+          ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          RUN_URL: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          MODEL_USED: '${{ vars.GEMINI_MODEL }}'
+          OUTCOME: '${{ steps.gemini_review.outcome }}'
+          RESPONSE: '${{ steps.gemini_review.outputs.gemini_response }}'
+          ERRORS: '${{ steps.gemini_review.outputs.gemini_errors }}'
+        with:
+          github-token: '${{ github.token }}'
+          script: |
+            const marker = '<!-- automation:gemini-review -->';
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            const runUrl = process.env.RUN_URL;
+            const modelUsed = process.env.MODEL_USED || '';
+            const outcome = (process.env.OUTCOME || '').toLowerCase();
+
+            const maxLen = 60000;
+            const trim = (s) => {
+              const t = (s || '').trim();
+              if (t.length <= maxLen) return t;
+              return t.slice(0, maxLen) + `\n\n...(truncated, ${t.length - maxLen} chars omitted)`;
+            };
+
+            const summarizeError = (raw) => {
+              const t = (raw || '').trim();
+              if (!t) return '';
+              // Keep it human-readable: first ~30 lines is usually enough.
+              const lines = t.split('\n').slice(0, 30).join('\n');
+              return trim(lines);
+            };
+
+            const ok = outcome === 'success';
+            const response = trim(process.env.RESPONSE);
+            const errors = summarizeError(process.env.ERRORS);
+
+            const header = `## Gemini Review (latest)\n${marker}`;
+            const meta = [
+              `- Status: ${ok ? 'success' : 'failure'}`,
+              modelUsed ? `- Model: ${modelUsed}` : null,
+              `- Run: ${runUrl}`,
+            ].filter(Boolean).join('\n');
+
+            const content = ok
+              ? (response ? `\n\n${response}` : `\n\n(No response captured. Check run logs: ${runUrl})`)
+              : `\n\n### Error\n\n\`\`\`\n${errors || '(no error text captured)'}\n\`\`\`\n\n(See run logs: ${runUrl})`;
+
+            const body = `${header}\n\n${meta}${content}`;
+
+            const { owner, repo } = context.repo;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+
+            const existing = comments.find((c) => (c.body || '').includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body,
+              });
+            }
+
+      - name: Fail job if review failed
+        if: steps.gemini_review.outcome != 'success'
+        run: exit 1
 
   triage:
     needs: dispatch
