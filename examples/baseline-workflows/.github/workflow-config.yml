@@ -1,0 +1,10 @@
+# GitHub Actions Workflow Configuration
+#
+# This file controls enable/disable toggles for automatic workflows.
+# Workflows should default to enabled if this file is missing.
+
+# Global review behavior.
+# - manual triggers (e.g. @gemini-cli /review, @claude) should keep working regardless.
+# - set review.auto=false to disable automatic PR reviews.
+review:
+  auto: false
