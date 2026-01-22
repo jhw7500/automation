@@ -68,6 +68,7 @@ jobs:
       review_enabled: '${{ steps.check_config.outputs.review_enabled }}'
       triage_enabled: '${{ steps.check_config.outputs.triage_enabled }}'
       invoke_enabled: '${{ steps.check_config.outputs.invoke_enabled }}'
+      auto_pr_review_enabled: '${{ steps.check_config.outputs.auto_pr_review_enabled }}'
     steps:
       - name: 'Checkout for config'
         uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
@@ -92,6 +93,13 @@ jobs:
           echo "triage_enabled=$(get_enabled 'gemini-triage')" >> $GITHUB_OUTPUT
           echo "invoke_enabled=$(get_enabled 'gemini-invoke')" >> $GITHUB_OUTPUT
 
+          # Global auto-review toggle. Defaults to true if missing.
+          auto_pr_review_enabled="true"
+          if [[ -f "$CONFIG_FILE" ]]; then
+            auto_pr_review_enabled="$(ruby -ryaml -e 'cfg = (YAML.load_file(ARGV[0]) rescue {}) || {}; v = cfg.dig("review", "auto"); v = true if v.nil?; puts(v ? "true" : "false")' "$CONFIG_FILE" 2>/dev/null || echo true)"
+          fi
+          echo "auto_pr_review_enabled=${auto_pr_review_enabled}" >> $GITHUB_OUTPUT
+
       - name: 'Mint identity token'
         id: 'mint_identity_token'
         if: |-
@@ -107,19 +115,27 @@ jobs:
       - name: 'Extract command'
         id: 'extract_command'
         uses: 'actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea' # ratchet:actions/github-script@v7
+        env:
+          AUTO_PR_REVIEW_ENABLED: '${{ steps.check_config.outputs.auto_pr_review_enabled }}'
         with:
           script: |
             const eventType = `${context.eventName}.${context.payload.action || ''}`;
-            const request =
+            let request =
               context.payload?.comment?.body ??
               context.payload?.review?.body ??
               context.payload?.issue?.body ??
               '';
 
+            // Alias: allow `@gemini` to behave like `@gemini-cli`.
+            // We only normalize when the mention is at the start of the request (after whitespace).
+            const trimmed = request.trimStart();
+            request = trimmed.replace(/^@gemini(?!-cli)\b/, '@gemini-cli');
+
             core.setOutput('request', request);
 
             if (eventType === 'pull_request.opened') {
-              core.setOutput('command', 'review');
+              const autoEnabled = (process.env.AUTO_PR_REVIEW_ENABLED || 'true') === 'true';
+              core.setOutput('command', autoEnabled ? 'review' : 'noop');
             } else if (['issues.opened', 'issues.reopened'].includes(eventType)) {
               core.setOutput('command', 'triage');
             } else if (request.startsWith("@gemini-cli /review")) {

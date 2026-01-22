@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
+      auto_enabled: ${{ steps.auto_mode.outputs.auto_enabled }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,9 +39,26 @@ jobs:
           workflow-name: claude-code-review
           force-run: ${{ inputs.force_run && 'true' || 'false' }}
 
+      - name: Check auto review mode
+        id: auto_mode
+        env:
+          FORCE_RUN: ${{ inputs.force_run && 'true' || 'false' }}
+        run: |-
+          CONFIG_FILE=".github/workflow-config.yml"
+          if [[ "$FORCE_RUN" == 'true' ]]; then
+            echo "auto_enabled=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          auto_enabled="true"
+          if [[ -f "$CONFIG_FILE" ]]; then
+            auto_enabled="$(ruby -ryaml -e 'cfg = (YAML.load_file(ARGV[0]) rescue {}) || {}; v = cfg.dig("review", "auto"); v = true if v.nil?; puts(v ? "true" : "false")' "$CONFIG_FILE" 2>/dev/null || echo true)"
+          fi
+          echo "auto_enabled=${auto_enabled}" >> "$GITHUB_OUTPUT"
+
   claude-review:
     needs: check-enabled
-    if: needs.check-enabled.outputs.enabled == 'true'
+    if: needs.check-enabled.outputs.enabled == 'true' && needs.check-enabled.outputs.auto_enabled == 'true'
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
@@ -94,7 +112,7 @@ jobs:
   skipped:
     name: Workflow Skipped
     needs: check-enabled
-    if: needs.check-enabled.outputs.enabled != 'true'
+    if: needs.check-enabled.outputs.enabled != 'true' || needs.check-enabled.outputs.auto_enabled != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Notice
