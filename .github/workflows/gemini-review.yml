@@ -19,6 +19,20 @@ on:
         type: 'string'
         description: 'Any additional context from the request'
         required: false
+      patch:
+        type: 'string'
+        description: 'Whether to generate a patch (true/false)'
+        required: false
+        default: 'false'
+      incremental:
+        type: 'string'
+        description: 'Whether to perform incremental review (true/false)'
+        required: false
+        default: 'false'
+      last_success_sha:
+        type: 'string'
+        description: 'Last successful review commit SHA'
+        required: false
 
 concurrency:
   group: '${{ github.workflow }}-review-${{ github.event_name }}-${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}'
@@ -42,7 +56,7 @@ jobs:
         if: vars.GEMINI_SPARSE_CHECKOUT == 'true' && vars.GEMINI_SPARSE_CHECKOUT_PATTERNS != ''
         uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           lfs: false
           submodules: false
           sparse-checkout-cone-mode: false
@@ -53,9 +67,32 @@ jobs:
         if: vars.GEMINI_SPARSE_CHECKOUT != 'true'
         uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           lfs: false
           submodules: false
+
+      - name: 'Determine diff range'
+        id: 'diff_range'
+        run: |-
+          BASE_SHA=""
+          HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          
+          if [[ "${{ inputs.incremental }}" == "true" && -n "${{ inputs.last_success_sha }}" ]]; then
+            echo "Incremental review requested."
+            if git merge-base --is-ancestor "${{ inputs.last_success_sha }}" "$HEAD_SHA"; then
+              BASE_SHA="${{ inputs.last_success_sha }}"
+              echo "Using last_success_sha as base: $BASE_SHA"
+            else
+              echo "last_success_sha is not an ancestor of HEAD. Falling back to PR base."
+              BASE_SHA="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+            fi
+          else
+            BASE_SHA="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+            echo "Using default base: $BASE_SHA"
+          fi
+          
+          echo "base_sha=$BASE_SHA" >> $GITHUB_OUTPUT
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
 
       - name: 'Setup safe shell wrappers'
         run: &setup_safe_shell_wrappers |-
@@ -167,6 +204,21 @@ jobs:
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
           fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
 
+      - name: 'Generate diff'
+        id: 'generate_diff'
+        run: |-
+          DIFF_FILE="dynamic_diff.txt"
+          git diff "${{ steps.diff_range.outputs.base_sha }}"..."${{ steps.diff_range.outputs.head_sha }}" > "$DIFF_FILE"
+          echo "diff_file=$DIFF_FILE" >> $GITHUB_OUTPUT
+
+      - name: 'Generate patch (if requested)'
+        id: 'generate_patch'
+        if: inputs.patch == 'true'
+        run: |-
+          PATCH_FILE="review.patch"
+          git format-patch "${{ steps.diff_range.outputs.base_sha }}"..."${{ steps.diff_range.outputs.head_sha }}" --stdout > "$PATCH_FILE"
+          echo "patch_file=$PATCH_FILE" >> $GITHUB_OUTPUT
+
       - name: 'Run Gemini pull request review (primary, attempt 1)'
         uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
         id: 'gemini_pr_review_1'
@@ -181,6 +233,8 @@ jobs:
           PULL_REQUEST_NUMBER: '${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}'
           REPOSITORY: '${{ github.repository }}'
           ADDITIONAL_CONTEXT: '${{ inputs.additional_context }}'
+          DIFF_FILE: '${{ steps.generate_diff.outputs.diff_file }}'
+          PATCH_FILE: '${{ steps.generate_patch.outputs.patch_file }}'
         with:
           gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
           gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
@@ -243,17 +297,24 @@ jobs:
             PR NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
             Reviewer: Gemini Dispatch (Broad Review)
 
-            You are performing a deep, professional review that goes BEYOND the current diff.
-            Focus on missing improvements, latent risks, and hardening opportunities in areas touched by this PR.
-            Do NOT repeat change-specific findings that a diff-focused review would cover.
-            Exclude CI/CD commentary.
+            You are performing a deep, professional review based on the provided diff.
+            The user has requested a review with the following parameters:
+            - Incremental: ${{ inputs.incremental }}
+            - Generate Patch: ${{ inputs.patch }}
 
-            Provide:
-            1. Broader risks or gaps not addressed by this PR
-            2. Improvements that should be scheduled soon (not necessarily in this PR)
-            3. Any architectural or operational concerns related to the affected areas
+            **Diff for review:**
+            ```diff
+            ${{ env.DIFF_FILE && fromJSON(toJSON(env.DIFF_FILE)) }}
+            ```
 
-            Keep the response concise and structured with clear headings.
+            **Instructions:**
+            1.  **Analyze the diff**: Focus on missing improvements, latent risks, and hardening opportunities in areas touched by the changes. Do NOT repeat change-specific findings that a simple diff review would cover.
+            2.  **Provide a concise review**: Structure your response with clear headings.
+                - Broader risks or gaps not addressed.
+                - Improvements that should be scheduled soon.
+                - Architectural or operational concerns.
+            3.  **Generate a patch (if requested)**: If `Generate Patch` is `true`, create a patch file named `review.patch` that includes your suggested improvements. The patch should be in the `git format-patch` style.
+            4.  **Exclude CI/CD commentary.**
 
       - name: 'Backoff before retry'
         if: steps.gemini_pr_review_1.outcome != 'success'
@@ -337,7 +398,7 @@ jobs:
           if [ "${{ steps.gemini_pr_review_fallback.outcome }}" = 'success' ]; then exit 0; fi
           exit 1
 
-      - name: 'Notify on failure'
+      - name: 'Notify and Persist on Finish'
         if: always()
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
@@ -354,6 +415,7 @@ jobs:
           OUTCOME_FB: '${{ steps.gemini_pr_review_fallback.outcome }}'
           RESP_FB: '${{ steps.gemini_pr_review_fallback.outputs.gemini_response }}'
           ERR_FB: '${{ steps.gemini_pr_review_fallback.outputs.gemini_errors }}'
+          HEAD_SHA: '${{ steps.diff_range.outputs.head_sha }}'
         with:
           github-token: '${{ github.token }}'
           script: |
@@ -392,7 +454,14 @@ jobs:
             };
 
             const result = pick();
-            const header = `## Gemini Review (latest)\n${marker}`;
+            const stickyData = {
+              status: result.ok ? 'success' : 'failure',
+              model: result.model,
+              run_url: runUrl,
+              ...(result.ok && { last_success_sha: process.env.HEAD_SHA }),
+            };
+            const header = `## Gemini Review (latest)\n<!-- automation:gemini-review ${JSON.stringify(stickyData)} -->`;
+
             const meta = [
               `- Status: ${result.ok ? 'success' : 'failure'}`,
               result.model ? `- Model: ${result.model}` : null,

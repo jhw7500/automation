@@ -64,6 +64,12 @@ jobs:
       command: '${{ steps.extract_command.outputs.command }}'
       request: '${{ steps.extract_command.outputs.request }}'
       additional_context: '${{ steps.extract_command.outputs.additional_context }}'
+      target_commit: '${{ steps.extract_command.outputs.target_commit }}'
+      scope: '${{ steps.extract_command.outputs.scope }}'
+      target_url: '${{ steps.extract_command.outputs.target_url }}'
+      patch: '${{ steps.extract_command.outputs.patch }}'
+      incremental: '${{ steps.extract_command.outputs.incremental }}'
+      last_success_sha: '${{ steps.extract_command.outputs.last_success_sha }}'
       issue_number: '${{ github.event.pull_request.number || github.event.issue.number }}'
       review_enabled: '${{ steps.check_config.outputs.review_enabled }}'
       triage_enabled: '${{ steps.check_config.outputs.triage_enabled }}'
@@ -120,6 +126,9 @@ jobs:
         with:
           script: |
             const eventType = `${context.eventName}.${context.payload.action || ''}`;
+            const { owner, repo } = context.repo;
+            const issueNumber = context.payload.pull_request?.number || context.payload.issue?.number;
+
             let request =
               context.payload?.comment?.body ??
               context.payload?.review?.body ??
@@ -133,24 +142,84 @@ jobs:
 
             core.setOutput('request', request);
 
+            let command = 'noop';
+            let additionalContext = '';
+
             if (eventType === 'pull_request.opened') {
               const autoEnabled = (process.env.AUTO_PR_REVIEW_ENABLED || 'true') === 'true';
-              core.setOutput('command', autoEnabled ? 'review' : 'noop');
+              command = autoEnabled ? 'review' : 'noop';
             } else if (['issues.opened', 'issues.reopened'].includes(eventType)) {
-              core.setOutput('command', 'triage');
+              command = 'triage';
             } else if (request.startsWith("@gemini-cli /review")) {
-              core.setOutput('command', 'review');
-              const additionalContext = request.replace(/^@gemini-cli \/review/, '').trim();
-              core.setOutput('additional_context', additionalContext);
+              command = 'review';
+              additionalContext = request.replace(/^@gemini-cli \/review/, '').trim();
             } else if (request.startsWith("@gemini-cli /triage")) {
-              core.setOutput('command', 'triage');
+              command = 'triage';
             } else if (request.startsWith("@gemini-cli")) {
-              const additionalContext = request.replace(/^@gemini-cli/, '').trim();
-              core.setOutput('command', 'invoke');
-              core.setOutput('additional_context', additionalContext);
-            } else {
-              core.setOutput('command', 'noop');
+              command = 'invoke';
+              additionalContext = request.replace(/^@gemini-cli/, '').trim();
             }
+
+            core.setOutput('command', command);
+
+            // Command parsing (commit=<sha>, scope=line|thread, from=<url>)
+            const commitMatch = request.match(/commit=([a-f0-9]+)/);
+            if (commitMatch) core.setOutput('target_commit', commitMatch[1]);
+
+            const scopeMatch = request.match(/scope=(line|thread)/);
+            if (scopeMatch) core.setOutput('scope', scopeMatch[1]);
+
+            const fromMatch = request.match(/from=([^\s]+)/);
+            if (fromMatch) core.setOutput('target_url', fromMatch[1]);
+
+            const patchMatch = request.match(/patch=(true|false)/);
+            if (patchMatch) core.setOutput('patch', patchMatch[1]);
+
+            const incrementalMatch = request.match(/incremental=(true|false)/);
+            if (incrementalMatch) core.setOutput('incremental', incrementalMatch[1]);
+
+            // Fetch last_success_sha from sticky comment
+            const marker = '<!-- automation:gemini-review -->';
+            if (issueNumber) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              });
+              const sticky = comments.find(c => (c.body || '').includes(marker));
+              if (sticky) {
+                const jsonMatch = sticky.body.match(/<!-- automation:gemini-review (\{.*\}) -->/);
+                if (jsonMatch) {
+                  try {
+                    const data = JSON.parse(jsonMatch[1]);
+                    if (data.last_success_sha) {
+                      core.setOutput('last_success_sha', data.last_success_sha);
+                    }
+                  } catch (e) {
+                    core.info(`Failed to parse sticky comment JSON: ${e.message}`);
+                  }
+                }
+              }
+            }
+
+            // Support Reply events: fetch parent comment context
+            if (context.eventName === 'pull_request_review_comment' && context.payload.comment.in_reply_to_id) {
+              try {
+                const { data: parentComment } = await github.rest.pulls.getReviewComment({
+                  owner,
+                  repo,
+                  comment_id: context.payload.comment.in_reply_to_id,
+                });
+                if (parentComment && parentComment.body) {
+                  additionalContext = `Parent Comment Context:\n${parentComment.body}\n\n${additionalContext}`.trim();
+                }
+              } catch (e) {
+                core.info(`Failed to fetch parent comment: ${e.message}`);
+              }
+            }
+
+            core.setOutput('additional_context', additionalContext);
 
       - name: 'Acknowledge request'
         if: steps.extract_command.outputs.command != 'noop'
@@ -198,6 +267,8 @@ jobs:
           PULL_REQUEST_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           REPOSITORY: '${{ github.repository }}'
           ADDITIONAL_CONTEXT: '${{ needs.dispatch.outputs.additional_context }}'
+          PATCH: '${{ needs.dispatch.outputs.patch }}'
+          INCREMENTAL: '${{ needs.dispatch.outputs.incremental }}'
         with:
           gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
           gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
