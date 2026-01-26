@@ -135,22 +135,12 @@ jobs:
               context.payload?.issue?.body ??
               '';
 
-            // Alias: allow `@gemini` to behave like `@gemini-cli`.
-            // We only normalize when the mention is at the start of the request (after whitespace).
-            const trimmed = request.trimStart();
-            request = trimmed.replace(/^@gemini(?!-cli)\b/, '@gemini-cli');
-
             core.setOutput('request', request);
 
             let command = 'noop';
             let additionalContext = '';
 
-            if (eventType === 'pull_request.opened') {
-              const autoEnabled = (process.env.AUTO_PR_REVIEW_ENABLED || 'true') === 'true';
-              command = autoEnabled ? 'review' : 'noop';
-            } else if (['issues.opened', 'issues.reopened'].includes(eventType)) {
-              command = 'triage';
-            } else if (request.startsWith("@gemini-cli /review")) {
+            if (request.startsWith("@gemini-cli /review")) {
               command = 'review';
               additionalContext = request.replace(/^@gemini-cli \/review/, '').trim();
             } else if (request.startsWith("@gemini-cli /triage")) {
@@ -285,7 +275,7 @@ jobs:
           workflow_name: 'gemini-review'
           settings: |-
             {
-              "model": { "maxSessionTurns": 25 },
+              "model": { "maxSessionTurns": 100 },
               "telemetry": { "enabled": true, "target": "local", "outfile": ".gemini/telemetry.log" },
               "tools": {
                 "core": [
@@ -453,7 +443,7 @@ jobs:
           workflow_name: 'gemini-triage'
           settings: |-
             {
-              "model": { "maxSessionTurns": 25 },
+              "model": { "maxSessionTurns": 100 },
               "telemetry": { "enabled": true, "target": "local", "outfile": ".gemini/telemetry.log" },
               "tools": { "core": ["run_shell_command(echo)"] }
             }
@@ -553,7 +543,7 @@ jobs:
           workflow_name: 'gemini-invoke'
           settings: |-
             {
-              "model": { "maxSessionTurns": 25 },
+              "model": { "maxSessionTurns": 100 },
               "telemetry": { "enabled": true, "target": "local", "outfile": ".gemini/telemetry.log" },
               "tools": {
                 "core": [
