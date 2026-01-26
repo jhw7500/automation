@@ -248,8 +248,8 @@ jobs:
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
           fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
 
-      - name: Run Gemini pull request review
-        id: gemini_review
+      - name: Run Gemini pull request review (primary)
+        id: gemini_review_primary
         uses: google-github-actions/run-gemini-cli@v0
         continue-on-error: true
         env:
@@ -309,16 +309,130 @@ jobs:
 
             Keep the response concise and structured with clear headings.
 
+      - name: Log primary model failure
+        if: steps.gemini_review_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != ''
+        env:
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
+          ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
+          FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
+          ERRORS: '${{ steps.gemini_review_primary.outputs.gemini_errors }}'
+          REPOSITORY: '${{ github.repository }}'
+        run: |-
+          cat > /tmp/error_comment.md <<'EOF'
+          ## ⚠️ Primary Model Failed
+
+          **Primary Model:** $PRIMARY_MODEL
+          **Attempting Fallback:** $FALLBACK_MODEL
+
+          <details>
+          <summary>Error Details</summary>
+
+          ```
+          $ERRORS
+          ```
+
+          </details>
+          EOF
+
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body-file /tmp/error_comment.md \
+            --repo "${REPOSITORY}"
+
+      - name: Run Gemini pull request review (fallback)
+        id: gemini_review_fallback
+        if: steps.gemini_review_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != ''
+        uses: google-github-actions/run-gemini-cli@v0
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
+          ISSUE_TITLE: '${{ github.event.pull_request.title || github.event.issue.title }}'
+          ISSUE_BODY: '${{ github.event.pull_request.body || github.event.issue.body }}'
+          PULL_REQUEST_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          REPOSITORY: '${{ github.repository }}'
+          ADDITIONAL_CONTEXT: '${{ needs.dispatch.outputs.additional_context }}'
+          PATCH: '${{ needs.dispatch.outputs.patch }}'
+          INCREMENTAL: '${{ needs.dispatch.outputs.incremental }}'
+        with:
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
+          gemini_model: '${{ vars.GEMINI_FALLBACK_MODEL }}'
+          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
+          workflow_name: 'gemini-review'
+          settings: |-
+            {
+              "model": { "maxSessionTurns": 100 },
+              "telemetry": { "enabled": true, "target": "local", "outfile": ".gemini/telemetry.log" },
+              "tools": {
+                "core": [
+                  "run_shell_command(cat)",
+                  "run_shell_command(echo)",
+                  "run_shell_command(grep)",
+                  "run_shell_command(head)",
+                  "run_shell_command(tail)"
+                ]
+              }
+            }
+          prompt: |-
+            Start your response with:
+
+            ## 🤖 Gemini CLI Review (명령어 기반 - Fallback Model)
+
+            **Repository:** ${{ github.repository }}
+            **PR/Issue:** #${{ github.event.pull_request.number || github.event.issue.number }}
+            **Model:** ${{ vars.GEMINI_FALLBACK_MODEL }}
+
+            You are performing a deep, professional review that goes BEYOND the current diff.
+            Focus on missing improvements, latent risks, and hardening opportunities in areas touched by this PR.
+            Do NOT repeat change-specific findings that a diff-focused review would cover.
+            Exclude CI/CD commentary.
+
+            Provide:
+            1. Broader risks or gaps not addressed by this PR
+            2. Improvements that should be scheduled soon (not necessarily in this PR)
+            3. Any architectural or operational concerns related to the affected areas
+
+            Keep the response concise and structured with clear headings.
+
+      - name: Set final review result
+        id: final_review
+        if: always()
+        run: |-
+          if [[ "${{ steps.gemini_review_primary.outcome }}" == "success" ]]; then
+            echo "outcome=success" >> $GITHUB_OUTPUT
+            echo "model=${{ vars.GEMINI_MODEL }}" >> $GITHUB_OUTPUT
+            echo "response=${{ steps.gemini_review_primary.outputs.gemini_response }}" >> $GITHUB_OUTPUT
+            echo "errors=${{ steps.gemini_review_primary.outputs.gemini_errors }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.gemini_review_fallback.outcome }}" == "success" ]]; then
+            echo "outcome=success" >> $GITHUB_OUTPUT
+            echo "model=${{ vars.GEMINI_FALLBACK_MODEL }}" >> $GITHUB_OUTPUT
+            echo "response=${{ steps.gemini_review_fallback.outputs.gemini_response }}" >> $GITHUB_OUTPUT
+            echo "errors=${{ steps.gemini_review_fallback.outputs.gemini_errors }}" >> $GITHUB_OUTPUT
+          else
+            echo "outcome=failure" >> $GITHUB_OUTPUT
+            echo "model=${{ vars.GEMINI_MODEL }}" >> $GITHUB_OUTPUT
+            echo "response=" >> $GITHUB_OUTPUT
+            echo "errors=${{ steps.gemini_review_primary.outputs.gemini_errors }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Upsert PR comment (Gemini Review)
         if: always()
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           RUN_URL: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-          MODEL_USED: '${{ vars.GEMINI_MODEL }}'
-          OUTCOME: '${{ steps.gemini_review.outcome }}'
-          RESPONSE: '${{ steps.gemini_review.outputs.gemini_response }}'
-          ERRORS: '${{ steps.gemini_review.outputs.gemini_errors }}'
+          MODEL_USED: '${{ steps.final_review.outputs.model }}'
+          OUTCOME: '${{ steps.final_review.outputs.outcome }}'
+          RESPONSE: '${{ steps.final_review.outputs.response }}'
+          ERRORS: '${{ steps.final_review.outputs.errors }}'
         with:
           github-token: '${{ github.token }}'
           script: |
@@ -387,7 +501,7 @@ jobs:
             }
 
       - name: Fail job if review failed
-        if: steps.gemini_review.outcome != 'success'
+        if: steps.final_review.outputs.outcome != 'success'
         run: exit 1
 
   triage:
@@ -520,8 +634,10 @@ jobs:
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
           fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
 
-      - name: Run Gemini CLI
+      - name: Run Gemini CLI (primary)
+        id: gemini_invoke_primary
         uses: google-github-actions/run-gemini-cli@v0
+        continue-on-error: true
         env:
           TITLE: '${{ github.event.pull_request.title || github.event.issue.title }}'
           DESCRIPTION: '${{ github.event.pull_request.body || github.event.issue.body }}'
@@ -540,6 +656,79 @@ jobs:
           gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
           gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
           gemini_model: '${{ vars.GEMINI_MODEL }}'
+          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
+          workflow_name: 'gemini-invoke'
+          settings: |-
+            {
+              "model": { "maxSessionTurns": 100 },
+              "telemetry": { "enabled": true, "target": "local", "outfile": ".gemini/telemetry.log" },
+              "tools": {
+                "core": [
+                  "run_shell_command(cat)",
+                  "run_shell_command(echo)",
+                  "run_shell_command(grep)",
+                  "run_shell_command(head)",
+                  "run_shell_command(tail)"
+                ]
+              }
+            }
+          prompt: '/gemini-invoke'
+
+      - name: Log primary model failure (invoke)
+        if: steps.gemini_invoke_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != ''
+        env:
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
+          ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
+          FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
+          ERRORS: '${{ steps.gemini_invoke_primary.outputs.gemini_errors }}'
+          REPOSITORY: '${{ github.repository }}'
+        run: |-
+          cat > /tmp/error_comment.md <<'EOF'
+          ## ⚠️ Primary Model Failed
+
+          **Primary Model:** $PRIMARY_MODEL
+          **Attempting Fallback:** $FALLBACK_MODEL
+
+          <details>
+          <summary>Error Details</summary>
+
+          ```
+          $ERRORS
+          ```
+
+          </details>
+          EOF
+
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body-file /tmp/error_comment.md \
+            --repo "${REPOSITORY}"
+
+      - name: Run Gemini CLI (fallback)
+        id: gemini_invoke_fallback
+        if: steps.gemini_invoke_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != ''
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          TITLE: '${{ github.event.pull_request.title || github.event.issue.title }}'
+          DESCRIPTION: '${{ github.event.pull_request.body || github.event.issue.body }}'
+          EVENT_NAME: '${{ github.event_name }}'
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
+          IS_PULL_REQUEST: '${{ !!github.event.pull_request }}'
+          ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          REPOSITORY: '${{ github.repository }}'
+          ADDITIONAL_CONTEXT: '${{ needs.dispatch.outputs.additional_context }}'
+        with:
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
+          gemini_model: '${{ vars.GEMINI_FALLBACK_MODEL }}'
           google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
           use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
           use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
