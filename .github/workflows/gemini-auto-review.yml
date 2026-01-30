@@ -216,7 +216,7 @@ jobs:
   skipped:
     name: Workflow Skipped
     needs: check-enabled
-    if: needs.check-enabled.outputs.enabled != 'true'
+    if: needs.check-enabled.outputs.enabled != 'true' || needs.check-enabled.outputs.auto_enabled != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Notice

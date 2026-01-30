@@ -3,6 +3,11 @@ name: '🔎 Gemini Review'
 on:
   workflow_call:
     inputs:
+      force_run:
+        description: 'Run even if disabled in workflow-config.yml'
+        type: boolean
+        required: false
+        default: false
       pr_number:
         type: 'string'
         description: 'Pull request number (optional; defaults to event PR number)'
@@ -43,7 +48,27 @@ defaults:
     shell: 'bash'
 
 jobs:
+  check-enabled:
+    name: Check if enabled
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Check workflow config
+        id: check
+        uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1.1
+        with:
+          workflow-name: gemini-review
+          force-run: ${{ inputs.force_run && 'true' || 'false' }}
+
   review:
+    needs: check-enabled
+    if: needs.check-enabled.outputs.enabled == 'true'
     runs-on: 'ubuntu-latest'
     timeout-minutes: 15
     permissions:
@@ -488,3 +513,15 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
             }
+
+  skipped:
+    name: Workflow Skipped
+    needs: check-enabled
+    if: needs.check-enabled.outputs.enabled != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notice
+        run: |
+          echo "::notice::gemini-review workflow is disabled in .github/workflow-config.yml"
+          echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "gemini-review is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY

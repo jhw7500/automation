@@ -3,6 +3,11 @@ name: '🔀 Gemini Triage'
 on:
   workflow_call:
     inputs:
+      force_run:
+        description: 'Run even if disabled in workflow-config.yml'
+        type: boolean
+        required: false
+        default: false
       issue_number:
         type: 'string'
         description: 'Issue number (optional; defaults to event issue number)'
@@ -29,7 +34,27 @@ defaults:
     shell: 'bash'
 
 jobs:
+  check-enabled:
+    name: Check if enabled
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Check workflow config
+        id: check
+        uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1.1
+        with:
+          workflow-name: gemini-triage
+          force-run: ${{ inputs.force_run && 'true' || 'false' }}
+
   triage:
+    needs: check-enabled
+    if: needs.check-enabled.outputs.enabled == 'true'
     runs-on: 'ubuntu-latest'
     timeout-minutes: 7
     outputs:
@@ -113,8 +138,9 @@ jobs:
     runs-on: 'ubuntu-latest'
     needs:
       - 'triage'
+      - 'check-enabled'
     if: |-
-      ${{ needs.triage.outputs.selected_labels != '' }}
+      ${{ needs.check-enabled.outputs.enabled == 'true' && needs.triage.outputs.selected_labels != '' }}
     permissions:
       contents: 'read'
       issues: 'write'
@@ -169,3 +195,15 @@ jobs:
             } else {
               core.info(`Failed to determine labels to set. There may not be enough information in the issue or pull request.`)
             }
+
+  skipped:
+    name: Workflow Skipped
+    needs: check-enabled
+    if: needs.check-enabled.outputs.enabled != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notice
+        run: |
+          echo "::notice::gemini-triage workflow is disabled in .github/workflow-config.yml"
+          echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "gemini-triage is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY
