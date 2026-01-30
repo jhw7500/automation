@@ -8,6 +8,19 @@ on:
         type: boolean
         required: false
         default: false
+  schedule:
+    - cron: '0 * * * *'
+  push:
+    branches:
+      - 'main'
+    paths:
+      - '.github/workflows/gemini-scheduled-triage.yml'
+  pull_request:
+    branches:
+      - 'main'
+    paths:
+      - '.github/workflows/gemini-scheduled-triage.yml'
+  workflow_dispatch:
 
 concurrency:
   group: '${{ github.workflow }}'

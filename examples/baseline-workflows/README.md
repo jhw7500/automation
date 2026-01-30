@@ -12,7 +12,9 @@ Goal: keep consumer repos thin (event triggers + `uses:`) and keep logic central
 
 2) Update the pinned version in each workflow file:
 
-- Search for `jhw7500/automation/.github/workflows/...@v1.15` and bump to the desired tag.
+- Search for `jhw7500/automation/.github/workflows/...@v1.21` and bump to the desired tag.
+- Or update `automation_ref` in `.github/workflow-config.yml` and use `bump-automation-ref.yml`
+  to auto-create a PR that rewrites all refs.
 
 3) Configure `review.auto` in `.github/workflow-config.yml`:
 
@@ -31,3 +33,7 @@ Quick minimum:
 If you enable Claude workflows:
 
 - Secret: `CLAUDE_CODE_OAUTH_TOKEN`
+
+If you enable opencode (z.ai GLM-4.7):
+
+- Secret: `ZHIPU_API_KEY`

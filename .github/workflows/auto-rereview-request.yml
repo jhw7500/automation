@@ -1,0 +1,129 @@
+name: 'Auto Re-review Request'
+
+on:
+  workflow_call:
+    inputs:
+      force_run:
+        description: 'Run even if disabled in workflow-config.yml'
+        type: boolean
+        required: false
+        default: false
+
+defaults:
+  run:
+    shell: 'bash'
+
+jobs:
+  check-enabled:
+    name: Check if enabled
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Check workflow config
+        id: check
+        uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1.1
+        with:
+          workflow-name: auto-rereview-request
+          force-run: ${{ inputs.force_run && 'true' || 'false' }}
+
+  notify-reviewers:
+    name: Notify reviewers
+    needs: check-enabled
+    if: |
+      needs.check-enabled.outputs.enabled == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.pull_request.user.login == github.event.sender.login)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check if this is a review response commit
+        id: check
+        run: |
+          PR_NUM="${{ steps.pr.outputs.number }}"
+          COMMIT_MSG=$(gh pr view $PR_NUM --json commits --jq '.commits[-1].messageHeadline')
+
+          # Check if commit message indicates review feedback was addressed
+          if echo "$COMMIT_MSG" | grep -iE "(review|feedback|fix|address)"; then
+            echo "is_review_response=true" >> $GITHUB_OUTPUT
+            echo "commit_msg=$COMMIT_MSG" >> $GITHUB_OUTPUT
+          else
+            echo "is_review_response=false" >> $GITHUB_OUTPUT
+            echo "commit_msg=$COMMIT_MSG" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Get previous reviewers
+        if: steps.check.outputs.is_review_response == 'true'
+        id: reviewers
+        run: |
+          PR_NUM="${{ steps.pr.outputs.number }}"
+          REVIEWERS=$(gh pr view $PR_NUM --json reviews \
+            --jq '[.reviews[].author.login] | unique | join(", @")')
+
+          if [ -n "$REVIEWERS" ]; then
+            echo "reviewers=@$REVIEWERS" >> $GITHUB_OUTPUT
+            echo "has_reviewers=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_reviewers=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Post re-review notification
+        if: steps.check.outputs.is_review_response == 'true' && steps.reviewers.outputs.has_reviewers == 'true'
+        run: |
+          PR_NUM="${{ steps.pr.outputs.number }}"
+          COMMIT_SHA=$(gh pr view $PR_NUM --json commits --jq '.commits[-1].oid[0:7]')
+          COMMIT_URL="https://github.com/${{ github.repository }}/commit/$(gh pr view $PR_NUM --json commits --jq '.commits[-1].oid')"
+
+          gh pr comment $PR_NUM --body "$(cat <<EOF
+          ## 🔄 Review Feedback Addressed
+
+          **Latest commit:** [\`$COMMIT_SHA\`]($COMMIT_URL)
+          **Message:** ${{ steps.check.outputs.commit_msg }}
+
+          Previous reviewers, please re-review when you have a chance:
+          ${{ steps.reviewers.outputs.reviewers }}
+
+          ---
+          *🤖 Automated by [Auto Re-review Request](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*
+          EOF
+          )"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Summary
+        if: steps.check.outputs.is_review_response == 'true'
+        run: |
+          echo "## Re-review Request Sent" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**PR:** #${{ steps.pr.outputs.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Reviewers notified:** ${{ steps.reviewers.outputs.reviewers }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ steps.check.outputs.commit_msg }}" >> $GITHUB_STEP_SUMMARY
+
+  skipped:
+    name: Workflow Skipped
+    needs: check-enabled
+    if: needs.check-enabled.outputs.enabled != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notice
+        run: |
+          echo "::notice::Auto Re-review Request workflow is disabled in .github/workflow-config.yml"
+          echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "Auto Re-review Request is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY

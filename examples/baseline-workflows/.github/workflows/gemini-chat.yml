@@ -1,4 +1,4 @@
-name: Claude Code
+name: Gemini Chat
 
 on:
   issue_comment:
@@ -11,12 +11,12 @@ on:
     types: [submitted]
 
 jobs:
-  claude:
-    uses: jhw7500/automation/.github/workflows/claude.yml@v1.21
+  gemini-chat:
     permissions:
       contents: read
-      pull-requests: read
-      issues: read
+      pull-requests: write
+      issues: write
       id-token: write
       actions: read
+    uses: jhw7500/automation/.github/workflows/gemini-chat.yml@v1.21
     secrets: inherit

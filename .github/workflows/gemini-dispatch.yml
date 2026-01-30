@@ -137,8 +137,23 @@ jobs:
 
             core.setOutput('request', request);
 
+            // Author association check: only OWNER/MEMBER/COLLABORATOR may use @gemini-cli
+            const authorAssociation =
+              context.payload?.comment?.author_association ??
+              context.payload?.review?.author_association ??
+              context.payload?.issue?.author_association ??
+              '';
+            const allowedAssociations = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+
             let command = 'noop';
             let additionalContext = '';
+
+            if (request.startsWith('@gemini-cli') && !allowedAssociations.includes(authorAssociation)) {
+              command = 'unauthorized';
+              core.info(`Rejected @gemini-cli command from author_association=${authorAssociation}`);
+              core.setOutput('command', command);
+              return;
+            }
 
             if (request.startsWith("@gemini-cli /review")) {
               command = 'review';
@@ -212,7 +227,7 @@ jobs:
             core.setOutput('additional_context', additionalContext);
 
       - name: 'Acknowledge request'
-        if: steps.extract_command.outputs.command != 'noop'
+        if: steps.extract_command.outputs.command != 'noop' && steps.extract_command.outputs.command != 'unauthorized'
         env:
           GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
@@ -761,3 +776,49 @@ jobs:
           echo "::notice::Gemini Dispatch workflow is disabled in .github/workflow-config.yml"
           echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY
           echo "Gemini Dispatch is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY
+
+  fallthrough:
+    needs:
+      - dispatch
+      - review
+      - triage
+      - invoke
+    if: |-
+      always() && !cancelled() &&
+      needs.dispatch.outputs.command != 'noop' &&
+      (failure() || needs.dispatch.outputs.command == 'unauthorized')
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: 'read'
+      issues: 'write'
+      pull-requests: 'write'
+    steps:
+      - name: 'Mint identity token'
+        id: 'mint_identity_token'
+        if: |-
+          ${{ vars.APP_ID }}
+        uses: 'actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b' # ratchet:actions/create-github-app-token@v2
+        with:
+          app-id: '${{ vars.APP_ID }}'
+          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
+          permission-contents: 'read'
+          permission-issues: 'write'
+          permission-pull-requests: 'write'
+
+      - name: 'Send failure comment'
+        env:
+          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}'
+          ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          COMMAND: '${{ needs.dispatch.outputs.command }}'
+          REPOSITORY: '${{ github.repository }}'
+          RUN_URL: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+        run: |-
+          if [[ "${COMMAND}" == "unauthorized" ]]; then
+            MESSAGE="🤖 Sorry @${{ github.actor }}, you don't have permission to use \`@gemini-cli\` commands. Only repository owners, members, and collaborators can use this feature."
+          else
+            MESSAGE="🤖 I'm sorry @${{ github.actor }}, but I was unable to process your request. Please [see the logs](${RUN_URL}) for more details."
+          fi
+
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body "${MESSAGE}" \
+            --repo "${REPOSITORY}"

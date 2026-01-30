@@ -1,0 +1,17 @@
+name: opencode
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  opencode:
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: read
+      issues: read
+    uses: jhw7500/automation/.github/workflows/opencode.yml@v1.21
+    secrets: inherit
