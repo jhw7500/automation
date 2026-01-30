@@ -3,6 +3,11 @@ name: '▶️ Gemini Invoke'
 on:
   workflow_call:
     inputs:
+      force_run:
+        description: 'Run even if disabled in workflow-config.yml'
+        type: boolean
+        required: false
+        default: false
       item_number:
         type: 'string'
         description: 'Issue or pull request number (optional; defaults to event item number)'
@@ -37,7 +42,27 @@ defaults:
     shell: 'bash'
 
 jobs:
+  check-enabled:
+    name: Check if enabled
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Check workflow config
+        id: check
+        uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1.1
+        with:
+          workflow-name: gemini-invoke
+          force-run: ${{ inputs.force_run && 'true' || 'false' }}
+
   invoke:
+    needs: check-enabled
+    if: needs.check-enabled.outputs.enabled == 'true'
     runs-on: 'ubuntu-latest'
     permissions:
       contents: 'read'
@@ -152,3 +177,15 @@ jobs:
           gh issue comment "${ISSUE_NUMBER}" \
             --body "I encountered an error while processing your request. Please [check the logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details." \
             --repo "${REPOSITORY}"
+
+  skipped:
+    name: Workflow Skipped
+    needs: check-enabled
+    if: needs.check-enabled.outputs.enabled != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notice
+        run: |
+          echo "::notice::gemini-invoke workflow is disabled in .github/workflow-config.yml"
+          echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "gemini-invoke is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY
