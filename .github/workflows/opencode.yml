@@ -2,6 +2,12 @@ name: 'opencode'
 
 on:
   workflow_call:
+    inputs:
+      force_run:
+        description: 'Run even if disabled in workflow-config.yml'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   check-enabled:
@@ -20,6 +26,7 @@ jobs:
         uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1.1
         with:
           workflow-name: opencode
+          force-run: ${{ inputs.force_run && 'true' || 'false' }}
 
   opencode:
     needs: check-enabled
