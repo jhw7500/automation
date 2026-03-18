@@ -52,7 +52,15 @@ jobs:
 
           auto_enabled="true"
           if [[ -f "$CONFIG_FILE" ]]; then
-            auto_enabled="$(ruby -ryaml -e 'cfg = (YAML.load_file(ARGV[0]) rescue {}) || {}; v = cfg.dig("review", "auto"); v = true if v.nil?; puts(v ? "true" : "false")' "$CONFIG_FILE" 2>/dev/null || echo true)"
+            # Per-workflow auto field: workflows.<name>.auto (default: true)
+            # Falls back to global review.auto for backward compatibility
+            auto_enabled="$(ruby -ryaml -e '
+              cfg = (YAML.load_file(ARGV[0]) rescue {}) || {}
+              v = cfg.dig("workflows", "claude-code-review", "auto")
+              v = cfg.dig("review", "auto") if v.nil?
+              v = true if v.nil?
+              puts(v ? "true" : "false")
+            ' "$CONFIG_FILE" 2>/dev/null || echo true)"
           fi
           echo "auto_enabled=${auto_enabled}" >> "$GITHUB_OUTPUT"
 
