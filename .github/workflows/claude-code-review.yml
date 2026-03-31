@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write  # Required for gh pr comment
+      pull-requests: write  # Required for gh pr review
       issues: read
       id-token: write
 
@@ -96,11 +96,6 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
 
-            Start your comment with:
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
-            Reviewer: Claude Code Review
-
             Please review this pull request and provide feedback on:
             - Code quality and best practices
             - Potential bugs or issues
@@ -110,11 +105,13 @@ jobs:
 
             Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
 
-            Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
+            Use `gh pr review` with your Bash tool to submit your review on the PR.
+            Use the --body flag for the overall review summary and --comment flag to mark it as a comment review (not approve/reject).
+            Example: gh pr review $PR_NUMBER --body "your review content" --comment
 
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr review:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
           show_full_output: true  # Enable for debugging (can be set to false in production)
 
 
