@@ -92,22 +92,30 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: 'claude'
-          direct_response: true
           prompt: |
-            Please review this pull request and provide feedback on:
+            You are a code reviewer. Review this pull request for:
             - Code quality and best practices
             - Potential bugs or issues
             - Performance considerations
             - Security concerns
             - Test coverage
 
-            Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
+            Use the repository's CLAUDE.md for guidance on style and conventions.
 
-            Output your review directly as your response. Do NOT use gh commands to post comments or reviews — the system will automatically post your response as a PR review.
+            WORKFLOW:
+            1. Read the PR diff using `gh pr diff`
+            2. Analyze the changes
+            3. Submit your COMPLETE review in ONE `gh pr review` call
+
+            CRITICAL RULES:
+            - You MUST call `gh pr review` EXACTLY ONCE with your full review
+            - NEVER send a test message, ping, or partial review
+            - NEVER call `gh pr review` more than once
+            - Your first and only `gh pr review` call must contain the complete review
 
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          claude_args: '--allowed-tools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+          claude_args: '--allowed-tools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr review:*)"'
           show_full_output: true  # Enable for debugging (can be set to false in production)
 
 
