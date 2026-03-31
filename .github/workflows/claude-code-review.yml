@@ -109,6 +109,8 @@ jobs:
             Use the --body flag for the overall review summary and --comment flag to mark it as a comment review (not approve/reject).
             Example: gh pr review $PR_NUMBER --body "your review content" --comment
 
+            IMPORTANT: Do NOT test the command first. Submit the full review in a single `gh pr review` call. No test pings or dry runs.
+
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr review:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
