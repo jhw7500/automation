@@ -92,10 +92,8 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: 'claude'
+          direct_response: true
           prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
-
             Please review this pull request and provide feedback on:
             - Code quality and best practices
             - Potential bugs or issues
@@ -105,15 +103,11 @@ jobs:
 
             Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
 
-            Use `gh pr review` with your Bash tool to submit your review on the PR.
-            Use the --body flag for the overall review summary and --comment flag to mark it as a comment review (not approve/reject).
-            Example: gh pr review $PR_NUMBER --body "your review content" --comment
-
-            IMPORTANT: Do NOT test the command first. Submit the full review in a single `gh pr review` call. No test pings or dry runs.
+            Output your review directly as your response. Do NOT use gh commands to post comments or reviews — the system will automatically post your response as a PR review.
 
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr review:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+          claude_args: '--allowed-tools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
           show_full_output: true  # Enable for debugging (can be set to false in production)
 
 
