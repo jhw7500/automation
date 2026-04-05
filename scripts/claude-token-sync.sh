@@ -8,7 +8,7 @@ LOG_FILE="$HOME/.claude/token_sync.log"
 REPOS=(
     wlan-package wlan-driver max9296 gstApp wlan-bridge streamApp automation
     cts-email-mcp-server cts-ta-mcp-server cts-ta-webapp
-    pim-check redmine sc16is7xx wpa-supplicant
+    pim-check redmine sc16is7xx wpa-supplicant pim-package-jhw
 )
 WAIT_INTERVAL=60
 

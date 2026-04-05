@@ -37,6 +37,7 @@
     "pim-check":            { "workflows": true, "secrets": true },
     "redmine":              { "workflows": true, "secrets": true },
     "sc16is7xx":            { "workflows": true, "secrets": true },
-    "wpa-supplicant":       { "workflows": true, "secrets": true }
+    "wpa-supplicant":       { "workflows": true, "secrets": true },
+    "pim-package-jhw":      { "workflows": true, "secrets": true }
   }
 }

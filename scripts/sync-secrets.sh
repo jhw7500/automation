@@ -24,6 +24,7 @@ REPOS=(
     jhw7500/redmine
     jhw7500/sc16is7xx
     jhw7500/wpa-supplicant
+    jhw7500/pim-package-jhw
 )
 
 SECRET_NAME="CLAUDE_CODE_OAUTH_TOKEN"
