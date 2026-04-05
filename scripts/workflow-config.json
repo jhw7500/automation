@@ -7,7 +7,14 @@
     "claude.yml",
     "claude-code-review.yml",
     "gemini-auto-review.yml",
-    "gemini-scheduled-triage.yml"
+    "gemini-scheduled-triage.yml",
+    "gemini-dispatch.yml",
+    "gemini-invoke.yml",
+    "gemini-review.yml",
+    "gemini-triage.yml",
+    "gemini-issue-triage.yml",
+    "gemini-pr-review.yml",
+    "bump-automation-ref.yml"
   ],
 
   "extra_files": [
