@@ -93,6 +93,7 @@ jobs:
         id: gemini-review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3-flash-preview' }}
         run: |
           # Install dependencies
           pip install -q google-generativeai
@@ -109,7 +110,8 @@ jobs:
               exit(1)
 
           genai.configure(api_key=api_key)
-          model = genai.GenerativeModel('gemini-2.0-flash-exp')
+          gemini_model = os.environ.get('GEMINI_MODEL', 'gemini-3-flash-preview')
+          model = genai.GenerativeModel(gemini_model)
 
           # Read PR details
           with open('pr_title.txt', 'r') as f:
