@@ -41,6 +41,7 @@
     "pim-package-jhw":      { "workflows": true, "secrets": true },
     "jhw-notion":           { "workflows": true, "secrets": true },
     "personal-ops":         { "workflows": true, "secrets": true },
-    "harness":              { "workflows": true, "secrets": true }
+    "harness":              { "workflows": true, "secrets": true },
+    "claude-config":        { "workflows": true, "secrets": true }
   }
 }
