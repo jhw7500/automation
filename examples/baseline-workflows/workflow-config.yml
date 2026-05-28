@@ -54,3 +54,12 @@ workflows:
     enabled: true
     auto: true
     description: "Claude automatic PR review"
+    # Optional per-workflow model override (overrides shared `claude.model`)
+    # model: "claude-sonnet-4-6"
+
+# === Shared Settings ===
+# Claude model used by claude-code-review (and any future Claude workflows).
+# Leave empty / omit the whole `claude:` block to use claude-code-action default.
+# Examples: claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5-20251001
+# claude:
+#   model: "claude-sonnet-4-6"

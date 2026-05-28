@@ -26,6 +26,7 @@ jobs:
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
       auto_enabled: ${{ steps.auto_mode.outputs.auto_enabled }}
+      model: ${{ steps.model.outputs.model }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,6 +65,24 @@ jobs:
           fi
           echo "auto_enabled=${auto_enabled}" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve Claude model from config
+        id: model
+        run: |-
+          CONFIG_FILE=".github/workflow-config.yml"
+          model=""
+          if [[ -f "$CONFIG_FILE" ]]; then
+            # Per-workflow override: workflows.claude-code-review.model
+            # Falls back to shared setting: claude.model
+            # Empty/missing → action default
+            model="$(ruby -ryaml -e '
+              cfg = (YAML.load_file(ARGV[0]) rescue {}) || {}
+              v = cfg.dig("workflows", "claude-code-review", "model")
+              v = cfg.dig("claude", "model") if v.nil? || v.to_s.strip.empty?
+              puts(v.to_s.strip)
+            ' "$CONFIG_FILE" 2>/dev/null || echo "")"
+          fi
+          echo "model=${model}" >> "$GITHUB_OUTPUT"
+
   claude-review:
     needs: check-enabled
     if: needs.check-enabled.outputs.enabled == 'true' && needs.check-enabled.outputs.auto_enabled == 'true'
@@ -91,6 +110,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ needs.check-enabled.outputs.model }}
           allowed_bots: 'claude'
           prompt: |
             You are a code reviewer. Review this pull request for:
