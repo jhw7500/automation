@@ -204,7 +204,10 @@ for repo in "${TARGET_REPOS[@]}"; do
                 SRC="$TEMPLATE_DIR/workflows/$wf"
                 if [ -f "$SRC" ]; then
                     cp "$SRC" "$REPO_PATH/.github/workflows/$wf"
-                    echo "  워크플로우: $wf"
+                    # automation ref를 config의 automation_ref로 정규화
+                    # (템플릿 파일의 버전과 무관하게 automation_ref를 단일 소스로)
+                    sed -i -E "s#(jhw7500/automation/\.github/(workflows|actions)/[^@[:space:]]+@)v[0-9.]+#\1${AUTOMATION_REF}#g" "$REPO_PATH/.github/workflows/$wf"
+                    echo "  워크플로우: $wf ($AUTOMATION_REF)"
                 else
                     echo "  WARN: 템플릿 없음 $wf"
                 fi
@@ -212,9 +215,17 @@ for repo in "${TARGET_REPOS[@]}"; do
 
             for ef in "${ALL_EXTRA_FILES[@]}"; do
                 SRC="$TEMPLATE_DIR/$ef"
+                DST="$REPO_PATH/.github/$ef"
                 if [ -f "$SRC" ]; then
-                    cp "$SRC" "$REPO_PATH/.github/$ef"
-                    echo "  추가파일: $ef"
+                    if [ "$ef" = "workflow-config.yml" ] && [ -f "$DST" ]; then
+                        # repo별 workflow-config.yml은 덮어쓰지 않고 automation_ref만 동기화
+                        # (claude.model 등 repo 고유 설정 보존)
+                        sed -i -E "s#^(automation_ref:[[:space:]]*)v[0-9.]+#\1${AUTOMATION_REF}#" "$DST"
+                        echo "  추가파일: $ef (automation_ref만 $AUTOMATION_REF 로 갱신, 기존 설정 보존)"
+                    else
+                        cp "$SRC" "$DST"
+                        echo "  추가파일: $ef"
+                    fi
                 fi
             done
 
