@@ -110,7 +110,6 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: ${{ needs.check-enabled.outputs.model }}
           allowed_bots: 'claude'
           prompt: |
             You are a code reviewer. Review this pull request for:
@@ -135,7 +134,9 @@ jobs:
 
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          claude_args: '--allowed-tools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr review:*)"'
+          # model은 claude_args 로 전달 (claude-code-action@v1 에서 'model' input 미지원)
+          claude_args: >-
+            ${{ needs.check-enabled.outputs.model && format('--model {0} ', needs.check-enabled.outputs.model) || '' }}--allowed-tools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr review:*)"
           show_full_output: true  # Enable for debugging (can be set to false in production)
 
 
