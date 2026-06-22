@@ -49,7 +49,7 @@ Automatically reviews pull requests when opened or updated.
 - Critical issue detection (security, bugs, breaking changes)
 - Code quality suggestions
 - Performance considerations
-- Uses Gemini 2.0 Flash Experimental (`gemini-2.0-flash-exp`) model
+- Uses the Gemini model set by the `GEMINI_MODEL` repo/org variable (default: `gemini-3-flash-preview`)
 
 **Triggers:** Automatically on PR opened or synchronized (new commits pushed)
 
@@ -185,6 +185,13 @@ Supported model IDs:
 If both keys are empty or omitted, the underlying `anthropics/claude-code-action`
 default is used. Available from automation `v1.29` onward — older trampoline
 pins (`@v1.28` and earlier) ignore the setting.
+
+### Changing Gemini Model
+
+The Gemini model is read from the `GEMINI_MODEL` repository/organization Actions
+**variable** (not a secret). If unset, it defaults to `gemini-3-flash-preview`.
+A separate `GEMINI_FALLBACK_MODEL` variable (default `gemini-3-flash-preview`) is
+used if the primary model call fails. No workflow file edit is required.
 
 ### Filtering Claude Reviews by Author
 

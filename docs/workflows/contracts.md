@@ -34,6 +34,13 @@ Semantics:
 - Manual triggers must continue to work regardless of `review.auto`.
   - Example manual trigger: comment `@gemini-cli /review ...`.
 
+> **Precedence:** the auto-review workflows first read the per-workflow key
+> `workflows.<name>.auto` (e.g. `workflows.gemini-auto-review.auto`,
+> `workflows.claude-code-review.auto`), then fall back to `review.auto`, then to
+> `true` if both are unset. A repo that pins the per-workflow keys must change
+> *those* to disable auto review — a global `review.auto: false` is silently
+> ignored when a per-workflow `auto` is present.
+
 ## Secrets (consumer repository)
 
 Required secrets depend on which workflows you enable.
