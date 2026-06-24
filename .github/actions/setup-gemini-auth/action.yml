@@ -34,11 +34,16 @@ runs:
     - name: 'Resolve token'
       id: 'resolve'
       shell: bash
+      # 토큰 표현식을 run: 스크립트 텍스트에 인라인하지 않고 env로 전달(둘 다 이미 auto-mask되지만
+      # GitHub Actions 권장 패턴). printf %s + 따옴표로 안전하게 $GITHUB_OUTPUT에 기록.
+      env:
+        MINTED: ${{ steps.mint_token.outputs.token }}
+        FALLBACK: ${{ inputs.fallback-token }}
       run: |
-        if [[ -n "${{ steps.mint_token.outputs.token }}" ]]; then
-          echo "token=${{ steps.mint_token.outputs.token }}" >> $GITHUB_OUTPUT
+        if [[ -n "$MINTED" ]]; then
+          printf 'token=%s\n' "$MINTED" >> "$GITHUB_OUTPUT"
           echo "::notice::Using GitHub App token"
         else
-          echo "token=${{ inputs.fallback-token }}" >> $GITHUB_OUTPUT
+          printf 'token=%s\n' "$FALLBACK" >> "$GITHUB_OUTPUT"
           echo "::notice::Using fallback token"
         fi

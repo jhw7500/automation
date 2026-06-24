@@ -231,11 +231,17 @@ for repo in "${TARGET_REPOS[@]}"; do
 
             CHANGES=$(git -C "$REPO_PATH" status --porcelain .github/ 2>/dev/null)
             if [ -n "$CHANGES" ]; then
+                # 분리 HEAD(detached)면 커밋이 어느 브랜치에도 안 붙어 유실/오배치되므로 스킵.
+                BRANCH=$(git -C "$REPO_PATH" branch --show-current)
+                if [ -z "$BRANCH" ]; then
+                    echo "  WARN: detached HEAD — 커밋/푸시 건너뜀 (브랜치 체크아웃 후 재실행)"
+                    ((FAIL_COUNT++)) || true
+                    continue
+                fi
                 git -C "$REPO_PATH" add .github/
                 git -C "$REPO_PATH" commit -m "ci: 공통 워크플로우 적용 (Claude + Gemini, automation $AUTOMATION_REF)"
                 echo "  커밋 완료"
 
-                BRANCH=$(git -C "$REPO_PATH" branch --show-current)
                 if ! git -C "$REPO_PATH" push 2>/dev/null; then
                     git -C "$REPO_PATH" push -u origin "$BRANCH" 2>/dev/null || {
                         echo "  WARN: push 실패"
