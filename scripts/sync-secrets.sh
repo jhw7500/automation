@@ -10,21 +10,20 @@
 # Fine-grained PAT 대신 gh auth 저장된 토큰(repo scope) 사용
 unset GITHUB_TOKEN
 
-REPOS=(
-    jhw7500/gstApp
-    jhw7500/wlan-driver
-    jhw7500/automation
-    jhw7500/wlan-package
-    jhw7500/max9296
-    jhw7500/wlan-bridge
-    jhw7500/cts-email-mcp-server
-    jhw7500/cts-ta-mcp-server
-    jhw7500/cts-ta-webapp
-    jhw7500/pim-check
-    jhw7500/redmine
-    jhw7500/sc16is7xx
-    jhw7500/wpa-supplicant
-    jhw7500/pim-package-jhw
+# Repo 목록은 workflow-config.json에서 소싱한다(하드코딩 drift 방지 — 과거 14개 목록이
+# config의 19개와 어긋나 일부 repo에 토큰이 silent 누락됐었다). secrets != false 인 repo만.
+# automation(소스 repo, self-review 토큰 필요)은 config.repos에 없으므로 명시 포함 후 dedup.
+CONFIG_JSON="$(cd "$(dirname "$0")" && pwd)/workflow-config.json"
+if ! command -v jq >/dev/null 2>&1 || [ ! -f "$CONFIG_JSON" ]; then
+    echo "Error: jq and $CONFIG_JSON required to resolve repo list"
+    exit 1
+fi
+OWNER="$(jq -r '.gh_owner // "jhw7500"' "$CONFIG_JSON")"
+mapfile -t REPOS < <(
+    {
+        printf '%s/automation\n' "$OWNER"
+        jq -r --arg o "$OWNER" '.repos | to_entries[] | select(.value.secrets != false) | $o + "/" + .key' "$CONFIG_JSON"
+    } | awk 'NF && !seen[$0]++'
 )
 
 SECRET_NAME="CLAUDE_CODE_OAUTH_TOKEN"
