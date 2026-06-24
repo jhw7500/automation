@@ -13,6 +13,12 @@ defaults:
   run:
     shell: 'bash'
 
+# Serialize per PR/issue so rapid repeated @gemini-cli triggers on the same context
+# don't dispatch/process concurrently (double-processing). Queue rather than drop.
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}'
+  cancel-in-progress: false
+
 jobs:
   check-enabled:
     name: Check if enabled
