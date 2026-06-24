@@ -560,6 +560,7 @@ jobs:
             return labelNames;
 
       - name: Run Gemini issue analysis
+        id: gemini_analysis
         uses: google-github-actions/run-gemini-cli@v0
         env:
           GITHUB_TOKEN: ''
@@ -605,7 +606,9 @@ jobs:
         env:
           ISSUE_NUMBER: '${{ github.event.issue.number }}'
           AVAILABLE_LABELS: '${{ steps.get_labels.outputs.available_labels }}'
-          SELECTED_LABELS: '${{ env.SELECTED_LABELS }}'
+          # gemini_analysis.summary(선택 라벨 CSV) 사용. env.SELECTED_LABELS는 미설정 dead-output이라
+          # 라벨이 한 번도 안 달리던 버그 수정(아래 script가 available_labels로 재필터링하므로 안전).
+          SELECTED_LABELS: '${{ steps.gemini_analysis.outputs.summary }}'
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
         with:
           github-token: '${{ steps.auth.outputs.token }}'

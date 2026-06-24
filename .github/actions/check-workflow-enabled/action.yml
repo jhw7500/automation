@@ -51,10 +51,12 @@ runs:
           ENABLED=$(yq ".workflows[\"${WORKFLOW_NAME}\"].enabled // true" "$CONFIG_FILE")
           CONFIG_JSON=$(yq -o=json ".workflows[\"${WORKFLOW_NAME}\"] // {}" "$CONFIG_FILE")
         else
-          # yq가 없으면 간단한 grep으로 처리
+          # yq가 없으면 간단한 grep으로 처리. -A1은 enabled:가 키 바로 다음 줄이 아니면
+          # (예: description:가 먼저면) 빈값→fail-open. 블록을 -A5로 넉넉히 스캔하고 첫 enabled:만 취함.
           echo "::warning::yq command not found. The 'config' output will be empty."
-          ENABLED=$(grep -A1 "^  ${WORKFLOW_NAME}:" "$CONFIG_FILE" | grep "enabled:" | sed 's/.*enabled: *//' | tr -d ' ')
+          ENABLED=$(grep -A5 "^  ${WORKFLOW_NAME}:" "$CONFIG_FILE" | grep -m1 "enabled:" | sed 's/.*enabled: *//' | tr -d ' ')
           if [[ -z "$ENABLED" ]]; then
+            echo "::warning::Could not parse enabled state for '${WORKFLOW_NAME}' via grep fallback; defaulting to enabled"
             ENABLED="true"
           fi
           CONFIG_JSON="{}"
