@@ -1,0 +1,24 @@
+# Dogfood the Claude review on this repo's OWN PRs.
+# The reusable `claude-code-review.yml` is `on: workflow_call`, so it never fires on
+# pull_request by itself — consumer repos add a thin caller. This is that caller for
+# automation itself, using a LOCAL path (`./.github/...`) so a PR is reviewed by the
+# reusable workflow AS CHANGED IN THAT PR (true dogfooding), not the pinned tag.
+name: Self Claude Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  claude-review:
+    if: ${{ github.event.pull_request.head.repo.fork == false }}
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+    uses: ./.github/workflows/claude-code-review.yml
+    with:
+      pr_number: '${{ github.event.pull_request.number }}'
+      force_run: false
+    secrets: inherit
