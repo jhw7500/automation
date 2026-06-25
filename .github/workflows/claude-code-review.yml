@@ -164,8 +164,12 @@ jobs:
           # Read + 단일 파일 Write(claude-review.md)만 허용: 리뷰 본문을 그 파일로 써서 --body-file로
           # 게시(인라인 --body의 셸 쿼팅 시행착오·$(...) 우회 제거). Write를 한 파일로 스코프해 PR diff가
           # untrusted여도 injection이 러너 임의 경로에 쓰지 못하게 한다. Bash는 gh pr 하위명령으로만 제한.
+          # --permission-mode acceptEdits: 헤드리스 러너엔 승인자가 없어, allowed-tools에 Write가 있어도
+          # 기본 모드에선 변경 도구(Write/Edit)가 permission prompt에 막혀 claude-review.md 작성→게시가
+          # 실패했다(v1.32 회귀: PR에 리뷰 미게시). acceptEdits로 허용된 Write(claude-review.md)를 prompt
+          # 없이 실행한다. Bash는 allowed-tools(gh pr 하위명령)로 계속 게이트되어 영향 없음.
           claude_args: >-
-            ${{ needs.check-enabled.outputs.model && format('--model {0} ', needs.check-enabled.outputs.model) || '' }}--allowed-tools "Read,Write(claude-review.md),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr review:*)"
+            ${{ needs.check-enabled.outputs.model && format('--model {0} ', needs.check-enabled.outputs.model) || '' }}--permission-mode acceptEdits --allowed-tools "Read,Write(claude-review.md),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr review:*)"
           show_full_output: true  # Enable for debugging (can be set to false in production)
 
 
