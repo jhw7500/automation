@@ -56,7 +56,10 @@ jobs:
     if: needs.check-enabled.outputs.enabled == 'true' && needs.check-enabled.outputs.auto_enabled == 'true'
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
+      # id-token 없음(의도) — 이게 있으면 액션이 OIDC 토큰을 발급받아
+      # api.opencode.ai 에서 App 토큰으로 교환할 수 있고, 그 토큰은 아래 contents: read
+      # 의 통제를 받지 않는다. use_github_token: true 와 함께 이중으로 막는다:
+      # 플래그가 기대대로 동작하지 않더라도 OIDC 발급 자체가 불가능(fail-closed).
       contents: read
       pull-requests: write
       issues: write
