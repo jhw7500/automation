@@ -56,7 +56,10 @@ jobs:
     if: needs.check-enabled.outputs.enabled == 'true' && needs.check-enabled.outputs.auto_enabled == 'true'
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
+      # id-token 없음(의도) — 이게 있으면 액션이 OIDC 토큰을 발급받아
+      # api.opencode.ai 에서 App 토큰으로 교환할 수 있고, 그 토큰은 아래 contents: read
+      # 의 통제를 받지 않는다. use_github_token: true 와 함께 이중으로 막는다:
+      # 플래그가 기대대로 동작하지 않더라도 OIDC 발급 자체가 불가능(fail-closed).
       contents: read
       pull-requests: write
       issues: write
@@ -67,11 +70,20 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      # use_github_token: OIDC 교환(api.opencode.ai → opencode-agent App 토큰)을 건너뛰고
+      # 이 잡의 GITHUB_TOKEN 을 쓴다. App 토큰은 App 설치 권한만 따르므로 위 permissions
+      # 블록(contents: read)이 무력했다 — 실제로 자동 리뷰가 PR 브랜치에 코드 커밋을 푸시한
+      # 사례가 있다(wlan-package #163, 게다가 실패하는 테스트였다). GITHUB_TOKEN 으로
+      # 바꾸면 permissions 블록이 그대로 강제되어 리뷰는 쓰되(pull-requests/issues: write)
+      # 코드는 못 쓴다(contents: read).
+      # 액션은 GITHUB_TOKEN 을 자동 주입하지 않으므로 env 로 명시해야 한다.
       - name: Run OpenCode PR review
         uses: anomalyco/opencode/github@bbc7bdb3fd5078d0add23273e0fdae436b9b47e4 # v1.1.43
         env:
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          use_github_token: true
           model: zai-coding-plan/glm-4.7
           prompt: |
             Review this pull request. Focus on:
