@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from unittest.mock import patch
+from unittest.mock import Mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.rollout_workflow_fleet import (
+    CommandError,
+    default_branch,
+    main,
+    materialize_release_contract,
+    prepare_with_prerequisites,
+    publish_repository,
+    rollout_branch,
+    secret_source,
+    sync_missing,
+)
+from scripts.prepare_workflow_rollout import SecretPrerequisiteError
+from scripts.prepare_workflow_rollout import RolloutResult
+
+
+SECURE_WORKFLOW = """\
+on:
+  workflow_call:
+jobs:
+  opencode-review:
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Run OpenCode PR review
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          use_github_token: true
+"""
+
+
+class RolloutWorkflowFleetTest(unittest.TestCase):
+    def test_branch_is_derived_from_release_ref(self) -> None:
+        self.assertEqual("codex/automation-v1.35-fleet", rollout_branch("v1.35"))
+        self.assertEqual("codex/automation-v1.36-fleet", rollout_branch("v1.36"))
+        self.assertNotEqual(rollout_branch("v1.35"), rollout_branch("v1.36"))
+
+    def test_prepare_mode_rejects_any_secret_sync_request_before_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "scripts.rollout_workflow_fleet.materialize_release_contract"
+        ) as materialize:
+            with self.assertRaises(SystemExit):
+                main(
+                    [
+                        "--workspace",
+                        temp,
+                        "--mode",
+                        "prepare",
+                        "--sync-missing-secrets",
+                    ]
+                )
+            materialize.assert_not_called()
+
+    def test_personal_oauth_source_requires_explicit_fanout_consent(self) -> None:
+        with patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "test-token"}):
+            self.assertIsNone(secret_source("CLAUDE_CODE_OAUTH_TOKEN", False))
+            self.assertEqual(
+                "test-token", secret_source("CLAUDE_CODE_OAUTH_TOKEN", True)
+            )
+
+    def test_ambient_environment_secret_requires_name_allowlist(self) -> None:
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "personal-key"}):
+            self.assertIsNone(secret_source("GEMINI_API_KEY", False, set()))
+            self.assertEqual(
+                "personal-key",
+                secret_source("GEMINI_API_KEY", False, {"GEMINI_API_KEY"}),
+            )
+
+    def test_missing_default_branch_becomes_a_command_error(self) -> None:
+        with patch(
+            "scripts.rollout_workflow_fleet.gh_json",
+            return_value={"defaultBranchRef": None},
+        ):
+            with self.assertRaisesRegex(CommandError, "default branch is unavailable"):
+                default_branch("owner", "empty-repo")
+
+    def test_sync_missing_passes_secret_via_stdin_and_never_argv(self) -> None:
+        calls: list[tuple[list[str], str | None]] = []
+
+        def fake_run(args: list[str], **kwargs: object) -> str:
+            calls.append((args, kwargs.get("input_text")))  # type: ignore[arg-type]
+            return ""
+
+        with patch("scripts.rollout_workflow_fleet.remote_names", return_value=set()), patch(
+            "scripts.rollout_workflow_fleet.secret_source", return_value="sensitive-value"
+        ), patch("scripts.rollout_workflow_fleet.run", side_effect=fake_run):
+            available, synced = sync_missing(
+                "owner", "repo", {"TOKEN"}, True, False, {"TOKEN"}
+            )
+        self.assertEqual({"TOKEN"}, available)
+        self.assertEqual(("TOKEN",), synced)
+        self.assertEqual("sensitive-value", calls[0][1])
+        self.assertNotIn("sensitive-value", calls[0][0])
+
+    def test_multiple_missing_secrets_are_synced_until_prepare_succeeds(self) -> None:
+        first = SecretPrerequisiteError("missing first", {"FIRST_TOKEN"})
+        second = SecretPrerequisiteError("missing second", {"SECOND_TOKEN"})
+        prepared = object()
+        with patch(
+            "scripts.rollout_workflow_fleet.remote_names",
+            side_effect=[set(), set()],
+        ), patch(
+            "scripts.rollout_workflow_fleet.prepare_repository",
+            side_effect=[first, second, prepared],
+        ), patch(
+            "scripts.rollout_workflow_fleet.sync_missing",
+            side_effect=[
+                ({"FIRST_TOKEN"}, ("FIRST_TOKEN",)),
+                ({"FIRST_TOKEN", "SECOND_TOKEN"}, ("SECOND_TOKEN",)),
+            ],
+        ) as sync:
+            result, synced = prepare_with_prerequisites(
+                Path("/tmp/repo"),
+                Path("/tmp/automation"),
+                "v1.35",
+                "owner",
+                "repo",
+                True,
+                False,
+                {"FIRST_TOKEN", "SECOND_TOKEN"},
+            )
+        self.assertIs(prepared, result)
+        self.assertEqual(("FIRST_TOKEN", "SECOND_TOKEN"), synced)
+        self.assertEqual(2, sync.call_count)
+
+    def test_release_contract_is_read_from_verified_tag_not_newer_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            remote = Path(temp) / "remote.git"
+            workflow = repo / ".github/workflows/opencode-auto-review.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(SECURE_WORKFLOW)
+            self.git(repo, "init", "-q")
+            self.git(repo, "config", "user.name", "Test")
+            self.git(repo, "config", "user.email", "test@example.com")
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-qm", "v1.35 contract")
+            tagged = self.git(repo, "rev-parse", "HEAD").strip()
+            self.git(repo, "tag", "-a", "v1.35", "-m", "v1.35")
+            subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+            self.git(repo, "remote", "add", "origin", str(remote))
+            self.git(repo, "push", "-q", "origin", "v1.35")
+
+            workflow.write_text(SECURE_WORKFLOW + "# newer untagged contract\n")
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-qm", "newer head")
+
+            extracted_temp, extracted, commit = materialize_release_contract(repo, "v1.35")
+            try:
+                text = (
+                    extracted / ".github/workflows/opencode-auto-review.yml"
+                ).read_text()
+                self.assertEqual(tagged, commit)
+                self.assertNotIn("newer untagged", text)
+            finally:
+                extracted_temp.cleanup()
+
+    def test_release_contract_rejects_non_version_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            workflow = repo / ".github/workflows/opencode-auto-review.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(SECURE_WORKFLOW)
+            self.git(repo, "init", "-q")
+            self.git(repo, "config", "user.name", "Test")
+            self.git(repo, "config", "user.email", "test@example.com")
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-qm", "contract")
+            self.git(repo, "tag", "release-candidate")
+            with self.assertRaisesRegex(RuntimeError, "invalid release ref"):
+                materialize_release_contract(repo, "release-candidate")
+
+    def test_publish_uses_release_specific_branch_for_push_and_pr(self) -> None:
+        calls: list[list[str]] = []
+        outputs = iter(
+            [
+                "",
+                "",
+                "head-sha",
+                "remote-sha\trefs/heads/codex/automation-v1.36-fleet",
+                "",
+                "https://example.test/pr/1",
+            ]
+        )
+
+        def fake_run(args: list[str], **_: object) -> str:
+            calls.append(args)
+            return next(outputs)
+
+        with patch("scripts.rollout_workflow_fleet.run", side_effect=fake_run), patch(
+            "scripts.rollout_workflow_fleet.gh_json", return_value=[]
+        ):
+            head, url = publish_repository(
+                Path("/tmp/repo"),
+                "owner",
+                "repo",
+                "main",
+                "v1.36",
+                "codex/automation-v1.36-fleet",
+            )
+        self.assertEqual("head-sha", head)
+        self.assertEqual("https://example.test/pr/1", url)
+        flattened = [item for command in calls for item in command]
+        self.assertIn("codex/automation-v1.36-fleet", flattened)
+        self.assertNotIn("codex/automation-v1.35-fleet", flattened)
+        self.assertIn(
+            "--force-with-lease=refs/heads/codex/automation-v1.36-fleet:remote-sha",
+            flattened,
+        )
+
+    def test_main_publishes_one_repo_contains_next_failure_and_writes_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".automation-fleet-workspace").write_text("managed\n")
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "gh_owner": "owner",
+                        "repos": {
+                            "a-ready": {"workflows": True, "secrets": True},
+                            "b-broken": {"workflows": True, "secrets": True},
+                        },
+                    }
+                )
+            )
+            release_temp = Mock()
+            prepared = RolloutResult(
+                callers=1,
+                changed_files=(Path(".github/workflows/caller.yml"),),
+                required_secrets=frozenset({"TOKEN"}),
+            )
+            with patch(
+                "scripts.rollout_workflow_fleet.materialize_release_contract",
+                return_value=(release_temp, Path("/contract"), "release-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.default_branch",
+                side_effect=["main", ValueError("unexpected metadata shape")],
+            ), patch(
+                "scripts.rollout_workflow_fleet.clone_or_reset",
+                return_value=(Path("/clone/a-ready"), "base-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
+                return_value=(prepared, ()),
+            ), patch(
+                "scripts.rollout_workflow_fleet.validate_repository"
+            ), patch(
+                "scripts.rollout_workflow_fleet.publish_repository",
+                return_value=("head-sha", "https://example.test/pr/1"),
+            ):
+                rc = main(
+                    [
+                        "--automation",
+                        str(ROOT),
+                        "--config",
+                        str(config),
+                        "--workspace",
+                        str(workspace),
+                        "--mode",
+                        "publish",
+                        "--confirm",
+                    ]
+                )
+            self.assertEqual(1, rc)
+            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+            self.assertEqual(["published", "blocked"], [item["status"] for item in manifest])
+            self.assertEqual("https://example.test/pr/1", manifest[0]["pr_url"])
+            self.assertIn("unexpected ValueError", manifest[1]["detail"])
+            release_temp.cleanup.assert_called_once()
+
+    @staticmethod
+    def git(repo: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+
+
+if __name__ == "__main__":
+    unittest.main()
