@@ -85,6 +85,8 @@ ZHIPU_API_KEY=... python3 scripts/rollout_workflow_fleet.py \
 
 각 실행은 `rollout-manifest.json`에 base/head/PR/blocked 결과를 남긴다. 한 저장소가
 blocked여도 다른 저장소의 준비는 계속하지만 명령은 non-zero로 끝난다.
+여러 secret 중 일부를 쓴 뒤 후속 secret write나 workflow 준비가 실패한 경우에도,
+실제로 완료된 secret **이름**은 blocked 항목에 남긴다(값은 기록하지 않는다).
 동일 release branch를 다시 게시할 때는 push 직전 원격 SHA를 조회해 exact
 `--force-with-lease=<ref>:<sha>`로 보호하므로 다른 실행이나 사람이 갱신한 branch를
 덮어쓰지 않는다.

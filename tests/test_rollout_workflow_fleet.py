@@ -24,8 +24,11 @@ from scripts.rollout_workflow_fleet import (
     secret_source,
     sync_missing,
 )
-from scripts.prepare_workflow_rollout import SecretPrerequisiteError
-from scripts.prepare_workflow_rollout import RolloutResult
+from scripts.prepare_workflow_rollout import (
+    RolloutError,
+    RolloutResult,
+    SecretPrerequisiteError,
+)
 
 
 SECURE_WORKFLOW = """\
@@ -171,6 +174,26 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
         self.assertEqual("rotated-value", calls[0][1])
         self.assertNotIn("rotated-value", calls[0][0])
 
+    def test_refresh_secret_reports_partial_writes_when_a_later_source_is_missing(self) -> None:
+        completed: list[str] = []
+        with patch(
+            "scripts.rollout_workflow_fleet.secret_source",
+            side_effect=["first-value", None],
+        ), patch("scripts.rollout_workflow_fleet.run") as run:
+            from scripts.rollout_workflow_fleet import refresh_secrets
+
+            with self.assertRaisesRegex(RolloutError, "no explicitly allowed source"):
+                refresh_secrets(
+                    "owner",
+                    "repo",
+                    {"FIRST", "SECOND"},
+                    False,
+                    {"FIRST", "SECOND"},
+                    completed,
+                )
+        self.assertEqual(["FIRST"], completed)
+        run.assert_called_once()
+
     def test_missing_default_branch_becomes_a_command_error(self) -> None:
         with patch(
             "scripts.rollout_workflow_fleet.gh_json",
@@ -196,6 +219,28 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
         self.assertEqual(("TOKEN",), synced)
         self.assertEqual("sensitive-value", calls[0][1])
         self.assertNotIn("sensitive-value", calls[0][0])
+
+    def test_sync_missing_reports_partial_writes_when_a_later_write_fails(self) -> None:
+        completed: list[str] = []
+        with patch(
+            "scripts.rollout_workflow_fleet.remote_names", return_value=set()
+        ), patch(
+            "scripts.rollout_workflow_fleet.secret_source", return_value="value"
+        ), patch(
+            "scripts.rollout_workflow_fleet.run",
+            side_effect=["", CommandError("second write failed")],
+        ):
+            with self.assertRaisesRegex(CommandError, "second write failed"):
+                sync_missing(
+                    "owner",
+                    "repo",
+                    {"FIRST", "SECOND"},
+                    True,
+                    False,
+                    {"FIRST", "SECOND"},
+                    completed,
+                )
+        self.assertEqual(["FIRST"], completed)
 
     def test_multiple_missing_secrets_are_synced_until_prepare_succeeds(self) -> None:
         first = SecretPrerequisiteError("missing first", {"FIRST_TOKEN"})
@@ -432,6 +477,111 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             manifest = json.loads((workspace / "rollout-manifest.json").read_text())
             self.assertEqual("current", manifest[0]["status"])
             self.assertEqual(["ZHIPU_API_KEY"], manifest[0]["synced_secrets"])
+            release_temp.cleanup.assert_called_once()
+
+    def test_main_records_refreshed_secret_when_a_later_step_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".automation-fleet-workspace").write_text("managed\n")
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "gh_owner": "owner",
+                        "repos": {"repo": {"workflows": True, "secrets": True}},
+                    }
+                )
+            )
+            release_temp = Mock()
+            with patch(
+                "scripts.rollout_workflow_fleet.materialize_release_contract",
+                return_value=(release_temp, Path("/contract"), "release-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.refresh_secrets",
+                return_value=("ZHIPU_API_KEY",),
+            ), patch(
+                "scripts.rollout_workflow_fleet.default_branch",
+                side_effect=CommandError("metadata unavailable"),
+            ):
+                rc = main(
+                    [
+                        "--automation",
+                        str(ROOT),
+                        "--config",
+                        str(config),
+                        "--workspace",
+                        str(workspace),
+                        "--mode",
+                        "publish",
+                        "--confirm",
+                        "--sync-missing-secrets",
+                        "--allow-env-secret",
+                        "ZHIPU_API_KEY",
+                        "--refresh-secret",
+                        "ZHIPU_API_KEY",
+                    ]
+                )
+            self.assertEqual(1, rc)
+            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+            self.assertEqual("blocked", manifest[0]["status"])
+            self.assertEqual(["ZHIPU_API_KEY"], manifest[0]["synced_secrets"])
+            release_temp.cleanup.assert_called_once()
+
+    def test_main_records_partially_synced_secret_when_prepare_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".automation-fleet-workspace").write_text("managed\n")
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "gh_owner": "owner",
+                        "repos": {"repo": {"workflows": True, "secrets": True}},
+                    }
+                )
+            )
+            release_temp = Mock()
+
+            def fail_after_sync(*args: object) -> object:
+                completed = args[-1]
+                self.assertIsInstance(completed, list)
+                completed.append("FIRST")  # type: ignore[union-attr]
+                raise CommandError("second write failed")
+
+            with patch(
+                "scripts.rollout_workflow_fleet.materialize_release_contract",
+                return_value=(release_temp, Path("/contract"), "release-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.default_branch", return_value="main"
+            ), patch(
+                "scripts.rollout_workflow_fleet.clone_or_reset",
+                return_value=(Path("/clone/repo"), "base-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
+                side_effect=fail_after_sync,
+            ):
+                rc = main(
+                    [
+                        "--automation",
+                        str(ROOT),
+                        "--config",
+                        str(config),
+                        "--workspace",
+                        str(workspace),
+                        "--mode",
+                        "publish",
+                        "--confirm",
+                        "--sync-missing-secrets",
+                    ]
+                )
+            self.assertEqual(1, rc)
+            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+            self.assertEqual("blocked", manifest[0]["status"])
+            self.assertEqual(["FIRST"], manifest[0]["synced_secrets"])
             release_temp.cleanup.assert_called_once()
 
     @staticmethod

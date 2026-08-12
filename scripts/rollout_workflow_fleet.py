@@ -199,6 +199,7 @@ def sync_missing(
     enabled: bool,
     allow_personal_oauth_fanout: bool,
     allowed_env_secrets: set[str],
+    completed: list[str] | None = None,
 ) -> tuple[set[str], tuple[str, ...]]:
     available = remote_names(owner, repo, "secret")
     synced: list[str] = []
@@ -218,6 +219,8 @@ def sync_missing(
         )
         available.add(name)
         synced.append(name)
+        if completed is not None:
+            completed.append(name)
     return available, tuple(synced)
 
 
@@ -227,6 +230,7 @@ def refresh_secrets(
     names: set[str],
     allow_personal_oauth_fanout: bool,
     allowed_env_secrets: set[str],
+    completed: list[str] | None = None,
 ) -> tuple[str, ...]:
     refreshed: list[str] = []
     for name in sorted(names):
@@ -242,6 +246,8 @@ def refresh_secrets(
             input_text=value,
         )
         refreshed.append(name)
+        if completed is not None:
+            completed.append(name)
     return tuple(refreshed)
 
 
@@ -254,6 +260,7 @@ def prepare_with_prerequisites(
     sync_missing_enabled: bool,
     allow_personal_oauth_fanout: bool,
     allowed_env_secrets: set[str],
+    completed: list[str] | None = None,
 ) -> tuple[object, tuple[str, ...]]:
     secrets = remote_names(owner, repo, "secret")
     variables = remote_names(owner, repo, "variable")
@@ -271,6 +278,7 @@ def prepare_with_prerequisites(
                 enabled=sync_missing_enabled,
                 allow_personal_oauth_fanout=allow_personal_oauth_fanout,
                 allowed_env_secrets=allowed_env_secrets,
+                completed=completed,
             )
             synced_all.extend(name for name in synced if name not in synced_all)
             if secrets == previous:
@@ -514,6 +522,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     try:
         for name in repos:
+            refreshed_progress: list[str] = []
+            synced_progress: list[str] = []
             try:
                 refreshed: tuple[str, ...] = ()
                 if args.refresh_secret:
@@ -527,6 +537,10 @@ def main(argv: list[str] | None = None) -> int:
                         set(args.refresh_secret),
                         args.allow_personal_oauth_fanout,
                         allowed_env_secrets,
+                        refreshed_progress,
+                    )
+                    refreshed_progress.extend(
+                        item for item in refreshed if item not in refreshed_progress
                     )
                 if repo_config[name].get("workflows", True) is False:
                     outcomes.append(
@@ -559,6 +573,13 @@ def main(argv: list[str] | None = None) -> int:
                         and repo_config[name].get("secrets", True) is not False,
                         args.allow_personal_oauth_fanout,
                         allowed_env_secrets,
+                        synced_progress,
+                    )
+                    synced_progress.extend(
+                        item for item in synced if item not in synced_progress
+                    )
+                    written_secrets = tuple(
+                        dict.fromkeys(refreshed_progress + synced_progress)
                     )
                     if result.callers == 0:
                         outcomes.append(
@@ -567,7 +588,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "skipped",
                                 "no existing central callers",
                                 base,
-                                synced_secrets=refreshed + synced,
+                                synced_secrets=written_secrets,
                             )
                         )
                     elif not result.changed_files:
@@ -577,7 +598,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "current",
                                 "already matches contract",
                                 base,
-                                synced_secrets=refreshed + synced,
+                                synced_secrets=written_secrets,
                             )
                         )
                     else:
@@ -592,23 +613,35 @@ def main(argv: list[str] | None = None) -> int:
                                 repo, owner, name, default, args.ref, branch
                             )
                             outcomes.append(
-                                RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, refreshed + synced)
+                                RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, written_secrets)
                             )
                         else:
                             outcomes.append(
-                                RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=refreshed + synced)
+                                RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=written_secrets)
                             )
                 finally:
                     if preview is not None:
                         preview.cleanup()
             except (CommandError, RolloutError, OSError, json.JSONDecodeError) as exc:
-                outcomes.append(RepoOutcome(name, "blocked", str(exc)))
+                outcomes.append(
+                    RepoOutcome(
+                        name,
+                        "blocked",
+                        str(exc),
+                        synced_secrets=tuple(
+                            dict.fromkeys(refreshed_progress + synced_progress)
+                        ),
+                    )
+                )
             except Exception as exc:
                 outcomes.append(
                     RepoOutcome(
                         name,
                         "blocked",
                         f"unexpected {type(exc).__name__}: {exc}",
+                        synced_secrets=tuple(
+                            dict.fromkeys(refreshed_progress + synced_progress)
+                        ),
                     )
                 )
     finally:
