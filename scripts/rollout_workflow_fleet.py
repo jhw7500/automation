@@ -513,6 +513,14 @@ def main(argv: list[str] | None = None) -> int:
                         preview.cleanup()
             except (CommandError, RolloutError, OSError, json.JSONDecodeError) as exc:
                 outcomes.append(RepoOutcome(name, "blocked", str(exc)))
+            except Exception as exc:
+                outcomes.append(
+                    RepoOutcome(
+                        name,
+                        "blocked",
+                        f"unexpected {type(exc).__name__}: {exc}",
+                    )
+                )
     finally:
         contract_temp.cleanup()
 

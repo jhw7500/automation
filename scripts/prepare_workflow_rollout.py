@@ -97,6 +97,40 @@ def block_end(lines: list[str], start: int, parent_indent: int) -> int:
     return len(lines)
 
 
+def validate_use_context(lines: list[str], index: int, indent: str, path: Path) -> None:
+    """Fail closed unless the line editor can safely own the caller job tail."""
+    width = len(indent)
+    parent_index = None
+    parent_width = -1
+    for candidate in range(index - 1, -1, -1):
+        stripped = lines[candidate].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        candidate_width = leading_spaces(lines[candidate])
+        if candidate_width < width:
+            parent_index = candidate
+            parent_width = candidate_width
+            break
+    parent_is_mapping_key = (
+        parent_index is not None
+        and re.fullmatch(r"[^:#][^:]*:\s*(?:#.*)?", lines[parent_index].strip())
+        is not None
+    )
+    if parent_index is None or width - parent_width != 2 or not parent_is_mapping_key:
+        raise RolloutError(
+            f"{path.name}: reusable workflow uses must be indented exactly "
+            "two spaces below its job key"
+        )
+
+    for line in lines[parent_index + 1 : index]:
+        if leading_spaces(line) != width:
+            continue
+        if re.match(r"(?:secrets|with)\s*:", line.strip()):
+            raise RolloutError(
+                f"{path.name}: secrets/with must follow uses for safe rewriting"
+            )
+
+
 def secret_names_for(
     filename: str,
     contract: Contract,
@@ -222,6 +256,7 @@ def transform_workflow(
     required: set[str] = set()
     for index, match in reversed(uses):
         indent = match.group("indent")
+        validate_use_context(lines, index, indent, path)
         end = block_end(lines, index, len(indent) - 2)
         contract = workflow_contract(automation, match.group("workflow"))
         names, pass_app_id = secret_names_for(

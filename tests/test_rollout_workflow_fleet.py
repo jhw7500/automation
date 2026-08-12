@@ -254,7 +254,7 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
                 return_value=(release_temp, Path("/contract"), "release-sha"),
             ), patch(
                 "scripts.rollout_workflow_fleet.default_branch",
-                side_effect=["main", CommandError("default branch unavailable")],
+                side_effect=["main", ValueError("unexpected metadata shape")],
             ), patch(
                 "scripts.rollout_workflow_fleet.clone_or_reset",
                 return_value=(Path("/clone/a-ready"), "base-sha"),
@@ -284,6 +284,7 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             manifest = json.loads((workspace / "rollout-manifest.json").read_text())
             self.assertEqual(["published", "blocked"], [item["status"] for item in manifest])
             self.assertEqual("https://example.test/pr/1", manifest[0]["pr_url"])
+            self.assertIn("unexpected ValueError", manifest[1]["detail"])
             release_temp.cleanup.assert_called_once()
 
     @staticmethod

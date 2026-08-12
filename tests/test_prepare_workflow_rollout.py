@@ -184,6 +184,42 @@ class PrepareWorkflowRolloutTest(unittest.TestCase):
             )
         self.assertEqual(before, p.read_text())
 
+    def test_secrets_before_uses_fails_before_writing(self) -> None:
+        p = self.write("ordered-caller.yml", """\
+            jobs:
+              call:
+                secrets: inherit
+                uses: jhw7500/automation/.github/workflows/claude.yml@v1.33
+        """)
+        before = p.read_text()
+        with self.assertRaisesRegex(RolloutError, "secrets/with must follow uses"):
+            prepare_repository(
+                self.repo,
+                self.automation,
+                "v1.35",
+                {"CLAUDE_CODE_OAUTH_TOKEN"},
+                set(),
+            )
+        self.assertEqual(before, p.read_text())
+
+    def test_noncanonical_job_indentation_fails_before_writing(self) -> None:
+        p = self.write("indented-caller.yml", """\
+            jobs:
+                call:
+                    uses: jhw7500/automation/.github/workflows/claude.yml@v1.33
+                    secrets: inherit
+        """)
+        before = p.read_text()
+        with self.assertRaisesRegex(RolloutError, "indented exactly two spaces"):
+            prepare_repository(
+                self.repo,
+                self.automation,
+                "v1.35",
+                {"CLAUDE_CODE_OAUTH_TOKEN"},
+                set(),
+            )
+        self.assertEqual(before, p.read_text())
+
     def test_secretless_workflow_removes_inherit(self) -> None:
         p = self.write("notice.yml", """\
             jobs:
