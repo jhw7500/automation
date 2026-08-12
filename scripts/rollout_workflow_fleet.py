@@ -26,10 +26,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.audit_workflow_fleet import audit_repository
-from scripts.prepare_workflow_rollout import RolloutError, prepare_repository
-
-
-BRANCH = "codex/automation-v1.35-fleet"
+from scripts.prepare_workflow_rollout import (
+    RolloutError,
+    SecretPrerequisiteError,
+    prepare_repository,
+)
+from scripts.verify_workflow_release import (
+    resolve_commit,
+    verify_remote_tag,
+    verify_tag_content,
+)
 
 
 @dataclass
@@ -80,7 +86,9 @@ def remote_names(owner: str, repo: str, kind: str) -> set[str]:
     return {item["name"] for item in data}  # type: ignore[union-attr]
 
 
-def secret_source(name: str) -> str | None:
+def secret_source(name: str, allow_personal_oauth_fanout: bool = False) -> str | None:
+    if name == "CLAUDE_CODE_OAUTH_TOKEN" and not allow_personal_oauth_fanout:
+        return None
     value = os.environ.get(name)
     if value:
         return value
@@ -97,7 +105,16 @@ def secret_source(name: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def clone_or_reset(workspace: Path, owner: str, repo: str, branch: str) -> tuple[Path, str]:
+def rollout_branch(ref: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", ref).strip("-")
+    if not safe:
+        raise RolloutError(f"invalid rollout ref: {ref!r}")
+    return f"codex/automation-{safe}-fleet"
+
+
+def clone_or_reset(
+    workspace: Path, owner: str, repo: str, default: str, rollout: str
+) -> tuple[Path, str]:
     path = workspace / repo
     if not (path / ".git").is_dir():
         run(
@@ -111,10 +128,10 @@ def clone_or_reset(workspace: Path, owner: str, repo: str, branch: str) -> tuple
                 str(path),
             ]
         )
-    run(["git", "fetch", "--no-tags", "origin", branch], cwd=path)
-    base = run(["git", "rev-parse", f"origin/{branch}"], cwd=path)
-    run(["git", "checkout", "-q", "-B", BRANCH, f"origin/{branch}"], cwd=path)
-    run(["git", "reset", "--hard", "-q", f"origin/{branch}"], cwd=path)
+    run(["git", "fetch", "--no-tags", "origin", default], cwd=path)
+    base = run(["git", "rev-parse", f"origin/{default}"], cwd=path)
+    run(["git", "checkout", "-q", "-B", rollout, f"origin/{default}"], cwd=path)
+    run(["git", "reset", "--hard", "-q", f"origin/{default}"], cwd=path)
     run(["git", "clean", "-fdq"], cwd=path)
     return path, base
 
@@ -128,13 +145,47 @@ def preview_copy(repo: Path) -> tempfile.TemporaryDirectory[str]:
     return temp
 
 
+def materialize_release_contract(
+    automation: Path, ref: str
+) -> tuple[tempfile.TemporaryDirectory[str], Path, str]:
+    expected = resolve_commit(automation, f"refs/tags/{ref}")
+    verify_tag_content(automation, ref)
+    verify_remote_tag(automation, "origin", ref, expected)
+    temp = tempfile.TemporaryDirectory()
+    archive = subprocess.run(
+        ["git", "archive", ref, ".github/workflows"],
+        cwd=automation,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if archive.returncode != 0:
+        temp.cleanup()
+        raise CommandError(f"cannot archive release {ref}")
+    extract = subprocess.run(
+        ["tar", "-x", "-C", temp.name],
+        input=archive.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if extract.returncode != 0:
+        temp.cleanup()
+        raise CommandError(f"cannot extract release {ref}")
+    return temp, Path(temp.name), expected
+
+
 def sync_missing(
-    owner: str, repo: str, missing: set[str], enabled: bool
+    owner: str,
+    repo: str,
+    missing: set[str],
+    enabled: bool,
+    allow_personal_oauth_fanout: bool,
 ) -> tuple[set[str], tuple[str, ...]]:
     available = remote_names(owner, repo, "secret")
     synced: list[str] = []
     for name in sorted(missing - available):
-        value = secret_source(name) if enabled else None
+        value = (
+            secret_source(name, allow_personal_oauth_fanout) if enabled else None
+        )
         if value is None:
             continue
         run(
@@ -153,25 +204,21 @@ def prepare_with_prerequisites(
     owner: str,
     repo: str,
     sync_missing_enabled: bool,
+    allow_personal_oauth_fanout: bool,
 ) -> tuple[object, tuple[str, ...]]:
     secrets = remote_names(owner, repo, "secret")
     variables = remote_names(owner, repo, "variable")
     synced: tuple[str, ...] = ()
     try:
         return prepare_repository(repo_path, automation, ref, secrets, variables), synced
-    except RolloutError as first:
-        text = str(first)
-        candidates: set[str] = set()
-        if "missing required secrets:" in text:
-            candidates.update(text.split("missing required secrets:", 1)[1].split(", "))
-        if "APP_ID exists but APP_PRIVATE_KEY is missing" in text:
-            candidates.add("APP_PRIVATE_KEY")
-        if "no usable Gemini authentication path" in text:
-            candidates.update({"GEMINI_API_KEY"})
-        if not candidates:
-            raise
+    except SecretPrerequisiteError as first:
+        candidates = set(first.missing_secrets)
         secrets, synced = sync_missing(
-            owner, repo, candidates, enabled=sync_missing_enabled
+            owner,
+            repo,
+            candidates,
+            enabled=sync_missing_enabled,
+            allow_personal_oauth_fanout=allow_personal_oauth_fanout,
         )
         return prepare_repository(repo_path, automation, ref, secrets, variables), synced
 
@@ -242,7 +289,7 @@ def actionlint_diagnostics(actionlint: Path, root: Path) -> Counter[str]:
 
 
 def publish_repository(
-    repo: Path, owner: str, name: str, default: str, ref: str
+    repo: Path, owner: str, name: str, default: str, ref: str, branch: str
 ) -> tuple[str, str]:
     run(["git", "add", ".github"], cwd=repo)
     run(
@@ -250,7 +297,7 @@ def publish_repository(
         cwd=repo,
     )
     head = run(["git", "rev-parse", "HEAD"], cwd=repo)
-    run(["git", "push", "--force-with-lease", "-u", "origin", BRANCH], cwd=repo)
+    run(["git", "push", "--force-with-lease", "-u", "origin", branch], cwd=repo)
     existing = gh_json(
         [
             "pr",
@@ -258,7 +305,7 @@ def publish_repository(
             "-R",
             f"{owner}/{name}",
             "--head",
-            BRANCH,
+            branch,
             "--base",
             default,
             "--state",
@@ -288,7 +335,7 @@ def publish_repository(
             "--base",
             default,
             "--head",
-            BRANCH,
+            branch,
             "--title",
             f"ci: restrict shared workflow secrets ({ref})",
             "--body",
@@ -307,6 +354,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", choices=("plan", "prepare", "publish"), default="plan")
     parser.add_argument("--repo", action="append", default=[])
     parser.add_argument("--sync-missing-secrets", action="store_true")
+    parser.add_argument(
+        "--allow-personal-oauth-fanout",
+        action="store_true",
+        help="explicitly allow ~/.claude OAuth token to fill missing repository secrets",
+    )
     parser.add_argument("--actionlint", type=Path)
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--manifest", type=Path)
@@ -328,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"repositories not in config: {', '.join(unknown)}")
     if args.mode == "publish" and not args.confirm:
         parser.error("--mode publish requires --confirm")
+    if args.allow_personal_oauth_fanout and not args.sync_missing_secrets:
+        parser.error("--allow-personal-oauth-fanout requires --sync-missing-secrets")
 
     marker = args.workspace / ".automation-fleet-workspace"
     if not marker.is_file():
@@ -339,47 +393,59 @@ def main(argv: list[str] | None = None) -> int:
         args.workspace.mkdir(parents=True, exist_ok=True)
         marker.write_text("managed disposable clones only\n", encoding="utf-8")
     outcomes: list[RepoOutcome] = []
-    for name in repos:
-        try:
-            default = default_branch(owner, name)
-            repo, base = clone_or_reset(args.workspace, owner, name, default)
-            target = repo
-            preview = None
-            if args.mode == "plan":
-                preview = preview_copy(repo)
-                target = Path(preview.name)
-            result, synced = prepare_with_prerequisites(
-                target,
-                automation,
-                args.ref,
-                owner,
-                name,
-                args.sync_missing_secrets and args.mode != "plan",
-            )
-            if result.callers == 0:
-                outcomes.append(RepoOutcome(name, "skipped", "no existing central callers", base))
-            elif not result.changed_files:
-                outcomes.append(RepoOutcome(name, "current", "already matches contract", base))
-            else:
-                validate_repository(
-                    target,
-                    automation,
-                    args.actionlint,
-                    baseline_repo=repo if args.mode == "plan" else None,
+    contract_temp, contract_source, release_commit = materialize_release_contract(
+        automation, args.ref
+    )
+    branch = rollout_branch(args.ref)
+    try:
+        for name in repos:
+            try:
+                default = default_branch(owner, name)
+                repo, base = clone_or_reset(
+                    args.workspace, owner, name, default, branch
                 )
-                if args.mode == "publish":
-                    head, url = publish_repository(repo, owner, name, default, args.ref)
-                    outcomes.append(
-                        RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, synced)
-                    )
+                target = repo
+                preview = None
+                if args.mode == "plan":
+                    preview = preview_copy(repo)
+                    target = Path(preview.name)
+                result, synced = prepare_with_prerequisites(
+                    target,
+                    contract_source,
+                    args.ref,
+                    owner,
+                    name,
+                    args.sync_missing_secrets and args.mode != "plan",
+                    args.allow_personal_oauth_fanout,
+                )
+                if result.callers == 0:
+                    outcomes.append(RepoOutcome(name, "skipped", "no existing central callers", base))
+                elif not result.changed_files:
+                    outcomes.append(RepoOutcome(name, "current", "already matches contract", base))
                 else:
-                    outcomes.append(
-                        RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=synced)
+                    validate_repository(
+                        target,
+                        contract_source,
+                        args.actionlint,
+                        baseline_repo=repo if args.mode == "plan" else None,
                     )
-            if preview is not None:
-                preview.cleanup()
-        except (CommandError, RolloutError, OSError, json.JSONDecodeError) as exc:
-            outcomes.append(RepoOutcome(name, "blocked", str(exc)))
+                    if args.mode == "publish":
+                        head, url = publish_repository(
+                            repo, owner, name, default, args.ref, branch
+                        )
+                        outcomes.append(
+                            RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, synced)
+                        )
+                    else:
+                        outcomes.append(
+                            RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=synced)
+                        )
+                if preview is not None:
+                    preview.cleanup()
+            except (CommandError, RolloutError, OSError, json.JSONDecodeError) as exc:
+                outcomes.append(RepoOutcome(name, "blocked", str(exc)))
+    finally:
+        contract_temp.cleanup()
 
     manifest = args.manifest or args.workspace / "rollout-manifest.json"
     manifest.write_text(
@@ -390,7 +456,10 @@ def main(argv: list[str] | None = None) -> int:
         suffix = f" {item.pr_url}" if item.pr_url else ""
         print(f"{item.status.upper():9} {item.repo}: {item.detail}{suffix}")
     blocked = sum(item.status == "blocked" for item in outcomes)
-    print(f"SUMMARY total={len(outcomes)} blocked={blocked} manifest={manifest}")
+    print(
+        f"SUMMARY ref={args.ref} commit={release_commit} "
+        f"total={len(outcomes)} blocked={blocked} manifest={manifest}"
+    )
     return 1 if blocked else 0
 
 

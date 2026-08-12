@@ -30,6 +30,12 @@ class RolloutError(RuntimeError):
     pass
 
 
+class SecretPrerequisiteError(RolloutError):
+    def __init__(self, message: str, missing_secrets: set[str]) -> None:
+        super().__init__(message)
+        self.missing_secrets = frozenset(missing_secrets)
+
+
 @dataclass(frozen=True)
 class Contract:
     declared: set[str]
@@ -96,8 +102,9 @@ def secret_names_for(
 ) -> tuple[list[str], bool]:
     missing = contract.required - available_secrets
     if missing:
-        raise RolloutError(
-            f"{filename}: missing required secrets: {', '.join(sorted(missing))}"
+        raise SecretPrerequisiteError(
+            f"{filename}: missing required secrets: {', '.join(sorted(missing))}",
+            missing,
         )
 
     selected = contract.declared & available_secrets
@@ -105,7 +112,10 @@ def secret_names_for(
     app_enabled = "APP_ID" in available_variables
     if "APP_PRIVATE_KEY" in contract.declared:
         if app_enabled and "APP_PRIVATE_KEY" not in available_secrets:
-            raise RolloutError(f"{filename}: APP_ID exists but APP_PRIVATE_KEY is missing")
+            raise SecretPrerequisiteError(
+                f"{filename}: APP_ID exists but APP_PRIVATE_KEY is missing",
+                {"APP_PRIVATE_KEY"},
+            )
         if not app_enabled:
             selected.discard("APP_PRIVATE_KEY")
 
@@ -113,7 +123,10 @@ def secret_names_for(
         usable_api_key = bool({"GEMINI_API_KEY", "GOOGLE_API_KEY"} & available_secrets)
         usable_app = app_enabled and "APP_PRIVATE_KEY" in available_secrets
         if not (usable_api_key or usable_app):
-            raise RolloutError(f"{filename}: no usable Gemini authentication path")
+            raise SecretPrerequisiteError(
+                f"{filename}: no usable Gemini authentication path",
+                {"GEMINI_API_KEY"},
+            )
 
     return sorted(selected), contract.has_app_id and app_enabled
 

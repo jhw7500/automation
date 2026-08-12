@@ -19,6 +19,9 @@ repository secret 전제조건을 한 실행에서 조율한다. GitHub는 Git P
 - `CLAUDE_CODE_OAUTH_TOKEN` 누락 시에만 `~/.claude/.credentials.json`을 source로 쓸 수 있다.
 - 그 외 누락 secret은 같은 이름의 환경변수가 있을 때만 쓸 수 있다.
 - `--sync-missing-secrets`가 없으면 이름 검사만 하며 어떠한 secret도 쓰지 않는다.
+- 개인 Claude OAuth token fan-out은 추가로 `--allow-personal-oauth-fanout`을 명시해야
+  한다. 이 옵션은 저장소마다 자격증명을 복제해 blast radius를 넓히므로, 이미 배포된
+  `personal-ops/claude-token-sync`의 대상/rotation 정책을 승인한 운영에서만 사용한다.
 - Claude token의 지속적인 rotation은 `personal-ops/claude-token-sync`가 담당한다.
 
 ## 실행
@@ -46,12 +49,18 @@ python3 scripts/rollout_workflow_fleet.py \
   --workspace /path/to/disposable-fleet \
   --mode publish \
   --sync-missing-secrets \
+  --allow-personal-oauth-fanout \
   --confirm \
   --actionlint /path/to/actionlint
 ```
 
 각 실행은 `rollout-manifest.json`에 base/head/PR/blocked 결과를 남긴다. 한 저장소가
 blocked여도 다른 저장소의 준비는 계속하지만 명령은 non-zero로 끝난다.
+
+계약은 현재 checkout이 아니라 지정한 local+remote release tag artifact에서 직접
+추출한다. 따라서 `--ref v1.36`을 사용하면 branch도
+`codex/automation-v1.36-fleet`로 분리되고, 원격 tag와 local tag가 같은 commit인지
+검증되지 않으면 어떤 소비 저장소도 수정하지 않는다.
 
 ## Merge와 rollback
 
