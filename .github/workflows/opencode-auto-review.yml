@@ -74,7 +74,9 @@ jobs:
         with:
           fetch-depth: 1
           # OpenCode fetches the PR head branch after checkout. Private repositories
-          # require this read-only job token to remain available for that fetch.
+          # require authenticated fetch. This same token is intentionally passed to the
+          # action below; contents: read prevents code pushes, while PR/issues write is
+          # limited to review output. Consumer callers admit same-repository PRs only.
           persist-credentials: true
 
       # use_github_token: OIDC 교환(api.opencode.ai → opencode-agent App 토큰)을 건너뛰고
