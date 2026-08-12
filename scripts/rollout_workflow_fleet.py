@@ -199,6 +199,7 @@ def sync_missing(
     enabled: bool,
     allow_personal_oauth_fanout: bool,
     allowed_env_secrets: set[str],
+    completed: list[str] | None = None,
 ) -> tuple[set[str], tuple[str, ...]]:
     available = remote_names(owner, repo, "secret")
     synced: list[str] = []
@@ -218,7 +219,36 @@ def sync_missing(
         )
         available.add(name)
         synced.append(name)
+        if completed is not None:
+            completed.append(name)
     return available, tuple(synced)
+
+
+def refresh_secrets(
+    owner: str,
+    repo: str,
+    names: set[str],
+    allow_personal_oauth_fanout: bool,
+    allowed_env_secrets: set[str],
+    completed: list[str] | None = None,
+) -> tuple[str, ...]:
+    refreshed: list[str] = []
+    for name in sorted(names):
+        value = secret_source(
+            name, allow_personal_oauth_fanout, allowed_env_secrets
+        )
+        if value is None:
+            raise RolloutError(
+                f"{owner}/{repo}: no explicitly allowed source for refresh secret {name}"
+            )
+        run(
+            ["gh", "secret", "set", name, "-R", f"{owner}/{repo}", "--body", "-"],
+            input_text=value,
+        )
+        refreshed.append(name)
+        if completed is not None:
+            completed.append(name)
+    return tuple(refreshed)
 
 
 def prepare_with_prerequisites(
@@ -230,8 +260,11 @@ def prepare_with_prerequisites(
     sync_missing_enabled: bool,
     allow_personal_oauth_fanout: bool,
     allowed_env_secrets: set[str],
+    deferred_secrets: set[str] | None = None,
+    completed: list[str] | None = None,
 ) -> tuple[object, tuple[str, ...]]:
-    secrets = remote_names(owner, repo, "secret")
+    deferred_secrets = deferred_secrets or set()
+    secrets = remote_names(owner, repo, "secret") | deferred_secrets
     variables = remote_names(owner, repo, "variable")
     synced_all: list[str] = []
     while True:
@@ -247,7 +280,9 @@ def prepare_with_prerequisites(
                 enabled=sync_missing_enabled,
                 allow_personal_oauth_fanout=allow_personal_oauth_fanout,
                 allowed_env_secrets=allowed_env_secrets,
+                completed=completed,
             )
+            secrets |= deferred_secrets
             synced_all.extend(name for name in synced if name not in synced_all)
             if secrets == previous:
                 raise error
@@ -402,6 +437,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar="NAME",
         help="allow this exact environment variable as a missing-secret source",
     )
+    parser.add_argument(
+        "--refresh-secret",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="replace this existing or missing secret from an explicitly allowed source",
+    )
     parser.add_argument("--actionlint", type=Path)
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--manifest", type=Path)
@@ -430,11 +472,38 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--allow-personal-oauth-fanout requires --sync-missing-secrets")
     if args.allow_env_secret and not args.sync_missing_secrets:
         parser.error("--allow-env-secret requires --sync-missing-secrets")
+    if args.refresh_secret and (
+        args.mode != "publish" or not args.sync_missing_secrets
+    ):
+        parser.error(
+            "--refresh-secret requires --mode publish and --sync-missing-secrets"
+        )
+    if args.refresh_secret and not args.repo:
+        parser.error("--refresh-secret requires at least one explicit --repo")
     invalid_env_names = [
         name for name in args.allow_env_secret if re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None
     ]
     if invalid_env_names:
         parser.error(f"invalid secret environment names: {', '.join(invalid_env_names)}")
+    invalid_refresh_names = [
+        name for name in args.refresh_secret if re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None
+    ]
+    if invalid_refresh_names:
+        parser.error(f"invalid refresh secret names: {', '.join(invalid_refresh_names)}")
+    refresh_without_source = sorted(
+        name
+        for name in set(args.refresh_secret)
+        if name not in set(args.allow_env_secret)
+        and not (
+            name == "CLAUDE_CODE_OAUTH_TOKEN"
+            and args.allow_personal_oauth_fanout
+        )
+    )
+    if refresh_without_source:
+        parser.error(
+            "--refresh-secret requires an exact --allow-env-secret source: "
+            + ", ".join(refresh_without_source)
+        )
 
     marker = args.workspace / ".automation-fleet-workspace"
     if not marker.is_file():
@@ -458,10 +527,23 @@ def main(argv: list[str] | None = None) -> int:
         )
     try:
         for name in repos:
+            refreshed_progress: list[str] = []
+            synced_progress: list[str] = []
             try:
+                if (
+                    args.refresh_secret
+                    and repo_config[name].get("secrets", True) is False
+                ):
+                    raise RolloutError(
+                        f"{name}: secret writes are disabled by config"
+                    )
                 if repo_config[name].get("workflows", True) is False:
                     outcomes.append(
-                        RepoOutcome(name, "skipped", "workflows disabled by config")
+                        RepoOutcome(
+                            name,
+                            "skipped",
+                            "workflows disabled by config",
+                        )
                     )
                     continue
                 default = default_branch(owner, name)
@@ -474,7 +556,7 @@ def main(argv: list[str] | None = None) -> int:
                     if args.mode == "plan":
                         preview = preview_copy(repo)
                         target = Path(preview.name)
-                    result, synced = prepare_with_prerequisites(
+                    result, _ = prepare_with_prerequisites(
                         target,
                         contract_source,
                         args.ref,
@@ -485,40 +567,92 @@ def main(argv: list[str] | None = None) -> int:
                         and repo_config[name].get("secrets", True) is not False,
                         args.allow_personal_oauth_fanout,
                         allowed_env_secrets,
+                        set(args.refresh_secret),
+                        synced_progress,
                     )
                     if result.callers == 0:
-                        outcomes.append(RepoOutcome(name, "skipped", "no existing central callers", base))
-                    elif not result.changed_files:
-                        outcomes.append(RepoOutcome(name, "current", "already matches contract", base))
-                    else:
+                        outcomes.append(
+                            RepoOutcome(
+                                name,
+                                "skipped",
+                                "no existing central callers",
+                                base,
+                                synced_secrets=tuple(synced_progress),
+                            )
+                        )
+                        continue
+                    undeclared_refresh = set(args.refresh_secret) - set(
+                        result.required_secrets
+                    )
+                    if undeclared_refresh:
+                        raise RolloutError(
+                            f"{name}: refresh secrets not declared by managed callers: "
+                            + ", ".join(sorted(undeclared_refresh))
+                        )
+                    if result.changed_files:
                         validate_repository(
                             target,
                             contract_source,
                             args.actionlint,
                             baseline_repo=repo if args.mode == "plan" else None,
                         )
+                    if args.refresh_secret:
+                        refresh_secrets(
+                            owner,
+                            name,
+                            set(args.refresh_secret),
+                            args.allow_personal_oauth_fanout,
+                            allowed_env_secrets,
+                            refreshed_progress,
+                        )
+                    written_secrets = tuple(
+                        dict.fromkeys(refreshed_progress + synced_progress)
+                    )
+                    if not result.changed_files:
+                        outcomes.append(
+                            RepoOutcome(
+                                name,
+                                "current",
+                                "already matches contract",
+                                base,
+                                synced_secrets=written_secrets,
+                            )
+                        )
+                    else:
                         if args.mode == "publish":
                             head, url = publish_repository(
                                 repo, owner, name, default, args.ref, branch
                             )
                             outcomes.append(
-                                RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, synced)
+                                RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, written_secrets)
                             )
                         else:
                             outcomes.append(
-                                RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=synced)
+                                RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=written_secrets)
                             )
                 finally:
                     if preview is not None:
                         preview.cleanup()
             except (CommandError, RolloutError, OSError, json.JSONDecodeError) as exc:
-                outcomes.append(RepoOutcome(name, "blocked", str(exc)))
+                outcomes.append(
+                    RepoOutcome(
+                        name,
+                        "blocked",
+                        str(exc),
+                        synced_secrets=tuple(
+                            dict.fromkeys(refreshed_progress + synced_progress)
+                        ),
+                    )
+                )
             except Exception as exc:
                 outcomes.append(
                     RepoOutcome(
                         name,
                         "blocked",
                         f"unexpected {type(exc).__name__}: {exc}",
+                        synced_secrets=tuple(
+                            dict.fromkeys(refreshed_progress + synced_progress)
+                        ),
                     )
                 )
     finally:
