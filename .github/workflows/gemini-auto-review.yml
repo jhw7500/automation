@@ -13,6 +13,11 @@ on:
         required: false
         default: false
 
+    secrets:
+      GEMINI_API_KEY:
+        description: 'Gemini API key'
+        required: true
+
 jobs:
   check-enabled:
     name: Check if enabled
@@ -77,7 +82,7 @@ jobs:
       - name: Get PR details
         id: pr-details
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
 
@@ -230,7 +235,7 @@ jobs:
       - name: Post review comment
         if: success()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
 
@@ -257,7 +262,7 @@ jobs:
       - name: Handle review failure
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
           gh pr comment $PR_NUMBER --body "⚠️ Gemini auto-review failed. Please check the workflow logs for details."

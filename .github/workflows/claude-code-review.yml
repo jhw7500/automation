@@ -19,6 +19,11 @@ on:
     #   - "src/**/*.js"
     #   - "src/**/*.jsx"
 
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: 'Claude Code OAuth token'
+        required: true
+
 jobs:
   check-enabled:
     name: Check if enabled

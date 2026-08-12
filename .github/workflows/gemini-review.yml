@@ -39,6 +39,17 @@ on:
         description: 'Last successful review commit SHA'
         required: false
 
+    secrets:
+      APP_PRIVATE_KEY:
+        description: 'GitHub App private key; required when vars.APP_ID is set'
+        required: false
+      GEMINI_API_KEY:
+        description: 'Gemini API key for API-key authentication'
+        required: false
+      GOOGLE_API_KEY:
+        description: 'Google API key for compatible Gemini authentication'
+        required: false
+
 concurrency:
   group: '${{ github.workflow }}-review-${{ github.event_name }}-${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}'
   cancel-in-progress: true
@@ -227,7 +238,7 @@ jobs:
         with:
           app-id: '${{ vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+          fallback-token: '${{ github.token }}'
 
       - name: 'Generate diff'
         id: 'generate_diff'

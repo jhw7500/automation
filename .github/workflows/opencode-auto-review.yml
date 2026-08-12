@@ -13,6 +13,11 @@ on:
         required: false
         default: false
 
+    secrets:
+      ZHIPU_API_KEY:
+        description: 'Z.AI API key'
+        required: true
+
 jobs:
   check-enabled:
     name: Check if enabled

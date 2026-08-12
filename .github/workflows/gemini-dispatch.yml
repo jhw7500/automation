@@ -9,6 +9,17 @@ on:
         required: false
         default: false
 
+    secrets:
+      APP_PRIVATE_KEY:
+        description: 'GitHub App private key; required when vars.APP_ID is set'
+        required: false
+      GEMINI_API_KEY:
+        description: 'Gemini API key for API-key authentication'
+        required: false
+      GOOGLE_API_KEY:
+        description: 'Google API key for compatible Gemini authentication'
+        required: false
+
 defaults:
   run:
     shell: 'bash'
@@ -235,7 +246,7 @@ jobs:
       - name: 'Acknowledge request'
         if: steps.extract_command.outputs.command != 'noop' && steps.extract_command.outputs.command != 'unauthorized'
         env:
-          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}'
+          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || github.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           MESSAGE: |-
             ## 🤖 Gemini CLI (명령어 기반)
@@ -267,7 +278,7 @@ jobs:
         with:
           app-id: '${{ vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+          fallback-token: '${{ github.token }}'
 
       - name: Run Gemini pull request review (primary)
         id: gemini_review_primary
@@ -600,7 +611,7 @@ jobs:
         with:
           app-id: '${{ vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+          fallback-token: '${{ github.token }}'
 
       - name: Apply labels
         env:
@@ -656,7 +667,7 @@ jobs:
         with:
           app-id: '${{ vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+          fallback-token: '${{ github.token }}'
 
       - name: Run Gemini CLI (primary)
         id: gemini_invoke_primary
@@ -816,7 +827,7 @@ jobs:
 
       - name: 'Send failure comment'
         env:
-          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}'
+          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || github.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           COMMAND: '${{ needs.dispatch.outputs.command }}'
           REPOSITORY: '${{ github.repository }}'

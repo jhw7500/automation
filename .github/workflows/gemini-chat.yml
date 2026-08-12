@@ -9,6 +9,17 @@ on:
         required: false
         default: false
 
+    secrets:
+      APP_PRIVATE_KEY:
+        description: 'GitHub App private key; required when vars.APP_ID is set'
+        required: false
+      GEMINI_API_KEY:
+        description: 'Gemini API key for API-key authentication'
+        required: false
+      GOOGLE_API_KEY:
+        description: 'Google API key for compatible Gemini authentication'
+        required: false
+
 jobs:
   check-enabled:
     name: Check if enabled
@@ -66,7 +77,7 @@ jobs:
         with:
           app-id: '${{ vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+          fallback-token: '${{ github.token }}'
 
       - name: Acknowledge request
         env:
