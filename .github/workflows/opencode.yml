@@ -18,8 +18,12 @@ jobs:
   check-enabled:
     name: Check if enabled
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
+      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,10 +37,28 @@ jobs:
           workflow-name: opencode
           force-run: ${{ inputs.force_run && 'true' || 'false' }}
 
+      - name: Verify same-repository PR
+        id: pr_scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          echo "safe_pr=false" >> "$GITHUB_OUTPUT"
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            exit 0
+          fi
+          metadata="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq '[.head.repo.full_name, .head.repo.fork] | @tsv' 2>/dev/null)" || exit 0
+          IFS=$'\t' read -r head_repo head_fork <<< "$metadata"
+          if [[ "$head_repo" == "$GITHUB_REPOSITORY" && "$head_fork" == "false" ]]; then
+            echo "safe_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+
   opencode:
     needs: check-enabled
     if: |
       needs.check-enabled.outputs.enabled == 'true' &&
+      needs.check-enabled.outputs.safe_pr == 'true' &&
       contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
       (
         contains(github.event.comment.body, ' /oc') ||
@@ -46,10 +68,9 @@ jobs:
       )
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
-      pull-requests: read
-      issues: read
+      pull-requests: write
+      issues: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -62,13 +83,17 @@ jobs:
         uses: anomalyco/opencode/github@bbc7bdb3fd5078d0add23273e0fdae436b9b47e4 # v1.1.43
         env:
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
         with:
+          use_github_token: true
           model: zai-coding-plan/glm-4.7
 
   skipped:
     name: Workflow Skipped
     needs: check-enabled
-    if: needs.check-enabled.outputs.enabled != 'true'
+    if: >-
+      needs.check-enabled.outputs.enabled != 'true' ||
+      needs.check-enabled.outputs.safe_pr != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Notice

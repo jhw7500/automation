@@ -26,10 +26,15 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
                 on:
                   workflow_call:
                 jobs:
+                  check-enabled:
+                    outputs:
+                      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
+                    steps:
+                      - id: pr_scope
+                        run: gh api example
                   opencode-review:
                     if: >-
-                      github.event.pull_request.head.repo.fork == false &&
-                      github.event.pull_request.head.repo.full_name == github.repository
+                      needs.check-enabled.outputs.safe_pr == 'true'
                     permissions:
                       contents: read
                       pull-requests: write
@@ -53,12 +58,28 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
                 on:
                   workflow_call:
                 jobs:
+                  check-enabled:
+                    outputs:
+                      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
+                    steps:
+                      - id: pr_scope
+                        run: gh api example
                   opencode:
+                    if: needs.check-enabled.outputs.safe_pr == 'true'
+                    permissions:
+                      contents: read
+                      pull-requests: write
+                      issues: write
                     steps:
                       - name: Checkout repository
                         uses: actions/checkout@v4
                         with:
                           persist-credentials: true
+                      - name: Run opencode
+                        env:
+                          GITHUB_TOKEN: ${{ github.token }}
+                        with:
+                          use_github_token: true
                 """
             )
         )
@@ -152,7 +173,7 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
         path = self.repo / ".github/workflows/opencode-auto-review.yml"
         path.write_text(
             path.read_text().replace(
-                "github.event.pull_request.head.repo.full_name == github.repository",
+                "needs.check-enabled.outputs.safe_pr == 'true'",
                 "true",
             )
         )
@@ -161,6 +182,22 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
         bad_commit = self.git("rev-parse", "HEAD").strip()
         self.git("tag", "-a", "v1.35", "-m", "bad")
         with self.assertRaisesRegex(ReleaseVerificationError, "same-repository PR guard"):
+            verify_release(self.repo, "v1.35", bad_commit)
+
+    def test_rejects_opencode_command_oidc_app_token_path(self) -> None:
+        self.git("tag", "-d", "v1.35")
+        path = self.repo / ".github/workflows/opencode.yml"
+        text = path.read_text().replace(
+            "    permissions:\n      contents: read",
+            "    permissions:\n      id-token: write\n      contents: read",
+        )
+        text = text.replace("use_github_token: true", "use_github_token: false")
+        path.write_text(text)
+        self.git("add", ".")
+        self.git("commit", "-qm", "restore app token path")
+        bad_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-a", "v1.35", "-m", "bad")
+        with self.assertRaisesRegex(ReleaseVerificationError, "opencode.yml security"):
             verify_release(self.repo, "v1.35", bad_commit)
 
 

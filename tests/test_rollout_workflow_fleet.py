@@ -32,10 +32,15 @@ SECURE_WORKFLOW = """\
 on:
   workflow_call:
 jobs:
+  check-enabled:
+    outputs:
+      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
+    steps:
+      - id: pr_scope
+        run: gh api example
   opencode-review:
     if: >-
-      github.event.pull_request.head.repo.fork == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      needs.check-enabled.outputs.safe_pr == 'true'
     permissions:
       contents: read
       pull-requests: write
@@ -56,12 +61,28 @@ SECURE_COMMAND_WORKFLOW = """\
 on:
   workflow_call:
 jobs:
+  check-enabled:
+    outputs:
+      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
+    steps:
+      - id: pr_scope
+        run: gh api example
   opencode:
+    if: needs.check-enabled.outputs.safe_pr == 'true'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+      - name: Run opencode
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          use_github_token: true
 """
 
 

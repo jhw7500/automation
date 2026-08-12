@@ -22,9 +22,13 @@ jobs:
   check-enabled:
     name: Check if enabled
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
       auto_enabled: ${{ steps.auto_mode.outputs.auto_enabled }}
+      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,13 +60,29 @@ jobs:
           fi
           echo "auto_enabled=${auto_enabled}" >> "$GITHUB_OUTPUT"
 
+      - name: Verify same-repository PR
+        id: pr_scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          echo "safe_pr=false" >> "$GITHUB_OUTPUT"
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            exit 0
+          fi
+          metadata="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq '[.head.repo.full_name, .head.repo.fork] | @tsv' 2>/dev/null)" || exit 0
+          IFS=$'\t' read -r head_repo head_fork <<< "$metadata"
+          if [[ "$head_repo" == "$GITHUB_REPOSITORY" && "$head_fork" == "false" ]]; then
+            echo "safe_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+
   opencode-review:
     needs: check-enabled
     if: >-
       needs.check-enabled.outputs.enabled == 'true' &&
       needs.check-enabled.outputs.auto_enabled == 'true' &&
-      github.event.pull_request.head.repo.fork == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      needs.check-enabled.outputs.safe_pr == 'true'
     runs-on: ubuntu-latest
     permissions:
       # id-token 없음(의도) — 이게 있으면 액션이 OIDC 토큰을 발급받아
@@ -109,7 +129,10 @@ jobs:
   skipped:
     name: Workflow Skipped
     needs: check-enabled
-    if: needs.check-enabled.outputs.enabled != 'true' || needs.check-enabled.outputs.auto_enabled != 'true'
+    if: >-
+      needs.check-enabled.outputs.enabled != 'true' ||
+      needs.check-enabled.outputs.auto_enabled != 'true' ||
+      needs.check-enabled.outputs.safe_pr != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Notice

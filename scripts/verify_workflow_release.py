@@ -73,6 +73,7 @@ def verify_tag_content(repo: Path, ref: str) -> None:
     if auto is None:
         raise ReleaseVerificationError("opencode-auto-review.yml is missing")
     try:
+        check_job = auto["jobs"]["check-enabled"]
         job = auto["jobs"]["opencode-review"]
         permissions = job["permissions"]
         checkout = next(
@@ -92,13 +93,17 @@ def verify_tag_content(repo: Path, ref: str) -> None:
         raise ReleaseVerificationError(
             f"OpenCode auto review permissions differ from {expected_permissions}"
         )
-    condition = job.get("if", "")
-    same_repo_guards = (
-        "github.event.pull_request.head.repo.fork == false",
-        "github.event.pull_request.head.repo.full_name == github.repository",
+    safe_output = check_job.get("outputs", {}).get("safe_pr")
+    scope_step = next(
+        (item for item in check_job.get("steps", []) if item.get("id") == "pr_scope"),
+        {},
     )
-    if not isinstance(condition, str) or not all(
-        guard in condition for guard in same_repo_guards
+    condition = job.get("if", "")
+    if (
+        safe_output != "${{ steps.pr_scope.outputs.safe_pr }}"
+        or "gh api" not in scope_step.get("run", "")
+        or not isinstance(condition, str)
+        or "needs.check-enabled.outputs.safe_pr == 'true'" not in condition
     ):
         raise ReleaseVerificationError(
             "OpenCode auto review lacks a central same-repository PR guard"
@@ -114,17 +119,45 @@ def verify_tag_content(repo: Path, ref: str) -> None:
 
     command = documents.get("opencode.yml")
     try:
+        command_check = command["jobs"]["check-enabled"]
         command_job = command["jobs"]["opencode"]
         command_checkout = next(
             item
             for item in command_job["steps"]
             if item.get("name") == "Checkout repository"
         )
+        command_step = next(
+            item for item in command_job["steps"] if item.get("name") == "Run opencode"
+        )
     except (KeyError, TypeError, StopIteration) as exc:
         raise ReleaseVerificationError("opencode.yml structure is missing") from exc
     if command_checkout.get("with", {}).get("persist-credentials") != "true":
         raise ReleaseVerificationError(
             "opencode.yml cannot authenticate private repository fetch"
+        )
+    command_scope = next(
+        (item for item in command_check.get("steps", []) if item.get("id") == "pr_scope"),
+        {},
+    )
+    command_condition = command_job.get("if", "")
+    command_permissions = {
+        "contents": "read",
+        "pull-requests": "write",
+        "issues": "write",
+    }
+    command_is_secure = (
+        command_check.get("outputs", {}).get("safe_pr")
+        == "${{ steps.pr_scope.outputs.safe_pr }}"
+        and "gh api" in command_scope.get("run", "")
+        and isinstance(command_condition, str)
+        and "needs.check-enabled.outputs.safe_pr == 'true'" in command_condition
+        and command_job.get("permissions") == command_permissions
+        and command_step.get("with", {}).get("use_github_token") == "true"
+        and command_step.get("env", {}).get("GITHUB_TOKEN") == "${{ github.token }}"
+    )
+    if not command_is_secure:
+        raise ReleaseVerificationError(
+            "opencode.yml security contract permits unsafe PR or App-token access"
         )
 
 
