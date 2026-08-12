@@ -33,6 +33,9 @@ on:
   workflow_call:
 jobs:
   opencode-review:
+    if: >-
+      github.event.pull_request.head.repo.fork == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       pull-requests: write

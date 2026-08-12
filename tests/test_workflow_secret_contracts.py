@@ -119,6 +119,15 @@ class WorkflowSecretContractsTest(unittest.TestCase):
         )
         self.assertEqual("true", checkout["with"]["persist-credentials"])
 
+    def test_opencode_auto_review_enforces_same_repository_prs_centrally(self) -> None:
+        workflow = load_workflow(WORKFLOWS / "opencode-auto-review.yml")
+        condition = workflow["jobs"]["opencode-review"]["if"]
+        self.assertIn("github.event.pull_request.head.repo.fork == false", condition)
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            condition,
+        )
+
     def test_opencode_command_keeps_read_only_checkout_auth_for_private_repos(self) -> None:
         workflow = load_workflow(WORKFLOWS / "opencode.yml")
         job = workflow["jobs"]["opencode"]

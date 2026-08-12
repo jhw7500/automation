@@ -58,7 +58,11 @@ jobs:
 
   opencode-review:
     needs: check-enabled
-    if: needs.check-enabled.outputs.enabled == 'true' && needs.check-enabled.outputs.auto_enabled == 'true'
+    if: >-
+      needs.check-enabled.outputs.enabled == 'true' &&
+      needs.check-enabled.outputs.auto_enabled == 'true' &&
+      github.event.pull_request.head.repo.fork == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       # id-token 없음(의도) — 이게 있으면 액션이 OIDC 토큰을 발급받아

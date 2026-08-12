@@ -27,6 +27,9 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
                   workflow_call:
                 jobs:
                   opencode-review:
+                    if: >-
+                      github.event.pull_request.head.repo.fork == false &&
+                      github.event.pull_request.head.repo.full_name == github.repository
                     permissions:
                       contents: read
                       pull-requests: write
@@ -142,6 +145,22 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
         bad_commit = self.git("rev-parse", "HEAD").strip()
         self.git("tag", "-a", "v1.35", "-m", "bad")
         with self.assertRaisesRegex(ReleaseVerificationError, "opencode.yml.*private"):
+            verify_release(self.repo, "v1.35", bad_commit)
+
+    def test_rejects_auto_review_without_central_same_repo_guard(self) -> None:
+        self.git("tag", "-d", "v1.35")
+        path = self.repo / ".github/workflows/opencode-auto-review.yml"
+        path.write_text(
+            path.read_text().replace(
+                "github.event.pull_request.head.repo.full_name == github.repository",
+                "true",
+            )
+        )
+        self.git("add", ".")
+        self.git("commit", "-qm", "remove same repo guard")
+        bad_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-a", "v1.35", "-m", "bad")
+        with self.assertRaisesRegex(ReleaseVerificationError, "same-repository PR guard"):
             verify_release(self.repo, "v1.35", bad_commit)
 
 

@@ -92,6 +92,17 @@ def verify_tag_content(repo: Path, ref: str) -> None:
         raise ReleaseVerificationError(
             f"OpenCode auto review permissions differ from {expected_permissions}"
         )
+    condition = job.get("if", "")
+    same_repo_guards = (
+        "github.event.pull_request.head.repo.fork == false",
+        "github.event.pull_request.head.repo.full_name == github.repository",
+    )
+    if not isinstance(condition, str) or not all(
+        guard in condition for guard in same_repo_guards
+    ):
+        raise ReleaseVerificationError(
+            "OpenCode auto review lacks a central same-repository PR guard"
+        )
     if checkout.get("with", {}).get("persist-credentials") != "true":
         raise ReleaseVerificationError(
             "OpenCode auto review cannot authenticate private repository fetch"
