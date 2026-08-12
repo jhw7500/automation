@@ -62,6 +62,9 @@ processing external contributor content.
 
 Both OpenCode workflows force the job-scoped `github.token`; `id-token: write` is forbidden,
 so the action cannot exchange OIDC for an App token outside the declared job permissions.
+Consumer OpenCode jobs must grant exactly `contents: read`, `pull-requests: write`, and
+`issues: write`. The fleet rollout tool normalizes these two caller permission blocks; this
+is the intentional exception to its general rule of preserving repository-owned permissions.
 
 ## Variables (consumer repository)
 

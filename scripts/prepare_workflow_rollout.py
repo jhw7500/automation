@@ -27,6 +27,12 @@ CONFIG_REF_RE = re.compile(
     r"(?P<suffix>[ \t]*(?:#.*)?)$"
 )
 GEMINI_AUTH_SECRETS = {"APP_PRIVATE_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"}
+OPENCODE_WORKFLOWS = {"opencode.yml", "opencode-auto-review.yml"}
+OPENCODE_CALLER_PERMISSIONS = (
+    ("contents", "read"),
+    ("pull-requests", "write"),
+    ("issues", "write"),
+)
 
 
 class RolloutError(RuntimeError):
@@ -97,7 +103,7 @@ def block_end(lines: list[str], start: int, parent_indent: int) -> int:
     return len(lines)
 
 
-def validate_use_context(lines: list[str], index: int, indent: str, path: Path) -> None:
+def validate_use_context(lines: list[str], index: int, indent: str, path: Path) -> int:
     """Fail closed unless the line editor can safely own the caller job tail."""
     width = len(indent)
     parent_index = None
@@ -129,6 +135,37 @@ def validate_use_context(lines: list[str], index: int, indent: str, path: Path) 
             raise RolloutError(
                 f"{path.name}: secrets/with must follow uses for safe rewriting"
             )
+    return parent_index
+
+
+def enforce_opencode_permissions(
+    lines: list[str], parent_index: int, use_index: int, indent: str, filename: str
+) -> int:
+    width = len(indent)
+    job_end = block_end(lines, parent_index, leading_spaces(lines[parent_index]))
+    permission_indices = [
+        index
+        for index in range(parent_index + 1, job_end)
+        if leading_spaces(lines[index]) == width
+        and re.match(r"permissions\s*:", lines[index].strip())
+    ]
+    if len(permission_indices) > 1:
+        raise RolloutError(f"{filename}: duplicate permissions blocks")
+    canonical = [f"{indent}permissions:\n"] + [
+        f"{indent}  {name}: {value}\n" for name, value in OPENCODE_CALLER_PERMISSIONS
+    ]
+    if permission_indices:
+        start = permission_indices[0]
+        end = block_end(lines, start, width)
+        lines[start:end] = canonical
+    else:
+        lines[use_index:use_index] = canonical
+
+    for index in range(parent_index + 1, block_end(lines, parent_index, leading_spaces(lines[parent_index]))):
+        match = USE_RE.match(lines[index].rstrip("\n"))
+        if match is not None and match.group("workflow") == filename:
+            return index
+    raise RolloutError(f"{filename}: reusable workflow use line lost during permission rewrite")
 
 
 def secret_names_for(
@@ -256,11 +293,19 @@ def transform_workflow(
     required: set[str] = set()
     for index, match in reversed(uses):
         indent = match.group("indent")
-        validate_use_context(lines, index, indent, path)
+        parent_index = validate_use_context(lines, index, indent, path)
+        filename = match.group("workflow")
+        if filename in OPENCODE_WORKFLOWS:
+            index = enforce_opencode_permissions(
+                lines, parent_index, index, indent, filename
+            )
+            match = USE_RE.match(lines[index].rstrip("\n"))
+            if match is None:
+                raise RolloutError(f"{path.name}: OpenCode use line became invalid")
         end = block_end(lines, index, len(indent) - 2)
-        contract = workflow_contract(automation, match.group("workflow"))
+        contract = workflow_contract(automation, filename)
         names, pass_app_id = secret_names_for(
-            match.group("workflow"), contract, available_secrets, available_variables
+            filename, contract, available_secrets, available_variables
         )
         required.update(names)
         segment = replace_job_segment(lines[index:end], indent, new_ref, names, pass_app_id)

@@ -37,6 +37,8 @@ jobs:
       safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
     steps:
       - id: pr_scope
+        env:
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
         run: gh api example
   opencode-review:
     if: >-
@@ -66,6 +68,8 @@ jobs:
       safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
     steps:
       - id: pr_scope
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
         run: gh api example
   opencode:
     if: needs.check-enabled.outputs.safe_pr == 'true'

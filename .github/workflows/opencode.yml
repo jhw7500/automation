@@ -41,7 +41,7 @@ jobs:
         id: pr_scope
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
         run: |
           echo "safe_pr=false" >> "$GITHUB_OUTPUT"
           if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then

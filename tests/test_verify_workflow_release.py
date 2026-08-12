@@ -31,6 +31,8 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
                       safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
                     steps:
                       - id: pr_scope
+                        env:
+                          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
                         run: gh api example
                   opencode-review:
                     if: >-
@@ -63,6 +65,8 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
                       safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
                     steps:
                       - id: pr_scope
+                        env:
+                          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
                         run: gh api example
                   opencode:
                     if: needs.check-enabled.outputs.safe_pr == 'true'
@@ -195,6 +199,22 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
         path.write_text(text)
         self.git("add", ".")
         self.git("commit", "-qm", "restore app token path")
+        bad_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-a", "v1.35", "-m", "bad")
+        with self.assertRaisesRegex(ReleaseVerificationError, "opencode.yml security"):
+            verify_release(self.repo, "v1.35", bad_commit)
+
+    def test_rejects_command_scope_without_inline_review_fallback(self) -> None:
+        self.git("tag", "-d", "v1.35")
+        path = self.repo / ".github/workflows/opencode.yml"
+        path.write_text(
+            path.read_text().replace(
+                "github.event.pull_request.number || github.event.issue.number",
+                "github.event.issue.number",
+            )
+        )
+        self.git("add", ".")
+        self.git("commit", "-qm", "break review comment scope")
         bad_commit = self.git("rev-parse", "HEAD").strip()
         self.git("tag", "-a", "v1.35", "-m", "bad")
         with self.assertRaisesRegex(ReleaseVerificationError, "opencode.yml security"):

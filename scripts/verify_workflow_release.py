@@ -149,6 +149,8 @@ def verify_tag_content(repo: Path, ref: str) -> None:
         command_check.get("outputs", {}).get("safe_pr")
         == "${{ steps.pr_scope.outputs.safe_pr }}"
         and "gh api" in command_scope.get("run", "")
+        and command_scope.get("env", {}).get("PR_NUMBER")
+        == "${{ github.event.pull_request.number || github.event.issue.number }}"
         and isinstance(command_condition, str)
         and "needs.check-enabled.outputs.safe_pr == 'true'" in command_condition
         and command_job.get("permissions") == command_permissions

@@ -149,6 +149,21 @@ class WorkflowSecretContractsTest(unittest.TestCase):
         run_step = next(step for step in job["steps"] if step.get("name") == "Run opencode")
         self.assertEqual("true", run_step["with"]["use_github_token"])
         self.assertEqual("${{ github.token }}", run_step["env"]["GITHUB_TOKEN"])
+        scope_step = next(step for step in check["steps"] if step.get("id") == "pr_scope")
+        self.assertEqual(
+            "${{ github.event.pull_request.number || github.event.issue.number }}",
+            scope_step["env"]["PR_NUMBER"],
+        )
+
+    def test_opencode_baseline_caller_grants_only_required_review_permissions(self) -> None:
+        path = ROOT / "examples/baseline-workflows/.github/workflows/opencode.yml"
+        workflow = load_workflow(path)
+        job = workflow["jobs"]["opencode"]
+        self.assertEqual(
+            {"contents": "read", "pull-requests": "write", "issues": "write"},
+            job["permissions"],
+        )
+        self.assertNotIn("id-token", job["permissions"])
 
     def test_app_token_workflows_accept_an_explicit_app_id_with_legacy_fallback(self) -> None:
         for filename in APP_TOKEN_WORKFLOWS:
