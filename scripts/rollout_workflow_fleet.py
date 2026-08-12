@@ -59,7 +59,11 @@ def run(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env={key: value for key, value in os.environ.items() if key != "GITHUB_TOKEN"},
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"GITHUB_TOKEN", "GH_TOKEN"}
+        },
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
@@ -229,20 +233,24 @@ def prepare_with_prerequisites(
 ) -> tuple[object, tuple[str, ...]]:
     secrets = remote_names(owner, repo, "secret")
     variables = remote_names(owner, repo, "variable")
-    synced: tuple[str, ...] = ()
-    try:
-        return prepare_repository(repo_path, automation, ref, secrets, variables), synced
-    except SecretPrerequisiteError as first:
-        candidates = set(first.missing_secrets)
-        secrets, synced = sync_missing(
-            owner,
-            repo,
-            candidates,
-            enabled=sync_missing_enabled,
-            allow_personal_oauth_fanout=allow_personal_oauth_fanout,
-            allowed_env_secrets=allowed_env_secrets,
-        )
-        return prepare_repository(repo_path, automation, ref, secrets, variables), synced
+    synced_all: list[str] = []
+    while True:
+        try:
+            result = prepare_repository(repo_path, automation, ref, secrets, variables)
+            return result, tuple(synced_all)
+        except SecretPrerequisiteError as error:
+            previous = set(secrets)
+            secrets, synced = sync_missing(
+                owner,
+                repo,
+                set(error.missing_secrets),
+                enabled=sync_missing_enabled,
+                allow_personal_oauth_fanout=allow_personal_oauth_fanout,
+                allowed_env_secrets=allowed_env_secrets,
+            )
+            synced_all.extend(name for name in synced if name not in synced_all)
+            if secrets == previous:
+                raise error
 
 
 def validate_repository(
@@ -402,7 +410,8 @@ def main(argv: list[str] | None = None) -> int:
     config_path = args.config or automation / "scripts/workflow-config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     owner = config["gh_owner"]
-    configured = sorted(config["repos"])
+    repo_config = config["repos"]
+    configured = sorted(repo_config)
     repos = args.repo or configured
     unknown = sorted(set(repos) - set(configured))
     if unknown:
@@ -444,6 +453,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for name in repos:
             try:
+                if repo_config[name].get("workflows", True) is False:
+                    outcomes.append(
+                        RepoOutcome(name, "skipped", "workflows disabled by config")
+                    )
+                    continue
                 default = default_branch(owner, name)
                 repo, base = clone_or_reset(
                     args.workspace, owner, name, default, branch
@@ -460,7 +474,9 @@ def main(argv: list[str] | None = None) -> int:
                         args.ref,
                         owner,
                         name,
-                        args.sync_missing_secrets and args.mode == "publish",
+                        args.sync_missing_secrets
+                        and args.mode == "publish"
+                        and repo_config[name].get("secrets", True) is not False,
                         args.allow_personal_oauth_fanout,
                         allowed_env_secrets,
                     )

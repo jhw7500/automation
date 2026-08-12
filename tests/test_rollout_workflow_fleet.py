@@ -16,11 +16,13 @@ from scripts.rollout_workflow_fleet import (
     default_branch,
     main,
     materialize_release_contract,
+    prepare_with_prerequisites,
     publish_repository,
     rollout_branch,
     secret_source,
     sync_missing,
 )
+from scripts.prepare_workflow_rollout import SecretPrerequisiteError
 
 
 SECURE_WORKFLOW = """\
@@ -103,6 +105,37 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
         self.assertEqual(("TOKEN",), synced)
         self.assertEqual("sensitive-value", calls[0][1])
         self.assertNotIn("sensitive-value", calls[0][0])
+
+    def test_multiple_missing_secrets_are_synced_until_prepare_succeeds(self) -> None:
+        first = SecretPrerequisiteError("missing first", {"FIRST_TOKEN"})
+        second = SecretPrerequisiteError("missing second", {"SECOND_TOKEN"})
+        prepared = object()
+        with patch(
+            "scripts.rollout_workflow_fleet.remote_names",
+            side_effect=[set(), set()],
+        ), patch(
+            "scripts.rollout_workflow_fleet.prepare_repository",
+            side_effect=[first, second, prepared],
+        ), patch(
+            "scripts.rollout_workflow_fleet.sync_missing",
+            side_effect=[
+                ({"FIRST_TOKEN"}, ("FIRST_TOKEN",)),
+                ({"FIRST_TOKEN", "SECOND_TOKEN"}, ("SECOND_TOKEN",)),
+            ],
+        ) as sync:
+            result, synced = prepare_with_prerequisites(
+                Path("/tmp/repo"),
+                Path("/tmp/automation"),
+                "v1.35",
+                "owner",
+                "repo",
+                True,
+                False,
+                {"FIRST_TOKEN", "SECOND_TOKEN"},
+            )
+        self.assertIs(prepared, result)
+        self.assertEqual(("FIRST_TOKEN", "SECOND_TOKEN"), synced)
+        self.assertEqual(2, sync.call_count)
 
     def test_release_contract_is_read_from_verified_tag_not_newer_head(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

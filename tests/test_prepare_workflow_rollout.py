@@ -86,6 +86,22 @@ class PrepareWorkflowRolloutTest(unittest.TestCase):
         self.assertNotIn("secrets: inherit", text)
         self.assertEqual(1, result.callers)
 
+    def test_preserves_inline_comment_on_uses_line(self) -> None:
+        p = self.write("caller.yml", """\
+            jobs:
+              call:
+                uses: 'jhw7500/automation/.github/workflows/claude.yml@v1.33' # pinned
+                secrets: inherit
+        """)
+        prepare_repository(
+            self.repo,
+            self.automation,
+            "v1.35",
+            {"CLAUDE_CODE_OAUTH_TOKEN"},
+            set(),
+        )
+        self.assertIn("claude.yml@v1.35' # pinned", p.read_text())
+
     def test_app_id_and_private_key_are_mapped_only_when_app_id_variable_exists(self) -> None:
         p = self.write("gemini.yml", """\
             jobs:
@@ -176,6 +192,28 @@ class PrepareWorkflowRolloutTest(unittest.TestCase):
         config = (self.repo / ".github/workflow-config.yml").read_text()
         self.assertIn("automation_ref: v1.35", config)
         self.assertIn("custom:\n    enabled: true", config)
+
+    def test_updates_commented_config_ref_without_duplicate_key(self) -> None:
+        config_path = self.repo / ".github/workflow-config.yml"
+        config_path.write_text(
+            "automation_ref: v1.33  # pinned by fleet\nworkflows:\n  custom:\n    enabled: true\n"
+        )
+        self.write("caller.yml", """\
+            jobs:
+              call:
+                uses: jhw7500/automation/.github/workflows/claude.yml@v1.33
+                secrets: inherit
+        """)
+        prepare_repository(
+            self.repo,
+            self.automation,
+            "v1.35",
+            {"CLAUDE_CODE_OAUTH_TOKEN"},
+            set(),
+        )
+        config = config_path.read_text()
+        self.assertEqual(1, config.count("automation_ref:"))
+        self.assertIn("automation_ref: v1.35  # pinned by fleet", config)
 
 
 if __name__ == "__main__":

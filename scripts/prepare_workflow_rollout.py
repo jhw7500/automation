@@ -18,11 +18,14 @@ import yaml
 
 
 USE_RE = re.compile(
-    r"^(?P<indent> +)uses:\s*['\"]?"
+    r"^(?P<indent> +)uses:\s*(?P<quote>['\"]?)"
     r"jhw7500/automation/\.github/workflows/(?P<workflow>[^@\s'\"]+)@"
-    r"(?P<ref>[^\s'\"]+)['\"]?\s*$"
+    r"(?P<ref>[^\s'\"]+)(?P=quote)(?P<suffix>\s*(?:#.*)?)$"
 )
-CONFIG_REF_RE = re.compile(r"(?m)^(automation_ref:\s*)\S+\s*$")
+CONFIG_REF_RE = re.compile(
+    r"(?m)^(?P<prefix>automation_ref:[ \t]*)\S+"
+    r"(?P<suffix>[ \t]*(?:#.*)?)$"
+)
 GEMINI_AUTH_SECRETS = {"APP_PRIVATE_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"}
 
 
@@ -87,7 +90,7 @@ def leading_spaces(line: str) -> int:
 def block_end(lines: list[str], start: int, parent_indent: int) -> int:
     for index in range(start + 1, len(lines)):
         stripped = lines[index].strip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped:
             continue
         if leading_spaces(lines[index]) <= parent_indent:
             return index
@@ -137,11 +140,12 @@ def replace_job_segment(
     if use_match is None:
         raise RolloutError("internal error: reusable workflow use line not found")
     newline = "\n" if segment[0].endswith("\n") else ""
-    segment[0] = re.sub(
-        r"(@)[^\s'\"]+(['\"]?\s*)$",
-        lambda match: match.group(1) + new_ref + match.group(2),
-        segment[0].rstrip("\n"),
-    ) + newline
+    quote = use_match.group("quote")
+    suffix = use_match.group("suffix")
+    segment[0] = (
+        f"{indent}uses: {quote}jhw7500/automation/.github/workflows/"
+        f"{use_match.group('workflow')}@{new_ref}{quote}{suffix}{newline}"
+    )
 
     width = len(indent)
     secret_index = None
@@ -197,6 +201,24 @@ def transform_workflow(
         if match is not None:
             uses.append((index, match))
 
+    workflow = load_yaml(path)
+    jobs = workflow.get("jobs", {})
+    yaml_callers = 0
+    if isinstance(jobs, dict):
+        for job in jobs.values():
+            if not isinstance(job, dict):
+                continue
+            use = job.get("uses")
+            if isinstance(use, str) and re.fullmatch(
+                r"jhw7500/automation/\.github/workflows/[^@\s]+@[^\s]+", use
+            ):
+                yaml_callers += 1
+    if yaml_callers != len(uses):
+        raise RolloutError(
+            f"{path.name}: found {yaml_callers} YAML caller(s) but "
+            f"can safely rewrite only {len(uses)}"
+        )
+
     required: set[str] = set()
     for index, match in reversed(uses):
         indent = match.group("indent")
@@ -242,8 +264,17 @@ def prepare_repository(
     config = repo / ".github/workflow-config.yml"
     if config.is_file():
         old_config = config.read_text(encoding="utf-8")
-        if CONFIG_REF_RE.search(old_config):
-            new_config = CONFIG_REF_RE.sub(rf"\g<1>{new_ref}", old_config, count=1)
+        matches = list(CONFIG_REF_RE.finditer(old_config))
+        if len(matches) > 1:
+            raise RolloutError(f"duplicate automation_ref keys: {config}")
+        if matches:
+            new_config = CONFIG_REF_RE.sub(
+                lambda match: (
+                    match.group("prefix") + new_ref + match.group("suffix")
+                ),
+                old_config,
+                count=1,
+            )
         else:
             new_config = f"automation_ref: {new_ref}\n" + old_config
     else:
