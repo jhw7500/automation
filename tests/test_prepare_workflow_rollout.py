@@ -260,6 +260,26 @@ class PrepareWorkflowRolloutTest(unittest.TestCase):
             permissions,
         )
 
+    def test_opencode_caller_permissions_are_inserted_when_absent(self) -> None:
+        p = self.write("opencode-auto-review.yml", """\
+            jobs:
+              call:
+                uses: jhw7500/automation/.github/workflows/opencode-auto-review.yml@v1.35
+                secrets: inherit
+        """)
+        prepare_repository(
+            self.repo,
+            self.automation,
+            "v1.36",
+            {"ZHIPU_API_KEY"},
+            set(),
+        )
+        workflow = yaml.load(p.read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(
+            {"contents": "read", "pull-requests": "write", "issues": "write"},
+            workflow["jobs"]["call"]["permissions"],
+        )
+
     def test_secretless_workflow_removes_inherit(self) -> None:
         p = self.write("notice.yml", """\
             jobs:
