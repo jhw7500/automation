@@ -81,7 +81,7 @@ ZHIPU_API_KEY=... python3 scripts/rollout_workflow_fleet.py \
 `plan`과 `prepare`에서는 `--sync-missing-secrets`를 지정할 수 없으며 parser가 즉시
 거부한다. 실제 repository secret write는 `publish + --sync-missing-secrets +
 --confirm` 조합에서만 가능하다. `--refresh-secret`은 기존 secret도 의도적으로 덮어쓰므로
-대상 저장소를 `--repo`로 좁혀 실행하는 것을 권장한다.
+실수로 전체 fleet를 덮어쓰지 않도록 하나 이상의 대상 `--repo`를 반드시 지정해야 한다.
 
 각 실행은 `rollout-manifest.json`에 base/head/PR/blocked 결과를 남긴다. 한 저장소가
 blocked여도 다른 저장소의 준비는 계속하지만 명령은 non-zero로 끝난다.

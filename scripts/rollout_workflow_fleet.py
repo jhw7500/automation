@@ -475,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--refresh-secret requires --mode publish and --sync-missing-secrets"
         )
+    if args.refresh_secret and not args.repo:
+        parser.error("--refresh-secret requires at least one explicit --repo")
     invalid_env_names = [
         name for name in args.allow_env_secret if re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None
     ]
