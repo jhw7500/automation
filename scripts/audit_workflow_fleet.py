@@ -11,8 +11,8 @@ import sys
 import yaml
 
 
-AUTOMATION_USE = re.compile(
-    r"jhw7500/automation/\.github/(?:workflows|actions)/([^@\s'\"]+)@([^\s'\"]+)"
+AUTOMATION_WORKFLOW_USE = re.compile(
+    r"jhw7500/automation/\.github/workflows/([^@\s'\"]+)@([^\s'\"]+)"
 )
 
 
@@ -61,7 +61,7 @@ def audit_repository(repo: Path, automation: Path) -> list[str]:
         relative = path.relative_to(repo)
         text = path.read_text(encoding="utf-8")
         for lineno, line in enumerate(text.splitlines(), 1):
-            for match in AUTOMATION_USE.finditer(line):
+            for match in AUTOMATION_WORKFLOW_USE.finditer(line):
                 actual_ref = match.group(2)
                 if expected_ref is not None and actual_ref != expected_ref:
                     issues.append(
@@ -78,8 +78,8 @@ def audit_repository(repo: Path, automation: Path) -> list[str]:
             use = job.get("uses")
             if not isinstance(use, str):
                 continue
-            match = AUTOMATION_USE.fullmatch(use.strip("'\""))
-            if match is None or "/workflows/" not in use:
+            match = AUTOMATION_WORKFLOW_USE.fullmatch(use.strip("'\""))
+            if match is None:
                 continue
             filename = match.group(1)
             contract = workflow_contract(automation, filename)
@@ -104,6 +104,17 @@ def audit_repository(repo: Path, automation: Path) -> list[str]:
                 issues.append(f"{location}: missing required secrets: {', '.join(missing)}")
             if unknown:
                 issues.append(f"{location}: undeclared secret mapping: {', '.join(unknown)}")
+            for name, value in passed.items():
+                if name not in declared or not isinstance(value, str):
+                    continue
+                expected_source = re.compile(
+                    rf"^\$\{{\{{\s*secrets\.{re.escape(name)}\s*\}}\}}$"
+                )
+                if expected_source.fullmatch(value) is None:
+                    issues.append(
+                        f"{location}: secret source mismatch for {name}; "
+                        f"expected secrets.{name}"
+                    )
     return issues
 
 

@@ -49,6 +49,15 @@ EXPECTED_REQUIRED = {
     "opencode.yml": {"ZHIPU_API_KEY": True},
 }
 
+APP_TOKEN_WORKFLOWS = {
+    "gemini-chat.yml",
+    "gemini-dispatch.yml",
+    "gemini-invoke.yml",
+    "gemini-review.yml",
+    "gemini-scheduled-triage.yml",
+    "gemini-triage.yml",
+}
+
 
 def load_workflow(path: Path) -> dict:
     return yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
@@ -81,6 +90,31 @@ class WorkflowSecretContractsTest(unittest.TestCase):
                 if "secrets.GITHUB_TOKEN" in line:
                     offenders.append(f"{path.name}:{lineno}")
         self.assertEqual([], offenders)
+
+    def test_opencode_auto_review_cannot_mint_an_oidc_app_token(self) -> None:
+        path = WORKFLOWS / "opencode-auto-review.yml"
+        workflow = load_workflow(path)
+        job = workflow["jobs"]["opencode-review"]
+        permissions = job["permissions"]
+        self.assertNotIn("id-token", permissions)
+
+        run_step = next(
+            step for step in job["steps"] if step.get("name") == "Run OpenCode PR review"
+        )
+        self.assertEqual("true", run_step["with"]["use_github_token"])
+        self.assertEqual("${{ github.token }}", run_step["env"]["GITHUB_TOKEN"])
+
+    def test_app_token_workflows_accept_an_explicit_app_id_with_legacy_fallback(self) -> None:
+        for filename in APP_TOKEN_WORKFLOWS:
+            with self.subTest(workflow=filename):
+                path = WORKFLOWS / filename
+                workflow = load_workflow(path)
+                app_id = workflow["on"]["workflow_call"]["inputs"]["app_id"]
+                self.assertEqual("string", app_id["type"])
+                self.assertEqual("false", app_id["required"])
+                self.assertEqual("", app_id["default"])
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("inputs.app_id || vars.APP_ID", text)
 
 
 if __name__ == "__main__":

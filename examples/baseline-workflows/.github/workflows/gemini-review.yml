@@ -33,6 +33,7 @@ jobs:
       issue_title: ${{ inputs.issue_title }}
       issue_body: ${{ inputs.issue_body }}
       additional_context: ${{ inputs.additional_context }}
+      app_id: ${{ vars.APP_ID }}
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

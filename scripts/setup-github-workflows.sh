@@ -206,7 +206,9 @@ for repo in "${TARGET_REPOS[@]}"; do
                     cp "$SRC" "$REPO_PATH/.github/workflows/$wf"
                     # automation ref를 config의 automation_ref로 정규화
                     # (템플릿 파일의 버전과 무관하게 automation_ref를 단일 소스로)
-                    sed -i -E "s#(jhw7500/automation/\.github/(workflows|actions)/[^@[:space:]]+@)v[0-9.]+#\1${AUTOMATION_REF}#g" "$REPO_PATH/.github/workflows/$wf"
+                    # Reusable workflows follow automation_ref. Composite actions have
+                    # their own release line (for example check-workflow-enabled@v1.1).
+                    sed -i -E "s#(jhw7500/automation/\.github/workflows/[^@[:space:]]+@)v[0-9.]+#\1${AUTOMATION_REF}#g" "$REPO_PATH/.github/workflows/$wf"
                     echo "  워크플로우: $wf ($AUTOMATION_REF)"
                 else
                     echo "  WARN: 템플릿 없음 $wf"

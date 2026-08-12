@@ -61,6 +61,7 @@ jobs:
       issue_title: ${{ needs.prepare.outputs.pr_title }}
       issue_body: ${{ needs.prepare.outputs.pr_body }}
       additional_context: ${{ inputs.additional_context }}
+      app_id: ${{ vars.APP_ID }}
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

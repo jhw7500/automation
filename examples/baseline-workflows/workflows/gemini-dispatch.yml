@@ -27,6 +27,8 @@ jobs:
       id-token: 'write'
       issues: 'write'
       pull-requests: 'write'
+    with:
+      app_id: ${{ vars.APP_ID }}
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

@@ -5,14 +5,15 @@ from pathlib import Path
 import json
 import re
 import shutil
+import sys
 import tempfile
 import textwrap
 import unittest
 
-from scripts.audit_workflow_fleet import audit_repository
-
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.audit_workflow_fleet import audit_repository
 
 
 class AuditWorkflowFleetTest(unittest.TestCase):
@@ -90,6 +91,35 @@ class AuditWorkflowFleetTest(unittest.TestCase):
         self.assertTrue(any("missing required" in issue for issue in issues), issues)
         self.assertTrue(any("undeclared secret" in issue for issue in issues), issues)
 
+    def test_reports_secret_mapping_from_wrong_source(self) -> None:
+        self.write_caller(
+            """\
+            jobs:
+              call:
+                uses: jhw7500/automation/.github/workflows/demo.yml@v1.35
+                secrets:
+                  TOKEN: ${{ secrets.SUBMODULE_TOKEN }}
+            """
+        )
+        issues = audit_repository(self.repo, self.automation)
+        self.assertTrue(any("source mismatch" in issue for issue in issues), issues)
+
+    def test_does_not_compare_direct_action_ref_to_workflow_release_ref(self) -> None:
+        self.write_caller(
+            """\
+            jobs:
+              local:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1.1
+              call:
+                uses: jhw7500/automation/.github/workflows/demo.yml@v1.35
+                secrets:
+                  TOKEN: ${{ secrets.TOKEN }}
+            """
+        )
+        self.assertEqual([], audit_repository(self.repo, self.automation))
+
     def test_active_baseline_templates_match_central_contracts_and_config(self) -> None:
         template = ROOT / "examples" / "baseline-workflows"
         materialized = self.root / "baseline-consumer"
@@ -111,6 +141,27 @@ class AuditWorkflowFleetTest(unittest.TestCase):
             if re.search(r"secrets:\s*['\"]?inherit", path.read_text(encoding="utf-8")):
                 inherited.append(str(path.relative_to(template)))
         self.assertEqual([], inherited)
+
+        app_id_missing = []
+        for path in template.rglob("gemini-*.yml"):
+            text = path.read_text(encoding="utf-8")
+            if "APP_PRIVATE_KEY:" in text and "app_id: ${{ vars.APP_ID }}" not in text:
+                app_id_missing.append(str(path.relative_to(template)))
+        self.assertEqual([], app_id_missing)
+
+    def test_distribution_only_rewrites_workflow_refs_and_rejects_zero_rewrites(self) -> None:
+        setup = (ROOT / "scripts" / "setup-github-workflows.sh").read_text()
+        self.assertNotIn("(workflows|actions)", setup)
+
+        for relative in (
+            "examples/baseline-workflows/workflows/bump-automation-ref.yml",
+            "examples/baseline-workflows/.github/workflows/bump-automation-ref.yml",
+        ):
+            with self.subTest(path=relative):
+                bump = (ROOT / relative).read_text()
+                self.assertNotIn("(?:workflows|actions)", bump)
+                self.assertIn("if changed_files == 0:", bump)
+                self.assertIn("raise SystemExit", bump)
 
 
 def load_config_ref(path: Path) -> str:

@@ -86,7 +86,7 @@ jobs:
         uses: anomalyco/opencode/github@bbc7bdb3fd5078d0add23273e0fdae436b9b47e4 # v1.1.43
         env:
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           use_github_token: true
           model: zai-coding-plan/glm-4.7

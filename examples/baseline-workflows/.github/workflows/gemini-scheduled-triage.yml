@@ -11,6 +11,8 @@ jobs:
       issues: write
       pull-requests: write
     uses: jhw7500/automation/.github/workflows/gemini-scheduled-triage.yml@v1.35
+    with:
+      app_id: ${{ vars.APP_ID }}
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
