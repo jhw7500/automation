@@ -111,6 +111,14 @@ class WorkflowSecretContractsTest(unittest.TestCase):
         self.assertEqual("true", run_step["with"]["use_github_token"])
         self.assertEqual("${{ github.token }}", run_step["env"]["GITHUB_TOKEN"])
 
+    def test_opencode_auto_review_keeps_read_only_checkout_auth_for_private_repos(self) -> None:
+        workflow = load_workflow(WORKFLOWS / "opencode-auto-review.yml")
+        job = workflow["jobs"]["opencode-review"]
+        checkout = next(
+            step for step in job["steps"] if step.get("name") == "Checkout repository"
+        )
+        self.assertEqual("true", checkout["with"]["persist-credentials"])
+
     def test_app_token_workflows_accept_an_explicit_app_id_with_legacy_fallback(self) -> None:
         for filename in APP_TOKEN_WORKFLOWS:
             with self.subTest(workflow=filename):

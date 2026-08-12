@@ -38,6 +38,10 @@ jobs:
       pull-requests: write
       issues: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
       - name: Run OpenCode PR review
         env:
           GITHUB_TOKEN: ${{ github.token }}

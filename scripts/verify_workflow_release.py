@@ -75,6 +75,9 @@ def verify_tag_content(repo: Path, ref: str) -> None:
     try:
         job = auto["jobs"]["opencode-review"]
         permissions = job["permissions"]
+        checkout = next(
+            item for item in job["steps"] if item.get("name") == "Checkout repository"
+        )
         step = next(
             item for item in job["steps"] if item.get("name") == "Run OpenCode PR review"
         )
@@ -88,6 +91,10 @@ def verify_tag_content(repo: Path, ref: str) -> None:
     if permissions != expected_permissions:
         raise ReleaseVerificationError(
             f"OpenCode auto review permissions differ from {expected_permissions}"
+        )
+    if checkout.get("with", {}).get("persist-credentials") != "true":
+        raise ReleaseVerificationError(
+            "OpenCode auto review cannot authenticate private repository fetch"
         )
     if step.get("with", {}).get("use_github_token") != "true":
         raise ReleaseVerificationError("OpenCode auto review does not force use_github_token")

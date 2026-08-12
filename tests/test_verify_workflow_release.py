@@ -32,6 +32,10 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
                       pull-requests: write
                       issues: write
                     steps:
+                      - name: Checkout repository
+                        uses: actions/checkout@v4
+                        with:
+                          persist-credentials: true
                       - name: Run OpenCode PR review
                         env:
                           GITHUB_TOKEN: ${{ github.token }}
@@ -93,6 +97,21 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
         bad_commit = self.git("rev-parse", "HEAD").strip()
         self.git("tag", "-a", "v1.35", "-m", "bad")
         with self.assertRaisesRegex(ReleaseVerificationError, "permissions"):
+            verify_release(self.repo, "v1.35", bad_commit)
+
+    def test_rejects_opencode_release_without_private_repo_fetch_auth(self) -> None:
+        self.git("tag", "-d", "v1.35")
+        path = self.repo / ".github/workflows/opencode-auto-review.yml"
+        path.write_text(
+            path.read_text().replace(
+                "persist-credentials: true", "persist-credentials: false"
+            )
+        )
+        self.git("add", ".")
+        self.git("commit", "-qm", "break private fetch")
+        bad_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-a", "v1.35", "-m", "bad")
+        with self.assertRaisesRegex(ReleaseVerificationError, "private repository fetch"):
             verify_release(self.repo, "v1.35", bad_commit)
 
 
