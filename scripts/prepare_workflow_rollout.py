@@ -110,25 +110,20 @@ def secret_names_for(
     selected = contract.declared & available_secrets
     has_gemini_auth_contract = GEMINI_AUTH_SECRETS <= contract.declared
     app_enabled = "APP_ID" in available_variables
-    if "APP_PRIVATE_KEY" in contract.declared:
-        if app_enabled and "APP_PRIVATE_KEY" not in available_secrets:
-            raise SecretPrerequisiteError(
-                f"{filename}: APP_ID exists but APP_PRIVATE_KEY is missing",
-                {"APP_PRIVATE_KEY"},
-            )
-        if not app_enabled:
-            selected.discard("APP_PRIVATE_KEY")
+    usable_app = app_enabled and "APP_PRIVATE_KEY" in available_secrets
+    if "APP_PRIVATE_KEY" in contract.declared and not usable_app:
+        selected.discard("APP_PRIVATE_KEY")
 
     if has_gemini_auth_contract:
         usable_api_key = bool({"GEMINI_API_KEY", "GOOGLE_API_KEY"} & available_secrets)
-        usable_app = app_enabled and "APP_PRIVATE_KEY" in available_secrets
         if not (usable_api_key or usable_app):
+            missing = {"APP_PRIVATE_KEY"} if app_enabled else {"GEMINI_API_KEY"}
             raise SecretPrerequisiteError(
                 f"{filename}: no usable Gemini authentication path",
-                {"GEMINI_API_KEY"},
+                missing,
             )
 
-    return sorted(selected), contract.has_app_id and app_enabled
+    return sorted(selected), contract.has_app_id and usable_app
 
 
 def replace_job_segment(

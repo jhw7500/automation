@@ -17,7 +17,9 @@ repository secret 전제조건을 한 실행에서 조율한다. GitHub는 Git P
 
 - 이미 존재하는 repository secret은 값을 읽거나 다시 쓰지 않는다.
 - `CLAUDE_CODE_OAUTH_TOKEN` 누락 시에만 `~/.claude/.credentials.json`을 source로 쓸 수 있다.
-- 그 외 누락 secret은 같은 이름의 환경변수가 있을 때만 쓸 수 있다.
+- 그 외 누락 secret은 같은 이름의 환경변수가 있고 `--allow-env-secret NAME`으로
+  그 이름을 이번 실행에 명시 승인했을 때만 쓸 수 있다. 승인된 이름은 값 없이
+  preflight 출력에 표시된다.
 - `--sync-missing-secrets`가 없으면 이름 검사만 하며 어떠한 secret도 쓰지 않는다.
 - 개인 Claude OAuth token fan-out은 추가로 `--allow-personal-oauth-fanout`을 명시해야
   한다. 이 옵션은 저장소마다 자격증명을 복제해 blast radius를 넓히므로, 이미 배포된
@@ -50,6 +52,7 @@ python3 scripts/rollout_workflow_fleet.py \
   --mode publish \
   --sync-missing-secrets \
   --allow-personal-oauth-fanout \
+  --allow-env-secret GEMINI_API_KEY \
   --confirm \
   --actionlint /path/to/actionlint
 ```

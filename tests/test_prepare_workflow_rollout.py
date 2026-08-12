@@ -106,6 +106,25 @@ class PrepareWorkflowRolloutTest(unittest.TestCase):
         self.assertIn("GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}", text)
         self.assertNotIn("GOOGLE_API_KEY:", text)
 
+    def test_app_id_without_private_key_uses_available_api_key_path(self) -> None:
+        p = self.write("gemini.yml", """\
+            jobs:
+              call:
+                uses: jhw7500/automation/.github/workflows/gemini.yml@v1.32
+                secrets: inherit
+        """)
+        prepare_repository(
+            self.repo,
+            self.automation,
+            "v1.35",
+            {"GEMINI_API_KEY"},
+            {"APP_ID"},
+        )
+        text = p.read_text()
+        self.assertNotIn("app_id:", text)
+        self.assertNotIn("APP_PRIVATE_KEY:", text)
+        self.assertIn("GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}", text)
+
     def test_optional_auth_requires_at_least_one_usable_gemini_path(self) -> None:
         self.write("gemini.yml", """\
             jobs:

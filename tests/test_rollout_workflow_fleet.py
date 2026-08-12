@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.rollout_workflow_fleet import (
+    CommandError,
+    default_branch,
     main,
     materialize_release_contract,
     publish_repository,
@@ -68,6 +70,22 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
                 "test-token", secret_source("CLAUDE_CODE_OAUTH_TOKEN", True)
             )
 
+    def test_ambient_environment_secret_requires_name_allowlist(self) -> None:
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "personal-key"}):
+            self.assertIsNone(secret_source("GEMINI_API_KEY", False, set()))
+            self.assertEqual(
+                "personal-key",
+                secret_source("GEMINI_API_KEY", False, {"GEMINI_API_KEY"}),
+            )
+
+    def test_missing_default_branch_becomes_a_command_error(self) -> None:
+        with patch(
+            "scripts.rollout_workflow_fleet.gh_json",
+            return_value={"defaultBranchRef": None},
+        ):
+            with self.assertRaisesRegex(CommandError, "default branch is unavailable"):
+                default_branch("owner", "empty-repo")
+
     def test_sync_missing_passes_secret_via_stdin_and_never_argv(self) -> None:
         calls: list[tuple[list[str], str | None]] = []
 
@@ -79,7 +97,7 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             "scripts.rollout_workflow_fleet.secret_source", return_value="sensitive-value"
         ), patch("scripts.rollout_workflow_fleet.run", side_effect=fake_run):
             available, synced = sync_missing(
-                "owner", "repo", {"TOKEN"}, True, False
+                "owner", "repo", {"TOKEN"}, True, False, {"TOKEN"}
             )
         self.assertEqual({"TOKEN"}, available)
         self.assertEqual(("TOKEN",), synced)

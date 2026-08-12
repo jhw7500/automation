@@ -1,0 +1,31 @@
+name: Test Fleet Tools
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/*.py'
+      - 'tests/*.py'
+      - '.github/workflows/test-fleet-tools.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/*.py'
+      - 'tests/*.py'
+      - '.github/workflows/test-fleet-tools.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install pytest PyYAML
+      - name: Run tests
+        run: pytest -q

@@ -74,18 +74,39 @@ def gh_json(args: list[str]) -> object:
 
 def default_branch(owner: str, repo: str) -> str:
     data = gh_json(["repo", "view", f"{owner}/{repo}", "--json", "defaultBranchRef"])
-    return data["defaultBranchRef"]["name"]  # type: ignore[index]
+    if not isinstance(data, dict):
+        raise CommandError(f"{owner}/{repo}: unexpected repository metadata")
+    branch = data.get("defaultBranchRef")
+    if not isinstance(branch, dict) or not isinstance(branch.get("name"), str):
+        raise CommandError(f"{owner}/{repo}: default branch is unavailable")
+    return branch["name"]
 
 
 def remote_names(owner: str, repo: str, kind: str) -> set[str]:
     data = gh_json([kind, "list", "-R", f"{owner}/{repo}", "--json", "name"])
-    return {item["name"] for item in data}  # type: ignore[union-attr]
+    if not isinstance(data, list):
+        raise CommandError(f"{owner}/{repo}: unexpected {kind} inventory")
+    names: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise CommandError(f"{owner}/{repo}: malformed {kind} inventory item")
+        names.add(item["name"])
+    return names
 
 
-def secret_source(name: str, allow_personal_oauth_fanout: bool = False) -> str | None:
-    if name == "CLAUDE_CODE_OAUTH_TOKEN" and not allow_personal_oauth_fanout:
-        return None
-    value = os.environ.get(name)
+def secret_source(
+    name: str,
+    allow_personal_oauth_fanout: bool = False,
+    allowed_env_secrets: set[str] | None = None,
+) -> str | None:
+    if name == "CLAUDE_CODE_OAUTH_TOKEN":
+        if not allow_personal_oauth_fanout:
+            return None
+        value = os.environ.get(name)
+        if value:
+            return value
+    allowed_env_secrets = allowed_env_secrets or set()
+    value = os.environ.get(name) if name in allowed_env_secrets else None
     if value:
         return value
     if name != "CLAUDE_CODE_OAUTH_TOKEN":
@@ -173,12 +194,17 @@ def sync_missing(
     missing: set[str],
     enabled: bool,
     allow_personal_oauth_fanout: bool,
+    allowed_env_secrets: set[str],
 ) -> tuple[set[str], tuple[str, ...]]:
     available = remote_names(owner, repo, "secret")
     synced: list[str] = []
     for name in sorted(missing - available):
         value = (
-            secret_source(name, allow_personal_oauth_fanout) if enabled else None
+            secret_source(
+                name, allow_personal_oauth_fanout, allowed_env_secrets
+            )
+            if enabled
+            else None
         )
         if value is None:
             continue
@@ -199,6 +225,7 @@ def prepare_with_prerequisites(
     repo: str,
     sync_missing_enabled: bool,
     allow_personal_oauth_fanout: bool,
+    allowed_env_secrets: set[str],
 ) -> tuple[object, tuple[str, ...]]:
     secrets = remote_names(owner, repo, "secret")
     variables = remote_names(owner, repo, "variable")
@@ -213,6 +240,7 @@ def prepare_with_prerequisites(
             candidates,
             enabled=sync_missing_enabled,
             allow_personal_oauth_fanout=allow_personal_oauth_fanout,
+            allowed_env_secrets=allowed_env_secrets,
         )
         return prepare_repository(repo_path, automation, ref, secrets, variables), synced
 
@@ -353,6 +381,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="explicitly allow ~/.claude OAuth token to fill missing repository secrets",
     )
+    parser.add_argument(
+        "--allow-env-secret",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="allow this exact environment variable as a missing-secret source",
+    )
     parser.add_argument("--actionlint", type=Path)
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--manifest", type=Path)
@@ -378,6 +413,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--sync-missing-secrets is allowed only in --mode publish")
     if args.allow_personal_oauth_fanout and not args.sync_missing_secrets:
         parser.error("--allow-personal-oauth-fanout requires --sync-missing-secrets")
+    if args.allow_env_secret and not args.sync_missing_secrets:
+        parser.error("--allow-env-secret requires --sync-missing-secrets")
+    invalid_env_names = [
+        name for name in args.allow_env_secret if re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None
+    ]
+    if invalid_env_names:
+        parser.error(f"invalid secret environment names: {', '.join(invalid_env_names)}")
 
     marker = args.workspace / ".automation-fleet-workspace"
     if not marker.is_file():
@@ -393,6 +435,12 @@ def main(argv: list[str] | None = None) -> int:
         automation, args.ref
     )
     branch = rollout_branch(args.ref)
+    allowed_env_secrets = set(args.allow_env_secret)
+    if allowed_env_secrets:
+        print(
+            "ALLOWED ENV SECRET SOURCES: "
+            + ", ".join(sorted(allowed_env_secrets))
+        )
     try:
         for name in repos:
             try:
@@ -400,44 +448,47 @@ def main(argv: list[str] | None = None) -> int:
                 repo, base = clone_or_reset(
                     args.workspace, owner, name, default, branch
                 )
-                target = repo
                 preview = None
-                if args.mode == "plan":
-                    preview = preview_copy(repo)
-                    target = Path(preview.name)
-                result, synced = prepare_with_prerequisites(
-                    target,
-                    contract_source,
-                    args.ref,
-                    owner,
-                    name,
-                    args.sync_missing_secrets and args.mode == "publish",
-                    args.allow_personal_oauth_fanout,
-                )
-                if result.callers == 0:
-                    outcomes.append(RepoOutcome(name, "skipped", "no existing central callers", base))
-                elif not result.changed_files:
-                    outcomes.append(RepoOutcome(name, "current", "already matches contract", base))
-                else:
-                    validate_repository(
+                try:
+                    target = repo
+                    if args.mode == "plan":
+                        preview = preview_copy(repo)
+                        target = Path(preview.name)
+                    result, synced = prepare_with_prerequisites(
                         target,
                         contract_source,
-                        args.actionlint,
-                        baseline_repo=repo if args.mode == "plan" else None,
+                        args.ref,
+                        owner,
+                        name,
+                        args.sync_missing_secrets and args.mode == "publish",
+                        args.allow_personal_oauth_fanout,
+                        allowed_env_secrets,
                     )
-                    if args.mode == "publish":
-                        head, url = publish_repository(
-                            repo, owner, name, default, args.ref, branch
-                        )
-                        outcomes.append(
-                            RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, synced)
-                        )
+                    if result.callers == 0:
+                        outcomes.append(RepoOutcome(name, "skipped", "no existing central callers", base))
+                    elif not result.changed_files:
+                        outcomes.append(RepoOutcome(name, "current", "already matches contract", base))
                     else:
-                        outcomes.append(
-                            RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=synced)
+                        validate_repository(
+                            target,
+                            contract_source,
+                            args.actionlint,
+                            baseline_repo=repo if args.mode == "plan" else None,
                         )
-                if preview is not None:
-                    preview.cleanup()
+                        if args.mode == "publish":
+                            head, url = publish_repository(
+                                repo, owner, name, default, args.ref, branch
+                            )
+                            outcomes.append(
+                                RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, synced)
+                            )
+                        else:
+                            outcomes.append(
+                                RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=synced)
+                            )
+                finally:
+                    if preview is not None:
+                        preview.cleanup()
             except (CommandError, RolloutError, OSError, json.JSONDecodeError) as exc:
                 outcomes.append(RepoOutcome(name, "blocked", str(exc)))
     finally:
