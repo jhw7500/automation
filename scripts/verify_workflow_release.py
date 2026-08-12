@@ -80,8 +80,15 @@ def verify_tag_content(repo: Path, ref: str) -> None:
         )
     except (KeyError, TypeError, StopIteration) as exc:
         raise ReleaseVerificationError("OpenCode security structure is missing") from exc
-    if "id-token" in permissions:
-        raise ReleaseVerificationError("OpenCode auto review grants id-token permission")
+    expected_permissions = {
+        "contents": "read",
+        "pull-requests": "write",
+        "issues": "write",
+    }
+    if permissions != expected_permissions:
+        raise ReleaseVerificationError(
+            f"OpenCode auto review permissions differ from {expected_permissions}"
+        )
     if step.get("with", {}).get("use_github_token") != "true":
         raise ReleaseVerificationError("OpenCode auto review does not force use_github_token")
     if step.get("env", {}).get("GITHUB_TOKEN") != "${{ github.token }}":

@@ -47,7 +47,46 @@ def workflow_contract(automation: Path, filename: str) -> tuple[set[str], set[st
     return declared, required
 
 
-def audit_repository(repo: Path, automation: Path) -> list[str]:
+def audit_template_contract(repo: Path, template: Path) -> list[str]:
+    issues: list[str] = []
+    target_dir = repo / ".github" / "workflows"
+    for canonical_path in sorted(template.glob("*.y*ml")):
+        target_path = target_dir / canonical_path.name
+        location = f".github/workflows/{canonical_path.name}"
+        if not target_path.is_file():
+            issues.append(f"{location}: managed caller missing")
+            continue
+        canonical = load_yaml(canonical_path)
+        target = load_yaml(target_path)
+        if canonical.get("on") != target.get("on"):
+            issues.append(f"{location}: trigger drift from managed template")
+
+        canonical_jobs = canonical.get("jobs", {})
+        target_jobs = target.get("jobs", {})
+        if not isinstance(canonical_jobs, dict) or not isinstance(target_jobs, dict):
+            continue
+        for job_name, canonical_job in canonical_jobs.items():
+            if not isinstance(canonical_job, dict):
+                continue
+            use = canonical_job.get("uses")
+            if not isinstance(use, str) or AUTOMATION_WORKFLOW_USE.fullmatch(
+                use.strip("'\"")
+            ) is None:
+                continue
+            target_job = target_jobs.get(job_name)
+            if not isinstance(target_job, dict):
+                issues.append(f"{location}:job {job_name}: managed caller job missing")
+                continue
+            if canonical_job.get("permissions", {}) != target_job.get("permissions", {}):
+                issues.append(
+                    f"{location}:job {job_name}: permissions drift from managed template"
+                )
+    return issues
+
+
+def audit_repository(
+    repo: Path, automation: Path, template: Path | None = None
+) -> list[str]:
     issues: list[str] = []
     expected_ref = configured_ref(repo)
     if expected_ref is None:
@@ -115,6 +154,8 @@ def audit_repository(repo: Path, automation: Path) -> list[str]:
                         f"{location}: secret source mismatch for {name}; "
                         f"expected secrets.{name}"
                     )
+    if template is not None:
+        issues.extend(audit_template_contract(repo, template))
     return issues
 
 
@@ -122,9 +163,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--automation", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument(
+        "--template",
+        type=Path,
+        help="optional managed caller directory for missing/trigger/permission drift checks",
+    )
     args = parser.parse_args(argv)
 
-    issues = audit_repository(args.repo.resolve(), args.automation.resolve())
+    template = args.template.resolve() if args.template is not None else None
+    issues = audit_repository(args.repo.resolve(), args.automation.resolve(), template)
     if issues:
         print(f"FAIL {args.repo}: {len(issues)} issue(s)")
         for issue in issues:

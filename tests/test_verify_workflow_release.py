@@ -30,6 +30,7 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
                     permissions:
                       contents: read
                       pull-requests: write
+                      issues: write
                     steps:
                       - name: Run OpenCode PR review
                         env:
@@ -80,7 +81,18 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
         self.git("commit", "-qm", "insecure")
         bad_commit = self.git("rev-parse", "HEAD").strip()
         self.git("tag", "-a", "v1.35", "-m", "bad")
-        with self.assertRaisesRegex(ReleaseVerificationError, "id-token"):
+        with self.assertRaisesRegex(ReleaseVerificationError, "permissions"):
+            verify_release(self.repo, "v1.35", bad_commit)
+
+    def test_rejects_opencode_release_with_contents_write(self) -> None:
+        self.git("tag", "-d", "v1.35")
+        path = self.repo / ".github/workflows/opencode-auto-review.yml"
+        path.write_text(path.read_text().replace("contents: read", "contents: write"))
+        self.git("add", ".")
+        self.git("commit", "-qm", "write permission")
+        bad_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-a", "v1.35", "-m", "bad")
+        with self.assertRaisesRegex(ReleaseVerificationError, "permissions"):
             verify_release(self.repo, "v1.35", bad_commit)
 
 

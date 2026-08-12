@@ -163,6 +163,36 @@ class AuditWorkflowFleetTest(unittest.TestCase):
                 self.assertIn("if changed_files == 0:", bump)
                 self.assertIn("raise SystemExit", bump)
 
+    def test_optional_template_reports_missing_caller_trigger_and_permission_drift(self) -> None:
+        template = self.root / "templates"
+        template.mkdir()
+        canonical = textwrap.dedent(
+            """\
+            on:
+              pull_request:
+            jobs:
+              call:
+                permissions:
+                  contents: read
+                uses: jhw7500/automation/.github/workflows/demo.yml@v1.35
+                secrets:
+                  TOKEN: ${{ secrets.TOKEN }}
+            """
+        )
+        (template / "caller.yml").write_text(canonical)
+
+        missing = audit_repository(self.repo, self.automation, template=template)
+        self.assertTrue(any("managed caller missing" in issue for issue in missing), missing)
+
+        self.write_caller(
+            canonical.replace("pull_request:", "push:").replace(
+                "contents: read", "contents: write"
+            )
+        )
+        drift = audit_repository(self.repo, self.automation, template=template)
+        self.assertTrue(any("trigger drift" in issue for issue in drift), drift)
+        self.assertTrue(any("permissions drift" in issue for issue in drift), drift)
+
 
 def load_config_ref(path: Path) -> str:
     for line in path.read_text(encoding="utf-8").splitlines():
