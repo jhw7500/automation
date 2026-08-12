@@ -349,6 +349,35 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
         self.assertEqual(("FIRST_TOKEN", "SECOND_TOKEN"), synced)
         self.assertEqual(2, sync.call_count)
 
+    def test_deferred_refresh_secret_is_available_to_prepare_without_early_write(self) -> None:
+        prepared = object()
+        completed: list[str] = []
+        with patch(
+            "scripts.rollout_workflow_fleet.remote_names",
+            side_effect=[set(), set()],
+        ), patch(
+            "scripts.rollout_workflow_fleet.prepare_repository",
+            return_value=prepared,
+        ) as prepare, patch(
+            "scripts.rollout_workflow_fleet.sync_missing"
+        ) as sync:
+            result, synced = prepare_with_prerequisites(
+                Path("/tmp/repo"),
+                Path("/tmp/automation"),
+                "v1.35",
+                "owner",
+                "repo",
+                True,
+                False,
+                {"TOKEN"},
+                {"TOKEN"},
+                completed,
+            )
+        self.assertIs(prepared, result)
+        self.assertEqual((), synced)
+        self.assertEqual({"TOKEN"}, prepare.call_args.args[3])
+        sync.assert_not_called()
+
     def test_release_contract_is_read_from_verified_tag_not_newer_head(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp) / "repo"
@@ -612,7 +641,54 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             self.assertEqual([], manifest[0]["synced_secrets"])
             release_temp.cleanup.assert_called_once()
 
-    def test_main_records_refreshed_secret_when_a_later_step_is_blocked(self) -> None:
+    def test_main_skips_refresh_when_workflows_are_disabled_by_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".automation-fleet-workspace").write_text("managed\n")
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "gh_owner": "owner",
+                        "repos": {"repo": {"workflows": False, "secrets": True}},
+                    }
+                )
+            )
+            release_temp = Mock()
+            with patch(
+                "scripts.rollout_workflow_fleet.materialize_release_contract",
+                return_value=(release_temp, Path("/contract"), "release-sha"),
+            ), patch("scripts.rollout_workflow_fleet.refresh_secrets") as refresh:
+                rc = main(
+                    [
+                        "--automation",
+                        str(ROOT),
+                        "--config",
+                        str(config),
+                        "--workspace",
+                        str(workspace),
+                        "--mode",
+                        "publish",
+                        "--confirm",
+                        "--sync-missing-secrets",
+                        "--allow-env-secret",
+                        "ZHIPU_API_KEY",
+                        "--refresh-secret",
+                        "ZHIPU_API_KEY",
+                        "--repo",
+                        "repo",
+                    ]
+                )
+            self.assertEqual(0, rc)
+            refresh.assert_not_called()
+            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+            self.assertEqual("skipped", manifest[0]["status"])
+            self.assertEqual([], manifest[0]["synced_secrets"])
+            release_temp.cleanup.assert_called_once()
+
+    def test_main_does_not_refresh_secret_when_repository_metadata_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = root / "workspace"
@@ -629,19 +705,12 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             )
             release_temp = Mock()
 
-            def complete_refresh(*args: object) -> tuple[str, ...]:
-                completed = args[-1]
-                self.assertIsInstance(completed, list)
-                completed.append("ZHIPU_API_KEY")  # type: ignore[union-attr]
-                return ("ZHIPU_API_KEY",)
-
             with patch(
                 "scripts.rollout_workflow_fleet.materialize_release_contract",
                 return_value=(release_temp, Path("/contract"), "release-sha"),
             ), patch(
                 "scripts.rollout_workflow_fleet.refresh_secrets",
-                side_effect=complete_refresh,
-            ), patch(
+            ) as refresh, patch(
                 "scripts.rollout_workflow_fleet.default_branch",
                 side_effect=CommandError("metadata unavailable"),
             ):
@@ -668,8 +737,141 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             self.assertEqual(1, rc)
             manifest = json.loads((workspace / "rollout-manifest.json").read_text())
             self.assertEqual("blocked", manifest[0]["status"])
+            self.assertEqual([], manifest[0]["synced_secrets"])
+            refresh.assert_not_called()
+            release_temp.cleanup.assert_called_once()
+
+    def test_main_records_refresh_when_publish_is_blocked_after_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".automation-fleet-workspace").write_text("managed\n")
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "gh_owner": "owner",
+                        "repos": {"repo": {"workflows": True, "secrets": True}},
+                    }
+                )
+            )
+            release_temp = Mock()
+            changed = RolloutResult(
+                1,
+                (Path(".github/workflows/opencode.yml"),),
+                frozenset({"ZHIPU_API_KEY"}),
+            )
+
+            def complete_refresh(*args: object) -> tuple[str, ...]:
+                completed = args[-1]
+                self.assertIsInstance(completed, list)
+                completed.append("ZHIPU_API_KEY")  # type: ignore[union-attr]
+                return ("ZHIPU_API_KEY",)
+
+            with patch(
+                "scripts.rollout_workflow_fleet.materialize_release_contract",
+                return_value=(release_temp, Path("/contract"), "release-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.default_branch", return_value="main"
+            ), patch(
+                "scripts.rollout_workflow_fleet.clone_or_reset",
+                return_value=(Path("/clone/repo"), "base-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
+                return_value=(changed, ()),
+            ), patch(
+                "scripts.rollout_workflow_fleet.validate_repository"
+            ) as validate, patch(
+                "scripts.rollout_workflow_fleet.refresh_secrets",
+                side_effect=complete_refresh,
+            ), patch(
+                "scripts.rollout_workflow_fleet.publish_repository",
+                side_effect=CommandError("push failed"),
+            ):
+                rc = main(
+                    [
+                        "--automation",
+                        str(ROOT),
+                        "--config",
+                        str(config),
+                        "--workspace",
+                        str(workspace),
+                        "--mode",
+                        "publish",
+                        "--confirm",
+                        "--sync-missing-secrets",
+                        "--allow-env-secret",
+                        "ZHIPU_API_KEY",
+                        "--refresh-secret",
+                        "ZHIPU_API_KEY",
+                        "--repo",
+                        "repo",
+                    ]
+                )
+            self.assertEqual(1, rc)
+            validate.assert_called_once()
+            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+            self.assertEqual("blocked", manifest[0]["status"])
             self.assertEqual(["ZHIPU_API_KEY"], manifest[0]["synced_secrets"])
             release_temp.cleanup.assert_called_once()
+
+    def test_main_blocks_refresh_name_not_required_by_managed_callers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".automation-fleet-workspace").write_text("managed\n")
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "gh_owner": "owner",
+                        "repos": {"repo": {"workflows": True, "secrets": True}},
+                    }
+                )
+            )
+            release_temp = Mock()
+            current = RolloutResult(1, (), frozenset())
+            with patch(
+                "scripts.rollout_workflow_fleet.materialize_release_contract",
+                return_value=(release_temp, Path("/contract"), "release-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.default_branch", return_value="main"
+            ), patch(
+                "scripts.rollout_workflow_fleet.clone_or_reset",
+                return_value=(Path("/clone/repo"), "base-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
+                return_value=(current, ()),
+            ), patch(
+                "scripts.rollout_workflow_fleet.refresh_secrets"
+            ) as refresh:
+                rc = main(
+                    [
+                        "--automation",
+                        str(ROOT),
+                        "--config",
+                        str(config),
+                        "--workspace",
+                        str(workspace),
+                        "--mode",
+                        "publish",
+                        "--confirm",
+                        "--sync-missing-secrets",
+                        "--allow-env-secret",
+                        "ZHIPU_API_KEY",
+                        "--refresh-secret",
+                        "ZHIPU_API_KEY",
+                        "--repo",
+                        "repo",
+                    ]
+                )
+            self.assertEqual(1, rc)
+            refresh.assert_not_called()
+            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+            self.assertEqual("blocked", manifest[0]["status"])
+            self.assertIn("not required by managed callers", manifest[0]["detail"])
 
     def test_main_records_partially_synced_secret_when_prepare_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

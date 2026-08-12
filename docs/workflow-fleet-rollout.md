@@ -3,7 +3,8 @@
 `scripts/rollout_workflow_fleet.py`는 중앙 reusable workflow caller와 필요한
 repository secret 전제조건을 한 실행에서 조율한다. GitHub는 Git PR과 secret write를
 하나의 transaction으로 제공하지 않으므로, 도구는 둘을 원자적이라고 주장하지 않는다.
-대신 secret 전제조건을 먼저 통과한 저장소만 독립 branch/PR로 게시한다.
+대신 저장소 metadata와 caller 계약을 준비·검증한 뒤 secret을 쓰고, 검증을 통과한
+저장소만 독립 branch/PR로 게시한다.
 
 ## 보존하는 것
 
@@ -26,6 +27,8 @@ repository secret 전제조건을 한 실행에서 조율한다. GitHub는 Git P
   이 옵션은 `publish + --confirm + --sync-missing-secrets`에서만 허용되고, 같은 이름의
   `--allow-env-secret NAME`(또는 Claude 전용 fan-out 승인)이 반드시 필요하다. 기존 값은
   읽지 않으며 새 값도 argv, 로그, manifest에 기록하지 않는다.
+- refresh 이름은 해당 저장소의 managed caller가 실제 요구하는 secret이어야 하며,
+  metadata/caller/actionlint 검증이 실패하거나 caller가 없으면 값을 쓰지 않는다.
 - 개인 Claude OAuth token fan-out은 추가로 `--allow-personal-oauth-fanout`을 명시해야
   한다. 이 옵션은 저장소마다 자격증명을 복제해 blast radius를 넓히므로, 이미 배포된
   `personal-ops/claude-token-sync`의 대상/rotation 정책을 승인한 운영에서만 사용한다.

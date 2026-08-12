@@ -260,9 +260,11 @@ def prepare_with_prerequisites(
     sync_missing_enabled: bool,
     allow_personal_oauth_fanout: bool,
     allowed_env_secrets: set[str],
+    deferred_secrets: set[str] | None = None,
     completed: list[str] | None = None,
 ) -> tuple[object, tuple[str, ...]]:
-    secrets = remote_names(owner, repo, "secret")
+    deferred_secrets = deferred_secrets or set()
+    secrets = remote_names(owner, repo, "secret") | deferred_secrets
     variables = remote_names(owner, repo, "variable")
     synced_all: list[str] = []
     while True:
@@ -280,6 +282,7 @@ def prepare_with_prerequisites(
                 allowed_env_secrets=allowed_env_secrets,
                 completed=completed,
             )
+            secrets |= deferred_secrets
             synced_all.extend(name for name in synced if name not in synced_all)
             if secrets == previous:
                 raise error
@@ -527,18 +530,12 @@ def main(argv: list[str] | None = None) -> int:
             refreshed_progress: list[str] = []
             synced_progress: list[str] = []
             try:
-                if args.refresh_secret:
-                    if repo_config[name].get("secrets", True) is False:
-                        raise RolloutError(
-                            f"{name}: secret writes are disabled by config"
-                        )
-                    refresh_secrets(
-                        owner,
-                        name,
-                        set(args.refresh_secret),
-                        args.allow_personal_oauth_fanout,
-                        allowed_env_secrets,
-                        refreshed_progress,
+                if (
+                    args.refresh_secret
+                    and repo_config[name].get("secrets", True) is False
+                ):
+                    raise RolloutError(
+                        f"{name}: secret writes are disabled by config"
                     )
                 if repo_config[name].get("workflows", True) is False:
                     outcomes.append(
@@ -546,7 +543,6 @@ def main(argv: list[str] | None = None) -> int:
                             name,
                             "skipped",
                             "workflows disabled by config",
-                            synced_secrets=tuple(refreshed_progress),
                         )
                     )
                     continue
@@ -571,10 +567,8 @@ def main(argv: list[str] | None = None) -> int:
                         and repo_config[name].get("secrets", True) is not False,
                         args.allow_personal_oauth_fanout,
                         allowed_env_secrets,
+                        set(args.refresh_secret),
                         synced_progress,
-                    )
-                    written_secrets = tuple(
-                        dict.fromkeys(refreshed_progress + synced_progress)
                     )
                     if result.callers == 0:
                         outcomes.append(
@@ -583,10 +577,40 @@ def main(argv: list[str] | None = None) -> int:
                                 "skipped",
                                 "no existing central callers",
                                 base,
-                                synced_secrets=written_secrets,
+                                synced_secrets=tuple(synced_progress),
                             )
                         )
-                    elif not result.changed_files:
+                        continue
+                    unrequired_refresh = set(args.refresh_secret) - set(
+                        result.required_secrets
+                    )
+                    if unrequired_refresh:
+                        raise RolloutError(
+                            f"{name}: refresh secrets not required by managed callers: "
+                            + ", ".join(sorted(unrequired_refresh))
+                        )
+                    if result.changed_files:
+                        validate_repository(
+                            target,
+                            contract_source,
+                            args.actionlint,
+                            baseline_repo=repo if args.mode == "plan" else None,
+                        )
+                    if args.refresh_secret:
+                        refresh_names = set(args.refresh_secret) - set(synced_progress)
+                        if refresh_names:
+                            refresh_secrets(
+                                owner,
+                                name,
+                                refresh_names,
+                                args.allow_personal_oauth_fanout,
+                                allowed_env_secrets,
+                                refreshed_progress,
+                            )
+                    written_secrets = tuple(
+                        dict.fromkeys(refreshed_progress + synced_progress)
+                    )
+                    if not result.changed_files:
                         outcomes.append(
                             RepoOutcome(
                                 name,
@@ -597,12 +621,6 @@ def main(argv: list[str] | None = None) -> int:
                             )
                         )
                     else:
-                        validate_repository(
-                            target,
-                            contract_source,
-                            args.actionlint,
-                            baseline_repo=repo if args.mode == "plan" else None,
-                        )
                         if args.mode == "publish":
                             head, url = publish_repository(
                                 repo, owner, name, default, args.ref, branch
