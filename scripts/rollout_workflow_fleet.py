@@ -527,13 +527,12 @@ def main(argv: list[str] | None = None) -> int:
             refreshed_progress: list[str] = []
             synced_progress: list[str] = []
             try:
-                refreshed: tuple[str, ...] = ()
                 if args.refresh_secret:
                     if repo_config[name].get("secrets", True) is False:
                         raise RolloutError(
                             f"{name}: secret writes are disabled by config"
                         )
-                    refreshed = refresh_secrets(
+                    refresh_secrets(
                         owner,
                         name,
                         set(args.refresh_secret),
@@ -541,16 +540,13 @@ def main(argv: list[str] | None = None) -> int:
                         allowed_env_secrets,
                         refreshed_progress,
                     )
-                    refreshed_progress.extend(
-                        item for item in refreshed if item not in refreshed_progress
-                    )
                 if repo_config[name].get("workflows", True) is False:
                     outcomes.append(
                         RepoOutcome(
                             name,
                             "skipped",
                             "workflows disabled by config",
-                            synced_secrets=refreshed,
+                            synced_secrets=tuple(refreshed_progress),
                         )
                     )
                     continue
@@ -564,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
                     if args.mode == "plan":
                         preview = preview_copy(repo)
                         target = Path(preview.name)
-                    result, synced = prepare_with_prerequisites(
+                    result, _ = prepare_with_prerequisites(
                         target,
                         contract_source,
                         args.ref,
@@ -576,9 +572,6 @@ def main(argv: list[str] | None = None) -> int:
                         args.allow_personal_oauth_fanout,
                         allowed_env_secrets,
                         synced_progress,
-                    )
-                    synced_progress.extend(
-                        item for item in synced if item not in synced_progress
                     )
                     written_secrets = tuple(
                         dict.fromkeys(refreshed_progress + synced_progress)

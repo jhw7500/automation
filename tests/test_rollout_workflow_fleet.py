@@ -189,6 +189,44 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
                 )
             materialize.assert_not_called()
 
+    def test_refresh_secret_requires_an_exact_allowed_source_before_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".automation-fleet-workspace").write_text("managed\n")
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "gh_owner": "owner",
+                        "repos": {"repo": {"workflows": True, "secrets": True}},
+                    }
+                )
+            )
+            with patch(
+                "scripts.rollout_workflow_fleet.materialize_release_contract"
+            ) as materialize, self.assertRaises(SystemExit):
+                main(
+                    [
+                        "--automation",
+                        str(ROOT),
+                        "--config",
+                        str(config),
+                        "--workspace",
+                        str(workspace),
+                        "--mode",
+                        "publish",
+                        "--confirm",
+                        "--sync-missing-secrets",
+                        "--refresh-secret",
+                        "ZHIPU_API_KEY",
+                        "--repo",
+                        "repo",
+                    ]
+                )
+            materialize.assert_not_called()
+
     def test_refresh_secret_overwrites_existing_value_via_stdin_only(self) -> None:
         calls: list[tuple[list[str], str | None]] = []
 
@@ -477,12 +515,19 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             )
             release_temp = Mock()
             current = RolloutResult(1, (), frozenset({"ZHIPU_API_KEY"}))
+
+            def complete_refresh(*args: object) -> tuple[str, ...]:
+                completed = args[-1]
+                self.assertIsInstance(completed, list)
+                completed.append("ZHIPU_API_KEY")  # type: ignore[union-attr]
+                return ("ZHIPU_API_KEY",)
+
             with patch(
                 "scripts.rollout_workflow_fleet.materialize_release_contract",
                 return_value=(release_temp, Path("/contract"), "release-sha"),
             ), patch(
                 "scripts.rollout_workflow_fleet.refresh_secrets",
-                return_value=("ZHIPU_API_KEY",),
+                side_effect=complete_refresh,
             ) as refresh, patch(
                 "scripts.rollout_workflow_fleet.default_branch", return_value="main"
             ), patch(
@@ -583,12 +628,19 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
                 )
             )
             release_temp = Mock()
+
+            def complete_refresh(*args: object) -> tuple[str, ...]:
+                completed = args[-1]
+                self.assertIsInstance(completed, list)
+                completed.append("ZHIPU_API_KEY")  # type: ignore[union-attr]
+                return ("ZHIPU_API_KEY",)
+
             with patch(
                 "scripts.rollout_workflow_fleet.materialize_release_contract",
                 return_value=(release_temp, Path("/contract"), "release-sha"),
             ), patch(
                 "scripts.rollout_workflow_fleet.refresh_secrets",
-                return_value=("ZHIPU_API_KEY",),
+                side_effect=complete_refresh,
             ), patch(
                 "scripts.rollout_workflow_fleet.default_branch",
                 side_effect=CommandError("metadata unavailable"),
