@@ -91,6 +91,13 @@ class WorkflowSecretContractsTest(unittest.TestCase):
                     offenders.append(f"{path.name}:{lineno}")
         self.assertEqual([], offenders)
 
+    def test_repository_callers_do_not_forward_all_secrets(self) -> None:
+        offenders = []
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            if re.search(r"secrets:\s*['\"]?inherit", path.read_text(encoding="utf-8")):
+                offenders.append(path.name)
+        self.assertEqual([], offenders)
+
     def test_opencode_auto_review_cannot_mint_an_oidc_app_token(self) -> None:
         path = WORKFLOWS / "opencode-auto-review.yml"
         workflow = load_workflow(path)
