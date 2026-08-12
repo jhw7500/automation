@@ -49,8 +49,13 @@ def workflow_contract(automation: Path, filename: str) -> tuple[set[str], set[st
 
 def audit_template_contract(repo: Path, template: Path) -> list[str]:
     issues: list[str] = []
+    if not template.is_dir():
+        return [f"managed template directory missing: {template}"]
+    canonical_paths = sorted(template.glob("*.y*ml"))
+    if not canonical_paths:
+        return [f"managed template contains no workflow YAML: {template}"]
     target_dir = repo / ".github" / "workflows"
-    for canonical_path in sorted(template.glob("*.y*ml")):
+    for canonical_path in canonical_paths:
         target_path = target_dir / canonical_path.name
         location = f".github/workflows/{canonical_path.name}"
         if not target_path.is_file():

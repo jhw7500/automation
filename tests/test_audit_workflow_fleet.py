@@ -193,6 +193,16 @@ class AuditWorkflowFleetTest(unittest.TestCase):
         self.assertTrue(any("trigger drift" in issue for issue in drift), drift)
         self.assertTrue(any("permissions drift" in issue for issue in drift), drift)
 
+    def test_optional_template_fails_closed_when_missing_or_empty(self) -> None:
+        missing = self.root / "missing-template"
+        missing_issues = audit_repository(self.repo, self.automation, template=missing)
+        self.assertTrue(any("template directory missing" in issue for issue in missing_issues))
+
+        empty = self.root / "empty-template"
+        empty.mkdir()
+        empty_issues = audit_repository(self.repo, self.automation, template=empty)
+        self.assertTrue(any("contains no workflow YAML" in issue for issue in empty_issues))
+
 
 def load_config_ref(path: Path) -> str:
     for line in path.read_text(encoding="utf-8").splitlines():
