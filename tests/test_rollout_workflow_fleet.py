@@ -816,7 +816,7 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             self.assertEqual(["ZHIPU_API_KEY"], manifest[0]["synced_secrets"])
             release_temp.cleanup.assert_called_once()
 
-    def test_main_blocks_refresh_name_not_required_by_managed_callers(self) -> None:
+    def test_main_blocks_refresh_name_not_declared_by_managed_callers(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = root / "workspace"
@@ -871,7 +871,7 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             refresh.assert_not_called()
             manifest = json.loads((workspace / "rollout-manifest.json").read_text())
             self.assertEqual("blocked", manifest[0]["status"])
-            self.assertIn("not required by managed callers", manifest[0]["detail"])
+            self.assertIn("not declared by managed callers", manifest[0]["detail"])
 
     def test_main_records_partially_synced_secret_when_prepare_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -581,13 +581,13 @@ def main(argv: list[str] | None = None) -> int:
                             )
                         )
                         continue
-                    unrequired_refresh = set(args.refresh_secret) - set(
+                    undeclared_refresh = set(args.refresh_secret) - set(
                         result.required_secrets
                     )
-                    if unrequired_refresh:
+                    if undeclared_refresh:
                         raise RolloutError(
-                            f"{name}: refresh secrets not required by managed callers: "
-                            + ", ".join(sorted(unrequired_refresh))
+                            f"{name}: refresh secrets not declared by managed callers: "
+                            + ", ".join(sorted(undeclared_refresh))
                         )
                     if result.changed_files:
                         validate_repository(
@@ -597,16 +597,14 @@ def main(argv: list[str] | None = None) -> int:
                             baseline_repo=repo if args.mode == "plan" else None,
                         )
                     if args.refresh_secret:
-                        refresh_names = set(args.refresh_secret) - set(synced_progress)
-                        if refresh_names:
-                            refresh_secrets(
-                                owner,
-                                name,
-                                refresh_names,
-                                args.allow_personal_oauth_fanout,
-                                allowed_env_secrets,
-                                refreshed_progress,
-                            )
+                        refresh_secrets(
+                            owner,
+                            name,
+                            set(args.refresh_secret),
+                            args.allow_personal_oauth_fanout,
+                            allowed_env_secrets,
+                            refreshed_progress,
+                        )
                     written_secrets = tuple(
                         dict.fromkeys(refreshed_progress + synced_progress)
                     )
