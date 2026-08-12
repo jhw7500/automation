@@ -54,7 +54,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          # The action fetches PR branches itself; private repositories require the
+          # contents: read job token to remain available for that authenticated fetch.
+          persist-credentials: true
 
       - name: Run opencode
         uses: anomalyco/opencode/github@bbc7bdb3fd5078d0add23273e0fdae436b9b47e4 # v1.1.43

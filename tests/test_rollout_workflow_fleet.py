@@ -49,6 +49,18 @@ jobs:
           use_github_token: true
 """
 
+SECURE_COMMAND_WORKFLOW = """\
+on:
+  workflow_call:
+jobs:
+  opencode:
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+"""
+
 
 class RolloutWorkflowFleetTest(unittest.TestCase):
     def test_branch_is_derived_from_release_ref(self) -> None:
@@ -151,6 +163,7 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             workflow = repo / ".github/workflows/opencode-auto-review.yml"
             workflow.parent.mkdir(parents=True)
             workflow.write_text(SECURE_WORKFLOW)
+            (workflow.parent / "opencode.yml").write_text(SECURE_COMMAND_WORKFLOW)
             self.git(repo, "init", "-q")
             self.git(repo, "config", "user.name", "Test")
             self.git(repo, "config", "user.email", "test@example.com")
@@ -182,6 +195,7 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             workflow = repo / ".github/workflows/opencode-auto-review.yml"
             workflow.parent.mkdir(parents=True)
             workflow.write_text(SECURE_WORKFLOW)
+            (workflow.parent / "opencode.yml").write_text(SECURE_COMMAND_WORKFLOW)
             self.git(repo, "init", "-q")
             self.git(repo, "config", "user.name", "Test")
             self.git(repo, "config", "user.email", "test@example.com")

@@ -44,6 +44,21 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
                 """
             )
         )
+        (self.repo / ".github/workflows/opencode.yml").write_text(
+            textwrap.dedent(
+                """\
+                on:
+                  workflow_call:
+                jobs:
+                  opencode:
+                    steps:
+                      - name: Checkout repository
+                        uses: actions/checkout@v4
+                        with:
+                          persist-credentials: true
+                """
+            )
+        )
         self.git("init", "-q")
         self.git("config", "user.name", "Test")
         self.git("config", "user.email", "test@example.com")
@@ -112,6 +127,21 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
         bad_commit = self.git("rev-parse", "HEAD").strip()
         self.git("tag", "-a", "v1.35", "-m", "bad")
         with self.assertRaisesRegex(ReleaseVerificationError, "private repository fetch"):
+            verify_release(self.repo, "v1.35", bad_commit)
+
+    def test_rejects_opencode_command_without_private_repo_fetch_auth(self) -> None:
+        self.git("tag", "-d", "v1.35")
+        path = self.repo / ".github/workflows/opencode.yml"
+        path.write_text(
+            path.read_text().replace(
+                "persist-credentials: true", "persist-credentials: false"
+            )
+        )
+        self.git("add", ".")
+        self.git("commit", "-qm", "break private command fetch")
+        bad_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-a", "v1.35", "-m", "bad")
+        with self.assertRaisesRegex(ReleaseVerificationError, "opencode.yml.*private"):
             verify_release(self.repo, "v1.35", bad_commit)
 
 

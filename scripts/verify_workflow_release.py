@@ -101,6 +101,21 @@ def verify_tag_content(repo: Path, ref: str) -> None:
     if step.get("env", {}).get("GITHUB_TOKEN") != "${{ github.token }}":
         raise ReleaseVerificationError("OpenCode auto review does not use github.token")
 
+    command = documents.get("opencode.yml")
+    try:
+        command_job = command["jobs"]["opencode"]
+        command_checkout = next(
+            item
+            for item in command_job["steps"]
+            if item.get("name") == "Checkout repository"
+        )
+    except (KeyError, TypeError, StopIteration) as exc:
+        raise ReleaseVerificationError("opencode.yml structure is missing") from exc
+    if command_checkout.get("with", {}).get("persist-credentials") != "true":
+        raise ReleaseVerificationError(
+            "opencode.yml cannot authenticate private repository fetch"
+        )
+
 
 def verify_release(
     repo: Path, ref: str, expected_commit: str, remote: str | None = None
