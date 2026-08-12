@@ -163,6 +163,27 @@ class PrepareWorkflowRolloutTest(unittest.TestCase):
             prepare_repository(self.repo, self.automation, "v1.35", set(), set())
         self.assertEqual(before, p.read_text())
 
+    def test_structural_caller_that_cannot_be_rewritten_fails_before_writing(self) -> None:
+        p = self.write("folded-caller.yml", """\
+            jobs:
+              call:
+                uses: >-
+                  jhw7500/automation/.github/workflows/claude.yml@v1.33
+                secrets: inherit
+        """)
+        before = p.read_text()
+        with self.assertRaisesRegex(
+            RolloutError, "found 1 YAML caller.*safely rewrite only 0"
+        ):
+            prepare_repository(
+                self.repo,
+                self.automation,
+                "v1.35",
+                {"CLAUDE_CODE_OAUTH_TOKEN"},
+                set(),
+            )
+        self.assertEqual(before, p.read_text())
+
     def test_secretless_workflow_removes_inherit(self) -> None:
         p = self.write("notice.yml", """\
             jobs:
