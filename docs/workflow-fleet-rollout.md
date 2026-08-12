@@ -54,6 +54,10 @@ python3 scripts/rollout_workflow_fleet.py \
   --actionlint /path/to/actionlint
 ```
 
+`plan`과 `prepare`에서는 `--sync-missing-secrets`를 지정할 수 없으며 parser가 즉시
+거부한다. 실제 repository secret write는 `publish + --sync-missing-secrets +
+--confirm` 조합에서만 가능하다.
+
 각 실행은 `rollout-manifest.json`에 base/head/PR/blocked 결과를 남긴다. 한 저장소가
 blocked여도 다른 저장소의 준비는 계속하지만 명령은 non-zero로 끝난다.
 

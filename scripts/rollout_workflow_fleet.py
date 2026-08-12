@@ -31,11 +31,7 @@ from scripts.prepare_workflow_rollout import (
     SecretPrerequisiteError,
     prepare_repository,
 )
-from scripts.verify_workflow_release import (
-    resolve_commit,
-    verify_remote_tag,
-    verify_tag_content,
-)
+from scripts.verify_workflow_release import verify_release
 
 
 @dataclass
@@ -148,9 +144,7 @@ def preview_copy(repo: Path) -> tempfile.TemporaryDirectory[str]:
 def materialize_release_contract(
     automation: Path, ref: str
 ) -> tuple[tempfile.TemporaryDirectory[str], Path, str]:
-    expected = resolve_commit(automation, f"refs/tags/{ref}")
-    verify_tag_content(automation, ref)
-    verify_remote_tag(automation, "origin", ref, expected)
+    expected = verify_release(automation, ref, ref, remote="origin")
     temp = tempfile.TemporaryDirectory()
     archive = subprocess.run(
         ["git", "archive", ref, ".github/workflows"],
@@ -380,6 +374,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"repositories not in config: {', '.join(unknown)}")
     if args.mode == "publish" and not args.confirm:
         parser.error("--mode publish requires --confirm")
+    if args.sync_missing_secrets and args.mode != "publish":
+        parser.error("--sync-missing-secrets is allowed only in --mode publish")
     if args.allow_personal_oauth_fanout and not args.sync_missing_secrets:
         parser.error("--allow-personal-oauth-fanout requires --sync-missing-secrets")
 
@@ -415,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.ref,
                     owner,
                     name,
-                    args.sync_missing_secrets and args.mode != "plan",
+                    args.sync_missing_secrets and args.mode == "publish",
                     args.allow_personal_oauth_fanout,
                 )
                 if result.callers == 0:

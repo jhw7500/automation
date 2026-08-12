@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.rollout_workflow_fleet import (
+    main,
     materialize_release_contract,
     publish_repository,
     rollout_branch,
@@ -43,6 +44,22 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
         self.assertEqual("codex/automation-v1.35-fleet", rollout_branch("v1.35"))
         self.assertEqual("codex/automation-v1.36-fleet", rollout_branch("v1.36"))
         self.assertNotEqual(rollout_branch("v1.35"), rollout_branch("v1.36"))
+
+    def test_prepare_mode_rejects_any_secret_sync_request_before_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "scripts.rollout_workflow_fleet.materialize_release_contract"
+        ) as materialize:
+            with self.assertRaises(SystemExit):
+                main(
+                    [
+                        "--workspace",
+                        temp,
+                        "--mode",
+                        "prepare",
+                        "--sync-missing-secrets",
+                    ]
+                )
+            materialize.assert_not_called()
 
     def test_personal_oauth_source_requires_explicit_fanout_consent(self) -> None:
         with patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "test-token"}):
@@ -100,6 +117,21 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
                 self.assertNotIn("newer untagged", text)
             finally:
                 extracted_temp.cleanup()
+
+    def test_release_contract_rejects_non_version_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            workflow = repo / ".github/workflows/opencode-auto-review.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(SECURE_WORKFLOW)
+            self.git(repo, "init", "-q")
+            self.git(repo, "config", "user.name", "Test")
+            self.git(repo, "config", "user.email", "test@example.com")
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-qm", "contract")
+            self.git(repo, "tag", "release-candidate")
+            with self.assertRaisesRegex(RuntimeError, "invalid release ref"):
+                materialize_release_contract(repo, "release-candidate")
 
     def test_publish_uses_release_specific_branch_for_push_and_pr(self) -> None:
         calls: list[list[str]] = []
