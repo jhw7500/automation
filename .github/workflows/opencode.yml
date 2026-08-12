@@ -98,6 +98,6 @@ jobs:
     steps:
       - name: Notice
         run: |
-          echo "::notice::opencode workflow is disabled in .github/workflow-config.yml"
+          echo "::notice::opencode is disabled or the PR is not from this repository"
           echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY
-          echo "opencode is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY
+          echo "opencode is disabled or the PR is external" >> $GITHUB_STEP_SUMMARY

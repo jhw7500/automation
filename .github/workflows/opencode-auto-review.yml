@@ -137,6 +137,6 @@ jobs:
     steps:
       - name: Notice
         run: |
-          echo "::notice::OpenCode Auto PR Review is disabled by workflow-config.yml (or review.auto=false)"
+          echo "::notice::OpenCode Auto PR Review is disabled or the PR is not from this repository"
           echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY
-          echo "opencode-auto-review is disabled (or review.auto=false)" >> $GITHUB_STEP_SUMMARY
+          echo "opencode-auto-review is disabled, auto review is off, or the PR is external" >> $GITHUB_STEP_SUMMARY
