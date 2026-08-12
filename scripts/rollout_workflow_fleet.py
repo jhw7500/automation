@@ -327,7 +327,13 @@ def publish_repository(
         cwd=repo,
     )
     head = run(["git", "rev-parse", "HEAD"], cwd=repo)
-    run(["git", "push", "--force-with-lease", "-u", "origin", branch], cwd=repo)
+    remote_ref = f"refs/heads/{branch}"
+    remote_line = run(
+        ["git", "ls-remote", "--heads", "origin", remote_ref], cwd=repo
+    )
+    remote_sha = remote_line.split(maxsplit=1)[0] if remote_line else ""
+    lease = f"--force-with-lease={remote_ref}:{remote_sha}"
+    run(["git", "push", lease, "-u", "origin", branch], cwd=repo)
     existing = gh_json(
         [
             "pr",

@@ -30,6 +30,8 @@ repository secret 전제조건을 한 실행에서 조율한다. GitHub는 Git P
 
 workspace는 reset/clean 가능한 전용 disposable clone 디렉터리여야 한다. 최초 한 번
 명시적으로 초기화한다.
+HTTPS clone/push는 ambient `GITHUB_TOKEN`/`GH_TOKEN`을 사용하지 않으므로 사전에
+`gh auth login`과 `gh auth setup-git`이 완료돼 있어야 한다.
 
 ```bash
 # 읽기 전용 계획. 원격 secret/variable은 이름만 조회한다.
@@ -63,6 +65,9 @@ python3 scripts/rollout_workflow_fleet.py \
 
 각 실행은 `rollout-manifest.json`에 base/head/PR/blocked 결과를 남긴다. 한 저장소가
 blocked여도 다른 저장소의 준비는 계속하지만 명령은 non-zero로 끝난다.
+동일 release branch를 다시 게시할 때는 push 직전 원격 SHA를 조회해 exact
+`--force-with-lease=<ref>:<sha>`로 보호하므로 다른 실행이나 사람이 갱신한 branch를
+덮어쓰지 않는다.
 
 계약은 현재 checkout이 아니라 지정한 local+remote release tag artifact에서 직접
 추출한다. 따라서 `--ref v1.36`을 사용하면 branch도

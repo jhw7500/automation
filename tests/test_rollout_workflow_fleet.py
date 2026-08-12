@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import json
 import os
 import subprocess
 import sys
@@ -7,6 +8,7 @@ import tempfile
 import textwrap
 import unittest
 from unittest.mock import patch
+from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -23,6 +25,7 @@ from scripts.rollout_workflow_fleet import (
     sync_missing,
 )
 from scripts.prepare_workflow_rollout import SecretPrerequisiteError
+from scripts.prepare_workflow_rollout import RolloutResult
 
 
 SECURE_WORKFLOW = """\
@@ -186,7 +189,16 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
 
     def test_publish_uses_release_specific_branch_for_push_and_pr(self) -> None:
         calls: list[list[str]] = []
-        outputs = iter(["", "", "head-sha", "", "https://example.test/pr/1"])
+        outputs = iter(
+            [
+                "",
+                "",
+                "head-sha",
+                "remote-sha\trefs/heads/codex/automation-v1.36-fleet",
+                "",
+                "https://example.test/pr/1",
+            ]
+        )
 
         def fake_run(args: list[str], **_: object) -> str:
             calls.append(args)
@@ -208,6 +220,71 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
         flattened = [item for command in calls for item in command]
         self.assertIn("codex/automation-v1.36-fleet", flattened)
         self.assertNotIn("codex/automation-v1.35-fleet", flattened)
+        self.assertIn(
+            "--force-with-lease=refs/heads/codex/automation-v1.36-fleet:remote-sha",
+            flattened,
+        )
+
+    def test_main_publishes_one_repo_contains_next_failure_and_writes_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".automation-fleet-workspace").write_text("managed\n")
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "gh_owner": "owner",
+                        "repos": {
+                            "a-ready": {"workflows": True, "secrets": True},
+                            "b-broken": {"workflows": True, "secrets": True},
+                        },
+                    }
+                )
+            )
+            release_temp = Mock()
+            prepared = RolloutResult(
+                callers=1,
+                changed_files=(Path(".github/workflows/caller.yml"),),
+                required_secrets=frozenset({"TOKEN"}),
+            )
+            with patch(
+                "scripts.rollout_workflow_fleet.materialize_release_contract",
+                return_value=(release_temp, Path("/contract"), "release-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.default_branch",
+                side_effect=["main", CommandError("default branch unavailable")],
+            ), patch(
+                "scripts.rollout_workflow_fleet.clone_or_reset",
+                return_value=(Path("/clone/a-ready"), "base-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
+                return_value=(prepared, ()),
+            ), patch(
+                "scripts.rollout_workflow_fleet.validate_repository"
+            ), patch(
+                "scripts.rollout_workflow_fleet.publish_repository",
+                return_value=("head-sha", "https://example.test/pr/1"),
+            ):
+                rc = main(
+                    [
+                        "--automation",
+                        str(ROOT),
+                        "--config",
+                        str(config),
+                        "--workspace",
+                        str(workspace),
+                        "--mode",
+                        "publish",
+                        "--confirm",
+                    ]
+                )
+            self.assertEqual(1, rc)
+            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+            self.assertEqual(["published", "blocked"], [item["status"] for item in manifest])
+            self.assertEqual("https://example.test/pr/1", manifest[0]["pr_url"])
+            release_temp.cleanup.assert_called_once()
 
     @staticmethod
     def git(repo: Path, *args: str) -> str:
