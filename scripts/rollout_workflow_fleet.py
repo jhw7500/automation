@@ -221,6 +221,30 @@ def sync_missing(
     return available, tuple(synced)
 
 
+def refresh_secrets(
+    owner: str,
+    repo: str,
+    names: set[str],
+    allow_personal_oauth_fanout: bool,
+    allowed_env_secrets: set[str],
+) -> tuple[str, ...]:
+    refreshed: list[str] = []
+    for name in sorted(names):
+        value = secret_source(
+            name, allow_personal_oauth_fanout, allowed_env_secrets
+        )
+        if value is None:
+            raise RolloutError(
+                f"{owner}/{repo}: no explicitly allowed source for refresh secret {name}"
+            )
+        run(
+            ["gh", "secret", "set", name, "-R", f"{owner}/{repo}", "--body", "-"],
+            input_text=value,
+        )
+        refreshed.append(name)
+    return tuple(refreshed)
+
+
 def prepare_with_prerequisites(
     repo_path: Path,
     automation: Path,
@@ -402,6 +426,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar="NAME",
         help="allow this exact environment variable as a missing-secret source",
     )
+    parser.add_argument(
+        "--refresh-secret",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="replace this existing or missing secret from an explicitly allowed source",
+    )
     parser.add_argument("--actionlint", type=Path)
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--manifest", type=Path)
@@ -430,11 +461,36 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--allow-personal-oauth-fanout requires --sync-missing-secrets")
     if args.allow_env_secret and not args.sync_missing_secrets:
         parser.error("--allow-env-secret requires --sync-missing-secrets")
+    if args.refresh_secret and (
+        args.mode != "publish" or not args.sync_missing_secrets
+    ):
+        parser.error(
+            "--refresh-secret requires --mode publish and --sync-missing-secrets"
+        )
     invalid_env_names = [
         name for name in args.allow_env_secret if re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None
     ]
     if invalid_env_names:
         parser.error(f"invalid secret environment names: {', '.join(invalid_env_names)}")
+    invalid_refresh_names = [
+        name for name in args.refresh_secret if re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None
+    ]
+    if invalid_refresh_names:
+        parser.error(f"invalid refresh secret names: {', '.join(invalid_refresh_names)}")
+    refresh_without_source = sorted(
+        name
+        for name in set(args.refresh_secret)
+        if name not in set(args.allow_env_secret)
+        and not (
+            name == "CLAUDE_CODE_OAUTH_TOKEN"
+            and args.allow_personal_oauth_fanout
+        )
+    )
+    if refresh_without_source:
+        parser.error(
+            "--refresh-secret requires an exact --allow-env-secret source: "
+            + ", ".join(refresh_without_source)
+        )
 
     marker = args.workspace / ".automation-fleet-workspace"
     if not marker.is_file():
@@ -459,9 +515,27 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for name in repos:
             try:
+                refreshed: tuple[str, ...] = ()
+                if args.refresh_secret:
+                    if repo_config[name].get("secrets", True) is False:
+                        raise RolloutError(
+                            f"{name}: secret writes are disabled by config"
+                        )
+                    refreshed = refresh_secrets(
+                        owner,
+                        name,
+                        set(args.refresh_secret),
+                        args.allow_personal_oauth_fanout,
+                        allowed_env_secrets,
+                    )
                 if repo_config[name].get("workflows", True) is False:
                     outcomes.append(
-                        RepoOutcome(name, "skipped", "workflows disabled by config")
+                        RepoOutcome(
+                            name,
+                            "skipped",
+                            "workflows disabled by config",
+                            synced_secrets=refreshed,
+                        )
                     )
                     continue
                 default = default_branch(owner, name)
@@ -487,9 +561,25 @@ def main(argv: list[str] | None = None) -> int:
                         allowed_env_secrets,
                     )
                     if result.callers == 0:
-                        outcomes.append(RepoOutcome(name, "skipped", "no existing central callers", base))
+                        outcomes.append(
+                            RepoOutcome(
+                                name,
+                                "skipped",
+                                "no existing central callers",
+                                base,
+                                synced_secrets=refreshed + synced,
+                            )
+                        )
                     elif not result.changed_files:
-                        outcomes.append(RepoOutcome(name, "current", "already matches contract", base))
+                        outcomes.append(
+                            RepoOutcome(
+                                name,
+                                "current",
+                                "already matches contract",
+                                base,
+                                synced_secrets=refreshed + synced,
+                            )
+                        )
                     else:
                         validate_repository(
                             target,
@@ -502,11 +592,11 @@ def main(argv: list[str] | None = None) -> int:
                                 repo, owner, name, default, args.ref, branch
                             )
                             outcomes.append(
-                                RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, synced)
+                                RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, refreshed + synced)
                             )
                         else:
                             outcomes.append(
-                                RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=synced)
+                                RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=refreshed + synced)
                             )
                 finally:
                     if preview is not None:

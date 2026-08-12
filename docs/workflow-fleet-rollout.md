@@ -8,7 +8,8 @@ repository secret 전제조건을 한 실행에서 조율한다. GitHub는 Git P
 ## 보존하는 것
 
 - 기존 workflow 파일과 caller job만 처리하고 새 workflow를 강제로 추가하지 않는다.
-- 저장소별 trigger, `if` guard, `permissions`, 기존 `with` 입력을 보존한다.
+- 저장소별 trigger, `if` guard, 기존 `with` 입력을 보존한다. `permissions`도 보존하되,
+  OpenCode 두 caller는 OIDC 제거와 review 출력에 필요한 최소 계약으로 정규화한다.
 - 중앙 release ref, `secrets` mapping, 지원되는 `app_id`, `automation_ref`만 변경한다.
 - caller가 없는 저장소는 skip한다.
 - required secret이 없고 안전한 source도 없으면 해당 저장소만 blocked 처리한다.
@@ -21,6 +22,10 @@ repository secret 전제조건을 한 실행에서 조율한다. GitHub는 Git P
   그 이름을 이번 실행에 명시 승인했을 때만 쓸 수 있다. 승인된 이름은 값 없이
   preflight 출력에 표시된다.
 - `--sync-missing-secrets`가 없으면 이름 검사만 하며 어떠한 secret도 쓰지 않는다.
+- 이름은 존재하지만 값이 만료된 키는 `--refresh-secret NAME`으로 명시 회전할 수 있다.
+  이 옵션은 `publish + --confirm + --sync-missing-secrets`에서만 허용되고, 같은 이름의
+  `--allow-env-secret NAME`(또는 Claude 전용 fan-out 승인)이 반드시 필요하다. 기존 값은
+  읽지 않으며 새 값도 argv, 로그, manifest에 기록하지 않는다.
 - 개인 Claude OAuth token fan-out은 추가로 `--allow-personal-oauth-fanout`을 명시해야
   한다. 이 옵션은 저장소마다 자격증명을 복제해 blast radius를 넓히므로, 이미 배포된
   `personal-ops/claude-token-sync`의 대상/rotation 정책을 승인한 운영에서만 사용한다.
@@ -57,11 +62,26 @@ python3 scripts/rollout_workflow_fleet.py \
   --allow-env-secret GEMINI_API_KEY \
   --confirm \
   --actionlint /path/to/actionlint
+
+# 만료된 기존 키 교체 + 누락 키 보충 + workflow PR 생성을 한 번에 수행
+ZHIPU_API_KEY=... python3 scripts/rollout_workflow_fleet.py \
+  --workspace /path/to/disposable-fleet \
+  --ref v1.36 \
+  --mode publish \
+  --sync-missing-secrets \
+  --allow-env-secret ZHIPU_API_KEY \
+  --refresh-secret ZHIPU_API_KEY \
+  --repo wlan-driver \
+  --repo wlan-driver-v2 \
+  --repo wlan-opc \
+  --confirm \
+  --actionlint /path/to/actionlint
 ```
 
 `plan`과 `prepare`에서는 `--sync-missing-secrets`를 지정할 수 없으며 parser가 즉시
 거부한다. 실제 repository secret write는 `publish + --sync-missing-secrets +
---confirm` 조합에서만 가능하다.
+--confirm` 조합에서만 가능하다. `--refresh-secret`은 기존 secret도 의도적으로 덮어쓰므로
+대상 저장소를 `--repo`로 좁혀 실행하는 것을 권장한다.
 
 각 실행은 `rollout-manifest.json`에 base/head/PR/blocked 결과를 남긴다. 한 저장소가
 blocked여도 다른 저장소의 준비는 계속하지만 명령은 non-zero로 끝난다.

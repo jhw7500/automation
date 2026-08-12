@@ -127,6 +127,50 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
                 secret_source("GEMINI_API_KEY", False, {"GEMINI_API_KEY"}),
             )
 
+    def test_refresh_secret_requires_publish_sync_and_exact_source_allowlist(self) -> None:
+        cases = [
+            ["--mode", "plan", "--refresh-secret", "ZHIPU_API_KEY"],
+            ["--mode", "publish", "--confirm", "--refresh-secret", "ZHIPU_API_KEY"],
+            [
+                "--mode",
+                "publish",
+                "--confirm",
+                "--sync-missing-secrets",
+                "--refresh-secret",
+                "ZHIPU_API_KEY",
+            ],
+        ]
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "scripts.rollout_workflow_fleet.materialize_release_contract"
+        ) as materialize:
+            for extra in cases:
+                with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                    main(["--workspace", temp, *extra])
+            materialize.assert_not_called()
+
+    def test_refresh_secret_overwrites_existing_value_via_stdin_only(self) -> None:
+        calls: list[tuple[list[str], str | None]] = []
+
+        def fake_run(args: list[str], **kwargs: object) -> str:
+            calls.append((args, kwargs.get("input_text")))  # type: ignore[arg-type]
+            return ""
+
+        with patch.dict(os.environ, {"ZHIPU_API_KEY": "rotated-value"}), patch(
+            "scripts.rollout_workflow_fleet.run", side_effect=fake_run
+        ):
+            from scripts.rollout_workflow_fleet import refresh_secrets
+
+            refreshed = refresh_secrets(
+                "owner",
+                "repo",
+                {"ZHIPU_API_KEY"},
+                False,
+                {"ZHIPU_API_KEY"},
+            )
+        self.assertEqual(("ZHIPU_API_KEY",), refreshed)
+        self.assertEqual("rotated-value", calls[0][1])
+        self.assertNotIn("rotated-value", calls[0][0])
+
     def test_missing_default_branch_becomes_a_command_error(self) -> None:
         with patch(
             "scripts.rollout_workflow_fleet.gh_json",
@@ -331,6 +375,63 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             self.assertEqual(["published", "blocked"], [item["status"] for item in manifest])
             self.assertEqual("https://example.test/pr/1", manifest[0]["pr_url"])
             self.assertIn("unexpected ValueError", manifest[1]["detail"])
+            release_temp.cleanup.assert_called_once()
+
+    def test_main_refreshes_existing_secret_before_current_contract_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".automation-fleet-workspace").write_text("managed\n")
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "gh_owner": "owner",
+                        "repos": {"repo": {"workflows": True, "secrets": True}},
+                    }
+                )
+            )
+            release_temp = Mock()
+            current = RolloutResult(1, (), frozenset({"ZHIPU_API_KEY"}))
+            with patch(
+                "scripts.rollout_workflow_fleet.materialize_release_contract",
+                return_value=(release_temp, Path("/contract"), "release-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.refresh_secrets",
+                return_value=("ZHIPU_API_KEY",),
+            ) as refresh, patch(
+                "scripts.rollout_workflow_fleet.default_branch", return_value="main"
+            ), patch(
+                "scripts.rollout_workflow_fleet.clone_or_reset",
+                return_value=(Path("/clone/repo"), "base-sha"),
+            ), patch(
+                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
+                return_value=(current, ()),
+            ):
+                rc = main(
+                    [
+                        "--automation",
+                        str(ROOT),
+                        "--config",
+                        str(config),
+                        "--workspace",
+                        str(workspace),
+                        "--mode",
+                        "publish",
+                        "--confirm",
+                        "--sync-missing-secrets",
+                        "--allow-env-secret",
+                        "ZHIPU_API_KEY",
+                        "--refresh-secret",
+                        "ZHIPU_API_KEY",
+                    ]
+                )
+            self.assertEqual(0, rc)
+            refresh.assert_called_once()
+            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+            self.assertEqual("current", manifest[0]["status"])
+            self.assertEqual(["ZHIPU_API_KEY"], manifest[0]["synced_secrets"])
             release_temp.cleanup.assert_called_once()
 
     @staticmethod
