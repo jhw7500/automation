@@ -3,11 +3,27 @@ name: 'Gemini Scheduled Issue Triage'
 on:
   workflow_call:
     inputs:
+      app_id:
+        description: 'GitHub App ID; falls back to caller vars.APP_ID for compatibility'
+        type: string
+        required: false
+        default: ''
       force_run:
         description: 'Run even if disabled in workflow-config.yml'
         type: boolean
         required: false
         default: false
+    secrets:
+      APP_PRIVATE_KEY:
+        description: 'GitHub App private key; required when app_id or legacy vars.APP_ID is set'
+        required: false
+      GEMINI_API_KEY:
+        description: 'Gemini API key for API-key authentication'
+        required: false
+      GOOGLE_API_KEY:
+        description: 'Google API key for compatible Gemini authentication'
+        required: false
+
   schedule:
     - cron: '0 * * * *'
   push:
@@ -90,7 +106,7 @@ jobs:
         id: 'find_issues'
         env:
           GITHUB_REPOSITORY: '${{ github.repository }}'
-          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN || github.token }}'
+          GITHUB_TOKEN: '${{ github.token }}'
         run: |-
           echo 'Finding unlabeled issues and issues marked for triage...'
           ISSUES="$(gh issue list \
@@ -163,10 +179,10 @@ jobs:
       - name: 'Mint identity token'
         id: 'mint_identity_token'
         if: |-
-          ${{ vars.APP_ID }}
+          ${{ inputs.app_id || vars.APP_ID }}
         uses: 'actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b' # ratchet:actions/create-github-app-token@v2
         with:
-          app-id: '${{ vars.APP_ID }}'
+          app-id: '${{ inputs.app_id || vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
           permission-contents: 'read'
           permission-issues: 'write'
@@ -178,7 +194,7 @@ jobs:
           TRIAGED_ISSUES: '${{ needs.triage.outputs.triaged_issues }}'
         uses: 'actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea' # ratchet:actions/github-script@v7.0.1
         with:
-          github-token: '${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}'
+          github-token: '${{ steps.mint_identity_token.outputs.token || github.token }}'
           script: |-
             const availableLabels = (process.env.AVAILABLE_LABELS || '').split(',')
               .map((label) => label.trim())

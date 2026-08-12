@@ -3,11 +3,27 @@ name: '🔀 Gemini Dispatch'
 on:
   workflow_call:
     inputs:
+      app_id:
+        description: 'GitHub App ID; falls back to caller vars.APP_ID for compatibility'
+        type: string
+        required: false
+        default: ''
       force_run:
         description: 'Run even if disabled in workflow-config.yml'
         type: boolean
         required: false
         default: false
+
+    secrets:
+      APP_PRIVATE_KEY:
+        description: 'GitHub App private key; required when app_id or legacy vars.APP_ID is set'
+        required: false
+      GEMINI_API_KEY:
+        description: 'Gemini API key for API-key authentication'
+        required: false
+      GOOGLE_API_KEY:
+        description: 'Google API key for compatible Gemini authentication'
+        required: false
 
 defaults:
   run:
@@ -115,10 +131,10 @@ jobs:
       - name: 'Mint identity token'
         id: 'mint_identity_token'
         if: |-
-          ${{ vars.APP_ID }}
+          ${{ inputs.app_id || vars.APP_ID }}
         uses: 'actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b' # ratchet:actions/create-github-app-token@v2
         with:
-          app-id: '${{ vars.APP_ID }}'
+          app-id: '${{ inputs.app_id || vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
           permission-contents: 'read'
           permission-issues: 'write'
@@ -235,7 +251,7 @@ jobs:
       - name: 'Acknowledge request'
         if: steps.extract_command.outputs.command != 'noop' && steps.extract_command.outputs.command != 'unauthorized'
         env:
-          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}'
+          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || github.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           MESSAGE: |-
             ## 🤖 Gemini CLI (명령어 기반)
@@ -265,9 +281,9 @@ jobs:
         id: auth
         uses: jhw7500/automation/.github/actions/setup-gemini-auth@v1.1
         with:
-          app-id: '${{ vars.APP_ID }}'
+          app-id: '${{ inputs.app_id || vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+          fallback-token: '${{ github.token }}'
 
       - name: Run Gemini pull request review (primary)
         id: gemini_review_primary
@@ -598,9 +614,9 @@ jobs:
         id: auth
         uses: jhw7500/automation/.github/actions/setup-gemini-auth@v1.1
         with:
-          app-id: '${{ vars.APP_ID }}'
+          app-id: '${{ inputs.app_id || vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+          fallback-token: '${{ github.token }}'
 
       - name: Apply labels
         env:
@@ -654,9 +670,9 @@ jobs:
         id: auth
         uses: jhw7500/automation/.github/actions/setup-gemini-auth@v1.1
         with:
-          app-id: '${{ vars.APP_ID }}'
+          app-id: '${{ inputs.app_id || vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+          fallback-token: '${{ github.token }}'
 
       - name: Run Gemini CLI (primary)
         id: gemini_invoke_primary
@@ -805,10 +821,10 @@ jobs:
       - name: 'Mint identity token'
         id: 'mint_identity_token'
         if: |-
-          ${{ vars.APP_ID }}
+          ${{ inputs.app_id || vars.APP_ID }}
         uses: 'actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b' # ratchet:actions/create-github-app-token@v2
         with:
-          app-id: '${{ vars.APP_ID }}'
+          app-id: '${{ inputs.app_id || vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
           permission-contents: 'read'
           permission-issues: 'write'
@@ -816,7 +832,7 @@ jobs:
 
       - name: 'Send failure comment'
         env:
-          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}'
+          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || github.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           COMMAND: '${{ needs.dispatch.outputs.command }}'
           REPOSITORY: '${{ github.repository }}'

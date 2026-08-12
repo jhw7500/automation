@@ -9,6 +9,11 @@ on:
         required: false
         default: false
 
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: 'Claude Code OAuth token'
+        required: true
+
 jobs:
   check-enabled:
     name: Check if enabled

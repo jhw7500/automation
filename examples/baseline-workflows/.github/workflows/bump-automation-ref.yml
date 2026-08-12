@@ -104,7 +104,7 @@ jobs:
 
           root = Path(".github/workflows")
           pattern = re.compile(
-            r"(jhw7500/automation/\.github/(?:workflows|actions)/[^@\s'\"]+@)v\d+(?:\.\d+)?"
+            r"(jhw7500/automation/\.github/workflows/[^@\s'\"]+@)v\d+(?:\.\d+)?"
           )
 
           changed_files = 0
@@ -115,6 +115,8 @@ jobs:
               path.write_text(new_text, encoding="utf-8")
               changed_files += 1
 
+          if changed_files == 0:
+            raise SystemExit("automation_ref changed but no reusable workflow refs were rewritten")
           print(f"rewrote {changed_files} file(s)")
           PY
 
@@ -145,4 +147,4 @@ jobs:
             --base "${{ github.event.repository.default_branch }}" \
             --head "$branch" \
             --title "chore: bump automation refs to ${NEW_REF}" \
-            --body "automation_ref updated in .github/workflow-config.yml; this PR rewrites all jhw7500/automation workflow/action refs to ${NEW_REF}."
+            --body "automation_ref updated in .github/workflow-config.yml; this PR rewrites all jhw7500/automation reusable workflow refs to ${NEW_REF}."

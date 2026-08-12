@@ -51,9 +51,13 @@ jobs:
       id-token: write
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-triage.yml@v1.28
+    uses: jhw7500/automation/.github/workflows/gemini-triage.yml@v1.35
     with:
       issue_number: ${{ inputs.issue_number }}
       issue_title: ${{ needs.prepare.outputs.issue_title }}
       issue_body: ${{ needs.prepare.outputs.issue_body }}
-    secrets: inherit
+      app_id: ${{ vars.APP_ID }}
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}

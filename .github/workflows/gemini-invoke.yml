@@ -3,6 +3,11 @@ name: '▶️ Gemini Invoke'
 on:
   workflow_call:
     inputs:
+      app_id:
+        description: 'GitHub App ID; falls back to caller vars.APP_ID for compatibility'
+        type: string
+        required: false
+        default: ''
       force_run:
         description: 'Run even if disabled in workflow-config.yml'
         type: boolean
@@ -31,6 +36,17 @@ on:
       additional_context:
         type: 'string'
         description: 'Any additional context from the request'
+        required: false
+
+    secrets:
+      APP_PRIVATE_KEY:
+        description: 'GitHub App private key; required when app_id or legacy vars.APP_ID is set'
+        required: false
+      GEMINI_API_KEY:
+        description: 'Gemini API key for API-key authentication'
+        required: false
+      GOOGLE_API_KEY:
+        description: 'Google API key for compatible Gemini authentication'
         required: false
 
 concurrency:
@@ -79,9 +95,9 @@ jobs:
         id: 'auth'
         uses: 'jhw7500/automation/.github/actions/setup-gemini-auth@v1.1'
         with:
-          app-id: '${{ vars.APP_ID }}'
+          app-id: '${{ inputs.app_id || vars.APP_ID }}'
           private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ secrets.GITHUB_TOKEN || github.token }}'
+          fallback-token: '${{ github.token }}'
 
       - name: 'Run Gemini CLI'
         id: 'run_gemini'
