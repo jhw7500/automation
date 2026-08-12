@@ -32,13 +32,57 @@ SECURE_WORKFLOW = """\
 on:
   workflow_call:
 jobs:
+  check-enabled:
+    outputs:
+      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
+    steps:
+      - id: pr_scope
+        env:
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+        run: gh api example
   opencode-review:
+    if: >-
+      needs.check-enabled.outputs.safe_pr == 'true'
     permissions:
       contents: read
       pull-requests: write
       issues: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
       - name: Run OpenCode PR review
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          use_github_token: true
+"""
+
+SECURE_COMMAND_WORKFLOW = """\
+on:
+  workflow_call:
+jobs:
+  check-enabled:
+    outputs:
+      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
+    steps:
+      - id: pr_scope
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: gh api example
+  opencode:
+    if: needs.check-enabled.outputs.safe_pr == 'true'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Run opencode
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
@@ -147,6 +191,7 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             workflow = repo / ".github/workflows/opencode-auto-review.yml"
             workflow.parent.mkdir(parents=True)
             workflow.write_text(SECURE_WORKFLOW)
+            (workflow.parent / "opencode.yml").write_text(SECURE_COMMAND_WORKFLOW)
             self.git(repo, "init", "-q")
             self.git(repo, "config", "user.name", "Test")
             self.git(repo, "config", "user.email", "test@example.com")
@@ -178,6 +223,7 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
             workflow = repo / ".github/workflows/opencode-auto-review.yml"
             workflow.parent.mkdir(parents=True)
             workflow.write_text(SECURE_WORKFLOW)
+            (workflow.parent / "opencode.yml").write_text(SECURE_COMMAND_WORKFLOW)
             self.git(repo, "init", "-q")
             self.git(repo, "config", "user.name", "Test")
             self.git(repo, "config", "user.email", "test@example.com")

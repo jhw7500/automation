@@ -49,6 +49,22 @@ Required secrets depend on which workflows you enable.
   - Required for Gemini workflows (review/triage/invoke/dispatch).
 - `CLAUDE_CODE_OAUTH_TOKEN`
   - Required for Claude workflows.
+- `ZHIPU_API_KEY`
+  - Required for OpenCode workflows.
+
+### OpenCode PR boundary
+
+OpenCode automatic review and the manual `/oc` command run only for pull requests whose
+head branch belongs to the same repository. Fork/external PRs fail closed and produce a
+skipped workflow summary. This restriction lets private repositories retain the read-only
+checkout credential required by OpenCode's internal branch fetch without exposing it while
+processing external contributor content.
+
+Both OpenCode workflows force the job-scoped `github.token`; `id-token: write` is forbidden,
+so the action cannot exchange OIDC for an App token outside the declared job permissions.
+Consumer OpenCode jobs must grant exactly `contents: read`, `pull-requests: write`, and
+`issues: write`. The fleet rollout tool normalizes these two caller permission blocks; this
+is the intentional exception to its general rule of preserving repository-owned permissions.
 
 ## Variables (consumer repository)
 

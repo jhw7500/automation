@@ -9,10 +9,9 @@ on:
 jobs:
   opencode:
     permissions:
-      id-token: write
       contents: read
-      pull-requests: read
-      issues: read
-    uses: jhw7500/automation/.github/workflows/opencode.yml@v1.35
+      pull-requests: write
+      issues: write
+    uses: jhw7500/automation/.github/workflows/opencode.yml@v1.36
     secrets:
       ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}

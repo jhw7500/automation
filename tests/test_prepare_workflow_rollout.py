@@ -5,6 +5,8 @@ import tempfile
 import textwrap
 import unittest
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -47,6 +49,15 @@ class PrepareWorkflowRolloutTest(unittest.TestCase):
               workflow_call:
             jobs: {}
         """))
+        for name in ("opencode.yml", "opencode-auto-review.yml"):
+            (wf / name).write_text(textwrap.dedent("""\
+                on:
+                  workflow_call:
+                    secrets:
+                      ZHIPU_API_KEY:
+                        required: true
+                jobs: {}
+            """))
         self.repo = self.root / "consumer"
         (self.repo / ".github/workflows").mkdir(parents=True)
         (self.repo / ".github/workflow-config.yml").write_text(
@@ -219,6 +230,55 @@ class PrepareWorkflowRolloutTest(unittest.TestCase):
                 set(),
             )
         self.assertEqual(before, p.read_text())
+
+    def test_opencode_caller_permissions_drop_oidc_and_allow_review_output(self) -> None:
+        p = self.write("opencode.yml", """\
+            on:
+              issue_comment:
+            jobs:
+              call:
+                if: github.actor != 'bot'
+                permissions:
+                  id-token: write
+                  contents: read
+                  pull-requests: read
+                  issues: read
+                uses: jhw7500/automation/.github/workflows/opencode.yml@v1.35
+                secrets: inherit
+        """)
+        prepare_repository(
+            self.repo,
+            self.automation,
+            "v1.36",
+            {"ZHIPU_API_KEY"},
+            set(),
+        )
+        workflow = yaml.load(p.read_text(), Loader=yaml.BaseLoader)
+        permissions = workflow["jobs"]["call"]["permissions"]
+        self.assertEqual(
+            {"contents": "read", "pull-requests": "write", "issues": "write"},
+            permissions,
+        )
+
+    def test_opencode_caller_permissions_are_inserted_when_absent(self) -> None:
+        p = self.write("opencode-auto-review.yml", """\
+            jobs:
+              call:
+                uses: jhw7500/automation/.github/workflows/opencode-auto-review.yml@v1.35
+                secrets: inherit
+        """)
+        prepare_repository(
+            self.repo,
+            self.automation,
+            "v1.36",
+            {"ZHIPU_API_KEY"},
+            set(),
+        )
+        workflow = yaml.load(p.read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(
+            {"contents": "read", "pull-requests": "write", "issues": "write"},
+            workflow["jobs"]["call"]["permissions"],
+        )
 
     def test_secretless_workflow_removes_inherit(self) -> None:
         p = self.write("notice.yml", """\

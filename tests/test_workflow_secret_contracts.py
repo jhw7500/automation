@@ -111,6 +111,60 @@ class WorkflowSecretContractsTest(unittest.TestCase):
         self.assertEqual("true", run_step["with"]["use_github_token"])
         self.assertEqual("${{ github.token }}", run_step["env"]["GITHUB_TOKEN"])
 
+    def test_opencode_auto_review_keeps_read_only_checkout_auth_for_private_repos(self) -> None:
+        workflow = load_workflow(WORKFLOWS / "opencode-auto-review.yml")
+        job = workflow["jobs"]["opencode-review"]
+        checkout = next(
+            step for step in job["steps"] if step.get("name") == "Checkout repository"
+        )
+        self.assertEqual("true", checkout["with"]["persist-credentials"])
+
+    def test_opencode_auto_review_enforces_same_repository_prs_centrally(self) -> None:
+        workflow = load_workflow(WORKFLOWS / "opencode-auto-review.yml")
+        check = workflow["jobs"]["check-enabled"]
+        self.assertEqual("${{ steps.pr_scope.outputs.safe_pr }}", check["outputs"]["safe_pr"])
+        scope_step = next(step for step in check["steps"] if step.get("id") == "pr_scope")
+        self.assertIn("gh api", scope_step["run"])
+        condition = workflow["jobs"]["opencode-review"]["if"]
+        self.assertIn("needs.check-enabled.outputs.safe_pr == 'true'", condition)
+
+    def test_opencode_command_keeps_read_only_checkout_auth_for_private_repos(self) -> None:
+        workflow = load_workflow(WORKFLOWS / "opencode.yml")
+        job = workflow["jobs"]["opencode"]
+        checkout = next(
+            step for step in job["steps"] if step.get("name") == "Checkout repository"
+        )
+        self.assertEqual("true", checkout["with"]["persist-credentials"])
+
+    def test_opencode_command_cannot_mint_app_token_and_requires_same_repo_pr(self) -> None:
+        workflow = load_workflow(WORKFLOWS / "opencode.yml")
+        check = workflow["jobs"]["check-enabled"]
+        self.assertEqual("${{ steps.pr_scope.outputs.safe_pr }}", check["outputs"]["safe_pr"])
+        job = workflow["jobs"]["opencode"]
+        self.assertEqual(
+            {"contents": "read", "pull-requests": "write", "issues": "write"},
+            job["permissions"],
+        )
+        self.assertIn("needs.check-enabled.outputs.safe_pr == 'true'", job["if"])
+        run_step = next(step for step in job["steps"] if step.get("name") == "Run opencode")
+        self.assertEqual("true", run_step["with"]["use_github_token"])
+        self.assertEqual("${{ github.token }}", run_step["env"]["GITHUB_TOKEN"])
+        scope_step = next(step for step in check["steps"] if step.get("id") == "pr_scope")
+        self.assertEqual(
+            "${{ github.event.pull_request.number || github.event.issue.number }}",
+            scope_step["env"]["PR_NUMBER"],
+        )
+
+    def test_opencode_baseline_caller_grants_only_required_review_permissions(self) -> None:
+        path = ROOT / "examples/baseline-workflows/.github/workflows/opencode.yml"
+        workflow = load_workflow(path)
+        job = workflow["jobs"]["opencode"]
+        self.assertEqual(
+            {"contents": "read", "pull-requests": "write", "issues": "write"},
+            job["permissions"],
+        )
+        self.assertNotIn("id-token", job["permissions"])
+
     def test_app_token_workflows_accept_an_explicit_app_id_with_legacy_fallback(self) -> None:
         for filename in APP_TOKEN_WORKFLOWS:
             with self.subTest(workflow=filename):
