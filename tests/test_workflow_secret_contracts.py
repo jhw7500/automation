@@ -156,6 +156,7 @@ class WorkflowSecretContractsTest(unittest.TestCase):
             with self.subTest(workflow=filename):
                 path = WORKFLOWS / filename
                 workflow = load_workflow(path)
+                self.assertEqual({"workflow_call"}, set(workflow["on"]))
                 call = workflow["on"]["workflow_call"]
                 self.assertEqual(
                     {
