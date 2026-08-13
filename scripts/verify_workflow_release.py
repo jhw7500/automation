@@ -207,7 +207,12 @@ ACCEPTED_AUTOMATION_REMOTES = frozenset(
 HERMETIC_GIT_HOME = "/nonexistent/automation-workflow-release/home"
 HERMETIC_GIT_XDG = "/nonexistent/automation-workflow-release/xdg"
 OID = re.compile(r"[0-9a-f]{40}")
-RELEASE_REF = re.compile(r"v\d+(?:\.\d+)+")
+RELEASE_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
+TAGGER_IDENT = re.compile(
+    rb"(?P<name>[^\x00-\x1f\x7f<>]+) <[^\x00-\x1f\x7f<> ]+> "
+    rb"(?P<timestamp>[0-9]+) "
+    rb"(?P<sign>[+-])(?P<hour>[0-9]{2})(?P<minute>[0-9]{2})\Z"
+)
 MAX_GIT_METADATA_BYTES = 1024 * 1024
 
 
@@ -743,13 +748,72 @@ def _linked_oid(payload: bytes, prefix: bytes) -> str:
     return oid
 
 
-def _tag_commit_oid(payload: bytes) -> str:
+def _tag_commit_oid(payload: bytes, requested_ref: str) -> str:
     """Parse the fail-closed release contract: one annotated tag -> one commit."""
 
-    lines = payload.split(b"\n", 2)
-    if len(lines) < 3 or lines[1] != b"type commit":
+    if RELEASE_REF.fullmatch(requested_ref) is None:
         raise ReleaseVerificationError("Git object is invalid")
-    return _linked_oid(payload, b"object ")
+    try:
+        expected_tag = requested_ref.encode("ascii")
+    except UnicodeEncodeError:
+        raise ReleaseVerificationError("Git object is invalid") from None
+    header, separator, _message = payload.partition(b"\n\n")
+    if separator != b"\n\n":
+        raise ReleaseVerificationError("Git object is invalid")
+    parsed: list[tuple[bytes, bytes]] = []
+    for line in header.split(b"\n"):
+        if line.startswith(b" "):
+            raise ReleaseVerificationError("Git object is invalid")
+        key, space, value = line.partition(b" ")
+        if (
+            space != b" "
+            or not key
+            or not value
+            or any(byte < 0x21 or byte > 0x7E for byte in key)
+        ):
+            raise ReleaseVerificationError("Git object is invalid")
+        parsed.append((key, value))
+    if [key for key, _value in parsed] != [b"object", b"type", b"tag", b"tagger"]:
+        raise ReleaseVerificationError("Git object is invalid")
+    tagger = TAGGER_IDENT.fullmatch(parsed[3][1])
+    if (
+        tagger is None
+        or not tagger.group("name").strip(b" ")
+        or (
+            len(tagger.group("timestamp")) > 1
+            and tagger.group("timestamp").startswith(b"0")
+        )
+        or int(tagger.group("timestamp")) > 2**63 - 1
+        or int(tagger.group("hour")) > 23
+        or int(tagger.group("minute")) > 59
+    ):
+        raise ReleaseVerificationError("Git object is invalid")
+    protected = {
+        key: [value for observed, value in parsed if observed == key]
+        for key in (b"object", b"type", b"tag")
+    }
+    if (
+        len(protected[b"object"]) != 1
+        or len(protected[b"type"]) != 1
+        or len(protected[b"tag"]) != 1
+        or protected[b"type"][0] != b"commit"
+        or protected[b"tag"][0] != expected_tag
+        or parsed[:3]
+        != [
+            (b"object", protected[b"object"][0]),
+            (b"type", b"commit"),
+            (b"tag", expected_tag),
+        ]
+    ):
+        raise ReleaseVerificationError("Git object is invalid")
+    oid = protected[b"object"][0]
+    try:
+        decoded = oid.decode("ascii")
+    except UnicodeDecodeError:
+        raise ReleaseVerificationError("Git object is invalid") from None
+    if not _valid_oid(decoded):
+        raise ReleaseVerificationError("Git object is invalid")
+    return decoded
 
 
 def _parse_tree(payload: bytes) -> tuple[GitTreeEntry, ...]:
@@ -1019,7 +1083,7 @@ def resolve_annotated_tag(repo: Path, ref: str) -> AnnotatedTag:
     tag_object = read_tag_oid(repo, ref)
     try:
         payload = read_git_object(repo, tag_object, "tag")
-        commit = _tag_commit_oid(payload)
+        commit = _tag_commit_oid(payload, ref)
         read_git_object(repo, commit, "commit")
     except ReleaseVerificationError:
         raise ReleaseVerificationError(f"release {ref} must be an annotated tag")
@@ -1748,7 +1812,7 @@ def verify_tag_content(
 def verify_release(
     repo: Path, ref: str, expected_commit: str, remote: str | None = None
 ) -> str:
-    if re.fullmatch(r"v\d+(?:\.\d+)+", ref) is None:
+    if re.fullmatch(r"v[0-9]+(?:\.[0-9]+)+", ref) is None:
         raise ReleaseVerificationError(f"invalid release ref: {ref}")
     tag = resolve_annotated_tag(repo, ref)
     expected = resolve_commit(repo, expected_commit)

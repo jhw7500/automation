@@ -2,13 +2,15 @@
 """Restricted Git and GitHub operations for workflow-fleet PR rollout.
 
 This module deliberately exposes only repository reads, prerequisite inventory reads,
-new-branch publication, and pull-request creation.  It has no merge, revert, or
-repository secret/variable mutation surface.
+atomic new-ref publication, and pull-request creation.  It has no ordinary Git push,
+merge, revert, or repository secret/variable mutation surface.
 """
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,6 +34,8 @@ PROVIDER_KEYS = frozenset(
 WORKSPACE_MARKER = ".automation-fleet-workspace"
 _REPO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_SHA1 = re.compile(r"[0-9a-f]{40}\Z")
+_ROLLOUT_BRANCH = re.compile(r"automation/common-workflows-v[0-9]+(?:\.[0-9]+)+\Z")
 _PULL_URL = re.compile(
     r"https://github\.com/jhw7500/([A-Za-z0-9][A-Za-z0-9._-]{0,99})/pull/([1-9][0-9]*)\Z"
 )
@@ -70,14 +74,35 @@ class PullRequest:
     body: str
 
 
+@dataclass(frozen=True)
+class GitBlob:
+    path: str
+    mode: str
+    sha: str
+    content: bytes
+
+
+@dataclass(frozen=True)
+class RolloutCommit:
+    head_sha: str
+    tree_sha: str
+    base_tree_sha: str
+    base_sha: str
+    message: str
+    blobs: tuple[GitBlob, ...]
+    deletions: tuple[str, ...]
+
+
 __all__ = (
     "FleetGitError",
+    "GitBlob",
     "PullRequest",
     "RepositorySnapshot",
+    "RolloutCommit",
     "clone_default_branch",
+    "create_rollout_branch",
     "create_pull_request",
     "list_rollout_prs",
-    "push_new_branch",
     "refetch_default",
     "remote_branch_sha",
 )
@@ -87,6 +112,29 @@ def child_env() -> dict[str, str]:
     """Return the operator environment without model/provider credentials."""
 
     return {key: value for key, value in os.environ.items() if key not in PROVIDER_KEYS}
+
+
+def github_env() -> dict[str, str]:
+    """Return only GitHub CLI runtime/config and intended credential variables."""
+
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    for key in (
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "GH_CONFIG_DIR",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            environment[key] = value
+    token_key = "GH_TOKEN" if os.environ.get("GH_TOKEN") else "GITHUB_TOKEN"
+    token = os.environ.get(token_key)
+    if token:
+        environment[token_key] = token
+    return environment
 
 
 def run(
@@ -108,7 +156,7 @@ def run(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=child_env(),
+            env=github_env() if operation == "gh" else child_env(),
         )
     except (OSError, ValueError):
         launch_failed = True
@@ -133,6 +181,32 @@ def _json(args: Sequence[str]) -> object:
     if malformed:
         raise FleetGitError("GitHub returned malformed JSON") from None
     return data
+
+
+def _github_post(repo: str, collection: str, body: object) -> object:
+    """POST one closed Git Data schema through JSON stdin, never argv fields."""
+
+    _validate_target(OWNER, repo)
+    if collection not in {"blobs", "trees", "commits", "refs"}:
+        raise FleetGitError("GitHub operation is not permitted")
+    output = run(
+        [
+            "gh",
+            "api",
+            "--hostname",
+            "github.com",
+            "--method",
+            "POST",
+            f"repos/{OWNER}/{repo}/git/{collection}",
+            "--input",
+            "-",
+        ],
+        stdin=json.dumps(body, separators=(",", ":"), sort_keys=True) + "\n",
+    )
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        raise FleetGitError("GitHub returned malformed JSON") from None
 
 
 def _validate_target(owner: str, repo: str) -> None:
@@ -165,6 +239,12 @@ def _validate_branch(branch: str) -> None:
 def _validate_object_id(value: str) -> str:
     if not _OBJECT_ID.fullmatch(value):
         raise FleetGitError("Git returned an invalid object identifier")
+    return value
+
+
+def _validate_sha1(value: str, description: str) -> str:
+    if not isinstance(value, str) or _SHA1.fullmatch(value) is None:
+        raise FleetGitError(f"{description} is invalid")
     return value
 
 
@@ -392,24 +472,226 @@ def remote_branch_sha(snapshot: RepositorySnapshot, branch: str) -> str | None:
     return _validate_object_id(fields[0])
 
 
-def push_new_branch(snapshot: RepositorySnapshot, branch: str) -> str:
-    """Create and publish a branch only when no remote branch exists."""
+def _exact_url(value: object, expected: str) -> bool:
+    return isinstance(value, str) and value == expected
+
+
+def _validate_blob_response(repo: str, expected: GitBlob, response: object) -> None:
+    root = f"https://api.github.com/repos/{OWNER}/{repo}/git"
+    if not isinstance(response, dict) or (
+        response.get("sha") != expected.sha
+        or not _exact_url(response.get("url"), f"{root}/blobs/{expected.sha}")
+    ):
+        raise FleetGitError("GitHub returned an invalid blob identity")
+
+
+def _validate_tree_response(repo: str, expected: str, response: object) -> None:
+    root = f"https://api.github.com/repos/{OWNER}/{repo}/git"
+    if (
+        not isinstance(response, dict)
+        or response.get("sha") != expected
+        or not _exact_url(response.get("url"), f"{root}/trees/{expected}")
+        or response.get("truncated") is not False
+        or not isinstance(response.get("tree"), list)
+    ):
+        raise FleetGitError("GitHub returned an invalid tree identity")
+
+
+def _commit_identity() -> dict[str, str]:
+    return {
+        "name": "workflow-fleet",
+        "email": "workflow-fleet@invalid",
+        "date": "2000-01-01T00:00:00Z",
+    }
+
+
+def _validate_commit_response(
+    repo: str, commit: RolloutCommit, response: object
+) -> None:
+    root = f"https://api.github.com/repos/{OWNER}/{repo}/git"
+    if not isinstance(response, dict):
+        raise FleetGitError("GitHub returned an invalid commit identity")
+    tree = response.get("tree")
+    parents = response.get("parents")
+    if (
+        response.get("sha") != commit.head_sha
+        or not _exact_url(response.get("url"), f"{root}/commits/{commit.head_sha}")
+        or response.get("message") != commit.message
+        or response.get("author") != _commit_identity()
+        or response.get("committer") != _commit_identity()
+        or not isinstance(tree, dict)
+        or tree.get("sha") != commit.tree_sha
+        or not _exact_url(tree.get("url"), f"{root}/trees/{commit.tree_sha}")
+        or not isinstance(parents, list)
+        or len(parents) != 1
+        or not isinstance(parents[0], dict)
+        or parents[0].get("sha") != commit.base_sha
+        or not _exact_url(parents[0].get("url"), f"{root}/commits/{commit.base_sha}")
+    ):
+        raise FleetGitError("GitHub returned an invalid commit identity")
+
+
+def _validate_ref_response(
+    repo: str, branch: str, head_sha: str, response: object
+) -> None:
+    root = f"https://api.github.com/repos/{OWNER}/{repo}/git"
+    ref = f"refs/heads/{branch}"
+    if not isinstance(response, dict):
+        raise FleetGitError("GitHub returned an invalid ref identity")
+    linked = response.get("object")
+    if (
+        response.get("ref") != ref
+        or not _exact_url(response.get("url"), f"{root}/refs/heads/{branch}")
+        or not isinstance(linked, dict)
+        or linked.get("sha") != head_sha
+        or linked.get("type") != "commit"
+        or not _exact_url(linked.get("url"), f"{root}/commits/{head_sha}")
+    ):
+        raise FleetGitError("GitHub returned an invalid ref identity")
+
+
+def _validate_rollout_commit(commit: RolloutCommit, branch: str) -> None:
+    if (
+        not isinstance(commit, RolloutCommit)
+        or not isinstance(commit.message, str)
+        or not isinstance(commit.blobs, tuple)
+        or not isinstance(commit.deletions, tuple)
+    ):
+        raise FleetGitError("rollout commit identity is invalid")
+    for value, description in (
+        (commit.head_sha, "rollout commit identity"),
+        (commit.tree_sha, "rollout tree identity"),
+        (commit.base_tree_sha, "default tree identity"),
+        (commit.base_sha, "default commit identity"),
+    ):
+        _validate_sha1(value, description)
+    ref = branch.removeprefix("automation/common-workflows-")
+    expected_message = f"ci: adopt common automation workflows ({ref})"
+    raw_commit = (
+        f"tree {commit.tree_sha}\n"
+        f"parent {commit.base_sha}\n"
+        "author workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
+        "committer workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
+        f"\n{commit.message}\n"
+    ).encode("utf-8")
+    computed_head = hashlib.sha1(
+        f"commit {len(raw_commit)}\0".encode("ascii") + raw_commit
+    ).hexdigest()
+    if commit.message != expected_message or commit.head_sha != computed_head:
+        raise FleetGitError("rollout commit message is invalid")
+    paths: set[str] = set()
+    for blob in commit.blobs:
+        if not isinstance(blob, GitBlob) or not isinstance(blob.content, bytes):
+            raise FleetGitError("rollout blob is invalid")
+        _validate_sha1(blob.sha, "rollout blob identity")
+        computed = hashlib.sha1(
+            f"blob {len(blob.content)}\0".encode("ascii") + blob.content
+        ).hexdigest()
+        if (
+            blob.sha != computed
+            or blob.mode != "100644"
+            or not blob.path
+            or blob.path in paths
+        ):
+            raise FleetGitError("rollout blob is invalid")
+        _validate_branch_path(blob.path)
+        paths.add(blob.path)
+    for path in commit.deletions:
+        if not isinstance(path, str) or not path or path in paths:
+            raise FleetGitError("rollout deletion is invalid")
+        _validate_branch_path(path)
+        paths.add(path)
+    if not paths:
+        raise FleetGitError("rollout commit has no managed changes")
+
+
+def _validate_branch_path(path: str) -> None:
+    components = path.split("/")
+    if (
+        path.startswith("/")
+        or path.endswith("/")
+        or any(component in {"", ".", ".."} for component in components)
+        or "\x00" in path
+    ):
+        raise FleetGitError("rollout path is invalid")
+
+
+def create_rollout_branch(
+    snapshot: RepositorySnapshot,
+    branch: str,
+    *,
+    commit: RolloutCommit,
+) -> str:
+    """Atomically create one exact rollout ref through the closed Git Data API."""
 
     _validate_branch(branch)
-    if branch == snapshot.default_branch:
-        raise FleetGitError("default branch publication is not permitted")
+    if _ROLLOUT_BRANCH.fullmatch(branch) is None or branch == snapshot.default_branch:
+        raise FleetGitError("rollout branch publication is not permitted")
     repo, path = _snapshot_repo(snapshot)
-    if remote_branch_sha(snapshot, branch) is not None:
-        raise FleetGitError("remote branch already exists")
-    fresh_base = refetch_default(snapshot)
-    _git(["switch", "-c", branch, fresh_base], cwd=path)
-    head_sha = _validate_object_id(_git(["rev-parse", "HEAD"], cwd=path))
     _verify_origin(path, repo)
-    _git(
-        ["push", "--set-upstream", "origin", f"HEAD:refs/heads/{branch}"],
-        cwd=path,
+    _validate_rollout_commit(commit, branch)
+    if commit.base_sha != snapshot.base_sha:
+        raise FleetGitError("rollout base does not match the repository snapshot")
+
+    tree_entries: list[dict[str, object]] = []
+    for blob in commit.blobs:
+        response = _github_post(
+            repo,
+            "blobs",
+            {
+                "content": base64.b64encode(blob.content).decode("ascii"),
+                "encoding": "base64",
+            },
+        )
+        _validate_blob_response(repo, blob, response)
+        tree_entries.append(
+            {
+                "mode": blob.mode,
+                "path": blob.path,
+                "sha": blob.sha,
+                "type": "blob",
+            }
+        )
+    tree_entries.extend(
+        {"mode": "100644", "path": path, "sha": None, "type": "blob"}
+        for path in commit.deletions
     )
-    return head_sha
+    tree_response = _github_post(
+        repo,
+        "trees",
+        {"base_tree": commit.base_tree_sha, "tree": tree_entries},
+    )
+    _validate_tree_response(repo, commit.tree_sha, tree_response)
+    commit_response = _github_post(
+        repo,
+        "commits",
+        {
+            "author": _commit_identity(),
+            "committer": _commit_identity(),
+            "message": commit.message,
+            "parents": [commit.base_sha],
+            "tree": commit.tree_sha,
+        },
+    )
+    _validate_commit_response(repo, commit, commit_response)
+    try:
+        ref_response = _github_post(
+            repo,
+            "refs",
+            {"ref": f"refs/heads/{branch}", "sha": commit.head_sha},
+        )
+    except FleetGitError:
+        try:
+            observed = remote_branch_sha(snapshot, branch)
+        except FleetGitError:
+            raise FleetGitError("atomic ref creation result is unavailable") from None
+        if observed != commit.head_sha:
+            raise FleetGitError("atomic ref creation failed") from None
+        return commit.head_sha
+    _validate_ref_response(repo, branch, commit.head_sha, ref_response)
+    if remote_branch_sha(snapshot, branch) != commit.head_sha:
+        raise FleetGitError("atomic ref creation attestation failed")
+    return commit.head_sha
 
 
 def _pull_request(

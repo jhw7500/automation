@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import stat
@@ -23,6 +26,56 @@ PROVIDER_KEYS = {
 SHA = "1" * 40
 HEAD_SHA = "2" * 40
 PR_HEAD_SHA = "3" * 40
+
+
+def object_oid(kind: str, payload: bytes) -> str:
+    return hashlib.sha1(
+        f"{kind} {len(payload)}\0".encode("ascii") + payload
+    ).hexdigest()
+
+
+def atomic_publication_values(base_sha: str = SHA) -> dict[str, object]:
+    content = b"name: managed\n"
+    blob_sha = object_oid("blob", content)
+    base_tree_sha = "4" * 40
+    tree_sha = "5" * 40
+    message = "ci: adopt common automation workflows (v1.40)"
+    commit_payload = (
+        f"tree {tree_sha}\n"
+        f"parent {base_sha}\n"
+        "author workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
+        "committer workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
+        f"\n{message}\n"
+    ).encode("utf-8")
+    return {
+        "base_sha": base_sha,
+        "base_tree_sha": base_tree_sha,
+        "tree_sha": tree_sha,
+        "head_sha": object_oid("commit", commit_payload),
+        "content": content,
+        "blob_sha": blob_sha,
+        "message": message,
+    }
+
+
+def rollout_commit(
+    values: dict[str, object], *, deletions: tuple[str, ...] = ()
+) -> workflow_fleet_git.RolloutCommit:
+    blob = workflow_fleet_git.GitBlob(
+        ".github/workflows/managed.yml",
+        "100644",
+        str(values["blob_sha"]),
+        values["content"],  # type: ignore[arg-type]
+    )
+    return workflow_fleet_git.RolloutCommit(
+        head_sha=str(values["head_sha"]),
+        tree_sha=str(values["tree_sha"]),
+        base_tree_sha=str(values["base_tree_sha"]),
+        base_sha=str(values["base_sha"]),
+        message=str(values["message"]),
+        blobs=(blob,),
+        deletions=deletions,
+    )
 
 
 def pr_item(**overrides: object) -> dict[str, object]:
@@ -119,6 +172,7 @@ def test_child_env_scrubs_provider_credentials(monkeypatch: pytest.MonkeyPatch) 
     for key in PROVIDER_KEYS:
         monkeypatch.setenv(key, f"sentinel-{key}")
     monkeypatch.setenv("GH_TOKEN", "operator-github-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-github-token")
 
     workflow_fleet_git.run(["gh", "repo", "view", "jhw7500/wlan-package"])
 
@@ -126,6 +180,19 @@ def test_child_env_scrubs_provider_credentials(monkeypatch: pytest.MonkeyPatch) 
     assert isinstance(env, dict)
     assert PROVIDER_KEYS.isdisjoint(env)
     assert env["GH_TOKEN"] == "operator-github-token"
+    assert "GITHUB_TOKEN" not in env
+
+
+def test_github_env_uses_github_token_only_when_preferred_token_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "fallback-github-token")
+
+    environment = workflow_fleet_git.github_env()
+
+    assert environment["GITHUB_TOKEN"] == "fallback-github-token"
+    assert "GH_TOKEN" not in environment
 
 
 def test_run_uses_closed_process_contract_and_sanitizes_errors(
@@ -455,83 +522,428 @@ def test_remote_branch_sha_is_read_only(
     assert calls[-1] == ["ls-remote", "--heads", "origin", "refs/heads/release"]
 
 
-def test_push_new_branch_proves_absence_and_never_forces_or_pushes_default(
+def test_atomic_rollout_branch_creation_uses_only_literal_git_data_post_schemas(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[list[str]] = []
+    values = atomic_publication_values()
+    branch = "automation/common-workflows-v1.40"
+    repo = snapshot(tmp_path / "repo")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    provider_sentinels = {
+        "CLAUDE_CODE_OAUTH_TOKEN": "claude-provider-sentinel",
+        "GEMINI_API_KEY": "gemini-provider-sentinel",
+        "UNRELATED_OPERATOR_SECRET": "unrelated-secret-sentinel",
+    }
+    for key, value in provider_sentinels.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("GH_TOKEN", "github-credential-sentinel")
+
+    api_root = "https://api.github.com/repos/jhw7500/repo/git"
 
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        payload = git_payload(args)
-        calls.append(payload)
-        if payload in [
-            ["remote", "get-url", "--all", "origin"],
-            ["remote", "get-url", "--push", "--all", "origin"],
-        ]:
-            return completed(args, "https://github.com/jhw7500/repo.git")
-        if payload == [
-            "ls-remote",
-            "--heads",
-            "origin",
-            "refs/heads/automation/common-workflows-v1.40",
-        ]:
-            return completed(args, "")
-        if payload == ["rev-parse", "refs/remotes/origin/main"]:
-            return completed(args, HEAD_SHA)
-        if payload == ["rev-parse", "HEAD"]:
-            return completed(args, HEAD_SHA)
-        return completed(args)
+        calls.append((list(args), dict(kwargs)))
+        if args[0] == "git":
+            payload = git_payload(args)
+            if payload in (
+                ["remote", "get-url", "--all", "origin"],
+                ["remote", "get-url", "--push", "--all", "origin"],
+            ):
+                return completed(args, "https://github.com/jhw7500/repo.git\n")
+            if payload == [
+                "ls-remote",
+                "--heads",
+                "origin",
+                f"refs/heads/{branch}",
+            ]:
+                return completed(args, f"{values['head_sha']}\trefs/heads/{branch}\n")
+            raise AssertionError(args)
+
+        assert args[:5] == [
+            "gh",
+            "api",
+            "--hostname",
+            "github.com",
+            "--method",
+        ]
+        assert args[5] == "POST"
+        assert args[-2:] == ["--input", "-"]
+        endpoint = args[6]
+        body = json.loads(str(kwargs["input"]))
+        if endpoint == "repos/jhw7500/repo/git/blobs":
+            assert body == {
+                "content": base64.b64encode(values["content"]).decode("ascii"),
+                "encoding": "base64",
+            }
+            response = {
+                "sha": values["blob_sha"],
+                "url": f"{api_root}/blobs/{values['blob_sha']}",
+            }
+        elif endpoint == "repos/jhw7500/repo/git/trees":
+            assert body == {
+                "base_tree": values["base_tree_sha"],
+                "tree": [
+                    {
+                        "mode": "100644",
+                        "path": ".github/workflows/managed.yml",
+                        "sha": values["blob_sha"],
+                        "type": "blob",
+                    },
+                    {
+                        "mode": "100644",
+                        "path": ".github/workflows/deleted.yml",
+                        "sha": None,
+                        "type": "blob",
+                    },
+                ],
+            }
+            response = {
+                "sha": values["tree_sha"],
+                "url": f"{api_root}/trees/{values['tree_sha']}",
+                "tree": [],
+                "truncated": False,
+            }
+        elif endpoint == "repos/jhw7500/repo/git/commits":
+            identity = {
+                "name": "workflow-fleet",
+                "email": "workflow-fleet@invalid",
+                "date": "2000-01-01T00:00:00Z",
+            }
+            assert body == {
+                "author": identity,
+                "committer": identity,
+                "message": values["message"],
+                "parents": [values["base_sha"]],
+                "tree": values["tree_sha"],
+            }
+            response = {
+                "sha": values["head_sha"],
+                "url": f"{api_root}/commits/{values['head_sha']}",
+                "message": values["message"],
+                "author": identity,
+                "committer": identity,
+                "tree": {
+                    "sha": values["tree_sha"],
+                    "url": f"{api_root}/trees/{values['tree_sha']}",
+                },
+                "parents": [
+                    {
+                        "sha": values["base_sha"],
+                        "url": f"{api_root}/commits/{values['base_sha']}",
+                    }
+                ],
+            }
+        elif endpoint == "repos/jhw7500/repo/git/refs":
+            assert body == {
+                "ref": f"refs/heads/{branch}",
+                "sha": values["head_sha"],
+            }
+            response = {
+                "ref": f"refs/heads/{branch}",
+                "url": f"https://api.github.com/repos/jhw7500/repo/git/refs/heads/{branch}",
+                "object": {
+                    "sha": values["head_sha"],
+                    "type": "commit",
+                    "url": f"{api_root}/commits/{values['head_sha']}",
+                },
+            }
+        else:
+            raise AssertionError(endpoint)
+        return completed(args, json.dumps(response))
 
     monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
-
-    result = workflow_fleet_git.push_new_branch(
-        snapshot(tmp_path / "repo"), "automation/common-workflows-v1.40"
+    result = workflow_fleet_git.create_rollout_branch(
+        repo,
+        branch,
+        commit=rollout_commit(values, deletions=(".github/workflows/deleted.yml",)),
     )
 
-    assert result == HEAD_SHA
-    push = calls[-1]
-    assert push == [
-        "push",
-        "--set-upstream",
-        "origin",
-        "HEAD:refs/heads/automation/common-workflows-v1.40",
+    assert result == values["head_sha"]
+    gh_calls = [(args, kwargs) for args, kwargs in calls if args[0] == "gh"]
+    assert [args[6] for args, _ in gh_calls] == [
+        "repos/jhw7500/repo/git/blobs",
+        "repos/jhw7500/repo/git/trees",
+        "repos/jhw7500/repo/git/commits",
+        "repos/jhw7500/repo/git/refs",
     ]
-    assert not any("force" in item for item in push)
-    assert all("main" not in item for item in push)
-    assert calls.index(
-        [
-            "ls-remote",
-            "--heads",
-            "origin",
-            "refs/heads/automation/common-workflows-v1.40",
-        ]
-    ) < calls.index(push)
-    assert ["switch", "-c", "automation/common-workflows-v1.40", HEAD_SHA] in calls
+    for args, kwargs in gh_calls:
+        assert not any(item.lstrip("-").startswith("force") for item in args)
+        assert values["content"].decode("utf-8") not in " ".join(args)
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        assert env["GH_TOKEN"] == "github-credential-sentinel"
+        assert provider_sentinels.keys().isdisjoint(env)
+        assert "UNRELATED_OPERATOR_SECRET" not in env
 
 
-def test_push_new_branch_refuses_existing_remote_without_writes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("corrupt", ("blob", "tree", "commit", "ref"))
+def test_atomic_rollout_branch_creation_rejects_each_mismatched_api_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corrupt: str,
 ) -> None:
+    values = atomic_publication_values()
+    branch = "automation/common-workflows-v1.40"
+    repo = snapshot(tmp_path / "repo")
+    identity = {
+        "name": "workflow-fleet",
+        "email": "workflow-fleet@invalid",
+        "date": "2000-01-01T00:00:00Z",
+    }
+    api_root = "https://api.github.com/repos/jhw7500/repo/git"
+    responses = {
+        "blobs": {
+            "sha": values["blob_sha"],
+            "url": f"{api_root}/blobs/{values['blob_sha']}",
+        },
+        "trees": {
+            "sha": values["tree_sha"],
+            "url": f"{api_root}/trees/{values['tree_sha']}",
+            "tree": [],
+            "truncated": False,
+        },
+        "commits": {
+            "sha": values["head_sha"],
+            "url": f"{api_root}/commits/{values['head_sha']}",
+            "message": values["message"],
+            "author": identity,
+            "committer": identity,
+            "tree": {
+                "sha": values["tree_sha"],
+                "url": f"{api_root}/trees/{values['tree_sha']}",
+            },
+            "parents": [
+                {
+                    "sha": values["base_sha"],
+                    "url": f"{api_root}/commits/{values['base_sha']}",
+                }
+            ],
+        },
+        "refs": {
+            "ref": f"refs/heads/{branch}",
+            "url": f"https://api.github.com/repos/jhw7500/repo/git/refs/heads/{branch}",
+            "object": {
+                "sha": values["head_sha"],
+                "type": "commit",
+                "url": f"{api_root}/commits/{values['head_sha']}",
+            },
+        },
+    }
+    response = responses[
+        {"blob": "blobs", "tree": "trees", "commit": "commits", "ref": "refs"}[corrupt]
+    ]
+    if corrupt == "ref":
+        response["object"] = {  # type: ignore[index]
+            "sha": "9" * 40,
+            "type": "commit",
+            "url": f"{api_root}/commits/{'9' * 40}",
+        }
+    else:
+        response["sha"] = "9" * 40
+
+    monkeypatch.setattr(
+        workflow_fleet_git,
+        "_github_post",
+        lambda _repo, collection, _body: responses[collection],
+    )
+    monkeypatch.setattr(
+        workflow_fleet_git,
+        "remote_branch_sha",
+        lambda *_args, **_kwargs: SHA,
+    )
+    monkeypatch.setattr(workflow_fleet_git, "_verify_origin", lambda *_args: None)
+    with pytest.raises(workflow_fleet_git.FleetGitError, match="GitHub returned"):
+        workflow_fleet_git.create_rollout_branch(
+            repo,
+            branch,
+            commit=rollout_commit(values),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("head_sha", "9" * 40),
+        ("message", "ci: adopt common automation workflows (v9.99)"),
+    ),
+    ids=("commit-object-id", "branch-bound-message"),
+)
+def test_atomic_branch_rejects_incoherent_local_commit_identity_before_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: str,
+) -> None:
+    values = atomic_publication_values()
+    commit = rollout_commit(values)
+    commit = replace(commit, **{field: replacement})
+    repo = snapshot(tmp_path / "repo")
+    monkeypatch.setattr(workflow_fleet_git, "_verify_origin", lambda *_args: None)
+    monkeypatch.setattr(
+        workflow_fleet_git,
+        "_github_post",
+        lambda *_args, **_kwargs: pytest.fail(
+            "incoherent local identity reached the GitHub API"
+        ),
+    )
+
+    with pytest.raises(workflow_fleet_git.FleetGitError, match="identity|message"):
+        workflow_fleet_git.create_rollout_branch(
+            repo,
+            "automation/common-workflows-v1.40",
+            commit=commit,
+        )
+
+
+@pytest.mark.parametrize(
+    ("concurrent_sha", "succeeds"),
+    ((SHA, False), (None, True)),
+    ids=("mismatched-concurrent-ref", "exact-idempotent-reconciliation"),
+)
+def test_atomic_ref_post_blocks_concurrent_branch_without_advancing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    concurrent_sha: str | None,
+    succeeds: bool,
+) -> None:
+    """Calibrate the old race, then prove POST refs is create-only."""
+
+    old = tmp_path / "old"
+    remote = tmp_path / "old-remote.git"
+    old.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=old, check=True)
+    subprocess.run(["git", "config", "user.name", "Race"], cwd=old, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "race@example.invalid"],
+        cwd=old,
+        check=True,
+    )
+    (old / "file").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file"], cwd=old, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=old, check=True)
+    old_base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=old,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=old, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=old, check=True)
+    (old / "file").write_text("head\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "head"], cwd=old, check=True)
+    old_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=old,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    race_ref = "refs/heads/automation/common-workflows-v1.40"
+    subprocess.run(
+        ["git", "--git-dir", str(remote), "update-ref", race_ref, old_base],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "origin", f"HEAD:{race_ref}"], cwd=old, check=True
+    )
+    assert (
+        subprocess.run(
+            ["git", "--git-dir", str(remote), "rev-parse", race_ref],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        == old_head
+    )
+
+    values = atomic_publication_values()
+    branch = "automation/common-workflows-v1.40"
+    state = {
+        "sha": str(values["head_sha"]) if concurrent_sha is None else concurrent_sha
+    }
     calls: list[list[str]] = []
+    api_repo = snapshot(tmp_path / "api" / "repo")
 
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        payload = git_payload(args)
-        calls.append(payload)
-        if payload in [
-            ["remote", "get-url", "--all", "origin"],
-            ["remote", "get-url", "--push", "--all", "origin"],
-        ]:
-            return completed(args, "https://github.com/jhw7500/repo.git")
-        return completed(args, f"{HEAD_SHA}\trefs/heads/release")
+        calls.append(list(args))
+        if args[0] == "git":
+            payload = git_payload(args)
+            if payload in (
+                ["remote", "get-url", "--all", "origin"],
+                ["remote", "get-url", "--push", "--all", "origin"],
+            ):
+                return completed(args, "https://github.com/jhw7500/repo.git")
+            if payload[0] == "ls-remote":
+                return completed(args, f"{state['sha']}\trefs/heads/{branch}\n")
+            raise AssertionError(args)
+        endpoint = args[6]
+        if endpoint.endswith("/refs"):
+            return subprocess.CompletedProcess(
+                args, 17, stdout="secret", stderr="secret"
+            )
+        response: dict[str, object]
+        if endpoint.endswith("/blobs"):
+            response = {
+                "sha": values["blob_sha"],
+                "url": "https://api.github.com/repos/jhw7500/repo/git/blobs/"
+                + str(values["blob_sha"]),
+            }
+        elif endpoint.endswith("/trees"):
+            response = {
+                "sha": values["tree_sha"],
+                "url": "https://api.github.com/repos/jhw7500/repo/git/trees/"
+                + str(values["tree_sha"]),
+                "tree": [],
+                "truncated": False,
+            }
+        else:
+            identity = {
+                "name": "workflow-fleet",
+                "email": "workflow-fleet@invalid",
+                "date": "2000-01-01T00:00:00Z",
+            }
+            response = {
+                "sha": values["head_sha"],
+                "url": "https://api.github.com/repos/jhw7500/repo/git/commits/"
+                + str(values["head_sha"]),
+                "message": values["message"],
+                "author": identity,
+                "committer": identity,
+                "tree": {
+                    "sha": values["tree_sha"],
+                    "url": "https://api.github.com/repos/jhw7500/repo/git/trees/"
+                    + str(values["tree_sha"]),
+                },
+                "parents": [
+                    {
+                        "sha": values["base_sha"],
+                        "url": "https://api.github.com/repos/jhw7500/repo/git/commits/"
+                        + str(values["base_sha"]),
+                    }
+                ],
+            }
+        return completed(args, json.dumps(response))
 
     monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
 
-    with pytest.raises(workflow_fleet_git.FleetGitError):
-        workflow_fleet_git.push_new_branch(snapshot(tmp_path / "repo"), "release")
+    def call() -> str:
+        return workflow_fleet_git.create_rollout_branch(
+            api_repo,
+            branch,
+            commit=rollout_commit(values),
+        )
 
-    assert not any(payload and payload[0] in {"switch", "push"} for payload in calls)
+    if succeeds:
+        assert call() == values["head_sha"]
+    else:
+        with pytest.raises(workflow_fleet_git.FleetGitError, match="ref creation"):
+            call()
+        assert state["sha"] == SHA
+    assert not any(args[0] == "git" and "push" in git_payload(args) for args in calls)
 
 
-def test_push_new_branch_rejects_default_branch_before_any_child(
+def test_atomic_branch_creation_rejects_default_branch_before_any_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -543,7 +955,11 @@ def test_push_new_branch_rejects_default_branch_before_any_child(
     )
 
     with pytest.raises(workflow_fleet_git.FleetGitError):
-        workflow_fleet_git.push_new_branch(snapshot(tmp_path / "repo"), "main")
+        workflow_fleet_git.create_rollout_branch(
+            snapshot(tmp_path / "repo"),
+            "main",
+            commit=rollout_commit(atomic_publication_values()),
+        )
 
 
 @pytest.mark.parametrize(
@@ -597,8 +1013,12 @@ def test_snapshot_operation_rejects_effective_push_url_redirects(
             id="remote-branch",
         ),
         pytest.param(
-            lambda item: workflow_fleet_git.push_new_branch(item, "release"),
-            id="push",
+            lambda item: workflow_fleet_git.create_rollout_branch(
+                item,
+                "automation/common-workflows-v1.40",
+                commit=rollout_commit(atomic_publication_values()),
+            ),
+            id="atomic-create",
         ),
     ],
 )
@@ -889,12 +1309,14 @@ def test_adapter_exposes_no_merge_revert_or_prerequisite_write_api() -> None:
     assert forbidden.isdisjoint(vars(workflow_fleet_git))
     assert set(workflow_fleet_git.__all__) == {
         "FleetGitError",
+        "GitBlob",
         "PullRequest",
         "RepositorySnapshot",
+        "RolloutCommit",
         "clone_default_branch",
         "create_pull_request",
+        "create_rollout_branch",
         "list_rollout_prs",
-        "push_new_branch",
         "refetch_default",
         "remote_branch_sha",
     }

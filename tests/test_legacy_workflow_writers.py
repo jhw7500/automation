@@ -41,7 +41,7 @@ FORBIDDEN = {
     "--allow-env-secret",
     "--allow-personal-oauth-fanout",
     "--mode prepare",
-    "--force-with-lease",
+    "force-with-lease",
 }
 PROVIDER_INPUTS = {
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -189,10 +189,12 @@ def test_rollout_document_describes_pr_only_operation_and_separate_tokens() -> N
 
     assert "## Workflow PR rollout" in text
     assert "## Token synchronization" in text
-    assert "python3 scripts/rollout_workflow_fleet.py" in text
+    assert (
+        'python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py"' in text
+    )
     assert "--mode plan" in text
     assert "--mode publish" in text
-    assert "python3 scripts/audit_workflow_fleet.py" in text
+    assert 'python3 "$AUTOMATION_RELEASE_ROOT/scripts/audit_workflow_fleet.py"' in text
     assert "--bootstrap-repo cts-email-mcp-server" in text
     assert "--bootstrap-repo wpa-supplicant" in text
     assert "automation/common-workflows-v1.40" in text
@@ -527,10 +529,53 @@ def test_task9_is_fail_closed_sequential_and_reuses_the_marked_workspace() -> No
     assert package_index < package_approval < driver_index < bootstrap_index
     assert "--workspace /tmp/automation-v1.40-audit" not in text
     expected_audit = (
-        "scripts/audit_workflow_fleet.py \\\n"
-        "  --automation . --workspace /tmp/automation-v1.40-fleet --ref v1.40"
+        '"$AUTOMATION_RELEASE_ROOT/scripts/audit_workflow_fleet.py" \\\n'
+        '  --automation "$AUTOMATION_RELEASE_ROOT" --workspace "$FLEET_WORKSPACE"'
     )
     assert expected_audit in text
+
+
+def test_task9_materializes_and_uses_one_fresh_full_public_release_clone() -> None:
+    text = IMPLEMENTATION_PLAN.read_text(encoding="utf-8")
+    task9 = text.split("### Task 9:", 1)[1]
+    post_tag = task9.index("POST_REMOTE_TAGS")
+    clone = task9.index("public_git clone", post_tag)
+    first_rollout = task9.index(
+        'rtk python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py"',
+        clone,
+    )
+    first_plan = task9.index("--mode plan", first_rollout)
+
+    materialization = task9[post_tag:first_plan]
+    assert "AUTOMATION_RELEASE_ROOT=/tmp/automation-v1.40-public" in materialization
+    assert "https://github.com/jhw7500/automation.git" in materialization
+    assert "public_git clone" in materialization
+    assert "--no-recurse-submodules" in materialization
+    assert "--is-shallow-repository" in materialization
+    assert "remote get-url --all origin" in materialization
+    assert "remote get-url --push --all origin" in materialization
+    assert "refs/heads/main" in materialization
+    assert "refs/tags/v1.40" in materialization
+    assert '"refs/tags/v1.40^{}"' in materialization
+    assert '"$DIRECT_COUNT" -eq 1' in materialization
+    assert '"$PEELED_COUNT" -eq 1' in materialization
+    assert '-e "$AUTOMATION_RELEASE_ROOT"' in materialization
+    assert '-L "$AUTOMATION_RELEASE_ROOT"' in materialization
+    for forbidden in ("--depth", "--filter", "--single-branch", "git clone origin"):
+        assert forbidden not in materialization
+
+    rollout_commands = task9[first_rollout:]
+    assert "--automation ." not in rollout_commands
+    assert "scripts/rollout_workflow_fleet.py" in rollout_commands
+    assert "scripts/audit_workflow_fleet.py" in rollout_commands
+    assert rollout_commands.count('--automation "$AUTOMATION_RELEASE_ROOT"') >= 7
+    assert '--workspace "$FLEET_WORKSPACE"' in rollout_commands
+    assert "--initialize-workspace" in rollout_commands
+    assert (
+        task9.index("public_git clone", post_tag)
+        < task9.index("--is-shallow-repository", clone)
+        < first_plan
+    )
 
 
 def test_design_and_plan_distinguish_public_plan_and_audit_statuses() -> None:

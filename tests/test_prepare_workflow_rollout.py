@@ -207,6 +207,76 @@ def test_existing_commit_is_moved_beside_ref_without_changing_other_bytes(
     )
 
 
+def test_quoted_identity_keys_and_values_are_updated_by_yaml_source_span(
+    tmp_path: Path,
+) -> None:
+    original = (
+        b"\"automation_ref\": 'v1.39' # keep quoted identity\n"
+        b"custom: keep\n"
+        b"'automation_commit': \"0000000000000000000000000000000000000000\""
+        b" # keep commit quote\n"
+    )
+    plan = render_existing(tmp_path, config=original)
+
+    assert plan.after(".github/workflow-config.yml") == (
+        b"\"automation_ref\": 'v1.40' # keep quoted identity\n"
+        + b"'automation_commit': \""
+        + COMMIT.encode()
+        + b'" # keep commit quote\n'
+        + b"custom: keep\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        b'"automation_ref": v9.99\nautomation_ref: v1.39\n',
+        b"automation_ref: v1.39\n'automation_ref': v9.99\n",
+        b'? "automation_ref"\n: v9.99\nautomation_ref: v1.39\n',
+        b'"automation_ref": v1.39\n"automation_commit": old\n'
+        b"automation_commit: older\n",
+    ),
+    ids=("quoted-first", "quoted-second", "explicit-key", "quoted-commit"),
+)
+def test_semantic_quoted_or_explicit_duplicate_identity_keys_block(
+    tmp_path: Path, config: bytes
+) -> None:
+    plan = render_existing(tmp_path, config=config)
+    assert plan.status == "blocked"
+    assert plan.changes == ()
+    assert "identity" in plan.reason
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        b"identity: &identity v1.39\nautomation_ref: *identity\n",
+        b"defaults: &defaults\n  automation_ref: v1.39\n"
+        b"<<: *defaults\nautomation_ref: v1.39\n",
+        b"? [complex, key]\n: value\nautomation_ref: v1.39\n",
+    ),
+    ids=("identity-alias", "merge-key", "non-scalar-key"),
+)
+def test_config_identity_alias_merge_or_non_scalar_key_fails_closed(
+    tmp_path: Path, config: bytes
+) -> None:
+    plan = render_existing(tmp_path, config=config)
+    assert plan.status == "blocked"
+    assert plan.changes == ()
+    assert "identity" in plan.reason
+
+
+@pytest.mark.parametrize("quoted_merge", (b"'<<': literal\n", b'"<<": literal\n'))
+def test_quoted_literal_merge_spelling_is_preserved(
+    tmp_path: Path, quoted_merge: bytes
+) -> None:
+    config = quoted_merge + b"automation_ref: v1.39\n"
+    plan = render_existing(tmp_path, config=config)
+
+    assert plan.status == "drift"
+    assert quoted_merge in plan.after(".github/workflow-config.yml")
+
+
 def test_all_19_profiles_render_deterministically(tmp_path: Path) -> None:
     assert len(PROFILES) == 19
     for name in PROFILES:

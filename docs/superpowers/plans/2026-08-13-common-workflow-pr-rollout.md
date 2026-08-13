@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a catalog-driven workflow fleet tool that renders the common AI callers, validates them, and opens independent repository pull requests without merging, reverting, force-pushing, or changing secrets.
+**Goal:** Build a catalog-driven workflow fleet tool that renders the common AI callers, validates them, and opens independent repository pull requests without merging, reverting, overwriting branches, or changing secrets.
 
-**Architecture:** The tagged `automation` release contains the reusable workflows, one typed catalog, one typed 19-repository profile inventory, and one canonical consumer tree. Pure catalog/render/audit code computes managed-file changes; a small Git/GitHub adapter only clones, checks prerequisite names, creates a deterministic branch, pushes a new commit, and opens or reuses an exact PR. Repository owners retain all merge and recovery control through GitHub.
+**Architecture:** The tagged `automation` release contains the reusable workflows, one typed catalog, one typed 19-repository profile inventory, and one canonical consumer tree. Pure catalog/render/audit code computes managed-file changes; a small Git/GitHub adapter only clones, checks prerequisite names, creates deterministic detached Git objects, atomically creates a previously absent branch ref, and opens or reuses an exact PR. Repository owners retain all merge and recovery control through GitHub.
 
 **Tech Stack:** Python 3.12 standard library, PyYAML `BaseLoader`, `unittest`/pytest, Bash, Git, GitHub CLI, GitHub Actions YAML, actionlint 1.7.12.
 
@@ -14,7 +14,7 @@
 - `examples/baseline-workflows/.github/` is the only canonical consumer tree. The duplicate `examples/baseline-workflows/workflows/` tree is deleted.
 - Manage only the 10 required callers, 4 profile-selected optional callers, `.github/workflow-config.yml`, and retired `bump-automation-ref.yml`; every other workflow remains byte-identical.
 - `plan` and `audit` are read-only. `publish` may create a non-default branch, one commit, and one PR only.
-- No code path may merge, enable auto-merge, update a PR branch, force-push, push a default branch, revert, or write a GitHub Actions secret/variable.
+- No code path may perform an ordinary Git branch push, merge, enable auto-merge, update a PR branch, force, write a default branch, revert, or write a GitHub Actions secret/variable.
 - Workflow rollout and `personal-ops/claude-token-sync` remain separate. Local provider values including `CLAUDE_CODE_OAUTH_TOKEN`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `ZHIPU_API_KEY`, and `APP_PRIVATE_KEY` are removed from Git/`gh` child environments and never enter argv, logs, commits, or reports.
 - Caller secret mappings are same-name expressions and never `secrets: inherit`: Claude uses `CLAUDE_CODE_OAUTH_TOKEN`, Gemini uses `GEMINI_API_KEY`, and profiled OpenCode uses `ZHIPU_API_KEY`.
 - Gemini model authentication has no `GOOGLE_API_KEY`, GCP/Vertex, Code Assist, or OIDC path. Repository-write authentication is exactly `github_app` or `github_token` from the profile.
@@ -33,7 +33,7 @@
 - `scripts/prepare_workflow_rollout.py`: pure managed-file rendering plus guarded application to a disposable clone.
 - `scripts/audit_workflow_fleet.py`: content-state classification (`current`, `drift`, `blocked`) only.
 - `scripts/workflow_release_bundle.py`: verified tag resolution and extraction of catalog/config/canonical files.
-- `scripts/workflow_fleet_git.py`: scrubbed subprocess execution, default-branch clone/fetch, name-only prerequisite inventory, branch inspection/push, and PR inspection/creation.
+- `scripts/workflow_fleet_git.py`: scrubbed subprocess execution, default-branch clone/fetch, name-only prerequisite inventory, branch inspection, restricted Git Data object/ref creation, and PR inspection/creation.
 - `scripts/rollout_workflow_fleet.py`: `plan`/`publish` orchestration and JSON reporting; no secret or merge client.
 - `scripts/verify_workflow_release.py`: immutable tag and central/canonical security contract gate.
 - `tests/test_workflow_catalog.py`, `tests/test_prepare_workflow_rollout.py`, `tests/test_audit_workflow_fleet.py`, `tests/test_workflow_release_bundle.py`, `tests/test_rollout_workflow_fleet.py`: focused unit and integration boundaries.
@@ -864,7 +864,9 @@ rtk git commit -m "feat: audit tagged workflow release content"
   - `clone_default_branch(owner: str, repo: str, workspace: Path) -> RepositorySnapshot`.
   - `refetch_default(snapshot: RepositorySnapshot) -> str`.
   - `remote_branch_sha(snapshot: RepositorySnapshot, branch: str) -> str | None`.
-  - `push_new_branch(snapshot: RepositorySnapshot, branch: str) -> str`.
+  - `GitBlob(path: str, mode: Literal["100644"], sha: str, content: bytes)`.
+  - `RolloutCommit(head_sha: str, tree_sha: str, base_tree_sha: str, base_sha: str, message: str, blobs: tuple[GitBlob, ...], deletions: tuple[str, ...])`.
+  - `create_rollout_branch(snapshot: RepositorySnapshot, branch: str, *, commit: RolloutCommit) -> str`.
   - `list_rollout_prs(owner: str, repo: str, branch: str) -> tuple[PullRequest, ...]`.
   - `create_pull_request(owner: str, repo: str, base: str, head: str, title: str, body: str) -> PullRequest`.
 
@@ -887,13 +889,15 @@ def test_child_env_scrubs_provider_credentials(monkeypatch) -> None:
     for key in PROVIDER_KEYS:
         monkeypatch.setenv(key, f"sentinel-{key}")
     monkeypatch.setenv("GH_TOKEN", "operator-github-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-github-token")
     run(["gh", "repo", "view", "jhw7500/wlan-package"])
     env = calls[0][1]["env"]
     assert PROVIDER_KEYS.isdisjoint(env)
     assert env["GH_TOKEN"] == "operator-github-token"
+    assert "GITHUB_TOKEN" not in env
 ```
 
-Add command tests proving clone uses `--no-recurse-submodules`, every Git invocation disables hooks and recursive submodules, the origin is exactly `https://github.com/jhw7500/<configured-name>.git` or its SSH equivalent reported by `gh`, secret/variable calls are list-only, push has no force option and no default-branch refspec, and no method constructs merge/revert/secret-set/variable-set requests.
+Add command tests proving clone uses `--no-recurse-submodules`, every Git invocation disables hooks and recursive submodules, the origin is exactly `https://github.com/jhw7500/<configured-name>.git` or its SSH equivalent reported by `gh`, secret/variable calls are list-only, and no method constructs an ordinary branch push, force, merge/revert, secret-set, or variable-set request.
 
 - [ ] **Step 2: Run adapter tests red**
 
@@ -923,13 +927,19 @@ Use `gh repo view --json defaultBranchRef,url` and `gh secret list`/`gh variable
 
 - [ ] **Step 4: Implement branch/PR reads and creation-only writes**
 
-`push_new_branch` must first prove the remote branch is absent, create a local branch from the freshly fetched base, and run only:
-
-```text
-git push --set-upstream origin HEAD:refs/heads/automation/common-workflows-v1.40
-```
-
-Do not accept a force parameter. Query all PR states for the exact head branch with `gh pr list --state all --json number,url,state,baseRefName,headRefName,title,body,isDraft,mergedAt`. `create_pull_request` uses only `gh pr create --base ... --head ... --title ... --body-file <0600 temp file>` so the body is not placed in argv.
+`create_rollout_branch` accepts only the deterministic release branch and a typed local
+snapshot. It recomputes each blob SHA-1, requires regular mode `100644`, and sends JSON only
+through stdin to the literal `repos/jhw7500/<catalog-repo>/git/blobs`, `trees`, `commits`,
+and `refs` endpoints with `gh api --hostname github.com --method POST --input -`. Tree
+creation names the exact base tree; commit creation uses one exact parent plus fixed
+`workflow-fleet` author/committer, `2000-01-01T00:00:00Z`, and deterministic PR title
+message. Every API response must match the locally computed blob/tree/commit identity.
+The final ref POST is atomic create-only; on an error, read-only reconciliation succeeds
+only if the branch equals the exact expected head. Never update/delete a ref, create an
+extra ref, or invoke an ordinary Git branch push. GitHub children inherit only fixed
+runtime variables, GitHub CLI config paths, and at most one intended token (`GH_TOKEN`
+preferred, otherwise `GITHUB_TOKEN`); all provider/unrelated operator variables are absent. Query all PR states for the exact head
+branch with `gh pr list --state all --json number,url,state,baseRefName,headRefName,title,body,isDraft,mergedAt`. `create_pull_request` uses only `gh pr create --base ... --head ... --title ... --body-file <0600 temp file>` so the body is not placed in argv.
 
 - [ ] **Step 5: Run adapter tests green**
 
@@ -974,13 +984,13 @@ def test_legacy_secret_flags_are_rejected(flag: str) -> None:
         child.assert_not_called()
 ```
 
-Add tests for: plan has no remote mutation; publish requires `--confirm` and an explicit `--repo`; multi-repo publish prevalidates all selected repos; each selected repo is refetched before write; exact absent branch creates branch/commit/PR; matching branch with no PR creates only the PR; one exact open PR is reused; mismatched content/base/title/body, multiple PRs, or closed/merged PR with branch present blocks; no force/default push; partial success is reported and rerunnable; bootstrap requires exactly one allowed repo and `--bootstrap-repo`; and every forbidden command sentinel (`merge`, `auto-merge`, `update-branch`, `secret set`, `variable set`) fails the test.
+Add tests for: plan has no remote mutation; publish requires `--confirm` and an explicit `--repo`; multi-repo publish prevalidates all selected repos; each selected repo is refetched before write; exact absent branch creates branch/commit/PR; matching branch with no PR creates only the PR; one exact open PR is reused; mismatched content/base/title/body, multiple PRs, or closed/merged PR with branch present blocks; no ordinary Git branch push or forced/default write; partial success is reported and rerunnable; bootstrap requires exactly one allowed repo and `--bootstrap-repo`; and every forbidden command sentinel (`merge`, `auto-merge`, `update-branch`, `secret set`, `variable set`) fails the test.
 
 - [ ] **Step 2: Run orchestration tests red**
 
 Run: `rtk python3 -m pytest tests/test_rollout_workflow_fleet.py tests/test_audit_workflow_fleet.py -q`
 
-Expected: old secret/prepare behavior and force-with-lease assertions fail.
+Expected: old secret/prepare behavior and ordinary branch-publication assertions fail.
 
 - [ ] **Step 3: Implement the narrowed CLI and report model**
 
@@ -1022,7 +1032,7 @@ For an existing branch, fetch it and require: its single parent equals the fresh
 
 First clone/render/validate every selected repo and collect blocks without writes. If any selected repo is blocked, return non-zero with zero new branches/PRs. Otherwise process in requested order: refetch one repo, recompute render/inventory, then create or reuse its branch/PR. A network failure after earlier PRs records those earlier outcomes and a blocked current outcome; remaining repos continue. Rerun reuses exact branches/PRs.
 
-Before push run YAML parse, catalog audit, `git diff --check`, and actionlint against only the managed result. Fail closed when actionlint is absent or returns diagnostics.
+Before remote object creation run YAML parse, catalog audit, `git diff --check`, and actionlint against only the managed result. Fail closed when actionlint is absent or returns diagnostics.
 
 - [ ] **Step 6: Make audit's fleet CLI use the same release/profile/read adapter**
 
@@ -1077,7 +1087,7 @@ Assert both legacy shell scripts exit non-zero without invoking `git`, `gh`, `cp
 ```python
 FORBIDDEN = {
     "--sync-missing-secrets", "--refresh-secret", "--allow-env-secret",
-    "--allow-personal-oauth-fanout", "--mode prepare", "--force-with-lease",
+    "--allow-personal-oauth-fanout", "--mode prepare",
 }
 
 def test_retired_scripts_are_side_effect_free_guards() -> None:
@@ -1326,11 +1336,113 @@ commands, credential helpers, askpass, agent, or provider/operator credentials. 
 forked automation remote remains unsupported without a separately reviewed explicit
 credential channel.
 
+Before any fleet command, materialize one fresh, full public release clone. The fixed
+clone and fleet paths must both be absent (including dangling symlinks); an operator clears
+only a previously reviewed disposable path in a separate step, then reruns this block. The
+clone uses the literal canonical HTTPS URL in a configuration-free, credential-free
+environment, never an ambient `origin`:
+
+```bash
+export AUTOMATION_RELEASE_ROOT=/tmp/automation-v1.40-public
+export FLEET_WORKSPACE=/tmp/automation-v1.40-fleet
+rtk bash -s <<'BASH'
+  set -euo pipefail
+  AUTOMATION_URL=https://github.com/jhw7500/automation.git
+  : "${AUTOMATION_RELEASE_ROOT:?}" "${FLEET_WORKSPACE:?}"
+  if [[ -e "$AUTOMATION_RELEASE_ROOT" || -L "$AUTOMATION_RELEASE_ROOT" \
+        || -e "$FLEET_WORKSPACE" || -L "$FLEET_WORKSPACE" ]]; then
+    printf '%s\n' "ERROR: release clone and fleet workspace must be fresh absent paths" >&2
+    exit 1
+  fi
+
+  public_git() {
+    rtk env -i \
+      PATH=/usr/bin:/bin \
+      HOME=/nonexistent/automation-workflow-release/home \
+      XDG_CONFIG_HOME=/nonexistent/automation-workflow-release/xdg \
+      LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+      GIT_CONFIG_NOSYSTEM=1 \
+      GIT_CONFIG_SYSTEM=/dev/null \
+      GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_TERMINAL_PROMPT=0 \
+      GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false GCM_INTERACTIVE=Never \
+      GIT_ALLOW_PROTOCOL=https GIT_PROTOCOL_FROM_USER=0 \
+      GIT_CEILING_DIRECTORIES=/ \
+      /usr/bin/git -C / "$@"
+  }
+  public_git clone --no-recurse-submodules \
+    "$AUTOMATION_URL" "$AUTOMATION_RELEASE_ROOT"
+
+  release_git() {
+    rtk env -i \
+      PATH=/usr/bin:/bin \
+      HOME=/nonexistent/automation-workflow-release/home \
+      XDG_CONFIG_HOME=/nonexistent/automation-workflow-release/xdg \
+      LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+      GIT_CONFIG_NOSYSTEM=1 \
+      GIT_CONFIG_SYSTEM=/dev/null \
+      GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_TERMINAL_PROMPT=0 \
+      GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false GCM_INTERACTIVE=Never \
+      GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+      /usr/bin/git -C "$AUTOMATION_RELEASE_ROOT" "$@"
+  }
+  [[ "$(release_git rev-parse --is-shallow-repository)" == false ]]
+  [[ "$(release_git remote get-url --all origin)" == "$AUTOMATION_URL" ]]
+  [[ "$(release_git remote get-url --push --all origin)" == "$AUTOMATION_URL" ]]
+
+  REMOTE_MAIN="$(public_git ls-remote --heads "$AUTOMATION_URL" refs/heads/main)"
+  REMOTE_TAGS="$(public_git ls-remote --tags "$AUTOMATION_URL" \
+    refs/tags/v1.40 "refs/tags/v1.40^{}")"
+  [[ -n "$REMOTE_MAIN" && "$REMOTE_MAIN" != *$'\n'* ]]
+  IFS=$'\t' read -r EXPECTED_MAIN MAIN_REF MAIN_EXTRA <<< "$REMOTE_MAIN"
+  [[ "$EXPECTED_MAIN" =~ ^[0-9a-f]{40}$ \
+      && "$MAIN_REF" == refs/heads/main && -z "${MAIN_EXTRA:-}" ]]
+  EXPECTED_TAG=
+  EXPECTED_PEELED=
+  DIRECT_COUNT=0
+  PEELED_COUNT=0
+  while IFS=$'\t' read -r SHA REF EXTRA; do
+    [[ "$SHA" =~ ^[0-9a-f]{40}$ && -z "${EXTRA:-}" ]]
+    case "$REF" in
+      refs/tags/v1.40)
+        EXPECTED_TAG="$SHA"
+        DIRECT_COUNT=$((DIRECT_COUNT + 1))
+        ;;
+      refs/tags/v1.40^\{\})
+        EXPECTED_PEELED="$SHA"
+        PEELED_COUNT=$((PEELED_COUNT + 1))
+        ;;
+      *) exit 1 ;;
+    esac
+  done <<< "$REMOTE_TAGS"
+  [[ "$DIRECT_COUNT" -eq 1 && "$PEELED_COUNT" -eq 1 \
+      && "$EXPECTED_PEELED" == "$EXPECTED_MAIN" ]]
+
+  [[ "$(release_git rev-parse --verify refs/heads/main)" == "$EXPECTED_MAIN" ]]
+  [[ "$(release_git rev-parse --verify refs/remotes/origin/main)" == "$EXPECTED_MAIN" ]]
+  [[ "$(release_git rev-parse --verify refs/tags/v1.40)" == "$EXPECTED_TAG" ]]
+  [[ "$(release_git rev-parse --verify 'refs/tags/v1.40^{}')" == "$EXPECTED_PEELED" ]]
+  (
+    cd "$AUTOMATION_RELEASE_ROOT"
+    rtk python3 -m scripts.verify_workflow_release \
+      --automation "$AUTOMATION_RELEASE_ROOT" --ref v1.40 \
+      --expected-commit "$EXPECTED_MAIN"
+  )
+BASH
+```
+
+The clone must remain non-shallow and its generated `origin` must remain the literal
+canonical URL. All remaining plan, publish, and audit commands execute the released script
+from this clone **and** pass the same clone as `--automation`; none uses the pre-merge
+checkout that intentionally lacks a local `v1.40`. The fleet workspace is marked only by
+the first `--initialize-workspace` plan below.
+
 - [ ] **Step 5: Run the full read-only fleet plan**
 
 ```bash
-rtk python3 scripts/rollout_workflow_fleet.py \
-  --automation . --workspace /tmp/automation-v1.40-fleet \
+rtk python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" --workspace "$FLEET_WORKSPACE" \
   --initialize-workspace --mode plan --ref v1.40 \
   --actionlint /tmp/actionlint-v1.7.12/actionlint
 ```
@@ -1344,8 +1456,8 @@ path.
 - [ ] **Step 6: Create and approve the `wlan-package` canary first**
 
 ```bash
-rtk python3 scripts/rollout_workflow_fleet.py \
-  --automation . --workspace /tmp/automation-v1.40-fleet \
+rtk python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" --workspace "$FLEET_WORKSPACE" \
   --mode publish --ref v1.40 \
   --repo wlan-package --confirm \
   --actionlint /tmp/actionlint-v1.7.12/actionlint
@@ -1360,8 +1472,8 @@ Claude invocation, OpenCode automatic review, and OpenCode manual command. Audit
 - [ ] **Step 7: Create and approve the `wlan-driver` canary second**
 
 ```bash
-rtk python3 scripts/rollout_workflow_fleet.py \
-  --automation . --workspace /tmp/automation-v1.40-fleet \
+rtk python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" --workspace "$FLEET_WORKSPACE" \
   --mode publish --ref v1.40 \
   --repo wlan-driver --confirm \
   --actionlint /tmp/actionlint-v1.7.12/actionlint
@@ -1375,8 +1487,8 @@ bootstrap canary is approved.
 - [ ] **Step 8: Create the disabled bootstrap canary PR third**
 
 ```bash
-rtk python3 scripts/rollout_workflow_fleet.py \
-  --automation . --workspace /tmp/automation-v1.40-fleet \
+rtk python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" --workspace "$FLEET_WORKSPACE" \
   --mode publish --ref v1.40 \
   --repo cts-email-mcp-server --bootstrap-repo cts-email-mcp-server --confirm \
   --actionlint /tmp/actionlint-v1.7.12/actionlint
@@ -1389,8 +1501,8 @@ Expected: one PR containing required callers plus a config that disables every c
 After the three canaries are human-reviewed, merged, runtime-checked, and audited `current`, create the remaining 15 ordinary PRs:
 
 ```bash
-rtk python3 scripts/rollout_workflow_fleet.py \
-  --automation . --workspace /tmp/automation-v1.40-fleet \
+rtk python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" --workspace "$FLEET_WORKSPACE" \
   --mode publish --ref v1.40 --confirm \
   --repo gstApp --repo max9296 --repo wlan-driver-v2 \
   --repo wlan-bridge --repo wlan-opc --repo pcap-analyzer \
@@ -1403,8 +1515,8 @@ rtk python3 scripts/rollout_workflow_fleet.py \
 Create `wpa-supplicant` separately as disabled bootstrap:
 
 ```bash
-rtk python3 scripts/rollout_workflow_fleet.py \
-  --automation . --workspace /tmp/automation-v1.40-fleet \
+rtk python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" --workspace "$FLEET_WORKSPACE" \
   --mode publish --ref v1.40 \
   --repo wpa-supplicant --bootstrap-repo wpa-supplicant --confirm \
   --actionlint /tmp/actionlint-v1.7.12/actionlint
@@ -1413,8 +1525,9 @@ rtk python3 scripts/rollout_workflow_fleet.py \
 Repository owners merge on their own schedules. Repeat the read-only fleet audit:
 
 ```bash
-rtk python3 scripts/audit_workflow_fleet.py \
-  --automation . --workspace /tmp/automation-v1.40-fleet --ref v1.40
+rtk python3 "$AUTOMATION_RELEASE_ROOT/scripts/audit_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" --workspace "$FLEET_WORKSPACE" \
+  --ref v1.40
 ```
 
 Stop only when it reports `current=19`, `drift=0`, `blocked=0`. Before merge, closing the

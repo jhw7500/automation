@@ -1,8 +1,8 @@
 # Workflow Fleet Rollout
 
 The fleet tooling standardizes only catalogued common AI caller workflows. It renders a
-managed diff, validates it, pushes a deterministic repository branch, and opens a pull
-request. It never merges, reverts, force-pushes, updates a default branch, or writes an
+managed diff, validates it, atomically creates a deterministic repository branch, and opens
+a pull request. It never merges, reverts, forces, updates a default branch, or writes an
 Actions secret or variable.
 
 The release input is an immutable annotated automation tag. For `v1.40`, the local and
@@ -45,10 +45,92 @@ CI pins and verifies actionlint itself, then runs its YAML schema and expression
 of optional host ShellCheck/Pyflakes installations; actionlint's own diagnostics remain
 fail-closed. The rollout validator uses the same actionlint boundary for managed callers.
 
+After the immutable tag is published, do not run from the pre-merge checkout, which has no
+local `v1.40`. Materialize one full public clone from the literal canonical HTTPS URL in a
+configuration-free, credential-free environment. The fixed clone and fleet paths must be
+absent, including dangling symlinks; clear only a previously reviewed disposable path in a
+separate operator step. The clone intentionally has no depth, filter, or single-branch flag:
+
 ```bash
-FLEET_WORKSPACE=/path/to/disposable-workflow-fleet
-ACTIONLINT=/path/to/actionlint
+set -euo pipefail
+export AUTOMATION_RELEASE_ROOT=/tmp/automation-v1.40-public
+export FLEET_WORKSPACE=/tmp/automation-v1.40-fleet
+export ACTIONLINT=/tmp/actionlint-v1.7.12/actionlint
+[[ ! -e "$AUTOMATION_RELEASE_ROOT" && ! -L "$AUTOMATION_RELEASE_ROOT" ]]
+[[ ! -e "$FLEET_WORKSPACE" && ! -L "$FLEET_WORKSPACE" ]]
+
+public_git() {
+  env -i PATH=/usr/bin:/bin \
+    HOME=/nonexistent/automation-workflow-release/home \
+    XDG_CONFIG_HOME=/nonexistent/automation-workflow-release/xdg \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+    GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false GCM_INTERACTIVE=Never \
+    GIT_ALLOW_PROTOCOL=https GIT_PROTOCOL_FROM_USER=0 \
+    /usr/bin/git -C / "$@"
+}
+public_git clone --no-recurse-submodules \
+  https://github.com/jhw7500/automation.git "$AUTOMATION_RELEASE_ROOT"
+
+release_git() {
+  env -i PATH=/usr/bin:/bin \
+    HOME=/nonexistent/automation-workflow-release/home \
+    XDG_CONFIG_HOME=/nonexistent/automation-workflow-release/xdg \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+    GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false GCM_INTERACTIVE=Never \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+    /usr/bin/git -C "$AUTOMATION_RELEASE_ROOT" "$@"
+}
+[[ "$(release_git rev-parse --is-shallow-repository)" == false ]]
+[[ "$(release_git remote get-url --all origin)" == \
+  https://github.com/jhw7500/automation.git ]]
+[[ "$(release_git remote get-url --push --all origin)" == \
+  https://github.com/jhw7500/automation.git ]]
+
+REMOTE_MAIN="$(public_git ls-remote --heads \
+  https://github.com/jhw7500/automation.git refs/heads/main)"
+[[ -n "$REMOTE_MAIN" && "$REMOTE_MAIN" != *$'\n'* ]]
+IFS=$'\t' read -r EXPECTED_MAIN MAIN_REF MAIN_EXTRA <<< "$REMOTE_MAIN"
+[[ "$EXPECTED_MAIN" =~ ^[0-9a-f]{40}$ \
+    && "$MAIN_REF" == refs/heads/main && -z "${MAIN_EXTRA:-}" ]]
+REMOTE_TAGS="$(public_git ls-remote --tags \
+  https://github.com/jhw7500/automation.git \
+  refs/tags/v1.40 'refs/tags/v1.40^{}')"
+EXPECTED_TAG=
+EXPECTED_PEELED=
+DIRECT_COUNT=0
+PEELED_COUNT=0
+while IFS=$'\t' read -r SHA REF EXTRA; do
+  [[ "$SHA" =~ ^[0-9a-f]{40}$ && -z "${EXTRA:-}" ]]
+  case "$REF" in
+    refs/tags/v1.40)
+      EXPECTED_TAG="$SHA"
+      DIRECT_COUNT=$((DIRECT_COUNT + 1))
+      ;;
+    refs/tags/v1.40^\{\})
+      EXPECTED_PEELED="$SHA"
+      PEELED_COUNT=$((PEELED_COUNT + 1))
+      ;;
+    *) exit 1 ;;
+  esac
+done <<< "$REMOTE_TAGS"
+[[ "$DIRECT_COUNT" -eq 1 && "$PEELED_COUNT" -eq 1 \
+    && "$EXPECTED_PEELED" == "$EXPECTED_MAIN" ]]
+[[ "$(release_git rev-parse --verify refs/heads/main)" == "$EXPECTED_MAIN" ]]
+[[ "$(release_git rev-parse --verify refs/remotes/origin/main)" == "$EXPECTED_MAIN" ]]
+[[ "$(release_git rev-parse --verify refs/tags/v1.40)" == "$EXPECTED_TAG" ]]
+[[ "$(release_git rev-parse --verify 'refs/tags/v1.40^{}')" == "$EXPECTED_PEELED" ]]
+(cd "$AUTOMATION_RELEASE_ROOT" && python3 -m scripts.verify_workflow_release \
+  --automation "$AUTOMATION_RELEASE_ROOT" --ref v1.40 \
+  --expected-commit "$EXPECTED_MAIN")
 ```
+
+The normative Task 9 block contains the same exact sequence. Every command below executes
+the released script from this non-shallow clone, passes the same directory as
+`--automation`, and uses only the marked `FLEET_WORKSPACE`.
 
 Do not place unrelated files or working repositories in `FLEET_WORKSPACE`.
 
@@ -57,7 +139,8 @@ Do not place unrelated files or working repositories in `FLEET_WORKSPACE`.
 Run the complete fleet plan before creating any branch:
 
 ```bash
-python3 scripts/rollout_workflow_fleet.py \
+python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" \
   --workspace "$FLEET_WORKSPACE" \
   --initialize-workspace \
   --mode plan \
@@ -94,7 +177,8 @@ publish always refetches and recomputes.
 Publish requires explicit repositories and confirmation:
 
 ```bash
-python3 scripts/rollout_workflow_fleet.py \
+python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" \
   --workspace "$FLEET_WORKSPACE" \
   --mode publish \
   --ref v1.40 \
@@ -104,9 +188,22 @@ python3 scripts/rollout_workflow_fleet.py \
 ```
 
 For `v1.40`, every repository uses the deterministic branch
-`automation/common-workflows-v1.40`. Publish may only create a local managed commit, push
-that non-default branch, and create a PR. It has no merge, auto-merge, update-branch,
-default-branch push, secret-write, variable-write, or revert operation.
+`automation/common-workflows-v1.40`. Publish computes exact blob, tree, and commit SHA-1
+identities locally with fixed author, committer, timestamp, and message fields. JSON sent
+through stdin creates those detached objects only at the literal GitHub Git Data API
+endpoints `repos/jhw7500/<catalog-repo>/git/blobs`, `trees`, and `commits`; the final
+`POST .../git/refs` atomically creates the exact non-default ref. Every response must match
+the locally computed identity, and the branch is re-read afterward. GitHub children receive
+only fixed runtime/config variables plus at most one intended GitHub token (`GH_TOKEN`
+preferred, otherwise `GITHUB_TOKEN`); provider credentials and unrelated operator variables
+do not cross the boundary.
+
+A concurrent ref creation makes `POST .../git/refs` fail without advancing or replacing
+the branch. A lost response is reconciled read-only only if the branch already equals the
+exact expected commit; otherwise publication blocks. Detached objects left unreachable by
+a failed ref creation are harmless, and no cleanup ref is created. There is no ordinary Git
+branch push, force option, merge, auto-merge, update-branch, default-branch write,
+secret-write, variable-write, or revert operation.
 
 All selected repositories pass read-only prevalidation before the first remote effect.
 Publication then refetches and recomputes each repository immediately before its branch
@@ -114,12 +211,12 @@ is created or reused. The reuse rules are fail-closed:
 
 - an absent rollout branch may be created from the freshly fetched default branch;
 - a matching branch may receive its missing PR only when its base, release commit, and
-  managed path/blob diff exactly match the fresh render;
+  managed path/mode/blob diff exactly match the fresh render;
 - one exact open PR is reusable only when its base branch, head repository, head branch,
   head object ID, title, body, and remote branch object ID all match;
 - a mismatched branch or PR, multiple PRs, or any closed or merged PR history for the
   deterministic head blocks that repository, whether or not the branch remains; and
-- no mismatch is repaired with a force-push.
+- no mismatch is repaired or overwritten.
 
 Publish reports `published`, `reused`, `current`, or `blocked`. A network or permission
 failure after earlier repositories were published is **partial success**: valid PRs remain
@@ -131,7 +228,8 @@ Bootstrap is deliberately separate and accepts exactly one matching, bootstrap-a
 repository. Its new config disables every common workflow:
 
 ```bash
-python3 scripts/rollout_workflow_fleet.py \
+python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" \
   --workspace "$FLEET_WORKSPACE" \
   --mode publish \
   --ref v1.40 \
@@ -160,7 +258,8 @@ After all three succeed, publish the remaining non-bootstrap repositories with r
 `--repo NAME` arguments. Bootstrap `wpa-supplicant` separately:
 
 ```bash
-python3 scripts/rollout_workflow_fleet.py \
+python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" \
   --workspace "$FLEET_WORKSPACE" \
   --mode publish \
   --ref v1.40 \
@@ -175,7 +274,8 @@ python3 scripts/rollout_workflow_fleet.py \
 Audit current default-branch content after reviewed merges:
 
 ```bash
-python3 scripts/audit_workflow_fleet.py \
+python3 "$AUTOMATION_RELEASE_ROOT/scripts/audit_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" \
   --workspace "$FLEET_WORKSPACE" \
   --ref v1.40
 ```

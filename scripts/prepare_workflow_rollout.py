@@ -279,15 +279,92 @@ def _scan_central_callers(
     return tuple(callers)
 
 
-def _identity_line(
-    line: str, key: str
-) -> re.Match[str] | None:
-    return re.fullmatch(
-        rf"(?P<prefix>{re.escape(key)}[ \t]*:[ \t]*)"
-        r"(?P<value>\S+)"
-        r"(?P<suffix>[ \t]+#[^\r\n]*|[ \t]*)"
-        r"(?P<newline>\r?\n|)",
-        line,
+def _identity_nodes(
+    text: str,
+) -> dict[str, tuple[yaml.nodes.ScalarNode, yaml.nodes.ScalarNode]]:
+    try:
+        document = yaml.compose(text, Loader=yaml.BaseLoader)
+    except yaml.YAMLError as exc:
+        raise RolloutError("rendered workflow config identity is malformed") from exc
+    if not isinstance(document, yaml.nodes.MappingNode):
+        raise RolloutError("rendered workflow config identity is malformed")
+    found: dict[str, list[tuple[yaml.nodes.ScalarNode, yaml.nodes.ScalarNode]]] = {
+        key: [] for key in _IDENTITY_KEYS
+    }
+    for key_node, value_node in document.value:
+        if not isinstance(key_node, yaml.nodes.ScalarNode):
+            raise RolloutError("workflow config identity has a non-scalar key")
+        if key_node.value == "<<" and key_node.style is None:
+            raise RolloutError("workflow config identity does not allow YAML merges")
+        if key_node.value not in found:
+            continue
+        if not isinstance(value_node, yaml.nodes.ScalarNode):
+            raise RolloutError(
+                f"workflow config identity {key_node.value} must be a scalar"
+            )
+        found[key_node.value].append((key_node, value_node))
+    if len(found["automation_ref"]) != 1:
+        raise RolloutError(
+            "workflow config identity requires exactly one top-level automation_ref"
+        )
+    if len(found["automation_commit"]) > 1:
+        raise RolloutError(
+            "workflow config identity allows at most one top-level automation_commit"
+        )
+    return {key: values[0] for key, values in found.items() if values}
+
+
+def _scalar_replacement(text: str, node: yaml.nodes.ScalarNode, value: str) -> str:
+    original = text[node.start_mark.index : node.end_mark.index]
+    if node.style is None and original == node.value:
+        return value
+    if node.style == "'" and original.startswith("'") and original.endswith("'"):
+        return "'" + value.replace("'", "''") + "'"
+    if node.style == '"' and original.startswith('"') and original.endswith('"'):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    raise RolloutError("workflow config identity scalar uses unsupported YAML syntax")
+
+
+def _identity_line_span(
+    text: str,
+    key: yaml.nodes.ScalarNode,
+    value: yaml.nodes.ScalarNode,
+) -> tuple[int, int]:
+    start = text.rfind("\n", 0, key.start_mark.index) + 1
+    newline = text.find("\n", value.end_mark.index)
+    end = len(text) if newline < 0 else newline + 1
+    if (
+        key.start_mark.index != start
+        or key.start_mark.line != value.start_mark.line
+        or value.start_mark.line != value.end_mark.line
+        or value.start_mark.index <= key.end_mark.index
+    ):
+        raise RolloutError("workflow config identity must use one-line scalar entries")
+    key_source = text[key.start_mark.index : key.end_mark.index]
+    if key.style is None:
+        valid_key = key_source == key.value
+    elif key.style == "'":
+        valid_key = key_source.startswith("'") and key_source.endswith("'")
+    elif key.style == '"':
+        valid_key = key_source.startswith('"') and key_source.endswith('"')
+    else:
+        valid_key = False
+    if not valid_key:
+        raise RolloutError("workflow config identity key uses unsupported YAML syntax")
+    return start, end
+
+
+def _replace_node_in_line(
+    text: str,
+    span: tuple[int, int],
+    node: yaml.nodes.ScalarNode,
+    replacement: str,
+) -> str:
+    start, end = span
+    return (
+        text[start : node.start_mark.index]
+        + replacement
+        + text[node.end_mark.index : end]
     )
 
 
@@ -296,95 +373,53 @@ def _render_existing_config(
 ) -> bytes:
     try:
         text = original.decode("utf-8")
-        document = yaml.load(text, Loader=yaml.BaseLoader)
-    except (UnicodeDecodeError, yaml.YAMLError) as exc:
-        raise RolloutError("workflow config identity is malformed") from exc
-    if not isinstance(document, dict):
-        raise RolloutError("workflow config identity is malformed")
-    if not isinstance(document.get("automation_ref"), str):
-        raise RolloutError("workflow config identity automation_ref must be a scalar")
-    if "automation_commit" in document and not isinstance(
-        document["automation_commit"], str
-    ):
-        raise RolloutError("workflow config identity automation_commit must be a scalar")
-
-    lines = text.splitlines(keepends=True)
-    key_indices = {
-        key: [
-            index
-            for index, line in enumerate(lines)
-            if re.match(rf"^{re.escape(key)}[ \t]*:", line)
-        ]
-        for key in _IDENTITY_KEYS
-    }
-    if len(key_indices["automation_ref"]) != 1:
-        raise RolloutError(
-            "workflow config identity requires exactly one top-level automation_ref"
-        )
-    if len(key_indices["automation_commit"]) > 1:
-        raise RolloutError(
-            "workflow config identity allows at most one top-level automation_commit"
-        )
-
-    ref_index = key_indices["automation_ref"][0]
-    commit_index = (
-        key_indices["automation_commit"][0]
-        if key_indices["automation_commit"]
-        else None
+    except UnicodeDecodeError as exc:
+        raise RolloutError("rendered workflow config identity is malformed") from exc
+    identity = _identity_nodes(text)
+    ref_key, ref_value = identity["automation_ref"]
+    ref_span = _identity_line_span(text, ref_key, ref_value)
+    ref_line = _replace_node_in_line(
+        text,
+        ref_span,
+        ref_value,
+        _scalar_replacement(text, ref_value, release_ref),
     )
-    ref_match = _identity_line(lines[ref_index], "automation_ref")
-    commit_match = (
-        _identity_line(lines[commit_index], "automation_commit")
-        if commit_index is not None
-        else None
-    )
-    if ref_match is None or ref_match.group("value")[:1] in {"|", ">"}:
-        raise RolloutError("workflow config identity automation_ref is malformed")
-    if commit_index is not None and (
-        commit_match is None or commit_match.group("value")[:1] in {"|", ">"}
-    ):
-        raise RolloutError("workflow config identity automation_commit is malformed")
+    newline = "\r\n" if ref_line.endswith("\r\n") else "\n"
+    if not ref_line.endswith(("\n", "\r")):
+        ref_line += newline
 
-    newline = ref_match.group("newline")
-    if not newline:
-        newline = "\r\n" if "\r\n" in text else "\n"
-    ref_line = (
-        ref_match.group("prefix")
-        + release_ref
-        + ref_match.group("suffix")
-        + newline
-    )
-    if commit_match is None:
+    commit_entry = identity.get("automation_commit")
+    spans = [ref_span]
+    if commit_entry is None:
         commit_line = f"automation_commit: {release_commit}{newline}"
     else:
-        commit_line = (
-            commit_match.group("prefix")
-            + release_commit
-            + commit_match.group("suffix")
-            + newline
+        commit_key, commit_value = commit_entry
+        commit_span = _identity_line_span(text, commit_key, commit_value)
+        spans.append(commit_span)
+        commit_line = _replace_node_in_line(
+            text,
+            commit_span,
+            commit_value,
+            _scalar_replacement(text, commit_value, release_commit),
         )
+        if not commit_line.endswith(("\n", "\r")):
+            commit_line += newline
 
-    identity_indices = {ref_index}
-    if commit_index is not None:
-        identity_indices.add(commit_index)
-    insertion = sum(
-        1 for index in range(ref_index) if index not in identity_indices
+    insertion = ref_span[0] - sum(
+        end - start for start, end in spans if start < ref_span[0]
     )
-    retained = [line for index, line in enumerate(lines) if index not in identity_indices]
-    retained[insertion:insertion] = [ref_line, commit_line]
-    rendered = "".join(retained).encode("utf-8")
-    try:
-        proposed = yaml.load(rendered.decode("utf-8"), Loader=yaml.BaseLoader)
-    except yaml.YAMLError as exc:
-        raise RolloutError("rendered workflow config is invalid YAML") from exc
-    if not isinstance(proposed, dict):
-        raise RolloutError("rendered workflow config must be a mapping")
+    retained = text
+    for start, end in sorted(spans, reverse=True):
+        retained = retained[:start] + retained[end:]
+    rendered_text = retained[:insertion] + ref_line + commit_line + retained[insertion:]
+    proposed = _identity_nodes(rendered_text)
     if (
-        proposed.get("automation_ref") != release_ref
-        or proposed.get("automation_commit") != release_commit
+        proposed["automation_ref"][1].value != release_ref
+        or proposed.get("automation_commit") is None
+        or proposed["automation_commit"][1].value != release_commit
     ):
         raise RolloutError("rendered workflow config has invalid identity values")
-    return rendered
+    return rendered_text.encode("utf-8")
 
 
 def _render_bootstrap_config(

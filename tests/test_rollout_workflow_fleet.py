@@ -409,7 +409,70 @@ def test_publish_repository_refetches_and_renders_again_before_inspection(
     assert calls == ["refetch", "render", "inspect"]
 
 
-def test_push_success_pr_failure_preserves_fresh_branch_outcome(
+def test_fresh_publication_rebinds_snapshot_to_refetched_base_before_atomic_creation(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    snap = snapshot(workspace)
+    plan = make_plan()
+    constructed = mock.Mock(head_sha=FRESH_HEAD, base_sha=FRESH_BASE)
+    observed_snapshot_bases: list[str] = []
+
+    def create_branch(snapshot_arg, _branch, *, commit):
+        observed_snapshot_bases.append(snapshot_arg.base_sha)
+        if snapshot_arg.base_sha != commit.base_sha:
+            raise rollout.FleetGitError(
+                "rollout base does not match the repository snapshot"
+            )
+        return commit.head_sha
+
+    with (
+        mock.patch.object(
+            rollout, "_make_clone_workspace", return_value=nullcontext(str(workspace))
+        ),
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(
+            rollout.fleet_git, "refetch_default", return_value=FRESH_BASE
+        ),
+        mock.patch.object(rollout, "git", return_value=""),
+        mock.patch.object(rollout, "_render", return_value=plan),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(
+            rollout,
+            "inspect_rollout",
+            return_value=rollout.RolloutInspection("create_branch"),
+        ),
+        mock.patch.object(
+            rollout, "construct_rollout_commit", return_value=constructed
+        ),
+        mock.patch.object(rollout, "validate_commit_tree"),
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=None),
+        mock.patch.object(
+            rollout.fleet_git, "create_rollout_branch", side_effect=create_branch
+        ),
+        mock.patch.object(
+            rollout.fleet_git,
+            "create_pull_request",
+            side_effect=rollout.FleetGitError("PR sentinel"),
+        ),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", return_value=()),
+    ):
+        result = rollout.publish_repository(
+            bundle,
+            workspace,
+            repo="gstApp",
+            bootstrap=False,
+            actionlint=Path("/bin/true"),
+        )
+
+    assert observed_snapshot_bases == [FRESH_BASE]
+    assert result.status == "blocked"
+    assert result.base_sha == FRESH_BASE
+    assert result.head_sha == FRESH_HEAD
+    assert "branch published" in result.detail
+
+
+def test_atomic_branch_success_pr_failure_preserves_fresh_branch_outcome(
     tmp_path: Path, bundle: ReleaseBundle
 ) -> None:
     workspace = marked_workspace(tmp_path)
@@ -548,7 +611,11 @@ def test_branch_failure_after_commit_reports_the_fresh_prepared_head(
             "inspect_rollout",
             return_value=rollout.RolloutInspection("create_branch"),
         ),
-        mock.patch.object(rollout, "construct_rollout_commit", return_value=FRESH_HEAD),
+        mock.patch.object(
+            rollout,
+            "construct_rollout_commit",
+            return_value=mock.Mock(head_sha=FRESH_HEAD),
+        ),
         mock.patch.object(
             rollout,
             "validate_commit_tree",
@@ -928,12 +995,16 @@ def test_existing_branch_requires_exact_parent_paths_and_managed_bytes(
             return ""
         if args[:2] == ["hash-object", "--stdin"]:
             return "expected-blob"
-        if args[:2] == ["ls-tree", "--name-only"]:
-            return args[-1] if mismatch == "deletion" else ""
-        if args[0] == "rev-parse":
-            if ":" in args[-1]:
-                return "wrong-blob" if mismatch == "blob" else "expected-blob"
-            return HEAD
+        if args[:2] == ["ls-tree", "-z"]:
+            path = args[-1]
+            if path.endswith("deleted.yml"):
+                return (
+                    f"100644 blob expected-blob\t{path}\0"
+                    if mismatch == "deletion"
+                    else ""
+                )
+            blob = "wrong-blob" if mismatch == "blob" else "expected-blob"
+            return f"100644 blob {blob}\t{path}\0"
         raise AssertionError(args)
 
     with mock.patch.object(rollout, "git", side_effect=git):
@@ -941,7 +1012,7 @@ def test_existing_branch_requires_exact_parent_paths_and_managed_bytes(
             rollout.validate_existing_branch(snap, HEAD, BASE, plan)
 
 
-def test_new_commit_tree_is_byte_attested_before_push(tmp_path: Path) -> None:
+def test_new_commit_tree_is_byte_attested_before_publication(tmp_path: Path) -> None:
     snap = snapshot(tmp_path)
     plan = make_plan()
     (snap.path / ".github/workflows/deleted.yml").unlink(missing_ok=True)
@@ -953,10 +1024,11 @@ def test_new_commit_tree_is_byte_attested_before_push(tmp_path: Path) -> None:
             return "\n".join(str(item.path) for item in plan.changes)
         if args[:2] == ["hash-object", "--stdin"]:
             return "expected-blob"
-        if args[:2] == ["ls-tree", "--name-only"]:
-            return ""
-        if args[0] == "rev-parse":
-            return "expected-blob"
+        if args[:2] == ["ls-tree", "-z"]:
+            path = args[-1]
+            if path.endswith("deleted.yml"):
+                return ""
+            return f"100644 blob expected-blob\t{path}\0"
         raise AssertionError(args)
 
     with mock.patch.object(rollout, "git", side_effect=git):
@@ -976,10 +1048,11 @@ def test_new_commit_tree_rejects_clean_filter_blob_transformation(
             return "\n".join(str(item.path) for item in plan.changes)
         if args[:2] == ["hash-object", "--stdin"]:
             return "expected-blob"
-        if args[:2] == ["ls-tree", "--name-only"]:
-            return ""
-        if args[0] == "rev-parse":
-            return "transformed-blob"
+        if args[:2] == ["ls-tree", "-z"]:
+            path = args[-1]
+            if path.endswith("deleted.yml"):
+                return ""
+            return f"100644 blob transformed-blob\t{path}\0"
         raise AssertionError(args)
 
     with mock.patch.object(rollout, "git", side_effect=git):
@@ -1024,6 +1097,53 @@ def initialized_repository(tmp_path: Path) -> tuple[RepositorySnapshot, RenderPl
     return RepositorySnapshot(repo, "main", base, frozenset(), frozenset()), plan
 
 
+@pytest.mark.parametrize(
+    ("replacement", "observed_mode"),
+    (("symlink", "120000"), ("executable", "100755")),
+)
+def test_existing_branch_rejects_noncanonical_managed_tree_modes_even_when_blob_matches(
+    tmp_path: Path, replacement: str, observed_mode: str
+) -> None:
+    """A matching blob cannot disguise a symlink or executable-bit mode drift."""
+
+    snap, plan = initialized_repository(tmp_path)
+    workflow = snap.path / ".github/workflows/claude.yml"
+    if replacement == "symlink":
+        workflow.unlink()
+        workflow.symlink_to("new\n")
+    else:
+        workflow.write_bytes(b"new\n")
+        workflow.chmod(0o755)
+    subprocess.run(["git", "add", "--all"], cwd=snap.path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", replacement], cwd=snap.path, check=True
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=snap.path,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    entry = subprocess.run(
+        [
+            "git",
+            "ls-tree",
+            head,
+            "--",
+            ".github/workflows/claude.yml",
+        ],
+        cwd=snap.path,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    assert entry.startswith(f"{observed_mode} blob ")
+
+    with pytest.raises(rollout.CommandError, match="mode|regular blob"):
+        rollout.validate_existing_branch(snap, head, snap.base_sha, plan)
+
+
 def executable_sentinel(path: Path, marker: Path, *, passthrough: bool) -> None:
     suffix = "cat\n" if passthrough else "exit 1\n"
     path.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n{suffix}")
@@ -1051,13 +1171,18 @@ def test_commit_plumbing_never_executes_a_configured_clean_filter(
         check=True,
     )
 
-    head = rollout.construct_rollout_commit(
+    constructed = rollout.construct_rollout_commit(
         snap, snap.base_sha, "v1.40", plan, bundle.catalog
     )
 
     assert not marker.exists()
     committed = subprocess.run(
-        ["git", "cat-file", "blob", f"{head}:.github/workflows/claude.yml"],
+        [
+            "git",
+            "cat-file",
+            "blob",
+            f"{constructed.head_sha}:.github/workflows/claude.yml",
+        ],
         cwd=snap.path,
         check=True,
         stdout=subprocess.PIPE,
@@ -1079,6 +1204,46 @@ def test_commit_plumbing_never_executes_a_configured_clean_filter(
     assert marker.read_text() == "ran"
 
 
+def test_commit_plumbing_normalizes_managed_files_to_canonical_regular_mode(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    snap, plan = initialized_repository(tmp_path)
+    (snap.path / ".github/workflows/claude.yml").chmod(0o755)
+
+    constructed = rollout.construct_rollout_commit(
+        snap, snap.base_sha, "v1.40", plan, bundle.catalog
+    )
+    entry = subprocess.run(
+        [
+            "git",
+            "ls-tree",
+            constructed.head_sha,
+            "--",
+            ".github/workflows/claude.yml",
+        ],
+        cwd=snap.path,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+
+    assert entry.startswith("100644 blob ")
+
+
+def test_local_commit_identity_matches_atomic_api_commit_contract(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    snap, plan = initialized_repository(tmp_path)
+
+    constructed = rollout.construct_rollout_commit(
+        snap, snap.base_sha, "v1.40", plan, bundle.catalog
+    )
+
+    rollout.fleet_git._validate_rollout_commit(
+        constructed, "automation/common-workflows-v1.40"
+    )
+
+
 def test_commit_plumbing_never_executes_a_configured_signing_helper(
     tmp_path: Path, bundle: ReleaseBundle
 ) -> None:
@@ -1093,13 +1258,19 @@ def test_commit_plumbing_never_executes_a_configured_signing_helper(
         ["git", "config", "gpg.program", str(helper)], cwd=snap.path, check=True
     )
 
-    head = rollout.construct_rollout_commit(
+    constructed = rollout.construct_rollout_commit(
         snap, snap.base_sha, "v1.40", plan, bundle.catalog
     )
 
     assert not marker.exists()
     metadata = subprocess.run(
-        ["git", "show", "-s", "--format=%P%n%s%n%an%n%ae", head],
+        [
+            "git",
+            "show",
+            "-s",
+            "--format=%P%n%s%n%an%n%ae",
+            constructed.head_sha,
+        ],
         cwd=snap.path,
         check=True,
         text=True,
@@ -1121,12 +1292,13 @@ def test_commit_plumbing_never_executes_a_configured_signing_helper(
     assert marker.read_text() == "ran"
 
 
-def test_new_branch_publication_uses_only_exact_non_force_refspec(
+def test_new_branch_publication_delegates_only_to_atomic_git_data_adapter(
     tmp_path: Path, bundle: ReleaseBundle
 ) -> None:
     snap = snapshot(tmp_path)
     plan = make_plan()
     calls: list[list[str]] = []
+    constructed = mock.Mock(head_sha=HEAD)
 
     def git(args, *, cwd=None):
         calls.append(list(args))
@@ -1143,11 +1315,14 @@ def test_new_branch_publication_uses_only_exact_non_force_refspec(
         mock.patch.object(
             rollout,
             "construct_rollout_commit",
-            return_value=HEAD,
+            return_value=constructed,
         ),
         mock.patch.object(rollout, "validate_commit_tree"),
         mock.patch.object(rollout, "validate_managed_result"),
         mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=None),
+        mock.patch.object(
+            rollout.fleet_git, "create_rollout_branch", return_value=HEAD
+        ) as create,
     ):
         assert (
             rollout.publish_new_branch(
@@ -1156,17 +1331,15 @@ def test_new_branch_publication_uses_only_exact_non_force_refspec(
             == HEAD
         )
 
-    push = next(args for args in calls if args and args[0] == "push")
-    assert push == [
-        "push",
-        "--set-upstream",
-        "origin",
-        "HEAD:refs/heads/automation/common-workflows-v1.40",
-    ]
+    create.assert_called_once_with(
+        snap,
+        "automation/common-workflows-v1.40",
+        commit=constructed,
+    )
     flattened = " ".join(" ".join(args) for args in calls)
     for forbidden in (
-        "--force",
-        "--force-with-lease",
+        "push",
+        "force",
         "merge",
         "auto-merge",
         "update-branch",
@@ -1203,50 +1376,21 @@ def test_new_branch_revalidates_before_applying_to_the_publish_clone(
         mock.patch.object(
             rollout,
             "construct_rollout_commit",
-            side_effect=lambda *_a, **_k: events.append("construct") or HEAD,
+            side_effect=lambda *_a, **_k: (
+                events.append("construct") or mock.Mock(head_sha=HEAD)
+            ),
         ),
         mock.patch.object(rollout, "validate_commit_tree"),
         mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=None),
+        mock.patch.object(
+            rollout.fleet_git, "create_rollout_branch", return_value=HEAD
+        ),
     ):
         rollout.publish_new_branch(
             snap, BASE, "v1.40", COMMIT, plan, Path("/bin/true"), bundle=bundle
         )
 
     assert events == ["validate", "construct"]
-
-
-def test_accepted_push_with_lost_response_is_reconciled_as_success(
-    tmp_path: Path, bundle: ReleaseBundle
-) -> None:
-    snap = snapshot(tmp_path)
-    plan = make_plan()
-
-    def git(args, *, cwd=None, stdin=None):
-        if args[:3] == ["diff", "--cached", "--name-only"]:
-            return "\n".join(str(item.path) for item in plan.changes)
-        if args == ["rev-parse", "HEAD"]:
-            return HEAD
-        if args[0] == "push":
-            raise rollout.FleetGitError("command failed (git, rc=1)")
-        return ""
-
-    with (
-        mock.patch.object(rollout, "git", side_effect=git),
-        mock.patch.object(rollout, "validate_managed_result"),
-        mock.patch.object(rollout, "construct_rollout_commit", return_value=HEAD),
-        mock.patch.object(rollout, "validate_commit_tree"),
-        mock.patch.object(
-            rollout.fleet_git,
-            "remote_branch_sha",
-            side_effect=[None, None, HEAD],
-        ),
-    ):
-        assert (
-            rollout.publish_new_branch(
-                snap, BASE, "v1.40", COMMIT, plan, Path("/bin/true"), bundle=bundle
-            )
-            == HEAD
-        )
 
 
 @pytest.mark.parametrize(
@@ -1806,7 +1950,7 @@ def test_release_aware_applier_prevalidates_every_change_before_writing(
         ["update-branch"],
         ["secret", "set", "X"],
         ["variable", "set", "X"],
-        ["push", "--force", "origin", "main"],
+        ["push", "origin", "main"],
     ],
 )
 def test_git_wrapper_rejects_forbidden_commands_before_child(

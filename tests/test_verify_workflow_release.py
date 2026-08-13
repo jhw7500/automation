@@ -282,6 +282,119 @@ def test_release_verification_ignores_replace_ref_payload(
     assert verify_release(repo, "v1.40", release_commit) == release_commit
 
 
+def test_release_rejects_annotated_tag_whose_authenticated_name_is_not_requested_ref(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, release_commit = release_repo
+    git(repo, "tag", "-d", "v1.40")
+    payload = (
+        f"object {release_commit}\n"
+        "type commit\n"
+        "tag v9.99\n"
+        "tagger Test <test@example.invalid> 1700000000 +0000\n"
+        "\nmisnamed release\n"
+    )
+    tag_object = subprocess.run(
+        ["git", "-C", str(repo), "mktag"],
+        input=payload,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    git(repo, "update-ref", "refs/tags/v1.40", tag_object)
+    assert b"tag v9.99\n" in raw_git_object(repo, "tag", tag_object)
+
+    with pytest.raises(ReleaseVerificationError, match="annotated tag"):
+        release_verifier.resolve_annotated_tag(repo, "v1.40")
+
+
+@pytest.mark.parametrize(
+    "tag_headers",
+    (
+        b"",
+        b"tag v1.40\ntag v1.40\n",
+        b"tag v9.99\n",
+        b"tag v1.40 extra\n",
+        b"tag\n",
+        b"tag v1.40\n tag v9.99\n",
+        b"tag v1.40\nunknown value\n",
+    ),
+    ids=(
+        "missing",
+        "duplicate",
+        "misnamed",
+        "extra-field",
+        "malformed",
+        "continuation",
+        "unknown",
+    ),
+)
+def test_authenticated_tag_parser_requires_one_exact_canonical_name_header(
+    tag_headers: bytes,
+) -> None:
+    payload = (
+        b"object "
+        + (b"1" * 40)
+        + b"\ntype commit\n"
+        + tag_headers
+        + b"tagger Test <test@example.invalid> 1700000000 +0000\n\nmessage\n"
+    )
+
+    with pytest.raises(ReleaseVerificationError, match="Git object is invalid"):
+        release_verifier._tag_commit_oid(payload, "v1.40")
+
+
+def test_authenticated_tag_parser_rejects_non_ascii_version_as_typed_error() -> None:
+    payload = (
+        b"object "
+        + (b"1" * 40)
+        + b"\ntype commit\ntag v1.40\n"
+        + b"tagger Test <test@example.invalid> 1700000000 +0000\n\nmessage\n"
+    )
+
+    with pytest.raises(ReleaseVerificationError, match="Git object is invalid"):
+        release_verifier._tag_commit_oid(payload, "v\u0661.\u0664\u0660")
+
+
+@pytest.mark.parametrize(
+    "tagger",
+    (
+        b"x",
+        b"T <t@x>",
+        b"T <t@x> nope +0000",
+        b"T <t@x> 1700000000 UTC",
+        b"T <t@x> 1700000000 +2400",
+        b"T <t@x> 1700000000 +0060",
+        b"T <t@x> 1700000000 +0000\x01",
+        b"  <t@x> 1700000000 +0000",
+        b"T <t@x> 01700000000 +0000",
+        b"T <t@x> 999999999999999999999999 +0000",
+    ),
+)
+def test_authenticated_tag_parser_rejects_malformed_tagger(tagger: bytes) -> None:
+    payload = (
+        b"object "
+        + (b"1" * 40)
+        + b"\ntype commit\ntag v1.40\ntagger "
+        + tagger
+        + b"\n\nmessage\n"
+    )
+
+    with pytest.raises(ReleaseVerificationError, match="Git object is invalid"):
+        release_verifier._tag_commit_oid(payload, "v1.40")
+
+
+def test_authenticated_tag_parser_accepts_valid_non_utc_offset() -> None:
+    payload = (
+        b"object "
+        + (b"1" * 40)
+        + b"\ntype commit\ntag v1.40\n"
+        + b"tagger Test <test@example.invalid> 1700000000 -0930\n\nmessage\n"
+    )
+
+    assert release_verifier._tag_commit_oid(payload, "v1.40") == "1" * 40
+
+
 @pytest.mark.parametrize("kind", ("tag", "commit", "tree", "blob"))
 def test_verified_object_reader_rejects_checksum_mismatch_for_each_object_type(
     release_repo: tuple[Path, Path, str], kind: str

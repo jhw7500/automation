@@ -6,9 +6,9 @@ Status: approved; implementation planned
 ## 1. Decision
 
 The fleet will standardize only the common AI caller workflows. Automation will render
-managed files, validate them, push a repository branch, and open a pull request. It will
-not merge or revert a pull request. Repository CI, review, merge, and recovery remain
-ordinary GitHub operations.
+managed files, validate them, atomically create a repository branch, and open a pull
+request. It will not merge or revert a pull request. Repository CI, review, merge, and
+recovery remain ordinary GitHub operations.
 
 The supported lifecycle is deliberately small:
 
@@ -32,8 +32,8 @@ workflow revision independently.
 2. Make allowed repository differences explicit rather than inferred from current files.
 3. Preserve project-specific build, test, verification, release, packaging, deployment,
    lint, hardware, and synchronization workflows byte-for-byte.
-4. Validate reusable workflow inputs, permissions, and secret mappings before creating a
-   remote branch.
+4. Validate reusable workflow inputs, permissions, secret mappings, and exact regular-file
+   Git tree modes before creating a remote branch.
 5. Create reviewable, independent PRs for all configured repositories.
 6. Roll out through representative canaries before creating the remaining PRs.
 7. Recover through normal GitHub PR closure or reviewed Git revert PRs.
@@ -59,7 +59,9 @@ workflow revision independently.
 The implementation starts from the current `automation/main` and must preserve the
 security fixes already shipped in `v1.39`. After its own tests and review, the final
 automation commit is published as a new immutable annotated tag, `v1.40`. The tag is never
-moved or deleted.
+moved or deleted. Verification authenticates the tag object payload and requires exactly
+one canonical internal `tag v1.40` header plus a direct `type commit` target; a ref pointing
+at a missing, duplicate, malformed, or differently named annotation is not this release.
 
 Consumer callers use the resolved 40-character commit, not tag text:
 
@@ -219,7 +221,7 @@ For each repository, the renderer:
 8. creates a disabled bootstrap config only in an explicitly allowed bootstrap repository;
 9. proposes deletion of unprofiled optional and retired callers;
 10. rejects any proposed change outside the managed path set; and
-11. validates the complete result before any push.
+11. validates the complete result before any remote object or ref creation.
 
 An out-of-catalog file that calls a reusable workflow under
 `jhw7500/automation/.github/workflows/` is blocked for operator review. The tool neither
@@ -227,7 +229,11 @@ silently accepts it as project-owned nor deletes it without a catalog change.
 
 Existing config comments, formatting, and every key other than `automation_ref` and
 `automation_commit` are preserved. A malformed or ambiguous config blocks rather than
-being rewritten wholesale.
+being rewritten wholesale. Duplicate-aware composed YAML nodes require exactly one semantic
+`automation_ref` and at most one semantic `automation_commit`, regardless of quoted,
+unquoted, or explicit-key spelling. Safe one-line quoted scalar keys/values are updated by
+their source spans; aliases, merge keys, non-scalar keys, and multiline identity values
+fail closed.
 
 Project-owned workflow bytes are captured before rendering and required to remain
 identical afterward.
@@ -238,12 +244,18 @@ The implementation keeps the existing repository scripts but narrows their publi
 behavior to three operations: plan, publish, and audit. Command spelling may follow the
 existing argparse layout, but the following semantics are normative.
 
-The commands use the operator's normal authenticated Git and `gh` installation. No custom
+Consumer reads use the operator's normal authenticated Git and `gh` installation. Branch
+publication uses only GitHub CLI's existing credential channel against four literal Git
+Data API endpoints. No custom
 credential broker or rollout credential store is introduced. A credential is never placed
 in a remote URL, command argument, commit, report, or log. Publish requires only repository
 access needed to create workflow-file commits, branches, and PRs; its code contains no
 merge or secret-mutation client. Temporary clones disable repository hooks, do not recurse
 into submodules, and accept only the configured `github.com/jhw7500/<repo>` remote.
+
+The adapter inherits at most one intended GitHub token variable: `GH_TOKEN` when set,
+otherwise `GITHUB_TOKEN`. It does not pass a provider credential or unrelated operator
+variable to a GitHub child process; JSON request bodies enter through stdin.
 
 The central release verifier is intentionally separate from those authenticated consumer
 operations. It discovers normal and linked-worktree metadata without Git, rejects
@@ -301,24 +313,33 @@ rollout_workflow_fleet.py --mode publish --ref v1.40
 
 Publish performs only these remote effects:
 
-1. create a repository branch from the freshly fetched default branch;
-2. commit the validated managed-file diff;
-3. push that branch; and
-4. open a pull request.
+1. create detached blobs, one tree, and one commit with exact locally computed identities;
+2. atomically create a previously absent non-default branch ref at that exact commit; and
+3. open a pull request.
 
-It has no merge, auto-merge, update-branch, force-push, default-branch push, secret write,
-variable write, or revert code path. It never calls a GitHub merge endpoint.
+The detached object requests use JSON stdin and only the literal
+`repos/jhw7500/<catalog-repo>/git/blobs|trees|commits` endpoints. A final create-only
+`POST repos/jhw7500/<catalog-repo>/git/refs` is the atomic expected-absent operation. Every
+response must match locally computed blob/tree/commit identities produced with fixed
+author, committer, timestamp, and message fields. A concurrent branch creation makes the
+ref request fail without changing it. Only an exact expected commit may reconcile a lost
+response read-only; any mismatch blocks. Unreachable detached objects from a failed ref
+creation are harmless and no cleanup ref is created.
+
+It has no ordinary Git branch push, merge, auto-merge, update-branch, force operation,
+default-branch write, secret write, variable write, or revert code path. It never calls a
+GitHub merge endpoint.
 
 The branch name is deterministic per repository and release, for example
 `automation/common-workflows-v1.40`. For each repository:
 
 - an absent branch is created;
-- an existing branch whose base and managed path/blob diff exactly match the fresh render
+- an existing branch whose base and managed path/mode/blob diff exactly match the fresh render
   may receive its missing PR;
 - an existing branch and one open PR are reused only when that same content plus PR base,
   title, and body match; and
 - a content mismatch, multiple PRs, or any closed/merged PR history for the deterministic
-  head blocks that repository without a force-push, whether or not its branch remains.
+  head blocks that repository without replacing it, whether or not its branch remains.
 
 Multi-repository publish first validates every selected repository, then creates PRs one
 at a time, refetching that repository immediately before branch creation. Network or
@@ -368,12 +389,17 @@ final audit checks content rather than a custom commit topology.
    security regression tests, and `git diff --check`.
 3. Merge to current `automation/main`, create immutable `v1.40`, and verify the tag and
    release commit.
+4. From the literal public HTTPS URL, create a fresh fixed-path, full, non-shallow clone in
+   a configuration-free and credential-free environment. Require the path (and the marked
+   fleet workspace path) to be absent and non-symlink first; attest its local `main`, direct
+   `v1.40`, and peeled `v1.40` identities exactly against credential-free public reads.
 
 No consumer PR is created before this gate succeeds.
 
 ### Gate 2: full read-only plan
 
-Run plan across all 19 repositories. Review every proposed managed diff and every blocked
+Execute the released plan script from that verified clone, pass the same clone as the
+automation root, and run across all 19 repositories in the marked workspace. Review every proposed managed diff and every blocked
 reason. Unexpected project-owned changes, permission expansion, unknown callers, or secret
 mapping changes stop the rollout.
 
@@ -481,8 +507,8 @@ Implementation follows test-driven development and covers:
 ### Commands
 
 - plan and audit issue no remote mutation;
-- publish calls only branch, push, and PR creation paths;
-- any merge, auto-merge, force-push, default-branch push, secret mutation, or variable
+- publish calls only exact blob/tree/commit creation, atomic ref creation, and PR creation paths;
+- any ordinary branch push, merge, auto-merge, force operation, default-branch write, secret mutation, or variable
   mutation sentinel fails the test;
 - exact existing PRs are reusable and mismatched branches/PRs block;
 - a partial multi-repository publish reports all completed and failed repositories and is
@@ -505,7 +531,7 @@ is required because the tool does not merge or revert default-branch content.
 - `v1.40` is an immutable verified automation release based on current `main`.
 - The catalog and fleet profile are the only policy sources for managed callers.
 - Every consumer change is an independent reviewable PR.
-- The fleet tool never merges, reverts, force-pushes, or writes a default branch.
+- The fleet tool never performs an ordinary branch push, merges, reverts, forces, or writes a default branch.
 - Project-owned workflows are unchanged.
 - Required and profiled optional callers match canonical content after rollout.
 - All caller references use the verified central commit.

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -43,6 +43,7 @@ from scripts.workflow_release_bundle import (  # noqa: E402
 
 VERSION_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
 OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+MANAGED_GIT_MODE = "100644"
 WORKSPACE_MARKER = ".automation-fleet-workspace"
 GIT_PREFIX = (
     "git",
@@ -152,19 +153,7 @@ def git(
     if not args:
         raise CommandError("Git operation is not permitted")
     operation = args[0]
-    if operation == "push":
-        allowed = (
-            len(args) == 4
-            and args[1:3] == ["--set-upstream", "origin"]
-            and re.fullmatch(
-                r"HEAD:refs/heads/automation/common-workflows-v[0-9]+(?:\.[0-9]+)+",
-                args[3],
-            )
-            is not None
-        )
-        if not allowed:
-            raise CommandError("Git operation is not permitted")
-    elif operation not in LOCAL_GIT_OPERATIONS:
+    if operation not in LOCAL_GIT_OPERATIONS:
         raise CommandError("Git operation is not permitted")
     return fleet_git.run([*GIT_PREFIX, *args], cwd=cwd, stdin=stdin)
 
@@ -569,18 +558,9 @@ def _validate_tree_contents(
     snapshot: RepositorySnapshot, revision: str, plan: RenderPlan
 ) -> None:
     for change in plan.changes:
-        revision_path = f"{revision}:{change.path.as_posix()}"
+        path = change.path.as_posix()
+        observed = git(["ls-tree", "-z", revision, "--", path], cwd=snapshot.path)
         if change.after is None:
-            observed = git(
-                [
-                    "ls-tree",
-                    "--name-only",
-                    revision,
-                    "--",
-                    change.path.as_posix(),
-                ],
-                cwd=snapshot.path,
-            )
             if observed:
                 raise CommandError(
                     "rollout tree deletion does not match the render plan"
@@ -595,9 +575,15 @@ def _validate_tree_contents(
             cwd=snapshot.path,
             stdin=text,
         )
-        observed_blob = git(["rev-parse", revision_path], cwd=snapshot.path)
-        if observed_blob != expected_blob:
-            raise CommandError("rollout tree blob does not match the render plan")
+        record = observed.removesuffix("\0")
+        if "\0" in record or "\t" not in record:
+            raise CommandError("rollout tree entry is malformed")
+        metadata, observed_path = record.split("\t", 1)
+        fields = metadata.split(" ")
+        if fields != [MANAGED_GIT_MODE, "blob", expected_blob] or observed_path != path:
+            raise CommandError(
+                "rollout tree entry must be the canonical regular blob mode"
+            )
 
 
 def validate_commit_tree(
@@ -694,8 +680,10 @@ def _hermetic_environment(root: Path, index: Path) -> dict[str, str]:
         "GIT_INDEX_FILE": str(index),
         "GIT_AUTHOR_NAME": "workflow-fleet",
         "GIT_AUTHOR_EMAIL": "workflow-fleet@invalid",
+        "GIT_AUTHOR_DATE": "@946684800 +0000",
         "GIT_COMMITTER_NAME": "workflow-fleet",
         "GIT_COMMITTER_EMAIL": "workflow-fleet@invalid",
+        "GIT_COMMITTER_DATE": "@946684800 +0000",
     }
 
 
@@ -725,7 +713,7 @@ def _plan_tree(
                 "update-index",
                 "--add",
                 "--cacheinfo",
-                "100644",
+                MANAGED_GIT_MODE,
                 blob,
                 change.path.as_posix(),
             ],
@@ -768,7 +756,7 @@ def construct_rollout_commit(
     ref: str,
     plan: RenderPlan,
     catalog: WorkflowCatalog,
-) -> str:
+) -> fleet_git.RolloutCommit:
     """Build the exact managed commit through a private filter-free index."""
 
     base_sha = _object_id(base_sha, "default branch object")
@@ -779,23 +767,23 @@ def construct_rollout_commit(
         _hermetic_git(
             ["read-tree", base_sha], cwd=snapshot.path, environment=environment
         )
+        base_tree = _object_id(
+            _hermetic_git(
+                ["write-tree"], cwd=snapshot.path, environment=environment
+            ).decode("ascii"),
+            "default branch tree",
+        )
         apply_release_plan(snapshot.path, plan, catalog)
+        blobs: list[fleet_git.GitBlob] = []
         for change in sorted(plan.changes, key=lambda item: item.path):
             relative = change.path.as_posix()
             if change.after is None:
                 _hermetic_git(
-                    ["update-index", "--force-remove", "--", relative],
+                    ["update-index", "--remove", "--", relative],
                     cwd=snapshot.path,
                     environment=environment,
                 )
                 continue
-            path = snapshot.path.joinpath(*change.path.parts)
-            try:
-                mode = path.lstat().st_mode
-            except OSError:
-                raise CommandError("managed commit path is unavailable") from None
-            if not stat.S_ISREG(mode):
-                raise CommandError("managed commit path is not a regular file")
             blob = _object_id(
                 _hermetic_git(
                     ["hash-object", "-w", "--stdin", "--no-filters"],
@@ -805,9 +793,18 @@ def construct_rollout_commit(
                 ).decode("ascii"),
                 "managed blob",
             )
-            git_mode = "100755" if stat.S_IMODE(mode) & 0o111 else "100644"
+            blobs.append(
+                fleet_git.GitBlob(relative, MANAGED_GIT_MODE, blob, change.after)
+            )
             _hermetic_git(
-                ["update-index", "--add", "--cacheinfo", git_mode, blob, relative],
+                [
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    MANAGED_GIT_MODE,
+                    blob,
+                    relative,
+                ],
                 cwd=snapshot.path,
                 environment=environment,
             )
@@ -840,7 +837,19 @@ def construct_rollout_commit(
             )
         except CommandError as exc:
             raise BranchPublishError(str(exc), head_sha) from None
-    return head_sha
+    return fleet_git.RolloutCommit(
+        head_sha=head_sha,
+        tree_sha=tree,
+        base_tree_sha=base_tree,
+        base_sha=base_sha,
+        message=pr_title(ref),
+        blobs=tuple(blobs),
+        deletions=tuple(
+            change.path.as_posix()
+            for change in sorted(plan.changes, key=lambda item: item.path)
+            if change.after is None
+        ),
+    )
 
 
 def _exact_pr(
@@ -1074,27 +1083,22 @@ def publish_new_branch(
         raise CommandError("rollout branch appeared before publication")
     if bundle is None:
         raise CommandError("release bundle is required for publication")
-    head_sha = construct_rollout_commit(snapshot, base_sha, ref, plan, bundle.catalog)
+    constructed = construct_rollout_commit(
+        snapshot, base_sha, ref, plan, bundle.catalog
+    )
+    head_sha = constructed.head_sha
     try:
         validate_commit_tree(snapshot, head_sha, base_sha, plan)
-        if fleet_git.remote_branch_sha(snapshot, branch) is not None:
-            raise CommandError("rollout branch appeared before push")
     except (CommandError, FleetGitError) as exc:
         raise BranchPublishError(str(exc), head_sha) from None
     try:
-        git(
-            ["push", "--set-upstream", "origin", f"HEAD:refs/heads/{branch}"],
-            cwd=snapshot.path,
+        published = fleet_git.create_rollout_branch(
+            snapshot, branch, commit=constructed
         )
-    except FleetGitError:
-        try:
-            published = fleet_git.remote_branch_sha(snapshot, branch)
-        except FleetGitError:
-            raise BranchPublishError(
-                "branch publication result is unavailable", head_sha
-            ) from None
-        if published != head_sha:
-            raise BranchPublishError("branch publication failed", head_sha) from None
+    except FleetGitError as exc:
+        raise BranchPublishError(str(exc), head_sha) from None
+    if published != head_sha:
+        raise BranchPublishError("branch publication failed", head_sha)
     return head_sha
 
 
@@ -1116,6 +1120,7 @@ def _publish_repository_fresh(
         )
         progress.stage = "refetch"
         base_sha = fleet_git.refetch_default(snapshot)
+        snapshot = replace(snapshot, base_sha=base_sha)
         progress.base_sha = base_sha
         git(["switch", "--detach", base_sha], cwd=snapshot.path)
         progress.stage = "render"
