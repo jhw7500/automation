@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import traceback
 
 import pytest
 
@@ -62,6 +63,32 @@ def raw_snapshot(path: Path) -> workflow_fleet_git.RepositorySnapshot:
     )
 
 
+def assert_sanitized_exception(
+    error: BaseException, *sentinels: str, expected: str
+) -> None:
+    rendered = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert str(error) == expected
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    related: list[BaseException] = [error]
+    seen: set[int] = set()
+    while related:
+        current = related.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for sentinel in sentinels:
+            assert sentinel not in rendered
+            assert sentinel not in str(current)
+            assert sentinel not in repr(current)
+        if current.__cause__ is not None:
+            related.append(current.__cause__)
+        if current.__context__ is not None:
+            related.append(current.__context__)
+
+
 def test_child_env_scrubs_provider_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[list[str], dict[str, object]]] = []
 
@@ -104,6 +131,96 @@ def test_run_uses_closed_process_contract_and_sanitizes_errors(
 
     assert str(raised.value) == "command failed (gh, rc=17)"
     assert secret not in str(raised.value)
+
+
+def test_child_launch_error_clears_provider_and_argv_exception_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = "provider-launch-sentinel"
+    raw_argv = "raw-child-argv-sentinel"
+    monkeypatch.setenv("GEMINI_API_KEY", provider)
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        assert "GEMINI_API_KEY" not in env
+        raise OSError(f"raw child launch text: {provider} {raw_argv} {args!r}")
+
+    monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
+
+    with pytest.raises(workflow_fleet_git.FleetGitError) as raised:
+        workflow_fleet_git.run(["gh", "repo", "view", raw_argv])
+
+    assert_sanitized_exception(
+        raised.value,
+        provider,
+        raw_argv,
+        "raw child launch text",
+        expected="command failed (gh, rc=unavailable)",
+    )
+
+
+def test_malformed_json_error_clears_raw_response_exception_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = "provider-json-sentinel"
+    monkeypatch.setattr(
+        workflow_fleet_git.subprocess,
+        "run",
+        lambda args, **kwargs: completed(args, "{" + provider),
+    )
+
+    with pytest.raises(workflow_fleet_git.FleetGitError) as raised:
+        workflow_fleet_git.list_rollout_prs("jhw7500", "repo", "release")
+
+    assert_sanitized_exception(
+        raised.value,
+        provider,
+        expected="GitHub returned malformed JSON",
+    )
+
+
+@pytest.mark.parametrize("failure", ["missing-repo", "missing-marker"])
+def test_snapshot_path_error_clears_raw_path_exception_chain(
+    tmp_path: Path, failure: str
+) -> None:
+    sentinel = f"raw-path-sentinel-{failure}"
+    root = tmp_path / sentinel
+    repo = root / "repo"
+    if failure == "missing-marker":
+        (repo / ".git").mkdir(parents=True)
+
+    with pytest.raises(workflow_fleet_git.FleetGitError) as raised:
+        workflow_fleet_git.refetch_default(raw_snapshot(repo))
+
+    assert_sanitized_exception(
+        raised.value,
+        sentinel,
+        str(repo),
+        expected=(
+            "repository root is not a real path"
+            if failure == "missing-repo"
+            else "workspace marker is unavailable"
+        ),
+    )
+
+
+def test_clone_marker_error_clears_raw_workspace_exception_chain(
+    tmp_path: Path,
+) -> None:
+    sentinel = "raw-clone-workspace-sentinel"
+    root = tmp_path / sentinel
+    root.mkdir()
+
+    with pytest.raises(workflow_fleet_git.FleetGitError) as raised:
+        workflow_fleet_git.clone_default_branch("jhw7500", "repo", root)
+
+    assert_sanitized_exception(
+        raised.value,
+        sentinel,
+        str(root),
+        expected="workspace is not marked for fleet automation",
+    )
 
 
 def test_clone_reads_only_metadata_and_prerequisite_names(

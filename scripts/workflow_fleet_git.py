@@ -96,18 +96,29 @@ def run(
 
     if not args:
         raise FleetGitError("command is empty")
-    completed = subprocess.run(
-        list(args),
-        cwd=cwd,
-        input=stdin,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=child_env(),
-    )
+    operation = Path(args[0]).name
+    if operation not in {"git", "gh"}:
+        operation = "child"
+    launch_failed = False
+    try:
+        completed = subprocess.run(
+            list(args),
+            cwd=cwd,
+            input=stdin,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env(),
+        )
+    except (OSError, ValueError):
+        launch_failed = True
+    if launch_failed:
+        raise FleetGitError(
+            f"command failed ({operation}, rc=unavailable)"
+        ) from None
     if completed.returncode:
         raise FleetGitError(
-            f"command failed ({Path(args[0]).name}, rc={completed.returncode})"
+            f"command failed ({operation}, rc={completed.returncode})"
         )
     return completed.stdout.strip()
 
@@ -118,10 +129,14 @@ def _git(args: Sequence[str], *, cwd: Path | None = None) -> str:
 
 def _json(args: Sequence[str]) -> object:
     output = run(args)
+    malformed = False
     try:
-        return json.loads(output or "null")
-    except json.JSONDecodeError as exc:
-        raise FleetGitError("GitHub returned malformed JSON") from exc
+        data = json.loads(output or "null")
+    except json.JSONDecodeError:
+        malformed = True
+    if malformed:
+        raise FleetGitError("GitHub returned malformed JSON") from None
+    return data
 
 
 def _validate_target(owner: str, repo: str) -> None:
@@ -191,11 +206,14 @@ def _clone_url(repo: str, reported_url: object) -> str:
 
 
 def _resolved_without_symlinks(path: Path, kind: str) -> Path:
+    invalid = False
     try:
         absolute = Path(os.path.abspath(path))
         resolved = path.resolve(strict=True)
-    except (OSError, RuntimeError, TypeError) as exc:
-        raise FleetGitError(f"{kind} is not a real path") from exc
+    except (OSError, RuntimeError, TypeError):
+        invalid = True
+    if invalid:
+        raise FleetGitError(f"{kind} is not a real path") from None
     if resolved != absolute:
         raise FleetGitError(f"{kind} contains a symlink component")
     return resolved
@@ -209,10 +227,13 @@ def _validate_repository_path(path: Path, repo: str) -> Path:
     if not workspace.is_dir() or workspace.is_symlink():
         raise FleetGitError("workspace is not a real directory")
     marker = workspace / WORKSPACE_MARKER
+    marker_mode: int | None = None
     try:
         marker_mode = marker.lstat().st_mode
-    except OSError as exc:
-        raise FleetGitError("workspace marker is unavailable") from exc
+    except OSError:
+        pass
+    if marker_mode is None:
+        raise FleetGitError("workspace marker is unavailable") from None
     if (
         marker.is_symlink()
         or not stat.S_ISREG(marker_mode)
@@ -278,13 +299,16 @@ def clone_default_branch(
     """Clone exactly one permitted repository and inventory prerequisite names."""
 
     _validate_target(owner, repo)
+    workspace = _resolved_without_symlinks(workspace, "workspace")
+    marker_mode: int | None = None
     try:
-        workspace = _resolved_without_symlinks(workspace, "workspace")
         marker_mode = (workspace / WORKSPACE_MARKER).lstat().st_mode
-    except FleetGitError:
-        raise
-    except OSError as exc:
-        raise FleetGitError("workspace is not marked for fleet automation") from exc
+    except OSError:
+        pass
+    if marker_mode is None:
+        raise FleetGitError(
+            "workspace is not marked for fleet automation"
+        ) from None
     if (
         workspace.is_symlink()
         or not workspace.is_dir()
