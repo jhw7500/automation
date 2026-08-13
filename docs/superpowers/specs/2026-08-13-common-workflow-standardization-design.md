@@ -91,6 +91,7 @@ The release bundle contains at least:
 - `.github/actions/`
 - `examples/baseline-workflows/.github/`
 - the machine-readable catalog
+- `scripts/workflow-config.json` with the reviewed fleet profiles
 - `scripts/prepare_workflow_rollout.py`
 - `scripts/audit_workflow_fleet.py`
 - `scripts/rollout_workflow_fleet.py`
@@ -140,6 +141,7 @@ The rollout manifest records:
 - release ref and resolved release commit;
 - renderer/tool commit;
 - catalog SHA-256;
+- fleet-profile configuration SHA-256;
 - action-pin manifest SHA-256;
 - actionlint version;
 - per-repository base and generated head commits.
