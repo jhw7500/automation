@@ -12,6 +12,17 @@ class CatalogError(ValueError):
     pass
 
 
+_CANONICAL_DIR = PurePosixPath("examples/baseline-workflows/.github")
+_CATALOG_PATH = "scripts/workflow-catalog.json"
+_REPOSITORY_NAMES = frozenset({
+    "gstApp", "max9296", "wlan-driver", "wlan-driver-v2", "wlan-bridge",
+    "wlan-package", "pim-package-jhw", "wlan-opc", "pcap-analyzer",
+    "wpa-supplicant", "sc16is7xx", "pim-check", "redmine", "jhw-notion",
+    "personal-ops", "cts-email-mcp-server", "cts-ta-mcp-server",
+    "cts-ta-webapp", "claude-config",
+})
+
+
 @dataclass(frozen=True)
 class CallerJobContract:
     name: str
@@ -169,9 +180,13 @@ def load_fleet_config(root: Path, catalog: WorkflowCatalog) -> FleetConfig:
     if raw["schema_version"] != 1:
         raise CatalogError("unsupported fleet config schema")
     canonical_dir = PurePosixPath(_string(raw["canonical_dir"], "canonical_dir"))
-    if canonical_dir.is_absolute() or ".." in canonical_dir.parts:
-        raise CatalogError("canonical_dir escapes root")
+    if canonical_dir != _CANONICAL_DIR:
+        raise CatalogError(f"invalid canonical_dir: {canonical_dir}")
+    if _string(raw["catalog"], "catalog") != _CATALOG_PATH:
+        raise CatalogError(f"invalid catalog path: {raw['catalog']}")
     repos = _mapping(raw["repos"], "repos")
+    if set(repos) != _REPOSITORY_NAMES:
+        raise CatalogError(f"invalid repository set: {sorted(repos)}")
     optional_names = {entry.path.name for entry in catalog.entries if entry.kind == "optional"}
     profiles: dict[str, RepoProfile] = {}
     bootstrap: set[str] = set()

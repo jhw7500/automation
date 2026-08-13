@@ -98,3 +98,23 @@ def test_fleet_rejects_invalid_profiles(tmp_path: Path, repos: dict[str, dict]) 
     _write(tmp_path, [_entry(kind="optional")], repos)
     with pytest.raises(CatalogError):
         load_fleet_config(tmp_path, load_catalog(tmp_path))
+
+@pytest.mark.parametrize("change", [
+    lambda config: config.__setitem__("canonical_dir", "other/.github"),
+    lambda config: config.__setitem__("catalog", "scripts/not-the-catalog.json"),
+    lambda config: config["repos"].__setitem__(
+        "unexpected-repository",
+        {"profile": "common-ai-v1", "optional_workflows": [], "repo_write_auth": "github_app", "bootstrap_allowed": False},
+    ),
+])
+def test_fleet_rejects_noncanonical_policy_shape(tmp_path: Path, change: object) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for filename in ("workflow-catalog.json", "workflow-config.json"):
+        (scripts / filename).write_text((ROOT / "scripts" / filename).read_text())
+    config_path = scripts / "workflow-config.json"
+    config = json.loads(config_path.read_text())
+    change(config)
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(CatalogError):
+        load_fleet_config(tmp_path, load_catalog(tmp_path))
