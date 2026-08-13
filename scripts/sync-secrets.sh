@@ -55,7 +55,7 @@ echo ""
 
 for repo in "${REPOS[@]}"; do
     echo -n "  $repo ... "
-    if echo "$TOKEN" | gh secret set "$SECRET_NAME" --repo "$repo" --body - 2>/dev/null; then
+    if printf '%s' "$TOKEN" | gh secret set "$SECRET_NAME" --repo "$repo" 2>/dev/null; then
         echo "OK"
     else
         echo "FAILED (check permissions)"

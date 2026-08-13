@@ -249,6 +249,7 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
         self.assertEqual(("ZHIPU_API_KEY",), refreshed)
         self.assertEqual("rotated-value", calls[0][1])
         self.assertNotIn("rotated-value", calls[0][0])
+        self.assertNotIn("--body", calls[0][0])
 
     def test_refresh_secret_reports_partial_writes_when_a_later_source_is_missing(self) -> None:
         completed: list[str] = []
@@ -295,6 +296,11 @@ class RolloutWorkflowFleetTest(unittest.TestCase):
         self.assertEqual(("TOKEN",), synced)
         self.assertEqual("sensitive-value", calls[0][1])
         self.assertNotIn("sensitive-value", calls[0][0])
+        self.assertNotIn("--body", calls[0][0])
+
+    def test_legacy_bulk_sync_reads_secret_from_stdin_not_literal_dash(self) -> None:
+        script = (ROOT / "scripts/sync-secrets.sh").read_text(encoding="utf-8")
+        self.assertNotIn("--body -", script)
 
     def test_sync_missing_reports_partial_writes_when_a_later_write_fails(self) -> None:
         completed: list[str] = []

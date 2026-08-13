@@ -214,7 +214,7 @@ def sync_missing(
         if value is None:
             continue
         run(
-            ["gh", "secret", "set", name, "-R", f"{owner}/{repo}", "--body", "-"],
+            ["gh", "secret", "set", name, "-R", f"{owner}/{repo}"],
             input_text=value,
         )
         available.add(name)
@@ -242,7 +242,7 @@ def refresh_secrets(
                 f"{owner}/{repo}: no explicitly allowed source for refresh secret {name}"
             )
         run(
-            ["gh", "secret", "set", name, "-R", f"{owner}/{repo}", "--body", "-"],
+            ["gh", "secret", "set", name, "-R", f"{owner}/{repo}"],
             input_text=value,
         )
         refreshed.append(name)
