@@ -136,7 +136,12 @@ The bootstrap defines the host trust root explicitly: a trusted `/usr/bin/python
 CPython 3.10 runtime/standard library, `/usr/bin/git`, `/usr/bin/gh`, the operating system,
 and TLS. It requires `sys.implementation.name == cpython` and
 `sys.version_info[:2] == (3, 10)` and records the full versions and executable digests;
-release code and parsers are not taken from the host. The
+release code and parsers are not taken from the host. Before project import it constructs
+a minimal child environment, removes model/provider credentials such as
+`ZHIPU_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, Claude tokens, and all unallowlisted
+secret-like variables, and fixes command paths to `/usr/bin:/bin`. The operator's GitHub
+authentication credential is the sole necessary credential exception: it is passed only
+to `/usr/bin/gh`, redacted from diagnostics, and never written to a preview or manifest. The
 supported invocation is exactly `/usr/bin/python3 -I -S -B
 scripts/workflow_release_bootstrap.py ...`. `-S` is mandatory so neither system/user
 `site-packages`, `.pth`, `sitecustomize`, nor `usercustomize` executes before attestation.
@@ -627,7 +632,8 @@ supported remote workflow writer and release-upgrade path.
 - Read-only inventory may call only the repository Actions Secrets **list** GET and
   Actions Variables list GET, requesting/consuming names and pagination metadata. GitHub
   never supplies secret values on this path; any unexpected response field is ignored and
-  no value-bearing local/environment source is consulted.
+  no repository/model secret value-bearing local or environment source is consulted. The
+  separately scoped operator GitHub authentication credential is used only for API access.
 - Tests replace every secret mutation route/method (PUT, PATCH, POST, or DELETE under a
   secret scope) and `gh secret set/delete` with fail-on-call sentinels. They require zero
   mutation calls in plan and publish while separately proving paginated name-only GET is
@@ -731,6 +737,9 @@ a failing regression test.
 - the supported process has `no_site=1`, only verified roots plus stdlib on `sys.path`, and
   loads vendored pure-Python PyYAML 6.0.3; a disposable executable `.pth` sentinel cannot
   run under `-I -S -B`;
+- sentinel local provider/model credentials (including `ZHIPU_API_KEY`) are absent from the
+  project/child environment and from every log, preview, and manifest; GitHub auth remains
+  scoped to the `gh` child and redacted;
 - the release-owned YAML 1.2 loader retains `on` as a key string, preserves true
   boolean/number/string nodes, rejects duplicate/unsafe tags, and never constructs objects;
 - catalog, fleet-profile, release-manifest, or recursive lock digest mismatch fails;
