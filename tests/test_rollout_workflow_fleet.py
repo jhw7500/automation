@@ -1392,6 +1392,97 @@ def test_managed_result_passes_yaml_catalog_diff_and_local_actionlint_gates(
     )
 
 
+def test_managed_result_validation_never_executes_a_configured_clean_filter(
+    tmp_path: Path, bundle: ReleaseBundle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "gstApp"
+    workflow = repo / ".github/workflows/claude.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_bytes(b"name: old\n")
+    (repo / ".github/.gitattributes").write_text(
+        "workflows/claude.yml filter=validation-tripwire\n"
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    marker = tmp_path / "validation-filter-ran"
+    helper = tmp_path / "validation-filter"
+    executable_sentinel(helper, marker, passthrough=True)
+    global_config = tmp_path / "operator-gitconfig"
+    global_config.write_text(
+        '[filter "validation-tripwire"]\n'
+        f"\tclean = {helper}\n"
+        "\tsmudge = cat\n"
+        "\trequired = true\n"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    plan = RenderPlan(
+        "drift",
+        "managed bytes differ",
+        (
+            FileChange(
+                PurePosixPath(".github/workflows/claude.yml"),
+                b"name: old\n",
+                b"name: new\n",
+            ),
+        ),
+        frozenset(),
+        frozenset(),
+    )
+    with mock.patch.object(
+        rollout,
+        "audit_repository",
+        return_value=mock.Mock(status="current", detail="managed files are current"),
+    ):
+        rollout.validate_managed_result(
+            repo, bundle, plan, Path("/bin/true"), bootstrap=False
+        )
+
+    assert not marker.exists()
+    subprocess.run(
+        [
+            "git",
+            "hash-object",
+            "--path=.github/workflows/claude.yml",
+            "--stdin",
+        ],
+        cwd=repo,
+        check=True,
+        input=b"calibration\n",
+        stdout=subprocess.PIPE,
+    )
+    assert marker.read_text() == "ran"
+
+
+def test_managed_result_filter_free_diff_still_rejects_trailing_whitespace(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    repo = tmp_path / "gstApp"
+    workflow = repo / ".github/workflows/claude.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_bytes(b"name: old\n")
+    plan = RenderPlan(
+        "drift",
+        "managed bytes differ",
+        (
+            FileChange(
+                PurePosixPath(".github/workflows/claude.yml"),
+                b"name: old\n",
+                b"name: new \n",
+            ),
+        ),
+        frozenset(),
+        frozenset(),
+    )
+    with mock.patch.object(
+        rollout,
+        "audit_repository",
+        return_value=mock.Mock(status="current", detail="managed files are current"),
+    ):
+        with pytest.raises(rollout.CommandError, match="managed diff"):
+            rollout.validate_managed_result(
+                repo, bundle, plan, Path("/bin/true"), bootstrap=False
+            )
+
+
 def test_initialize_workspace_refuses_to_mark_nonempty_directory(
     tmp_path: Path,
 ) -> None:
@@ -1701,6 +1792,10 @@ def test_release_aware_applier_prevalidates_every_change_before_writing(
 @pytest.mark.parametrize(
     "args",
     [
+        ["add", "--all"],
+        ["commit", "-m", "unsafe"],
+        ["diff", "--check"],
+        ["init", "-q"],
         ["merge", "main"],
         ["update-branch"],
         ["secret", "set", "X"],

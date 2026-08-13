@@ -53,13 +53,9 @@ GIT_PREFIX = (
 )
 LOCAL_GIT_OPERATIONS = frozenset(
     {
-        "add",
-        "commit",
-        "diff",
         "diff-tree",
         "fetch",
         "hash-object",
-        "init",
         "ls-tree",
         "rev-list",
         "rev-parse",
@@ -70,7 +66,9 @@ HERMETIC_GIT = Path("/usr/bin/git")
 HERMETIC_GIT_OPERATIONS = frozenset(
     {
         "commit-tree",
+        "diff",
         "hash-object",
+        "init",
         "read-tree",
         "symbolic-ref",
         "update-index",
@@ -485,16 +483,7 @@ def validate_managed_result(
         sandbox = Path(temporary) / repo.name
         try:
             _copy_github_tree(repo, sandbox)
-            git(["init", "-q"], cwd=sandbox)
-            git(["add", "--all"], cwd=sandbox)
             apply_release_plan(sandbox, plan, bundle.catalog)
-            created = [
-                change.path.as_posix()
-                for change in plan.changes
-                if change.before is None and change.after is not None
-            ]
-            if created:
-                git(["add", "-N", "--", *created], cwd=sandbox)
             _parse_managed_yaml(sandbox, bundle)
             profile = bundle.config.profiles[repo.name]
             result = audit_repository(
@@ -506,7 +495,7 @@ def validate_managed_result(
             )
             if result.status != "current":
                 raise CommandError(f"catalog audit failed: {result.detail}")
-            git(["diff", "--check"], cwd=sandbox)
+            validate_managed_diff(sandbox, plan)
             _run_actionlint(actionlint, sandbox, bundle)
         except CommandError:
             raise
@@ -686,6 +675,88 @@ def _hermetic_git(
     return completed.stdout.strip()
 
 
+def _hermetic_environment(root: Path, index: Path) -> dict[str, str]:
+    home = root / "home"
+    home.mkdir(exist_ok=True)
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home),
+        "TMPDIR": str(root),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_INDEX_FILE": str(index),
+        "GIT_AUTHOR_NAME": "workflow-fleet",
+        "GIT_AUTHOR_EMAIL": "workflow-fleet@invalid",
+        "GIT_COMMITTER_NAME": "workflow-fleet",
+        "GIT_COMMITTER_EMAIL": "workflow-fleet@invalid",
+    }
+
+
+def _plan_tree(
+    repo: Path,
+    plan: RenderPlan,
+    environment: dict[str, str],
+    *,
+    after: bool,
+) -> str:
+    _hermetic_git(["read-tree", "--empty"], cwd=repo, environment=environment)
+    for change in sorted(plan.changes, key=lambda item: item.path):
+        content = change.after if after else change.before
+        if content is None:
+            continue
+        blob = _object_id(
+            _hermetic_git(
+                ["hash-object", "-w", "--stdin", "--no-filters"],
+                cwd=repo,
+                environment=environment,
+                stdin=content,
+            ).decode("ascii"),
+            "managed validation blob",
+        )
+        _hermetic_git(
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                blob,
+                change.path.as_posix(),
+            ],
+            cwd=repo,
+            environment=environment,
+        )
+    return _object_id(
+        _hermetic_git(["write-tree"], cwd=repo, environment=environment).decode(
+            "ascii"
+        ),
+        "managed validation tree",
+    )
+
+
+def validate_managed_diff(repo: Path, plan: RenderPlan) -> None:
+    """Check proposed whitespace with exact blobs and no filters or operator config."""
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="workflow-validation-index-"
+        ) as temporary:
+            root = Path(temporary)
+            environment = _hermetic_environment(root, root / "before-index")
+            _hermetic_git(["init", "-q"], cwd=repo, environment=environment)
+            before = _plan_tree(repo, plan, environment, after=False)
+            environment["GIT_INDEX_FILE"] = str(root / "after-index")
+            after = _plan_tree(repo, plan, environment, after=True)
+            _hermetic_git(
+                ["diff", "--check", before, after, "--"],
+                cwd=repo,
+                environment=environment,
+            )
+    except (CommandError, OSError, UnicodeError):
+        raise CommandError("managed diff validation failed") from None
+
+
 def construct_rollout_commit(
     snapshot: RepositorySnapshot,
     base_sha: str,
@@ -699,22 +770,7 @@ def construct_rollout_commit(
     branch = rollout_branch(ref)
     with tempfile.TemporaryDirectory(prefix="workflow-fleet-index-") as temporary:
         root = Path(temporary)
-        home = root / "home"
-        home.mkdir()
-        environment = {
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(home),
-            "XDG_CONFIG_HOME": str(home),
-            "TMPDIR": str(root),
-            "LANG": "C",
-            "LC_ALL": "C",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_INDEX_FILE": str(root / "index"),
-            "GIT_AUTHOR_NAME": "workflow-fleet",
-            "GIT_AUTHOR_EMAIL": "workflow-fleet@invalid",
-            "GIT_COMMITTER_NAME": "workflow-fleet",
-            "GIT_COMMITTER_EMAIL": "workflow-fleet@invalid",
-        }
+        environment = _hermetic_environment(root, root / "index")
         _hermetic_git(
             ["read-tree", base_sha], cwd=snapshot.path, environment=environment
         )
