@@ -61,6 +61,15 @@ class ActionPinsTest(unittest.TestCase):
         self.assertGreater(len(references), 0, "no managed checkout references found")
         self.assertEqual([], offenders)
 
+    def test_managed_workflows_do_not_contain_empty_github_expressions(self) -> None:
+        offenders: list[str] = []
+        pattern = re.compile(r"\$\{\{\s*\}\}")
+        for path in workflow_paths():
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if pattern.search(line):
+                    offenders.append(f"{path.relative_to(ROOT)}:{lineno}")
+        self.assertEqual([], offenders)
+
     def test_opencode_workflows_pin_cli_archive_and_cache_action(self) -> None:
         for filename, job_name, run_name in (
             ("opencode.yml", "opencode", "Run opencode"),
