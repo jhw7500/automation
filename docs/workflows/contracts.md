@@ -61,10 +61,30 @@ checkout credential required by OpenCode's internal branch fetch without exposin
 processing external contributor content.
 
 Both OpenCode workflows force the job-scoped `github.token`; `id-token: write` is forbidden,
-so the action cannot exchange OIDC for an App token outside the declared job permissions.
+so the CLI cannot exchange OIDC for an App token outside the declared job permissions.
 Consumer OpenCode jobs must grant exactly `contents: read`, `pull-requests: write`, and
 `issues: write`. The fleet rollout tool normalizes these two caller permission blocks; this
 is the intentional exception to its general rule of preserving repository-owned permissions.
+
+### OpenCode runtime pin
+
+The central workflows, not consumer repositories, own the OpenCode CLI version. They download
+the Linux x64 archive for exactly `1.18.17`, verify SHA-256
+`3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a`, and only then extract
+and run it. The cache stores the archive rather than an unchecked executable, and the digest is
+verified after every cache restore. Consumers must not add an independent OpenCode installer.
+
+To update the CLI, change the version and GitHub release asset digest together in both OpenCode
+workflows, update the release verifier constants and tests, then publish a new immutable
+`automation` release only after a same-repository canary succeeds. Never replace a release tag
+or change the version to `latest`.
+
+### Action runtime pins
+
+Managed central and baseline workflows pin `actions/checkout` v7.0.1 and `actions/cache` v6.1.0
+to their full commit SHAs. `tests/test_action_pins.py` prevents tag, branch, and mixed-major drift.
+When updating either action, verify the upstream release tag resolves to the selected commit,
+run actionlint and the complete test suite, and ship the change through a new immutable release.
 
 ## Variables (consumer repository)
 

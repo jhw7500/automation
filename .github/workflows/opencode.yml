@@ -71,22 +71,48 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+    env:
+      OPENCODE_VERSION: '1.18.17'
+      OPENCODE_ARCHIVE_SHA256: '3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a'
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The action fetches PR branches itself; private repositories require the
+          # The CLI fetches PR branches itself; private repositories require the
           # contents: read job token to remain available for that authenticated fetch.
           persist-credentials: true
 
+      - name: Cache pinned OpenCode CLI archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/opencode/opencode-linux-x64-${{ env.OPENCODE_VERSION }}.tar.gz
+          key: opencode-cli-linux-x64-${{ env.OPENCODE_VERSION }}-${{ env.OPENCODE_ARCHIVE_SHA256 }}
+
+      - name: Install pinned OpenCode CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_dir="$HOME/.cache/opencode"
+          archive="$cache_dir/opencode-linux-x64-${OPENCODE_VERSION}.tar.gz"
+          install_dir="$RUNNER_TEMP/opencode-${OPENCODE_VERSION}"
+          mkdir -p "$cache_dir" "$install_dir"
+          if [[ ! -f "$archive" ]]; then
+            curl --fail --location --silent --show-error --retry 3 \
+              --output "$archive" \
+              "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
+          fi
+          echo "${OPENCODE_ARCHIVE_SHA256}  ${archive}" | sha256sum --check -
+          tar -xzf "$archive" -C "$install_dir"
+          [[ "$("$install_dir/opencode" --version)" == "$OPENCODE_VERSION" ]]
+          echo "$install_dir" >> "$GITHUB_PATH"
+
       - name: Run opencode
-        uses: anomalyco/opencode/github@bbc7bdb3fd5078d0add23273e0fdae436b9b47e4 # v1.1.43
+        run: opencode github run
         env:
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
-        with:
-          use_github_token: true
-          model: zai-coding-plan/glm-4.7
+          USE_GITHUB_TOKEN: 'true'
+          MODEL: zai-coding-plan/glm-4.7
 
   skipped:
     name: Workflow Skipped

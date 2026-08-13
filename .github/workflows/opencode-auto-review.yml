@@ -87,11 +87,14 @@ jobs:
     permissions:
       # id-token 없음(의도) — 이게 있으면 액션이 OIDC 토큰을 발급받아
       # api.opencode.ai 에서 App 토큰으로 교환할 수 있고, 그 토큰은 아래 contents: read
-      # 의 통제를 받지 않는다. use_github_token: true 와 함께 이중으로 막는다:
+      # 의 통제를 받지 않는다. USE_GITHUB_TOKEN=true 와 함께 이중으로 막는다:
       # 플래그가 기대대로 동작하지 않더라도 OIDC 발급 자체가 불가능(fail-closed).
       contents: read
       pull-requests: write
       issues: write
+    env:
+      OPENCODE_VERSION: '1.18.17'
+      OPENCODE_ARCHIVE_SHA256: '3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a'
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -99,26 +102,49 @@ jobs:
           fetch-depth: 1
           # OpenCode fetches the PR head branch after checkout. Private repositories
           # require authenticated fetch. This same token is intentionally passed to the
-          # action below; contents: read prevents code pushes, while PR/issues write is
+          # CLI below; contents: read prevents code pushes, while PR/issues write is
           # limited to review output. Consumer callers admit same-repository PRs only.
           persist-credentials: true
 
-      # use_github_token: OIDC 교환(api.opencode.ai → opencode-agent App 토큰)을 건너뛰고
+      - name: Cache pinned OpenCode CLI archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/opencode/opencode-linux-x64-${{ env.OPENCODE_VERSION }}.tar.gz
+          key: opencode-cli-linux-x64-${{ env.OPENCODE_VERSION }}-${{ env.OPENCODE_ARCHIVE_SHA256 }}
+
+      - name: Install pinned OpenCode CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_dir="$HOME/.cache/opencode"
+          archive="$cache_dir/opencode-linux-x64-${OPENCODE_VERSION}.tar.gz"
+          install_dir="$RUNNER_TEMP/opencode-${OPENCODE_VERSION}"
+          mkdir -p "$cache_dir" "$install_dir"
+          if [[ ! -f "$archive" ]]; then
+            curl --fail --location --silent --show-error --retry 3 \
+              --output "$archive" \
+              "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
+          fi
+          echo "${OPENCODE_ARCHIVE_SHA256}  ${archive}" | sha256sum --check -
+          tar -xzf "$archive" -C "$install_dir"
+          [[ "$("$install_dir/opencode" --version)" == "$OPENCODE_VERSION" ]]
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+      # USE_GITHUB_TOKEN: OIDC 교환(api.opencode.ai → opencode-agent App 토큰)을 건너뛰고
       # 이 잡의 GITHUB_TOKEN 을 쓴다. App 토큰은 App 설치 권한만 따르므로 위 permissions
       # 블록(contents: read)이 무력했다 — 실제로 자동 리뷰가 PR 브랜치에 코드 커밋을 푸시한
       # 사례가 있다(wlan-package #163, 게다가 실패하는 테스트였다). GITHUB_TOKEN 으로
       # 바꾸면 permissions 블록이 그대로 강제되어 리뷰는 쓰되(pull-requests/issues: write)
       # 코드는 못 쓴다(contents: read).
-      # 액션은 GITHUB_TOKEN 을 자동 주입하지 않으므로 env 로 명시해야 한다.
+      # CLI에는 GITHUB_TOKEN과 USE_GITHUB_TOKEN을 모두 명시한다.
       - name: Run OpenCode PR review
-        uses: anomalyco/opencode/github@bbc7bdb3fd5078d0add23273e0fdae436b9b47e4 # v1.1.43
+        run: opencode github run
         env:
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
-        with:
-          use_github_token: true
-          model: zai-coding-plan/glm-4.7
-          prompt: |
+          USE_GITHUB_TOKEN: 'true'
+          MODEL: zai-coding-plan/glm-4.7
+          PROMPT: |
             Review this pull request. Focus on:
             - correctness and regressions
             - security issues
