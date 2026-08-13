@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -25,6 +26,11 @@ from scripts.workflow_catalog import (
     load_catalog,
     load_fleet_config,
 )
+from scripts.workflow_release_inventory import (
+    RELEASE_PATHS,
+    SETUP_GEMINI_AUTH_ROOT,
+    validate_release_listing,
+)
 
 
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -38,6 +44,7 @@ SETUP_GEMINI_AUTH = (
     "2254f13aab44585c78954d20749f4fb677a8c2f1"
 )
 APPROVED_V140_POLICY_FILES = (
+    ".github/actions/setup-gemini-auth/action.yml",
     "scripts/workflow-catalog.json",
     "scripts/workflow-config.json",
     "examples/baseline-workflows/.github/workflow-config.yml",
@@ -57,7 +64,7 @@ APPROVED_V140_POLICY_FILES = (
     "examples/baseline-workflows/.github/workflows/opencode.yml",
 )
 APPROVED_V140_POLICY_SHA256 = (
-    "4f9b9943b204b3cb564c962a81d26ccea3819bd7c0ca3eafcd99d913cc3479f4"
+    "56d1672a70e2edc81b902894eba9b437c70fb7af54376e105bd1862637389642"
 )
 EXPECTED_GEMINI_MODE_INPUT = {
     "description": "Repository write authentication: github_app or github_token",
@@ -119,6 +126,66 @@ EXPECTED_GEMINI_VALIDATION = {
         "esac\n"
     ),
 }
+EXPECTED_SETUP_GEMINI_AUTH = {
+    "name": "Setup Gemini Auth",
+    "description": "Mint GitHub App token for Gemini workflows",
+    "inputs": {
+        "app-id": {"description": "GitHub App ID", "required": "false"},
+        "private-key": {
+            "description": "GitHub App Private Key",
+            "required": "false",
+        },
+        "fallback-token": {
+            "description": "Fallback token if App credentials not provided",
+            "required": "false",
+        },
+    },
+    "outputs": {
+        "token": {
+            "description": "Generated or fallback token",
+            "value": "${{ steps.resolve.outputs.token }}",
+        }
+    },
+    "runs": {
+        "using": "composite",
+        "steps": [
+            {
+                "name": "Mint identity token",
+                "id": "mint_token",
+                "if": "${{ inputs.app-id != '' }}",
+                "uses": (
+                    "actions/create-github-app-token@"
+                    "a8d616148505b5069dccd32f177bb87d7f39123b"
+                ),
+                "with": {
+                    "app-id": "${{ inputs.app-id }}",
+                    "private-key": "${{ inputs.private-key }}",
+                    "permission-contents": "read",
+                    "permission-issues": "write",
+                    "permission-pull-requests": "write",
+                },
+            },
+            {
+                "name": "Resolve token",
+                "id": "resolve",
+                "shell": "bash",
+                "env": {
+                    "MINTED": "${{ steps.mint_token.outputs.token }}",
+                    "FALLBACK": "${{ inputs.fallback-token }}",
+                },
+                "run": (
+                    'if [[ -n "$MINTED" ]]; then\n'
+                    "  printf 'token=%s\\n' \"$MINTED\" >> \"$GITHUB_OUTPUT\"\n"
+                    '  echo "::notice::Using GitHub App token"\n'
+                    "else\n"
+                    "  printf 'token=%s\\n' \"$FALLBACK\" >> \"$GITHUB_OUTPUT\"\n"
+                    '  echo "::notice::Using fallback token"\n'
+                    "fi\n"
+                ),
+            },
+        ],
+    },
+}
 GEMINI_AUTH_OUTPUT = "${{ steps.auth.outputs.token }}"
 APPROVED_GEMINI_ACTIONS = frozenset(
     {
@@ -157,8 +224,9 @@ class AnnotatedTag:
 
 @dataclass(frozen=True)
 class GitStorage:
-    common_dir: Path
-    object_dir: Path
+    common_fd: int
+    object_fd: int
+    owner_uid: int
 
 
 def git_child_env() -> dict[str, str]:
@@ -180,152 +248,383 @@ def git_child_env() -> dict[str, str]:
     }
 
 
-def _read_metadata(path: Path, *, maximum: int = MAX_GIT_METADATA_BYTES) -> bytes:
+_SECURE_FILESYSTEM_NAMES = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+
+
+def _require_secure_filesystem() -> None:
+    supported = (
+        os.name == "posix"
+        and os.open in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.stat in os.supports_follow_symlinks
+        and hasattr(os, "geteuid")
+        and all(hasattr(os, name) for name in _SECURE_FILESYSTEM_NAMES)
+        and Path("/proc/self/fd").is_dir()
+    )
+    if not supported:
+        raise ReleaseVerificationError("unsupported Git repository layout")
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _open_child_directory(
+    directory_fd: int,
+    name: str,
+    *,
+    expected_uid: int | None,
+    missing_ok: bool = False,
+) -> int | None:
+    if not name or name in {".", ".."} or "/" in name or "\0" in name:
+        raise ReleaseVerificationError("unsupported Git repository layout")
     descriptor: int | None = None
-    value: bytes | None = None
     try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise ReleaseVerificationError("unsupported Git repository layout") from None
+    except OSError:
+        raise ReleaseVerificationError("unsupported Git repository layout") from None
+    try:
+        if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            raise OSError
         descriptor = os.open(
-            path,
-            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
         )
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum:
+        opened = os.fstat(descriptor)
+        after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or _directory_identity(before) != _directory_identity(opened)
+            or _directory_identity(opened) != _directory_identity(after)
+            or (expected_uid is not None and opened.st_uid != expected_uid)
+        ):
             raise OSError
-        candidate = os.read(descriptor, maximum + 1)
-        if len(candidate) > maximum or os.read(descriptor, 1):
-            raise OSError
-        value = candidate
+        return descriptor
     except OSError:
         pass
-    finally:
+    if descriptor is not None:
+        os.close(descriptor)
+    raise ReleaseVerificationError("unsupported Git repository layout") from None
+
+
+def _absolute_metadata_path(base: Path, raw: str) -> Path:
+    if not raw or "\0" in raw:
+        raise ReleaseVerificationError("unsupported Git repository layout")
+    candidate = Path(raw)
+    parts = candidate.parts
+    parent_prefix = 0
+    if candidate.is_absolute():
+        if ".." in parts:
+            raise ReleaseVerificationError("unsupported Git repository layout")
+    else:
+        while parent_prefix < len(parts) and parts[parent_prefix] == "..":
+            parent_prefix += 1
+        if ".." in parts[parent_prefix:]:
+            raise ReleaseVerificationError("unsupported Git repository layout")
+        candidate = base / candidate
+    return Path(os.path.abspath(os.fspath(candidate)))
+
+
+def _open_directory_path(path: Path, *, expected_uid: int | None) -> tuple[Path, int]:
+    _require_secure_filesystem()
+    if ".." in path.parts:
+        raise ReleaseVerificationError("unsupported Git repository layout")
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            "/", os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+        for component in absolute.parts[1:]:
+            child = _open_child_directory(
+                descriptor, component, expected_uid=None
+            )
+            assert child is not None
+            os.close(descriptor)
+            descriptor = child
+        metadata = os.fstat(descriptor)
+        if expected_uid is not None and metadata.st_uid != expected_uid:
+            raise OSError
+        return absolute, descriptor
+    except (OSError, ReleaseVerificationError):
         if descriptor is not None:
             os.close(descriptor)
-    if value is None:
-        raise ReleaseVerificationError("unsupported Git repository metadata") from None
-    return value
+        raise ReleaseVerificationError("unsupported Git repository layout") from None
 
 
-def _one_metadata_line(path: Path) -> str:
-    value: str | None = None
+def _read_metadata_at(
+    directory_fd: int,
+    name: str,
+    *,
+    maximum: int = MAX_GIT_METADATA_BYTES,
+    expected_uid: int,
+    missing_ok: bool = False,
+) -> bytes | None:
+    """Read one stable, owned regular metadata file without following names."""
+
+    _require_secure_filesystem()
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\0" in name
+        or maximum < 0
+    ):
+        raise ReleaseVerificationError("unsupported Git repository metadata")
+    descriptor: int | None = None
     try:
-        value = _read_metadata(path, maximum=4096).decode("utf-8")
-    except UnicodeDecodeError:
-        pass
+        named_before = os.stat(
+            name, dir_fd=directory_fd, follow_symlinks=False
+        )
+    except OSError as exc:
+        if missing_ok and exc.errno == errno.ENOENT:
+            return None
+        raise ReleaseVerificationError(
+            "unsupported Git repository metadata"
+        ) from None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+    except OSError:
+        raise ReleaseVerificationError(
+            "unsupported Git repository metadata"
+        ) from None
+
+    try:
+        opened_before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_before.st_mode)
+            or stat.S_ISLNK(named_before.st_mode)
+            or opened_before.st_uid != expected_uid
+            or opened_before.st_nlink != 1
+            or opened_before.st_size > maximum
+            or _metadata_identity(named_before)
+            != _metadata_identity(opened_before)
+        ):
+            raise OSError
+        chunks: list[bytes] = []
+        length = 0
+        while length <= maximum:
+            chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - length))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            length += len(chunk)
+        value = b"".join(chunks)
+        after = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            length > maximum
+            or length != opened_before.st_size
+            or _metadata_identity(opened_before) != _metadata_identity(after)
+            or _metadata_identity(after) != _metadata_identity(current)
+        ):
+            raise OSError
+        return value
+    except OSError:
+        raise ReleaseVerificationError(
+            "unsupported Git repository metadata"
+        ) from None
+    finally:
+        os.close(descriptor)
+
+
+def _one_metadata_line_at(
+    directory_fd: int,
+    name: str,
+    *,
+    expected_uid: int,
+    missing_ok: bool = False,
+) -> str | None:
+    value = _read_metadata_at(
+        directory_fd,
+        name,
+        maximum=4096,
+        expected_uid=expected_uid,
+        missing_ok=missing_ok,
+    )
     if value is None:
-        raise ReleaseVerificationError("unsupported Git repository metadata") from None
-    lines = value.splitlines()
+        return None
+    try:
+        lines = value.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        lines = []
     if len(lines) != 1 or not lines[0]:
         raise ReleaseVerificationError("unsupported Git repository metadata")
     return lines[0]
 
 
-def _resolved_directory(path: Path) -> Path:
-    resolved: Path | None = None
-    metadata: os.stat_result | None = None
+def _entry_exists_at(directory_fd: int, name: str) -> bool:
     try:
-        resolved = path.resolve(strict=True)
-        metadata = resolved.lstat()
-    except (OSError, RuntimeError):
-        pass
-    if resolved is None or metadata is None:
-        raise ReleaseVerificationError("unsupported Git repository layout") from None
-    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise ReleaseVerificationError("unsupported Git repository layout")
-    return resolved
-
-
-def git_storage(repo: Path) -> GitStorage:
-    """Discover a normal or linked-worktree object store without invoking Git."""
-
-    root = _resolved_directory(repo)
-    dot_git = root / ".git"
-    dot_git_metadata: os.stat_result | None = None
-    try:
-        dot_git_metadata = dot_git.lstat()
-    except OSError:
-        pass
-    if dot_git_metadata is None:
-        raise ReleaseVerificationError("unsupported Git repository layout") from None
-    if stat.S_ISDIR(dot_git_metadata.st_mode) and not stat.S_ISLNK(
-        dot_git_metadata.st_mode
-    ):
-        git_dir = dot_git.resolve(strict=True)
-    elif stat.S_ISREG(dot_git_metadata.st_mode) and not stat.S_ISLNK(
-        dot_git_metadata.st_mode
-    ):
-        pointer = _one_metadata_line(dot_git)
-        if not pointer.startswith("gitdir: "):
-            raise ReleaseVerificationError("unsupported Git repository layout")
-        candidate = Path(pointer.removeprefix("gitdir: "))
-        git_dir = _resolved_directory(
-            candidate if candidate.is_absolute() else root / candidate
-        )
-    else:
-        raise ReleaseVerificationError("unsupported Git repository layout")
-
-    commondir_file = git_dir / "commondir"
-    try:
-        commondir_metadata = commondir_file.lstat()
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        return True
     except FileNotFoundError:
-        commondir_metadata = None
+        return False
     except OSError:
-        raise ReleaseVerificationError("unsupported Git repository layout") from None
-    if commondir_metadata is not None:
-        if not stat.S_ISREG(commondir_metadata.st_mode) or stat.S_ISLNK(
-            commondir_metadata.st_mode
-        ):
-            raise ReleaseVerificationError("unsupported Git repository layout")
-        common_value = Path(_one_metadata_line(commondir_file))
-        common_dir = _resolved_directory(
-            common_value if common_value.is_absolute() else git_dir / common_value
-        )
-    else:
-        common_dir = git_dir
-    object_dir = _resolved_directory(common_dir / "objects")
+        raise ReleaseVerificationError("unsupported Git object storage") from None
 
-    unsupported = (
-        object_dir / "info/alternates",
-        object_dir / "info/http-alternates",
-        common_dir / "shallow",
-        git_dir / "shallow",
-    )
-    unsupported_exists = False
-    for path in unsupported:
-        try:
-            path.lstat()
-            unsupported_exists = True
-            break
-        except FileNotFoundError:
-            continue
-        except OSError:
-            unsupported_exists = True
-            break
+
+def _unsupported_object_storage(
+    git_fd: int, common_fd: int, object_fd: int, *, owner_uid: int
+) -> bool:
+    if _entry_exists_at(common_fd, "shallow") or _entry_exists_at(git_fd, "shallow"):
+        return True
+    opened: list[int] = []
     try:
-        has_promisor = any((object_dir / "pack").glob("*.promisor"))
-    except OSError:
-        has_promisor = True
-    if unsupported_exists or has_promisor:
-        raise ReleaseVerificationError("unsupported Git object storage")
-    return GitStorage(common_dir, object_dir)
+        info_fd = _open_child_directory(
+            object_fd, "info", expected_uid=owner_uid, missing_ok=True
+        )
+        if info_fd is not None:
+            opened.append(info_fd)
+            if _entry_exists_at(info_fd, "alternates") or _entry_exists_at(
+                info_fd, "http-alternates"
+            ):
+                return True
+        pack_fd = _open_child_directory(
+            object_fd, "pack", expected_uid=owner_uid, missing_ok=True
+        )
+        if pack_fd is not None:
+            opened.append(pack_fd)
+            if any(name.endswith(".promisor") for name in os.listdir(pack_fd)):
+                return True
+        return False
+    except (OSError, ReleaseVerificationError):
+        raise ReleaseVerificationError("unsupported Git object storage") from None
+    finally:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
 
 
 @contextmanager
-def _raw_git_environment(repo: Path) -> Iterator[dict[str, str]]:
-    storage = git_storage(repo)
-    with tempfile.TemporaryDirectory(prefix="workflow-release-git-") as temporary:
-        isolated = Path(temporary) / "git"
-        (isolated / "objects").mkdir(parents=True)
-        (isolated / "refs").mkdir()
-        (isolated / "HEAD").write_text(
-            "ref: refs/heads/unborn\n", encoding="ascii"
+def git_storage(repo: Path) -> Iterator[GitStorage]:
+    """Pin a normal or linked-worktree object store without invoking Git."""
+
+    owner_uid = os.geteuid() if hasattr(os, "geteuid") else -1
+    descriptors: list[int] = []
+    try:
+        root, root_fd = _open_directory_path(repo, expected_uid=owner_uid)
+        descriptors.append(root_fd)
+        try:
+            dot_git = os.stat(".git", dir_fd=root_fd, follow_symlinks=False)
+        except OSError:
+            raise ReleaseVerificationError(
+                "unsupported Git repository layout"
+            ) from None
+        if stat.S_ISDIR(dot_git.st_mode) and not stat.S_ISLNK(dot_git.st_mode):
+            opened = _open_child_directory(
+                root_fd, ".git", expected_uid=owner_uid
+            )
+            assert opened is not None
+            git_dir = root / ".git"
+            git_fd = opened
+        elif stat.S_ISREG(dot_git.st_mode) and not stat.S_ISLNK(dot_git.st_mode):
+            pointer = _one_metadata_line_at(
+                root_fd, ".git", expected_uid=owner_uid
+            )
+            assert pointer is not None
+            if not pointer.startswith("gitdir: "):
+                raise ReleaseVerificationError("unsupported Git repository layout")
+            git_dir = _absolute_metadata_path(
+                root, pointer.removeprefix("gitdir: ")
+            )
+            if git_dir.parent.name != "worktrees":
+                raise ReleaseVerificationError("unsupported Git repository layout")
+            git_dir, git_fd = _open_directory_path(
+                git_dir, expected_uid=owner_uid
+            )
+        else:
+            raise ReleaseVerificationError("unsupported Git repository layout")
+        descriptors.append(git_fd)
+
+        common_value = _one_metadata_line_at(
+            git_fd, "commondir", expected_uid=owner_uid, missing_ok=True
         )
-        yield {
-            **git_child_env(),
-            "GIT_DIR": str(isolated),
-            "GIT_OBJECT_DIRECTORY": str(storage.object_dir),
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-        }
+        if common_value is None:
+            common_dir = git_dir
+            common_fd = os.dup(git_fd)
+        else:
+            common_dir = _absolute_metadata_path(git_dir, common_value)
+            if common_dir != git_dir.parent.parent:
+                raise ReleaseVerificationError("unsupported Git repository layout")
+            common_dir, common_fd = _open_directory_path(
+                common_dir, expected_uid=owner_uid
+            )
+        descriptors.append(common_fd)
+
+        opened = _open_child_directory(
+            common_fd, "objects", expected_uid=owner_uid
+        )
+        assert opened is not None
+        object_fd = opened
+        descriptors.append(object_fd)
+        if os.fstat(object_fd).st_dev != os.fstat(common_fd).st_dev:
+            raise ReleaseVerificationError("unsupported Git repository layout")
+        if _unsupported_object_storage(
+            git_fd, common_fd, object_fd, owner_uid=owner_uid
+        ):
+            raise ReleaseVerificationError("unsupported Git object storage")
+        yield GitStorage(common_fd, object_fd, owner_uid)
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+@contextmanager
+def _raw_git_environment(
+    repo: Path,
+) -> Iterator[tuple[dict[str, str], tuple[int, ...]]]:
+    with git_storage(repo) as storage:
+        with tempfile.TemporaryDirectory(prefix="workflow-release-git-") as temporary:
+            isolated = Path(temporary) / "git"
+            (isolated / "objects").mkdir(parents=True)
+            (isolated / "refs").mkdir()
+            (isolated / "HEAD").write_text(
+                "ref: refs/heads/unborn\n", encoding="ascii"
+            )
+            yield (
+                {
+                    **git_child_env(),
+                    "GIT_DIR": str(isolated),
+                    "GIT_OBJECT_DIRECTORY": f"/proc/self/fd/{storage.object_fd}",
+                    "GIT_NO_REPLACE_OBJECTS": "1",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                },
+                (storage.object_fd,),
+            )
 
 
 def remote_git_env() -> dict[str, str]:
@@ -342,13 +641,14 @@ def remote_git_env() -> dict[str, str]:
 def git_bytes(repo: Path, *args: str) -> bytes:
     result: subprocess.CompletedProcess[bytes] | None = None
     try:
-        with _raw_git_environment(repo) as environment:
+        with _raw_git_environment(repo) as (environment, pass_fds):
             result = subprocess.run(
                 [GIT_EXECUTABLE, *args],
                 cwd="/",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=environment,
+                pass_fds=pass_fds,
             )
     except (OSError, ValueError):
         pass
@@ -407,33 +707,64 @@ def read_tag_oid(repo: Path, ref: str) -> str:
 
     if RELEASE_REF.fullmatch(ref) is None:
         raise ReleaseVerificationError("invalid release ref")
-    storage = git_storage(repo)
-    loose = storage.common_dir / "refs" / "tags" / ref
-    try:
-        loose_metadata = loose.lstat()
-    except FileNotFoundError:
-        loose_metadata = None
-    except OSError:
-        raise ReleaseVerificationError("release tag identity is unavailable") from None
-    if loose_metadata is not None:
-        if not stat.S_ISREG(loose_metadata.st_mode) or stat.S_ISLNK(
-            loose_metadata.st_mode
-        ):
-            raise ReleaseVerificationError("release tag identity is unavailable")
-        oid = _one_metadata_line(loose)
-        if not _valid_oid(oid):
-            raise ReleaseVerificationError("release tag has an invalid Git identity")
-        return oid
+    with git_storage(repo) as storage:
+        opened: list[int] = []
+        try:
+            loose_value: str | None = None
+            refs_fd = _open_child_directory(
+                storage.common_fd,
+                "refs",
+                expected_uid=storage.owner_uid,
+                missing_ok=True,
+            )
+            if refs_fd is not None:
+                opened.append(refs_fd)
+                tags_fd = _open_child_directory(
+                    refs_fd,
+                    "tags",
+                    expected_uid=storage.owner_uid,
+                    missing_ok=True,
+                )
+                if tags_fd is not None:
+                    opened.append(tags_fd)
+                    loose_value = _one_metadata_line_at(
+                        tags_fd,
+                        ref,
+                        expected_uid=storage.owner_uid,
+                        missing_ok=True,
+                    )
+            if loose_value is not None:
+                if not _valid_oid(loose_value):
+                    raise ReleaseVerificationError(
+                        "release tag has an invalid Git identity"
+                    )
+                return loose_value
 
-    packed = storage.common_dir / "packed-refs"
-    if not packed.exists():
-        raise ReleaseVerificationError("release tag identity is unavailable")
-    try:
-        lines = _read_metadata(packed, maximum=16 * 1024 * 1024).decode(
-            "ascii"
-        ).splitlines()
-    except UnicodeDecodeError:
-        raise ReleaseVerificationError("release tag identity is unavailable") from None
+            packed = _read_metadata_at(
+                storage.common_fd,
+                "packed-refs",
+                maximum=16 * 1024 * 1024,
+                expected_uid=storage.owner_uid,
+                missing_ok=True,
+            )
+            if packed is None:
+                raise ReleaseVerificationError(
+                    "release tag identity is unavailable"
+                )
+            lines = packed.decode("ascii").splitlines()
+        except UnicodeDecodeError:
+            raise ReleaseVerificationError(
+                "release tag identity is unavailable"
+            ) from None
+        except ReleaseVerificationError as exc:
+            if "invalid Git identity" in str(exc):
+                raise
+            raise ReleaseVerificationError(
+                "release tag identity is unavailable"
+            ) from None
+        finally:
+            for descriptor in reversed(opened):
+                os.close(descriptor)
     target = f"refs/tags/{ref}"
     matches: list[str] = []
     for line in lines:
@@ -483,11 +814,19 @@ def assert_tag_unchanged(repo: Path, tag: AnnotatedTag) -> None:
 def _direct_origin_urls(repo: Path) -> list[str]:
     """Parse only the literal origin URL in the common config; never follow includes."""
 
-    config = git_storage(repo).common_dir / "config"
-    try:
-        lines = _read_metadata(config).decode("utf-8").splitlines()
-    except UnicodeDecodeError:
-        raise ReleaseVerificationError("origin configuration is invalid") from None
+    with git_storage(repo) as storage:
+        try:
+            config = _read_metadata_at(
+                storage.common_fd,
+                "config",
+                expected_uid=storage.owner_uid,
+            )
+            assert config is not None
+            lines = config.decode("utf-8").splitlines()
+        except UnicodeDecodeError:
+            raise ReleaseVerificationError(
+                "origin configuration is invalid"
+            ) from None
     in_origin = False
     urls: list[str] = []
     for line in lines:
@@ -615,6 +954,47 @@ def _verify_approved_v140_policy(repo: Path, ref: str, revision: str) -> None:
         )
 
 
+def _release_inventory(repo: Path, revision: str) -> None:
+    try:
+        listing = git_bytes(
+            repo,
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            revision,
+            "--",
+            *RELEASE_PATHS,
+        )
+        validate_release_listing(listing)
+    except (ReleaseVerificationError, ValueError):
+        raise ReleaseVerificationError(
+            "release inventory is incomplete or invalid"
+        ) from None
+
+
+def _release_version(ref: str) -> tuple[int, ...]:
+    if RELEASE_REF.fullmatch(ref) is None:
+        raise ReleaseVerificationError(f"invalid release ref: {ref}")
+    return tuple(int(part) for part in ref.removeprefix("v").split("."))
+
+
+def _verify_setup_gemini_auth(repo: Path, revision: str) -> None:
+    path = SETUP_GEMINI_AUTH_ROOT.path.as_posix()
+    try:
+        document = yaml.load(
+            git(repo, "show", f"{revision}:{path}"), Loader=yaml.BaseLoader
+        )
+    except (ReleaseVerificationError, yaml.YAMLError):
+        raise ReleaseVerificationError(
+            "setup-gemini-auth action contract is invalid"
+        ) from None
+    if document != EXPECTED_SETUP_GEMINI_AUTH:
+        raise ReleaseVerificationError(
+            "setup-gemini-auth action contract is invalid"
+        )
+
+
 def _verify_tag_catalog(
     repo: Path, ref: str, revision: str
 ) -> WorkflowCatalog | None:
@@ -635,8 +1015,7 @@ def _verify_tag_catalog(
         # Historical tags predate the closed release inventory.  Keep their
         # OpenCode verifier regression path readable, while all v1.40+ tags
         # must carry the renderer-owned catalog and fleet config.
-        version = tuple(int(part) for part in ref.removeprefix("v").split("."))
-        if version < (1, 40):
+        if _release_version(ref) < (1, 40):
             return None
         raise ReleaseVerificationError(
             f"tag {ref} release inventory is missing: {sorted(missing_inventory)}"
@@ -963,6 +1342,9 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
 
 
 def _verify_commit_content(repo: Path, ref: str, revision: str) -> None:
+    if _release_version(ref) >= (1, 40):
+        _release_inventory(repo, revision)
+        _verify_setup_gemini_auth(repo, revision)
     _verify_approved_v140_policy(repo, ref, revision)
     catalog = _verify_tag_catalog(repo, ref, revision)
     names = git(
@@ -1153,7 +1535,6 @@ def verify_tag_content(
 def verify_release(
     repo: Path, ref: str, expected_commit: str, remote: str | None = None
 ) -> str:
-    repo = repo.resolve()
     if re.fullmatch(r"v\d+(?:\.\d+)+", ref) is None:
         raise ReleaseVerificationError(f"invalid release ref: {ref}")
     tag = resolve_annotated_tag(repo, ref)

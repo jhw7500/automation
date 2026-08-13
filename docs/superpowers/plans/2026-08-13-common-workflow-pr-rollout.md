@@ -1242,7 +1242,7 @@ rtk bash -s <<'BASH'
     exit 1
   fi
 
-  rtk python3 scripts/verify_workflow_release.py \
+  rtk python3 -m scripts.verify_workflow_release \
     --automation . --ref v1.40 --expected-commit "$MERGE_SHA" --commit-only
 
   TAG_RESULT="$(

@@ -27,16 +27,12 @@ from scripts.workflow_catalog import (
     load_catalog,
     load_fleet_config,
 )
-
-
-RELEASE_PATHS = (
-    ".github/workflows",
-    ".github/actions/setup-gemini-auth/action.yml",
-    "examples/baseline-workflows/.github",
-    "scripts/workflow-catalog.json",
-    "scripts/workflow-config.json",
+from scripts.workflow_release_inventory import (
+    RELEASE_PATHS,
+    release_directory,
+    release_file_modes,
+    validate_release_listing,
 )
-_RELEASE_ROOTS = tuple(PurePosixPath(path) for path in RELEASE_PATHS)
 
 
 @dataclass(frozen=True)
@@ -50,13 +46,7 @@ class ReleaseBundle:
 
 
 def _release_owned(path: PurePosixPath, *, directory: bool) -> bool:
-    return any(
-        path == release_root or path.is_relative_to(release_root)
-        for release_root in _RELEASE_ROOTS
-    ) or (
-        directory
-        and any(release_root.is_relative_to(path) for release_root in _RELEASE_ROOTS)
-    )
+    return release_directory(path) if directory else bool(release_file_modes(path))
 
 
 def _build_git_archive(automation: Path, revision: str) -> bytes:
@@ -70,41 +60,17 @@ def _build_git_archive(automation: Path, revision: str) -> bytes:
         "--",
         *RELEASE_PATHS,
     )
-    entries: list[tuple[PurePosixPath, int, str]] = []
-    seen: set[PurePosixPath] = set()
-    for record in listing.split(b"\0"):
-        if not record:
-            continue
-        metadata, raw_path = record.split(b"\t", 1)
-        mode, kind, raw_oid = metadata.split(b" ", 2)
-        path = PurePosixPath(raw_path.decode("utf-8"))
-        oid = raw_oid.decode("ascii")
-        if (
-            kind != b"blob"
-            or mode not in {b"100644", b"100755"}
-            or len(oid) != 40
-            or any(character not in "0123456789abcdef" for character in oid)
-            or path in seen
-            or not _release_owned(path, directory=False)
-        ):
-            raise ValueError
-        seen.add(path)
-        entries.append((path, 0o755 if mode == b"100755" else 0o644, oid))
-    if not entries or any(
-        not any(path == root or path.is_relative_to(root) for path, _, _ in entries)
-        for root in _RELEASE_ROOTS
-    ):
-        raise ValueError
+    entries = validate_release_listing(listing)
 
     output = BytesIO()
     with tarfile.open(
         fileobj=output, mode="w", format=tarfile.USTAR_FORMAT
     ) as archive:
-        for path, mode, oid in sorted(entries, key=lambda item: str(item[0])):
-            payload = git_bytes(automation, "cat-file", "blob", oid)
-            member = tarfile.TarInfo(str(path))
+        for entry in sorted(entries, key=lambda item: str(item.path)):
+            payload = git_bytes(automation, "cat-file", "blob", entry.oid)
+            member = tarfile.TarInfo(str(entry.path))
             member.size = len(payload)
-            member.mode = mode
+            member.mode = entry.archive_mode
             member.mtime = 0
             member.uid = 0
             member.gid = 0
@@ -127,12 +93,14 @@ def _git_archive(automation: Path, revision: str) -> bytes:
 
 def _safe_member(member: tarfile.TarInfo) -> PurePosixPath:
     path = PurePosixPath(member.name)
+    allowed_modes = release_file_modes(path)
     safe = (
         bool(path.parts)
         and not path.is_absolute()
         and ".." not in path.parts
         and _release_owned(path, directory=member.isdir())
         and (member.isdir() or member.isreg())
+        and (member.isdir() or member.mode in allowed_modes)
         and not member.issym()
         and not member.islnk()
     )
@@ -167,7 +135,6 @@ def _extract_archive(archive_bytes: bytes, destination: Path) -> None:
 def _materialize(
     automation: Path, ref: str, *, remote: str | None
 ) -> Iterator[ReleaseBundle]:
-    automation = automation.resolve()
     tag: AnnotatedTag = resolve_annotated_tag(automation, ref)
     if remote is not None:
         verify_remote_tag(automation, remote, tag)

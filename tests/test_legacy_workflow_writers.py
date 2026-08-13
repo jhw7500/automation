@@ -500,7 +500,9 @@ def test_task9_is_fail_closed_sequential_and_reuses_the_marked_workspace() -> No
     assert "https://github.com/jhw7500/automation.git" in text
     main_index = text.index("refs/heads/main")
     tag_index = text.index("refs/tags/v1.40", main_index)
-    verify_index = text.index("scripts/verify_workflow_release.py", tag_index)
+    verifier_command = "python3 -m scripts.verify_workflow_release"
+    verify_index = text.index(verifier_command, tag_index)
+    assert "python3 scripts/verify_workflow_release.py" not in text[tag_index:]
     publish_index = text.index("repos/jhw7500/automation/git/tags", verify_index)
     postverify_index = text.index("POST_REMOTE_TAGS", publish_index)
     assert main_index < tag_index < verify_index < publish_index < postverify_index

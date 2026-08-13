@@ -16,15 +16,12 @@ from scripts.verify_workflow_release import ReleaseVerificationError
 import scripts.verify_workflow_release as release_verifier
 import scripts.workflow_release_bundle as release_bundle
 from scripts.workflow_release_bundle import materialize_release_bundle
+from scripts.workflow_release_inventory import EXACT_RELEASE_ROOTS, RELEASE_PATHS
 
 ROOT = Path(__file__).resolve().parents[1]
 
-RELEASE_PATHS = (
-    ".github/workflows",
-    ".github/actions/setup-gemini-auth/action.yml",
-    "examples/baseline-workflows/.github",
-    "scripts/workflow-catalog.json",
-    "scripts/workflow-config.json",
+EXACT_RELEASE_FILES = tuple(
+    root.path.as_posix() for root in EXACT_RELEASE_ROOTS
 )
 
 
@@ -147,6 +144,81 @@ def test_release_archive_uses_only_raw_tree_and_blob_reads(
     assert calls[0][0] == "ls-tree"
     assert all(call[0] in {"ls-tree", "cat-file"} for call in calls)
     assert all("archive" not in call for call in calls)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "directory-collision", "executable-mode", "gitlink"),
+)
+@pytest.mark.parametrize("relative", EXACT_RELEASE_FILES)
+def test_release_archive_requires_each_exact_file_as_one_0644_blob(
+    release_repo: tuple[Path, str], relative: str, mutation: str
+) -> None:
+    repo, release_commit = release_repo
+    target = repo / relative
+    if mutation == "missing":
+        target.unlink()
+        bad_commit = commit(repo, f"remove {relative}")
+    elif mutation == "directory-collision":
+        target.unlink()
+        target.mkdir()
+        (target / "dummy").write_text("not the release file\n", encoding="utf-8")
+        bad_commit = commit(repo, f"replace {relative} with a directory")
+    elif mutation == "executable-mode":
+        target.chmod(0o755)
+        bad_commit = commit(repo, f"make {relative} executable")
+    else:
+        target.unlink()
+        git(repo, "add", "-u", "--", relative)
+        git(
+            repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{release_commit},{relative}",
+        )
+        git(repo, "commit", "-qm", f"replace {relative} with a gitlink")
+        bad_commit = git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(ReleaseVerificationError, match="archive verified release"):
+        release_bundle._git_archive(repo, bad_commit)
+
+
+def test_release_archive_rejects_lexical_parent_descendant(
+    release_repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, release_commit = release_repo
+    oid = "f" * 40
+    original = release_bundle.git_bytes
+
+    def malicious_listing(repository: Path, *args: str) -> bytes:
+        if args[:1] == ("ls-tree",):
+            return original(repository, *args) + (
+                f"100644 blob {oid}\t.github/workflows/../escape\0".encode()
+            )
+        if args == ("cat-file", "blob", oid):
+            return b"escaped\n"
+        return original(repository, *args)
+
+    monkeypatch.setattr(release_bundle, "git_bytes", malicious_listing)
+
+    with pytest.raises(ReleaseVerificationError, match="archive verified release"):
+        release_bundle._git_archive(repo, release_commit)
+
+
+def test_bundle_rejects_action_file_replaced_by_directory_and_dummy_blob(
+    release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = release_repo
+    action = repo / ".github/actions/setup-gemini-auth/action.yml"
+    action.unlink()
+    action.mkdir()
+    (action / "dummy").write_text("not a composite action\n", encoding="utf-8")
+    retag(repo, "v1.41")
+
+    with pytest.raises(ReleaseVerificationError, match="release inventory"):
+        with materialize_release_bundle(repo, "v1.41", remote=None):
+            pass
 
 
 def test_release_archive_ignores_host_user_and_xdg_git_includes(

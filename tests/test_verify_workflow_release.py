@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import threading
 import traceback
 
@@ -15,6 +17,7 @@ import yaml
 
 import scripts.verify_workflow_release as release_verifier
 from scripts.verify_workflow_release import ReleaseVerificationError, verify_release
+from scripts.workflow_release_inventory import RELEASE_PATHS
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,16 +42,6 @@ HERMETIC_REMOTE_GIT_ENV = {
     "GIT_PROTOCOL_FROM_USER": "0",
     "GIT_CEILING_DIRECTORIES": "/",
 }
-
-
-RELEASE_PATHS = (
-    ".github/workflows",
-    ".github/actions/setup-gemini-auth/action.yml",
-    "examples/baseline-workflows/.github",
-    "scripts/workflow-catalog.json",
-    "scripts/workflow-config.json",
-)
-
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(
@@ -198,6 +191,10 @@ def test_release_verifier_git_uses_a_minimal_provider_free_environment(
     observed: dict[str, object] = {}
 
     def child(args, **kwargs):
+        passed = kwargs["pass_fds"]
+        assert len(passed) == 1
+        descriptor = passed[0]
+        observed["object_stat"] = os.fstat(descriptor)
         observed.update({"args": list(args), **kwargs})
         return subprocess.CompletedProcess(args, 0, stdout=b"ok\n", stderr=b"")
 
@@ -218,7 +215,14 @@ def test_release_verifier_git_uses_a_minimal_provider_free_environment(
     assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
     assert env["GIT_OPTIONAL_LOCKS"] == "0"
     assert Path(env["GIT_DIR"]).name == "git"
-    assert Path(env["GIT_OBJECT_DIRECTORY"]) == expected_object_dir
+    assert env["GIT_OBJECT_DIRECTORY"] == f"/proc/self/fd/{observed['pass_fds'][0]}"
+    expected_stat = expected_object_dir.stat()
+    object_stat = observed["object_stat"]
+    assert isinstance(object_stat, os.stat_result)
+    assert (object_stat.st_dev, object_stat.st_ino) == (
+        expected_stat.st_dev,
+        expected_stat.st_ino,
+    )
     assert sensitive.isdisjoint(env)
     assert not any(str(value).startswith("sentinel-") for value in env.values())
     assert "SSH_AUTH_SOCK" not in env
@@ -259,6 +263,20 @@ def test_release_verification_ignores_replace_ref_payload(
     assert verify_release(repo, "v1.40", release_commit) == release_commit
 
 
+def test_release_verifier_preserves_pre_inventory_v139_contract(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "historical-automation"
+    shutil.copytree(ROOT / ".github/workflows", repo / ".github/workflows")
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    commit_oid = commit(repo, "historical release")
+    git(repo, "tag", "-a", "v1.39", "-m", "v1.39")
+
+    assert verify_release(repo, "v1.39", commit_oid) == commit_oid
+
+
 @pytest.mark.parametrize("unsupported", ("alternates", "promisor"))
 def test_release_verification_fails_closed_on_unsupported_object_storage(
     release_repo: tuple[Path, Path, str],
@@ -292,6 +310,289 @@ def test_release_raw_object_boundary_supports_linked_worktree(
     install_commit_replacement(repo, release_commit)
 
     assert verify_release(linked, "v1.40", release_commit) == release_commit
+
+
+@pytest.mark.parametrize("linked_worktree", (False, True), ids=("normal", "linked"))
+def test_release_rejects_external_object_directory_symlink(
+    release_repo: tuple[Path, Path, str],
+    tmp_path: Path,
+    linked_worktree: bool,
+) -> None:
+    repo, _, release_commit = release_repo
+    checkout = repo
+    if linked_worktree:
+        checkout = tmp_path / "linked-worktree"
+        git(repo, "worktree", "add", "--detach", str(checkout), release_commit)
+    objects = common_git_dir(repo) / "objects"
+    external = tmp_path / "external-object-store"
+    objects.rename(external)
+    objects.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ReleaseVerificationError, match="repository layout"):
+        verify_release(checkout, "v1.40", release_commit)
+
+
+def test_release_rejects_symlink_in_linked_gitdir_chain(
+    release_repo: tuple[Path, Path, str], tmp_path: Path
+) -> None:
+    repo, _, release_commit = release_repo
+    linked = tmp_path / "linked-worktree"
+    git(repo, "worktree", "add", "--detach", str(linked), release_commit)
+    pointer = Path(
+        (linked / ".git")
+        .read_text(encoding="utf-8")
+        .removeprefix("gitdir: ")
+        .strip()
+    )
+    moved = pointer.with_name(f"{pointer.name}-real")
+    pointer.rename(moved)
+    pointer.symlink_to(moved, target_is_directory=True)
+
+    with pytest.raises(ReleaseVerificationError, match="repository layout"):
+        verify_release(linked, "v1.40", release_commit)
+
+
+def test_release_rejects_gitdir_symlink_hidden_before_parent_traversal(
+    release_repo: tuple[Path, Path, str], tmp_path: Path
+) -> None:
+    repo, _, release_commit = release_repo
+    linked = tmp_path / "linked-worktree"
+    git(repo, "worktree", "add", "--detach", str(linked), release_commit)
+    pointer_file = linked / ".git"
+    git_dir = Path(
+        pointer_file.read_text(encoding="utf-8")
+        .removeprefix("gitdir: ")
+        .strip()
+    )
+    alias = git_dir.parent / "gitdir-link"
+    alias.symlink_to(git_dir, target_is_directory=True)
+    pointer_file.write_text(
+        f"gitdir: {alias}/../{git_dir.name}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ReleaseVerificationError, match="repository layout"):
+        verify_release(linked, "v1.40", release_commit)
+
+
+def test_release_rejects_symlinked_commondir_target(
+    release_repo: tuple[Path, Path, str], tmp_path: Path
+) -> None:
+    repo, _, release_commit = release_repo
+    linked = tmp_path / "linked-worktree"
+    git(repo, "worktree", "add", "--detach", str(linked), release_commit)
+    git_dir = Path(
+        (linked / ".git")
+        .read_text(encoding="utf-8")
+        .removeprefix("gitdir: ")
+        .strip()
+    )
+    (git_dir / "common-link").symlink_to(
+        common_git_dir(repo), target_is_directory=True
+    )
+    (git_dir / "commondir").write_text("common-link\n", encoding="utf-8")
+
+    with pytest.raises(ReleaseVerificationError, match="repository layout"):
+        verify_release(linked, "v1.40", release_commit)
+
+
+def test_release_rejects_repository_path_symlink(
+    release_repo: tuple[Path, Path, str], tmp_path: Path
+) -> None:
+    repo, _, release_commit = release_repo
+    linked_path = tmp_path / "repository-link"
+    linked_path.symlink_to(repo, target_is_directory=True)
+
+    with pytest.raises(ReleaseVerificationError, match="repository layout"):
+        verify_release(linked_path, "v1.40", release_commit)
+
+
+def test_release_rejects_repository_path_symlink_before_parent_traversal(
+    release_repo: tuple[Path, Path, str], tmp_path: Path
+) -> None:
+    repo, _, release_commit = release_repo
+    linked_path = tmp_path / "repository-link"
+    linked_path.symlink_to(repo, target_is_directory=True)
+    traversal = linked_path / ".." / repo.name
+
+    with pytest.raises(ReleaseVerificationError, match="repository layout"):
+        verify_release(traversal, "v1.40", release_commit)
+
+
+def test_packed_refs_fifo_fails_without_blocking(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, _ = release_repo
+    expected = git(repo, "rev-parse", "refs/tags/v1.40")
+    git(repo, "pack-refs", "--all")
+    packed = common_git_dir(repo) / "packed-refs"
+    packed.unlink()
+    os.mkfifo(packed)
+    program = """
+from pathlib import Path
+import sys
+from scripts.verify_workflow_release import ReleaseVerificationError, read_tag_oid
+try:
+    read_tag_oid(Path(sys.argv[1]), "v1.40")
+except ReleaseVerificationError:
+    raise SystemExit(0)
+raise SystemExit(3)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(repo)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=2,
+    )
+
+    assert result.returncode == 0, (expected, result.stdout, result.stderr)
+
+
+def test_read_tag_oid_accepts_normal_packed_refs_and_rejects_duplicate(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, _ = release_repo
+    expected = git(repo, "rev-parse", "refs/tags/v1.40")
+    git(repo, "pack-refs", "--all")
+    packed = common_git_dir(repo) / "packed-refs"
+    assert not (common_git_dir(repo) / "refs/tags/v1.40").exists()
+    assert release_verifier.read_tag_oid(repo, "v1.40") == expected
+
+    with packed.open("a", encoding="ascii") as handle:
+        handle.write(f"{'0' * 40} refs/tags/v1.40\n")
+    with pytest.raises(ReleaseVerificationError, match="identity is unavailable"):
+        release_verifier.read_tag_oid(repo, "v1.40")
+
+
+@pytest.mark.parametrize("kind", ("symlink", "oversize", "hardlink"))
+def test_read_tag_oid_rejects_ambiguous_packed_refs_storage(
+    release_repo: tuple[Path, Path, str], tmp_path: Path, kind: str
+) -> None:
+    repo, _, _ = release_repo
+    git(repo, "pack-refs", "--all")
+    packed = common_git_dir(repo) / "packed-refs"
+    if kind == "symlink":
+        external = tmp_path / "external-packed-refs"
+        packed.rename(external)
+        packed.symlink_to(external)
+    elif kind == "oversize":
+        with packed.open("wb") as handle:
+            handle.truncate(16 * 1024 * 1024 + 1)
+    else:
+        os.link(packed, tmp_path / "packed-refs-hardlink")
+
+    with pytest.raises(ReleaseVerificationError, match="identity is unavailable"):
+        release_verifier.read_tag_oid(repo, "v1.40")
+
+
+def test_direct_git_config_reader_rejects_hardlink_ambiguity(
+    release_repo: tuple[Path, Path, str], tmp_path: Path
+) -> None:
+    repo, _, _ = release_repo
+    git(repo, "remote", "set-url", "origin", CANONICAL_REMOTE)
+    config = common_git_dir(repo) / "config"
+    os.link(config, tmp_path / "config-hardlink")
+
+    with pytest.raises(ReleaseVerificationError, match="canonical public HTTPS"):
+        release_verifier._canonical_remote_url(repo, "origin")
+
+
+def test_safe_metadata_reader_reconstructs_short_reads_and_checks_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "metadata"
+    payload = b"0123456789abcdef\n"
+    path.write_bytes(payload)
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_read = os.read
+
+    def short_read(descriptor: int, maximum: int) -> bytes:
+        return original_read(descriptor, min(maximum, 3))
+
+    monkeypatch.setattr(release_verifier.os, "read", short_read)
+    try:
+        assert release_verifier._read_metadata_at(
+            directory_fd,
+            path.name,
+            maximum=4096,
+            expected_uid=os.geteuid(),
+        ) == payload
+        with pytest.raises(ReleaseVerificationError, match="repository metadata"):
+            release_verifier._read_metadata_at(
+                directory_fd,
+                path.name,
+                maximum=4096,
+                expected_uid=os.geteuid() + 1,
+            )
+    finally:
+        os.close(directory_fd)
+
+
+def test_safe_metadata_reader_rejects_same_size_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "metadata"
+    payload = b"a" * (128 * 1024)
+    path.write_bytes(payload)
+    old = 1_600_000_000_000_000_000
+    os.utime(path, ns=(old, old))
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_read = os.read
+    reads = 0
+
+    def racing_read(descriptor: int, maximum: int) -> bytes:
+        nonlocal reads
+        value = original_read(descriptor, min(maximum, 64 * 1024))
+        reads += 1
+        if reads == 1:
+            with path.open("r+b") as handle:
+                handle.seek(len(payload) - 1)
+                handle.write(b"b")
+        return value
+
+    monkeypatch.setattr(release_verifier.os, "read", racing_read)
+    try:
+        with pytest.raises(ReleaseVerificationError, match="repository metadata"):
+            release_verifier._read_metadata_at(
+                directory_fd,
+                path.name,
+                maximum=len(payload),
+                expected_uid=os.geteuid(),
+            )
+    finally:
+        os.close(directory_fd)
+
+
+def test_commit_gate_rejects_action_file_replaced_by_directory_and_dummy_blob(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, _ = release_repo
+    action = repo / ".github/actions/setup-gemini-auth/action.yml"
+    action.unlink()
+    action.mkdir()
+    (action / "dummy").write_text("not a composite action\n", encoding="utf-8")
+    bad_commit = commit(repo, "replace setup action with directory")
+
+    with pytest.raises(ReleaseVerificationError, match="release inventory"):
+        release_verifier.verify_commit_content(repo, "v1.41", bad_commit)
+
+
+def test_commit_gate_verifies_setup_gemini_auth_action_contract(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, _ = release_repo
+    action = repo / ".github/actions/setup-gemini-auth/action.yml"
+    replace(
+        action,
+        "actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b",
+        "actions/create-github-app-token@main",
+    )
+    bad_commit = commit(repo, "weaken setup action pin")
+
+    with pytest.raises(ReleaseVerificationError, match="setup-gemini-auth"):
+        release_verifier.verify_commit_content(repo, "v1.41", bad_commit)
 
 
 def test_commit_only_cli_verifies_content_before_a_release_tag_exists(
