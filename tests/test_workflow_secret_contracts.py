@@ -14,42 +14,22 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 EXPECTED_REQUIRED = {
     "claude-code-review.yml": {"CLAUDE_CODE_OAUTH_TOKEN": True},
     "claude.yml": {"CLAUDE_CODE_OAUTH_TOKEN": True},
-    "gemini-auto-review.yml": {"GEMINI_API_KEY": True},
-    "gemini-chat.yml": {
-        "APP_PRIVATE_KEY": False,
-        "GEMINI_API_KEY": False,
-        "GOOGLE_API_KEY": False,
-    },
-    "gemini-dispatch.yml": {
-        "APP_PRIVATE_KEY": False,
-        "GEMINI_API_KEY": False,
-        "GOOGLE_API_KEY": False,
-    },
-    "gemini-invoke.yml": {
-        "APP_PRIVATE_KEY": False,
-        "GEMINI_API_KEY": False,
-        "GOOGLE_API_KEY": False,
-    },
-    "gemini-review.yml": {
-        "APP_PRIVATE_KEY": False,
-        "GEMINI_API_KEY": False,
-        "GOOGLE_API_KEY": False,
-    },
+    "gemini-auto-review.yml": {"APP_PRIVATE_KEY": False, "GEMINI_API_KEY": True},
+    "gemini-chat.yml": {"APP_PRIVATE_KEY": False, "GEMINI_API_KEY": True},
+    "gemini-dispatch.yml": {"APP_PRIVATE_KEY": False, "GEMINI_API_KEY": True},
+    "gemini-invoke.yml": {"APP_PRIVATE_KEY": False, "GEMINI_API_KEY": True},
+    "gemini-review.yml": {"APP_PRIVATE_KEY": False, "GEMINI_API_KEY": True},
     "gemini-scheduled-triage.yml": {
         "APP_PRIVATE_KEY": False,
-        "GEMINI_API_KEY": False,
-        "GOOGLE_API_KEY": False,
+        "GEMINI_API_KEY": True,
     },
-    "gemini-triage.yml": {
-        "APP_PRIVATE_KEY": False,
-        "GEMINI_API_KEY": False,
-        "GOOGLE_API_KEY": False,
-    },
+    "gemini-triage.yml": {"APP_PRIVATE_KEY": False, "GEMINI_API_KEY": True},
     "opencode-auto-review.yml": {"ZHIPU_API_KEY": True},
     "opencode.yml": {"ZHIPU_API_KEY": True},
 }
 
-APP_TOKEN_WORKFLOWS = {
+GEMINI_WORKFLOWS = {
+    "gemini-auto-review.yml",
     "gemini-chat.yml",
     "gemini-dispatch.yml",
     "gemini-invoke.yml",
@@ -57,6 +37,10 @@ APP_TOKEN_WORKFLOWS = {
     "gemini-scheduled-triage.yml",
     "gemini-triage.yml",
 }
+SETUP_AUTH = (
+    "jhw7500/automation/.github/actions/setup-gemini-auth@"
+    "2254f13aab44585c78954d20749f4fb677a8c2f1"
+)
 
 
 def load_workflow(path: Path) -> dict:
@@ -167,17 +151,52 @@ class WorkflowSecretContractsTest(unittest.TestCase):
         )
         self.assertNotIn("id-token", job["permissions"])
 
-    def test_app_token_workflows_accept_an_explicit_app_id_with_legacy_fallback(self) -> None:
-        for filename in APP_TOKEN_WORKFLOWS:
+    def test_gemini_contract_is_api_key_only_and_mode_explicit(self) -> None:
+        for filename in GEMINI_WORKFLOWS:
             with self.subTest(workflow=filename):
                 path = WORKFLOWS / filename
                 workflow = load_workflow(path)
-                app_id = workflow["on"]["workflow_call"]["inputs"]["app_id"]
-                self.assertEqual("string", app_id["type"])
-                self.assertEqual("false", app_id["required"])
-                self.assertEqual("", app_id["default"])
+                call = workflow["on"]["workflow_call"]
+                self.assertEqual(
+                    {
+                        "description": (
+                            "Repository write authentication: github_app or github_token"
+                        ),
+                        "type": "string",
+                        "required": "true",
+                    },
+                    call["inputs"]["repo_write_auth"],
+                )
+                self.assertEqual("false", call["inputs"]["app_id"]["required"])
+                self.assertEqual(
+                    {"APP_PRIVATE_KEY", "GEMINI_API_KEY"}, set(call["secrets"])
+                )
+                self.assertEqual(
+                    "false", call["secrets"]["APP_PRIVATE_KEY"]["required"]
+                )
+                self.assertEqual("true", call["secrets"]["GEMINI_API_KEY"]["required"])
                 text = path.read_text(encoding="utf-8")
-                self.assertIn("inputs.app_id || vars.APP_ID", text)
+                self.assertNotIn("GOOGLE_API_KEY", text)
+                self.assertNotIn("vars.APP_ID", text)
+                self.assertNotIn("id-token:", text)
+                self.assertIn(SETUP_AUTH, text)
+
+                auth_steps = [
+                    step
+                    for job in workflow["jobs"].values()
+                    for step in job.get("steps", [])
+                    if "setup-gemini-auth" in step.get("uses", "")
+                ]
+                self.assertTrue(auth_steps)
+                for step in auth_steps:
+                    self.assertEqual(
+                        {
+                            "app-id": "${{ inputs.repo_write_auth == 'github_app' && inputs.app_id || '' }}",
+                            "private-key": "${{ inputs.repo_write_auth == 'github_app' && secrets.APP_PRIVATE_KEY || '' }}",
+                            "fallback-token": "${{ inputs.repo_write_auth == 'github_token' && github.token || '' }}",
+                        },
+                        step["with"],
+                    )
 
     def test_auto_rereview_gh_cli_has_repository_context_without_checkout(self) -> None:
         workflow = load_workflow(WORKFLOWS / "auto-rereview-request.yml")
