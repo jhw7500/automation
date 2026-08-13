@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tarfile
 import traceback
+import zlib
 
 import pytest
 
@@ -43,6 +44,24 @@ def commit(repo: Path, message: str) -> str:
 def common_git_dir(repo: Path) -> Path:
     value = Path(git(repo, "rev-parse", "--git-common-dir"))
     return value if value.is_absolute() else (repo / value).resolve()
+
+
+def raw_git_object(repo: Path, kind: str, oid: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(repo), "cat-file", kind, oid],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+
+
+def replace_loose_object_payload(
+    repo: Path, oid: str, kind: str, payload: bytes
+) -> None:
+    object_path = common_git_dir(repo) / "objects" / oid[:2] / oid[2:]
+    assert object_path.is_file(), f"expected loose test object: {oid}"
+    header = f"{kind} {len(payload)}\0".encode("ascii")
+    object_path.chmod(0o600)
+    object_path.write_bytes(zlib.compress(header + payload))
 
 
 def install_local_release_filter_attack(
@@ -127,23 +146,55 @@ def archive_with(member: tarfile.TarInfo, payload: bytes = b"bad") -> bytes:
     return stream.getvalue()
 
 
-def test_release_archive_uses_only_raw_tree_and_blob_reads(
+def test_release_archive_uses_only_authenticated_tree_and_blob_reads(
     release_repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo, release_commit = release_repo
-    original = release_bundle.git_bytes
-    calls: list[tuple[str, ...]] = []
+    original = release_verifier.subprocess.run
 
-    def observed(repository: Path, *args: str) -> bytes:
-        calls.append(args)
-        return original(repository, *args)
+    def authenticated_only(args, **kwargs):
+        if args[0] == "/usr/bin/git":
+            assert args[1:] == ["cat-file", "--batch"]
+        return original(args, **kwargs)
 
-    monkeypatch.setattr(release_bundle, "git_bytes", observed)
+    monkeypatch.setattr(release_verifier.subprocess, "run", authenticated_only)
 
     assert release_bundle._git_archive(repo, release_commit)
-    assert calls[0][0] == "ls-tree"
-    assert all(call[0] in {"ls-tree", "cat-file"} for call in calls)
-    assert all("archive" not in call for call in calls)
+
+
+def test_release_archive_rejects_semantically_valid_blob_at_wrong_object_name(
+    release_repo: tuple[Path, str],
+) -> None:
+    repo, release_commit = release_repo
+    path = ".github/workflows/claude.yml"
+    oid = git(repo, "rev-parse", f"{release_commit}:{path}")
+    payload = raw_git_object(repo, "blob", oid) + b"\n# checksum mismatch\n"
+    replace_loose_object_payload(repo, oid, "blob", payload)
+
+    with pytest.raises(ReleaseVerificationError, match="archive verified release"):
+        release_bundle._git_archive(repo, release_commit)
+
+
+@pytest.mark.parametrize("layout", ("loose", "packed", "linked"))
+def test_authenticated_release_archive_supports_normal_storage_layouts(
+    release_repo: tuple[Path, str], tmp_path: Path, layout: str
+) -> None:
+    repo, release_commit = release_repo
+    checkout = repo
+    if layout == "packed":
+        git(repo, "repack", "-ad")
+        git(repo, "prune-packed")
+        assert not (
+            common_git_dir(repo)
+            / "objects"
+            / release_commit[:2]
+            / release_commit[2:]
+        ).exists()
+    elif layout == "linked":
+        checkout = tmp_path / "linked-authenticated-archive"
+        git(repo, "worktree", "add", "--detach", str(checkout), release_commit)
+
+    assert release_bundle._git_archive(checkout, release_commit)
 
 
 @pytest.mark.parametrize(
@@ -189,18 +240,18 @@ def test_release_archive_rejects_lexical_parent_descendant(
 ) -> None:
     repo, release_commit = release_repo
     oid = "f" * 40
-    original = release_bundle.git_bytes
+    original = release_verifier.VerifiedCommitTree.listing
 
-    def malicious_listing(repository: Path, *args: str) -> bytes:
-        if args[:1] == ("ls-tree",):
-            return original(repository, *args) + (
-                f"100644 blob {oid}\t.github/workflows/../escape\0".encode()
-            )
-        if args == ("cat-file", "blob", oid):
-            return b"escaped\n"
-        return original(repository, *args)
+    def malicious_listing(
+        tree: release_verifier.VerifiedCommitTree, paths: object
+    ) -> bytes:
+        return original(tree, paths) + (
+            f"100644 blob {oid}\t.github/workflows/../escape\0".encode()
+        )
 
-    monkeypatch.setattr(release_bundle, "git_bytes", malicious_listing)
+    monkeypatch.setattr(
+        release_verifier.VerifiedCommitTree, "listing", malicious_listing
+    )
 
     with pytest.raises(ReleaseVerificationError, match="archive verified release"):
         release_bundle._git_archive(repo, release_commit)
@@ -325,7 +376,7 @@ def test_release_archive_failure_does_not_expose_child_or_provider_data(
     def child(_repo: Path, *_args: str) -> bytes:
         raise ReleaseVerificationError(f"{provider} {raw}")
 
-    monkeypatch.setattr(release_bundle, "git_bytes", child)
+    monkeypatch.setattr(release_verifier, "read_git_object", child)
     with pytest.raises(ReleaseVerificationError) as raised:
         release_bundle._git_archive(repo, raw)
 
@@ -407,17 +458,17 @@ def test_bundle_rejects_tag_changed_during_verification(
 ) -> None:
     repo, _ = release_repo
     alternate = alternate_tag_object(repo)
-    original_git = release_verifier.git
+    original_read = release_verifier.read_git_object
     moved = False
 
-    def racing_git(repository: Path, *args: str) -> str:
+    def racing_read(repository: Path, oid: str, expected_type: str) -> bytes:
         nonlocal moved
-        if not moved and args[:1] in {("show",), ("ls-tree",)}:
+        if not moved and expected_type == "tree":
             git(repository, "update-ref", "refs/tags/v1.40", alternate)
             moved = True
-        return original_git(repository, *args)
+        return original_read(repository, oid, expected_type)
 
-    monkeypatch.setattr(release_verifier, "git", racing_git)
+    monkeypatch.setattr(release_verifier, "read_git_object", racing_read)
     with pytest.raises(ReleaseVerificationError, match="changed during verification"):
         with materialize_release_bundle(repo, "v1.40", remote=None):
             pass
@@ -429,39 +480,54 @@ def test_bundle_binds_content_and_archive_across_aba_tag_movement(
     repo, release_commit = release_repo
     original_tag = git(repo, "rev-parse", "refs/tags/v1.40")
     alternate = alternate_tag_object(repo)
-    original_git = release_verifier.git
+    original_read = release_verifier.read_git_object
     original_archive = release_bundle._git_archive
     movements = 0
-    content_revisions: list[str] = []
+    opened_revisions: list[str] = []
     archive_revisions: list[str] = []
 
-    def racing_git(repository: Path, *args: str) -> str:
+    def racing_read(repository: Path, oid: str, expected_type: str) -> bytes:
         nonlocal movements
-        if args[:1] in {("show",), ("ls-tree",)}:
+        if expected_type in {"tree", "blob"}:
             if movements == 0:
                 git(repository, "update-ref", "refs/tags/v1.40", alternate)
                 movements = 1
             elif movements == 1:
                 git(repository, "update-ref", "refs/tags/v1.40", original_tag)
                 movements = 2
-            revision = (
-                args[1].split(":", 1)[0]
-                if args[0] == "show"
-                else args[-2]
-            )
-            content_revisions.append(revision)
-        return original_git(repository, *args)
+        return original_read(repository, oid, expected_type)
 
-    def capture_archive(automation: Path, revision: str) -> bytes:
+    original_open = release_verifier.VerifiedCommitTree.open.__func__
+
+    def capture_open(
+        cls: type[release_verifier.VerifiedCommitTree],
+        repository: Path,
+        revision: str,
+    ) -> release_verifier.VerifiedCommitTree:
+        opened_revisions.append(revision)
+        return original_open(cls, repository, revision)
+
+    def capture_archive(
+        automation: Path,
+        revision: str,
+        *,
+        tree: release_verifier.VerifiedCommitTree | None = None,
+    ) -> bytes:
         archive_revisions.append(revision)
-        return original_archive(automation, revision)
+        assert tree is not None
+        return original_archive(automation, revision, tree=tree)
 
-    monkeypatch.setattr(release_verifier, "git", racing_git)
+    monkeypatch.setattr(release_verifier, "read_git_object", racing_read)
+    monkeypatch.setattr(
+        release_verifier.VerifiedCommitTree,
+        "open",
+        classmethod(capture_open),
+    )
     monkeypatch.setattr(release_bundle, "_git_archive", capture_archive)
     with materialize_release_bundle(repo, "v1.40", remote=None) as bundle:
         assert bundle.commit == release_commit
     assert movements == 2
-    assert set(content_revisions) == {release_commit}
+    assert opened_revisions == [release_commit]
     assert archive_revisions == [release_commit]
 
 
@@ -538,7 +604,7 @@ def test_bundle_rejects_unsafe_archive_members(
     malicious = archive_with(member)
     monkeypatch.setattr(
         "scripts.workflow_release_bundle._git_archive",
-        lambda automation, ref: malicious,
+        lambda automation, ref, **_kwargs: malicious,
     )
 
     with pytest.raises(ReleaseVerificationError, match="unsafe archive member"):

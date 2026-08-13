@@ -14,8 +14,8 @@ from typing import Iterator
 from scripts.verify_workflow_release import (
     AnnotatedTag,
     ReleaseVerificationError,
+    VerifiedCommitTree,
     assert_tag_unchanged,
-    git_bytes,
     resolve_annotated_tag,
     verify_remote_tag,
     verify_tag_content,
@@ -49,25 +49,23 @@ def _release_owned(path: PurePosixPath, *, directory: bool) -> bool:
     return release_directory(path) if directory else bool(release_file_modes(path))
 
 
-def _build_git_archive(automation: Path, revision: str) -> bytes:
-    listing = git_bytes(
-        automation,
-        "ls-tree",
-        "-r",
-        "-z",
-        "--full-tree",
-        revision,
-        "--",
-        *RELEASE_PATHS,
-    )
-    entries = validate_release_listing(listing)
+def _build_git_archive(
+    automation: Path,
+    revision: str,
+    *,
+    tree: VerifiedCommitTree | None = None,
+) -> bytes:
+    verified = tree if tree is not None else VerifiedCommitTree.open(automation, revision)
+    if verified.commit != revision:
+        raise ReleaseVerificationError("unable to archive verified release")
+    entries = validate_release_listing(verified.listing(RELEASE_PATHS))
 
     output = BytesIO()
     with tarfile.open(
         fileobj=output, mode="w", format=tarfile.USTAR_FORMAT
     ) as archive:
         for entry in sorted(entries, key=lambda item: str(item.path)):
-            payload = git_bytes(automation, "cat-file", "blob", entry.oid)
+            payload = verified.reader.read(entry.oid, "blob")
             member = tarfile.TarInfo(str(entry.path))
             member.size = len(payload)
             member.mode = entry.archive_mode
@@ -80,10 +78,15 @@ def _build_git_archive(automation: Path, revision: str) -> bytes:
     return output.getvalue()
 
 
-def _git_archive(automation: Path, revision: str) -> bytes:
+def _git_archive(
+    automation: Path,
+    revision: str,
+    *,
+    tree: VerifiedCommitTree | None = None,
+) -> bytes:
     archive: bytes | None = None
     try:
-        archive = _build_git_archive(automation, revision)
+        archive = _build_git_archive(automation, revision, tree=tree)
     except (OSError, UnicodeDecodeError, ValueError, ReleaseVerificationError):
         pass
     if archive is None:
@@ -138,11 +141,13 @@ def _materialize(
     tag: AnnotatedTag = resolve_annotated_tag(automation, ref)
     if remote is not None:
         verify_remote_tag(automation, remote, tag)
-    verify_tag_content(automation, ref, tag=tag)
+    verified_tree = verify_tag_content(automation, ref, tag=tag)
 
     with tempfile.TemporaryDirectory(prefix="workflow-release-") as temporary:
         root = Path(temporary)
-        _extract_archive(_git_archive(automation, tag.commit), root)
+        _extract_archive(
+            _git_archive(automation, tag.commit, tree=verified_tree), root
+        )
         try:
             catalog = load_catalog(root)
             config = load_fleet_config(root, catalog)

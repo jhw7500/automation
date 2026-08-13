@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import traceback
+import zlib
 
 import pytest
 import yaml
@@ -117,6 +118,24 @@ def common_git_dir(repo: Path) -> Path:
     return value if value.is_absolute() else (repo / value).resolve()
 
 
+def raw_git_object(repo: Path, kind: str, oid: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(repo), "cat-file", kind, oid],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+
+
+def replace_loose_object_payload(
+    repo: Path, oid: str, kind: str, payload: bytes
+) -> None:
+    object_path = common_git_dir(repo) / "objects" / oid[:2] / oid[2:]
+    assert object_path.is_file(), f"expected loose test object: {oid}"
+    header = f"{kind} {len(payload)}\0".encode("ascii")
+    object_path.chmod(0o600)
+    object_path.write_bytes(zlib.compress(header + payload))
+
+
 def install_local_release_filter_attack(
     repo: Path, tmp_path: Path, *, target: str
 ) -> tuple[Path, bytes]:
@@ -199,14 +218,14 @@ def test_release_verifier_git_uses_a_minimal_provider_free_environment(
         return subprocess.CompletedProcess(args, 0, stdout=b"ok\n", stderr=b"")
 
     monkeypatch.setattr(release_verifier.subprocess, "run", child)
-    assert release_verifier.git(repo, "cat-file", "-t", release_commit) == "ok\n"
+    assert release_verifier._git_object_frame(repo, release_commit) == b"ok\n"
 
     assert observed["args"] == [
         "/usr/bin/git",
         "cat-file",
-        "-t",
-        release_commit,
+        "--batch",
     ]
+    assert observed["input"] == f"{release_commit}\n".encode("ascii")
     assert observed["cwd"] == "/"
     env = observed["env"]
     assert isinstance(env, dict)
@@ -261,6 +280,133 @@ def test_release_verification_ignores_replace_ref_payload(
     assert tag.tag_object == tag_object
     assert tag.commit == release_commit
     assert verify_release(repo, "v1.40", release_commit) == release_commit
+
+
+@pytest.mark.parametrize("kind", ("tag", "commit", "tree", "blob"))
+def test_verified_object_reader_rejects_checksum_mismatch_for_each_object_type(
+    release_repo: tuple[Path, Path, str], kind: str
+) -> None:
+    repo, _, release_commit = release_repo
+    oid = {
+        "tag": git(repo, "rev-parse", "refs/tags/v1.40"),
+        "commit": release_commit,
+        "tree": git(repo, "rev-parse", f"{release_commit}^{{tree}}"),
+        "blob": git(
+            repo,
+            "rev-parse",
+            f"{release_commit}:.github/workflows/claude.yml",
+        ),
+    }[kind]
+    payload = raw_git_object(repo, kind, oid) + b"checksum-mismatch"
+    replace_loose_object_payload(repo, oid, kind, payload)
+
+    with pytest.raises(
+        ReleaseVerificationError, match="Git object is invalid"
+    ) as raised:
+        release_verifier.read_git_object(repo, oid, kind)
+    rendered = "".join(
+        traceback.format_exception(
+            type(raised.value), raised.value, raised.value.__traceback__
+        )
+    )
+    assert "checksum-mismatch" not in rendered
+
+
+def test_verified_object_reader_rejects_an_authentic_object_of_the_wrong_type(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, release_commit = release_repo
+    blob = git(
+        repo,
+        "rev-parse",
+        f"{release_commit}:.github/workflows/claude.yml",
+    )
+
+    with pytest.raises(ReleaseVerificationError, match="Git object is invalid"):
+        release_verifier.read_git_object(repo, blob, "tree")
+
+
+def test_binary_tree_parser_rejects_noncanonical_git_entry_order() -> None:
+    later = b"40000 foo\0" + bytes.fromhex("11" * 20)
+    earlier = b"100644 foo.bar\0" + bytes.fromhex("22" * 20)
+
+    with pytest.raises(ReleaseVerificationError, match="Git tree is invalid"):
+        release_verifier._parse_tree(later + earlier)
+
+
+def test_release_verifier_rejects_semantically_valid_blob_at_wrong_object_name(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, release_commit = release_repo
+    path = ".github/workflows/claude.yml"
+    oid = git(repo, "rev-parse", f"{release_commit}:{path}")
+    payload = raw_git_object(repo, "blob", oid) + b"\n# checksum mismatch\n"
+    replace_loose_object_payload(repo, oid, "blob", payload)
+
+    with pytest.raises(ReleaseVerificationError):
+        verify_release(repo, "v1.40", release_commit)
+
+
+def test_release_inventory_authenticates_even_nonsemantic_owned_blob_payloads(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, _ = release_repo
+    unparsed = repo / ".github/workflows/release-note.txt"
+    unparsed.write_text("release note\n", encoding="utf-8")
+    release_commit = commit(repo, "release with nonsemantic owned blob")
+    git(repo, "tag", "-a", "v1.41", "-m", "v1.41")
+    oid = git(repo, "rev-parse", f"{release_commit}:.github/workflows/release-note.txt")
+    replace_loose_object_payload(repo, oid, "blob", b"forged release note\n")
+
+    with pytest.raises(ReleaseVerificationError, match="release inventory"):
+        verify_release(repo, "v1.41", release_commit)
+
+
+def test_release_verifier_never_uses_unverified_show_or_ls_tree_content(
+    release_repo: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, release_commit = release_repo
+    original = release_verifier.subprocess.run
+
+    def authenticated_only(args, **kwargs):
+        if args[0] == "/usr/bin/git":
+            assert args[1:] == ["cat-file", "--batch"]
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(release_verifier.subprocess, "run", authenticated_only)
+
+    assert verify_release(repo, "v1.40", release_commit) == release_commit
+
+
+@pytest.mark.parametrize("layout", ("loose", "packed", "linked"))
+def test_authenticated_release_objects_support_normal_storage_layouts(
+    release_repo: tuple[Path, Path, str], tmp_path: Path, layout: str
+) -> None:
+    repo, _, release_commit = release_repo
+    checkout = repo
+    if layout == "packed":
+        git(repo, "repack", "-ad")
+        git(repo, "prune-packed")
+        assert not (
+            common_git_dir(repo)
+            / "objects"
+            / release_commit[:2]
+            / release_commit[2:]
+        ).exists()
+    elif layout == "linked":
+        checkout = tmp_path / "linked-authenticated-release"
+        git(repo, "worktree", "add", "--detach", str(checkout), release_commit)
+
+    assert verify_release(checkout, "v1.40", release_commit) == release_commit
+
+
+def test_actual_current_commit_only_uses_authenticated_objects() -> None:
+    current = git(ROOT, "rev-parse", "HEAD")
+
+    assert (
+        release_verifier.verify_commit_content(ROOT, "v1.40", current)
+        == current
+    )
 
 
 def test_release_verifier_preserves_pre_inventory_v139_contract(
@@ -902,7 +1048,7 @@ def test_release_verifier_git_failure_does_not_expose_child_or_provider_data(
 
     monkeypatch.setattr(release_verifier.subprocess, "run", child)
     with pytest.raises(ReleaseVerificationError) as raised:
-        release_verifier.git(repo, "show", raw)
+        release_verifier.read_git_object(repo, "f" * 40, "blob")
 
     rendered = "".join(
         traceback.format_exception(
@@ -1139,6 +1285,16 @@ def test_rejects_lightweight_release_tag(
         verify_release(repo, "v1.41", release_commit)
 
 
+def test_release_requires_an_annotated_tag_to_link_directly_to_a_commit(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, release_commit = release_repo
+    git(repo, "tag", "-a", "v1.41", "v1.40", "-m", "v1.41")
+
+    with pytest.raises(ReleaseVerificationError, match="annotated tag"):
+        verify_release(repo, "v1.41", release_commit)
+
+
 def test_rejects_tag_that_does_not_point_at_expected_commit(
     release_repo: tuple[Path, Path, str],
 ) -> None:
@@ -1170,17 +1326,17 @@ def test_verify_release_rejects_one_way_tag_movement_during_content_reads(
 ) -> None:
     repo, _, release_commit = release_repo
     alternate = alternate_tag_object(repo)
-    original_git = release_verifier.git
+    original_read = release_verifier.read_git_object
     moved = False
 
-    def racing_git(repository: Path, *args: str) -> str:
+    def racing_read(repository: Path, oid: str, expected_type: str) -> bytes:
         nonlocal moved
-        if not moved and args[:1] in {("show",), ("ls-tree",)}:
+        if not moved and expected_type == "tree":
             git(repository, "update-ref", "refs/tags/v1.40", alternate)
             moved = True
-        return original_git(repository, *args)
+        return original_read(repository, oid, expected_type)
 
-    monkeypatch.setattr(release_verifier, "git", racing_git)
+    monkeypatch.setattr(release_verifier, "read_git_object", racing_read)
     with pytest.raises(ReleaseVerificationError, match="changed during verification"):
         verify_release(repo, "v1.40", release_commit)
 
@@ -1191,31 +1347,40 @@ def test_verify_release_binds_every_content_read_across_aba_tag_movement(
     repo, _, release_commit = release_repo
     original_tag = git(repo, "rev-parse", "refs/tags/v1.40")
     alternate = alternate_tag_object(repo)
-    original_git = release_verifier.git
+    original_read = release_verifier.read_git_object
     movements = 0
-    content_revisions: list[str] = []
+    opened_revisions: list[str] = []
 
-    def racing_git(repository: Path, *args: str) -> str:
+    def racing_read(repository: Path, oid: str, expected_type: str) -> bytes:
         nonlocal movements
-        if args[:1] in {("show",), ("ls-tree",)}:
+        if expected_type in {"tree", "blob"}:
             if movements == 0:
                 git(repository, "update-ref", "refs/tags/v1.40", alternate)
                 movements = 1
             elif movements == 1:
                 git(repository, "update-ref", "refs/tags/v1.40", original_tag)
                 movements = 2
-            revision = (
-                args[1].split(":", 1)[0]
-                if args[0] == "show"
-                else args[-2]
-            )
-            content_revisions.append(revision)
-        return original_git(repository, *args)
+        return original_read(repository, oid, expected_type)
 
-    monkeypatch.setattr(release_verifier, "git", racing_git)
+    original_open = release_verifier.VerifiedCommitTree.open.__func__
+
+    def capture_open(
+        cls: type[release_verifier.VerifiedCommitTree],
+        repository: Path,
+        revision: str,
+    ) -> release_verifier.VerifiedCommitTree:
+        opened_revisions.append(revision)
+        return original_open(cls, repository, revision)
+
+    monkeypatch.setattr(release_verifier, "read_git_object", racing_read)
+    monkeypatch.setattr(
+        release_verifier.VerifiedCommitTree,
+        "open",
+        classmethod(capture_open),
+    )
     assert verify_release(repo, "v1.40", release_commit) == release_commit
     assert movements == 2
-    assert set(content_revisions) == {release_commit}
+    assert opened_revisions == [release_commit]
 
 
 @pytest.mark.parametrize(

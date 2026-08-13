@@ -5,17 +5,17 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
 import sys
 import tempfile
-from typing import Iterator
+from typing import Iterable, Iterator
 
 import yaml
 
@@ -638,34 +638,261 @@ def remote_git_env() -> dict[str, str]:
     }
 
 
-def git_bytes(repo: Path, *args: str) -> bytes:
+def _git_object_frame(repo: Path, oid: str) -> bytes:
     result: subprocess.CompletedProcess[bytes] | None = None
     try:
         with _raw_git_environment(repo) as (environment, pass_fds):
             result = subprocess.run(
-                [GIT_EXECUTABLE, *args],
+                [GIT_EXECUTABLE, "cat-file", "--batch"],
                 cwd="/",
+                input=f"{oid}\n".encode("ascii"),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=environment,
                 pass_fds=pass_fds,
             )
-    except (OSError, ValueError):
+    except (OSError, UnicodeEncodeError, ValueError):
         pass
-    if result is None:
-        raise ReleaseVerificationError("Git command failed (rc=unavailable)") from None
-    if result.returncode != 0:
-        raise ReleaseVerificationError(
-            f"Git command failed (rc={result.returncode})"
-        ) from None
+    if result is None or result.returncode != 0:
+        raise ReleaseVerificationError("Git object is invalid") from None
     return result.stdout
 
 
-def git(repo: Path, *args: str) -> str:
+def read_git_object(repo: Path, oid: str, expected_type: str) -> bytes:
+    """Return one object only after authenticating its standard Git SHA-1 name."""
+
+    if not _valid_oid(oid) or expected_type not in {"tag", "commit", "tree", "blob"}:
+        raise ReleaseVerificationError("Git object is invalid")
     try:
-        return git_bytes(repo, *args).decode("utf-8")
+        header, separator, framed = _git_object_frame(repo, oid).partition(b"\n")
+        raw_oid, raw_type, raw_size = header.split(b" ")
+        object_oid = raw_oid.decode("ascii")
+        object_type = raw_type.decode("ascii")
+        rendered_size = raw_size.decode("ascii")
+        if (
+            separator != b"\n"
+            or object_oid != oid
+            or object_type != expected_type
+            or re.fullmatch(r"0|[1-9][0-9]*", rendered_size) is None
+        ):
+            raise ValueError
+        size = int(rendered_size)
+        if len(framed) != size + 1 or framed[-1:] != b"\n":
+            raise ValueError
+        payload = framed[:size]
+        digest = hashlib.sha1(
+            f"{object_type} {len(payload)}\0".encode("ascii") + payload
+        ).hexdigest()
+        if digest != oid:
+            raise ValueError
+        return payload
+    except (UnicodeDecodeError, ValueError):
+        raise ReleaseVerificationError("Git object is invalid") from None
+
+
+@dataclass
+class GitObjectReader:
+    """Shared checksum gate for release-owned Git object payloads."""
+
+    repo: Path
+    _cache: dict[tuple[str, str], bytes] = field(default_factory=dict)
+
+    def read(self, oid: str, expected_type: str) -> bytes:
+        key = (oid, expected_type)
+        if key not in self._cache:
+            self._cache[key] = read_git_object(self.repo, oid, expected_type)
+        return self._cache[key]
+
+
+@dataclass(frozen=True)
+class GitTreeEntry:
+    mode: str
+    name: bytes
+    oid: str
+
+    @property
+    def object_type(self) -> str:
+        if self.mode == "40000":
+            return "tree"
+        if self.mode == "160000":
+            return "commit"
+        return "blob"
+
+
+@dataclass(frozen=True)
+class GitTreeFile:
+    path: PurePosixPath
+    mode: str
+    oid: str
+    object_type: str
+
+
+_TREE_ENTRY_MODES = frozenset({"40000", "100644", "100755", "120000", "160000"})
+
+
+def _linked_oid(payload: bytes, prefix: bytes) -> str:
+    first, separator, _remainder = payload.partition(b"\n")
+    if separator != b"\n" or not first.startswith(prefix):
+        raise ReleaseVerificationError("Git object is invalid")
+    try:
+        oid = first.removeprefix(prefix).decode("ascii")
     except UnicodeDecodeError:
-        raise ReleaseVerificationError("Git command returned invalid text") from None
+        raise ReleaseVerificationError("Git object is invalid") from None
+    if not _valid_oid(oid):
+        raise ReleaseVerificationError("Git object is invalid")
+    return oid
+
+
+def _tag_commit_oid(payload: bytes) -> str:
+    """Parse the fail-closed release contract: one annotated tag -> one commit."""
+
+    lines = payload.split(b"\n", 2)
+    if len(lines) < 3 or lines[1] != b"type commit":
+        raise ReleaseVerificationError("Git object is invalid")
+    return _linked_oid(payload, b"object ")
+
+
+def _parse_tree(payload: bytes) -> tuple[GitTreeEntry, ...]:
+    entries: list[GitTreeEntry] = []
+    seen: set[bytes] = set()
+    cursor = 0
+    previous_key: bytes | None = None
+    try:
+        while cursor < len(payload):
+            space = payload.index(b" ", cursor)
+            nul = payload.index(b"\0", space + 1)
+            mode = payload[cursor:space].decode("ascii")
+            name = payload[space + 1 : nul]
+            oid_end = nul + 21
+            ordering_key = name + (b"/" if mode == "40000" else b"\0")
+            if (
+                mode not in _TREE_ENTRY_MODES
+                or not name
+                or name in {b".", b".."}
+                or b"/" in name
+                or name in seen
+                or oid_end > len(payload)
+                or (previous_key is not None and ordering_key <= previous_key)
+            ):
+                raise ValueError
+            oid = payload[nul + 1 : oid_end].hex()
+            if not _valid_oid(oid):
+                raise ValueError
+            seen.add(name)
+            entries.append(GitTreeEntry(mode, name, oid))
+            previous_key = ordering_key
+            cursor = oid_end
+    except (UnicodeDecodeError, ValueError):
+        raise ReleaseVerificationError("Git tree is invalid") from None
+    return tuple(entries)
+
+
+def _release_path(path: str | PurePosixPath) -> PurePosixPath:
+    rendered = str(path)
+    parsed = PurePosixPath(rendered)
+    if (
+        not parsed.parts
+        or parsed.is_absolute()
+        or ".." in parsed.parts
+        or rendered != parsed.as_posix()
+    ):
+        raise ReleaseVerificationError("release path is invalid")
+    return parsed
+
+
+class VerifiedCommitTree:
+    """Python traversal of one authenticated commit and its selected tree paths."""
+
+    def __init__(self, reader: GitObjectReader, commit: str) -> None:
+        self.reader = reader
+        self.commit = commit
+        commit_payload = reader.read(commit, "commit")
+        self.root_oid = _linked_oid(commit_payload, b"tree ")
+        self._trees: dict[str, tuple[GitTreeEntry, ...]] = {}
+        self._entries(self.root_oid)
+
+    @classmethod
+    def open(cls, repo: Path, commit: str) -> VerifiedCommitTree:
+        if not _valid_oid(commit):
+            raise ReleaseVerificationError("commit has an invalid Git identity")
+        return cls(GitObjectReader(repo), commit)
+
+    def _entries(self, oid: str) -> tuple[GitTreeEntry, ...]:
+        if oid not in self._trees:
+            self._trees[oid] = _parse_tree(self.reader.read(oid, "tree"))
+        return self._trees[oid]
+
+    def entry(self, path: str | PurePosixPath) -> GitTreeEntry | None:
+        release_path = _release_path(path)
+        tree_oid = self.root_oid
+        for index, component in enumerate(release_path.parts):
+            raw_component = component.encode("utf-8")
+            entry = next(
+                (
+                    candidate
+                    for candidate in self._entries(tree_oid)
+                    if candidate.name == raw_component
+                ),
+                None,
+            )
+            if entry is None:
+                return None
+            if index == len(release_path.parts) - 1:
+                return entry
+            if entry.object_type != "tree":
+                return None
+            tree_oid = entry.oid
+        return None
+
+    def read_file(self, path: str | PurePosixPath) -> bytes:
+        entry = self.entry(path)
+        if entry is None or entry.object_type != "blob":
+            raise ReleaseVerificationError("release file is unavailable")
+        return self.reader.read(entry.oid, "blob")
+
+    def read_text(self, path: str | PurePosixPath) -> str:
+        try:
+            return self.read_file(path).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ReleaseVerificationError("release file contains invalid text") from None
+
+    def _walk_tree(
+        self, tree_oid: str, parent: PurePosixPath
+    ) -> Iterator[GitTreeFile]:
+        for entry in self._entries(tree_oid):
+            try:
+                component = entry.name.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ReleaseVerificationError("Git tree is invalid") from None
+            path = parent / component
+            if entry.object_type == "tree":
+                yield from self._walk_tree(entry.oid, path)
+            else:
+                yield GitTreeFile(path, entry.mode, entry.oid, entry.object_type)
+
+    def files(self, path: str | PurePosixPath) -> tuple[GitTreeFile, ...]:
+        release_path = _release_path(path)
+        entry = self.entry(release_path)
+        if entry is None:
+            return ()
+        if entry.object_type == "tree":
+            return tuple(self._walk_tree(entry.oid, release_path))
+        return (
+            GitTreeFile(release_path, entry.mode, entry.oid, entry.object_type),
+        )
+
+    def listing(self, paths: Iterable[str | PurePosixPath]) -> bytes:
+        records: list[bytes] = []
+        for path in paths:
+            for entry in self.files(path):
+                kind = entry.object_type
+                mode = "040000" if entry.mode == "40000" else entry.mode
+                records.append(
+                    f"{mode} {kind} {entry.oid}\t{entry.path.as_posix()}\0".encode(
+                        "utf-8"
+                    )
+                )
+        return b"".join(records)
 
 
 def remote_git(url: str, *refs: str) -> str:
@@ -781,20 +1008,21 @@ def read_tag_oid(repo: Path, ref: str) -> str:
 def resolve_commit(repo: Path, revision: str) -> str:
     if not _valid_oid(revision):
         raise ReleaseVerificationError("commit has an invalid Git identity")
-    commit = git(
-        repo, "rev-parse", "--verify", f"{revision}^{{commit}}"
-    ).strip()
-    if not _valid_oid(commit):
-        raise ReleaseVerificationError("commit has an invalid Git identity")
-    return commit
+    try:
+        read_git_object(repo, revision, "commit")
+    except ReleaseVerificationError:
+        raise ReleaseVerificationError("commit has an invalid Git identity") from None
+    return revision
 
 
 def resolve_annotated_tag(repo: Path, ref: str) -> AnnotatedTag:
     tag_object = read_tag_oid(repo, ref)
-    object_type = git(repo, "cat-file", "-t", tag_object).strip()
-    if object_type != "tag":
+    try:
+        payload = read_git_object(repo, tag_object, "tag")
+        commit = _tag_commit_oid(payload)
+        read_git_object(repo, commit, "commit")
+    except ReleaseVerificationError:
         raise ReleaseVerificationError(f"release {ref} must be an annotated tag")
-    commit = resolve_commit(repo, tag_object)
     if not all(_valid_oid(value) for value in (tag_object, commit)):
         raise ReleaseVerificationError(f"release {ref} has an invalid Git identity")
     return AnnotatedTag(ref, tag_object, commit)
@@ -939,14 +1167,14 @@ def verify_opencode_runtime(job: dict, step_name: str, workflow_name: str) -> di
     return run_step
 
 
-def _verify_approved_v140_policy(repo: Path, ref: str, revision: str) -> None:
+def _verify_approved_v140_policy(tree: VerifiedCommitTree, ref: str) -> None:
     if ref != "v1.40":
         return
     digest = hashlib.sha256()
     for path in APPROVED_V140_POLICY_FILES:
         digest.update(path.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(git(repo, "show", f"{revision}:{path}").encode("utf-8"))
+        digest.update(tree.read_file(path))
         digest.update(b"\0")
     if digest.hexdigest() != APPROVED_V140_POLICY_SHA256:
         raise ReleaseVerificationError(
@@ -954,19 +1182,11 @@ def _verify_approved_v140_policy(repo: Path, ref: str, revision: str) -> None:
         )
 
 
-def _release_inventory(repo: Path, revision: str) -> None:
+def _release_inventory(tree: VerifiedCommitTree) -> None:
     try:
-        listing = git_bytes(
-            repo,
-            "ls-tree",
-            "-r",
-            "-z",
-            "--full-tree",
-            revision,
-            "--",
-            *RELEASE_PATHS,
-        )
-        validate_release_listing(listing)
+        entries = validate_release_listing(tree.listing(RELEASE_PATHS))
+        for entry in entries:
+            tree.reader.read(entry.oid, "blob")
     except (ReleaseVerificationError, ValueError):
         raise ReleaseVerificationError(
             "release inventory is incomplete or invalid"
@@ -979,11 +1199,11 @@ def _release_version(ref: str) -> tuple[int, ...]:
     return tuple(int(part) for part in ref.removeprefix("v").split("."))
 
 
-def _verify_setup_gemini_auth(repo: Path, revision: str) -> None:
+def _verify_setup_gemini_auth(tree: VerifiedCommitTree) -> None:
     path = SETUP_GEMINI_AUTH_ROOT.path.as_posix()
     try:
         document = yaml.load(
-            git(repo, "show", f"{revision}:{path}"), Loader=yaml.BaseLoader
+            tree.read_text(path), Loader=yaml.BaseLoader
         )
     except (ReleaseVerificationError, yaml.YAMLError):
         raise ReleaseVerificationError(
@@ -996,7 +1216,7 @@ def _verify_setup_gemini_auth(repo: Path, revision: str) -> None:
 
 
 def _verify_tag_catalog(
-    repo: Path, ref: str, revision: str
+    tree: VerifiedCommitTree, ref: str
 ) -> WorkflowCatalog | None:
     """Run the catalog/config/canonical contracts against tag-owned bytes."""
 
@@ -1007,10 +1227,11 @@ def _verify_tag_catalog(
         "scripts/workflow-config.json",
         "examples/baseline-workflows/.github",
     )
-    inventory_names = set(
-        git(repo, "ls-tree", "-r", "--name-only", revision, "scripts").splitlines()
-    )
-    missing_inventory = set(paths[:2]) - inventory_names
+    missing_inventory = {
+        path
+        for path in paths[:2]
+        if (entry := tree.entry(path)) is None or entry.object_type != "blob"
+    }
     if missing_inventory:
         # Historical tags predate the closed release inventory.  Keep their
         # OpenCode verifier regression path readable, while all v1.40+ tags
@@ -1025,9 +1246,7 @@ def _verify_tag_catalog(
         for relative in paths[:2]:
             target = root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
-                git(repo, "show", f"{revision}:{relative}"), encoding="utf-8"
-            )
+            target.write_bytes(tree.read_file(relative))
         try:
             catalog = load_catalog(root)
             config = load_fleet_config(root, catalog)
@@ -1048,11 +1267,7 @@ def _verify_tag_catalog(
                 "tag v1.40 violates the approved v1.40 semantic identity"
             )
 
-        canonical_names = set(
-            git(
-                repo, "ls-tree", "-r", "--name-only", revision, paths[2]
-            ).splitlines()
-        )
+        canonical_names = {entry.path.as_posix() for entry in tree.files(paths[2])}
         expected_names = {
             f"{config.canonical_dir}/{entry.path.relative_to('.github')}"
             for entry in catalog.entries
@@ -1067,7 +1282,7 @@ def _verify_tag_catalog(
         for entry in catalog.callers:
             relative = entry.path.relative_to(".github")
             name = f"{config.canonical_dir}/{relative}"
-            text = git(repo, "show", f"{revision}:{name}")
+            text = tree.read_text(name)
             try:
                 document = yaml.load(text, Loader=yaml.BaseLoader)
             except yaml.YAMLError as exc:
@@ -1097,7 +1312,7 @@ def _verify_tag_catalog(
         config_name = f"{config.canonical_dir}/workflow-config.yml"
         try:
             canonical_config = yaml.load(
-                git(repo, "show", f"{revision}:{config_name}"),
+                tree.read_text(config_name),
                 Loader=yaml.BaseLoader,
             )
         except yaml.YAMLError as exc:
@@ -1341,27 +1556,23 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
         raise ReleaseVerificationError(f"{name} has no setup-gemini-auth resolver")
 
 
-def _verify_commit_content(repo: Path, ref: str, revision: str) -> None:
+def _verify_commit_content(
+    repo: Path, ref: str, revision: str
+) -> VerifiedCommitTree:
+    tree = VerifiedCommitTree.open(repo, revision)
     if _release_version(ref) >= (1, 40):
-        _release_inventory(repo, revision)
-        _verify_setup_gemini_auth(repo, revision)
-    _verify_approved_v140_policy(repo, ref, revision)
-    catalog = _verify_tag_catalog(repo, ref, revision)
-    names = git(
-        repo,
-        "ls-tree",
-        "-r",
-        "--name-only",
-        revision,
-        ".github/workflows",
-    ).splitlines()
+        _release_inventory(tree)
+        _verify_setup_gemini_auth(tree)
+    _verify_approved_v140_policy(tree, ref)
+    catalog = _verify_tag_catalog(tree, ref)
+    names = [entry.path.as_posix() for entry in tree.files(".github/workflows")]
     workflows = [name for name in names if name.endswith((".yml", ".yaml"))]
     if not workflows:
         raise ReleaseVerificationError(f"tag {ref} contains no reusable workflows")
 
     documents: dict[str, dict] = {}
     for name in workflows:
-        text = git(repo, "show", f"{revision}:{name}")
+        text = tree.read_text(name)
         if "secrets.GITHUB_TOKEN" in text:
             raise ReleaseVerificationError(f"{name} uses secrets.GITHUB_TOKEN")
         for match in re.finditer(r"actions/checkout@([^'\"\s#]+)", text):
@@ -1510,6 +1721,7 @@ def _verify_commit_content(repo: Path, ref: str, revision: str) -> None:
         raise ReleaseVerificationError(
             "opencode.yml security contract permits unsafe PR or App-token access"
         )
+    return tree
 
 
 def verify_commit_content(repo: Path, ref: str, commit: str) -> str:
@@ -1524,12 +1736,13 @@ def verify_commit_content(repo: Path, ref: str, commit: str) -> str:
 
 def verify_tag_content(
     repo: Path, ref: str, *, tag: AnnotatedTag | None = None
-) -> None:
+) -> VerifiedCommitTree:
     captured = tag if tag is not None else resolve_annotated_tag(repo, ref)
     if captured.ref != ref:
         raise ReleaseVerificationError("captured tag identity does not match release ref")
-    _verify_commit_content(repo, ref, captured.commit)
+    tree = _verify_commit_content(repo, ref, captured.commit)
     assert_tag_unchanged(repo, captured)
+    return tree
 
 
 def verify_release(
