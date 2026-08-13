@@ -1,0 +1,608 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "path": ".github/workflows/claude.yml",
+      "kind": "required",
+      "central_workflow": "claude.yml",
+      "auth_family": "claude",
+      "profile_axis": null,
+      "trigger": {
+        "issue_comment": {
+          "types": [
+            "created"
+          ]
+        },
+        "pull_request_review_comment": {
+          "types": [
+            "created"
+          ]
+        },
+        "issues": {
+          "types": [
+            "opened",
+            "assigned"
+          ]
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "claude",
+          "permissions": {
+            "contents": "read",
+            "pull-requests": "read",
+            "issues": "read",
+            "id-token": "write",
+            "actions": "read"
+          },
+          "with": [],
+          "secrets": [
+            "CLAUDE_CODE_OAUTH_TOKEN"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/claude-code-review.yml",
+      "kind": "required",
+      "central_workflow": "claude-code-review.yml",
+      "auth_family": "claude",
+      "profile_axis": null,
+      "trigger": {
+        "pull_request": {
+          "types": [
+            "opened",
+            "synchronize"
+          ]
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "claude-review",
+          "permissions": {
+            "contents": "read",
+            "pull-requests": "write",
+            "issues": "read",
+            "id-token": "write"
+          },
+          "with": [
+            "pr_number"
+          ],
+          "secrets": [
+            "CLAUDE_CODE_OAUTH_TOKEN"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/gemini-auto-review.yml",
+      "kind": "required",
+      "central_workflow": "gemini-auto-review.yml",
+      "auth_family": "gemini",
+      "profile_axis": "repo_write_auth",
+      "trigger": {
+        "pull_request": {
+          "types": [
+            "opened",
+            "synchronize"
+          ]
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "gemini-review",
+          "permissions": {
+            "contents": "read",
+            "pull-requests": "write",
+            "issues": "write",
+            "id-token": "write"
+          },
+          "with": [
+            "pr_number"
+          ],
+          "secrets": [
+            "GEMINI_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/gemini-dispatch.yml",
+      "kind": "required",
+      "central_workflow": "gemini-dispatch.yml",
+      "auth_family": "gemini",
+      "profile_axis": "repo_write_auth",
+      "trigger": {
+        "pull_request_review_comment": {
+          "types": [
+            "created"
+          ]
+        },
+        "pull_request": {
+          "types": [
+            "opened"
+          ]
+        },
+        "issues": {
+          "types": [
+            "opened",
+            "reopened"
+          ]
+        },
+        "issue_comment": {
+          "types": [
+            "created"
+          ]
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "dispatch",
+          "permissions": {
+            "contents": "read",
+            "id-token": "write",
+            "issues": "write",
+            "pull-requests": "write"
+          },
+          "with": [
+            "app_id"
+          ],
+          "secrets": [
+            "APP_PRIVATE_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/gemini-invoke.yml",
+      "kind": "required",
+      "central_workflow": "gemini-invoke.yml",
+      "auth_family": "gemini",
+      "profile_axis": "repo_write_auth",
+      "trigger": {
+        "workflow_call": {
+          "inputs": {
+            "item_number": {
+              "type": "string",
+              "description": "Issue or pull request number",
+              "required": "true"
+            },
+            "item_title": {
+              "type": "string",
+              "description": "Issue or pull request title",
+              "required": "true"
+            },
+            "item_body": {
+              "type": "string",
+              "description": "Issue or pull request body",
+              "required": "true"
+            },
+            "event_name": {
+              "type": "string",
+              "description": "Caller event name",
+              "required": "true"
+            },
+            "is_pull_request": {
+              "type": "boolean",
+              "description": "Whether the caller event is for a pull request",
+              "required": "true"
+            },
+            "additional_context": {
+              "type": "string",
+              "description": "Any additional context from the request",
+              "required": "false"
+            }
+          }
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "invoke",
+          "permissions": {
+            "contents": "read",
+            "id-token": "write",
+            "issues": "write",
+            "pull-requests": "write"
+          },
+          "with": [
+            "additional_context",
+            "app_id",
+            "event_name",
+            "is_pull_request",
+            "item_body",
+            "item_number",
+            "item_title"
+          ],
+          "secrets": [
+            "APP_PRIVATE_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/gemini-issue-triage.yml",
+      "kind": "required",
+      "central_workflow": "gemini-triage.yml",
+      "auth_family": "gemini",
+      "profile_axis": "repo_write_auth",
+      "trigger": {
+        "issues": {
+          "types": [
+            "opened",
+            "reopened"
+          ]
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "triage",
+          "permissions": {
+            "contents": "read",
+            "id-token": "write",
+            "issues": "read",
+            "pull-requests": "read"
+          },
+          "with": [
+            "additional_context",
+            "app_id",
+            "issue_body",
+            "issue_number",
+            "issue_title"
+          ],
+          "secrets": [
+            "APP_PRIVATE_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/gemini-pr-review.yml",
+      "kind": "required",
+      "central_workflow": "gemini-review.yml",
+      "auth_family": "gemini",
+      "profile_axis": "repo_write_auth",
+      "trigger": {
+        "pull_request": {
+          "types": [
+            "opened"
+          ]
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "review",
+          "permissions": {
+            "contents": "read",
+            "id-token": "write",
+            "issues": "write",
+            "pull-requests": "write"
+          },
+          "with": [
+            "additional_context",
+            "app_id",
+            "issue_body",
+            "issue_title",
+            "pr_number"
+          ],
+          "secrets": [
+            "APP_PRIVATE_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/gemini-review.yml",
+      "kind": "required",
+      "central_workflow": "gemini-review.yml",
+      "auth_family": "gemini",
+      "profile_axis": "repo_write_auth",
+      "trigger": {
+        "workflow_call": {
+          "inputs": {
+            "pr_number": {
+              "type": "string",
+              "description": "Pull request number",
+              "required": "true"
+            },
+            "issue_title": {
+              "type": "string",
+              "description": "Pull request title",
+              "required": "true"
+            },
+            "issue_body": {
+              "type": "string",
+              "description": "Pull request body",
+              "required": "true"
+            },
+            "additional_context": {
+              "type": "string",
+              "description": "Any additional context from the request",
+              "required": "false"
+            }
+          }
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "review",
+          "permissions": {
+            "contents": "read",
+            "id-token": "write",
+            "issues": "write",
+            "pull-requests": "write"
+          },
+          "with": [
+            "additional_context",
+            "app_id",
+            "issue_body",
+            "issue_title",
+            "pr_number"
+          ],
+          "secrets": [
+            "APP_PRIVATE_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/gemini-scheduled-triage.yml",
+      "kind": "required",
+      "central_workflow": "gemini-scheduled-triage.yml",
+      "auth_family": "gemini",
+      "profile_axis": "repo_write_auth",
+      "trigger": {
+        "workflow_dispatch": ""
+      },
+      "caller_jobs": [
+        {
+          "name": "triage",
+          "permissions": {
+            "contents": "read",
+            "id-token": "write",
+            "issues": "write",
+            "pull-requests": "write"
+          },
+          "with": [
+            "app_id"
+          ],
+          "secrets": [
+            "APP_PRIVATE_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/gemini-triage.yml",
+      "kind": "required",
+      "central_workflow": "gemini-triage.yml",
+      "auth_family": "gemini",
+      "profile_axis": "repo_write_auth",
+      "trigger": {
+        "workflow_call": {
+          "inputs": {
+            "issue_number": {
+              "type": "string",
+              "description": "Issue number",
+              "required": "true"
+            },
+            "issue_title": {
+              "type": "string",
+              "description": "Issue title",
+              "required": "true"
+            },
+            "issue_body": {
+              "type": "string",
+              "description": "Issue body",
+              "required": "true"
+            },
+            "additional_context": {
+              "type": "string",
+              "description": "Any additional context from the request",
+              "required": "false"
+            }
+          }
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "triage",
+          "permissions": {
+            "contents": "read",
+            "id-token": "write",
+            "issues": "read",
+            "pull-requests": "read"
+          },
+          "with": [
+            "additional_context",
+            "app_id",
+            "issue_body",
+            "issue_number",
+            "issue_title"
+          ],
+          "secrets": [
+            "APP_PRIVATE_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/auto-rereview-request.yml",
+      "kind": "optional",
+      "central_workflow": "auto-rereview-request.yml",
+      "auth_family": "none",
+      "profile_axis": null,
+      "trigger": {
+        "pull_request": {
+          "types": [
+            "synchronize"
+          ]
+        },
+        "workflow_dispatch": {
+          "inputs": {
+            "pr_number": {
+              "description": "PR number to notify reviewers",
+              "required": "true",
+              "type": "number"
+            },
+            "force_run": {
+              "description": "Run even if disabled in config",
+              "type": "boolean",
+              "default": "false"
+            }
+          }
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "rereview",
+          "permissions": {
+            "contents": "read",
+            "pull-requests": "write",
+            "issues": "write"
+          },
+          "with": [],
+          "secrets": []
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/gemini-chat.yml",
+      "kind": "optional",
+      "central_workflow": "gemini-chat.yml",
+      "auth_family": "gemini",
+      "profile_axis": "repo_write_auth",
+      "trigger": {
+        "issue_comment": {
+          "types": [
+            "created"
+          ]
+        },
+        "pull_request_review_comment": {
+          "types": [
+            "created"
+          ]
+        },
+        "issues": {
+          "types": [
+            "opened",
+            "assigned"
+          ]
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "gemini-chat",
+          "permissions": {
+            "contents": "read",
+            "pull-requests": "write",
+            "issues": "write",
+            "id-token": "write",
+            "actions": "read"
+          },
+          "with": [
+            "app_id"
+          ],
+          "secrets": [
+            "APP_PRIVATE_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/opencode.yml",
+      "kind": "optional",
+      "central_workflow": "opencode.yml",
+      "auth_family": "opencode",
+      "profile_axis": null,
+      "trigger": {
+        "issue_comment": {
+          "types": [
+            "created"
+          ]
+        },
+        "pull_request_review_comment": {
+          "types": [
+            "created"
+          ]
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "opencode",
+          "permissions": {
+            "contents": "read",
+            "pull-requests": "write",
+            "issues": "write"
+          },
+          "with": [],
+          "secrets": [
+            "ZHIPU_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/opencode-auto-review.yml",
+      "kind": "optional",
+      "central_workflow": "opencode-auto-review.yml",
+      "auth_family": "opencode",
+      "profile_axis": null,
+      "trigger": {
+        "pull_request": {
+          "types": [
+            "opened",
+            "synchronize"
+          ]
+        }
+      },
+      "caller_jobs": [
+        {
+          "name": "opencode-review",
+          "permissions": {
+            "contents": "read",
+            "issues": "write",
+            "pull-requests": "write"
+          },
+          "with": [],
+          "secrets": [
+            "ZHIPU_API_KEY"
+          ]
+        }
+      ]
+    },
+    {
+      "path": ".github/workflow-config.yml",
+      "kind": "config",
+      "central_workflow": null,
+      "auth_family": "none",
+      "profile_axis": null,
+      "trigger": {},
+      "caller_jobs": []
+    },
+    {
+      "path": ".github/workflows/bump-automation-ref.yml",
+      "kind": "retired",
+      "central_workflow": null,
+      "auth_family": "none",
+      "profile_axis": null,
+      "trigger": {},
+      "caller_jobs": []
+    }
+  ]
+}
