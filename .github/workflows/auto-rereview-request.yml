@@ -100,7 +100,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # All untrusted/templated values come in via env above; the script never interpolates
-          # ${{ }} into shell, and the comment body is built with printf + --body-file (no inline
+          # GitHub expressions into shell, and the comment body is built with printf + --body-file (no inline
           # --body / heredoc), so a malicious commit message cannot reach the shell.
           OID=$(gh pr view "$PR_NUM" --json commits --jq '.commits[-1].oid')
           COMMIT_SHA="${OID:0:7}"
