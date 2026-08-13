@@ -1,7 +1,7 @@
 # Common Workflow Standardization Design
 
 Date: 2026-08-13
-Status: revised after two independent security and architecture review rounds
+Status: revised after three independent security and architecture review rounds
 
 ## Decision Summary
 
@@ -105,6 +105,8 @@ The release bundle contains at least:
 - the recursive action/container/runtime-artifact lock manifest
 - `scripts/workflow-release-manifest.json`, which hashes every declared release-bundle
   file while excluding only itself to avoid a self-referential digest
+- `scripts/workflow_release_bootstrap.py`, a standard-library-only verified loader
+- `third_party/pyyaml/`, the reviewed pure-Python parser and its upstream license
 - `scripts/prepare_workflow_rollout.py`
 - `scripts/audit_workflow_fleet.py`
 - `scripts/rollout_workflow_fleet.py`
@@ -114,8 +116,11 @@ The release bundle contains at least:
 The verifier has two closed phases. `prepush` requires an annotated local `v1.40` at the
 expected merge commit and requires the remote tag to be absent. `remote` requires local
 and remote tags to resolve to that same expected commit. Both archive the bundle from the
-local tag and verify the archive rather than a development working tree. Rollout accepts
-only evidence from the successful `remote` phase.
+local tag and verify the archive rather than a development working tree. The release
+manifest defines closed bundle roots and every tracked file below them must appear exactly
+once; an undeclared file, missing file, duplicate path, symlink escape, special file, or
+case-colliding path fails. Rollout accepts only evidence from the successful `remote`
+phase.
 
 Release refs use one shared grammar in the CLI, verifier, catalog, and tests:
 `^v[0-9]+\.[0-9]+(?:\.[0-9]+)?$`. No component maintains its own narrower regex.
@@ -124,27 +129,55 @@ Release refs use one shared grammar in the CLI, verifier, catalog, and tests:
 
 The supported operator path first resolves and verifies the annotated remote tag, creates
 one disposable **detached** Git worktree at that exact commit, and invokes the tagged tool
-with isolated, no-bytecode Python mode (`python3 -I -B`). The manifest and preview are written outside that
-worktree. Executing a renderer copied from another checkout is unsupported and fails.
+with isolated, no-site, no-bytecode Python mode (`/usr/bin/python3 -I -S -B`). The
+manifest and preview are written outside that worktree. Executing a renderer copied from another checkout is unsupported and fails.
 
-At process start, before loading policy or touching a consumer clone, the tagged tool
-requires all of the following:
+The bootstrap defines the host trust root explicitly: a trusted `/usr/bin/python3`
+CPython 3.10 runtime/standard library, `/usr/bin/git`, `/usr/bin/gh`, the operating system,
+and TLS. It requires `sys.implementation.name == cpython` and
+`sys.version_info[:2] == (3, 10)` and records the full versions and executable digests;
+release code and parsers are not taken from the host. The
+supported invocation is exactly `/usr/bin/python3 -I -S -B
+scripts/workflow_release_bootstrap.py ...`. `-S` is mandatory so neither system/user
+`site-packages`, `.pth`, `sitecustomize`, nor `usercustomize` executes before attestation.
 
-- `HEAD == expected_release_commit == local_tag_commit == remote_tag_commit`;
+At process start, before loading policy, importing a project/non-stdlib module, or touching
+a consumer clone, the standard-library-only bootstrap requires all of the following:
+
+- `HEAD == expected_release_commit == local_tag_commit`;
+- phase-specific remote state: `prepush` requires remote tag absence, while `remote` and
+  every rollout command require `remote_tag_commit == local_tag_commit`;
 - detached HEAD, GitHub API-confirmed `jhw7500/automation` repository identity, and no
   submodule indirection;
 - zero staged, unstaged, or untracked changes and no policy input loaded from an ignored
   path in the release worktree;
-- a standard-library-only bootstrap performs these checks before project imports;
-- `__file__`, every subsequently imported project module, catalog, profile, template, and
-  lock manifest is a tracked Git path beneath that detached release root and matches its
-  release blob;
+- its own path and the release manifest are tracked paths whose working bytes equal their
+  release blobs, after which every manifest path and digest is verified;
+- every subsequently imported project or non-stdlib module resolves to a verified tracked
+  path beneath the detached release root; and
 - the recomputed bundle digests equal the archived release metadata.
 
-The tool records `tool_commit == release_commit`; this is an enforced equality, not merely
-informational metadata. A dirty tree, a branch checkout, a mismatched tool commit, an
-outside-root module, or a changed policy file blocks. Regression tests exercise every
-mismatch. The disposable worktree is removed after evidence is preserved.
+PyYAML is the only allowed non-stdlib runtime dependency. The release vendors the
+pure-Python `yaml/` tree from PyYAML `6.0.3` sdist
+`pyyaml-6.0.3.tar.gz` (SHA-256
+`d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f`) with its MIT license.
+Only after the complete release manifest verifies does the bootstrap install a restrictive
+import hook for the verified `scripts/` and `third_party/pyyaml/` roots and invoke the
+tagged CLI. Import of `_yaml`, host PyYAML, any other site package, or an unmanifested
+module fails. Project code never calls PyYAML's default/unsafe loader. A release-owned
+`GitHubLoader` uses YAML 1.2 core scalar rules (`true`/`false` are booleans while
+`on`/`off`/`yes`/`no` remain strings), preserves scalar node kind/style and source spans,
+rejects duplicate keys and unsafe/unknown tags, and never constructs Python objects. The
+config editor layers the stricter alias/anchor/merge policy described below. Contract
+tests explicitly cover the GitHub `on:` key and boolean/number/string distinctions.
+
+The tool records `tool_commit == release_commit`; this is enforced equality, not merely
+informational metadata. A dirty tree, branch checkout, mismatched tool commit, outside-root
+module, changed policy file, `sys.flags.no_site != 1`, unexpected preloaded module, or
+unexpected `sys.path` entry blocks. A disposable-venv regression fixture installs an
+executable `.pth` sentinel and proves the supported `-I -S -B` entrypoint cannot execute it;
+negative tests omit `-S` and demonstrate the sentinel would be detected. The disposable
+worktree is removed only after evidence is preserved.
 
 ### 1.3 Locked declared action and installer graph
 
@@ -155,11 +188,22 @@ integrity-checked installer artifact.
 
 The release verifier recursively materializes each remote action or reusable-workflow
 node at its locked SHA. For composite actions it parses the fetched `action.yml`, follows
-nested `uses:` edges, and repeats until no unvisited node remains. It also checks workflow
-`container`/`services` images and `docker://` action images. Mutable action refs and mutable
-container tags are rejected; remote images require `@sha256:`. JavaScript and Docker
+nested `uses:` edges, and repeats until no unvisited node remains. JavaScript and Docker
 entrypoints must exist in the locked action tree. The verifier rejects a fetched tree or
 nested edge whose digest is absent from the lock manifest.
+
+OCI references have a conservative closed policy across the entire released graph. The
+scanner covers workflow `container`/`services`, `docker://`, action `runs.image`, every
+Dockerfile `FROM` stage, typed image inputs, JSON/Gemini settings command arrays, and shell
+blocks or scripts invoking `docker`, `podman`, `nerdctl`, or `ctr`. `scratch` is the only
+non-digest `FROM`; build arguments or variable interpolation in `FROM` are forbidden.
+Every other image must contain `@sha256:` and map to one lock entry. Image-bearing inputs
+have catalog type `locked_oci_image` and accept only the exact locked literal; concatenated,
+environment-derived, tag-only, or free-form image values fail. Direct container-CLI
+invocation is rejected except for catalogued canonical command arrays/blocks whose image
+argument is that typed constant. Textual/AST tests cover the current `configure-gemini`
+settings generator and the inline Gemini MCP settings, Dockerfiles, and dynamic/literal
+`docker run` variants.
 
 The current upstream `google-github-actions/run-gemini-cli` action is not acceptable as a
 root pin by itself because its pinned commit still contains mutable nested actions,
@@ -214,6 +258,24 @@ The rollout manifest records:
 - actionlint version and verified binary SHA-256;
 - operation kind and secret-write policy;
 - per-repository base and generated head commits.
+
+### 1.5 Runtime provenance evidence
+
+Every released reusable workflow begins with an unconditional, least-privileged
+`provenance` job (`permissions: {}`, no checkout, no secret) that records only:
+
+- caller `github.workflow_ref` and `github.workflow_sha`;
+- called `job.workflow_ref`, `job.workflow_repository`, `job.workflow_file_path`, and
+  `job.workflow_sha`.
+
+All remaining jobs depend on that job. The catalog and release tests require this exact
+job and forbid caller/profile overrides. Canary validation retrieves the log through the
+Actions API and requires `job.workflow_repository == jhw7500/automation`,
+`job.workflow_sha == verified_release_commit`, the expected reusable-workflow path, and a
+caller SHA whose workflow file bytes match the approved rendered caller. This proves the
+actual run, not merely the default branch after the fact, used the intended caller and
+immutable reusable revision. Provenance contains no token, full context dump, or
+attacker-controlled event payload.
 
 ## 2. Single Canonical Catalog
 
@@ -404,11 +466,13 @@ Bootstrap has a read-only preview and a separately confirmed publish form. Both 
 - the declared repository profile and required secret-name prerequisites;
 - the same verified release/tool context as normal rollout.
 
-`workflows plan --bootstrap-repo <name>` renders an exact temporary diff and manifest
-without a remote write. `workflows publish --bootstrap-repo <name> --plan-manifest
-<path> --confirm` requires that prior manifest's digest, release/profile/catalog hashes,
-and base SHA to remain unchanged, then opens one independent pull request. The workflows
-subcommand has no secret-sync or secret-refresh options.
+`workflows plan --bootstrap-repo <name>` renders an exact temporary diff and
+content-addressed manifest without a remote write. After reviewing that diff, the operator
+records the printed external digest. `workflows publish --bootstrap-repo <name>
+--plan-manifest <path> --plan-sha256 <approved-64-hex-digest> --confirm` requires the exact
+approved manifest bytes, preview bundle, release/profile/catalog hashes, and base SHA to
+remain unchanged, then opens one independent pull request. The workflows subcommand has
+no secret-sync or secret-refresh options.
 
 Bootstrap creates the required callers and a fail-closed config. Every required workflow
 is explicitly disabled; enablement is a later reviewed repository config change:
@@ -460,8 +524,8 @@ or in a preview tree before writing the managed clone:
    `gemini_auth_mode: api-key`, and no ambient authentication inputs.
 9. Apply only dependency SHAs and digests present in the verified lock.
 10. For the typed `config` entry, insert or replace only `automation_ref` and
-    `automation_commit` scalar nodes in an existing file while preserving every other
-    byte.
+    `automation_commit` scalar tokens in an existing file under the fail-closed edit
+    grammar below, while preserving every other byte.
 11. Propose deletion of typed `retired` paths.
 12. Refuse to touch paths outside the typed managed set.
 13. Validate the entire planned repository before performing any write.
@@ -469,7 +533,28 @@ or in a preview tree before writing the managed clone:
 The renderer is idempotent: applying the same verified bundle, catalog, profile, and
 inventory to its own output produces zero changed files.
 
-### 5.1 Project-owned boundary
+### 5.1 Consumer-config edit grammar
+
+The vendored loader rejects duplicate mapping keys throughout the consumer config. For
+the two managed top-level keys it also rejects aliases, anchors, merge keys, explicit YAML
+tags, non-scalar values, multiline scalars, and multiple documents. Existing managed
+values must be unquoted plain scalars; an inline comment is allowed and preserved.
+
+Edits are token-span based, not a parse-and-reserialize round trip:
+
+- if both keys exist once, replace only their scalar token bytes;
+- if only `automation_ref` exists, insert `automation_commit` on the immediately following
+  line;
+- if only `automation_commit` exists, insert `automation_ref` immediately before it;
+- if neither exists, insert the ordered pair after the optional `---` and leading comment
+  block, before the first content key.
+
+Both keys are top-level and always ordered ref then commit. Any other structure blocks
+without writing. Tests cover each insertion case, CRLF/LF, inline comments, duplicate
+keys, quoted/non-scalar values, anchors, aliases, merge keys, tags, and byte preservation
+of all unmanaged content.
+
+### 5.2 Project-owned boundary
 
 Files outside the typed managed path set are hashed before and after preparation. Any
 byte change blocks the repository. The durable proof is the recorded
@@ -539,8 +624,14 @@ supported remote workflow writer and release-upgrade path.
 - Any future fleet secret operation uses a separate first-class command path, separate
   confirmation, and code path that cannot write workflow files. It is not chained into
   this rollout.
-- Tests replace GitHub secret endpoints with fail-on-call sentinels and require zero calls
-  in both workflow plan and publish.
+- Read-only inventory may call only the repository Actions Secrets **list** GET and
+  Actions Variables list GET, requesting/consuming names and pagination metadata. GitHub
+  never supplies secret values on this path; any unexpected response field is ignored and
+  no value-bearing local/environment source is consulted.
+- Tests replace every secret mutation route/method (PUT, PATCH, POST, or DELETE under a
+  secret scope) and `gh secret set/delete` with fail-on-call sentinels. They require zero
+  mutation calls in plan and publish while separately proving paginated name-only GET is
+  allowed.
 - Documentation directs operators to profile changes plus fleet plan/publish rather than
   editing or deleting common wrapper files.
 
@@ -569,7 +660,8 @@ Required plan gates:
 - verified detached execution context, local/remote release identity, and bundle hashes;
 - typed profile/catalog and closed operation-policy validation;
 - recursive action/container/artifact lock verification;
-- secret/variable name prerequisites without value reads;
+- paginated secret/variable name prerequisites through the two allowlisted read-only
+  list APIs, without value reads;
 - authoritative static input-type and secret contract audit;
 - exact managed-file comparison;
 - retired and unmanaged central-caller checks;
@@ -589,14 +681,26 @@ when there is no blocked outcome, exits 3 when it produces a complete manifest c
 one or more blocked repositories, and exits 2 when it cannot produce a trustworthy full
 manifest. It never hides a missing catalog behind `skipped`.
 
+A successful complete plan emits canonical UTF-8 JSON plus a deterministic preview archive.
+The manifest contains the preview archive SHA-256 and every planned file/deletion digest;
+its own SHA-256 is external and is printed as
+`APPROVAL_PLAN_SHA256=<64 lowercase hex>`. It is also copied to an operator-controlled,
+content-addressed evidence path `<sha256>.json`. The human/controller reviews the exact
+manifest and preview, then preserves that digest in an approval record independent of the
+manifest. Publish must receive it through `--plan-sha256`; it never trusts a digest stored
+inside the manifest and never silently computes-and-accepts a replacement digest.
+
 ### 8.2 Publish
 
-Publish requires `--plan-manifest`, verifies that manifest's digest and all release,
-tool, policy, profile, catalog, lock, preview, and base identities, then retains
-`--confirm` and fail-fast behavior. A repository is fully validated before any push.
-Immediately before commit/push, the tool refetches the remote default branch and requires
-it to equal the recorded base SHA. A mismatch blocks without pushing and must be
-replanned.
+Publish requires both `--plan-manifest` and the independently preserved
+`--plan-sha256 <approved digest>`. Before GitHub access it hashes the exact manifest bytes,
+requires equality with that external input/content-addressed filename, then verifies every
+release, tool, policy, profile, catalog, lock, preview-archive, planned-file, and base
+identity. A missing/malformed digest or mismatch is a parser/gate failure, never an
+interactive auto-approval. It then retains `--confirm` and fail-fast behavior. A repository
+is fully validated before any push. Immediately before commit/push, the tool refetches the
+remote default branch and requires it to equal the recorded base SHA. A mismatch blocks
+without pushing and must be replanned.
 
 Each repository receives an independent branch and pull request. The manifest records
 completed remote effects. Resumption uses explicit `--repo` selections and never replays
@@ -623,10 +727,18 @@ a failing regression test.
 ### Release and catalog
 
 - local/remote tag mismatch, non-detached HEAD, dirty/untracked release tree, tool-commit
-  mismatch, and outside-root project import each fail;
-- catalog, fleet-profile, or recursive lock digest mismatch fails;
+  mismatch, and outside-root project/non-stdlib import each fail;
+- the supported process has `no_site=1`, only verified roots plus stdlib on `sys.path`, and
+  loads vendored pure-Python PyYAML 6.0.3; a disposable executable `.pth` sentinel cannot
+  run under `-I -S -B`;
+- the release-owned YAML 1.2 loader retains `on` as a key string, preserves true
+  boolean/number/string nodes, rejects duplicate/unsafe tags, and never constructs objects;
+- catalog, fleet-profile, release-manifest, or recursive lock digest mismatch fails;
 - a root or nested action tag/branch, mutable container tag, missing fetched tree, or
   unlocked reusable-workflow edge fails;
+- Dockerfile `FROM`, workflow/service/action images, typed image inputs, JSON/settings
+  arrays, and container-CLI shell blocks accept only lock-mapped digests; dynamic and
+  untyped image paths fail;
 - an internal action pin that is not an ancestor or whose full directory tree differs at
   release fails;
 - the hardened Gemini action uses only locked nested dependencies and the exact CLI
@@ -649,7 +761,11 @@ a failing regression test.
 - missing, unknown, inherited, and wrong-source secrets fail;
 - caller permissions, trigger, input, and same-repository guard drift fail;
 - out-of-catalog central callers fail;
-- only the two allowed existing-config scalars change;
+- config insertion/replacement follows the fixed byte-span grammar; duplicate keys,
+  quotes/non-scalars, aliases, anchors, merges, tags, and multiple documents block;
+- only the two allowed existing-config scalar tokens change;
+- every canonical reusable workflow has the no-secret/no-permission provenance job and
+  all execution jobs depend on it;
 - `base_sha..generated_head_sha` contains zero project-owned changes;
 - retired bump files are deleted;
 - a second render produces no changes;
@@ -660,14 +776,20 @@ a failing regression test.
 - plan performs no remote write and reports all repositories with stable status/reason;
 - only an explicitly bootstrap-allowed, fully caller-free/config-free repository yields
   `blocked/bootstrap_required`; partial and unauthorized absence use distinct blocks;
-- bootstrap plan is read-only and bootstrap publish requires one repository, its unchanged
-  plan-manifest digest, and confirmation;
+- bootstrap plan is read-only and bootstrap publish requires one repository, an external
+  `--plan-sha256` matching the reviewed content-addressed manifest, and confirmation;
+- missing, malformed, manifest-self-supplied, or mismatched plan digest blocks before
+  GitHub access; exact external digest plus unchanged preview succeeds;
 - publish requires actionlint and fails on tool execution errors;
 - publish refetches and blocks a stale default branch or stale preview;
 - publish is fail-fast and resume is explicit;
 - rollout branch and PR text use rollout ID as metadata rather than a security switch;
-- secret-related flags are parser errors and fail-on-call GitHub secret sentinels remain
-  untouched;
+- secret-related flags are parser errors, name-only inventory GET remains allowed, and
+  all secret-mutation sentinels remain untouched;
+- allowlisted paginated secret-name GET succeeds, while every mutation method/CLI
+  sentinel fails the test if called;
+- canary evidence rejects a caller SHA with wrong bytes or a called `job.workflow_sha`
+  other than the verified release;
 - all standardization manifests contain empty `synced_secrets`.
 
 ## 10. Rollout Sequence and Stop Conditions
@@ -703,30 +825,52 @@ Run normal read-only plan for all 19 profiles. The expected manifest is exactly 
 `status: drift`, exactly two `status: blocked, reason_code: bootstrap_required`
 (`cts-email-mcp-server` and `wpa-supplicant`), zero other blocked reasons, and no skip.
 Exit 3 is expected for this discovery gate. The controller may advance only after parsing
-and hashing that exact complete manifest; any other count, reason, exit code, incomplete
-result, or secret endpoint call stops. This is the sole gate-specific exception to the
+that exact complete manifest, reviewing its preview, and preserving the printed
+`APPROVAL_PLAN_SHA256` outside the manifest; any other count, reason, exit code, incomplete
+result, or secret mutation call stops. This is the sole gate-specific exception to the
 normal "any blocked stops" rule. It permits canary publish of explicitly selected
 non-blocked entries from that complete manifest; blocked entries remain ineligible for
 the normal publish path.
 
-### Gate 3: behavioral and bootstrap canaries
+### Gate 3: merged behavioral and bootstrap canaries
 
-1. `wlan-package`: validate canonical replacement of its local OpenCode check jobs,
-   GitHub-App profile, OpenCode automatic review, and manual `/opencode` path.
-2. `wlan-driver`: validate the API-key-only profile produces no App input or private-key
-   mapping.
-3. `cts-email-mcp-server`: first approve the explicit bootstrap plan, then publish from
-   that unchanged plan manifest. Verify all required callers are discovered and skip
-   because the fail-closed bootstrap config disables every caller.
+A workflow-changing pull request is not treated as live evidence: several relevant events
+load the workflow from the base/default branch. Each canary therefore follows
+**publish reviewed plan → merge managed PR → verify default-branch bytes → create a separate
+harmless same-repository PR → trigger → verify runtime provenance**. The managed canary PR
+remains merged on success; only the harmless test PR/branch is removed.
 
-Temporary canary pull requests and branches are closed or deleted after evidence is
-captured. Any canary failure stops the rollout.
+1. `wlan-package`: publish the selected non-blocked entry using its externally approved
+   Gate 2 plan digest and merge it. Verify the default branch contains the exact rendered
+   OpenCode callers. Create a harmless same-repository PR based after that merge; observe
+   automatic OpenCode review, then post `/opencode` as a normal PR `issue_comment`.
+   Because the rollout caller is already on the default branch, both events exercise it.
+   For both runs require caller file bytes at `github.workflow_sha` to match the approved
+   caller and called `job.workflow_sha` to equal the verified `v1.40` commit.
+2. `wlan-driver`: publish and merge its approved API-key-only entry, create a harmless
+   same-repository PR, and invoke the manual Gemini PR-review `workflow_dispatch` from the
+   default branch for that PR. Require provenance equality, a successful API-key model
+   path, no App-token mint, no `APP_PRIVATE_KEY` mapping, and no OIDC/GCP/Vertex/Code
+   Assist path.
+3. `cts-email-mcp-server`: approve a separate explicit bootstrap plan/digest, publish and
+   merge the bootstrap PR, and verify the default-branch caller/config bytes. Invoke the
+   newly available `gemini-scheduled-triage` `workflow_dispatch`; require the central
+   provenance job to run from `v1.40` and the execution job to skip because the bootstrap
+   config explicitly disables it. No model or App credential may be consumed.
+
+The controller records run IDs, events, caller/called refs and SHAs, conclusions, and
+review/comment evidence before removing harmless test PRs and branches. If any live or
+provenance assertion fails, fleet rollout stops and all Gate 3 managed consumer merges are
+reverted in reverse order through independently reviewed revert PRs before retry; the
+immutable automation tag is never moved.
 
 ### Gate 4: fleet publish
 
-Publish independent PRs for the remaining repositories from their unchanged plan
-manifests. `wpa-supplicant` receives its own explicit bootstrap plan and confirmed publish;
-all of its common callers remain disabled until a separate reviewed enablement change.
+The three successful managed canary PRs are already part of the target state. Publish
+independent PRs for the remaining sixteen repositories from their externally approved,
+unchanged plan manifests. `wpa-supplicant` receives its own explicit bootstrap plan and
+confirmed publish; all of its common callers remain disabled until a separate reviewed
+enablement change.
 
 ### Gate 5: final audit
 
@@ -784,10 +928,12 @@ the next stage.
 - Every recorded rollout `base_sha..generated_head_sha` contains zero unmanaged-path
   changes.
 - Mandatory actionlint and all automated tests pass with recorded versions/evidence.
-- Publish consumes an unchanged plan manifest and the remote default branch still equals
-  its planned base SHA for each repository.
+- Publish requires an externally approved `--plan-sha256`, consumes the byte-identical
+  content-addressed manifest/preview, and the remote default branch still equals its
+  planned base SHA for each repository.
 - `wlan-package` automatic and manual OpenCode canaries succeed.
 - API-key-only and fail-closed bootstrap canaries satisfy their declared profiles.
 - Final fleet state is `current=19`, `skipped=0`, `blocked=0`.
-- The operation policy is `secret_writes: deny`; secret endpoint sentinels remain unused;
-  every manifest entry has `synced_secrets: []`.
+- The operation policy is `secret_writes: deny`; allowlisted name-only inventory GETs
+  may occur, all secret-mutation sentinels remain unused, and every manifest entry has
+  `synced_secrets: []`.
