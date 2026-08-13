@@ -103,15 +103,19 @@ The release bundle contains at least:
 - the typed machine-readable catalog
 - `scripts/workflow-config.json` with the reviewed fleet profiles
 - the recursive action/container/runtime-artifact lock manifest
+- `scripts/workflow-release-manifest.json`, which hashes every declared release-bundle
+  file while excluding only itself to avoid a self-referential digest
 - `scripts/prepare_workflow_rollout.py`
 - `scripts/audit_workflow_fleet.py`
 - `scripts/rollout_workflow_fleet.py`
 - `scripts/verify_workflow_release.py`
 - tests that enforce bundle invariants
 
-The release verifier resolves local and remote `v1.40` to the same expected merge
-commit, archives the bundle from that tag, and verifies the archive rather than the
-working tree.
+The verifier has two closed phases. `prepush` requires an annotated local `v1.40` at the
+expected merge commit and requires the remote tag to be absent. `remote` requires local
+and remote tags to resolve to that same expected commit. Both archive the bundle from the
+local tag and verify the archive rather than a development working tree. Rollout accepts
+only evidence from the successful `remote` phase.
 
 Release refs use one shared grammar in the CLI, verifier, catalog, and tests:
 `^v[0-9]+\.[0-9]+(?:\.[0-9]+)?$`. No component maintains its own narrower regex.
@@ -203,6 +207,7 @@ The rollout manifest records:
 
 - release ref and resolved release commit;
 - renderer/tool commit, required to equal the release commit;
+- release-manifest SHA-256;
 - catalog SHA-256;
 - fleet-profile configuration SHA-256;
 - recursive action/container/runtime-artifact lock SHA-256;
@@ -454,8 +459,9 @@ or in a preview tree before writing the managed clone:
 8. Render the catalog's exact typed `with`/`secrets` mappings, including literal
    `gemini_auth_mode: api-key`, and no ambient authentication inputs.
 9. Apply only dependency SHAs and digests present in the verified lock.
-10. For the typed `config` entry, update only `automation_ref` and
-    `automation_commit` in an existing file while preserving every other byte.
+10. For the typed `config` entry, insert or replace only `automation_ref` and
+    `automation_commit` scalar nodes in an existing file while preserving every other
+    byte.
 11. Propose deletion of typed `retired` paths.
 12. Refuse to touch paths outside the typed managed set.
 13. Validate the entire planned repository before performing any write.
@@ -682,10 +688,12 @@ a failing regression test.
 3. Run the full unit, YAML, archived-bundle, recursive-lock, static-contract, actionlint,
    and diff gates after each bounded PR.
 4. Merge in dependency order. The later PRs must not modify the pinned internal action
-   trees. Fetch the final exact merge commit and rerun all gates from a clean detached
-   checkout of that commit.
-5. Create annotated `v1.40` only at the final commit and verify locally before push.
-6. Push the tag and rerun the verifier against remote from a new clean detached checkout.
+   trees. Fetch the final exact merge commit and rerun all pre-release gates from a clean
+   detached checkout of that commit.
+5. Create annotated local `v1.40` only at the final commit. Run verifier `prepush`, which
+   requires the remote tag to still be absent; any unexpected remote tag stops release.
+6. Push the tag once, create a new clean detached checkout, and run verifier `remote` to
+   require local/remote equality. Only that evidence unlocks rollout.
 
 Do not create a consumer PR before the remote release verifier succeeds.
 
@@ -697,7 +705,9 @@ Run normal read-only plan for all 19 profiles. The expected manifest is exactly 
 Exit 3 is expected for this discovery gate. The controller may advance only after parsing
 and hashing that exact complete manifest; any other count, reason, exit code, incomplete
 result, or secret endpoint call stops. This is the sole gate-specific exception to the
-normal "any blocked stops" rule.
+normal "any blocked stops" rule. It permits canary publish of explicitly selected
+non-blocked entries from that complete manifest; blocked entries remain ineligible for
+the normal publish path.
 
 ### Gate 3: behavioral and bootstrap canaries
 
@@ -754,8 +764,8 @@ the next stage.
 - `v1.40` local and remote tags resolve to the reviewed final merge commit.
 - Rollout executes only from a clean detached checkout whose tool commit equals that
   release commit; mismatch, dirty tree, and outside-root import tests pass.
-- The archived release-bundle verifier passes and all recorded bundle/profile/catalog/lock
-  digests match.
+- The archived release-bundle verifier passes and all recorded
+  release-manifest/profile/catalog/lock digests match.
 - Every root and nested remote action/reusable-workflow reference is an approved full SHA;
   every remote image is digest-pinned; internal ancestor action trees equal release trees.
 - The hardened Gemini action uses exactly CLI `0.55.1` with the recorded npm integrity and
