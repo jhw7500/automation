@@ -11,6 +11,14 @@ import sys
 
 import yaml
 
+from scripts.workflow_catalog import (
+    CatalogError,
+    WorkflowCatalog,
+    extract_caller_jobs,
+    load_catalog,
+    load_fleet_config,
+)
+
 
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 CACHE_ACTION = "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
@@ -18,6 +26,11 @@ OPENCODE_VERSION = "1.18.17"
 OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
 )
+SETUP_GEMINI_AUTH = (
+    "jhw7500/automation/.github/actions/setup-gemini-auth@"
+    "2254f13aab44585c78954d20749f4fb677a8c2f1"
+)
+GEMINI_SECRETS = {"APP_PRIVATE_KEY", "GEMINI_API_KEY"}
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -39,6 +52,12 @@ def git(repo: Path, *args: str) -> str:
 
 def resolve_commit(repo: Path, revision: str) -> str:
     return git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip()
+
+
+def require_annotated_tag(repo: Path, ref: str) -> None:
+    object_type = git(repo, "cat-file", "-t", f"refs/tags/{ref}").strip()
+    if object_type != "tag":
+        raise ReleaseVerificationError(f"release {ref} must be an annotated tag")
 
 
 def verify_remote_tag(repo: Path, remote: str, ref: str, expected: str) -> None:
@@ -105,7 +124,167 @@ def verify_opencode_runtime(job: dict, step_name: str, workflow_name: str) -> di
     return run_step
 
 
+def _verify_tag_catalog(repo: Path, ref: str) -> WorkflowCatalog | None:
+    """Run the catalog/config/canonical contracts against tag-owned bytes."""
+
+    import tempfile
+
+    paths = (
+        "scripts/workflow-catalog.json",
+        "scripts/workflow-config.json",
+        "examples/baseline-workflows/.github",
+    )
+    inventory_names = set(
+        git(repo, "ls-tree", "-r", "--name-only", ref, "scripts").splitlines()
+    )
+    missing_inventory = set(paths[:2]) - inventory_names
+    if missing_inventory:
+        # Historical tags predate the closed release inventory.  Keep their
+        # OpenCode verifier regression path readable, while all v1.40+ tags
+        # must carry the renderer-owned catalog and fleet config.
+        version = tuple(int(part) for part in ref.removeprefix("v").split("."))
+        if version < (1, 40):
+            return None
+        raise ReleaseVerificationError(
+            f"tag {ref} release inventory is missing: {sorted(missing_inventory)}"
+        )
+    with tempfile.TemporaryDirectory(prefix="verify-workflow-tag-") as temporary:
+        root = Path(temporary)
+        for relative in paths[:2]:
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(git(repo, "show", f"{ref}:{relative}"), encoding="utf-8")
+        try:
+            catalog = load_catalog(root)
+            config = load_fleet_config(root, catalog)
+        except CatalogError as exc:
+            raise ReleaseVerificationError(
+                f"tag {ref} catalog/config is invalid: {exc}"
+            ) from exc
+
+        canonical_names = set(
+            git(repo, "ls-tree", "-r", "--name-only", ref, paths[2]).splitlines()
+        )
+        expected_names = {
+            f"{config.canonical_dir}/{entry.path.relative_to('.github')}"
+            for entry in catalog.entries
+            if entry.kind != "retired"
+        }
+        if canonical_names != expected_names:
+            missing = sorted(expected_names - canonical_names)
+            unknown = sorted(canonical_names - expected_names)
+            raise ReleaseVerificationError(
+                f"tag {ref} canonical tree mismatch: missing={missing}, unknown={unknown}"
+            )
+        for entry in catalog.callers:
+            relative = entry.path.relative_to(".github")
+            name = f"{config.canonical_dir}/{relative}"
+            text = git(repo, "show", f"{ref}:{name}")
+            try:
+                document = yaml.load(text, Loader=yaml.BaseLoader)
+            except yaml.YAMLError as exc:
+                raise ReleaseVerificationError(f"{name} is invalid YAML") from exc
+            if not isinstance(document, dict):
+                raise ReleaseVerificationError(f"{name} must be a mapping")
+            if document.get("on") != entry.trigger:
+                raise ReleaseVerificationError(f"{name} trigger violates the catalog")
+            try:
+                jobs = extract_caller_jobs(document)
+            except CatalogError as exc:
+                raise ReleaseVerificationError(
+                    f"{name} caller contract is invalid: {exc}"
+                ) from exc
+            if jobs != entry.caller_jobs:
+                raise ReleaseVerificationError(f"{name} caller jobs violate the catalog")
+            uses = re.findall(
+                r"jhw7500/automation/\.github/workflows/([^@\s'\"]+)@"
+                r"([^\s'\"]+)",
+                text,
+            )
+            if uses != [(entry.central_workflow, "__AUTOMATION_COMMIT__")]:
+                raise ReleaseVerificationError(
+                    f"{name} central target or release placeholder violates the catalog"
+                )
+
+        config_name = f"{config.canonical_dir}/workflow-config.yml"
+        try:
+            canonical_config = yaml.load(
+                git(repo, "show", f"{ref}:{config_name}"), Loader=yaml.BaseLoader
+            )
+        except yaml.YAMLError as exc:
+            raise ReleaseVerificationError(f"{config_name} is invalid YAML") from exc
+        expected_workflows = {entry.path.stem for entry in catalog.callers}
+        workflow_values = (
+            canonical_config.get("workflows", {})
+            if isinstance(canonical_config, dict)
+            else {}
+        )
+        config_is_closed = (
+            isinstance(canonical_config, dict)
+            and set(canonical_config)
+            == {"automation_ref", "automation_commit", "review", "workflows"}
+            and canonical_config.get("automation_ref") == "__AUTOMATION_REF__"
+            and canonical_config.get("automation_commit") == "__AUTOMATION_COMMIT__"
+            and canonical_config.get("review") == {"auto": "false"}
+            and isinstance(workflow_values, dict)
+            and set(workflow_values) == expected_workflows
+            and all(value == {"enabled": "false"} for value in workflow_values.values())
+        )
+        if not config_is_closed:
+            raise ReleaseVerificationError(
+                f"{config_name} violates the disabled bootstrap contract"
+            )
+        return catalog
+
+
+def _verify_gemini_workflow(name: str, document: dict, text: str) -> None:
+    try:
+        call = document["on"]["workflow_call"]
+        inputs = call["inputs"]
+        secrets = call["secrets"]
+    except (KeyError, TypeError) as exc:
+        raise ReleaseVerificationError(
+            f"{name} Gemini workflow_call contract is missing"
+        ) from exc
+    mode = inputs.get("repo_write_auth") if isinstance(inputs, dict) else None
+    if (
+        set(document.get("on", {})) != {"workflow_call"}
+        or not isinstance(mode, dict)
+        or mode.get("type") != "string"
+        or mode.get("required") != "true"
+    ):
+        raise ReleaseVerificationError(f"{name} must require repo_write_auth")
+    if "GOOGLE_API_KEY" in text:
+        raise ReleaseVerificationError(f"{name} contains forbidden GOOGLE_API_KEY")
+    if not isinstance(secrets, dict) or set(secrets) != GEMINI_SECRETS:
+        raise ReleaseVerificationError(
+            f"{name} must declare only APP_PRIVATE_KEY and GEMINI_API_KEY"
+        )
+    if (
+        not isinstance(secrets["APP_PRIVATE_KEY"], dict)
+        or secrets["APP_PRIVATE_KEY"].get("required", "false") != "false"
+        or not isinstance(secrets["GEMINI_API_KEY"], dict)
+        or secrets["GEMINI_API_KEY"].get("required") != "true"
+    ):
+        raise ReleaseVerificationError(f"{name} Gemini secret requirements are invalid")
+    if re.search(
+        r"(?i)(?:google-github-actions/auth|google_application_credentials|"
+        r"workload_identity_provider|\bgcp\b|oidc|id-token\s*:)",
+        text,
+    ):
+        raise ReleaseVerificationError(f"{name} contains forbidden Google/GCP/OIDC auth")
+    if "vars.APP_ID" in text:
+        raise ReleaseVerificationError(f"{name} contains forbidden ambient App fallback")
+    setup_refs = re.findall(
+        r"jhw7500/automation/\.github/actions/setup-gemini-auth@[^'\"\s#]+",
+        text,
+    )
+    if not setup_refs or any(reference != SETUP_GEMINI_AUTH for reference in setup_refs):
+        raise ReleaseVerificationError(f"{name} setup-gemini-auth is not pinned")
+
+
 def verify_tag_content(repo: Path, ref: str) -> None:
+    catalog = _verify_tag_catalog(repo, ref)
     names = git(repo, "ls-tree", "-r", "--name-only", ref, ".github/workflows").splitlines()
     workflows = [name for name in names if name.endswith((".yml", ".yaml"))]
     if not workflows:
@@ -124,6 +303,43 @@ def verify_tag_content(repo: Path, ref: str) -> None:
                 )
         data = yaml.load(text, Loader=yaml.BaseLoader)
         documents[Path(name).name] = data if isinstance(data, dict) else {}
+        if Path(name).name.startswith("gemini-"):
+            _verify_gemini_workflow(Path(name).name, documents[Path(name).name], text)
+
+    if catalog is not None:
+        for entry in catalog.callers:
+            assert entry.central_workflow is not None
+            central = documents.get(entry.central_workflow)
+            if central is None:
+                raise ReleaseVerificationError(
+                    f"central workflow is missing: {entry.central_workflow}"
+                )
+            try:
+                call = central["on"]["workflow_call"]
+                declared_inputs = set(call.get("inputs", {}))
+                declared_secrets = call.get("secrets", {})
+            except (KeyError, TypeError) as exc:
+                raise ReleaseVerificationError(
+                    f"{entry.central_workflow} workflow_call contract is missing"
+                ) from exc
+            if not isinstance(declared_secrets, dict):
+                raise ReleaseVerificationError(
+                    f"{entry.central_workflow} secrets must be a mapping"
+                )
+            required_secrets = {
+                name
+                for name, value in declared_secrets.items()
+                if isinstance(value, dict) and value.get("required", "false") == "true"
+            }
+            if any(
+                not set(job.with_keys) <= declared_inputs
+                or not set(job.secrets) <= set(declared_secrets)
+                or not required_secrets <= set(job.secrets)
+                for job in entry.caller_jobs
+            ):
+                raise ReleaseVerificationError(
+                    f"{entry.path} is incompatible with {entry.central_workflow}"
+                )
 
     auto = documents.get("opencode-auto-review.yml")
     if auto is None:
@@ -221,6 +437,7 @@ def verify_release(
     repo = repo.resolve()
     if re.fullmatch(r"v\d+(?:\.\d+)+", ref) is None:
         raise ReleaseVerificationError(f"invalid release ref: {ref}")
+    require_annotated_tag(repo, ref)
     expected = resolve_commit(repo, expected_commit)
     tag_commit = resolve_commit(repo, f"refs/tags/{ref}")
     if tag_commit != expected:
