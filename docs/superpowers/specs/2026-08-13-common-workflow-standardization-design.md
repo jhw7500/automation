@@ -1,22 +1,26 @@
 # Common Workflow Standardization Design
 
 Date: 2026-08-13
-Status: revised after independent security and architecture review
+Status: revised after two independent security and architecture review rounds
 
 ## Decision Summary
 
-The fleet will use one immutable release bundle, one machine-readable caller catalog,
-one declarative repository profile, and one remote writer.
+The fleet will use one immutable release bundle, one typed machine-readable catalog,
+one declarative repository profile, and one remote workflow writer.
 
-- `automation@v1.40` will bundle the reusable workflows, fully pinned transitive
-  actions, caller catalog, renderer, verifier, and tests.
+- `automation@v1.40` will bundle the reusable workflows, a recursively locked declared
+  Actions/container graph, caller catalog, fleet profiles, renderer, verifier, and tests.
+- The supported rollout entrypoint executes only from a clean detached checkout of the
+  verified release commit; working-tree tooling is not an accepted execution path.
 - Consumer reusable-workflow calls will use the resolved 40-character `v1.40` commit,
   not the movable tag text.
 - All 19 repositories registered in `scripts/workflow-config.json` are managed by the
   required common-AI profile. The two repositories that currently have no `.github`
   directory are explicit bootstrap targets rather than implicit skips.
-- Optional workflow presence and Gemini authentication mode are declared in fleet
-  configuration. They are never inferred from mutable repository contents.
+- Optional workflow presence, Gemini model-auth mode, and GitHub App mode are declared
+  in fleet configuration. They are never inferred from mutable repository contents.
+- `v1.40` supports Gemini API-key model authentication only. It removes ambient GCP,
+  Vertex AI, Code Assist, Google API-key, OIDC, and caller-selected CLI-version paths.
 - Project-owned build, test, verification, release, packaging, deployment, lint, and
   synchronization workflows remain byte-for-byte outside the managed catalog.
 - `rollout_workflow_fleet.py` is the only remote workflow writer. The legacy direct-copy
@@ -62,8 +66,13 @@ rendering and exact contract validation.
 6. Make accidental caller deletion, optional-file deletion, and unmanaged central calls
    fail closed.
 7. Keep each consumer change independently reviewable and reversible.
-8. Provide one command for plan and one confirmed command for publish across the fleet.
+8. Provide one authoritative workflow-standardization CLI form for read-only plan and
+   confirmed publish across the fleet, with an explicit one-repository bootstrap form.
 9. Perform no secret value write during this standardization rollout.
+10. Bind the executing renderer and every policy input to the verified release commit.
+11. Lock the declared GitHub Actions/container dependency graph and the Gemini CLI
+    installer artifact; live API responses and service behavior remain outside this
+    reproducibility boundary.
 
 ## Non-goals
 
@@ -72,7 +81,8 @@ rendering and exact contract validation.
 - Enabling optional OpenCode, Gemini Chat, or auto-rereview workflows in repositories
   where the approved profile does not include them.
 - Changing model provider, model name, prompts, secret values, repository variables, or
-  Claude/Gemini/OpenCode enablement settings in the 17 existing consumers.
+  Claude/Gemini/OpenCode enablement settings in the 17 existing consumers. Caller control
+  of `GEMINI_CLI_VERSION` is intentionally removed as a runtime-integrity hardening change.
 - Automatically enabling PR auto-review in the two bootstrap repositories.
 - Moving or deleting an existing release tag.
 - Retaining consumer-side regex replacement as a release-upgrade mechanism.
@@ -90,8 +100,9 @@ The release bundle contains at least:
 - `.github/workflows/`
 - `.github/actions/`
 - `examples/baseline-workflows/.github/`
-- the machine-readable catalog
+- the typed machine-readable catalog
 - `scripts/workflow-config.json` with the reviewed fleet profiles
+- the recursive action/container/runtime-artifact lock manifest
 - `scripts/prepare_workflow_rollout.py`
 - `scripts/audit_workflow_fleet.py`
 - `scripts/rollout_workflow_fleet.py`
@@ -105,23 +116,75 @@ working tree.
 Release refs use one shared grammar in the CLI, verifier, catalog, and tests:
 `^v[0-9]+\.[0-9]+(?:\.[0-9]+)?$`. No component maintains its own narrower regex.
 
-### 1.2 Transitive action pins
+### 1.2 Verified execution context
+
+The supported operator path first resolves and verifies the annotated remote tag, creates
+one disposable **detached** Git worktree at that exact commit, and invokes the tagged tool
+with isolated, no-bytecode Python mode (`python3 -I -B`). The manifest and preview are written outside that
+worktree. Executing a renderer copied from another checkout is unsupported and fails.
+
+At process start, before loading policy or touching a consumer clone, the tagged tool
+requires all of the following:
+
+- `HEAD == expected_release_commit == local_tag_commit == remote_tag_commit`;
+- detached HEAD, GitHub API-confirmed `jhw7500/automation` repository identity, and no
+  submodule indirection;
+- zero staged, unstaged, or untracked changes and no policy input loaded from an ignored
+  path in the release worktree;
+- a standard-library-only bootstrap performs these checks before project imports;
+- `__file__`, every subsequently imported project module, catalog, profile, template, and
+  lock manifest is a tracked Git path beneath that detached release root and matches its
+  release blob;
+- the recomputed bundle digests equal the archived release metadata.
+
+The tool records `tool_commit == release_commit`; this is an enforced equality, not merely
+informational metadata. A dirty tree, a branch checkout, a mismatched tool commit, an
+outside-root module, or a changed policy file blocks. Regression tests exercise every
+mismatch. The disposable worktree is removed after evidence is preserved.
+
+### 1.3 Locked declared action and installer graph
 
 Every remote `uses:` in released reusable workflows and composite actions must use a
-40-character commit SHA. This includes internal calls back to
-`jhw7500/automation/.github/actions` and credential-sensitive third-party actions.
+40-character commit SHA. The lock manifest records each owner/repository/path/commit,
+materialized action-directory tree digest, nested edge, container image digest, and
+integrity-checked installer artifact.
 
-The release verifier recursively scans released workflow and action YAML and rejects:
+The release verifier recursively materializes each remote action or reusable-workflow
+node at its locked SHA. For composite actions it parses the fetched `action.yml`, follows
+nested `uses:` edges, and repeats until no unvisited node remains. It also checks workflow
+`container`/`services` images and `docker://` action images. Mutable action refs and mutable
+container tags are rejected; remote images require `@sha256:`. JavaScript and Docker
+entrypoints must exist in the locked action tree. The verifier rejects a fetched tree or
+nested edge whose digest is absent from the lock manifest.
 
-- version tags, branches, or other mutable refs;
-- unregistered `uses:` targets;
-- a SHA that does not match the approved action-pin manifest;
-- missing action-pin metadata or comments.
+The current upstream `google-github-actions/run-gemini-cli` action is not acceptable as a
+root pin by itself because its pinned commit still contains mutable nested actions,
+container tags, and a `latest` CLI path. `v1.40` therefore vendors a reviewed hardened
+derivative under `.github/actions/run-gemini-cli-hardened/`, preserving upstream notice
+and license. The derivative removes the unused GCP-auth branch entirely. Its remaining
+nested Actions use approved full SHAs, every image uses a digest, and its committed npm
+lock fixes every transitive package version and integrity. Installation uses immutable
+lockfile mode and exactly Gemini CLI `0.55.1`, whose npm integrity is
+`sha512-leEv91V7J3YWhZdXqYIj4nTl0hXl8oNos5aVR0whPCFqVbRvoFPTzaQOHdI2UIT1wGgp+XdCi4qUrFDnUFN7RQ==`.
+The central workflows do not pass `vars.GEMINI_CLI_VERSION`, `latest`, or `preview`.
+Any other locked third-party composite action with a mutable descendant is likewise
+hardened/vendorized or the release is blocked. A credential-bearing runtime installer
+must use an exact artifact plus verified integrity or a committed frozen lockfile; an
+unlocked package-manager or download command blocks release.
 
-No general `ratchet:exclude` exception is allowed for an action that receives a token,
-private key, API key, or repository write permission.
+An internal `jhw7500/automation/.github/actions/...@<SHA>` cannot self-pin to the final
+commit. Its SHA must instead be a reviewed ancestor that already contains the finalized
+action directory. The verifier requires that SHA to be an ancestor of `v1.40` and requires
+the complete pinned action-directory Git tree to be byte-identical at the ancestor and at
+the release commit. Any later action edit invalidates the pin and blocks the tag.
 
-### 1.3 Consumer runtime pin
+This guarantee covers the declarative GitHub Actions/reusable-workflow/container graph and
+the explicitly locked CLI installer artifact. Live API responses, model output, runner
+base-image evolution, and arbitrary service behavior are not claimed to be reproducible.
+No `ratchet:exclude` or equivalent bypass is allowed for a credential-bearing or
+write-capable node.
+
+### 1.4 Consumer runtime pin
 
 The renderer resolves `v1.40` to its verified 40-character commit and writes that commit
 into every consumer reusable-workflow `uses:` value. Human-readable consumer config
@@ -139,22 +202,34 @@ therefore fails audit and cannot alter an already deployed caller.
 The rollout manifest records:
 
 - release ref and resolved release commit;
-- renderer/tool commit;
+- renderer/tool commit, required to equal the release commit;
 - catalog SHA-256;
 - fleet-profile configuration SHA-256;
-- action-pin manifest SHA-256;
-- actionlint version;
+- recursive action/container/runtime-artifact lock SHA-256;
+- actionlint version and verified binary SHA-256;
+- operation kind and secret-write policy;
 - per-repository base and generated head commits.
 
 ## 2. Single Canonical Catalog
 
-`examples/baseline-workflows/.github/` becomes the only canonical caller tree. The
+`examples/baseline-workflows/.github/` becomes the only canonical managed tree. The
 duplicate top-level `workflows/` and `workflow-config.yml` are removed after all code,
 tests, and documentation use the canonical tree.
 
-A single machine-readable catalog, stored beside the canonical tree, declares every
-managed filename, class, central target, and removal policy. Lists are not duplicated in
-Python, shell, tests, or JSON fleet configuration.
+A single typed machine-readable catalog, stored beside that tree, declares every managed
+path. Its closed entry kinds are:
+
+- `caller`: `presence` (`required` or `optional`), canonical YAML path, central target,
+  config `enablement_key`, exact per-job permission map, exact-trigger policy, declared
+  input/secret value schema, and the only profile-dependent substitutions;
+- `config`: `.github/workflow-config.yml`, one bootstrap template, schema, and an
+  existing-file mutation allowlist limited to `automation_ref` and `automation_commit`;
+- `retired`: a path with `removal_policy: delete` and no canonical YAML.
+
+The active/optional/retired path lists and permission policy are not duplicated in Python,
+shell, tests, or fleet JSON. Canonical caller YAML must conform to the catalog's explicit
+permission and mapping policy; editing both is a reviewed release change, never an ambient
+consumer exception. Documentation such as `.github/README.md` is not fleet-managed.
 
 ### 2.1 Required workflows
 
@@ -188,46 +263,57 @@ it is never silently accepted.
 
 ### 2.3 Retired workflow
 
-`bump-automation-ref.yml` is removed from the canonical catalog and all consumers. It
-cannot safely update input and secret mappings when a reusable contract changes, and
-its GitHub App token path otherwise requires high workflow-write permission. Future
-release upgrades are performed only through the verified fleet renderer.
+`bump-automation-ref.yml` is removed from the **active caller set**, its canonical YAML
+is deleted, and consumer copies are removed. It cannot safely update input and secret
+mappings when a reusable contract changes, and its GitHub App token path otherwise
+requires high workflow-write permission. Future release upgrades are performed only
+through the verified fleet renderer.
 
-The catalog records it as an explicitly retired managed filename so the renderer can
+The typed catalog retains exactly one `retired` entry for the path so the renderer can
 propose deletion and the auditor can reject reintroduction.
 
 ### 2.4 Catalog completeness invariants
 
 Tests fail unless:
 
-- every catalog entry has exactly one canonical YAML file;
-- every canonical workflow YAML is registered;
+- every `caller` entry has exactly one canonical YAML and every canonical workflow YAML
+  has exactly one `caller` entry;
+- every `retired` entry has zero canonical files and is absent from the active caller set;
+- the single `config` entry has exactly one canonical bootstrap template and its only
+  mutable existing-file keys are `automation_ref` and `automation_commit`;
 - each caller contains exactly one expected central reusable-workflow job;
-- the central target exists in the release bundle;
-- required and optional sets are disjoint;
-- retired filenames are absent from the canonical workflow directory;
-- no catalog filename uses both `.yml` and `.yaml` variants.
+- every central target exists in the release bundle;
+- required and optional caller sets are disjoint;
+- catalog permission maps, value schemas, and canonical callers agree exactly;
+- no managed path uses both `.yml` and `.yaml` variants.
 
 ## 3. Declarative Fleet Profiles
 
 `scripts/workflow-config.json` remains the fleet inventory but gains an explicit schema
-version and per-repository policy. It no longer treats current file presence as intent.
+version, a closed operation policy, and per-repository policy. It no longer treats current
+file presence as intent. The release-level `workflow-standardization` operation declares
+`secret_writes: deny`; repository entries cannot override it.
 
 Each repository entry declares:
 
 ```json
 {
   "profile": "common-ai-v1",
+  "bootstrap_allowed": false,
   "optional_workflows": ["opencode.yml", "opencode-auto-review.yml"],
-  "gemini_auth": {
+  "gemini": {
+    "model_auth": "gemini_api_key",
     "model_secret": "GEMINI_API_KEY",
     "github_app": true
   }
 }
 ```
 
-`profile: common-ai-v1` means the required catalog is mandatory. A future opt-out must
-be an explicit reviewed configuration change, not an empty workflow directory.
+`profile: common-ai-v1` means the required catalog is mandatory. Only
+`cts-email-mcp-server` and `wpa-supplicant` declare `bootstrap_allowed: true`; this is an
+authorization policy, not inferred or persisted lifecycle state. The other seventeen
+declare false. A future opt-out must be an explicit reviewed configuration change, not an
+empty workflow directory.
 
 ### 3.1 Approved optional-presence snapshot
 
@@ -246,11 +332,26 @@ machine source.
 
 ### 3.2 Authentication profiles
 
-All 19 profiles explicitly select `GEMINI_API_KEY` as the model credential. The
-renderer never also exposes `GOOGLE_API_KEY` merely because that secret later appears.
+Gemini model authentication and repository-write authentication are separate policy axes.
+All 19 profiles select `model_auth: gemini_api_key`. Every Gemini caller passes the exact
+literal `gemini_auth_mode: api-key` and maps only
+`GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}` for model authentication.
 
-GitHub App authentication is enabled for the following eleven repositories because the
-current approved inventory contains both `APP_ID` and `APP_PRIVATE_KEY`:
+The `v1.40` central Gemini workflows accept only that mode. They remove the
+`GOOGLE_API_KEY` reusable secret, never read or forward `GOOGLE_API_KEY`, and never read or
+forward ambient `GCP_WIF_PROVIDER`, `GOOGLE_CLOUD_LOCATION`, `GOOGLE_CLOUD_PROJECT`,
+`SERVICE_ACCOUNT_EMAIL`, `GOOGLE_GENAI_USE_VERTEXAI`, or `GOOGLE_GENAI_USE_GCA`. Their
+Gemini jobs omit `id-token` permission entirely and pass none of the GCP, Vertex AI, or
+Code Assist inputs to the hardened action. A future non-API-key mode requires a new typed
+profile, explicit central input contract, threat review, tests, and immutable release.
+
+Caller-controlled `GEMINI_CLI_VERSION` is also ignored; the hardened action owns the exact
+version and integrity declared in the release lock. Model selection and non-auth runtime
+settings remain unchanged where they do not create another authentication path.
+
+GitHub App authentication for repository API writes is enabled for the following eleven
+repositories because the current approved inventory contains both `APP_ID` and
+`APP_PRIVATE_KEY`:
 
 - `gstApp`
 - `jhw-notion`
@@ -264,8 +365,8 @@ current approved inventory contains both `APP_ID` and `APP_PRIVATE_KEY`:
 - `wlan-driver-v2`
 - `wlan-package`
 
-It is disabled for the other eight repositories. Ambient addition or removal of a
-secret or variable never changes the rendered mapping:
+It is disabled for the other eight repositories. Ambient addition or removal of a secret
+or variable never changes the rendered mapping:
 
 - a configured credential missing from inventory blocks the repository;
 - an unconfigured credential present in inventory is ignored;
@@ -277,26 +378,35 @@ mode is controlled only by the explicit `app_id` input, preventing an `APP_ID`-o
 inventory from failing later inside the called workflow.
 
 The Gemini GitHub App token is restricted exactly to `contents: read`, `issues: write`,
-and `pull-requests: write`. It receives no workflow, secret, administration, or
+and `pull-requests: write`. It receives no workflow, secret, administration, OIDC, or
 cross-repository permission. Tests inspect the pinned token action inputs in every job
 that can mint the token.
 
 ## 4. Bootstrap Policy for the Two Caller-Free Repositories
 
-`cts-email-mcp-server` and `wpa-supplicant` are explicit bootstrap targets. Normal
-`plan` blocks while their config or required catalog is absent and reports that explicit
-bootstrap is required; it does not classify them as skipped or silently create files.
+`cts-email-mcp-server` and `wpa-supplicant` are explicit bootstrap targets. Normal plan
+emits `status: blocked, reason_code: bootstrap_required` only when the reviewed profile has
+`bootstrap_allowed: true`, the config is absent, and zero active managed callers exist.
+A partial managed tree is `blocked/inconsistent_managed_state`; a non-bootstrap profile
+with missing config is `blocked/missing_required_config`. A missing individual caller in
+an otherwise managed repository is ordinary drift. The tool does not classify absence as
+skipped, silently create files, or persist a mutable "bootstrap state."
 
-Bootstrap requires all of:
+Bootstrap has a read-only preview and a separately confirmed publish form. Both require:
 
 - an explicit `--bootstrap-repo <name>` argument;
 - exactly one selected repository per invocation;
-- `--mode publish --confirm`;
 - the declared repository profile and required secret-name prerequisites;
-- zero secret-sync or secret-refresh flags;
-- an independent pull request.
+- the same verified release/tool context as normal rollout.
 
-Bootstrap creates the required catalog and a minimal config with automatic review off:
+`workflows plan --bootstrap-repo <name>` renders an exact temporary diff and manifest
+without a remote write. `workflows publish --bootstrap-repo <name> --plan-manifest
+<path> --confirm` requires that prior manifest's digest, release/profile/catalog hashes,
+and base SHA to remain unchanged, then opens one independent pull request. The workflows
+subcommand has no secret-sync or secret-refresh options.
+
+Bootstrap creates the required callers and a fail-closed config. Every required workflow
+is explicitly disabled; enablement is a later reviewed repository config change:
 
 ```yaml
 automation_ref: v1.40
@@ -304,40 +414,62 @@ automation_commit: <verified-commit>
 review:
   auto: false
 workflows:
+  claude:
+    enabled: false
+  claude-code-review:
+    enabled: false
+  gemini-auto-review:
+    enabled: false
+  gemini-dispatch:
+    enabled: false
+  gemini-invoke:
+    enabled: false
+  gemini-review:
+    enabled: false
   gemini-scheduled-triage:
+    enabled: false
+  gemini-triage:
     enabled: false
 ```
 
+Catalog completeness tests require this bootstrap template to disable every distinct
+`enablement_key` reached by a required caller (the manual issue/PR wrappers share
+`gemini-triage`/`gemini-review`).
 Normal plan always treats config and required callers as mandatory. After bootstrap,
-their deletion remains blocked drift; an operator must deliberately invoke the explicit
-single-repository bootstrap path again to recover it.
+their deletion remains blocked drift; recovery requires the same explicit preview and
+single-repository bootstrap publish path again.
 
 ## 5. Deterministic Renderer
 
-For each repository the renderer performs the following steps entirely in memory or in
-a preview tree before writing the managed clone:
+For each repository the tagged renderer performs the following steps entirely in memory
+or in a preview tree before writing the managed clone:
 
-1. Load and validate the catalog and repository profile.
-2. Resolve and verify the immutable release bundle.
-3. Enumerate secret and variable names only; never read values.
-4. Check declared authentication prerequisites without deriving policy from inventory.
-5. Start every required and profiled optional file from canonical bytes.
-6. Substitute the verified release commit into the expected central `uses:` value.
-7. Render the exact declared `with` and `secrets` mappings.
-8. Apply the approved full action SHAs in managed callers.
-9. Update only `automation_ref` and `automation_commit` in an existing consumer config;
-   preserve all other bytes.
-10. Propose deletion of catalog-declared retired files.
-11. Refuse to touch files outside the managed catalog.
-12. Validate the entire planned repository before performing any write.
+1. Prove the clean detached execution context and all release-bundle digests.
+2. Load and validate the typed catalog, operation policy, and repository profile.
+3. Resolve and verify the immutable release and recursive dependency lock.
+4. Enumerate secret and variable **names** only; never read values.
+5. Check declared authentication prerequisites without deriving policy from inventory.
+6. Start every required and profiled optional caller from canonical bytes.
+7. Substitute the verified release commit into the expected central `uses:` value.
+8. Render the catalog's exact typed `with`/`secrets` mappings, including literal
+   `gemini_auth_mode: api-key`, and no ambient authentication inputs.
+9. Apply only dependency SHAs and digests present in the verified lock.
+10. For the typed `config` entry, update only `automation_ref` and
+    `automation_commit` in an existing file while preserving every other byte.
+11. Propose deletion of typed `retired` paths.
+12. Refuse to touch paths outside the typed managed set.
+13. Validate the entire planned repository before performing any write.
 
 The renderer is idempotent: applying the same verified bundle, catalog, profile, and
 inventory to its own output produces zero changed files.
 
 ### 5.1 Project-owned boundary
 
-Files outside the managed catalog are hashed before and after preparation. Any byte
-change blocks the repository.
+Files outside the typed managed path set are hashed before and after preparation. Any
+byte change blocks the repository. The durable proof is the recorded
+`base_sha..generated_head_sha` diff: it must contain zero changes outside managed paths.
+Final audit evaluates that recorded rollout diff, not an entire later default branch that
+may legitimately contain unrelated project commits.
 
 An out-of-catalog file that calls `jhw7500/automation/.github/workflows` is not silently
 treated as project-owned. It is an unmanaged central caller and blocks until the caller
@@ -349,54 +481,73 @@ reviewed policy change.
 Contracts are loaded only from the verified release bundle. For every central target the
 loader records:
 
-- declared inputs;
-- required inputs;
-- input types and defaults;
-- declared secrets;
-- required secrets.
+- declared inputs, required inputs, and each `string`/`boolean`/`number` type and default;
+- declared and required secrets;
+- the catalog's allowed caller expressions and their expected result types.
 
-Every rendered and existing managed caller must satisfy:
+The static contract checker, not actionlint, is authoritative for remote reusable
+workflows. It preserves YAML scalar node types and directly validates:
+
+- literal booleans are YAML booleans, numbers are YAML numbers, and strings are strings;
+- an expression is allowed only when it exactly matches the catalog/canonical value
+  schema and its declared source type is compatible with the callee input;
+- a forwarding expression such as `${{ inputs.force_run }}` agrees with the caller's own
+  typed trigger input; opaque alternative expressions are rejected;
+- canonical templates themselves satisfy the archived callee contract before consumer
+  rendering.
+
+Every rendered and existing managed caller must also satisfy:
 
 - target workflow exists and declares `workflow_call`;
-- no unknown input or secret key;
-- every required input and secret is present;
+- no unknown input or secret key and every required key is present;
 - secret sources are exactly `${{ secrets.<same-name> }}`;
 - `app_id`, when configured, is exactly `${{ vars.APP_ID }}`;
+- `gemini_auth_mode` is the literal string `api-key` for every Gemini caller;
 - the caller uses the verified release commit;
-- caller job permissions equal the catalog permission allowlist;
+- caller job permissions equal the catalog's explicit per-job permission maps;
 - triggers and all non-profile-dependent structure equal canonical output;
 - no `secrets: inherit`;
 - OpenCode callers contain no `id-token: write` and retain the read-only contents
-  ceiling and same-repository caller guard.
+  ceiling and same-repository caller guard;
+- Gemini callers contain no `id-token`, Google API-key, GCP, Vertex AI, Code Assist, or
+  caller-selected CLI-version path.
 
-Static audit checks key presence and canonical expressions. Actionlint supplies GitHub
-expression and input type validation. Missing/unknown input and secret tests must fail
-for the intended reason before production code is added.
+Actionlint remains mandatory for syntax, expressions it can understand, and local
+workflow checks, but no gate assumes it downloads or type-checks an external reusable
+workflow. Regression tests cover wrong boolean, number, and string literals; incompatible
+forwarded expressions; unknown/missing inputs; and wrong secret sources.
 
 ## 7. One Writer and One Upgrade Path
 
-`scripts/rollout_workflow_fleet.py` is the only supported remote workflow writer and the
-only release-upgrade path.
+The tagged `scripts/rollout_workflow_fleet.py workflows ...` subcommand is the only
+supported remote workflow writer and release-upgrade path.
 
 - `setup-github-workflows.sh` and `sync-secrets.sh` become side-effect-free deprecation
-  guards. `--help` prints the exact Python replacement commands; every former mutating
-  invocation exits with status 2 without reading a secret or changing a repository.
-- `bump-automation-ref.yml` is removed from consumers and the catalog.
-- `sync-secrets.sh` is not used by this rollout. Future secret operations use the
-  Python tool's explicit allowlisted flags and remain a separately confirmed phase.
-- Documentation must direct operators to profile changes plus fleet plan/publish rather
-  than editing or deleting common wrapper files.
+  guards. `--help` prints the exact replacement; every former mutating invocation exits
+  with status 2 without reading a secret or changing a repository.
+- `bump-automation-ref.yml` is removed from consumers and retained only as a typed retired
+  path.
+- The `workflows` parser exposes only `plan` and `publish`; it has no secret-sync,
+  secret-refresh, secret-value, or generic passthrough option. The release profile and
+  manifest both require `operation: workflow-standardization` and `secret_writes: deny`.
+- Any future fleet secret operation uses a separate first-class command path, separate
+  confirmation, and code path that cannot write workflow files. It is not chained into
+  this rollout.
+- Tests replace GitHub secret endpoints with fail-on-call sentinels and require zero calls
+  in both workflow plan and publish.
+- Documentation directs operators to profile changes plus fleet plan/publish rather than
+  editing or deleting common wrapper files.
 
 The rollout CLI separates target release identity from rollout identity:
 
 ```text
---ref v1.40
---rollout-id common-ai-v1-v140
+workflows plan|publish --ref v1.40 --rollout-id common-ai-v1-v140
 ```
 
-Branches, commit messages, PR titles, and manifests use the rollout ID. They do not reuse
-the old secret-hardening branch name or claim that repository-owned triggers and
-permissions were preserved when canonical replacement intentionally changes them.
+The rollout ID is cosmetic metadata, never a security switch. Branches, commit messages,
+PR titles, and manifests use it. They do not reuse the old secret-hardening branch name or
+claim that repository-owned triggers and permissions were preserved when canonical
+replacement intentionally changes them.
 
 ## 8. Validation and Failure Semantics
 
@@ -404,47 +555,59 @@ permissions were preserved when canonical replacement intentionally changes them
 
 Plan mode is read-only for GitHub state. It fetches every default branch, renders into a
 temporary preview, and collects outcomes for the full fleet. It may write only local
-disposable clones and the requested local manifest.
+disposable clones, previews, and the requested local manifest outside the clean release
+worktree.
 
 Required plan gates:
 
-- verified local/remote release bundle and hashes;
-- profile/catalog schema validation;
-- secret/variable name prerequisites;
-- complete input and secret contract audit;
+- verified detached execution context, local/remote release identity, and bundle hashes;
+- typed profile/catalog and closed operation-policy validation;
+- recursive action/container/artifact lock verification;
+- secret/variable name prerequisites without value reads;
+- authoritative static input-type and secret contract audit;
 - exact managed-file comparison;
 - retired and unmanaged central-caller checks;
+- Gemini API-key-only and no-OIDC/no-GCP assertions;
 - YAML parse;
 - `git diff --check`;
 - mandatory actionlint `1.7.12` using the official Linux AMD64 archive SHA-256
   `8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8`, with recorded
   version and fail-closed process status;
-- zero new actionlint diagnostics compared with untouched project-owned baseline;
-- confirmation that project-owned file hashes are unchanged.
+- zero actionlint diagnostics in released/canonical managed workflows and zero new
+  diagnostics compared with the untouched project-owned baseline;
+- a zero unmanaged-path diff between each recorded base and generated head.
 
-Plan returns non-zero for any `blocked` outcome. It does not hide a missing catalog
-behind `skipped`.
+Every repository outcome uses `status: current|drift|blocked` plus a stable reason code.
+`bootstrap_required` is a failure reason, not persistent policy state. Plan exits 0 only
+when there is no blocked outcome, exits 3 when it produces a complete manifest containing
+one or more blocked repositories, and exits 2 when it cannot produce a trustworthy full
+manifest. It never hides a missing catalog behind `skipped`.
 
 ### 8.2 Publish
 
-Publish retains `--confirm` and is fail-fast by default. A repository is prepared and
-fully validated before any push. Immediately before commit/push, the tool refetches the
-remote default branch and requires it to equal the recorded base SHA. A mismatch blocks
-without pushing and must be replanned.
+Publish requires `--plan-manifest`, verifies that manifest's digest and all release,
+tool, policy, profile, catalog, lock, preview, and base identities, then retains
+`--confirm` and fail-fast behavior. A repository is fully validated before any push.
+Immediately before commit/push, the tool refetches the remote default branch and requires
+it to equal the recorded base SHA. A mismatch blocks without pushing and must be
+replanned.
 
 Each repository receives an independent branch and pull request. The manifest records
-completed remote effects. Resumption uses explicit `--repo` selections and never
-replays already merged repositories implicitly.
+completed remote effects. Resumption uses explicit `--repo` selections and never replays
+already merged repositories implicitly.
 
-The tool rejects every secret-sync and refresh option for this rollout ID. Every
-manifest outcome must contain `synced_secrets: []`.
+The workflow-standardization operation structurally has no secret option or secret-write
+code path, regardless of rollout ID. Every manifest outcome must contain
+`synced_secrets: []`, and any attempt to supply a secret-related flag is a parser error
+before GitHub access.
 
 ### 8.3 Tool failure
 
-Actionlint absence, non-zero execution without parseable diagnostics, malformed GitHub
-metadata, release/tag mismatch, stale default branch, invalid YAML, incomplete
-inventory, or a catalog inconsistency is blocked rather than treated as an empty clean
-result.
+Dirty or mismatched release tooling, actionlint absence, non-zero execution without
+parseable diagnostics, malformed GitHub metadata, nested dependency-lock drift,
+release/tag mismatch, stale default branch, invalid YAML, incompatible input types,
+ambient Gemini authentication paths, incomplete inventory, or a catalog inconsistency is
+blocked rather than treated as an empty clean result.
 
 ## 9. Test Strategy
 
@@ -453,61 +616,88 @@ a failing regression test.
 
 ### Release and catalog
 
-- local and remote tag mismatch fails;
-- catalog or action-pin digest mismatch fails;
-- any released remote action tag/branch ref fails;
-- all catalog files exist and no unregistered managed YAML exists;
+- local/remote tag mismatch, non-detached HEAD, dirty/untracked release tree, tool-commit
+  mismatch, and outside-root project import each fail;
+- catalog, fleet-profile, or recursive lock digest mismatch fails;
+- a root or nested action tag/branch, mutable container tag, missing fetched tree, or
+  unlocked reusable-workflow edge fails;
+- an internal action pin that is not an ancestor or whose full directory tree differs at
+  release fails;
+- the hardened Gemini action uses only locked nested dependencies and the exact CLI
+  version/integrity; `latest`, `preview`, and caller version input fail;
+- every typed caller/config/retired entry satisfies its class-specific cardinality and no
+  unregistered managed YAML exists;
 - missing required and profiled optional files are drift;
-- unprofiled optional and retired files are reported according to policy.
+- unprofiled optional and retired files produce their declared deletion drift.
 
 ### Rendering and contracts
 
 - required caller output equals canonical rendering;
 - API-key-only and GitHub-App profiles differ only by approved fields;
-- ambient `GOOGLE_API_KEY` or `APP_ID` does not expand a profile;
+- adding any ambient `GOOGLE_API_KEY`, App, GCP/WIF, Vertex AI, Code Assist, or CLI-version
+  variable does not expand a profile;
+- every Gemini caller and central Gemini job remains no-OIDC and API-key-only;
 - partial configured App inventory blocks;
-- missing and unknown input keys fail;
+- missing/unknown inputs and wrong boolean, number, string, or forwarded-expression types
+  fail in the static checker even when actionlint returns 0;
 - missing, unknown, inherited, and wrong-source secrets fail;
 - caller permissions, trigger, input, and same-repository guard drift fail;
 - out-of-catalog central callers fail;
-- project-owned hashes remain identical;
+- only the two allowed existing-config scalars change;
+- `base_sha..generated_head_sha` contains zero project-owned changes;
 - retired bump files are deleted;
 - a second render produces no changes;
 - no file is written when any planned YAML is invalid.
 
 ### Orchestration
 
-- plan performs no remote write and reports all repositories;
-- normal mode does not infer bootstrap from absence;
-- bootstrap requires one explicit repository and confirmation;
+- plan performs no remote write and reports all repositories with stable status/reason;
+- only an explicitly bootstrap-allowed, fully caller-free/config-free repository yields
+  `blocked/bootstrap_required`; partial and unauthorized absence use distinct blocks;
+- bootstrap plan is read-only and bootstrap publish requires one repository, its unchanged
+  plan-manifest digest, and confirmation;
 - publish requires actionlint and fails on tool execution errors;
-- publish refetches and blocks a stale default branch;
+- publish refetches and blocks a stale default branch or stale preview;
 - publish is fail-fast and resume is explicit;
-- rollout branch and PR text use rollout ID rather than release-only identity;
+- rollout branch and PR text use rollout ID as metadata rather than a security switch;
+- secret-related flags are parser errors and fail-on-call GitHub secret sentinels remain
+  untouched;
 - all standardization manifests contain empty `synced_secrets`.
 
 ## 10. Rollout Sequence and Stop Conditions
 
 ### Gate 1: automation implementation and release
 
-1. Implement in the isolated `codex/standardize-common-workflows` worktree.
-2. Review the automation changes as two bounded commits or pull requests:
-   - runtime hardening: transitive action pins, explicit App mode, and release verifier;
-   - delivery tooling: catalog, profiles, renderer/auditor, writer retirement, and tests.
-3. Run the full unit, YAML, release-bundle, action-pin, actionlint, and diff gates after
-   each bounded change.
-4. Merge both in dependency order, fetch the final exact merge commit, and rerun all
-   gates from that commit.
+1. Implement in isolated worktrees and use three bounded, non-squashed PRs so an internal
+   action can be pinned to a real ancestor on `main`:
+   - action payload: finalized hardened internal action trees, upstream notices, locked
+     nested Actions/images, and exact Gemini CLI installer integrity;
+   - runtime workflows: central workflows pinned to the merged action-payload commit,
+     API-key-only Gemini mode, explicit App mode, dependency lock, and release verifier;
+   - delivery tooling: typed catalog, profiles, static contract checker,
+     renderer/auditor, writer retirement, and orchestration tests.
+2. After the action-payload PR merges, record its exact mainline merge commit. The next
+   PR pins that commit; squash or history rewriting that would destroy ancestry is not
+   allowed.
+3. Run the full unit, YAML, archived-bundle, recursive-lock, static-contract, actionlint,
+   and diff gates after each bounded PR.
+4. Merge in dependency order. The later PRs must not modify the pinned internal action
+   trees. Fetch the final exact merge commit and rerun all gates from a clean detached
+   checkout of that commit.
 5. Create annotated `v1.40` only at the final commit and verify locally before push.
-6. Push the tag and rerun the verifier against remote.
+6. Push the tag and rerun the verifier against remote from a new clean detached checkout.
 
 Do not create a consumer PR before the remote release verifier succeeds.
 
 ### Gate 2: full read-only fleet plan
 
-Run all 19 profiles with secret sync disabled. Expected initial outcomes are drift for
-the 17 existing consumers and explicit blocked/bootstrap instructions for the two
-caller-free repositories, with no ordinary skip.
+Run normal read-only plan for all 19 profiles. The expected manifest is exactly 17
+`status: drift`, exactly two `status: blocked, reason_code: bootstrap_required`
+(`cts-email-mcp-server` and `wpa-supplicant`), zero other blocked reasons, and no skip.
+Exit 3 is expected for this discovery gate. The controller may advance only after parsing
+and hashing that exact complete manifest; any other count, reason, exit code, incomplete
+result, or secret endpoint call stops. This is the sole gate-specific exception to the
+normal "any blocked stops" rule.
 
 ### Gate 3: behavioral and bootstrap canaries
 
@@ -515,16 +705,18 @@ caller-free repositories, with no ordinary skip.
    GitHub-App profile, OpenCode automatic review, and manual `/opencode` path.
 2. `wlan-driver`: validate the API-key-only profile produces no App input or private-key
    mapping.
-3. `cts-email-mcp-server`: bootstrap the required catalog with automatic review disabled
-   and verify workflow discovery/skip behavior on a harmless pull request.
+3. `cts-email-mcp-server`: first approve the explicit bootstrap plan, then publish from
+   that unchanged plan manifest. Verify all required callers are discovered and skip
+   because the fail-closed bootstrap config disables every caller.
 
 Temporary canary pull requests and branches are closed or deleted after evidence is
 captured. Any canary failure stops the rollout.
 
 ### Gate 4: fleet publish
 
-Publish independent PRs for the remaining repositories. `wpa-supplicant` uses the same
-explicit bootstrap path and remains automatic-review-disabled initially.
+Publish independent PRs for the remaining repositories from their unchanged plan
+manifests. `wpa-supplicant` receives its own explicit bootstrap plan and confirmed publish;
+all of its common callers remain disabled until a separate reviewed enablement change.
 
 ### Gate 5: final audit
 
@@ -535,10 +727,11 @@ The final read-only plan must report:
 - `blocked=0`;
 - `synced_secrets=[]` for every repository;
 - all consumer callers pinned to the verified release commit;
-- project-owned hashes unchanged from each PR base.
+- each recorded `base_sha..generated_head_sha` changes zero unmanaged paths.
 
-At every gate, release verification, catalog/profile validation, contract audit, YAML,
-actionlint, default-branch freshness, project-file hashes, or live canary failure stops
+Except for the exact Gate 2 discovery condition above, any release/tool verification,
+dependency-lock, catalog/profile, contract/type, Gemini-auth, YAML, actionlint,
+default-branch freshness, unmanaged-path, secret-endpoint, or live-canary failure stops
 the next stage.
 
 ## 11. Recovery
@@ -547,7 +740,7 @@ the next stage.
 - Initial design commit: `7ea29d2e5d5c7b1673cce378c40c8c24deb3df81`.
 - Development remains isolated on `codex/standardize-common-workflows`.
 - Before merge, delete the isolated worktree and branch to abandon the change.
-- After merge, revert the automation PR; never move or delete `v1.40`.
+- After merge, revert the three automation PRs in reverse order; never move or delete `v1.40`.
 - If released behavior is unsafe, fix forward with a new immutable tag.
 - Consumer changes are independent PRs and are reverted independently in reverse merge
   order.
@@ -558,22 +751,33 @@ the next stage.
 
 ## 12. Acceptance Criteria
 
-- `v1.40` local and remote tags resolve to the reviewed merge commit.
-- The release bundle verifier passes against the archived tag content.
-- Every released remote action reference is an approved full commit SHA.
-- The canonical catalog is complete, unique, and digest-recorded.
-- All 19 repository profiles are explicit; no management or optional state is inferred
-  from file presence.
-- All 19 repositories contain the required catalog and exactly their profiled optional
+- `v1.40` local and remote tags resolve to the reviewed final merge commit.
+- Rollout executes only from a clean detached checkout whose tool commit equals that
+  release commit; mismatch, dirty tree, and outside-root import tests pass.
+- The archived release-bundle verifier passes and all recorded bundle/profile/catalog/lock
+  digests match.
+- Every root and nested remote action/reusable-workflow reference is an approved full SHA;
+  every remote image is digest-pinned; internal ancestor action trees equal release trees.
+- The hardened Gemini action uses exactly CLI `0.55.1` with the recorded npm integrity and
+  no caller-controlled/latest/preview path.
+- The typed catalog is complete, class-consistent, unique, and digest-recorded.
+- All 19 repository profiles are explicit; no management, optional, or authentication
+  state is inferred from ambient inventory or file presence.
+- All 19 repositories contain the required callers and exactly their profiled optional
   callers.
-- Every central caller uses the verified release commit and satisfies complete input,
-  secret, permission, and trigger contracts.
+- Every central caller uses the verified release commit and satisfies authoritative input
+  type, secret, permission, trigger, and canonical-expression contracts.
+- Gemini is API-key-only with no OIDC/GCP/Vertex/Code Assist/Google API-key path; GitHub
+  App mode remains separately explicit and least-privileged.
 - No managed caller uses `secrets: inherit` or an undeclared ambient credential.
 - `bump-automation-ref.yml` is absent from all consumers.
-- Every project-owned workflow hash equals its pre-rollout base hash.
+- Every recorded rollout `base_sha..generated_head_sha` contains zero unmanaged-path
+  changes.
 - Mandatory actionlint and all automated tests pass with recorded versions/evidence.
-- Publish-time default branch SHA equals its planned base SHA for each repository.
+- Publish consumes an unchanged plan manifest and the remote default branch still equals
+  its planned base SHA for each repository.
 - `wlan-package` automatic and manual OpenCode canaries succeed.
-- API-key-only and bootstrap canaries satisfy their declared profiles.
+- API-key-only and fail-closed bootstrap canaries satisfy their declared profiles.
 - Final fleet state is `current=19`, `skipped=0`, `blocked=0`.
-- Every manifest entry has `synced_secrets: []`.
+- The operation policy is `secret_writes: deny`; secret endpoint sentinels remain unused;
+  every manifest entry has `synced_secrets: []`.
