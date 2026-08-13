@@ -115,6 +115,15 @@ EXPECTED_GEMINI_VALIDATION = {
     ),
 }
 GEMINI_AUTH_OUTPUT = "${{ steps.auth.outputs.token }}"
+APPROVED_GEMINI_ACTIONS = frozenset(
+    {
+        CHECKOUT_ACTION,
+        "actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea",
+        "google-github-actions/run-gemini-cli@v0",
+        "jhw7500/automation/.github/actions/check-workflow-enabled@v1.1",
+        SETUP_GEMINI_AUTH,
+    }
+)
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -415,6 +424,50 @@ def _resolver_candidate(step: dict) -> bool:
     )
 
 
+def _grants_write(permissions: object) -> bool:
+    return permissions == "write-all" or (
+        isinstance(permissions, dict)
+        and any(value == "write" for value in permissions.values())
+    )
+
+
+def _action_references(value: object) -> list[str]:
+    result: list[str] = []
+    if isinstance(value, dict):
+        uses = value.get("uses")
+        if isinstance(uses, str):
+            result.append(uses)
+        for item in value.values():
+            result.extend(_action_references(item))
+    elif isinstance(value, list):
+        for item in value:
+            result.extend(_action_references(item))
+    return result
+
+
+def _verify_token_mapping(
+    name: str, location: str, mapping: object, *, allow_empty: bool = False
+) -> int:
+    if not isinstance(mapping, dict):
+        return 0
+    sinks = 0
+    for key, value in mapping.items():
+        token_key = str(key).lower().replace("_", "-")
+        if token_key == "token" or token_key.endswith("-token"):
+            if allow_empty:
+                if value in {None, ""}:
+                    continue
+                raise ReleaseVerificationError(
+                    f"{name}:{location} sets a repository token before resolver"
+                )
+            sinks += 1
+            if value != GEMINI_AUTH_OUTPUT:
+                raise ReleaseVerificationError(
+                    f"{name}:{location} repository token sink must use steps.auth"
+                )
+    return sinks
+
+
 def _verify_gemini_workflow(name: str, document: dict) -> None:
     try:
         call = document["on"]["workflow_call"]
@@ -459,6 +512,24 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
         )
     if "vars.app_id" in normalized_lower:
         raise ReleaseVerificationError(f"{name} contains forbidden ambient App fallback")
+    if _grants_write(document.get("permissions")):
+        raise ReleaseVerificationError(
+            f"{name} must not grant workflow-level write permissions"
+        )
+    unapproved_actions = sorted(
+        set(_action_references(document)) - APPROVED_GEMINI_ACTIONS
+    )
+    if unapproved_actions:
+        raise ReleaseVerificationError(
+            f"{name} uses a resolver/action outside the approved action allowlist: "
+            f"{unapproved_actions[0]}"
+        )
+    workflow_metadata = {key: value for key, value in document.items() if key != "jobs"}
+    if "github.token" in "\n".join(_values(workflow_metadata)):
+        raise ReleaseVerificationError(
+            f"{name}:workflow contains forbidden github.token outside resolver"
+        )
+    _verify_token_mapping(name, "workflow.env", document.get("env", {}), allow_empty=True)
 
     jobs = document.get("jobs", {})
     if not isinstance(jobs, dict):
@@ -476,9 +547,7 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
             index for index, step in enumerate(steps) if _resolver_candidate(step)
         ]
         permissions = job.get("permissions", {})
-        writes = isinstance(permissions, dict) and any(
-            value == "write" for value in permissions.values()
-        )
+        writes = _grants_write(permissions)
         if writes and len(candidates) != 1:
             raise ReleaseVerificationError(
                 f"{name}:{job_name} must contain exactly one setup-gemini-auth resolver"
@@ -508,7 +577,14 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
                 "repository-write auth validation"
             )
 
-        write_token_sinks = 0
+        metadata = {key: value for key, value in job.items() if key != "steps"}
+        if "github.token" in "\n".join(_values(metadata)):
+            raise ReleaseVerificationError(
+                f"{name}:{job_name} contains forbidden github.token outside resolver"
+            )
+        write_token_sinks = _verify_token_mapping(
+            name, f"{job_name}.env", job.get("env", {}), allow_empty=True
+        )
         for step_index, step in enumerate(steps):
             if step_index == index:
                 continue
@@ -516,20 +592,13 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
                 raise ReleaseVerificationError(
                     f"{name}:{job_name} bypasses the resolved repository-write token"
                 )
-            if step_index < index:
-                continue
             for mapping_name in ("env", "with"):
-                mapping = step.get(mapping_name, {})
-                if not isinstance(mapping, dict):
-                    continue
-                for key, value in mapping.items():
-                    token_key = str(key).lower().replace("_", "-")
-                    if token_key == "token" or token_key.endswith("-token"):
-                        write_token_sinks += 1
-                        if value != GEMINI_AUTH_OUTPUT:
-                            raise ReleaseVerificationError(
-                                f"{name}:{job_name} write token sink bypasses steps.auth"
-                            )
+                write_token_sinks += _verify_token_mapping(
+                    name,
+                    f"{job_name}.steps[{step_index}].{mapping_name}",
+                    step.get(mapping_name, {}),
+                    allow_empty=step_index < index,
+                )
         if write_token_sinks == 0:
             raise ReleaseVerificationError(
                 f"{name}:{job_name} has no resolved repository-write token sink"

@@ -215,6 +215,63 @@ def validation_not_immediately_before_resolver(path: Path) -> None:
     replace(path, needle, replacement, count=1)
 
 
+def mutate_yaml(path: Path, mutate) -> None:
+    document = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    mutate(document)
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+
+def inherited_write_without_resolver(path: Path) -> None:
+    def mutate(document: dict) -> None:
+        document["permissions"] = {"issues": "write"}
+        document["jobs"]["inherited-writer"] = {
+            "runs-on": "ubuntu-latest",
+            "env": {"GH_TOKEN": "${{ github.token }}"},
+            "steps": [{"run": "gh issue comment 1 --body inherited"}],
+        }
+
+    mutate_yaml(path, mutate)
+
+
+def explicit_write_without_resolver(path: Path) -> None:
+    def mutate(document: dict) -> None:
+        document["jobs"]["direct-writer"] = {
+            "runs-on": "ubuntu-latest",
+            "permissions": {"issues": "write"},
+            "steps": [{"run": 'echo "${{ github.token }}"'}],
+        }
+
+    mutate_yaml(path, mutate)
+
+
+def github_token_in_write_job_env(path: Path) -> None:
+    def mutate(document: dict) -> None:
+        document["jobs"]["gemini-review"]["env"] = {
+            "GH_TOKEN": "${{ github.token }}"
+        }
+
+    mutate_yaml(path, mutate)
+
+
+def alternate_local_token_mint_action(path: Path) -> None:
+    def mutate(document: dict) -> None:
+        document["jobs"]["gemini-review"]["steps"].append(
+            {
+                "name": "Mint another repository token",
+                "uses": "./.github/actions/mint-repository-token",
+            }
+        )
+
+    mutate_yaml(path, mutate)
+
+
+def github_token_in_workflow_env(path: Path) -> None:
+    def mutate(document: dict) -> None:
+        document["env"] = {"GH_TOKEN": "${{ github.token }}"}
+
+    mutate_yaml(path, mutate)
+
+
 def test_accepts_local_and_remote_annotated_tag_at_secure_commit(
     release_repo: tuple[Path, Path, str],
 ) -> None:
@@ -522,5 +579,33 @@ def test_rejects_insecure_tagged_gemini_contracts(
     repo, _, _ = release_repo
     mutate(repo / ".github/workflows/gemini-auto-review.yml")
     bad_commit = retag_bad_release(repo, "break Gemini contract")
+    with pytest.raises(ReleaseVerificationError, match=error):
+        verify_release(repo, "v1.40", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error"),
+    [
+        (inherited_write_without_resolver, "workflow-level write permissions"),
+        (explicit_write_without_resolver, "exactly one.*resolver"),
+        (github_token_in_write_job_env, "github.token"),
+        (alternate_local_token_mint_action, "approved action"),
+        (github_token_in_workflow_env, "workflow.*github.token"),
+    ],
+    ids=(
+        "inherited-write",
+        "explicit-write-run-token",
+        "job-env-token",
+        "alternate-mint-action",
+        "workflow-env-token",
+    ),
+)
+def test_rejects_effective_gemini_write_path_auth_bypasses(
+    release_repo: tuple[Path, Path, str], mutate, error: str
+) -> None:
+    repo, _, _ = release_repo
+    mutate(repo / ".github/workflows/gemini-auto-review.yml")
+    bad_commit = retag_bad_release(repo, "add effective write bypass")
+
     with pytest.raises(ReleaseVerificationError, match=error):
         verify_release(repo, "v1.40", bad_commit)
