@@ -27,6 +27,13 @@ DESIGN = (
 )
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "test-fleet-tools.yml"
 CENTRAL_WORKFLOWS = ROOT / ".github" / "workflows"
+IMPLEMENTATION_PLAN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-13-common-workflow-pr-rollout.md"
+)
 
 FORBIDDEN = {
     "--sync-missing-secrets",
@@ -128,6 +135,49 @@ def test_retired_scripts_remain_directly_executable() -> None:
         assert script.stat().st_mode & stat.S_IXUSR, script.name
 
 
+def test_retired_scripts_use_only_bash_builtins_with_hostile_or_missing_path(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "external-cat-called"
+    fake_cat = fake_bin / "cat"
+    fake_cat.write_text(
+        "#!/bin/bash\nprintf called > \"$MARKER\"\nexit 97\n",
+        encoding="utf-8",
+    )
+    fake_cat.chmod(0o755)
+
+    for script in LEGACY_SCRIPTS:
+        source = script.read_text(encoding="utf-8")
+        assert re.search(r"(?m)^\s*cat(?:\s|$)", source) is None, script.name
+
+        missing_path = subprocess.run(
+            [str(script)],
+            env={"PATH": "/nonexistent", "HOME": str(tmp_path)},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert missing_path.returncode == 2, script.name
+        assert "performs no changes" in missing_path.stderr
+
+        hostile_path = subprocess.run(
+            ["/bin/bash", str(script)],
+            env={
+                "PATH": str(fake_bin),
+                "HOME": str(tmp_path),
+                "MARKER": str(marker),
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert hostile_path.returncode == 2, script.name
+        assert "performs no changes" in hostile_path.stderr
+        assert not marker.exists()
+
+
 def test_retired_options_are_absent_from_operator_surfaces() -> None:
     paths = (*LEGACY_SCRIPTS, ROLLOUT_DOC, CONTRACT_DOC, BASELINE_README, DESIGN)
     combined = "\n".join(path.read_text(encoding="utf-8") for path in paths)
@@ -147,7 +197,7 @@ def test_rollout_document_describes_pr_only_operation_and_separate_tokens() -> N
     assert "--bootstrap-repo wpa-supplicant" in text
     assert "automation/common-workflows-v1.40" in text
 
-    for status in ("current", "drift", "bootstrap_required", "blocked"):
+    for status in ("current", "planned", "reusable", "blocked"):
         assert f"`{status}`" in text
     for canary in ("wlan-package", "wlan-driver", "cts-email-mcp-server"):
         assert canary in text
@@ -161,6 +211,23 @@ def test_rollout_document_describes_pr_only_operation_and_separate_tokens() -> N
         "personal-ops/claude-token-sync",
     ):
         assert rule in text
+    assert "public plan statuses" in text.lower()
+    assert "missing config without explicit bootstrap" in text.lower()
+    assert "renderer-only" in text.lower()
+    assert "Audit reports `current`, `drift`, or `blocked`" in text
+
+
+def test_rollout_recovery_matches_closed_pr_fail_closed_behavior() -> None:
+    rollout = ROLLOUT_DOC.read_text(encoding="utf-8")
+    design = DESIGN.read_text(encoding="utf-8")
+    combined = f"{rollout}\n{design}"
+
+    assert "closed PR history" in combined
+    assert "blocks reuse" in combined
+    assert "new immutable release" in combined
+    assert "same repository/release attempt" in combined
+    assert "close the PR and delete" not in combined.lower()
+    assert "re-run plan and create a new PR" not in combined.lower()
 
 
 def test_consumer_docs_match_commit_pins_auth_modes_and_catalog_boundary() -> None:
@@ -196,6 +263,8 @@ def test_fleet_ci_covers_policy_canonical_code_tests_and_docs() -> None:
         "scripts/*.sh",
         "tests/*.py",
         ".github/workflows/*.yml",
+        ".github/actions/**/*.yml",
+        ".github/actions/**/*.yaml",
         "examples/baseline-workflows/.github/**/*.yml",
         "docs/workflow-fleet-rollout.md",
         "docs/workflows/**/*.md",
@@ -264,8 +333,195 @@ def test_run_gemini_cli_output_consumers_use_the_public_action_contract() -> Non
                 (path.name, step_id, match.group(1))
                 for match in pattern.finditer(text)
             )
+            for job in workflow.get("jobs", {}).values():
+                for step in job.get("steps", []):
+                    assert pattern.search(step.get("run", "")) is None, (
+                        path.name,
+                        step.get("name", step.get("id", "unnamed")),
+                        step_id,
+                    )
 
     assert consumers
     assert sorted(
         item for item in consumers if item[2] not in allowed_outputs
     ) == []
+
+
+def _workflow_step(path: Path, name: str) -> dict:
+    workflow = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    matches = [
+        step
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("name") == name
+    ]
+    assert len(matches) == 1, (path.name, name)
+    return matches[0]
+
+
+def _parse_github_outputs(text: str) -> dict[str, str]:
+    lines = text.splitlines()
+    parsed: dict[str, str] = {}
+    index = 0
+    while index < len(lines):
+        header = lines[index]
+        if "<<" not in header:
+            name, value = header.split("=", 1)
+            parsed[name] = value
+            index += 1
+            continue
+        name, delimiter = header.split("<<", 1)
+        index += 1
+        value: list[str] = []
+        while index < len(lines) and lines[index] != delimiter:
+            value.append(lines[index])
+            index += 1
+        assert index < len(lines), (name, delimiter)
+        parsed[name] = "\n".join(value)
+        index += 1
+    return parsed
+
+
+def test_final_gemini_selection_treats_adversarial_model_output_as_data(
+    tmp_path: Path,
+) -> None:
+    step = _workflow_step(
+        CENTRAL_WORKFLOWS / "gemini-dispatch.yml", "Set final review result"
+    )
+    marker = tmp_path / "command-substitution-ran"
+    backtick_marker = tmp_path / "backtick-ran"
+    response = (
+        f'alpha $(touch "{marker}") `touch "{backtick_marker}"` "double" \'single\'\n'
+        "__AUTOMATION_OUTPUT__\nomega"
+    )
+    error = "failure %s $(false) `false`\nsecond line"
+    output = tmp_path / "github-output"
+    environment = {
+        **os.environ,
+        "GITHUB_OUTPUT": str(output),
+        "PRIMARY_OUTCOME": "success",
+        "PRIMARY_MODEL": "gemini-primary",
+        "PRIMARY_RESPONSE": response,
+        "PRIMARY_ERRORS": error,
+        "FALLBACK_OUTCOME": "failure",
+        "FALLBACK_MODEL": "gemini-fallback",
+        "FALLBACK_RESPONSE": "unused",
+        "FALLBACK_ERRORS": "unused",
+    }
+
+    completed = subprocess.run(
+        ["/bin/bash", "-eu", "-o", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not marker.exists()
+    assert not backtick_marker.exists()
+    assert _parse_github_outputs(output.read_text(encoding="utf-8")) == {
+        "outcome": "success",
+        "model": "gemini-primary",
+        "response": response,
+        "errors": error,
+    }
+
+
+@pytest.mark.parametrize(
+    "step_name",
+    ("Log primary model failure", "Log primary model failure (invoke)"),
+)
+def test_failure_comments_propagate_adversarial_error_text_as_data(
+    tmp_path: Path, step_name: str
+) -> None:
+    step = _workflow_step(CENTRAL_WORKFLOWS / "gemini-dispatch.yml", step_name)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    capture = tmp_path / "captured-comment"
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        "while (($#)); do\n"
+        "  if [[ $1 == --body-file ]]; then /bin/cp -- \"$2\" \"$CAPTURE\"; exit 0; fi\n"
+        "  shift\n"
+        "done\n"
+        "exit 98\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    marker = tmp_path / "error-command-ran"
+    backtick_marker = tmp_path / "error-backtick-ran"
+    model = 'gemini "quoted" $(not-a-command)'
+    errors = (
+        f'first $(touch "{marker}") `touch "{backtick_marker}"` %s "quote"\n'
+        "second line"
+    )
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "CAPTURE": str(capture),
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_TOKEN": "token",
+        "ISSUE_NUMBER": "17",
+        "PRIMARY_MODEL": model,
+        "FALLBACK_MODEL": "fallback-model",
+        "ERRORS": errors,
+        "REPOSITORY": "jhw7500/example",
+    }
+
+    completed = subprocess.run(
+        ["/bin/bash", "-eu", "-o", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not marker.exists()
+    assert not backtick_marker.exists()
+    body = capture.read_text(encoding="utf-8")
+    assert model in body
+    assert errors in body
+    assert "$PRIMARY_MODEL" not in body
+    assert "$ERRORS" not in body
+
+
+def test_task9_is_fail_closed_sequential_and_reuses_the_marked_workspace() -> None:
+    text = IMPLEMENTATION_PLAN.read_text(encoding="utf-8")
+
+    assert "set -euo pipefail" in text
+    assert "show-ref --verify --quiet refs/tags/v1.40" in text
+    assert "ls-remote --tags origin refs/tags/v1.40" in text
+    tag_index = text.index("git tag -a v1.40")
+    verify_index = text.index("scripts/verify_workflow_release.py", tag_index)
+    push_index = text.index("git push origin refs/tags/v1.40", verify_index)
+    assert tag_index < verify_index < push_index
+    assert "--repo wlan-package --repo wlan-driver" not in text
+    package_index = text.index("--repo wlan-package", push_index)
+    package_approval = text.index("wlan-package", package_index + len("--repo wlan-package"))
+    driver_index = text.index("--repo wlan-driver", package_approval)
+    bootstrap_index = text.index("--repo cts-email-mcp-server", driver_index)
+    assert package_index < package_approval < driver_index < bootstrap_index
+    assert "--workspace /tmp/automation-v1.40-audit" not in text
+    expected_audit = (
+        "scripts/audit_workflow_fleet.py \\\n"
+        "  --automation . --workspace /tmp/automation-v1.40-fleet --ref v1.40"
+    )
+    assert expected_audit in text
+
+
+def test_design_and_plan_distinguish_public_plan_and_audit_statuses() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    plan = IMPLEMENTATION_PLAN.read_text(encoding="utf-8")
+    for text in (design, plan):
+        assert "public plan statuses" in text.lower()
+        for status in ("current", "planned", "reusable", "blocked"):
+            assert f"`{status}`" in text
+        assert "missing config without explicit bootstrap" in text.lower()
+        assert "audit" in text.lower()
+        assert "`drift`" in text

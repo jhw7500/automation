@@ -447,7 +447,12 @@ def _run_actionlint(actionlint: Path, repo: Path, bundle: ReleaseBundle) -> None
         if not executable.is_file() or not os.access(executable, os.X_OK):
             raise OSError
         completed = subprocess.run(
-            [str(executable), "-shellcheck=", *(str(path) for path in workflows)],
+            [
+                str(executable),
+                "-shellcheck=",
+                "-pyflakes=",
+                *(str(path) for path in workflows),
+            ],
             cwd=repo,
             input=None,
             text=True,

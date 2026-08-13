@@ -6,15 +6,15 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import traceback
 
 import pytest
 import yaml
 
-
-ROOT = Path(__file__).resolve().parents[1]
-
 import scripts.verify_workflow_release as release_verifier
 from scripts.verify_workflow_release import ReleaseVerificationError, verify_release
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 RELEASE_PATHS = (
@@ -93,6 +93,79 @@ def load_json(path: Path) -> dict:
 
 def write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+def test_release_verifier_git_uses_a_minimal_provider_free_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sensitive = {
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "ZHIPU_API_KEY",
+        "APP_PRIVATE_KEY",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "UNRELATED_OPERATOR_SECRET",
+        "GIT_CONFIG_COUNT",
+    }
+    for key in sensitive:
+        monkeypatch.setenv(key, f"sentinel-{key}")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "agent.sock"))
+    observed: dict[str, object] = {}
+
+    def child(args, **kwargs):
+        observed.update({"args": list(args), **kwargs})
+        return subprocess.CompletedProcess(args, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(release_verifier.subprocess, "run", child)
+    assert release_verifier.git(tmp_path, "status") == "ok\n"
+
+    assert observed["args"][0] == "/usr/bin/git"
+    env = observed["env"]
+    assert isinstance(env, dict)
+    assert set(env) == {
+        "PATH",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "SSH_AUTH_SOCK",
+        "LANG",
+        "LC_ALL",
+        "GIT_TERMINAL_PROMPT",
+    }
+    assert sensitive.isdisjoint(env)
+    assert not any(str(value).startswith("sentinel-") for value in env.values())
+
+
+def test_release_verifier_git_failure_does_not_expose_child_or_provider_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = "release-provider-sentinel"
+    raw = "release-raw-child-sentinel"
+    monkeypatch.setenv("ZHIPU_API_KEY", provider)
+
+    def child(args, **kwargs):
+        assert provider not in kwargs["env"].values()
+        return subprocess.CompletedProcess(
+            args, 31, stdout=f"stdout {provider} {raw}", stderr=f"stderr {provider} {raw}"
+        )
+
+    monkeypatch.setattr(release_verifier.subprocess, "run", child)
+    with pytest.raises(ReleaseVerificationError) as raised:
+        release_verifier.git(tmp_path, "show", raw)
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(raised.value), raised.value, raised.value.__traceback__
+        )
+    )
+    assert provider not in rendered
+    assert raw not in rendered
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def coordinated_permission_drift(repo: Path) -> None:

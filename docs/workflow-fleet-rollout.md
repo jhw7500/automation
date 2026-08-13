@@ -48,18 +48,25 @@ Use repeated `--repo NAME` arguments to narrow a later read-only plan. Plan clon
 reads GitHub state, renders locally, validates YAML/catalog contracts, and writes
 `$FLEET_WORKSPACE/rollout-manifest.json`; it performs no remote mutation.
 
-The renderer classifies content as:
+The public plan statuses are exactly:
 
-- `current`: managed content already matches the release;
-- `drift`: a normal managed PR can converge it;
-- `bootstrap_required`: an allowed caller-free repository needs explicit bootstrap; or
-- `blocked`: repository, inventory, contract, or remote state is unsafe.
+- `current`: managed content already matches the release and no stale rollout branch exists;
+- `planned`: validated managed changes can create a branch/PR, or an exact branch can
+  receive its missing PR;
+- `reusable`: one exact open PR and its branch can be reused; or
+- `blocked`: repository, config, inventory, contract, prerequisites, or remote state is
+  unsafe.
 
-After checking the deterministic branch and PR state, plan reports actionable drift as
-`planned`, an exact reusable PR as `reusable`, and otherwise reports `current` or
-`blocked`. The manifest includes the observed base SHA, release commit, required secret
-and variable **names**, and managed diff paths. It is a convenience report, not an
-approval token; publish always refetches and recomputes.
+The pure renderer's renderer-only content classifications are `current`, `drift`,
+`bootstrap_required`, and `blocked`. They are not the public plan statuses: after remote
+inspection, safe `drift` and an explicitly requested safe `bootstrap_required` become
+`planned`. A missing config without explicit bootstrap is `blocked`; it is never presented
+as an implicit bootstrap opportunity. Audit reports `current`, `drift`, or `blocked` for
+default-branch content.
+
+The manifest includes the observed base SHA, release commit, required secret and variable
+**names**, and managed diff paths. It is a convenience report, not an approval token;
+publish always refetches and recomputes.
 
 ### 2. Publish independent PRs
 
@@ -89,8 +96,8 @@ is created or reused. The reuse rules are fail-closed:
   managed path/blob diff exactly match the fresh render;
 - one exact open PR is reusable only when its base branch, head repository, head branch,
   head object ID, title, body, and remote branch object ID all match;
-- a mismatched branch or PR, multiple PRs, or a closed or merged PR whose rollout branch
-  remains present blocks that repository; and
+- a mismatched branch or PR, multiple PRs, or any closed or merged PR history for the
+  deterministic head blocks that repository, whether or not the branch remains; and
 - no mismatch is repaired with a force-push.
 
 Publish reports `published`, `reused`, `current`, or `blocked`. A network or permission
@@ -163,10 +170,15 @@ Repository owners inspect each diff, run project-specific CI, obtain their norma
 and use a **GitHub-native merge**. Merge commit, squash, or rebase policy remains local to
 the repository because audit validates final content.
 
-Before merge, close the PR and delete its rollout branch if recovery is needed. After
-merge, use a **GitHub-native revert** PR (or a normal reviewed PR containing `git revert`).
-Never move an immutable automation tag. Repair a bad central release with a new tag and
-new consumer PRs.
+Before merge, closing the PR (and optionally deleting its branch) safely aborts that
+repository/release attempt without changing the default branch. Closed PR history blocks
+reuse of the deterministic identity, so the same repository/release attempt cannot be
+recreated. Correct the source and use a new immutable release/ref and its new deterministic
+branch for another attempt.
+
+After merge, use a **GitHub-native revert** PR (or a normal reviewed PR containing
+`git revert`). Never move an immutable automation tag. Repair a bad central release with a
+new immutable release and new consumer PRs.
 
 ## Token synchronization
 

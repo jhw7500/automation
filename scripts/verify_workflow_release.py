@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -124,6 +125,8 @@ APPROVED_GEMINI_ACTIONS = frozenset(
         SETUP_GEMINI_AUTH,
     }
 )
+GIT_EXECUTABLE = "/usr/bin/git"
+GIT_ENVIRONMENT_KEYS = ("HOME", "XDG_CONFIG_HOME", "SSH_AUTH_SOCK")
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -137,16 +140,40 @@ class AnnotatedTag:
     commit: str
 
 
+def git_child_env() -> dict[str, str]:
+    """Return only the local configuration and agent socket needed by read-only Git."""
+
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    for key in GIT_ENVIRONMENT_KEYS:
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    return environment
+
+
 def git(repo: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    result: subprocess.CompletedProcess[str] | None = None
+    try:
+        result = subprocess.run(
+            [GIT_EXECUTABLE, "-C", str(repo), *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=git_child_env(),
+        )
+    except (OSError, ValueError):
+        pass
+    if result is None:
+        raise ReleaseVerificationError("Git command failed (rc=unavailable)") from None
     if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise ReleaseVerificationError(detail or f"git {' '.join(args)} failed")
+        raise ReleaseVerificationError(
+            f"Git command failed (rc={result.returncode})"
+        ) from None
     return result.stdout
 
 

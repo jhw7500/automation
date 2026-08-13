@@ -21,6 +21,8 @@
 - `github_app` callers map `app_id: ${{ vars.APP_ID }}` and `APP_PRIVATE_KEY`; `github_token` callers map neither and central workflows use `${{ github.token }}`.
 - Preserve the `v1.39` OpenCode same-repository guard, exact permissions, private-repository checkout authentication, `github.token` use, and pinned CLI archive checks.
 - Bootstrap is permitted only for `wpa-supplicant` and `cts-email-mcp-server`, requires a one-repository publish command plus `--bootstrap-repo`, and renders every common workflow disabled.
+- Public plan statuses are exactly `current`, `planned`, `reusable`, and `blocked`; renderer-only `drift`/`bootstrap_required` never leak through the plan CLI, missing config without explicit bootstrap is `blocked`, and audit separately reports `current`, `drift`, or `blocked`.
+- Closed PR history blocks reuse of the deterministic repository/release identity. Closing/deleting aborts that attempt; a corrected retry requires a new immutable release/ref.
 - Use TDD, run the focused test red before implementation, run it green afterward, and make one reviewable commit per task. Prefix every shell command with `rtk`.
 
 ## File Responsibility Map
@@ -1174,15 +1176,30 @@ From a clean automation checkout after fetching `origin/main` and tags:
 
 ```bash
 rtk bash -lc '
+  set -euo pipefail
   MERGE_SHA="$(rtk git rev-parse origin/main)"
+  if rtk git show-ref --verify --quiet refs/tags/v1.40; then
+    printf "%s\n" "ERROR: local v1.40 already exists; stop without changing it" >&2
+    exit 1
+  fi
+  REMOTE_TAGS="$(rtk git ls-remote --tags origin refs/tags/v1.40 "refs/tags/v1.40^{}")"
+  if [ -n "$REMOTE_TAGS" ]; then
+    printf "%s\n" "ERROR: remote v1.40 already exists; stop without changing it" >&2
+    exit 1
+  fi
   rtk git tag -a v1.40 "$MERGE_SHA" -m "automation workflow release v1.40"
+  test "$(rtk git cat-file -t refs/tags/v1.40)" = tag
+  test "$(rtk git rev-parse refs/tags/v1.40^{commit})" = "$MERGE_SHA"
   rtk python3 scripts/verify_workflow_release.py --automation . --ref v1.40 --expected-commit "$MERGE_SHA"
   rtk git push origin refs/tags/v1.40
   rtk python3 scripts/verify_workflow_release.py --automation . --ref v1.40 --expected-commit "$MERGE_SHA" --remote origin
 '
 ```
 
-Expected: local verification passes before tag push and remote verification passes afterward. If `v1.40` already exists or points elsewhere, stop; never move/delete it.
+Expected: both absence checks pass before creation, the annotated local object and commit
+are verified before push, and remote verification passes afterward. Any local/remote
+`v1.40` presence or verification failure stops the shell under `set -euo pipefail`; never
+move/delete the tag.
 
 - [ ] **Step 5: Run the full read-only fleet plan**
 
@@ -1193,23 +1210,44 @@ rtk python3 scripts/rollout_workflow_fleet.py \
   --actionlint /tmp/actionlint-v1.7.12/actionlint
 ```
 
-Expected: exactly 19 outcomes, only `current`, `drift`, `bootstrap_required`, or reviewed `blocked` reasons; no remote branch, PR, secret, or variable changes. Stop on any unexplained blocked result or project-owned path.
+Expected: exactly 19 outcomes with only the public plan statuses `current`, `planned`,
+`reusable`, or reviewed `blocked`; no remote branch, PR, secret, or variable changes.
+Renderer-only `drift`/`bootstrap_required` are not public plan statuses, and missing config
+without explicit bootstrap is `blocked`. Stop on any unexplained block or project-owned
+path.
 
-- [ ] **Step 6: Create the two normal canary PRs**
+- [ ] **Step 6: Create and approve the `wlan-package` canary first**
 
 ```bash
 rtk python3 scripts/rollout_workflow_fleet.py \
   --automation . --workspace /tmp/automation-v1.40-fleet \
   --mode publish --ref v1.40 \
-  --repo wlan-package --repo wlan-driver --confirm \
+  --repo wlan-package --confirm \
   --actionlint /tmp/actionlint-v1.7.12/actionlint
 ```
 
-Expected: independent branch/PR outcomes for the App and built-in GitHub-token profiles. Stop without merging; repository owners review, run CI, and merge through GitHub.
+Expected: one independent App-auth branch/PR outcome. Stop without merging; repository
+owners review, run CI, and merge through GitHub. After human merge, use harmless repository
+PRs/manual dispatches to record the `wlan-package` Gemini App comment, representative
+Claude invocation, OpenCode automatic review, and OpenCode manual command. Audit only
+`wlan-package` and require `current` before approving the next canary.
 
-After human merge, use harmless repository PRs/manual dispatches to record: `wlan-package` Gemini App comment, Claude representative invocation, OpenCode automatic review, and OpenCode manual command; and `wlan-driver` Gemini comment via the built-in token with no App credentials. Run audit for both repositories and require `current` before the bootstrap canary is approved.
+- [ ] **Step 7: Create and approve the `wlan-driver` canary second**
 
-- [ ] **Step 7: Create the disabled bootstrap canary PR separately**
+```bash
+rtk python3 scripts/rollout_workflow_fleet.py \
+  --automation . --workspace /tmp/automation-v1.40-fleet \
+  --mode publish --ref v1.40 \
+  --repo wlan-driver --confirm \
+  --actionlint /tmp/actionlint-v1.7.12/actionlint
+```
+
+Expected: one independent built-in GitHub-token branch/PR outcome. Stop without merging.
+After human review and merge, record a `wlan-driver` Gemini comment through the built-in
+token with no App credentials, audit only `wlan-driver`, and require `current` before the
+bootstrap canary is approved.
+
+- [ ] **Step 8: Create the disabled bootstrap canary PR third**
 
 ```bash
 rtk python3 scripts/rollout_workflow_fleet.py \
@@ -1221,7 +1259,7 @@ rtk python3 scripts/rollout_workflow_fleet.py \
 
 Expected: one PR containing required callers plus a config that disables every common workflow. Stop without enabling or merging it automatically.
 
-- [ ] **Step 8: Handoff the remaining rollout to the approved GitHub process**
+- [ ] **Step 9: Handoff the remaining rollout to the approved GitHub process**
 
 After the three canaries are human-reviewed, merged, runtime-checked, and audited `current`, create the remaining 15 ordinary PRs:
 
@@ -1251,10 +1289,14 @@ Repository owners merge on their own schedules. Repeat the read-only fleet audit
 
 ```bash
 rtk python3 scripts/audit_workflow_fleet.py \
-  --automation . --workspace /tmp/automation-v1.40-audit --ref v1.40
+  --automation . --workspace /tmp/automation-v1.40-fleet --ref v1.40
 ```
 
-Stop only when it reports `current=19`, `drift=0`, `blocked=0`. Before merge, recovery is PR closure/branch deletion; after merge, recovery is a normal reviewed GitHub revert PR or a new immutable roll-forward release.
+Stop only when it reports `current=19`, `drift=0`, `blocked=0`. Before merge, closing the
+PR and optionally deleting its branch aborts that repository/release attempt; closed PR
+history prevents reuse, so a corrected retry uses a new immutable release/ref. After
+merge, recovery is a normal reviewed GitHub revert PR or a new immutable roll-forward
+release.
 
 ## Final Stop Conditions
 

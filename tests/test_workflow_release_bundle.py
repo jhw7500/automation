@@ -8,16 +8,16 @@ import json
 import shutil
 import subprocess
 import tarfile
+import traceback
 
 import pytest
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 from scripts.verify_workflow_release import ReleaseVerificationError
 import scripts.verify_workflow_release as release_verifier
 import scripts.workflow_release_bundle as release_bundle
 from scripts.workflow_release_bundle import materialize_release_bundle
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 RELEASE_PATHS = (
@@ -87,6 +87,82 @@ def archive_with(member: tarfile.TarInfo, payload: bytes = b"bad") -> bytes:
         else:
             archive.addfile(member)
     return stream.getvalue()
+
+
+def test_release_archive_git_uses_the_same_minimal_provider_free_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sensitive = {
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "ZHIPU_API_KEY",
+        "APP_PRIVATE_KEY",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "UNRELATED_OPERATOR_SECRET",
+        "GIT_CONFIG_COUNT",
+    }
+    for key in sensitive:
+        monkeypatch.setenv(key, f"sentinel-{key}")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "agent.sock"))
+    observed: dict[str, object] = {}
+
+    def child(args, **kwargs):
+        observed.update({"args": list(args), **kwargs})
+        return subprocess.CompletedProcess(args, 0, stdout=b"archive", stderr=b"")
+
+    monkeypatch.setattr(release_bundle.subprocess, "run", child)
+    assert release_bundle._git_archive(tmp_path, "a" * 40) == b"archive"
+
+    assert observed["args"][0] == "/usr/bin/git"
+    env = observed["env"]
+    assert isinstance(env, dict)
+    assert set(env) == {
+        "PATH",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "SSH_AUTH_SOCK",
+        "LANG",
+        "LC_ALL",
+        "GIT_TERMINAL_PROMPT",
+    }
+    assert sensitive.isdisjoint(env)
+    assert not any(str(value).startswith("sentinel-") for value in env.values())
+
+
+def test_release_archive_failure_does_not_expose_child_or_provider_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = "archive-provider-sentinel"
+    raw = "archive-raw-child-sentinel"
+    monkeypatch.setenv("ZHIPU_API_KEY", provider)
+
+    def child(args, **kwargs):
+        assert provider not in kwargs["env"].values()
+        return subprocess.CompletedProcess(
+            args,
+            29,
+            stdout=f"stdout {provider} {raw}".encode(),
+            stderr=f"stderr {provider} {raw}".encode(),
+        )
+
+    monkeypatch.setattr(release_bundle.subprocess, "run", child)
+    with pytest.raises(ReleaseVerificationError) as raised:
+        release_bundle._git_archive(tmp_path, raw)
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(raised.value), raised.value, raised.value.__traceback__
+        )
+    )
+    assert provider not in rendered
+    assert raw not in rendered
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_bundle_reads_catalog_config_and_canonical_tree_from_tag(

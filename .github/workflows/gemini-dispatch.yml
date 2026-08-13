@@ -399,24 +399,19 @@ jobs:
           ERRORS: '${{ steps.gemini_review_primary.outputs.error }}'
           REPOSITORY: '${{ github.repository }}'
         run: |-
-          cat > /tmp/error_comment.md <<'EOF'
-          ## ⚠️ Primary Model Failed
-
-          **Primary Model:** $PRIMARY_MODEL
-          **Attempting Fallback:** $FALLBACK_MODEL
-
-          <details>
-          <summary>Error Details</summary>
-
-          ```
-          $ERRORS
-          ```
-
-          </details>
-          EOF
+          error_comment="${RUNNER_TEMP}/gemini-review-primary-error.md"
+          umask 077
+          {
+            printf '%s\n\n' '## ⚠️ Primary Model Failed'
+            printf '**Primary Model:** %s\n' "$PRIMARY_MODEL"
+            printf '**Attempting Fallback:** %s\n\n' "$FALLBACK_MODEL"
+            printf '%s\n' '<details>' '<summary>Error Details</summary>' '' '```'
+            printf '%s\n' "$ERRORS"
+            printf '%s\n' '```' '' '</details>'
+          } > "$error_comment"
 
           gh issue comment "${ISSUE_NUMBER}" \
-            --body-file /tmp/error_comment.md \
+            --body-file "$error_comment" \
             --repo "${REPOSITORY}"
 
       - name: Run Gemini pull request review (fallback)
@@ -478,23 +473,53 @@ jobs:
       - name: Set final review result
         id: final_review
         if: always()
+        env:
+          PRIMARY_OUTCOME: '${{ steps.gemini_review_primary.outcome }}'
+          PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
+          PRIMARY_RESPONSE: '${{ steps.gemini_review_primary.outputs.summary }}'
+          PRIMARY_ERRORS: '${{ steps.gemini_review_primary.outputs.error }}'
+          FALLBACK_OUTCOME: '${{ steps.gemini_review_fallback.outcome }}'
+          FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
+          FALLBACK_RESPONSE: '${{ steps.gemini_review_fallback.outputs.summary }}'
+          FALLBACK_ERRORS: '${{ steps.gemini_review_fallback.outputs.error }}'
         run: |-
-          if [[ "${{ steps.gemini_review_primary.outcome }}" == "success" ]]; then
-            echo "outcome=success" >> $GITHUB_OUTPUT
-            echo "model=${{ vars.GEMINI_MODEL }}" >> $GITHUB_OUTPUT
-            echo "response=${{ steps.gemini_review_primary.outputs.summary }}" >> $GITHUB_OUTPUT
-            echo "errors=${{ steps.gemini_review_primary.outputs.error }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ steps.gemini_review_fallback.outcome }}" == "success" ]]; then
-            echo "outcome=success" >> $GITHUB_OUTPUT
-            echo "model=${{ vars.GEMINI_FALLBACK_MODEL }}" >> $GITHUB_OUTPUT
-            echo "response=${{ steps.gemini_review_fallback.outputs.summary }}" >> $GITHUB_OUTPUT
-            echo "errors=${{ steps.gemini_review_fallback.outputs.error }}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          write_output() {
+            local name="$1"
+            local value="$2"
+            local delimiter='__AUTOMATION_OUTPUT__'
+            while [[ "$value" == *"$delimiter"* ]]; do
+              delimiter="${delimiter}_X"
+            done
+            {
+              printf '%s<<%s\n' "$name" "$delimiter"
+              printf '%s\n' "$value"
+              printf '%s\n' "$delimiter"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          if [[ "$PRIMARY_OUTCOME" == "success" ]]; then
+            outcome='success'
+            model="$PRIMARY_MODEL"
+            response="$PRIMARY_RESPONSE"
+            errors="$PRIMARY_ERRORS"
+          elif [[ "$FALLBACK_OUTCOME" == "success" ]]; then
+            outcome='success'
+            model="$FALLBACK_MODEL"
+            response="$FALLBACK_RESPONSE"
+            errors="$FALLBACK_ERRORS"
           else
-            echo "outcome=failure" >> $GITHUB_OUTPUT
-            echo "model=${{ vars.GEMINI_MODEL }}" >> $GITHUB_OUTPUT
-            echo "response=" >> $GITHUB_OUTPUT
-            echo "errors=${{ steps.gemini_review_primary.outputs.error }}" >> $GITHUB_OUTPUT
+            outcome='failure'
+            model="$PRIMARY_MODEL"
+            response=''
+            errors="$PRIMARY_ERRORS"
           fi
+
+          write_output outcome "$outcome"
+          write_output model "$model"
+          write_output response "$response"
+          write_output errors "$errors"
 
       - name: Upsert PR comment (Gemini Review)
         if: always()
@@ -799,24 +824,19 @@ jobs:
           ERRORS: '${{ steps.gemini_invoke_primary.outputs.error }}'
           REPOSITORY: '${{ github.repository }}'
         run: |-
-          cat > /tmp/error_comment.md <<'EOF'
-          ## ⚠️ Primary Model Failed
-
-          **Primary Model:** $PRIMARY_MODEL
-          **Attempting Fallback:** $FALLBACK_MODEL
-
-          <details>
-          <summary>Error Details</summary>
-
-          ```
-          $ERRORS
-          ```
-
-          </details>
-          EOF
+          error_comment="${RUNNER_TEMP}/gemini-invoke-primary-error.md"
+          umask 077
+          {
+            printf '%s\n\n' '## ⚠️ Primary Model Failed'
+            printf '**Primary Model:** %s\n' "$PRIMARY_MODEL"
+            printf '**Attempting Fallback:** %s\n\n' "$FALLBACK_MODEL"
+            printf '%s\n' '<details>' '<summary>Error Details</summary>' '' '```'
+            printf '%s\n' "$ERRORS"
+            printf '%s\n' '```' '' '</details>'
+          } > "$error_comment"
 
           gh issue comment "${ISSUE_NUMBER}" \
-            --body-file /tmp/error_comment.md \
+            --body-file "$error_comment" \
             --repo "${REPOSITORY}"
 
       - name: Run Gemini CLI (fallback)

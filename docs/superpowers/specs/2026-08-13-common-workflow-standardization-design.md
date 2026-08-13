@@ -255,12 +255,20 @@ Plan is read-only for GitHub. With no `--repo`, it evaluates all 19 profiles and
 convenience JSON report containing the release commit, observed base SHA, status, reason,
 and proposed managed-file diff for every repository.
 
-Statuses are:
+The public plan statuses are:
 
-- `current`: managed content already matches;
-- `drift`: a normal managed PR can converge it;
-- `bootstrap_required`: an allowed caller-free repository needs explicit bootstrap; or
-- `blocked`: input, contract, config, inventory, or repository state is unsafe.
+- `current`: managed content already matches and no stale rollout branch exists;
+- `planned`: validated managed changes can create a branch/PR, or an exact branch can
+  receive its missing PR;
+- `reusable`: one exact open PR and branch match the complete rollout identity; or
+- `blocked`: input, contract, config, inventory, prerequisites, or repository state is
+  unsafe.
+
+The pure renderer retains renderer-only classifications `current`, `drift`,
+`bootstrap_required`, and `blocked`. Orchestration maps safe `drift` and an explicitly
+requested safe `bootstrap_required` to public `planned` only after exact remote-state
+inspection. A missing config without explicit bootstrap is `blocked`. Audit remains a
+separate content classifier and reports only `current`, `drift`, or `blocked`.
 
 The report is not an approval token or transaction journal. Publish always refetches and
 recomputes the selected repository before writing.
@@ -290,8 +298,8 @@ The branch name is deterministic per repository and release, for example
   may receive its missing PR;
 - an existing branch and one open PR are reused only when that same content plus PR base,
   title, and body match; and
-- a content mismatch, multiple PRs, or a closed/merged PR with the rollout branch still
-  present blocks that repository without a force-push.
+- a content mismatch, multiple PRs, or any closed/merged PR history for the deterministic
+  head blocks that repository without a force-push, whether or not its branch remains.
 
 Multi-repository publish first validates every selected repository, then creates PRs one
 at a time, refetching that repository immediately before branch creation. Network or
@@ -361,8 +369,10 @@ Create independent PRs for:
 
 Repository owners review and merge each PR normally. After merge, use harmless test PRs or
 manual dispatch to verify the expected central revision and behavior. Any failure stops
-further PR creation. Open canary PRs are closed; merged canaries are reverted through an
-ordinary reviewed revert PR when rollback is preferable to roll-forward.
+further PR creation. An unmerged canary is closed to abort that repository/release attempt;
+its closed PR history blocks reuse, so a corrected retry uses a new immutable release/ref.
+Merged canaries are reverted through an ordinary reviewed revert PR when rollback is
+preferable to roll-forward.
 
 ### Gate 4: remaining PRs
 
@@ -379,10 +389,11 @@ Repositories with an open, not-yet-merged PR legitimately remain `drift` during 
 
 ### Before merge
 
-- Close the PR.
-- Delete the rollout branch.
-- Correct the central template or profile.
-- Re-run plan and create a new PR.
+- Close the PR and optionally delete the rollout branch to abort the current attempt.
+- Treat its closed PR history as permanently blocking reuse of that deterministic
+  repository/release identity.
+- Correct the central template or profile, publish a new immutable release/ref, and plan a
+  new deterministic branch and PR.
 
 The default branch is unchanged, so no rollback transaction is needed.
 

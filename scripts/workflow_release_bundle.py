@@ -14,8 +14,10 @@ from typing import Iterator
 
 from scripts.verify_workflow_release import (
     AnnotatedTag,
+    GIT_EXECUTABLE,
     ReleaseVerificationError,
     assert_tag_unchanged,
+    git_child_env,
     resolve_annotated_tag,
     verify_remote_tag,
     verify_tag_content,
@@ -60,22 +62,32 @@ def _release_owned(path: PurePosixPath, *, directory: bool) -> bool:
 
 
 def _git_archive(automation: Path, revision: str) -> bytes:
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(automation),
-            "archive",
-            "--format=tar",
-            revision,
-            *RELEASE_PATHS,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    result: subprocess.CompletedProcess[bytes] | None = None
+    try:
+        result = subprocess.run(
+            [
+                GIT_EXECUTABLE,
+                "-C",
+                str(automation),
+                "archive",
+                "--format=tar",
+                revision,
+                *RELEASE_PATHS,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=git_child_env(),
+        )
+    except (OSError, ValueError):
+        pass
+    if result is None:
+        raise ReleaseVerificationError(
+            "unable to archive verified release (rc=unavailable)"
+        ) from None
     if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise ReleaseVerificationError(detail or f"unable to archive {revision}")
+        raise ReleaseVerificationError(
+            f"unable to archive verified release (rc={result.returncode})"
+        ) from None
     return result.stdout
 
 

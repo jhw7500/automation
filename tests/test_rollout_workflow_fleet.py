@@ -1352,6 +1352,12 @@ def test_actionlint_child_receives_only_a_fixed_credential_free_environment(
     assert len(observed) == 1
     call = observed[0]
     assert call["args"][0] == str(actionlint.resolve())
+    assert call["args"] == [
+        str(actionlint.resolve()),
+        "-shellcheck=",
+        "-pyflakes=",
+        str(workflow),
+    ]
     env = call["env"]
     assert isinstance(env, dict)
     assert set(env) == {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"}
