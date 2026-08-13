@@ -98,15 +98,31 @@ def test_app_and_token_profiles_differ_only_by_declared_auth_lines(
 ) -> None:
     app = render_fixture(tmp_path / "app", auth="github_app")
     token = render_fixture(tmp_path / "token", auth="github_token")
-    app_text = app.after(".github/workflows/gemini-review.yml").decode()
-    token_text = token.after(".github/workflows/gemini-review.yml").decode()
-    assert "repo_write_auth: github_app" in app_text
-    assert "app_id: ${{ vars.APP_ID }}" in app_text
-    assert "APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}" in app_text
-    assert "repo_write_auth: github_token" in token_text
-    assert "app_id:" not in token_text
-    assert "APP_PRIVATE_KEY:" not in token_text
-    assert "GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}" in token_text
+    template = (CANONICAL / "workflows/gemini-review.yml").read_bytes()
+    assert template.count(b"@__AUTOMATION_COMMIT__") == 1
+    app_expected = template.replace(
+        b"@__AUTOMATION_COMMIT__", f"@{COMMIT}".encode()
+    )
+    assert app.after(".github/workflows/gemini-review.yml") == app_expected
+
+    assert app_expected.count(b"repo_write_auth: github_app") == 1
+    assert app_expected.count(b"      app_id: ${{ vars.APP_ID }}\n") == 1
+    assert (
+        app_expected.count(
+            b"      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}\n"
+        )
+        == 1
+    )
+    token_expected = (
+        app_expected.replace(
+            b"repo_write_auth: github_app", b"repo_write_auth: github_token"
+        )
+        .replace(b"      app_id: ${{ vars.APP_ID }}\n", b"")
+        .replace(
+            b"      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}\n", b""
+        )
+    )
+    assert token.after(".github/workflows/gemini-review.yml") == token_expected
 
 
 def test_config_preserves_every_non_identity_byte(tmp_path: Path) -> None:
@@ -196,6 +212,55 @@ def test_missing_required_callers_are_created_from_canonical_bytes(
     assert rendered is not None
     assert f"claude.yml@{COMMIT}".encode() in rendered
     assert b"__AUTOMATION_COMMIT__" not in rendered
+
+
+def test_canonical_root_symlink_blocks_rendering(tmp_path: Path) -> None:
+    repo = make_existing_repo(tmp_path / "repo")
+    canonical = tmp_path / "canonical-link"
+    canonical.symlink_to(CANONICAL, target_is_directory=True)
+
+    plan = render_repository(
+        repo,
+        canonical,
+        CATALOG,
+        PROFILES["pcap-analyzer"],
+        "v1.40",
+        COMMIT,
+        ALL_SECRETS,
+        ALL_VARIABLES,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.changes == ()
+    assert "canonical" in plan.reason
+    assert "symlink" in plan.reason
+
+
+def test_canonical_intermediate_directory_symlink_blocks_rendering(
+    tmp_path: Path,
+) -> None:
+    repo = make_existing_repo(tmp_path / "repo")
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    (canonical / "workflows").symlink_to(
+        CANONICAL / "workflows", target_is_directory=True
+    )
+
+    plan = render_repository(
+        repo,
+        canonical,
+        CATALOG,
+        PROFILES["pcap-analyzer"],
+        "v1.40",
+        COMMIT,
+        ALL_SECRETS,
+        ALL_VARIABLES,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.changes == ()
+    assert "canonical" in plan.reason
+    assert "symlink" in plan.reason
 
 
 def test_unknown_central_caller_blocks_without_proposing_changes(
@@ -325,9 +390,13 @@ def test_allowed_disabled_bootstrap_renders_required_callers_and_config_only(
     assert "CLAUDE_CODE_OAUTH_TOKEN" in plan.reason
     assert "GEMINI_API_KEY" in plan.reason
     config = plan.after(".github/workflow-config.yml")
-    assert config is not None
-    assert b"automation_ref: v1.40" in config
-    assert f"automation_commit: {COMMIT}".encode() in config
+    template = (CANONICAL / "workflow-config.yml").read_bytes()
+    assert template.count(b"__AUTOMATION_REF__") == 1
+    assert template.count(b"__AUTOMATION_COMMIT__") == 1
+    expected_config = template.replace(b"__AUTOMATION_REF__", b"v1.40").replace(
+        b"__AUTOMATION_COMMIT__", COMMIT.encode()
+    )
+    assert config == expected_config
 
 
 @pytest.mark.parametrize(
@@ -416,13 +485,26 @@ def test_apply_rejects_non_actionable_and_stale_plans(tmp_path: Path) -> None:
     with pytest.raises(RolloutError, match="not actionable"):
         apply_render_plan(repo, current)
 
-    plan = render_profile(repo, "pcap-analyzer")
-    path = repo / plan.changes[0].path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"concurrent edit\n")
+    rendered = render_profile(repo, "pcap-analyzer")
+    sorted_changes = tuple(sorted(rendered.changes, key=lambda change: change.path))
+    plan = dataclasses.replace(rendered, changes=sorted_changes)
+    earlier = {
+        change.path: (repo / change.path).read_bytes()
+        if (repo / change.path).exists()
+        else None
+        for change in plan.changes[:-1]
+    }
+    stale = repo / plan.changes[-1].path
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"concurrent edit\n")
+
     with pytest.raises(RolloutError, match="changed since rendering"):
         apply_render_plan(repo, plan)
-    assert path.read_bytes() == b"concurrent edit\n"
+    assert stale.read_bytes() == b"concurrent edit\n"
+    for relative, before in earlier.items():
+        path = repo / relative
+        actual = path.read_bytes() if path.exists() else None
+        assert actual == before
 
 
 def test_render_and_apply_refuse_symlinks_at_managed_paths(tmp_path: Path) -> None:

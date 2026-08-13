@@ -199,9 +199,30 @@ def _canonical_bytes(canonical: Path, entry: CatalogEntry) -> bytes:
         relative = entry.path.relative_to(".github")
     except ValueError as exc:
         raise RolloutError(f"{entry.path}: managed path is outside .github") from exc
-    path = canonical / relative
-    if path.is_symlink() or not path.is_file():
-        raise RolloutError(f"{entry.path}: canonical file is missing or unsafe")
+    components = (canonical,) + tuple(
+        canonical.joinpath(*relative.parts[:index])
+        for index in range(1, len(relative.parts) + 1)
+    )
+    for index, component in enumerate(components):
+        try:
+            metadata = component.lstat()
+        except OSError as exc:
+            raise RolloutError(
+                f"{entry.path}: canonical path is missing or unsafe"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RolloutError(
+                f"{entry.path}: canonical path contains a symlink"
+            )
+        if index < len(components) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            raise RolloutError(
+                f"{entry.path}: canonical path component is not a directory"
+            )
+        if index == len(components) - 1 and not stat.S_ISREG(metadata.st_mode):
+            raise RolloutError(
+                f"{entry.path}: canonical path is not a regular file"
+            )
+    path = components[-1]
     try:
         return path.read_bytes()
     except OSError as exc:
