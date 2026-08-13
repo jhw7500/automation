@@ -396,7 +396,7 @@ jobs:
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
           FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
-          ERRORS: '${{ steps.gemini_review_primary.outputs.gemini_errors }}'
+          ERRORS: '${{ steps.gemini_review_primary.outputs.error }}'
           REPOSITORY: '${{ github.repository }}'
         run: |-
           cat > /tmp/error_comment.md <<'EOF'
@@ -482,18 +482,18 @@ jobs:
           if [[ "${{ steps.gemini_review_primary.outcome }}" == "success" ]]; then
             echo "outcome=success" >> $GITHUB_OUTPUT
             echo "model=${{ vars.GEMINI_MODEL }}" >> $GITHUB_OUTPUT
-            echo "response=${{ steps.gemini_review_primary.outputs.gemini_response }}" >> $GITHUB_OUTPUT
-            echo "errors=${{ steps.gemini_review_primary.outputs.gemini_errors }}" >> $GITHUB_OUTPUT
+            echo "response=${{ steps.gemini_review_primary.outputs.summary }}" >> $GITHUB_OUTPUT
+            echo "errors=${{ steps.gemini_review_primary.outputs.error }}" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.gemini_review_fallback.outcome }}" == "success" ]]; then
             echo "outcome=success" >> $GITHUB_OUTPUT
             echo "model=${{ vars.GEMINI_FALLBACK_MODEL }}" >> $GITHUB_OUTPUT
-            echo "response=${{ steps.gemini_review_fallback.outputs.gemini_response }}" >> $GITHUB_OUTPUT
-            echo "errors=${{ steps.gemini_review_fallback.outputs.gemini_errors }}" >> $GITHUB_OUTPUT
+            echo "response=${{ steps.gemini_review_fallback.outputs.summary }}" >> $GITHUB_OUTPUT
+            echo "errors=${{ steps.gemini_review_fallback.outputs.error }}" >> $GITHUB_OUTPUT
           else
             echo "outcome=failure" >> $GITHUB_OUTPUT
             echo "model=${{ vars.GEMINI_MODEL }}" >> $GITHUB_OUTPUT
             echo "response=" >> $GITHUB_OUTPUT
-            echo "errors=${{ steps.gemini_review_primary.outputs.gemini_errors }}" >> $GITHUB_OUTPUT
+            echo "errors=${{ steps.gemini_review_primary.outputs.error }}" >> $GITHUB_OUTPUT
           fi
 
       - name: Upsert PR comment (Gemini Review)
@@ -796,7 +796,7 @@ jobs:
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
           FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
-          ERRORS: '${{ steps.gemini_invoke_primary.outputs.gemini_errors }}'
+          ERRORS: '${{ steps.gemini_invoke_primary.outputs.error }}'
           REPOSITORY: '${{ github.repository }}'
         run: |-
           cat > /tmp/error_comment.md <<'EOF'

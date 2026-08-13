@@ -1,141 +1,136 @@
 # Shared Workflow Consumer Contract
 
-This document defines the consumer-facing contract for repositories that use the reusable
-workflows in `jhw7500/automation`.
+Consumer repositories keep thin event/permission/authentication callers. Non-trivial AI
+behavior remains in reusable workflows published by `jhw7500/automation`.
 
-The intent:
+## Authoritative managed set
 
-- Consumer repos keep only thin workflow wrappers (event triggers + `uses:`).
-- All non-trivial logic lives in `jhw7500/automation`.
+`scripts/workflow-catalog.json` is the only managed-path and caller-contract authority.
+It defines **14 managed caller workflows**: ten required callers and four optional callers.
+It also declares the managed config path and the retired
+`.github/workflows/bump-automation-ref.yml` path. Repository membership and the only
+allowed profile differences come from `scripts/workflow-config.json`.
 
-## Baseline copy
+The canonical source bytes live only under:
 
-Start by copying the baseline wrappers:
+```text
+examples/baseline-workflows/.github/
+```
 
-- `examples/baseline-workflows/.github/`
+Do not maintain another filename list or copy caller files with an ad-hoc script.
+Project-owned build, test, packaging, deployment, release, lint, hardware, and other
+workflows are outside the catalog and remain byte-for-byte repository-owned.
 
-Copy that folder into your consumer repo's `.github/`.
+## Immutable automation identity
 
-## Repo config file: `.github/workflow-config.yml`
+Every reusable `uses:` target in a rendered caller ends with the verified
+**40-character commit** resolved from an immutable annotated release tag:
 
-Workflows read `.github/workflow-config.yml` for repo-level behavior.
+```yaml
+uses: jhw7500/automation/.github/workflows/gemini-review.yml@0123456789abcdef0123456789abcdef01234567
+```
 
-### `review.auto`
+Tag text is retained only as human-readable identity in the consumer config:
+
+```yaml
+automation_ref: v1.40
+automation_commit: 0123456789abcdef0123456789abcdef01234567
+```
+
+The renderer may update only these two scalars in an existing
+`.github/workflow-config.yml`; all other keys, formatting, and comments are preserved.
+An explicitly approved bootstrap creates the canonical disabled config. Never hand-edit a
+caller to use a moving tag or branch.
+
+## Same-name credential mappings
+
+Model credential names are fixed by authentication family, and every mapping uses the
+same repository secret name on both sides:
+
+```yaml
+# Claude callers
+CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+# Every Gemini caller
+GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+# Profiled OpenCode callers
+ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+```
+
+Bulk or wildcard secret forwarding is forbidden. A caller maps only the names declared by
+its catalog entry. Workflow rollout checks whether prerequisite names exist but never
+reads, refreshes, or writes their values.
+
+## Explicit Gemini repository-write modes
+
+Gemini model authentication always uses `GEMINI_API_KEY`. Repository-write
+authentication is an independent profile axis with exactly two modes.
+
+### GitHub App mode
+
+```yaml
+with:
+  repo_write_auth: github_app
+  app_id: ${{ vars.APP_ID }}
+secrets:
+  APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+```
+
+Both `APP_ID` and `APP_PRIVATE_KEY` must exist. The App is used only for the central
+workflow's declared repository write operations.
+
+### Built-in token mode
+
+```yaml
+with:
+  repo_write_auth: github_token
+secrets:
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+```
+
+This mode passes neither `app_id` nor `APP_PRIVATE_KEY`; the reusable workflow uses the
+exact built-in `${{ github.token }}` path within its declared permissions. Ambient
+authentication, OIDC model authentication, and alternate Gemini provider variables are
+not supported.
+
+## Triggers, inputs, and permissions
+
+Each catalog entry owns the exact trigger shape, caller job name, typed `with` inputs,
+permissions, and secret names. Required callers must exist in every configured repository.
+An optional caller exists only when selected by that repository's declarative profile;
+unexpected optional callers are removed by the managed PR.
+
+OpenCode callers accept only same-repository pull request content and fail closed for
+fork/external heads. Their jobs grant exactly `contents: read`, `pull-requests: write`, and
+`issues: write`, force the job-scoped GitHub token, and do not grant OIDC. Central
+workflows own the pinned OpenCode CLI archive and action versions; consumers do not add an
+installer.
+
+Claude and Gemini callers retain only the catalogued permissions. Repository-specific
+trigger or permission changes require an explicit catalog/design change rather than an
+in-place consumer exception.
+
+## Repository config behavior
+
+The shared review default remains:
 
 ```yaml
 review:
   auto: false
 ```
 
-Semantics:
+For auto-review callers, `workflows.<name>.auto` takes precedence over `review.auto`.
+Manual mention/comment and manual-dispatch behavior remains available when the applicable
+caller is enabled. The disabled bootstrap template uses `workflows.<name>.enabled: false`
+for every common caller; enabling any of them is a later repository-owned PR.
 
-- `review.auto: true`: enable automatic PR reviews (e.g. on PR opened/synchronize).
-- `review.auto: false`: disable automatic PR reviews.
-- Manual triggers must continue to work regardless of `review.auto`.
-  - Example manual trigger: comment `@gemini-cli /review ...`.
+## Adoption and recovery
 
-> **Precedence:** the auto-review workflows first read the per-workflow key
-> `workflows.<name>.auto` (e.g. `workflows.gemini-auto-review.auto`,
-> `workflows.claude-code-review.auto`), then fall back to `review.auto`, then to
-> `true` if both are unset. A repo that pins the per-workflow keys must change
-> *those* to disable auto review — a global `review.auto: false` is silently
-> ignored when a per-workflow `auto` is present.
-
-## Secrets (consumer repository)
-
-Required secrets depend on which workflows you enable.
-
-- `GEMINI_API_KEY`
-  - Required for Gemini workflows (review/triage/invoke/dispatch).
-- `CLAUDE_CODE_OAUTH_TOKEN`
-  - Required for Claude workflows.
-- `ZHIPU_API_KEY`
-  - Required for OpenCode workflows.
-
-### OpenCode PR boundary
-
-OpenCode automatic review and the manual `/oc` command run only for pull requests whose
-head branch belongs to the same repository. Fork/external PRs fail closed and produce a
-skipped workflow summary. This restriction lets private repositories retain the read-only
-checkout credential required by OpenCode's internal branch fetch without exposing it while
-processing external contributor content.
-
-Both OpenCode workflows force the job-scoped `github.token`; `id-token: write` is forbidden,
-so the CLI cannot exchange OIDC for an App token outside the declared job permissions.
-Consumer OpenCode jobs must grant exactly `contents: read`, `pull-requests: write`, and
-`issues: write`. The fleet rollout tool normalizes these two caller permission blocks; this
-is the intentional exception to its general rule of preserving repository-owned permissions.
-
-### OpenCode runtime pin
-
-The central workflows, not consumer repositories, own the OpenCode CLI version. They download
-the Linux x64 archive for exactly `1.18.17`, verify SHA-256
-`3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a`, and only then extract
-and run it. The cache stores the archive rather than an unchecked executable, and the digest is
-verified after every cache restore. Consumers must not add an independent OpenCode installer.
-
-To update the CLI, change the version and GitHub release asset digest together in both OpenCode
-workflows, update the release verifier constants and tests, then publish a new immutable
-`automation` release only after a same-repository canary succeeds. Never replace a release tag
-or change the version to `latest`.
-
-### Action runtime pins
-
-Managed central and baseline workflows pin `actions/checkout` v7.0.1 and `actions/cache` v6.1.0
-to their full commit SHAs. `tests/test_action_pins.py` prevents tag, branch, and mixed-major drift.
-When updating either action, verify the upstream release tag resolves to the selected commit,
-run actionlint and the complete test suite, and ship the change through a new immutable release.
-
-## Variables (consumer repository)
-
-These are configured as GitHub Actions Variables.
-
-### Gemini runtime
-
-- `GEMINI_CLI_VERSION`
-  - Example: `preview`
-- `GEMINI_MODEL`
-  - Recommended default: `gemini-3-flash-preview`
-- `GEMINI_FALLBACK_MODEL`
-  - Recommended default: `gemini-3-flash-preview`
-- `GEMINI_DEBUG`
-  - Set to `true` to enable verbose logging.
-- `UPLOAD_ARTIFACTS`
-  - Set to `true` to upload run artifacts (logs/reports) for debugging.
-  - Recommended default: `false`.
-
-### Gemini guardrails
-
-- `GEMINI_MAX_READ_BYTES`
-  - Hard cap for file reads through the safe wrapper layer.
-  - Default: `200000` (bytes) if unset.
-
-- `GEMINI_SPARSE_CHECKOUT`
-- `GEMINI_SPARSE_CHECKOUT_PATTERNS`
-
-Sparse checkout is optional. If you enable it, you must provide patterns.
-
-Example:
-
-```text
-GEMINI_SPARSE_CHECKOUT=true
-GEMINI_SPARSE_CHECKOUT_PATTERNS=\
-.github/\
-src/\
-scripts/\
-README.md
-```
-
-Notes:
-
-- Keep patterns tight to reduce checkout size and reduce the chance of context bloat.
-- Do not include large generated artifacts or release outputs.
-
-## Wrapper workflow expectations
-
-Consumer repos should:
-
-- Pin reusable workflow versions (e.g. `@v1.15`) in wrapper `uses:` lines.
-- Keep wrappers portable (no `main`/`master` assumptions).
-- Avoid storing documentation under `.github/workflows/` in consumer repos.
-  - Put docs in `docs/` or keep them in `jhw7500/automation`.
+Use `scripts/rollout_workflow_fleet.py` to plan and open managed PRs; do not copy the
+baseline into existing repositories manually. Operators and repository owners then use
+normal CI, review, and GitHub merge controls. After merge, verify default-branch content
+with `scripts/audit_workflow_fleet.py`. See
+[`docs/workflow-fleet-rollout.md`](../workflow-fleet-rollout.md) for exact commands,
+canaries, bootstrap, and recovery.

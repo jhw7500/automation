@@ -1147,18 +1147,18 @@ Expected: tests pass, syntax/diff checks pass, and status is empty. If a test fa
 
 - [ ] **Step 2: Run the actionlint gate exactly as CI does**
 
-Download `actionlint_1.7.12_linux_x86_64.tar.gz` into `/tmp/actionlint-v1.7.12`, verify the exact SHA-256 from Task 8, extract `/tmp/actionlint-v1.7.12/actionlint`, and run it over `.github/workflows/*.yml` and `examples/baseline-workflows/.github/workflows/*.yml`. Keep that verified executable for the plan/publish commands below.
+Download `actionlint_1.7.12_linux_amd64.tar.gz` into `/tmp/actionlint-v1.7.12`, verify the exact SHA-256 from Task 8, extract `/tmp/actionlint-v1.7.12/actionlint`, and run its deterministic schema/expression gate with `-shellcheck= -pyflakes=` over `.github/workflows/*.yml` and `examples/baseline-workflows/.github/workflows/*.yml`. These empty analyzer paths make the gate independent of optional host ShellCheck/Pyflakes installations; actionlint's own diagnostics remain fail-closed. Keep that verified executable for the plan/publish commands below.
 
 ```bash
 rtk rm -rf /tmp/actionlint-v1.7.12
 rtk mkdir -p /tmp/actionlint-v1.7.12
 rtk curl -fsSL -o /tmp/actionlint-v1.7.12/actionlint.tar.gz \
-  https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_x86_64.tar.gz
+  https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
 rtk bash -lc "printf '%s  %s\n' \
   8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 \
   /tmp/actionlint-v1.7.12/actionlint.tar.gz | rtk sha256sum -c -"
 rtk tar -xzf /tmp/actionlint-v1.7.12/actionlint.tar.gz -C /tmp/actionlint-v1.7.12 actionlint
-rtk /tmp/actionlint-v1.7.12/actionlint \
+rtk /tmp/actionlint-v1.7.12/actionlint -shellcheck= -pyflakes= \
   .github/workflows/*.yml examples/baseline-workflows/.github/workflows/*.yml
 ```
 

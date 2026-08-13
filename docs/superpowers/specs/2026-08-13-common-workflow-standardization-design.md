@@ -1,7 +1,7 @@
 # Common Workflow Standardization Design
 
 Date: 2026-08-13  
-Status: approved direction; written specification awaiting user review
+Status: approved; implementation planned
 
 ## 1. Decision
 
