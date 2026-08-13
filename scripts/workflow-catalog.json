@@ -29,11 +29,11 @@
         {
           "name": "claude",
           "permissions": {
+            "actions": "read",
             "contents": "read",
-            "pull-requests": "read",
-            "issues": "read",
             "id-token": "write",
-            "actions": "read"
+            "issues": "read",
+            "pull-requests": "read"
           },
           "with": [],
           "secrets": [
@@ -61,9 +61,9 @@
           "name": "claude-review",
           "permissions": {
             "contents": "read",
-            "pull-requests": "write",
+            "id-token": "write",
             "issues": "read",
-            "id-token": "write"
+            "pull-requests": "write"
           },
           "with": [
             "pr_number"
@@ -93,14 +93,16 @@
           "name": "gemini-review",
           "permissions": {
             "contents": "read",
-            "pull-requests": "write",
             "issues": "write",
-            "id-token": "write"
+            "pull-requests": "write"
           },
           "with": [
-            "pr_number"
+            "app_id",
+            "pr_number",
+            "repo_write_auth"
           ],
           "secrets": [
+            "APP_PRIVATE_KEY",
             "GEMINI_API_KEY"
           ]
         }
@@ -140,17 +142,16 @@
           "name": "dispatch",
           "permissions": {
             "contents": "read",
-            "id-token": "write",
             "issues": "write",
             "pull-requests": "write"
           },
           "with": [
-            "app_id"
+            "app_id",
+            "repo_write_auth"
           ],
           "secrets": [
             "APP_PRIVATE_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY"
+            "GEMINI_API_KEY"
           ]
         }
       ]
@@ -202,7 +203,6 @@
           "name": "invoke",
           "permissions": {
             "contents": "read",
-            "id-token": "write",
             "issues": "write",
             "pull-requests": "write"
           },
@@ -213,12 +213,12 @@
             "is_pull_request",
             "item_body",
             "item_number",
-            "item_title"
+            "item_title",
+            "repo_write_auth"
           ],
           "secrets": [
             "APP_PRIVATE_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY"
+            "GEMINI_API_KEY"
           ]
         }
       ]
@@ -230,11 +230,14 @@
       "auth_family": "gemini",
       "profile_axis": "repo_write_auth",
       "trigger": {
-        "issues": {
-          "types": [
-            "opened",
-            "reopened"
-          ]
+        "workflow_dispatch": {
+          "inputs": {
+            "issue_number": {
+              "description": "Issue number to triage (e.g. 123)",
+              "required": "true",
+              "type": "string"
+            }
+          }
         }
       },
       "caller_jobs": [
@@ -242,21 +245,19 @@
           "name": "triage",
           "permissions": {
             "contents": "read",
-            "id-token": "write",
-            "issues": "read",
-            "pull-requests": "read"
+            "issues": "write",
+            "pull-requests": "write"
           },
           "with": [
-            "additional_context",
             "app_id",
             "issue_body",
             "issue_number",
-            "issue_title"
+            "issue_title",
+            "repo_write_auth"
           ],
           "secrets": [
             "APP_PRIVATE_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY"
+            "GEMINI_API_KEY"
           ]
         }
       ]
@@ -268,10 +269,19 @@
       "auth_family": "gemini",
       "profile_axis": "repo_write_auth",
       "trigger": {
-        "pull_request": {
-          "types": [
-            "opened"
-          ]
+        "workflow_dispatch": {
+          "inputs": {
+            "pr_number": {
+              "description": "Pull request number to review (e.g. 45)",
+              "required": "true",
+              "type": "string"
+            },
+            "additional_context": {
+              "description": "Optional extra context for the review prompt",
+              "required": "false",
+              "type": "string"
+            }
+          }
         }
       },
       "caller_jobs": [
@@ -279,7 +289,6 @@
           "name": "review",
           "permissions": {
             "contents": "read",
-            "id-token": "write",
             "issues": "write",
             "pull-requests": "write"
           },
@@ -288,12 +297,12 @@
             "app_id",
             "issue_body",
             "issue_title",
-            "pr_number"
+            "pr_number",
+            "repo_write_auth"
           ],
           "secrets": [
             "APP_PRIVATE_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY"
+            "GEMINI_API_KEY"
           ]
         }
       ]
@@ -335,7 +344,6 @@
           "name": "review",
           "permissions": {
             "contents": "read",
-            "id-token": "write",
             "issues": "write",
             "pull-requests": "write"
           },
@@ -344,12 +352,12 @@
             "app_id",
             "issue_body",
             "issue_title",
-            "pr_number"
+            "pr_number",
+            "repo_write_auth"
           ],
           "secrets": [
             "APP_PRIVATE_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY"
+            "GEMINI_API_KEY"
           ]
         }
       ]
@@ -368,17 +376,16 @@
           "name": "triage",
           "permissions": {
             "contents": "read",
-            "id-token": "write",
             "issues": "write",
             "pull-requests": "write"
           },
           "with": [
-            "app_id"
+            "app_id",
+            "repo_write_auth"
           ],
           "secrets": [
             "APP_PRIVATE_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY"
+            "GEMINI_API_KEY"
           ]
         }
       ]
@@ -420,21 +427,20 @@
           "name": "triage",
           "permissions": {
             "contents": "read",
-            "id-token": "write",
-            "issues": "read",
-            "pull-requests": "read"
+            "issues": "write",
+            "pull-requests": "write"
           },
           "with": [
             "additional_context",
             "app_id",
             "issue_body",
             "issue_number",
-            "issue_title"
+            "issue_title",
+            "repo_write_auth"
           ],
           "secrets": [
             "APP_PRIVATE_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY"
+            "GEMINI_API_KEY"
           ]
         }
       ]
@@ -471,8 +477,8 @@
           "name": "rereview",
           "permissions": {
             "contents": "read",
-            "pull-requests": "write",
-            "issues": "write"
+            "issues": "write",
+            "pull-requests": "write"
           },
           "with": [],
           "secrets": []
@@ -507,19 +513,18 @@
         {
           "name": "gemini-chat",
           "permissions": {
+            "actions": "read",
             "contents": "read",
-            "pull-requests": "write",
             "issues": "write",
-            "id-token": "write",
-            "actions": "read"
+            "pull-requests": "write"
           },
           "with": [
-            "app_id"
+            "app_id",
+            "repo_write_auth"
           ],
           "secrets": [
             "APP_PRIVATE_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY"
+            "GEMINI_API_KEY"
           ]
         }
       ]
@@ -547,8 +552,8 @@
           "name": "opencode",
           "permissions": {
             "contents": "read",
-            "pull-requests": "write",
-            "issues": "write"
+            "issues": "write",
+            "pull-requests": "write"
           },
           "with": [],
           "secrets": [
@@ -579,7 +584,9 @@
             "issues": "write",
             "pull-requests": "write"
           },
-          "with": [],
+          "with": [
+            "pr_number"
+          ],
           "secrets": [
             "ZHIPU_API_KEY"
           ]

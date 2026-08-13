@@ -1,4 +1,4 @@
-name: opencode
+name: OpenCode
 
 on:
   issue_comment:
@@ -10,8 +10,8 @@ jobs:
   opencode:
     permissions:
       contents: read
-      pull-requests: write
       issues: write
-    uses: jhw7500/automation/.github/workflows/opencode.yml@v1.36
+      pull-requests: write
+    uses: jhw7500/automation/.github/workflows/opencode.yml@__AUTOMATION_COMMIT__
     secrets:
       ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}

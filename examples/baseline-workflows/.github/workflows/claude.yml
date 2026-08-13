@@ -10,12 +10,12 @@ on:
 
 jobs:
   claude:
-    uses: jhw7500/automation/.github/workflows/claude.yml@v1.36
     permissions:
-      contents: read
-      pull-requests: read
-      issues: read
-      id-token: write
       actions: read
+      contents: read
+      id-token: write
+      issues: read
+      pull-requests: read
+    uses: jhw7500/automation/.github/workflows/claude.yml@__AUTOMATION_COMMIT__
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

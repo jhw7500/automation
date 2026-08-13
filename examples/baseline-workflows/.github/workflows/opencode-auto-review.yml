@@ -1,0 +1,17 @@
+name: OpenCode Auto PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  opencode-review:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: jhw7500/automation/.github/workflows/opencode-auto-review.yml@__AUTOMATION_COMMIT__
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+    secrets:
+      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
