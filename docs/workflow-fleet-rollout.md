@@ -15,9 +15,21 @@ processed. Rendered callers pin that 40-character commit rather than the tag tex
 
 Use a dedicated disposable directory. The first plan initializes its marker; subsequent
 plan, publish, and audit commands reuse it. The scripts accept only repositories declared
-by `scripts/workflow-config.json`. Git and `gh` use the operator's normal GitHub
-authentication, but provider credentials are removed from child environments. Supply the
-locally installed, reviewed `actionlint` executable explicitly.
+by `scripts/workflow-config.json`. Consumer-repository Git and `gh` operations use the
+operator's normal GitHub authentication, but provider credentials are removed from child
+environments. Supply the locally installed, reviewed `actionlint` executable explicitly.
+
+Automation release verification has a narrower boundary. Local tag resolution, content
+reads, and archive creation use absolute `/usr/bin/git` with a nonexistent home/XDG root,
+system and global Git configuration disabled, prompts and askpass disabled, and no SSH
+agent or provider/operator environment. Remote tag verification accepts only the local
+remote name `origin`, requires that its directly configured URL be exactly the public
+`jhw7500/automation` HTTPS URL, canonicalizes it to
+`https://github.com/jhw7500/automation.git`, and runs a credential-free public HTTPS
+`ls-remote` outside the checkout. It does not load host or repository credential helpers,
+URL rewrites, includes, or SSH commands. A private or forked automation remote is not
+supported by this release-verification path; supporting one requires a separately designed
+explicit minimal credential channel rather than ambient host Git configuration.
 
 CI pins and verifies actionlint itself, then runs its YAML schema and expression gate with
 `-shellcheck= -pyflakes=`. Empty analyzer paths make this gate deterministic and independent

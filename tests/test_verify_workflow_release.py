@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 import traceback
 
 import pytest
@@ -15,6 +17,28 @@ import scripts.verify_workflow_release as release_verifier
 from scripts.verify_workflow_release import ReleaseVerificationError, verify_release
 
 ROOT = Path(__file__).resolve().parents[1]
+
+CANONICAL_REMOTE = "https://github.com/jhw7500/automation.git"
+HERMETIC_LOCAL_GIT_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent/automation-workflow-release/home",
+    "XDG_CONFIG_HOME": "/nonexistent/automation-workflow-release/xdg",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "/bin/false",
+    "SSH_ASKPASS": "/bin/false",
+    "GCM_INTERACTIVE": "Never",
+}
+HERMETIC_REMOTE_GIT_ENV = {
+    **HERMETIC_LOCAL_GIT_ENV,
+    "GIT_ALLOW_PROTOCOL": "https",
+    "GIT_PROTOCOL_FROM_USER": "0",
+    "GIT_CEILING_DIRECTORIES": "/",
+}
 
 
 RELEASE_PATHS = (
@@ -127,17 +151,274 @@ def test_release_verifier_git_uses_a_minimal_provider_free_environment(
     assert observed["args"][0] == "/usr/bin/git"
     env = observed["env"]
     assert isinstance(env, dict)
-    assert set(env) == {
-        "PATH",
-        "HOME",
-        "XDG_CONFIG_HOME",
-        "SSH_AUTH_SOCK",
-        "LANG",
-        "LC_ALL",
-        "GIT_TERMINAL_PROMPT",
-    }
+    assert env == HERMETIC_LOCAL_GIT_ENV
     assert sensitive.isdisjoint(env)
     assert not any(str(value).startswith("sentinel-") for value in env.values())
+    assert "SSH_AUTH_SOCK" not in env
+
+
+def test_remote_git_uses_public_https_outside_the_repository_with_no_host_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def child(args, **kwargs):
+        observed.update({"args": list(args), **kwargs})
+        return subprocess.CompletedProcess(args, 0, stdout="remote\n", stderr="")
+
+    monkeypatch.setattr(release_verifier.subprocess, "run", child)
+
+    assert release_verifier.remote_git(CANONICAL_REMOTE, "refs/tags/v1.40") == (
+        "remote\n"
+    )
+    assert observed["args"] == [
+        "/usr/bin/git",
+        "ls-remote",
+        "--tags",
+        CANONICAL_REMOTE,
+        "refs/tags/v1.40",
+    ]
+    assert observed["cwd"] == "/"
+    assert observed["env"] == HERMETIC_REMOTE_GIT_ENV
+    assert "-C" not in observed["args"]
+
+
+def test_remote_git_failure_does_not_expose_child_or_provider_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = "remote-provider-sentinel"
+    raw = "remote-raw-child-sentinel"
+    monkeypatch.setenv("ZHIPU_API_KEY", provider)
+
+    def child(args, **kwargs):
+        assert provider not in kwargs["env"].values()
+        return subprocess.CompletedProcess(
+            args,
+            37,
+            stdout=f"stdout {provider} {raw}",
+            stderr=f"stderr {provider} {raw}",
+        )
+
+    monkeypatch.setattr(release_verifier.subprocess, "run", child)
+
+    with pytest.raises(ReleaseVerificationError) as raised:
+        release_verifier.remote_git(CANONICAL_REMOTE, raw)
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(raised.value), raised.value, raised.value.__traceback__
+        )
+    )
+    assert provider not in rendered
+    assert raw not in rendered
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_local_release_reads_ignore_host_user_and_xdg_git_includes(
+    release_repo: tuple[Path, Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _, release_commit = release_repo
+    marker = tmp_path / "host-config-command-ran"
+    provider_token = tmp_path / "provider-token"
+    provider_token.write_text("provider-secret", encoding="utf-8")
+    helper = tmp_path / "host-ssh-command"
+    helper.write_text(
+        "#!/bin/sh\n"
+        f"/bin/cat {provider_token} > {marker}\n"
+        "exit 91\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    included = tmp_path / "provider.gitconfig"
+    included.write_text(
+        f"[core]\n\tsshCommand = {helper}\n"
+        f"[credential]\n\thelper = !{helper}\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "host-home"
+    xdg = tmp_path / "host-xdg"
+    home.mkdir()
+    (xdg / "git").mkdir(parents=True)
+    (home / ".gitconfig").write_text(
+        f"[include]\n\tpath = {included}\n", encoding="utf-8"
+    )
+    (xdg / "git/config").write_text(
+        f"[include]\n\tpath = {included}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(included))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(included))
+
+    assert verify_release(repo, "v1.40", release_commit) == release_commit
+    assert not marker.exists()
+
+
+def test_remote_verification_does_not_execute_included_host_ssh_command(
+    release_repo: tuple[Path, Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _, _ = release_repo
+    marker = tmp_path / "host-ssh-command-ran"
+    provider_token = tmp_path / "provider-token"
+    provider_token.write_text("provider-secret", encoding="utf-8")
+    helper = tmp_path / "host-ssh-command"
+    helper.write_text(
+        "#!/bin/sh\n"
+        f"/bin/cat {provider_token} > {marker}\n"
+        "exit 92\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    included = tmp_path / "provider.gitconfig"
+    included.write_text(
+        f"[core]\n\tsshCommand = {helper}\n", encoding="utf-8"
+    )
+    home = tmp_path / "host-home"
+    home.mkdir()
+    (home / ".gitconfig").write_text(
+        f"[include]\n\tpath = {included}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    git(repo, "remote", "set-url", "origin", "ssh://git@127.0.0.1/provider")
+    tag = release_verifier.resolve_annotated_tag(repo, "v1.40")
+
+    with pytest.raises(ReleaseVerificationError) as raised:
+        release_verifier.verify_remote_tag(repo, "origin", tag)
+
+    assert not marker.exists()
+    assert "canonical public HTTPS" in str(raised.value)
+
+
+def test_remote_verification_does_not_execute_local_credential_helper(
+    release_repo: tuple[Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    repo, _, _ = release_repo
+    requests: list[str] = []
+
+    class Unauthorized(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
+            requests.append(self.path)
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="provider"')
+            self.end_headers()
+
+        def log_message(self, _format: str, *args: object) -> None:
+            del args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Unauthorized)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    marker = tmp_path / "credential-helper-ran"
+    provider_token = tmp_path / "provider-token"
+    provider_token.write_text("provider-secret", encoding="utf-8")
+    helper = tmp_path / "credential-helper"
+    helper.write_text(
+        "#!/bin/sh\n"
+        f"/bin/cat {provider_token} > {marker}\n"
+        "if [ \"$1\" = get ]; then\n"
+        "  printf 'username=provider\\npassword=secret\\n'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    git(
+        repo,
+        "remote",
+        "set-url",
+        "origin",
+        f"http://127.0.0.1:{server.server_port}/provider",
+    )
+    git(repo, "config", "credential.helper", f"!{helper}")
+    tag = release_verifier.resolve_annotated_tag(repo, "v1.40")
+
+    try:
+        with pytest.raises(ReleaseVerificationError) as raised:
+            release_verifier.verify_remote_tag(repo, "origin", tag)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert not marker.exists()
+    assert requests == []
+    assert "canonical public HTTPS" in str(raised.value)
+
+
+def test_remote_url_inspection_does_not_follow_local_config_includes(
+    release_repo: tuple[Path, Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _, release_commit = release_repo
+    tag = release_verifier.resolve_annotated_tag(repo, "v1.40")
+    git(repo, "remote", "set-url", "origin", CANONICAL_REMOTE)
+    provider_token = tmp_path / "provider-token"
+    provider_token.write_text(
+        "provider-secret-is-not-valid-git-config\n", encoding="utf-8"
+    )
+    with (repo / ".git/config").open("a", encoding="utf-8") as config:
+        config.write(f"\n[include]\n\tpath = {provider_token}\n")
+
+    def remote_git(_url: str, *_refs: str) -> str:
+        return (
+            f"{tag.tag_object}\trefs/tags/v1.40\n"
+            f"{release_commit}\trefs/tags/v1.40^{{}}\n"
+        )
+
+    monkeypatch.setattr(release_verifier, "remote_git", remote_git)
+
+    release_verifier.verify_remote_tag(repo, "origin", tag)
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "ext::/bin/false",
+        "file:///tmp/provider-token",
+        "/tmp/provider-token",
+        "ssh://git@github.com/jhw7500/automation.git",
+        "git@github.com:jhw7500/automation.git",
+        "http://github.com/jhw7500/automation.git",
+        "https://github.com/other/automation.git",
+        "https://provider@github.com/jhw7500/automation.git",
+    ),
+)
+def test_remote_verification_rejects_noncanonical_url_before_transport(
+    release_repo: tuple[Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    repo, _, _ = release_repo
+    git(repo, "remote", "set-url", "origin", url)
+    tag = release_verifier.resolve_annotated_tag(repo, "v1.40")
+
+    def forbidden(*_args: object, **_kwargs: object) -> str:
+        pytest.fail("unsafe remote reached transport")
+
+    monkeypatch.setattr(release_verifier, "remote_git", forbidden)
+
+    with pytest.raises(ReleaseVerificationError, match="canonical public HTTPS"):
+        release_verifier.verify_remote_tag(repo, "origin", tag)
+
+
+def test_remote_verification_rejects_non_origin_name_before_transport(
+    release_repo: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, _ = release_repo
+    tag = release_verifier.resolve_annotated_tag(repo, "v1.40")
+
+    def forbidden(*_args: object, **_kwargs: object) -> str:
+        pytest.fail("unsafe remote reached transport")
+
+    monkeypatch.setattr(release_verifier, "remote_git", forbidden)
+
+    with pytest.raises(ReleaseVerificationError, match="only origin"):
+        release_verifier.verify_remote_tag(repo, "upstream", tag)
 
 
 def test_release_verifier_git_failure_does_not_expose_child_or_provider_data(
@@ -358,8 +639,28 @@ def ambient_caller_write_without_permissions(path: Path) -> None:
 
 def test_accepts_local_and_remote_annotated_tag_at_secure_commit(
     release_repo: tuple[Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, _, release_commit = release_repo
+    tag_object = git(repo, "rev-parse", "refs/tags/v1.40")
+    git(
+        repo,
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/jhw7500/automation",
+    )
+
+    def remote_git(url: str, *refs: str) -> str:
+        assert url == CANONICAL_REMOTE
+        assert refs == ("refs/tags/v1.40", "refs/tags/v1.40^{}")
+        return (
+            f"{tag_object}\trefs/tags/v1.40\n"
+            f"{release_commit}\trefs/tags/v1.40^{{}}\n"
+        )
+
+    monkeypatch.setattr(release_verifier, "remote_git", remote_git)
+
     assert verify_release(repo, "v1.40", release_commit, remote="origin") == release_commit
 
 
@@ -384,23 +685,15 @@ def test_rejects_tag_that_does_not_point_at_expected_commit(
 
 def test_rejects_remote_lightweight_tag_for_local_annotated_release(
     release_repo: tuple[Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo, remote, release_commit = release_repo
-    subprocess.run(
-        ["git", "--git-dir", str(remote), "update-ref", "-d", "refs/tags/v1.40"],
-        check=True,
-    )
-    subprocess.run(
-        [
-            "git",
-            "--git-dir",
-            str(remote),
-            "update-ref",
-            "refs/tags/v1.40",
-            release_commit,
-        ],
-        check=True,
-    )
+    repo, _, release_commit = release_repo
+    git(repo, "remote", "set-url", "origin", CANONICAL_REMOTE)
+
+    def remote_git(_url: str, *_refs: str) -> str:
+        return f"{release_commit}\trefs/tags/v1.40\n"
+
+    monkeypatch.setattr(release_verifier, "remote_git", remote_git)
 
     with pytest.raises(ReleaseVerificationError, match="annotated.*peeled"):
         verify_release(repo, "v1.40", release_commit, remote="origin")

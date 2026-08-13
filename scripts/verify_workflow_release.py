@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -126,7 +125,15 @@ APPROVED_GEMINI_ACTIONS = frozenset(
     }
 )
 GIT_EXECUTABLE = "/usr/bin/git"
-GIT_ENVIRONMENT_KEYS = ("HOME", "XDG_CONFIG_HOME", "SSH_AUTH_SOCK")
+CANONICAL_AUTOMATION_REMOTE = "https://github.com/jhw7500/automation.git"
+ACCEPTED_AUTOMATION_REMOTES = frozenset(
+    {
+        CANONICAL_AUTOMATION_REMOTE,
+        "https://github.com/jhw7500/automation",
+    }
+)
+HERMETIC_GIT_HOME = "/nonexistent/automation-workflow-release/home"
+HERMETIC_GIT_XDG = "/nonexistent/automation-workflow-release/xdg"
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -141,19 +148,33 @@ class AnnotatedTag:
 
 
 def git_child_env() -> dict[str, str]:
-    """Return only the local configuration and agent socket needed by read-only Git."""
+    """Return a fixed environment that excludes host and provider Git state."""
 
-    environment = {
+    return {
         "PATH": "/usr/bin:/bin",
+        "HOME": HERMETIC_GIT_HOME,
+        "XDG_CONFIG_HOME": HERMETIC_GIT_XDG,
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+        "SSH_ASKPASS": "/bin/false",
+        "GCM_INTERACTIVE": "Never",
     }
-    for key in GIT_ENVIRONMENT_KEYS:
-        value = os.environ.get(key)
-        if value:
-            environment[key] = value
-    return environment
+
+
+def remote_git_env() -> dict[str, str]:
+    """Restrict remote verification to unauthenticated public HTTPS."""
+
+    return {
+        **git_child_env(),
+        "GIT_ALLOW_PROTOCOL": "https",
+        "GIT_PROTOCOL_FROM_USER": "0",
+        "GIT_CEILING_DIRECTORIES": "/",
+    }
 
 
 def git(repo: Path, *args: str) -> str:
@@ -173,6 +194,36 @@ def git(repo: Path, *args: str) -> str:
     if result.returncode != 0:
         raise ReleaseVerificationError(
             f"Git command failed (rc={result.returncode})"
+        ) from None
+    return result.stdout
+
+
+def remote_git(url: str, *refs: str) -> str:
+    """Read tag refs from the one public automation endpoint without host config."""
+
+    if url != CANONICAL_AUTOMATION_REMOTE:
+        raise ReleaseVerificationError(
+            "remote must be the canonical public HTTPS automation endpoint"
+        )
+    result: subprocess.CompletedProcess[str] | None = None
+    try:
+        result = subprocess.run(
+            [GIT_EXECUTABLE, "ls-remote", "--tags", url, *refs],
+            cwd="/",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=remote_git_env(),
+        )
+    except (OSError, ValueError):
+        pass
+    if result is None:
+        raise ReleaseVerificationError(
+            "Remote Git command failed (rc=unavailable)"
+        ) from None
+    if result.returncode != 0:
+        raise ReleaseVerificationError(
+            f"Remote Git command failed (rc={result.returncode})"
         ) from None
     return result.stdout
 
@@ -207,12 +258,33 @@ def assert_tag_unchanged(repo: Path, tag: AnnotatedTag) -> None:
         raise ReleaseVerificationError(f"tag {tag.ref} changed during verification")
 
 
+def _canonical_remote_url(repo: Path, remote: str) -> str:
+    if remote != "origin":
+        raise ReleaseVerificationError(
+            "remote verification supports only origin"
+        )
+    try:
+        configured = git(
+            repo,
+            "config",
+            "--local",
+            "--no-includes",
+            "--get-all",
+            "remote.origin.url",
+        ).splitlines()
+    except ReleaseVerificationError:
+        configured = []
+    if len(configured) != 1 or configured[0] not in ACCEPTED_AUTOMATION_REMOTES:
+        raise ReleaseVerificationError(
+            "origin must be the canonical public HTTPS automation remote"
+        ) from None
+    return CANONICAL_AUTOMATION_REMOTE
+
+
 def verify_remote_tag(repo: Path, remote: str, tag: AnnotatedTag) -> None:
-    result = git(
-        repo,
-        "ls-remote",
-        "--tags",
-        remote,
+    url = _canonical_remote_url(repo, remote)
+    result = remote_git(
+        url,
         f"refs/tags/{tag.ref}",
         f"refs/tags/{tag.ref}^{{}}",
     )

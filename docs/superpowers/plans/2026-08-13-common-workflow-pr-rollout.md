@@ -799,6 +799,17 @@ RELEASE_PATHS = (
 
 Use `git cat-file -t refs/tags/<ref>` to require `tag`, `git rev-parse <ref>^{commit}` for the 40-character commit, and `git ls-remote --tags` when `remote` is set. Extract with `git archive` into a fresh temporary directory; reject absolute paths, `..`, symlink/hardlink members, and unexpected top-level paths before writing. Load catalog/config from the extracted root.
 
+Release Git is hermetic rather than an ambient authenticated Git client. Local
+resolve/show/ls-tree/archive subprocesses use absolute `/usr/bin/git`, a fixed nonexistent
+home/XDG root, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, disabled
+prompt/askpass, and no SSH agent. Remote verification accepts only `origin` when its direct,
+no-include URL is the public automation HTTPS identity, canonicalizes it to
+`https://github.com/jhw7500/automation.git`, and runs credential-free public HTTPS outside
+the repository with `GIT_ALLOW_PROTOCOL=https`. Host/repository includes, URL rewrites, SSH
+commands, and credential helpers cannot enter the transport. A private or forked automation
+remote is unsupported unless a separate explicit minimal credential channel is designed and
+reviewed.
+
 - [ ] **Step 4: Rewrite audit as a renderer comparison**
 
 Call `render_repository(repo, bundle.canonical, bundle.catalog, profile, bundle.ref, bundle.commit, secret_names, variable_names, bootstrap=False)` without applying it. Map `current` directly, map `drift` and `bootstrap_required` to audit status `drift` with sorted paths/reason, and map every render block to `blocked`. Audit reports no branch, PR, merge method, commit topology, or journal fields.
@@ -1182,7 +1193,23 @@ rtk bash -lc '
     printf "%s\n" "ERROR: local v1.40 already exists; stop without changing it" >&2
     exit 1
   fi
-  REMOTE_TAGS="$(rtk git ls-remote --tags origin refs/tags/v1.40 "refs/tags/v1.40^{}")"
+  REMOTE_TAGS="$(
+    rtk env -i \
+      PATH=/usr/bin:/bin \
+      HOME=/nonexistent/automation-workflow-release/home \
+      XDG_CONFIG_HOME=/nonexistent/automation-workflow-release/xdg \
+      LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+      GIT_CONFIG_NOSYSTEM=1 \
+      GIT_CONFIG_SYSTEM=/dev/null \
+      GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_TERMINAL_PROMPT=0 \
+      GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false GCM_INTERACTIVE=Never \
+      GIT_ALLOW_PROTOCOL=https GIT_PROTOCOL_FROM_USER=0 \
+      GIT_CEILING_DIRECTORIES=/ \
+      /usr/bin/git -C / ls-remote --tags \
+      https://github.com/jhw7500/automation.git \
+      refs/tags/v1.40 "refs/tags/v1.40^{}"
+  )"
   if [ -n "$REMOTE_TAGS" ]; then
     printf "%s\n" "ERROR: remote v1.40 already exists; stop without changing it" >&2
     exit 1
@@ -1199,7 +1226,10 @@ rtk bash -lc '
 Expected: both absence checks pass before creation, the annotated local object and commit
 are verified before push, and remote verification passes afterward. Any local/remote
 `v1.40` presence or verification failure stops the shell under `set -euo pipefail`; never
-move/delete the tag.
+move/delete the tag. The absence read and verifier use credential-free public HTTPS and do
+not consult host Git includes, URL rewrites, SSH commands, credential helpers, askpass, or
+provider/operator credentials. This central release contract does not support a private or
+forked automation remote without a separately reviewed explicit credential channel.
 
 - [ ] **Step 5: Run the full read-only fleet plan**
 

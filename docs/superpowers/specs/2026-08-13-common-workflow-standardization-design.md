@@ -245,6 +245,18 @@ access needed to create workflow-file commits, branches, and PRs; its code conta
 merge or secret-mutation client. Temporary clones disable repository hooks, do not recurse
 into submodules, and accept only the configured `github.com/jhw7500/<repo>` remote.
 
+The central release verifier is intentionally separate from those authenticated consumer
+operations. Its local resolve/show/ls-tree/archive subprocesses use absolute `/usr/bin/git`
+with a fixed nonexistent home/XDG root, system and global Git configuration disabled,
+prompts and askpass disabled, and no SSH agent. For remote tag attestation it reads only the
+direct, no-include local `remote.origin.url`, accepts exactly the public automation HTTPS
+identity, canonicalizes it to `https://github.com/jhw7500/automation.git`, and performs
+credential-free public HTTPS outside the repository with only the HTTPS transport allowed.
+Host/repository URL rewrites, SSH commands, includes, and credential helpers never enter the
+transport subprocess. A private or forked automation remote is outside this contract until
+an explicit, minimal release-verification credential channel is separately designed and
+reviewed.
+
 ### 9.1 Plan
 
 ```text

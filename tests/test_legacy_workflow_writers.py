@@ -496,7 +496,8 @@ def test_task9_is_fail_closed_sequential_and_reuses_the_marked_workspace() -> No
 
     assert "set -euo pipefail" in text
     assert "show-ref --verify --quiet refs/tags/v1.40" in text
-    assert "ls-remote --tags origin refs/tags/v1.40" in text
+    assert "/usr/bin/git -C / ls-remote --tags" in text
+    assert "https://github.com/jhw7500/automation.git" in text
     tag_index = text.index("git tag -a v1.40")
     verify_index = text.index("scripts/verify_workflow_release.py", tag_index)
     push_index = text.index("git push origin refs/tags/v1.40", verify_index)
@@ -525,3 +526,21 @@ def test_design_and_plan_distinguish_public_plan_and_audit_statuses() -> None:
         assert "missing config without explicit bootstrap" in text.lower()
         assert "audit" in text.lower()
         assert "`drift`" in text
+
+
+def test_release_verification_docs_define_the_public_hermetic_git_boundary() -> None:
+    rollout = ROLLOUT_DOC.read_text(encoding="utf-8")
+    design = DESIGN.read_text(encoding="utf-8")
+    plan = IMPLEMENTATION_PLAN.read_text(encoding="utf-8")
+    combined = f"{rollout}\n{design}\n{plan}"
+
+    assert "https://github.com/jhw7500/automation.git" in combined
+    assert "credential-free public HTTPS" in combined
+    assert "system and global Git configuration" in combined
+    assert "credential helpers" in combined
+    assert "private or forked automation remote" in combined
+    assert "GIT_CONFIG_NOSYSTEM=1" in plan
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in plan
+    assert "GIT_ALLOW_PROTOCOL=https" in plan
+    assert "/usr/bin/git -C / ls-remote --tags" in plan
+    assert "git ls-remote --tags origin refs/tags/v1.40" not in plan

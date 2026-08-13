@@ -19,6 +19,21 @@ from scripts.workflow_release_bundle import materialize_release_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 
+HERMETIC_LOCAL_GIT_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent/automation-workflow-release/home",
+    "XDG_CONFIG_HOME": "/nonexistent/automation-workflow-release/xdg",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "/bin/false",
+    "SSH_ASKPASS": "/bin/false",
+    "GCM_INTERACTIVE": "Never",
+}
+
 
 RELEASE_PATHS = (
     ".github/workflows",
@@ -121,17 +136,58 @@ def test_release_archive_git_uses_the_same_minimal_provider_free_environment(
     assert observed["args"][0] == "/usr/bin/git"
     env = observed["env"]
     assert isinstance(env, dict)
-    assert set(env) == {
-        "PATH",
-        "HOME",
-        "XDG_CONFIG_HOME",
-        "SSH_AUTH_SOCK",
-        "LANG",
-        "LC_ALL",
-        "GIT_TERMINAL_PROMPT",
-    }
+    assert env == HERMETIC_LOCAL_GIT_ENV
     assert sensitive.isdisjoint(env)
     assert not any(str(value).startswith("sentinel-") for value in env.values())
+    assert "SSH_AUTH_SOCK" not in env
+
+
+def test_release_archive_ignores_host_user_and_xdg_git_includes(
+    release_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, release_commit = release_repo
+    marker = tmp_path / "archive-host-config-command-ran"
+    provider_token = tmp_path / "provider-token"
+    provider_token.write_text("examples/** export-ignore\n", encoding="utf-8")
+    helper = tmp_path / "host-command"
+    helper.write_text(
+        "#!/bin/sh\n"
+        f"/bin/cat {provider_token} > {marker}\n"
+        "exit 93\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    included = tmp_path / "provider.gitconfig"
+    included.write_text(
+        f"[core]\n\tsshCommand = {helper}\n"
+        f"\tattributesFile = {provider_token}\n"
+        f"[credential]\n\thelper = !{helper}\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "host-home"
+    xdg = tmp_path / "host-xdg"
+    home.mkdir()
+    (xdg / "git").mkdir(parents=True)
+    (home / ".gitconfig").write_text(
+        f"[include]\n\tpath = {included}\n", encoding="utf-8"
+    )
+    (xdg / "git/config").write_text(
+        f"[include]\n\tpath = {included}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(included))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(included))
+
+    archive = release_bundle._git_archive(repo, release_commit)
+
+    assert archive
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as stream:
+        names = set(stream.getnames())
+    assert "examples/baseline-workflows/.github/workflows/claude.yml" in names
+    assert not marker.exists()
 
 
 def test_release_archive_failure_does_not_expose_child_or_provider_data(
@@ -198,17 +254,29 @@ def test_bundle_rejects_lightweight_tag(release_repo: tuple[Path, str]) -> None:
 
 
 def test_bundle_rejects_local_remote_tag_mismatch(
-    release_repo: tuple[Path, str], tmp_path: Path
+    release_repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo, _ = release_repo
-    remote = tmp_path / "origin.git"
-    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
-    git(repo, "remote", "add", "origin", str(remote))
-    git(repo, "push", "-q", "origin", "v1.40")
+    repo, release_commit = release_repo
+    original_tag = git(repo, "rev-parse", "refs/tags/v1.40")
+    git(
+        repo,
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/jhw7500/automation.git",
+    )
     (repo / "new").write_text("new", encoding="utf-8")
     commit(repo, "new release")
     git(repo, "tag", "-d", "v1.40")
     git(repo, "tag", "-a", "v1.40", "-m", "local replacement")
+
+    def remote_git(_url: str, *_refs: str) -> str:
+        return (
+            f"{original_tag}\trefs/tags/v1.40\n"
+            f"{release_commit}\trefs/tags/v1.40^{{}}\n"
+        )
+
+    monkeypatch.setattr(release_verifier, "remote_git", remote_git)
 
     with pytest.raises(ReleaseVerificationError, match="remote tag.*expected commit"):
         with materialize_release_bundle(repo, "v1.40", remote="origin"):
