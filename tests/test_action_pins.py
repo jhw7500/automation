@@ -3,12 +3,19 @@
 
 from pathlib import Path
 import re
+import sys
 import unittest
 
 import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.prepare_workflow_rollout import CHECKOUT_SHA as FLEET_CHECKOUT_SHA
+from scripts.verify_workflow_release import CHECKOUT_ACTION
+
+
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 CACHE_SHA = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
 OPENCODE_VERSION = "1.18.17"
@@ -31,6 +38,10 @@ def workflow_paths() -> list[Path]:
 
 
 class ActionPinsTest(unittest.TestCase):
+    def test_release_and_fleet_gates_use_the_source_checkout_pin(self) -> None:
+        self.assertEqual(CHECKOUT_SHA, FLEET_CHECKOUT_SHA)
+        self.assertEqual(f"actions/checkout@{CHECKOUT_SHA}", CHECKOUT_ACTION)
+
     def test_all_managed_checkout_references_use_the_approved_sha(self) -> None:
         references: list[tuple[Path, int, str]] = []
         offenders: list[str] = []

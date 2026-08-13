@@ -11,7 +11,12 @@ repository secret 전제조건을 한 실행에서 조율한다. GitHub는 Git P
 - 기존 workflow 파일과 caller job만 처리하고 새 workflow를 강제로 추가하지 않는다.
 - 저장소별 trigger, `if` guard, 기존 `with` 입력을 보존한다. `permissions`도 보존하되,
   OpenCode 두 caller는 OIDC 제거와 review 출력에 필요한 최소 계약으로 정규화한다.
-- 중앙 release ref, `secrets` mapping, 지원되는 `app_id`, `automation_ref`만 변경한다.
+- 중앙 release ref, `secrets` mapping, 지원되는 `app_id`, `automation_ref`와 승인된
+  GitHub Action pin만 변경한다.
+- 중앙 caller가 있는 workflow와 `bump-automation-ref.yml` 안의 `actions/checkout`은
+  `v7.0.1`의 전체 commit SHA로 정규화한다. 중앙 caller가 없는 저장소 고유 workflow는
+  건드리지 않으며, YAML에는 checkout action이 있지만 안전한 단일행 형태로 편집할 수
+  없으면 해당 저장소를 fail-closed로 blocked 처리한다.
 - caller가 없는 저장소는 skip한다.
 - required secret이 없고 안전한 source도 없으면 해당 저장소만 blocked 처리한다.
 
