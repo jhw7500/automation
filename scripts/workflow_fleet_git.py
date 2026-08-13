@@ -171,6 +171,11 @@ def _ssh_scheme_url(repo: str) -> str:
     return f"ssh://git@github.com/{OWNER}/{repo}.git"
 
 
+def _permitted_urls(repo: str) -> frozenset[str]:
+    urls = {_https_url(repo), _ssh_url(repo), _ssh_scheme_url(repo)}
+    return frozenset({*urls, *(url.removesuffix(".git") for url in urls)})
+
+
 def _clone_url(repo: str, reported_url: object) -> str:
     allowed = {
         _https_url(repo): _https_url(repo),
@@ -185,19 +190,69 @@ def _clone_url(repo: str, reported_url: object) -> str:
     return allowed[reported_url]
 
 
+def _resolved_without_symlinks(path: Path, kind: str) -> Path:
+    try:
+        absolute = Path(os.path.abspath(path))
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError, TypeError) as exc:
+        raise FleetGitError(f"{kind} is not a real path") from exc
+    if resolved != absolute:
+        raise FleetGitError(f"{kind} contains a symlink component")
+    return resolved
+
+
+def _validate_repository_path(path: Path, repo: str) -> Path:
+    resolved = _resolved_without_symlinks(path, "repository root")
+    workspace = _resolved_without_symlinks(resolved.parent, "workspace")
+    if resolved.parent != workspace or resolved.name != repo:
+        raise FleetGitError("repository is not a direct workspace child")
+    if not workspace.is_dir() or workspace.is_symlink():
+        raise FleetGitError("workspace is not a real directory")
+    marker = workspace / WORKSPACE_MARKER
+    try:
+        marker_mode = marker.lstat().st_mode
+    except OSError as exc:
+        raise FleetGitError("workspace marker is unavailable") from exc
+    if (
+        marker.is_symlink()
+        or not stat.S_ISREG(marker_mode)
+        or _resolved_without_symlinks(marker, "workspace marker") != marker
+    ):
+        raise FleetGitError("workspace marker is not a regular file")
+    git_directory = resolved / ".git"
+    if (
+        not resolved.is_dir()
+        or resolved.is_symlink()
+        or not git_directory.is_dir()
+        or git_directory.is_symlink()
+        or _resolved_without_symlinks(git_directory, "Git directory")
+        != git_directory
+    ):
+        raise FleetGitError("repository does not have clone-shaped Git state")
+    return resolved
+
+
 def _verify_origin(path: Path, repo: str) -> None:
-    if path.is_symlink():
-        raise FleetGitError("repository root must not be a symlink")
-    origin = _git(["remote", "get-url", "origin"], cwd=path)
-    if origin not in {_https_url(repo), _ssh_url(repo), _ssh_scheme_url(repo)}:
-        raise FleetGitError("repository origin does not match the permitted target")
+    permitted = _permitted_urls(repo)
+    for args in (
+        ["remote", "get-url", "--all", "origin"],
+        ["remote", "get-url", "--push", "--all", "origin"],
+    ):
+        urls = _git(args, cwd=path).splitlines()
+        if not urls or any(url not in permitted for url in urls):
+            raise FleetGitError(
+                "repository origin does not match the permitted target"
+            )
 
 
-def _snapshot_repo(snapshot: RepositorySnapshot) -> str:
+def _snapshot_repo(snapshot: RepositorySnapshot) -> tuple[str, Path]:
+    if not isinstance(snapshot.path, Path):
+        raise FleetGitError("repository path is invalid")
     repo = snapshot.path.name
     _validate_target(OWNER, repo)
     _validate_branch(snapshot.default_branch)
-    return repo
+    _validate_object_id(snapshot.base_sha)
+    return repo, _validate_repository_path(snapshot.path, repo)
 
 
 def _inventory(owner: str, repo: str, kind: str) -> frozenset[str]:
@@ -223,10 +278,18 @@ def clone_default_branch(
     """Clone exactly one permitted repository and inventory prerequisite names."""
 
     _validate_target(owner, repo)
+    try:
+        workspace = _resolved_without_symlinks(workspace, "workspace")
+        marker_mode = (workspace / WORKSPACE_MARKER).lstat().st_mode
+    except FleetGitError:
+        raise
+    except OSError as exc:
+        raise FleetGitError("workspace is not marked for fleet automation") from exc
     if (
         workspace.is_symlink()
         or not workspace.is_dir()
-        or not (workspace / WORKSPACE_MARKER).is_file()
+        or (workspace / WORKSPACE_MARKER).is_symlink()
+        or not stat.S_ISREG(marker_mode)
     ):
         raise FleetGitError("workspace is not marked for fleet automation")
     target = workspace / repo
@@ -265,8 +328,7 @@ def clone_default_branch(
             str(target),
         ]
     )
-    if target.is_symlink() or not target.is_dir():
-        raise FleetGitError("clone produced an unsafe repository root")
+    target = _validate_repository_path(target, repo)
     _verify_origin(target, repo)
     base_sha = _validate_object_id(_git(["rev-parse", "HEAD"], cwd=target))
     secret_names = _inventory(owner, repo, "secret")
@@ -283,8 +345,8 @@ def clone_default_branch(
 def refetch_default(snapshot: RepositorySnapshot) -> str:
     """Fetch and return the current permitted origin's default-branch SHA."""
 
-    repo = _snapshot_repo(snapshot)
-    _verify_origin(snapshot.path, repo)
+    repo, path = _snapshot_repo(snapshot)
+    _verify_origin(path, repo)
     _git(
         [
             "fetch",
@@ -292,12 +354,12 @@ def refetch_default(snapshot: RepositorySnapshot) -> str:
             "origin",
             snapshot.default_branch,
         ],
-        cwd=snapshot.path,
+        cwd=path,
     )
     return _validate_object_id(
         _git(
             ["rev-parse", f"refs/remotes/origin/{snapshot.default_branch}"],
-            cwd=snapshot.path,
+            cwd=path,
         )
     )
 
@@ -306,10 +368,10 @@ def remote_branch_sha(snapshot: RepositorySnapshot, branch: str) -> str | None:
     """Return a remote branch SHA without fetching or changing local state."""
 
     _validate_branch(branch)
-    repo = _snapshot_repo(snapshot)
-    _verify_origin(snapshot.path, repo)
+    repo, path = _snapshot_repo(snapshot)
+    _verify_origin(path, repo)
     ref = f"refs/heads/{branch}"
-    output = _git(["ls-remote", "--heads", "origin", ref], cwd=snapshot.path)
+    output = _git(["ls-remote", "--heads", "origin", ref], cwd=path)
     if not output:
         return None
     lines = output.splitlines()
@@ -327,19 +389,23 @@ def push_new_branch(snapshot: RepositorySnapshot, branch: str) -> str:
     _validate_branch(branch)
     if branch == snapshot.default_branch:
         raise FleetGitError("default branch publication is not permitted")
+    repo, path = _snapshot_repo(snapshot)
     if remote_branch_sha(snapshot, branch) is not None:
         raise FleetGitError("remote branch already exists")
     fresh_base = refetch_default(snapshot)
-    _git(["switch", "-c", branch, fresh_base], cwd=snapshot.path)
-    head_sha = _validate_object_id(_git(["rev-parse", "HEAD"], cwd=snapshot.path))
+    _git(["switch", "-c", branch, fresh_base], cwd=path)
+    head_sha = _validate_object_id(_git(["rev-parse", "HEAD"], cwd=path))
+    _verify_origin(path, repo)
     _git(
         ["push", "--set-upstream", "origin", f"HEAD:refs/heads/{branch}"],
-        cwd=snapshot.path,
+        cwd=path,
     )
     return head_sha
 
 
-def _pull_request(item: object) -> PullRequest:
+def _pull_request(
+    item: object, *, owner: str, repo: str, expected_head: str
+) -> PullRequest:
     if not isinstance(item, dict):
         raise FleetGitError("GitHub returned malformed pull request metadata")
     fields = {
@@ -350,20 +416,37 @@ def _pull_request(item: object) -> PullRequest:
         "headRefName": str,
         "title": str,
         "body": str,
+        "isDraft": bool,
     }
     if any(
         key not in item or not isinstance(item[key], expected)
         for key, expected in fields.items()
-    ):
+    ) or "mergedAt" not in item:
         raise FleetGitError("GitHub returned malformed pull request metadata")
     number = item["number"]
     if isinstance(number, bool) or number < 1:
         raise FleetGitError("GitHub returned malformed pull request metadata")
+    expected_url = f"https://github.com/{owner}/{repo}/pull/{number}"
+    state = item["state"]
+    base = item["baseRefName"]
+    merged_at = item.get("mergedAt")
+    if (
+        item["url"] != expected_url
+        or state not in {"OPEN", "CLOSED", "MERGED"}
+        or not base
+        or item["headRefName"] != expected_head
+        or (merged_at is not None and not isinstance(merged_at, str))
+        or (state == "MERGED" and not isinstance(merged_at, str))
+        or (state == "MERGED" and not merged_at)
+        or (state != "MERGED" and merged_at is not None)
+    ):
+        raise FleetGitError("GitHub returned inconsistent pull request metadata")
+    _validate_branch(base)
     return PullRequest(
         number=number,
         url=item["url"],
-        state=item["state"],
-        base=item["baseRefName"],
+        state=state,
+        base=base,
         head=item["headRefName"],
         title=item["title"],
         body=item["body"],
@@ -392,10 +475,10 @@ def list_rollout_prs(owner: str, repo: str, branch: str) -> tuple[PullRequest, .
     )
     if not isinstance(data, list):
         raise FleetGitError("GitHub returned malformed pull request list")
-    pulls = tuple(_pull_request(item) for item in data)
-    if any(pull.head != branch for pull in pulls):
-        raise FleetGitError("GitHub returned a pull request for an unexpected head")
-    return pulls
+    return tuple(
+        _pull_request(item, owner=owner, repo=repo, expected_head=branch)
+        for item in data
+    )
 
 
 def create_pull_request(

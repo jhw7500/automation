@@ -45,6 +45,14 @@ def git_payload(args: list[str]) -> list[str]:
 
 
 def snapshot(path: Path) -> workflow_fleet_git.RepositorySnapshot:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workspace(path.parent)
+    path.mkdir(exist_ok=True)
+    (path / ".git").mkdir(exist_ok=True)
+    return raw_snapshot(path)
+
+
+def raw_snapshot(path: Path) -> workflow_fleet_git.RepositorySnapshot:
     return workflow_fleet_git.RepositorySnapshot(
         path=path,
         default_branch="main",
@@ -127,7 +135,10 @@ def test_clone_reads_only_metadata_and_prerequisite_names(
             Path(payload[-1]).mkdir()
             (Path(payload[-1]) / ".git").mkdir()
             return completed(args)
-        if payload == ["remote", "get-url", "origin"]:
+        if payload in [
+            ["remote", "get-url", "--all", "origin"],
+            ["remote", "get-url", "--push", "--all", "origin"],
+        ]:
             return completed(args, "https://github.com/jhw7500/wlan-package.git\n")
         if payload == ["rev-parse", "HEAD"]:
             return completed(args, f"{SHA}\n")
@@ -257,7 +268,10 @@ def test_refetch_default_uses_origin_tracking_ref(
 
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(git_payload(args))
-        if calls[-1] == ["remote", "get-url", "origin"]:
+        if calls[-1] in [
+            ["remote", "get-url", "--all", "origin"],
+            ["remote", "get-url", "--push", "--all", "origin"],
+        ]:
             return completed(args, "https://github.com/jhw7500/repo.git")
         if calls[-1] == ["rev-parse", "refs/remotes/origin/main"]:
             return completed(args, HEAD_SHA)
@@ -267,7 +281,8 @@ def test_refetch_default_uses_origin_tracking_ref(
 
     assert workflow_fleet_git.refetch_default(snapshot(tmp_path / "repo")) == HEAD_SHA
     assert calls == [
-        ["remote", "get-url", "origin"],
+        ["remote", "get-url", "--all", "origin"],
+        ["remote", "get-url", "--push", "--all", "origin"],
         ["fetch", "--no-recurse-submodules", "origin", "main"],
         ["rev-parse", "refs/remotes/origin/main"],
     ]
@@ -288,7 +303,10 @@ def test_remote_branch_sha_is_read_only(
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         payload = git_payload(args)
         calls.append(payload)
-        if payload == ["remote", "get-url", "origin"]:
+        if payload in [
+            ["remote", "get-url", "--all", "origin"],
+            ["remote", "get-url", "--push", "--all", "origin"],
+        ]:
             return completed(args, "https://github.com/jhw7500/repo.git")
         return completed(args, output)
 
@@ -309,7 +327,10 @@ def test_push_new_branch_proves_absence_and_never_forces_or_pushes_default(
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         payload = git_payload(args)
         calls.append(payload)
-        if payload == ["remote", "get-url", "origin"]:
+        if payload in [
+            ["remote", "get-url", "--all", "origin"],
+            ["remote", "get-url", "--push", "--all", "origin"],
+        ]:
             return completed(args, "https://github.com/jhw7500/repo.git")
         if payload == ["ls-remote", "--heads", "origin", "refs/heads/automation/common-workflows-v1.40"]:
             return completed(args, "")
@@ -349,7 +370,10 @@ def test_push_new_branch_refuses_existing_remote_without_writes(
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         payload = git_payload(args)
         calls.append(payload)
-        if payload == ["remote", "get-url", "origin"]:
+        if payload in [
+            ["remote", "get-url", "--all", "origin"],
+            ["remote", "get-url", "--push", "--all", "origin"],
+        ]:
             return completed(args, "https://github.com/jhw7500/repo.git")
         return completed(args, f"{HEAD_SHA}\trefs/heads/release")
 
@@ -374,6 +398,130 @@ def test_push_new_branch_rejects_default_branch_before_any_child(
 
     with pytest.raises(workflow_fleet_git.FleetGitError):
         workflow_fleet_git.push_new_branch(snapshot(tmp_path / "repo"), "main")
+
+
+@pytest.mark.parametrize(
+    "redirected_push_url",
+    [
+        pytest.param(
+            "https://github.com/jhw7500/repo.git\n"
+            "https://github.com/attacker/repo.git",
+            id="remote-pushurl",
+        ),
+        pytest.param(
+            "ssh://git@attacker.invalid/jhw7500/repo.git",
+            id="url-pushInsteadOf",
+        ),
+    ],
+)
+def test_snapshot_operation_rejects_effective_push_url_redirects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    redirected_push_url: str,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        payload = git_payload(args)
+        calls.append(payload)
+        if payload == ["remote", "get-url", "--all", "origin"]:
+            return completed(args, "https://github.com/jhw7500/repo.git")
+        if payload == ["remote", "get-url", "--push", "--all", "origin"]:
+            return completed(args, redirected_push_url)
+        raise AssertionError("redirected origin reached a remote operation")
+
+    monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
+
+    with pytest.raises(workflow_fleet_git.FleetGitError):
+        workflow_fleet_git.remote_branch_sha(snapshot(tmp_path / "repo"), "release")
+
+    assert calls == [
+        ["remote", "get-url", "--all", "origin"],
+        ["remote", "get-url", "--push", "--all", "origin"],
+    ]
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(lambda item: workflow_fleet_git.refetch_default(item), id="refetch"),
+        pytest.param(
+            lambda item: workflow_fleet_git.remote_branch_sha(item, "release"),
+            id="remote-branch",
+        ),
+        pytest.param(
+            lambda item: workflow_fleet_git.push_new_branch(item, "release"),
+            id="push",
+        ),
+    ],
+)
+def test_every_snapshot_operation_rejects_unmarked_ordinary_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: object,
+) -> None:
+    repo = tmp_path / "ordinary" / "repo"
+    (repo / ".git").mkdir(parents=True)
+    item = raw_snapshot(repo)
+    monkeypatch.setattr(
+        workflow_fleet_git.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail(
+            "unmarked checkout reached a child process"
+        ),
+    )
+
+    with pytest.raises(workflow_fleet_git.FleetGitError):
+        operation(item)  # type: ignore[operator]
+
+
+def test_snapshot_operation_rejects_moved_repo_and_non_clone_git_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    safe = snapshot(tmp_path / "marked" / "repo")
+    moved = tmp_path / "outside" / "repo"
+    moved.parent.mkdir()
+    safe.path.rename(moved)
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    workspace(worktree)
+    checkout = worktree / "repo"
+    checkout.mkdir()
+    (checkout / ".git").write_text("gitdir: ../real.git\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        workflow_fleet_git.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail(
+            "invalid snapshot shape reached a child process"
+        ),
+    )
+
+    with pytest.raises(workflow_fleet_git.FleetGitError):
+        workflow_fleet_git.refetch_default(safe)
+    with pytest.raises(workflow_fleet_git.FleetGitError):
+        workflow_fleet_git.refetch_default(raw_snapshot(checkout))
+
+
+def test_snapshot_operation_rejects_symlinked_workspace_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_workspace = tmp_path / "real"
+    snapshot(real_workspace / "repo")
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_workspace, target_is_directory=True)
+    item = raw_snapshot(alias / "repo")
+    monkeypatch.setattr(
+        workflow_fleet_git.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail(
+            "symlinked snapshot reached a child process"
+        ),
+    )
+
+    with pytest.raises(workflow_fleet_git.FleetGitError):
+        workflow_fleet_git.remote_branch_sha(item, "release")
 
 
 def test_list_rollout_prs_queries_all_states_for_exact_head(
@@ -430,6 +578,140 @@ def test_list_rollout_prs_queries_all_states_for_exact_head(
             "number,url,state,baseRefName,headRefName,title,body,isDraft,mergedAt",
         ]
     ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("number", 0),
+        ("number", True),
+        ("url", "https://github.com/jhw7500/other/pull/7"),
+        ("url", "https://github.com/jhw7500/repo/pull/8"),
+        ("state", "UNKNOWN"),
+        ("baseRefName", ""),
+        ("baseRefName", "bad branch"),
+        ("headRefName", "another-head"),
+        ("title", None),
+        ("body", None),
+        ("isDraft", "false"),
+        ("mergedAt", "2026-08-13T00:00:00Z"),
+    ],
+)
+def test_list_rollout_prs_rejects_malformed_or_mismatched_metadata(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: object
+) -> None:
+    item = {
+        "number": 7,
+        "url": "https://github.com/jhw7500/repo/pull/7",
+        "state": "OPEN",
+        "baseRefName": "main",
+        "headRefName": "release",
+        "title": "Roll out workflows",
+        "body": "Body",
+        "isDraft": False,
+        "mergedAt": None,
+    }
+    item[field] = value
+    monkeypatch.setattr(
+        workflow_fleet_git.subprocess,
+        "run",
+        lambda args, **kwargs: completed(args, json.dumps([item])),
+    )
+
+    with pytest.raises(workflow_fleet_git.FleetGitError):
+        workflow_fleet_git.list_rollout_prs("jhw7500", "repo", "release")
+
+
+@pytest.mark.parametrize(
+    ("state", "merged_at"),
+    [
+        ("MERGED", None),
+        ("MERGED", ""),
+        ("CLOSED", "2026-08-13T00:00:00Z"),
+        ("OPEN", 42),
+    ],
+)
+def test_list_rollout_prs_rejects_inconsistent_merged_state(
+    monkeypatch: pytest.MonkeyPatch, state: str, merged_at: object
+) -> None:
+    item = {
+        "number": 7,
+        "url": "https://github.com/jhw7500/repo/pull/7",
+        "state": state,
+        "baseRefName": "main",
+        "headRefName": "release",
+        "title": "Roll out workflows",
+        "body": "Body",
+        "isDraft": False,
+        "mergedAt": merged_at,
+    }
+    monkeypatch.setattr(
+        workflow_fleet_git.subprocess,
+        "run",
+        lambda args, **kwargs: completed(args, json.dumps([item])),
+    )
+
+    with pytest.raises(workflow_fleet_git.FleetGitError):
+        workflow_fleet_git.list_rollout_prs("jhw7500", "repo", "release")
+
+
+@pytest.mark.parametrize("missing", ["isDraft", "mergedAt"])
+def test_list_rollout_prs_requires_auxiliary_metadata_fields(
+    monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    item = {
+        "number": 7,
+        "url": "https://github.com/jhw7500/repo/pull/7",
+        "state": "OPEN",
+        "baseRefName": "main",
+        "headRefName": "release",
+        "title": "Roll out workflows",
+        "body": "Body",
+        "isDraft": False,
+        "mergedAt": None,
+    }
+    del item[missing]
+    monkeypatch.setattr(
+        workflow_fleet_git.subprocess,
+        "run",
+        lambda args, **kwargs: completed(args, json.dumps([item])),
+    )
+
+    with pytest.raises(workflow_fleet_git.FleetGitError):
+        workflow_fleet_git.list_rollout_prs("jhw7500", "repo", "release")
+
+
+def test_list_rollout_prs_accepts_consistent_merged_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = {
+        "number": 7,
+        "url": "https://github.com/jhw7500/repo/pull/7",
+        "state": "MERGED",
+        "baseRefName": "main",
+        "headRefName": "release",
+        "title": "Roll out workflows",
+        "body": "Body",
+        "isDraft": False,
+        "mergedAt": "2026-08-13T00:00:00Z",
+    }
+    monkeypatch.setattr(
+        workflow_fleet_git.subprocess,
+        "run",
+        lambda args, **kwargs: completed(args, json.dumps([item])),
+    )
+
+    assert workflow_fleet_git.list_rollout_prs("jhw7500", "repo", "release") == (
+        workflow_fleet_git.PullRequest(
+            number=7,
+            url="https://github.com/jhw7500/repo/pull/7",
+            state="MERGED",
+            base="main",
+            head="release",
+            title="Roll out workflows",
+            body="Body",
+        ),
+    )
 
 
 def test_create_pull_request_uses_0600_body_file_not_argv(
