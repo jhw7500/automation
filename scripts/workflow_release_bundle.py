@@ -13,8 +13,10 @@ import tempfile
 from typing import Iterator
 
 from scripts.verify_workflow_release import (
+    AnnotatedTag,
     ReleaseVerificationError,
-    git,
+    assert_tag_unchanged,
+    resolve_annotated_tag,
     verify_remote_tag,
     verify_tag_content,
 )
@@ -57,29 +59,23 @@ def _release_owned(path: PurePosixPath, *, directory: bool) -> bool:
     )
 
 
-def _require_annotated_tag(automation: Path, ref: str) -> str:
-    object_type = git(automation, "cat-file", "-t", f"refs/tags/{ref}").strip()
-    if object_type != "tag":
-        raise ReleaseVerificationError(f"release {ref} must be an annotated tag")
-    commit = git(
-        automation, "rev-parse", "--verify", f"refs/tags/{ref}^{{commit}}"
-    ).strip()
-    if len(commit) != 40 or any(
-        character not in "0123456789abcdef" for character in commit
-    ):
-        raise ReleaseVerificationError(f"tag {ref} did not resolve to a 40-character commit")
-    return commit
-
-
-def _git_archive(automation: Path, ref: str) -> bytes:
+def _git_archive(automation: Path, revision: str) -> bytes:
     result = subprocess.run(
-        ["git", "-C", str(automation), "archive", "--format=tar", ref, *RELEASE_PATHS],
+        [
+            "git",
+            "-C",
+            str(automation),
+            "archive",
+            "--format=tar",
+            revision,
+            *RELEASE_PATHS,
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise ReleaseVerificationError(detail or f"unable to archive tag {ref}")
+        raise ReleaseVerificationError(detail or f"unable to archive {revision}")
     return result.stdout
 
 
@@ -126,16 +122,14 @@ def _materialize(
     automation: Path, ref: str, *, remote: str | None
 ) -> Iterator[ReleaseBundle]:
     automation = automation.resolve()
-    commit = _require_annotated_tag(automation, ref)
+    tag: AnnotatedTag = resolve_annotated_tag(automation, ref)
     if remote is not None:
-        verify_remote_tag(automation, remote, ref, commit)
-    verify_tag_content(automation, ref)
-    if _require_annotated_tag(automation, ref) != commit:
-        raise ReleaseVerificationError(f"tag {ref} changed during verification")
+        verify_remote_tag(automation, remote, tag)
+    verify_tag_content(automation, ref, tag=tag)
 
     with tempfile.TemporaryDirectory(prefix="workflow-release-") as temporary:
         root = Path(temporary)
-        _extract_archive(_git_archive(automation, commit), root)
+        _extract_archive(_git_archive(automation, tag.commit), root)
         try:
             catalog = load_catalog(root)
             config = load_fleet_config(root, catalog)
@@ -148,7 +142,9 @@ def _materialize(
             raise ReleaseVerificationError(
                 f"tag {ref} canonical path is missing: {config.canonical_dir}"
             )
-        yield ReleaseBundle(root, ref, commit, catalog, config, canonical)
+        assert_tag_unchanged(automation, tag)
+        yield ReleaseBundle(root, ref, tag.commit, catalog, config, canonical)
+        assert_tag_unchanged(automation, tag)
 
 
 def materialize_release_bundle(

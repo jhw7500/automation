@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 import subprocess
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
+import scripts.verify_workflow_release as release_verifier
 from scripts.verify_workflow_release import ReleaseVerificationError, verify_release
 
 
@@ -75,6 +78,143 @@ def retag_bad_release(repo: Path, message: str) -> str:
     return bad_commit
 
 
+def alternate_tag_object(repo: Path) -> str:
+    (repo / "race-marker").write_text("alternate", encoding="utf-8")
+    commit(repo, "alternate release")
+    git(repo, "tag", "-a", "race-target", "-m", "race target")
+    return git(repo, "rev-parse", "refs/tags/race-target")
+
+
+def load_json(path: Path) -> dict:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    return value
+
+
+def write_json(path: Path, value: dict) -> None:
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+def coordinated_permission_drift(repo: Path) -> None:
+    catalog_path = repo / "scripts/workflow-catalog.json"
+    catalog = load_json(catalog_path)
+    entry = catalog["entries"][0]
+    entry["caller_jobs"][0]["permissions"]["contents"] = "write"
+    write_json(catalog_path, catalog)
+    replace(
+        repo / "examples/baseline-workflows/.github/workflows/claude.yml",
+        "      contents: read",
+        "      contents: write",
+        count=1,
+    )
+
+
+def coordinated_trigger_drift(repo: Path) -> None:
+    catalog_path = repo / "scripts/workflow-catalog.json"
+    catalog = load_json(catalog_path)
+    catalog["entries"][0]["trigger"]["issue_comment"]["types"] = [
+        "created",
+        "edited",
+    ]
+    write_json(catalog_path, catalog)
+    replace(
+        repo / "examples/baseline-workflows/.github/workflows/claude.yml",
+        "    types: [created]",
+        "    types: [created, edited]",
+        count=1,
+    )
+
+
+def coordinated_central_target_drift(repo: Path) -> None:
+    catalog_path = repo / "scripts/workflow-catalog.json"
+    catalog = load_json(catalog_path)
+    catalog["entries"][0]["central_workflow"] = "claude-code-review.yml"
+    write_json(catalog_path, catalog)
+    replace(
+        repo / "examples/baseline-workflows/.github/workflows/claude.yml",
+        "/claude.yml@__AUTOMATION_COMMIT__",
+        "/claude-code-review.yml@__AUTOMATION_COMMIT__",
+        count=1,
+    )
+
+
+def coordinated_profile_drift(repo: Path) -> None:
+    config_path = repo / "scripts/workflow-config.json"
+    config = load_json(config_path)
+    config["repos"]["gstApp"]["repo_write_auth"] = "github_token"
+    config["repos"]["gstApp"]["optional_workflows"] = [
+        "opencode-auto-review.yml"
+    ]
+    write_json(config_path, config)
+
+
+def comment_only_setup_pin(path: Path) -> None:
+    approved = (
+        "        uses: jhw7500/automation/.github/actions/setup-gemini-auth@"
+        "2254f13aab44585c78954d20749f4fb677a8c2f1"
+    )
+    replace(path, approved, f"        # {approved.strip()}", count=1)
+
+
+def unconditional_setup_input(path: Path) -> None:
+    replace(
+        path,
+        "fallback-token: ${{ inputs.repo_write_auth == 'github_token' && github.token || '' }}",
+        "fallback-token: ${{ github.token }}",
+        count=1,
+    )
+
+
+def extra_local_setup_resolver(path: Path) -> None:
+    document = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    steps = document["jobs"]["gemini-review"]["steps"]
+    steps.append(
+        {
+            "name": "Extra unsafe resolver",
+            "uses": "./.github/actions/setup-gemini-auth",
+        }
+    )
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+
+def extra_direct_app_resolver(path: Path) -> None:
+    document = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    steps = document["jobs"]["gemini-review"]["steps"]
+    steps.append(
+        {
+            "name": "Unsafe direct App token",
+            "uses": "actions/create-github-app-token@main",
+            "with": {
+                "app-id": "${{ inputs.app_id }}",
+                "private-key": "${{ secrets.APP_PRIVATE_KEY }}",
+            },
+        }
+    )
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+
+def downstream_github_token(path: Path) -> None:
+    replace(
+        path,
+        "${{ steps.auth.outputs.token }}",
+        "${{ github.token }}",
+        count=1,
+    )
+
+
+def validation_not_immediately_before_resolver(path: Path) -> None:
+    needle = (
+        "      - name: Resolve repository-write token\n"
+        "        id: auth\n"
+    )
+    replacement = (
+        "      - name: Intervening step\n"
+        "        run: echo bypass\n\n"
+        + needle
+    )
+    replace(path, needle, replacement, count=1)
+
+
 def test_accepts_local_and_remote_annotated_tag_at_secure_commit(
     release_repo: tuple[Path, Path, str],
 ) -> None:
@@ -99,6 +239,104 @@ def test_rejects_tag_that_does_not_point_at_expected_commit(
     new_commit = commit(repo, "new")
     with pytest.raises(ReleaseVerificationError, match="expected commit"):
         verify_release(repo, "v1.40", new_commit)
+
+
+def test_rejects_remote_lightweight_tag_for_local_annotated_release(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, remote, release_commit = release_repo
+    subprocess.run(
+        ["git", "--git-dir", str(remote), "update-ref", "-d", "refs/tags/v1.40"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            str(remote),
+            "update-ref",
+            "refs/tags/v1.40",
+            release_commit,
+        ],
+        check=True,
+    )
+
+    with pytest.raises(ReleaseVerificationError, match="annotated.*peeled"):
+        verify_release(repo, "v1.40", release_commit, remote="origin")
+
+
+def test_verify_release_rejects_one_way_tag_movement_during_content_reads(
+    release_repo: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, release_commit = release_repo
+    alternate = alternate_tag_object(repo)
+    original_git = release_verifier.git
+    moved = False
+
+    def racing_git(repository: Path, *args: str) -> str:
+        nonlocal moved
+        if not moved and args[:1] in {("show",), ("ls-tree",)}:
+            git(repository, "update-ref", "refs/tags/v1.40", alternate)
+            moved = True
+        return original_git(repository, *args)
+
+    monkeypatch.setattr(release_verifier, "git", racing_git)
+    with pytest.raises(ReleaseVerificationError, match="changed during verification"):
+        verify_release(repo, "v1.40", release_commit)
+
+
+def test_verify_release_binds_every_content_read_across_aba_tag_movement(
+    release_repo: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, release_commit = release_repo
+    original_tag = git(repo, "rev-parse", "refs/tags/v1.40")
+    alternate = alternate_tag_object(repo)
+    original_git = release_verifier.git
+    movements = 0
+    content_revisions: list[str] = []
+
+    def racing_git(repository: Path, *args: str) -> str:
+        nonlocal movements
+        if args[:1] in {("show",), ("ls-tree",)}:
+            if movements == 0:
+                git(repository, "update-ref", "refs/tags/v1.40", alternate)
+                movements = 1
+            elif movements == 1:
+                git(repository, "update-ref", "refs/tags/v1.40", original_tag)
+                movements = 2
+            revision = (
+                args[1].split(":", 1)[0]
+                if args[0] == "show"
+                else args[-2]
+            )
+            content_revisions.append(revision)
+        return original_git(repository, *args)
+
+    monkeypatch.setattr(release_verifier, "git", racing_git)
+    assert verify_release(repo, "v1.40", release_commit) == release_commit
+    assert movements == 2
+    assert set(content_revisions) == {release_commit}
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        coordinated_permission_drift,
+        coordinated_trigger_drift,
+        coordinated_central_target_drift,
+        coordinated_profile_drift,
+    ],
+    ids=("permissions", "trigger", "central-target", "profile"),
+)
+def test_rejects_coordinated_drift_from_approved_v140_policy(
+    release_repo: tuple[Path, Path, str], mutate
+) -> None:
+    repo, _, _ = release_repo
+    mutate(repo)
+    bad_commit = retag_bad_release(repo, "coordinated policy drift")
+
+    with pytest.raises(ReleaseVerificationError, match="approved v1.40 policy"):
+        verify_release(repo, "v1.40", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -257,6 +495,12 @@ def test_rejects_opencode_command_oidc_app_token_path(
             ),
             "repo_write_auth",
         ),
+        (comment_only_setup_pin, "resolver"),
+        (unconditional_setup_input, "mode-controlled inputs"),
+        (extra_local_setup_resolver, "resolver"),
+        (extra_direct_app_resolver, "App token"),
+        (downstream_github_token, "write token"),
+        (validation_not_immediately_before_resolver, "immediately preceded"),
     ],
     ids=(
         "google-api-key",
@@ -264,6 +508,12 @@ def test_rejects_opencode_command_oidc_app_token_path(
         "ambient-app-id",
         "unpinned-setup-auth",
         "missing-explicit-mode",
+        "comment-only-pin",
+        "unconditional-with",
+        "extra-local-resolver",
+        "extra-direct-app-resolver",
+        "downstream-github-token",
+        "validation-gap",
     ),
 )
 def test_rejects_insecure_tagged_gemini_contracts(

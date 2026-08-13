@@ -15,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 from scripts.verify_workflow_release import ReleaseVerificationError
+import scripts.verify_workflow_release as release_verifier
 import scripts.workflow_release_bundle as release_bundle
 from scripts.workflow_release_bundle import materialize_release_bundle
 
@@ -68,6 +69,13 @@ def retag(repo: Path, ref: str, *, annotated: bool = True) -> str:
     args = ("tag", "-a", ref, "-m", ref) if annotated else ("tag", ref)
     git(repo, *args)
     return release_commit
+
+
+def alternate_tag_object(repo: Path) -> str:
+    (repo / "race-marker").write_text("alternate", encoding="utf-8")
+    commit(repo, "alternate release")
+    git(repo, "tag", "-a", "race-target", "-m", "race target")
+    return git(repo, "rev-parse", "refs/tags/race-target")
 
 
 def archive_with(member: tarfile.TarInfo, payload: bytes = b"bad") -> bytes:
@@ -135,19 +143,74 @@ def test_bundle_rejects_tag_changed_during_verification(
     release_repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo, _ = release_repo
-    verify_tag_content = release_bundle.verify_tag_content
+    alternate = alternate_tag_object(repo)
+    original_git = release_verifier.git
+    moved = False
 
-    def move_tag(automation: Path, ref: str) -> None:
-        verify_tag_content(automation, ref)
-        (automation / "new").write_text("new", encoding="utf-8")
-        commit(automation, "move release")
-        git(automation, "tag", "-d", ref)
-        git(automation, "tag", "-a", ref, "-m", "moved")
+    def racing_git(repository: Path, *args: str) -> str:
+        nonlocal moved
+        if not moved and args[:1] in {("show",), ("ls-tree",)}:
+            git(repository, "update-ref", "refs/tags/v1.40", alternate)
+            moved = True
+        return original_git(repository, *args)
 
-    monkeypatch.setattr(release_bundle, "verify_tag_content", move_tag)
+    monkeypatch.setattr(release_verifier, "git", racing_git)
     with pytest.raises(ReleaseVerificationError, match="changed during verification"):
         with materialize_release_bundle(repo, "v1.40", remote=None):
             pass
+
+
+def test_bundle_binds_content_and_archive_across_aba_tag_movement(
+    release_repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, release_commit = release_repo
+    original_tag = git(repo, "rev-parse", "refs/tags/v1.40")
+    alternate = alternate_tag_object(repo)
+    original_git = release_verifier.git
+    original_archive = release_bundle._git_archive
+    movements = 0
+    content_revisions: list[str] = []
+    archive_revisions: list[str] = []
+
+    def racing_git(repository: Path, *args: str) -> str:
+        nonlocal movements
+        if args[:1] in {("show",), ("ls-tree",)}:
+            if movements == 0:
+                git(repository, "update-ref", "refs/tags/v1.40", alternate)
+                movements = 1
+            elif movements == 1:
+                git(repository, "update-ref", "refs/tags/v1.40", original_tag)
+                movements = 2
+            revision = (
+                args[1].split(":", 1)[0]
+                if args[0] == "show"
+                else args[-2]
+            )
+            content_revisions.append(revision)
+        return original_git(repository, *args)
+
+    def capture_archive(automation: Path, revision: str) -> bytes:
+        archive_revisions.append(revision)
+        return original_archive(automation, revision)
+
+    monkeypatch.setattr(release_verifier, "git", racing_git)
+    monkeypatch.setattr(release_bundle, "_git_archive", capture_archive)
+    with materialize_release_bundle(repo, "v1.40", remote=None) as bundle:
+        assert bundle.commit == release_commit
+    assert movements == 2
+    assert set(content_revisions) == {release_commit}
+    assert archive_revisions == [release_commit]
+
+
+def test_bundle_rejects_tag_change_before_context_completion(
+    release_repo: tuple[Path, str]
+) -> None:
+    repo, _ = release_repo
+    alternate = alternate_tag_object(repo)
+
+    with pytest.raises(ReleaseVerificationError, match="changed during verification"):
+        with materialize_release_bundle(repo, "v1.40", remote=None):
+            git(repo, "update-ref", "refs/tags/v1.40", alternate)
 
 
 def test_bundle_rejects_absent_canonical_path(
