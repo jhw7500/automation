@@ -273,14 +273,35 @@ Every released reusable workflow begins with an unconditional, least-privileged
 - called `job.workflow_ref`, `job.workflow_repository`, `job.workflow_file_path`, and
   `job.workflow_sha`.
 
-All remaining jobs depend on that job. The catalog and release tests require this exact
-job and forbid caller/profile overrides. Canary validation retrieves the log through the
+All remaining jobs depend on that job. The catalog and release-owned static tests require
+this exact job, property spellings, expression ASTs, and no-payload/no-secret structure;
+caller/profile overrides are forbidden. Canary validation retrieves the log through the
 Actions API and requires `job.workflow_repository == jhw7500/automation`,
 `job.workflow_sha == verified_release_commit`, the expected reusable-workflow path, and a
 caller SHA whose workflow file bytes match the approved rendered caller. This proves the
 actual run, not merely the default branch after the fact, used the intended caller and
 immutable reusable revision. Provenance contains no token, full context dump, or
 attacker-controlled event payload.
+
+GitHub.com documents these four `job.workflow_*` properties, but pinned actionlint 1.7.12
+predates them and emits one schema false-positive for each exact property. The release
+owns a structured compatibility allowlist containing only tuples of:
+
+- diagnostic code/category `expression` with message shape
+  `property "<exact-name>" is not defined in object type`;
+- exact expression AST `job.<exact-name>` for one of `workflow_ref`,
+  `workflow_repository`, `workflow_file_path`, or `workflow_sha`;
+- a catalogued central reusable-workflow provenance field whose static provenance check
+  has already passed.
+
+The filter parses actionlint's machine-readable output and the YAML expression AST; it does
+not use line-number, free-form path, substring, or blanket regex ignores. It requires
+exactly the expected four diagnostics per canonical reusable workflow under actionlint
+1.7.12 and rejects missing, duplicate, relocated, misspelled, or additional diagnostics.
+The actionlint binary/hash and allowlist version are release-manifest fields. A tool upgrade
+must first run a compatibility probe: once the schema accepts a property, that entry must
+be removed rather than silently accepting zero-or-one. All other released/canonical
+managed diagnostics remain forbidden.
 
 ## 2. Single Canonical Catalog
 
@@ -677,8 +698,10 @@ Required plan gates:
 - mandatory actionlint `1.7.12` using the official Linux AMD64 archive SHA-256
   `8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8`, with recorded
   version and fail-closed process status;
-- zero actionlint diagnostics in released/canonical managed workflows and zero new
-  diagnostics compared with the untouched project-owned baseline;
+- exactly the release-owned structured actionlint compatibility diagnostics for the four
+  statically verified `job.workflow_*` provenance expressions, zero other diagnostics in
+  released/canonical managed workflows, and zero new diagnostics compared with the
+  untouched project-owned baseline;
 - a zero unmanaged-path diff between each recorded base and generated head.
 
 Every repository outcome uses `status: current|drift|blocked` plus a stable reason code.
@@ -773,8 +796,11 @@ a failing regression test.
 - config insertion/replacement follows the fixed byte-span grammar; duplicate keys,
   quotes/non-scalars, aliases, anchors, merges, tags, and multiple documents block;
 - only the two allowed existing-config scalar tokens change;
-- every canonical reusable workflow has the no-secret/no-permission provenance job and
-  all execution jobs depend on it;
+- every canonical reusable workflow has the exact no-secret/no-permission provenance job
+  and all execution jobs depend on it;
+- actionlint's exact four known `job.workflow_*` schema diagnostics per central workflow
+  are structurally matched only after the static provenance AST passes; missing, typoed,
+  relocated, extra, or blanket-ignored diagnostics fail;
 - `base_sha..generated_head_sha` contains zero project-owned changes;
 - retired bump files are deleted;
 - a second render produces no changes;
@@ -936,7 +962,9 @@ the next stage.
 - `bump-automation-ref.yml` is absent from all consumers.
 - Every recorded rollout `base_sha..generated_head_sha` contains zero unmanaged-path
   changes.
-- Mandatory actionlint and all automated tests pass with recorded versions/evidence.
+- Mandatory actionlint passes with only the exact release-owned structured
+  `job.workflow_*` schema-compatibility diagnostics, and all automated tests pass with
+  recorded versions/evidence.
 - Publish requires an externally approved `--plan-sha256`, consumes the byte-identical
   content-addressed manifest/preview, and the remote default branch still equals its
   planned base SHA for each repository.
