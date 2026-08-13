@@ -181,8 +181,8 @@ caller:
 
 An optional file missing from a profile is absent by policy. A profiled optional file
 missing from a repository is drift and is restored through a pull request. An optional
-file present without being profiled is drift and is removed or blocked according to the
-catalog policy; it is never silently accepted.
+file present without being profiled is drift and the renderer proposes its deletion;
+it is never silently accepted.
 
 ### 2.3 Retired workflow
 
@@ -282,8 +282,8 @@ that can mint the token.
 ## 4. Bootstrap Policy for the Two Caller-Free Repositories
 
 `cts-email-mcp-server` and `wpa-supplicant` are explicit bootstrap targets. Normal
-`plan` reports `bootstrap-required` while their config or required catalog is absent; it
-does not classify them as skipped or silently create files.
+`plan` blocks while their config or required catalog is absent and reports that explicit
+bootstrap is required; it does not classify them as skipped or silently create files.
 
 Bootstrap requires all of:
 
@@ -306,9 +306,9 @@ workflows:
     enabled: false
 ```
 
-After bootstrap merges, normal plan treats config and required callers as mandatory;
-their deletion becomes blocked drift rather than another bootstrap opportunity unless
-the explicit bootstrap flag is supplied again.
+Normal plan always treats config and required callers as mandatory. After bootstrap,
+their deletion remains blocked drift; an operator must deliberately invoke the explicit
+single-repository bootstrap path again to recover it.
 
 ## 5. Deterministic Renderer
 
@@ -376,9 +376,9 @@ for the intended reason before production code is added.
 `scripts/rollout_workflow_fleet.py` is the only supported remote workflow writer and the
 only release-upgrade path.
 
-- `setup-github-workflows.sh` loses raw copy, direct commit/push, and secret-write
-  behavior. It either becomes a deprecation shim that invokes the Python tool or exits
-  with the exact replacement command.
+- `setup-github-workflows.sh` and `sync-secrets.sh` become side-effect-free deprecation
+  guards. `--help` prints the exact Python replacement commands; every former mutating
+  invocation exits with status 2 without reading a secret or changing a repository.
 - `bump-automation-ref.yml` is removed from consumers and the catalog.
 - `sync-secrets.sh` is not used by this rollout. Future secret operations use the
   Python tool's explicit allowlisted flags and remain a separately confirmed phase.
@@ -420,8 +420,8 @@ Required plan gates:
 - zero new actionlint diagnostics compared with untouched project-owned baseline;
 - confirmation that project-owned file hashes are unchanged.
 
-Plan returns non-zero for any `blocked` or `bootstrap-required` outcome. It does not hide
-a missing catalog behind `skipped`.
+Plan returns non-zero for any `blocked` outcome. It does not hide a missing catalog
+behind `skipped`.
 
 ### 8.2 Publish
 
@@ -504,8 +504,8 @@ Do not create a consumer PR before the remote release verifier succeeds.
 ### Gate 2: full read-only fleet plan
 
 Run all 19 profiles with secret sync disabled. Expected initial outcomes are drift for
-the 17 existing consumers and explicit `bootstrap-required` for the two caller-free
-repositories, with no ordinary skip.
+the 17 existing consumers and explicit blocked/bootstrap instructions for the two
+caller-free repositories, with no ordinary skip.
 
 ### Gate 3: behavioral and bootstrap canaries
 
@@ -530,7 +530,6 @@ The final read-only plan must report:
 
 - `current=19`;
 - `skipped=0`;
-- `bootstrap-required=0`;
 - `blocked=0`;
 - `synced_secrets=[]` for every repository;
 - all consumer callers pinned to the verified release commit;
@@ -574,5 +573,5 @@ the next stage.
 - Publish-time default branch SHA equals its planned base SHA for each repository.
 - `wlan-package` automatic and manual OpenCode canaries succeed.
 - API-key-only and bootstrap canaries satisfy their declared profiles.
-- Final fleet state is `current=19`, `skipped=0`, `bootstrap-required=0`, `blocked=0`.
+- Final fleet state is `current=19`, `skipped=0`, `blocked=0`.
 - Every manifest entry has `synced_secrets: []`.
