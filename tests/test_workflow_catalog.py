@@ -89,15 +89,32 @@ def test_catalog_rejects_invalid_entries(tmp_path: Path, entries: list[dict]) ->
         load_catalog(tmp_path)
 
 
-@pytest.mark.parametrize("repos", [
-    {"repo": {"profile": "common-ai-v1", "optional_workflows": ["missing.yml"], "repo_write_auth": "github_app", "bootstrap_allowed": False}},
-    {"repo": {"profile": "common-ai-v1", "optional_workflows": [], "repo_write_auth": "invalid", "bootstrap_allowed": False}},
-    {"first": {"profile": "common-ai-v1", "optional_workflows": [], "repo_write_auth": "github_app", "bootstrap_allowed": True}, "second": {"profile": "common-ai-v1", "optional_workflows": [], "repo_write_auth": "github_app", "bootstrap_allowed": True}, "third": {"profile": "common-ai-v1", "optional_workflows": [], "repo_write_auth": "github_app", "bootstrap_allowed": True}},
+@pytest.mark.parametrize(("change", "message"), [
+    (
+        lambda config: config["repos"]["wlan-package"].__setitem__("optional_workflows", ["missing.yml"]),
+        "repos.wlan-package: unknown optional workflow",
+    ),
+    (
+        lambda config: config["repos"]["wlan-package"].__setitem__("repo_write_auth", "invalid"),
+        "repos.wlan-package: invalid repo_write_auth",
+    ),
+    (
+        lambda config: config["repos"]["wlan-package"].__setitem__("bootstrap_allowed", True),
+        "invalid bootstrap repositories: [\'cts-email-mcp-server\', \'wlan-package\', \'wpa-supplicant\']",
+    ),
 ])
-def test_fleet_rejects_invalid_profiles(tmp_path: Path, repos: dict[str, dict]) -> None:
-    _write(tmp_path, [_entry(kind="optional")], repos)
-    with pytest.raises(CatalogError):
+def test_fleet_rejects_invalid_profiles(tmp_path: Path, change: object, message: str) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for filename in ("workflow-catalog.json", "workflow-config.json"):
+        (scripts / filename).write_text((ROOT / "scripts" / filename).read_text())
+    config_path = scripts / "workflow-config.json"
+    config = json.loads(config_path.read_text())
+    change(config)
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(CatalogError) as error:
         load_fleet_config(tmp_path, load_catalog(tmp_path))
+    assert str(error.value) == message
 
 @pytest.mark.parametrize("change", [
     lambda config: config.__setitem__("canonical_dir", "other/.github"),
