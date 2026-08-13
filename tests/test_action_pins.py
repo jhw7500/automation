@@ -3,15 +3,19 @@
 
 from pathlib import Path
 import re
+import sys
 import unittest
 
 import yaml
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from scripts.prepare_workflow_rollout import CHECKOUT_SHA as FLEET_CHECKOUT_SHA
 from scripts.verify_workflow_release import CHECKOUT_ACTION
 
 
-ROOT = Path(__file__).resolve().parents[1]
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 CACHE_SHA = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
 OPENCODE_VERSION = "1.18.17"
