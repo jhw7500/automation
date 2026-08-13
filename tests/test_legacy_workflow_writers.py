@@ -282,6 +282,19 @@ def test_fleet_ci_covers_policy_canonical_code_tests_and_docs() -> None:
     assert "examples/baseline-workflows/.github/workflows" in run_steps
 
 
+def test_fleet_ci_checks_out_complete_history_for_release_verification() -> None:
+    workflow = yaml.load(CI_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"]["pytest"]["steps"]
+    checkout_steps = [
+        step
+        for step in steps
+        if step.get("uses", "").startswith("actions/checkout@")
+    ]
+
+    assert len(checkout_steps) == 1
+    assert checkout_steps[0].get("with", {}).get("fetch-depth") == "0"
+
+
 def test_fleet_ci_installs_and_runs_only_digest_verified_actionlint() -> None:
     workflow = yaml.load(CI_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     steps = workflow["jobs"]["pytest"]["steps"]
