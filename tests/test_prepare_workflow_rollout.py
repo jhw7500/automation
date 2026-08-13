@@ -93,6 +93,60 @@ def render_profile(repo: Path, name: str, *, bootstrap: bool = False) -> RenderP
     )
 
 
+@pytest.mark.parametrize("profile_name", tuple(PROFILES))
+def test_every_profile_renders_exactly_its_canonical_caller_bytes(
+    tmp_path: Path, profile_name: str
+) -> None:
+    profile = PROFILES[profile_name]
+    plan = render_profile(make_existing_repo(tmp_path / profile_name), profile_name)
+    selected = tuple(
+        entry
+        for entry in CATALOG.callers
+        if entry.kind == "required"
+        or (
+            entry.kind == "optional"
+            and entry.path.name in profile.optional_workflows
+        )
+    )
+    selected_paths = {entry.path for entry in selected}
+    managed_caller_paths = {entry.path for entry in CATALOG.callers}
+    actual_caller_paths = {
+        change.path
+        for change in plan.changes
+        if change.path in managed_caller_paths
+    }
+    assert actual_caller_paths == selected_paths
+
+    for entry in selected:
+        canonical_path = CANONICAL / entry.path.relative_to(".github")
+        template = canonical_path.read_bytes()
+        assert template.count(b"@__AUTOMATION_COMMIT__") == 1
+        expected = template.replace(
+            b"@__AUTOMATION_COMMIT__", f"@{COMMIT}".encode()
+        )
+        if entry.auth_family == "gemini" and profile.repo_write_auth == "github_token":
+            assert expected.count(b"repo_write_auth: github_app") == 1
+            assert expected.count(b"      app_id: ${{ vars.APP_ID }}\n") == 1
+            assert (
+                expected.count(
+                    b"      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}\n"
+                )
+                == 1
+            )
+            expected = (
+                expected.replace(
+                    b"repo_write_auth: github_app",
+                    b"repo_write_auth: github_token",
+                )
+                .replace(b"      app_id: ${{ vars.APP_ID }}\n", b"")
+                .replace(
+                    b"      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}\n",
+                    b"",
+                )
+            )
+        assert plan.after(entry.path.as_posix()) == expected
+
+
 def test_app_and_token_profiles_differ_only_by_declared_auth_lines(
     tmp_path: Path,
 ) -> None:
