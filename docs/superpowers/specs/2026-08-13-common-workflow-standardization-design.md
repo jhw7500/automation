@@ -885,7 +885,7 @@ The final read-only plan must report:
 
 Except for the exact Gate 2 discovery condition above, any release/tool verification,
 dependency-lock, catalog/profile, contract/type, Gemini-auth, YAML, actionlint,
-default-branch freshness, unmanaged-path, secret-endpoint, or live-canary failure stops
+default-branch freshness, unmanaged-path, secret-mutation, or live-canary failure stops
 the next stage.
 
 ## 11. Recovery
