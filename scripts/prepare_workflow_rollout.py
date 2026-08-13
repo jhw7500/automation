@@ -3,7 +3,8 @@
 
 This module deliberately does not add workflows or replace whole caller files. It keeps
 repository-owned triggers, guards, permissions and inputs, changing only the central
-release ref, secret mapping, optional app_id forwarding and automation_ref config.
+release ref, secret mapping, optional app_id forwarding, approved action pins and
+automation_ref config.
 """
 
 from __future__ import annotations
@@ -26,6 +27,14 @@ CONFIG_REF_RE = re.compile(
     r"(?m)^(?P<prefix>automation_ref:[ \t]*)\S+"
     r"(?P<suffix>[ \t]*(?:#.*)?)$"
 )
+CHECKOUT_USE_RE = re.compile(
+    r"^(?P<prefix>[ \t]*(?:-[ \t]+)?uses:[ \t]*)(?P<quote>['\"]?)"
+    r"actions/checkout@(?P<ref>[^\s'\"#]+)(?P=quote)"
+    r"(?P<suffix>[ \t]*(?:#.*)?)(?P<newline>\r?\n?)$"
+)
+CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+CHECKOUT_VERSION = "v7.0.1"
+BUMP_WORKFLOW = "bump-automation-ref.yml"
 GEMINI_AUTH_SECRETS = {"APP_PRIVATE_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"}
 OPENCODE_WORKFLOWS = {"opencode.yml", "opencode-auto-review.yml"}
 OPENCODE_CALLER_PERMISSIONS = (
@@ -257,6 +266,41 @@ def replace_job_segment(
     return segment
 
 
+def yaml_checkout_count(value: object) -> int:
+    if isinstance(value, dict):
+        count = int(
+            isinstance(value.get("uses"), str)
+            and value["uses"].startswith("actions/checkout@")
+        )
+        return count + sum(yaml_checkout_count(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(yaml_checkout_count(item) for item in value)
+    return 0
+
+
+def ratchet_checkout_references(text: str, path: Path, workflow: dict) -> str:
+    """Pin every checkout step in a managed workflow or fail closed."""
+    lines = text.splitlines(keepends=True)
+    matches = [CHECKOUT_USE_RE.match(line) for line in lines]
+    editable = sum(match is not None for match in matches)
+    declared = yaml_checkout_count(workflow)
+    if editable != declared:
+        raise RolloutError(
+            f"{path.name}: found {declared} checkout action(s) but "
+            f"can safely rewrite only {editable}"
+        )
+
+    for index, match in enumerate(matches):
+        if match is None:
+            continue
+        lines[index] = (
+            f"{match.group('prefix')}{match.group('quote')}"
+            f"actions/checkout@{CHECKOUT_SHA}{match.group('quote')} "
+            f"# {CHECKOUT_VERSION}{match.group('newline')}"
+        )
+    return "".join(lines)
+
+
 def transform_workflow(
     path: Path,
     automation: Path,
@@ -311,7 +355,15 @@ def transform_workflow(
         segment = replace_job_segment(lines[index:end], indent, new_ref, names, pass_app_id)
         lines[index:end] = segment
 
-    return "".join(lines), len(uses), required
+    transformed = "".join(lines)
+    if uses or path.name == BUMP_WORKFLOW:
+        transformed_workflow = yaml.load(transformed, Loader=yaml.BaseLoader)
+        if not isinstance(transformed_workflow, dict):
+            transformed_workflow = {}
+        transformed = ratchet_checkout_references(
+            transformed, path, transformed_workflow
+        )
+    return transformed, len(uses), required
 
 
 def prepare_repository(

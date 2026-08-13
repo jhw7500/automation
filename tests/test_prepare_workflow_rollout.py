@@ -13,6 +13,9 @@ sys.path.insert(0, str(ROOT))
 from scripts.prepare_workflow_rollout import RolloutError, prepare_repository
 
 
+CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+
+
 class PrepareWorkflowRolloutTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -112,6 +115,80 @@ class PrepareWorkflowRolloutTest(unittest.TestCase):
             set(),
         )
         self.assertIn("claude.yml@v1.35' # pinned", p.read_text())
+
+    def test_ratchets_checkout_in_managed_callers_and_bump_workflow(self) -> None:
+        caller = self.write("notice.yml", """\
+            jobs:
+              inspect:
+                steps:
+                  - uses: actions/checkout@v4
+                    with:
+                      fetch-depth: 1
+              call:
+                uses: jhw7500/automation/.github/workflows/notice.yml@v1.33
+                secrets: inherit
+        """)
+        bump = self.write("bump-automation-ref.yml", """\
+            jobs:
+              bump:
+                steps:
+                  - uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # v5
+        """)
+
+        result = prepare_repository(self.repo, self.automation, "v1.37", set(), set())
+
+        approved = f"actions/checkout@{CHECKOUT_SHA}"
+        caller_yaml = yaml.load(caller.read_text(), Loader=yaml.BaseLoader)
+        bump_yaml = yaml.load(bump.read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(approved, caller_yaml["jobs"]["inspect"]["steps"][0]["uses"])
+        self.assertEqual(
+            "1", caller_yaml["jobs"]["inspect"]["steps"][0]["with"]["fetch-depth"]
+        )
+        self.assertEqual(approved, bump_yaml["jobs"]["bump"]["steps"][0]["uses"])
+        self.assertIn("# v7.0.1", caller.read_text())
+        self.assertIn("# v7.0.1", bump.read_text())
+        self.assertIn(Path(".github/workflows/notice.yml"), result.changed_files)
+        self.assertIn(
+            Path(".github/workflows/bump-automation-ref.yml"), result.changed_files
+        )
+
+    def test_leaves_checkout_in_unmanaged_workflow_unchanged(self) -> None:
+        unmanaged = self.write("custom-build.yml", """\
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@v4
+        """)
+        self.write("notice.yml", """\
+            jobs:
+              call:
+                uses: jhw7500/automation/.github/workflows/notice.yml@v1.33
+                secrets: inherit
+        """)
+
+        prepare_repository(self.repo, self.automation, "v1.37", set(), set())
+
+        self.assertIn("actions/checkout@v4", unmanaged.read_text())
+
+    def test_uneditable_checkout_in_managed_workflow_fails_before_writing(self) -> None:
+        caller = self.write("notice.yml", """\
+            jobs:
+              inspect:
+                steps:
+                  - uses: >-
+                      actions/checkout@v4
+              call:
+                uses: jhw7500/automation/.github/workflows/notice.yml@v1.33
+                secrets: inherit
+        """)
+        before = caller.read_text()
+
+        with self.assertRaisesRegex(
+            RolloutError, "found 1 checkout action.*safely rewrite only 0"
+        ):
+            prepare_repository(self.repo, self.automation, "v1.37", set(), set())
+
+        self.assertEqual(before, caller.read_text())
 
     def test_app_id_and_private_key_are_mapped_only_when_app_id_variable_exists(self) -> None:
         p = self.write("gemini.yml", """\
