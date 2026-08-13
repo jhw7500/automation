@@ -537,16 +537,20 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
     resolver_count = 0
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
-            continue
+            raise ReleaseVerificationError(f"{name}:{job_name} job must be a mapping")
         steps = job.get("steps", [])
         if not isinstance(steps, list) or not all(
             isinstance(step, dict) for step in steps
         ):
             raise ReleaseVerificationError(f"{name}:{job_name} steps are invalid")
+        if "permissions" not in job or not isinstance(job["permissions"], dict):
+            raise ReleaseVerificationError(
+                f"{name}:{job_name} must declare an explicit permissions mapping"
+            )
         candidates = [
             index for index, step in enumerate(steps) if _resolver_candidate(step)
         ]
-        permissions = job.get("permissions", {})
+        permissions = job["permissions"]
         writes = _grants_write(permissions)
         if writes and len(candidates) != 1:
             raise ReleaseVerificationError(
@@ -556,6 +560,20 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
             raise ReleaseVerificationError(
                 f"{name}:{job_name} contains a resolver outside a write job"
             )
+
+        metadata = {key: value for key, value in job.items() if key != "steps"}
+        if "github.token" in "\n".join(_values(metadata)):
+            raise ReleaseVerificationError(
+                f"{name}:{job_name} contains forbidden github.token outside resolver"
+            )
+        for step_index, step in enumerate(steps):
+            if step_index not in candidates and "github.token" in "\n".join(
+                _values(step)
+            ):
+                raise ReleaseVerificationError(
+                    f"{name}:{job_name} bypasses the resolved repository-write token"
+                )
+
         if not candidates:
             continue
         resolver_count += 1
@@ -577,21 +595,12 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
                 "repository-write auth validation"
             )
 
-        metadata = {key: value for key, value in job.items() if key != "steps"}
-        if "github.token" in "\n".join(_values(metadata)):
-            raise ReleaseVerificationError(
-                f"{name}:{job_name} contains forbidden github.token outside resolver"
-            )
         write_token_sinks = _verify_token_mapping(
             name, f"{job_name}.env", job.get("env", {}), allow_empty=True
         )
         for step_index, step in enumerate(steps):
             if step_index == index:
                 continue
-            if "github.token" in "\n".join(_values(step)):
-                raise ReleaseVerificationError(
-                    f"{name}:{job_name} bypasses the resolved repository-write token"
-                )
             for mapping_name in ("env", "with"):
                 write_token_sinks += _verify_token_mapping(
                     name,

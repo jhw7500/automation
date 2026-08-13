@@ -272,6 +272,17 @@ def github_token_in_workflow_env(path: Path) -> None:
     mutate_yaml(path, mutate)
 
 
+def ambient_caller_write_without_permissions(path: Path) -> None:
+    def mutate(document: dict) -> None:
+        document["jobs"]["ambient-writer"] = {
+            "runs-on": "ubuntu-latest",
+            "env": {"GH_TOKEN": "${{ github.token }}"},
+            "steps": [{"run": "gh issue comment 1 --body ambient"}],
+        }
+
+    mutate_yaml(path, mutate)
+
+
 def test_accepts_local_and_remote_annotated_tag_at_secure_commit(
     release_repo: tuple[Path, Path, str],
 ) -> None:
@@ -591,6 +602,7 @@ def test_rejects_insecure_tagged_gemini_contracts(
         (github_token_in_write_job_env, "github.token"),
         (alternate_local_token_mint_action, "approved action"),
         (github_token_in_workflow_env, "workflow.*github.token"),
+        (ambient_caller_write_without_permissions, "explicit permissions"),
     ],
     ids=(
         "inherited-write",
@@ -598,6 +610,7 @@ def test_rejects_insecure_tagged_gemini_contracts(
         "job-env-token",
         "alternate-mint-action",
         "workflow-env-token",
+        "ambient-caller-write",
     ),
 )
 def test_rejects_effective_gemini_write_path_auth_bypasses(

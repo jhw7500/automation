@@ -32,6 +32,8 @@ on:
 
 jobs:
   check-enabled:
+    permissions:
+      contents: read
     name: Check if enabled
     runs-on: ubuntu-latest
     outputs:
@@ -313,6 +315,7 @@ jobs:
           gh pr comment $PR_NUMBER --body "⚠️ Gemini auto-review failed. Please check the workflow logs for details."
 
   skipped:
+    permissions: {}
     name: Workflow Skipped
     needs: check-enabled
     if: needs.check-enabled.outputs.enabled != 'true' || needs.check-enabled.outputs.auto_enabled != 'true'

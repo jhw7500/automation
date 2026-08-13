@@ -48,6 +48,18 @@ def load_workflow(path: Path) -> dict:
 
 
 class WorkflowSecretContractsTest(unittest.TestCase):
+    def test_gemini_jobs_declare_explicit_permissions(self) -> None:
+        for filename in GEMINI_WORKFLOWS:
+            workflow = load_workflow(WORKFLOWS / filename)
+            for job_name, job in workflow["jobs"].items():
+                with self.subTest(workflow=filename, job=job_name):
+                    self.assertIn("permissions", job)
+                    self.assertIsInstance(job["permissions"], dict)
+                    if job_name == "check-enabled":
+                        self.assertEqual({"contents": "read"}, job["permissions"])
+                    elif job_name == "skipped":
+                        self.assertEqual({}, job["permissions"])
+
     def test_declares_exactly_the_external_secrets_it_references(self) -> None:
         for filename, expected in EXPECTED_REQUIRED.items():
             with self.subTest(workflow=filename):

@@ -38,6 +38,8 @@ concurrency:
 
 jobs:
   check-enabled:
+    permissions:
+      contents: read
     name: Check if enabled
     runs-on: ubuntu-latest
     outputs:
@@ -854,6 +856,7 @@ jobs:
           prompt: '/gemini-invoke'
 
   skipped:
+    permissions: {}
     name: Workflow Skipped
     needs: check-enabled
     if: needs.check-enabled.outputs.enabled != 'true'
