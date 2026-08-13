@@ -19,22 +19,6 @@ from scripts.workflow_release_bundle import materialize_release_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 
-HERMETIC_LOCAL_GIT_ENV = {
-    "PATH": "/usr/bin:/bin",
-    "HOME": "/nonexistent/automation-workflow-release/home",
-    "XDG_CONFIG_HOME": "/nonexistent/automation-workflow-release/xdg",
-    "LANG": "C.UTF-8",
-    "LC_ALL": "C.UTF-8",
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_CONFIG_SYSTEM": "/dev/null",
-    "GIT_CONFIG_GLOBAL": "/dev/null",
-    "GIT_TERMINAL_PROMPT": "0",
-    "GIT_ASKPASS": "/bin/false",
-    "SSH_ASKPASS": "/bin/false",
-    "GCM_INTERACTIVE": "Never",
-}
-
-
 RELEASE_PATHS = (
     ".github/workflows",
     ".github/actions/setup-gemini-auth/action.yml",
@@ -57,6 +41,48 @@ def commit(repo: Path, message: str) -> str:
     git(repo, "add", ".")
     git(repo, "commit", "-qm", message)
     return git(repo, "rev-parse", "HEAD")
+
+
+def common_git_dir(repo: Path) -> Path:
+    value = Path(git(repo, "rev-parse", "--git-common-dir"))
+    return value if value.is_absolute() else (repo / value).resolve()
+
+
+def install_local_release_filter_attack(
+    repo: Path, tmp_path: Path, *, target: str
+) -> tuple[Path, bytes]:
+    common = common_git_dir(repo)
+    provider = tmp_path / "LOCAL-PROVIDER-SECRET"
+    provider.write_text("LOCAL-PROVIDER-SECRET", encoding="utf-8")
+    marker = tmp_path / "archive-local-provider-read"
+    substituted = b'{"substituted": "LOCAL-PROVIDER-SECRET"}\n'
+    helper = tmp_path / "archive-local-filter-helper"
+    helper.write_text(
+        "#!/bin/sh\n"
+        f"/bin/cat {provider} > {marker}\n"
+        "/bin/cat >/dev/null\n"
+        f"/usr/bin/printf '%s' '{substituted.decode().strip()}'\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    included = tmp_path / "archive-local-provider.gitconfig"
+    included.write_text(
+        '[filter "local-provider"]\n'
+        f"\tsmudge = {helper}\n"
+        "\trequired = true\n"
+        "[core]\n"
+        f"\tsshCommand = {helper}\n"
+        "[credential]\n"
+        f"\thelper = !{helper}\n",
+        encoding="utf-8",
+    )
+    with (common / "config").open("a", encoding="utf-8") as config:
+        config.write(f"\n[include]\n\tpath = {included}\n")
+    info = common / "info"
+    info.mkdir(exist_ok=True)
+    with (info / "attributes").open("a", encoding="utf-8") as attributes:
+        attributes.write(f"{target} filter=local-provider\n")
+    return marker, substituted
 
 
 @pytest.fixture
@@ -104,42 +130,23 @@ def archive_with(member: tarfile.TarInfo, payload: bytes = b"bad") -> bytes:
     return stream.getvalue()
 
 
-def test_release_archive_git_uses_the_same_minimal_provider_free_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_release_archive_uses_only_raw_tree_and_blob_reads(
+    release_repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sensitive = {
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "ZHIPU_API_KEY",
-        "APP_PRIVATE_KEY",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "AWS_SECRET_ACCESS_KEY",
-        "UNRELATED_OPERATOR_SECRET",
-        "GIT_CONFIG_COUNT",
-    }
-    for key in sensitive:
-        monkeypatch.setenv(key, f"sentinel-{key}")
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "agent.sock"))
-    observed: dict[str, object] = {}
+    repo, release_commit = release_repo
+    original = release_bundle.git_bytes
+    calls: list[tuple[str, ...]] = []
 
-    def child(args, **kwargs):
-        observed.update({"args": list(args), **kwargs})
-        return subprocess.CompletedProcess(args, 0, stdout=b"archive", stderr=b"")
+    def observed(repository: Path, *args: str) -> bytes:
+        calls.append(args)
+        return original(repository, *args)
 
-    monkeypatch.setattr(release_bundle.subprocess, "run", child)
-    assert release_bundle._git_archive(tmp_path, "a" * 40) == b"archive"
+    monkeypatch.setattr(release_bundle, "git_bytes", observed)
 
-    assert observed["args"][0] == "/usr/bin/git"
-    env = observed["env"]
-    assert isinstance(env, dict)
-    assert env == HERMETIC_LOCAL_GIT_ENV
-    assert sensitive.isdisjoint(env)
-    assert not any(str(value).startswith("sentinel-") for value in env.values())
-    assert "SSH_AUTH_SOCK" not in env
+    assert release_bundle._git_archive(repo, release_commit)
+    assert calls[0][0] == "ls-tree"
+    assert all(call[0] in {"ls-tree", "cat-file"} for call in calls)
+    assert all("archive" not in call for call in calls)
 
 
 def test_release_archive_ignores_host_user_and_xdg_git_includes(
@@ -190,25 +197,65 @@ def test_release_archive_ignores_host_user_and_xdg_git_includes(
     assert not marker.exists()
 
 
-def test_release_archive_failure_does_not_expose_child_or_provider_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_release_archive_ignores_source_local_filter_and_info_attributes(
+    release_repo: tuple[Path, str], tmp_path: Path
 ) -> None:
+    repo, release_commit = release_repo
+    target = "scripts/workflow-config.json"
+    expected = subprocess.run(
+        ["/usr/bin/git", "-C", str(repo), "show", f"{release_commit}:{target}"],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    marker, substituted = install_local_release_filter_attack(
+        repo, tmp_path, target=target
+    )
+
+    archive = release_bundle._git_archive(repo, release_commit)
+
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as stream:
+        archived = stream.extractfile(target)
+        assert archived is not None
+        payload = archived.read()
+    assert payload == expected
+    assert payload != substituted
+    assert not marker.exists()
+
+
+def test_bundle_uses_original_commit_tree_despite_replace_ref(
+    release_repo: tuple[Path, str],
+) -> None:
+    repo, release_commit = release_repo
+    original = json.loads(
+        git(repo, "show", f"{release_commit}:scripts/workflow-config.json")
+    )
+    config_path = repo / "scripts/workflow-config.json"
+    replacement = json.loads(config_path.read_text(encoding="utf-8"))
+    replacement["automation_ref"] = "v9.99"
+    config_path.write_text(json.dumps(replacement) + "\n", encoding="utf-8")
+    alternate = commit(repo, "replacement payload")
+    git(repo, "replace", release_commit, alternate)
+
+    with materialize_release_bundle(repo, "v1.40", remote=None) as bundle:
+        extracted = json.loads(
+            (bundle.root / "scripts/workflow-config.json").read_text(encoding="utf-8")
+        )
+        assert bundle.commit == release_commit
+        assert extracted == original
+
+
+def test_release_archive_failure_does_not_expose_child_or_provider_data(
+    release_repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _ = release_repo
     provider = "archive-provider-sentinel"
     raw = "archive-raw-child-sentinel"
-    monkeypatch.setenv("ZHIPU_API_KEY", provider)
+    def child(_repo: Path, *_args: str) -> bytes:
+        raise ReleaseVerificationError(f"{provider} {raw}")
 
-    def child(args, **kwargs):
-        assert provider not in kwargs["env"].values()
-        return subprocess.CompletedProcess(
-            args,
-            29,
-            stdout=f"stdout {provider} {raw}".encode(),
-            stderr=f"stderr {provider} {raw}".encode(),
-        )
-
-    monkeypatch.setattr(release_bundle.subprocess, "run", child)
+    monkeypatch.setattr(release_bundle, "git_bytes", child)
     with pytest.raises(ReleaseVerificationError) as raised:
-        release_bundle._git_archive(tmp_path, raw)
+        release_bundle._git_archive(repo, raw)
 
     rendered = "".join(
         traceback.format_exception(

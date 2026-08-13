@@ -119,9 +119,65 @@ def write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
 
 
+def common_git_dir(repo: Path) -> Path:
+    value = Path(git(repo, "rev-parse", "--git-common-dir"))
+    return value if value.is_absolute() else (repo / value).resolve()
+
+
+def install_local_release_filter_attack(
+    repo: Path, tmp_path: Path, *, target: str
+) -> tuple[Path, bytes]:
+    common = common_git_dir(repo)
+    provider = tmp_path / "LOCAL-PROVIDER-SECRET"
+    provider.write_text("LOCAL-PROVIDER-SECRET", encoding="utf-8")
+    marker = tmp_path / "local-filter-provider-read"
+    substituted = b'{"substituted": "LOCAL-PROVIDER-SECRET"}\n'
+    helper = tmp_path / "local-filter-helper"
+    helper.write_text(
+        "#!/bin/sh\n"
+        f"/bin/cat {provider} > {marker}\n"
+        "/bin/cat >/dev/null\n"
+        f"/usr/bin/printf '%s' '{substituted.decode().strip()}'\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    included = tmp_path / "local-provider.gitconfig"
+    included.write_text(
+        '[filter "local-provider"]\n'
+        f"\tsmudge = {helper}\n"
+        "\trequired = true\n"
+        "[core]\n"
+        f"\tsshCommand = {helper}\n"
+        "[credential]\n"
+        f"\thelper = !{helper}\n",
+        encoding="utf-8",
+    )
+    with (common / "config").open("a", encoding="utf-8") as config:
+        config.write(f"\n[include]\n\tpath = {included}\n")
+    info = common / "info"
+    info.mkdir(exist_ok=True)
+    with (info / "attributes").open("a", encoding="utf-8") as attributes:
+        attributes.write(f"{target} filter=local-provider\n")
+    return marker, substituted
+
+
+def install_commit_replacement(repo: Path, commit_oid: str) -> str:
+    config_path = repo / "scripts/workflow-config.json"
+    replacement = load_json(config_path)
+    replacement["automation_ref"] = "v9.99"
+    write_json(config_path, replacement)
+    alternate = commit(repo, "replacement payload")
+    git(repo, "replace", commit_oid, alternate)
+    return alternate
+
+
 def test_release_verifier_git_uses_a_minimal_provider_free_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    release_repo: tuple[Path, Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    repo, _, release_commit = release_repo
+    expected_object_dir = common_git_dir(repo) / "objects"
     sensitive = {
         "CLAUDE_CODE_OAUTH_TOKEN",
         "GEMINI_API_KEY",
@@ -143,18 +199,123 @@ def test_release_verifier_git_uses_a_minimal_provider_free_environment(
 
     def child(args, **kwargs):
         observed.update({"args": list(args), **kwargs})
-        return subprocess.CompletedProcess(args, 0, stdout="ok\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout=b"ok\n", stderr=b"")
 
     monkeypatch.setattr(release_verifier.subprocess, "run", child)
-    assert release_verifier.git(tmp_path, "status") == "ok\n"
+    assert release_verifier.git(repo, "cat-file", "-t", release_commit) == "ok\n"
 
-    assert observed["args"][0] == "/usr/bin/git"
+    assert observed["args"] == [
+        "/usr/bin/git",
+        "cat-file",
+        "-t",
+        release_commit,
+    ]
+    assert observed["cwd"] == "/"
     env = observed["env"]
     assert isinstance(env, dict)
-    assert env == HERMETIC_LOCAL_GIT_ENV
+    for key, value in HERMETIC_LOCAL_GIT_ENV.items():
+        assert env[key] == value
+    assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+    assert Path(env["GIT_DIR"]).name == "git"
+    assert Path(env["GIT_OBJECT_DIRECTORY"]) == expected_object_dir
     assert sensitive.isdisjoint(env)
     assert not any(str(value).startswith("sentinel-") for value in env.values())
     assert "SSH_AUTH_SOCK" not in env
+
+
+def test_tag_ref_resolution_does_not_invoke_git_or_read_local_includes(
+    release_repo: tuple[Path, Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _, _ = release_repo
+    expected = git(repo, "rev-parse", "refs/tags/v1.40")
+    common = common_git_dir(repo)
+    provider = tmp_path / "LOCAL-PROVIDER-SECRET"
+    provider.write_text("LOCAL-PROVIDER-SECRET is not Git config\n", encoding="utf-8")
+    with (common / "config").open("a", encoding="utf-8") as config:
+        config.write(f"\n[include]\n\tpath = {provider}\n")
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("tag ref resolution invoked Git")
+
+    monkeypatch.setattr(release_verifier.subprocess, "run", forbidden)
+
+    assert release_verifier.read_tag_oid(repo, "v1.40") == expected
+
+
+def test_release_verification_ignores_replace_ref_payload(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, release_commit = release_repo
+    tag_object = git(repo, "rev-parse", "refs/tags/v1.40")
+    install_commit_replacement(repo, release_commit)
+
+    tag = release_verifier.resolve_annotated_tag(repo, "v1.40")
+
+    assert tag.tag_object == tag_object
+    assert tag.commit == release_commit
+    assert verify_release(repo, "v1.40", release_commit) == release_commit
+
+
+@pytest.mark.parametrize("unsupported", ("alternates", "promisor"))
+def test_release_verification_fails_closed_on_unsupported_object_storage(
+    release_repo: tuple[Path, Path, str],
+    tmp_path: Path,
+    unsupported: str,
+) -> None:
+    repo, _, release_commit = release_repo
+    objects = common_git_dir(repo) / "objects"
+    if unsupported == "alternates":
+        alternate = tmp_path / "alternate-objects"
+        alternate.mkdir()
+        (objects / "info/alternates").write_text(
+            f"{alternate}\n", encoding="utf-8"
+        )
+    else:
+        pack = objects / "pack"
+        pack.mkdir(exist_ok=True)
+        (pack / "pack-provider.promisor").write_text("", encoding="utf-8")
+
+    with pytest.raises(ReleaseVerificationError, match="object storage"):
+        verify_release(repo, "v1.40", release_commit)
+
+
+def test_release_raw_object_boundary_supports_linked_worktree(
+    release_repo: tuple[Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    repo, _, release_commit = release_repo
+    linked = tmp_path / "linked-worktree"
+    git(repo, "worktree", "add", "--detach", str(linked), release_commit)
+    install_commit_replacement(repo, release_commit)
+
+    assert verify_release(linked, "v1.40", release_commit) == release_commit
+
+
+def test_commit_only_cli_verifies_content_before_a_release_tag_exists(
+    release_repo: tuple[Path, Path, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo, _, release_commit = release_repo
+    git(repo, "tag", "-d", "v1.40")
+
+    rc = release_verifier.main(
+        [
+            "--automation",
+            str(repo),
+            "--ref",
+            "v1.40",
+            "--expected-commit",
+            release_commit,
+            "--commit-only",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert release_commit in captured.out
+    assert "commit content" in captured.out
 
 
 def test_remote_git_uses_public_https_outside_the_repository_with_no_host_config(
@@ -422,8 +583,9 @@ def test_remote_verification_rejects_non_origin_name_before_transport(
 
 
 def test_release_verifier_git_failure_does_not_expose_child_or_provider_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    release_repo: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    repo, _, _ = release_repo
     provider = "release-provider-sentinel"
     raw = "release-raw-child-sentinel"
     monkeypatch.setenv("ZHIPU_API_KEY", provider)
@@ -431,12 +593,15 @@ def test_release_verifier_git_failure_does_not_expose_child_or_provider_data(
     def child(args, **kwargs):
         assert provider not in kwargs["env"].values()
         return subprocess.CompletedProcess(
-            args, 31, stdout=f"stdout {provider} {raw}", stderr=f"stderr {provider} {raw}"
+            args,
+            31,
+            stdout=f"stdout {provider} {raw}".encode(),
+            stderr=f"stderr {provider} {raw}".encode(),
         )
 
     monkeypatch.setattr(release_verifier.subprocess, "run", child)
     with pytest.raises(ReleaseVerificationError) as raised:
-        release_verifier.git(tmp_path, "show", raw)
+        release_verifier.git(repo, "show", raw)
 
     rendered = "".join(
         traceback.format_exception(

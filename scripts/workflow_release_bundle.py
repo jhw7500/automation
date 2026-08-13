@@ -7,17 +7,15 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-import subprocess
 import tarfile
 import tempfile
 from typing import Iterator
 
 from scripts.verify_workflow_release import (
     AnnotatedTag,
-    GIT_EXECUTABLE,
     ReleaseVerificationError,
     assert_tag_unchanged,
-    git_child_env,
+    git_bytes,
     resolve_annotated_tag,
     verify_remote_tag,
     verify_tag_content,
@@ -61,34 +59,70 @@ def _release_owned(path: PurePosixPath, *, directory: bool) -> bool:
     )
 
 
+def _build_git_archive(automation: Path, revision: str) -> bytes:
+    listing = git_bytes(
+        automation,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        revision,
+        "--",
+        *RELEASE_PATHS,
+    )
+    entries: list[tuple[PurePosixPath, int, str]] = []
+    seen: set[PurePosixPath] = set()
+    for record in listing.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_path = record.split(b"\t", 1)
+        mode, kind, raw_oid = metadata.split(b" ", 2)
+        path = PurePosixPath(raw_path.decode("utf-8"))
+        oid = raw_oid.decode("ascii")
+        if (
+            kind != b"blob"
+            or mode not in {b"100644", b"100755"}
+            or len(oid) != 40
+            or any(character not in "0123456789abcdef" for character in oid)
+            or path in seen
+            or not _release_owned(path, directory=False)
+        ):
+            raise ValueError
+        seen.add(path)
+        entries.append((path, 0o755 if mode == b"100755" else 0o644, oid))
+    if not entries or any(
+        not any(path == root or path.is_relative_to(root) for path, _, _ in entries)
+        for root in _RELEASE_ROOTS
+    ):
+        raise ValueError
+
+    output = BytesIO()
+    with tarfile.open(
+        fileobj=output, mode="w", format=tarfile.USTAR_FORMAT
+    ) as archive:
+        for path, mode, oid in sorted(entries, key=lambda item: str(item[0])):
+            payload = git_bytes(automation, "cat-file", "blob", oid)
+            member = tarfile.TarInfo(str(path))
+            member.size = len(payload)
+            member.mode = mode
+            member.mtime = 0
+            member.uid = 0
+            member.gid = 0
+            member.uname = ""
+            member.gname = ""
+            archive.addfile(member, BytesIO(payload))
+    return output.getvalue()
+
+
 def _git_archive(automation: Path, revision: str) -> bytes:
-    result: subprocess.CompletedProcess[bytes] | None = None
+    archive: bytes | None = None
     try:
-        result = subprocess.run(
-            [
-                GIT_EXECUTABLE,
-                "-C",
-                str(automation),
-                "archive",
-                "--format=tar",
-                revision,
-                *RELEASE_PATHS,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=git_child_env(),
-        )
-    except (OSError, ValueError):
+        archive = _build_git_archive(automation, revision)
+    except (OSError, UnicodeDecodeError, ValueError, ReleaseVerificationError):
         pass
-    if result is None:
-        raise ReleaseVerificationError(
-            "unable to archive verified release (rc=unavailable)"
-        ) from None
-    if result.returncode != 0:
-        raise ReleaseVerificationError(
-            f"unable to archive verified release (rc={result.returncode})"
-        ) from None
-    return result.stdout
+    if archive is None:
+        raise ReleaseVerificationError("unable to archive verified release") from None
+    return archive
 
 
 def _safe_member(member: tarfile.TarInfo) -> PurePosixPath:

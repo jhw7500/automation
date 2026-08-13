@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
+import tempfile
+from typing import Iterator
 
 import yaml
 
@@ -134,6 +139,9 @@ ACCEPTED_AUTOMATION_REMOTES = frozenset(
 )
 HERMETIC_GIT_HOME = "/nonexistent/automation-workflow-release/home"
 HERMETIC_GIT_XDG = "/nonexistent/automation-workflow-release/xdg"
+OID = re.compile(r"[0-9a-f]{40}")
+RELEASE_REF = re.compile(r"v\d+(?:\.\d+)+")
+MAX_GIT_METADATA_BYTES = 1024 * 1024
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -145,6 +153,12 @@ class AnnotatedTag:
     ref: str
     tag_object: str
     commit: str
+
+
+@dataclass(frozen=True)
+class GitStorage:
+    common_dir: Path
+    object_dir: Path
 
 
 def git_child_env() -> dict[str, str]:
@@ -166,6 +180,154 @@ def git_child_env() -> dict[str, str]:
     }
 
 
+def _read_metadata(path: Path, *, maximum: int = MAX_GIT_METADATA_BYTES) -> bytes:
+    descriptor: int | None = None
+    value: bytes | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum:
+            raise OSError
+        candidate = os.read(descriptor, maximum + 1)
+        if len(candidate) > maximum or os.read(descriptor, 1):
+            raise OSError
+        value = candidate
+    except OSError:
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if value is None:
+        raise ReleaseVerificationError("unsupported Git repository metadata") from None
+    return value
+
+
+def _one_metadata_line(path: Path) -> str:
+    value: str | None = None
+    try:
+        value = _read_metadata(path, maximum=4096).decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    if value is None:
+        raise ReleaseVerificationError("unsupported Git repository metadata") from None
+    lines = value.splitlines()
+    if len(lines) != 1 or not lines[0]:
+        raise ReleaseVerificationError("unsupported Git repository metadata")
+    return lines[0]
+
+
+def _resolved_directory(path: Path) -> Path:
+    resolved: Path | None = None
+    metadata: os.stat_result | None = None
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.lstat()
+    except (OSError, RuntimeError):
+        pass
+    if resolved is None or metadata is None:
+        raise ReleaseVerificationError("unsupported Git repository layout") from None
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise ReleaseVerificationError("unsupported Git repository layout")
+    return resolved
+
+
+def git_storage(repo: Path) -> GitStorage:
+    """Discover a normal or linked-worktree object store without invoking Git."""
+
+    root = _resolved_directory(repo)
+    dot_git = root / ".git"
+    dot_git_metadata: os.stat_result | None = None
+    try:
+        dot_git_metadata = dot_git.lstat()
+    except OSError:
+        pass
+    if dot_git_metadata is None:
+        raise ReleaseVerificationError("unsupported Git repository layout") from None
+    if stat.S_ISDIR(dot_git_metadata.st_mode) and not stat.S_ISLNK(
+        dot_git_metadata.st_mode
+    ):
+        git_dir = dot_git.resolve(strict=True)
+    elif stat.S_ISREG(dot_git_metadata.st_mode) and not stat.S_ISLNK(
+        dot_git_metadata.st_mode
+    ):
+        pointer = _one_metadata_line(dot_git)
+        if not pointer.startswith("gitdir: "):
+            raise ReleaseVerificationError("unsupported Git repository layout")
+        candidate = Path(pointer.removeprefix("gitdir: "))
+        git_dir = _resolved_directory(
+            candidate if candidate.is_absolute() else root / candidate
+        )
+    else:
+        raise ReleaseVerificationError("unsupported Git repository layout")
+
+    commondir_file = git_dir / "commondir"
+    try:
+        commondir_metadata = commondir_file.lstat()
+    except FileNotFoundError:
+        commondir_metadata = None
+    except OSError:
+        raise ReleaseVerificationError("unsupported Git repository layout") from None
+    if commondir_metadata is not None:
+        if not stat.S_ISREG(commondir_metadata.st_mode) or stat.S_ISLNK(
+            commondir_metadata.st_mode
+        ):
+            raise ReleaseVerificationError("unsupported Git repository layout")
+        common_value = Path(_one_metadata_line(commondir_file))
+        common_dir = _resolved_directory(
+            common_value if common_value.is_absolute() else git_dir / common_value
+        )
+    else:
+        common_dir = git_dir
+    object_dir = _resolved_directory(common_dir / "objects")
+
+    unsupported = (
+        object_dir / "info/alternates",
+        object_dir / "info/http-alternates",
+        common_dir / "shallow",
+        git_dir / "shallow",
+    )
+    unsupported_exists = False
+    for path in unsupported:
+        try:
+            path.lstat()
+            unsupported_exists = True
+            break
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unsupported_exists = True
+            break
+    try:
+        has_promisor = any((object_dir / "pack").glob("*.promisor"))
+    except OSError:
+        has_promisor = True
+    if unsupported_exists or has_promisor:
+        raise ReleaseVerificationError("unsupported Git object storage")
+    return GitStorage(common_dir, object_dir)
+
+
+@contextmanager
+def _raw_git_environment(repo: Path) -> Iterator[dict[str, str]]:
+    storage = git_storage(repo)
+    with tempfile.TemporaryDirectory(prefix="workflow-release-git-") as temporary:
+        isolated = Path(temporary) / "git"
+        (isolated / "objects").mkdir(parents=True)
+        (isolated / "refs").mkdir()
+        (isolated / "HEAD").write_text(
+            "ref: refs/heads/unborn\n", encoding="ascii"
+        )
+        yield {
+            **git_child_env(),
+            "GIT_DIR": str(isolated),
+            "GIT_OBJECT_DIRECTORY": str(storage.object_dir),
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+
+
 def remote_git_env() -> dict[str, str]:
     """Restrict remote verification to unauthenticated public HTTPS."""
 
@@ -177,16 +339,17 @@ def remote_git_env() -> dict[str, str]:
     }
 
 
-def git(repo: Path, *args: str) -> str:
-    result: subprocess.CompletedProcess[str] | None = None
+def git_bytes(repo: Path, *args: str) -> bytes:
+    result: subprocess.CompletedProcess[bytes] | None = None
     try:
-        result = subprocess.run(
-            [GIT_EXECUTABLE, "-C", str(repo), *args],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=git_child_env(),
-        )
+        with _raw_git_environment(repo) as environment:
+            result = subprocess.run(
+                [GIT_EXECUTABLE, *args],
+                cwd="/",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
     except (OSError, ValueError):
         pass
     if result is None:
@@ -196,6 +359,13 @@ def git(repo: Path, *args: str) -> str:
             f"Git command failed (rc={result.returncode})"
         ) from None
     return result.stdout
+
+
+def git(repo: Path, *args: str) -> str:
+    try:
+        return git_bytes(repo, *args).decode("utf-8")
+    except UnicodeDecodeError:
+        raise ReleaseVerificationError("Git command returned invalid text") from None
 
 
 def remote_git(url: str, *refs: str) -> str:
@@ -228,28 +398,80 @@ def remote_git(url: str, *refs: str) -> str:
     return result.stdout
 
 
+def _valid_oid(value: str) -> bool:
+    return OID.fullmatch(value) is not None
+
+
+def read_tag_oid(repo: Path, ref: str) -> str:
+    """Read one version tag ref directly, without loading any Git configuration."""
+
+    if RELEASE_REF.fullmatch(ref) is None:
+        raise ReleaseVerificationError("invalid release ref")
+    storage = git_storage(repo)
+    loose = storage.common_dir / "refs" / "tags" / ref
+    try:
+        loose_metadata = loose.lstat()
+    except FileNotFoundError:
+        loose_metadata = None
+    except OSError:
+        raise ReleaseVerificationError("release tag identity is unavailable") from None
+    if loose_metadata is not None:
+        if not stat.S_ISREG(loose_metadata.st_mode) or stat.S_ISLNK(
+            loose_metadata.st_mode
+        ):
+            raise ReleaseVerificationError("release tag identity is unavailable")
+        oid = _one_metadata_line(loose)
+        if not _valid_oid(oid):
+            raise ReleaseVerificationError("release tag has an invalid Git identity")
+        return oid
+
+    packed = storage.common_dir / "packed-refs"
+    if not packed.exists():
+        raise ReleaseVerificationError("release tag identity is unavailable")
+    try:
+        lines = _read_metadata(packed, maximum=16 * 1024 * 1024).decode(
+            "ascii"
+        ).splitlines()
+    except UnicodeDecodeError:
+        raise ReleaseVerificationError("release tag identity is unavailable") from None
+    target = f"refs/tags/{ref}"
+    matches: list[str] = []
+    for line in lines:
+        if not line or line.startswith(("#", "^")):
+            continue
+        fields = line.split(" ")
+        if len(fields) == 2 and fields[1] == target:
+            matches.append(fields[0])
+    if len(matches) != 1 or not _valid_oid(matches[0]):
+        raise ReleaseVerificationError("release tag identity is unavailable")
+    return matches[0]
+
+
 def resolve_commit(repo: Path, revision: str) -> str:
-    return git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip()
+    if not _valid_oid(revision):
+        raise ReleaseVerificationError("commit has an invalid Git identity")
+    commit = git(
+        repo, "rev-parse", "--verify", f"{revision}^{{commit}}"
+    ).strip()
+    if not _valid_oid(commit):
+        raise ReleaseVerificationError("commit has an invalid Git identity")
+    return commit
 
 
 def resolve_annotated_tag(repo: Path, ref: str) -> AnnotatedTag:
-    tag_object = git(repo, "rev-parse", "--verify", f"refs/tags/{ref}").strip()
+    tag_object = read_tag_oid(repo, ref)
     object_type = git(repo, "cat-file", "-t", tag_object).strip()
     if object_type != "tag":
         raise ReleaseVerificationError(f"release {ref} must be an annotated tag")
     commit = resolve_commit(repo, tag_object)
-    if not all(
-        len(value) == 40
-        and all(character in "0123456789abcdef" for character in value)
-        for value in (tag_object, commit)
-    ):
+    if not all(_valid_oid(value) for value in (tag_object, commit)):
         raise ReleaseVerificationError(f"release {ref} has an invalid Git identity")
     return AnnotatedTag(ref, tag_object, commit)
 
 
 def assert_tag_unchanged(repo: Path, tag: AnnotatedTag) -> None:
     try:
-        current = git(repo, "rev-parse", "--verify", f"refs/tags/{tag.ref}").strip()
+        current = read_tag_oid(repo, tag.ref)
     except ReleaseVerificationError as exc:
         raise ReleaseVerificationError(
             f"tag {tag.ref} changed during verification"
@@ -258,20 +480,45 @@ def assert_tag_unchanged(repo: Path, tag: AnnotatedTag) -> None:
         raise ReleaseVerificationError(f"tag {tag.ref} changed during verification")
 
 
+def _direct_origin_urls(repo: Path) -> list[str]:
+    """Parse only the literal origin URL in the common config; never follow includes."""
+
+    config = git_storage(repo).common_dir / "config"
+    try:
+        lines = _read_metadata(config).decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        raise ReleaseVerificationError("origin configuration is invalid") from None
+    in_origin = False
+    urls: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if stripped.startswith("["):
+            in_origin = (
+                re.fullmatch(
+                    r'\[remote\s+"origin"\](?:\s*[#;].*)?',
+                    stripped,
+                    flags=re.IGNORECASE,
+                )
+                is not None
+            )
+            continue
+        if not in_origin:
+            continue
+        match = re.fullmatch(r"url\s*=\s*(\S+)", stripped, flags=re.IGNORECASE)
+        if match is not None:
+            urls.append(match.group(1))
+    return urls
+
+
 def _canonical_remote_url(repo: Path, remote: str) -> str:
     if remote != "origin":
         raise ReleaseVerificationError(
             "remote verification supports only origin"
         )
     try:
-        configured = git(
-            repo,
-            "config",
-            "--local",
-            "--no-includes",
-            "--get-all",
-            "remote.origin.url",
-        ).splitlines()
+        configured = _direct_origin_urls(repo)
     except ReleaseVerificationError:
         configured = []
     if len(configured) != 1 or configured[0] not in ACCEPTED_AUTOMATION_REMOTES:
@@ -715,13 +962,7 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
         raise ReleaseVerificationError(f"{name} has no setup-gemini-auth resolver")
 
 
-def verify_tag_content(
-    repo: Path, ref: str, *, tag: AnnotatedTag | None = None
-) -> None:
-    captured = tag if tag is not None else resolve_annotated_tag(repo, ref)
-    if captured.ref != ref:
-        raise ReleaseVerificationError("captured tag identity does not match release ref")
-    revision = captured.commit
+def _verify_commit_content(repo: Path, ref: str, revision: str) -> None:
     _verify_approved_v140_policy(repo, ref, revision)
     catalog = _verify_tag_catalog(repo, ref, revision)
     names = git(
@@ -887,6 +1128,25 @@ def verify_tag_content(
         raise ReleaseVerificationError(
             "opencode.yml security contract permits unsafe PR or App-token access"
         )
+
+
+def verify_commit_content(repo: Path, ref: str, commit: str) -> str:
+    """Verify one exact raw commit before an immutable release tag is published."""
+
+    if RELEASE_REF.fullmatch(ref) is None:
+        raise ReleaseVerificationError(f"invalid release ref: {ref}")
+    revision = resolve_commit(repo, commit)
+    _verify_commit_content(repo, ref, revision)
+    return revision
+
+
+def verify_tag_content(
+    repo: Path, ref: str, *, tag: AnnotatedTag | None = None
+) -> None:
+    captured = tag if tag is not None else resolve_annotated_tag(repo, ref)
+    if captured.ref != ref:
+        raise ReleaseVerificationError("captured tag identity does not match release ref")
+    _verify_commit_content(repo, ref, captured.commit)
     assert_tag_unchanged(repo, captured)
 
 
@@ -915,16 +1175,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref", required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--remote")
+    parser.add_argument("--commit-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.commit_only and args.remote is not None:
+        parser.error("--commit-only does not accept --remote")
     try:
-        commit = verify_release(
-            args.automation, args.ref, args.expected_commit, remote=args.remote
+        commit = (
+            verify_commit_content(args.automation, args.ref, args.expected_commit)
+            if args.commit_only
+            else verify_release(
+                args.automation, args.ref, args.expected_commit, remote=args.remote
+            )
         )
     except ReleaseVerificationError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
-    remote_note = f" and remote {args.remote}" if args.remote else ""
-    print(f"PASS: {args.ref} resolves to secure commit {commit}{remote_note}")
+    if args.commit_only:
+        print(f"PASS: {args.ref} commit content is secure at {commit}")
+    else:
+        remote_note = f" and remote {args.remote}" if args.remote else ""
+        print(f"PASS: {args.ref} resolves to secure commit {commit}{remote_note}")
     return 0
 
 

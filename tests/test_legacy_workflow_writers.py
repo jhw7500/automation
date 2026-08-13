@@ -495,15 +495,17 @@ def test_task9_is_fail_closed_sequential_and_reuses_the_marked_workspace() -> No
     text = IMPLEMENTATION_PLAN.read_text(encoding="utf-8")
 
     assert "set -euo pipefail" in text
-    assert "show-ref --verify --quiet refs/tags/v1.40" in text
-    assert "/usr/bin/git -C / ls-remote --tags" in text
+    assert "show-ref --verify --quiet refs/tags/v1.40" not in text
+    assert "/usr/bin/git -C / ls-remote" in text
     assert "https://github.com/jhw7500/automation.git" in text
-    tag_index = text.index("git tag -a v1.40")
+    main_index = text.index("refs/heads/main")
+    tag_index = text.index("refs/tags/v1.40", main_index)
     verify_index = text.index("scripts/verify_workflow_release.py", tag_index)
-    push_index = text.index("git push origin refs/tags/v1.40", verify_index)
-    assert tag_index < verify_index < push_index
+    publish_index = text.index("repos/jhw7500/automation/git/tags", verify_index)
+    postverify_index = text.index("POST_REMOTE_TAGS", publish_index)
+    assert main_index < tag_index < verify_index < publish_index < postverify_index
     assert "--repo wlan-package --repo wlan-driver" not in text
-    package_index = text.index("--repo wlan-package", push_index)
+    package_index = text.index("--repo wlan-package", postverify_index)
     package_approval = text.index("wlan-package", package_index + len("--repo wlan-package"))
     driver_index = text.index("--repo wlan-driver", package_approval)
     bootstrap_index = text.index("--repo cts-email-mcp-server", driver_index)
@@ -539,8 +541,146 @@ def test_release_verification_docs_define_the_public_hermetic_git_boundary() -> 
     assert "system and global Git configuration" in combined
     assert "credential helpers" in combined
     assert "private or forked automation remote" in combined
+    assert "isolated temporary Git directory" in combined
+    assert "source `.git/config`" in combined
+    assert "`.git/info/attributes`" in combined
+    assert "replacement refs" in combined
+    assert "alternates and promisor" in combined
     assert "GIT_CONFIG_NOSYSTEM=1" in plan
     assert "GIT_CONFIG_GLOBAL=/dev/null" in plan
+    assert "GIT_NO_REPLACE_OBJECTS=1" in plan
+    assert "GIT_OBJECT_DIRECTORY" in plan
     assert "GIT_ALLOW_PROTOCOL=https" in plan
-    assert "/usr/bin/git -C / ls-remote --tags" in plan
+    assert "/usr/bin/git -C / ls-remote" in plan
     assert "git ls-remote --tags origin refs/tags/v1.40" not in plan
+
+
+def test_task9_binds_release_creation_to_exact_github_repository_and_main() -> None:
+    text = IMPLEMENTATION_PLAN.read_text(encoding="utf-8")
+    task9 = text.split("### Task 9:", 1)[1]
+    release_shell = task9.split("rtk bash -s <<'BASH'", 1)[1].split(
+        "\nBASH", 1
+    )[0]
+
+    assert "git push" not in release_shell
+    assert "origin/main" not in release_shell
+    assert "pushurl" not in release_shell.lower()
+    assert "url." not in release_shell.lower()
+    assert "refs/heads/main" in task9
+    assert "https://github.com/jhw7500/automation.git" in task9
+    assert "--commit-only" in task9
+    assert "gh api --hostname github.com --method POST" in task9
+    assert "repos/jhw7500/automation/git/tags" in task9
+    assert "repos/jhw7500/automation/git/refs" in task9
+    assert "ref=refs/tags/v1.40" in task9
+
+    main_read = task9.index("refs/heads/main")
+    tag_absence = task9.index("refs/tags/v1.40", main_read)
+    preverify = task9.index("--commit-only", tag_absence)
+    create_object = task9.index("repos/jhw7500/automation/git/tags", preverify)
+    create_ref = task9.index("repos/jhw7500/automation/git/refs", create_object)
+    postverify = task9.index("POST_REMOTE_TAGS", create_ref)
+    assert main_read < tag_absence < preverify < create_object < create_ref < postverify
+
+
+def _task9_release_shell() -> str:
+    text = IMPLEMENTATION_PLAN.read_text(encoding="utf-8")
+    return text.split("rtk bash -s <<'BASH'", 1)[1].split("\nBASH", 1)[0]
+
+
+def _task9_mock_rtk(tmp_path: Path) -> tuple[Path, Path]:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "rtk.log"
+    fake = fake_bin / "rtk"
+    fake.write_text(
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        "printf '%s\\n' \"$*\" >> \"$MOCK_LOG\"\n"
+        "all=\" $* \"\n"
+        "if [[ $1 == env && $all == *' refs/heads/main '* ]]; then\n"
+        "  printf '%s\\t%s\\n' \"$MOCK_MERGE_SHA\" refs/heads/main\n"
+        "elif [[ $1 == env && $all == *' refs/tags/v1.40 '* ]]; then\n"
+        "  count=0; [[ -f $MOCK_STATE ]] && read -r count < \"$MOCK_STATE\"\n"
+        "  count=$((count + 1)); printf '%s\\n' \"$count\" > \"$MOCK_STATE\"\n"
+        "  if ((count > 1)); then\n"
+        "    printf '%s\\t%s\\n' \"$MOCK_TAG_SHA\" refs/tags/v1.40\n"
+        "    printf '%s\\t%s\\n' \"$MOCK_MERGE_SHA\" 'refs/tags/v1.40^{}'\n"
+        "  fi\n"
+        "elif [[ $1 == python3 && $all == *' --commit-only '* ]]; then\n"
+        "  :\n"
+        "elif [[ $1 == gh && $all == *' repos/jhw7500/automation/git/tags '* ]]; then\n"
+        "  printf '%s\\t%s\\t%s\\t%s\\n' \"$MOCK_TAG_SHA\" v1.40 \"$MOCK_MERGE_SHA\" commit\n"
+        "elif [[ $1 == gh && $all == *' repos/jhw7500/automation/git/refs '* ]]; then\n"
+        "  [[ ${MOCK_REF_FAIL:-0} != 1 ]] || exit 41\n"
+        "  printf '%s\\t%s\\n' refs/tags/v1.40 \"$MOCK_TAG_SHA\"\n"
+        "else\n"
+        "  printf '%s\\n' 'unexpected mocked rtk invocation' >&2\n"
+        "  exit 97\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    return fake_bin, log
+
+
+def test_task9_release_shell_executes_bound_sequence_with_mocked_clients(
+    tmp_path: Path,
+) -> None:
+    fake_bin, log = _task9_mock_rtk(tmp_path)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "MOCK_LOG": str(log),
+        "MOCK_STATE": str(tmp_path / "state"),
+        "MOCK_MERGE_SHA": "1" * 40,
+        "MOCK_TAG_SHA": "2" * 40,
+    }
+
+    completed = subprocess.run(
+        ["/bin/bash", "-s"],
+        input=_task9_release_shell(),
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+    main = next(i for i, call in enumerate(calls) if "refs/heads/main" in call)
+    tag_reads = [i for i, call in enumerate(calls) if "refs/tags/v1.40" in call and call.startswith("env ")]
+    preverify = next(i for i, call in enumerate(calls) if "--commit-only" in call)
+    tag_object = next(i for i, call in enumerate(calls) if "/git/tags" in call)
+    tag_ref = next(i for i, call in enumerate(calls) if "/git/refs" in call)
+    assert main < tag_reads[0] < preverify < tag_object < tag_ref < tag_reads[1]
+    assert all("git push" not in call and " origin" not in call for call in calls)
+
+
+def test_task9_release_shell_stops_on_ref_creation_race_before_post_read(
+    tmp_path: Path,
+) -> None:
+    fake_bin, log = _task9_mock_rtk(tmp_path)
+    completed = subprocess.run(
+        ["/bin/bash", "-s"],
+        input=_task9_release_shell(),
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "MOCK_LOG": str(log),
+            "MOCK_STATE": str(tmp_path / "state"),
+            "MOCK_MERGE_SHA": "1" * 40,
+            "MOCK_TAG_SHA": "2" * 40,
+            "MOCK_REF_FAIL": "1",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 41
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert sum(call.startswith("env ") and "refs/tags/v1.40" in call for call in calls) == 1
+    assert any("repos/jhw7500/automation/git/refs" in call for call in calls)

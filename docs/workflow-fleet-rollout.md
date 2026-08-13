@@ -19,17 +19,26 @@ by `scripts/workflow-config.json`. Consumer-repository Git and `gh` operations u
 operator's normal GitHub authentication, but provider credentials are removed from child
 environments. Supply the locally installed, reviewed `actionlint` executable explicitly.
 
-Automation release verification has a narrower boundary. Local tag resolution, content
-reads, and archive creation use absolute `/usr/bin/git` with a nonexistent home/XDG root,
-system and global Git configuration disabled, prompts and askpass disabled, and no SSH
-agent or provider/operator environment. Remote tag verification accepts only the local
+Automation release verification has a narrower boundary. It discovers a normal repository
+or linked worktree by reading the `.git` pointer and `commondir` itself, reads tag refs
+directly, rejects alternates and promisor/shallow object stores, and creates an isolated
+temporary Git directory. Raw object commands use absolute `/usr/bin/git`, point
+`GIT_OBJECT_DIRECTORY` only at the discovered common object directory, set
+`GIT_NO_REPLACE_OBJECTS=1`, and receive a nonexistent home/XDG root with all system and global Git configuration disabled, along with prompts, askpass, and the SSH agent. They never load source
+`.git/config`, `.git/info/attributes`, filters, hooks/helpers, or replacement refs. Release
+archives are constructed from exact raw tree/blob OIDs with fixed tar metadata rather than
+`git archive`, so attributes cannot transform bytes or execute a filter.
+
+Remote tag verification accepts only the local
 remote name `origin`, requires that its directly configured URL be exactly the public
 `jhw7500/automation` HTTPS URL, canonicalizes it to
 `https://github.com/jhw7500/automation.git`, and runs a credential-free public HTTPS
 `ls-remote` outside the checkout. It does not load host or repository credential helpers,
 URL rewrites, includes, or SSH commands. A private or forked automation remote is not
 supported by this release-verification path; supporting one requires a separately designed
-explicit minimal credential channel rather than ambient host Git configuration.
+explicit minimal credential channel rather than ambient host Git configuration. A linked
+worktree sharing an ordinary complete SHA-1 object directory is supported; alternates and
+promisor/shallow layouts fail closed rather than fetching missing objects.
 
 CI pins and verifies actionlint itself, then runs its YAML schema and expression gate with
 `-shellcheck= -pyflakes=`. Empty analyzer paths make this gate deterministic and independent

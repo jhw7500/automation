@@ -797,12 +797,24 @@ RELEASE_PATHS = (
 )
 ```
 
-Use `git cat-file -t refs/tags/<ref>` to require `tag`, `git rev-parse <ref>^{commit}` for the 40-character commit, and `git ls-remote --tags` when `remote` is set. Extract with `git archive` into a fresh temporary directory; reject absolute paths, `..`, symlink/hardlink members, and unexpected top-level paths before writing. Load catalog/config from the extracted root.
+Read the version tag ref directly and use raw `cat-file`/`rev-parse` against exact OIDs to
+require an annotated tag and its 40-character commit. Use credential-free public
+`ls-remote --tags` when remote attestation is requested. Build a deterministic tar from raw
+tree/blob bytes into a fresh temporary directory; reject absolute paths, `..`,
+symlink/hardlink modes, and unexpected top-level paths before writing. Load catalog/config
+from the extracted root.
 
-Release Git is hermetic rather than an ambient authenticated Git client. Local
-resolve/show/ls-tree/archive subprocesses use absolute `/usr/bin/git`, a fixed nonexistent
-home/XDG root, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, disabled
-prompt/askpass, and no SSH agent. Remote verification accepts only `origin` when its direct,
+Release Git is hermetic rather than an ambient authenticated Git client. Read normal or
+linked-worktree `.git`/`commondir` metadata and version refs without invoking Git. Reject
+alternates and promisor/shallow object stores. Each raw object command gets an isolated
+temporary Git directory, `GIT_OBJECT_DIRECTORY` pointing only to the complete common object
+store, `GIT_NO_REPLACE_OBJECTS=1`, absolute `/usr/bin/git`, a fixed nonexistent home/XDG
+root, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, disabled prompt/askpass, and
+no SSH agent. Do not load source `.git/config`, `.git/info/attributes`, filters,
+hooks/helpers, or replacement refs. Build the release tar from exact raw `ls-tree`/blob OIDs
+with fixed metadata; do not use worktree conversion or `git archive`.
+
+Remote verification accepts only `origin` when its direct,
 no-include URL is the public automation HTTPS identity, canonicalizes it to
 `https://github.com/jhw7500/automation.git`, and runs credential-free public HTTPS outside
 the repository with `GIT_ALLOW_PROTOCOL=https`. Host/repository includes, URL rewrites, SSH
@@ -1183,17 +1195,16 @@ Push the feature branch normally and open a PR describing: central contract chan
 
 - [ ] **Step 4: After human merge, verify and publish the immutable central tag**
 
-From a clean automation checkout after fetching `origin/main` and tags:
+From a clean automation checkout after the implementation PR is human-merged, use the
+public endpoint for identity reads and GitHub CLI's authenticated API client for the one
+exact tag/ref publication. Do not use an ambient Git remote for either identity or push:
 
 ```bash
-rtk bash -lc '
+rtk bash -s <<'BASH'
   set -euo pipefail
-  MERGE_SHA="$(rtk git rev-parse origin/main)"
-  if rtk git show-ref --verify --quiet refs/tags/v1.40; then
-    printf "%s\n" "ERROR: local v1.40 already exists; stop without changing it" >&2
-    exit 1
-  fi
-  REMOTE_TAGS="$(
+  AUTOMATION_URL=https://github.com/jhw7500/automation.git
+
+  public_ls_remote() {
     rtk env -i \
       PATH=/usr/bin:/bin \
       HOME=/nonexistent/automation-workflow-release/home \
@@ -1206,30 +1217,114 @@ rtk bash -lc '
       GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false GCM_INTERACTIVE=Never \
       GIT_ALLOW_PROTOCOL=https GIT_PROTOCOL_FROM_USER=0 \
       GIT_CEILING_DIRECTORIES=/ \
-      /usr/bin/git -C / ls-remote --tags \
-      https://github.com/jhw7500/automation.git \
+      /usr/bin/git -C / ls-remote "$@"
+  }
+
+  REMOTE_MAIN="$(public_ls_remote --heads "$AUTOMATION_URL" refs/heads/main)"
+  if [[ -z "$REMOTE_MAIN" || "$REMOTE_MAIN" == *$'\n'* ]]; then
+    printf "%s\n" "ERROR: public main identity is absent or ambiguous" >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r MERGE_SHA MAIN_REF MAIN_EXTRA <<< "$REMOTE_MAIN"
+  if [[ ! "$MERGE_SHA" =~ ^[0-9a-f]{40}$ \
+        || "$MAIN_REF" != refs/heads/main \
+        || -n "${MAIN_EXTRA:-}" ]]; then
+    printf "%s\n" "ERROR: public main identity is invalid" >&2
+    exit 1
+  fi
+
+  REMOTE_TAGS="$(
+    public_ls_remote --tags "$AUTOMATION_URL" \
       refs/tags/v1.40 "refs/tags/v1.40^{}"
   )"
   if [ -n "$REMOTE_TAGS" ]; then
     printf "%s\n" "ERROR: remote v1.40 already exists; stop without changing it" >&2
     exit 1
   fi
-  rtk git tag -a v1.40 "$MERGE_SHA" -m "automation workflow release v1.40"
-  test "$(rtk git cat-file -t refs/tags/v1.40)" = tag
-  test "$(rtk git rev-parse refs/tags/v1.40^{commit})" = "$MERGE_SHA"
-  rtk python3 scripts/verify_workflow_release.py --automation . --ref v1.40 --expected-commit "$MERGE_SHA"
-  rtk git push origin refs/tags/v1.40
-  rtk python3 scripts/verify_workflow_release.py --automation . --ref v1.40 --expected-commit "$MERGE_SHA" --remote origin
-'
+
+  rtk python3 scripts/verify_workflow_release.py \
+    --automation . --ref v1.40 --expected-commit "$MERGE_SHA" --commit-only
+
+  TAG_RESULT="$(
+    rtk gh api --hostname github.com --method POST \
+      repos/jhw7500/automation/git/tags \
+      -f tag=v1.40 \
+      -f message="automation workflow release v1.40" \
+      -f object="$MERGE_SHA" \
+      -f type=commit \
+      --jq '[.sha, .tag, .object.sha, .object.type] | @tsv'
+  )"
+  IFS=$'\t' read -r TAG_SHA TAG_NAME TAG_COMMIT TAG_TYPE TAG_EXTRA <<< "$TAG_RESULT"
+  if [[ ! "$TAG_SHA" =~ ^[0-9a-f]{40}$ \
+        || "$TAG_NAME" != v1.40 \
+        || "$TAG_COMMIT" != "$MERGE_SHA" \
+        || "$TAG_TYPE" != commit \
+        || -n "${TAG_EXTRA:-}" ]]; then
+    printf "%s\n" "ERROR: GitHub returned an invalid annotated tag object" >&2
+    exit 1
+  fi
+
+  REF_RESULT="$(
+    rtk gh api --hostname github.com --method POST \
+      repos/jhw7500/automation/git/refs \
+      -f ref=refs/tags/v1.40 \
+      -f sha="$TAG_SHA" \
+      --jq '[.ref, .object.sha] | @tsv'
+  )"
+  IFS=$'\t' read -r CREATED_REF CREATED_SHA REF_EXTRA <<< "$REF_RESULT"
+  if [[ "$CREATED_REF" != refs/tags/v1.40 \
+        || "$CREATED_SHA" != "$TAG_SHA" \
+        || -n "${REF_EXTRA:-}" ]]; then
+    printf "%s\n" "ERROR: GitHub returned an invalid immutable ref" >&2
+    exit 1
+  fi
+
+  POST_REMOTE_TAGS="$(
+    public_ls_remote --tags "$AUTOMATION_URL" \
+      refs/tags/v1.40 "refs/tags/v1.40^{}"
+  )"
+  DIRECT_COUNT=0
+  PEELED_COUNT=0
+  while IFS=$'\t' read -r REMOTE_SHA REMOTE_REF REMOTE_EXTRA; do
+    if [[ ! "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ || -n "${REMOTE_EXTRA:-}" ]]; then
+      printf "%s\n" "ERROR: post-publication tag identity is invalid" >&2
+      exit 1
+    fi
+    case "$REMOTE_REF" in
+      refs/tags/v1.40)
+        [[ "$REMOTE_SHA" == "$TAG_SHA" ]] || exit 1
+        DIRECT_COUNT=$((DIRECT_COUNT + 1))
+        ;;
+      refs/tags/v1.40^\{\})
+        [[ "$REMOTE_SHA" == "$MERGE_SHA" ]] || exit 1
+        PEELED_COUNT=$((PEELED_COUNT + 1))
+        ;;
+      *)
+        printf "%s\n" "ERROR: post-publication tag identity is ambiguous" >&2
+        exit 1
+        ;;
+    esac
+  done <<< "$POST_REMOTE_TAGS"
+  [[ "$DIRECT_COUNT" -eq 1 && "$PEELED_COUNT" -eq 1 ]]
+BASH
 ```
 
-Expected: both absence checks pass before creation, the annotated local object and commit
-are verified before push, and remote verification passes afterward. Any local/remote
-`v1.40` presence or verification failure stops the shell under `set -euo pipefail`; never
-move/delete the tag. The absence read and verifier use credential-free public HTTPS and do
-not consult host Git includes, URL rewrites, SSH commands, credential helpers, askpass, or
-provider/operator credentials. This central release contract does not support a private or
-forked automation remote without a separately reviewed explicit credential channel.
+Expected: the public `main` identity and remote tag absence are bound to the literal
+canonical HTTPS endpoint before mutation; exact raw commit content passes local verification;
+GitHub creates one annotated tag object and then one immutable ref through the exact
+`github.com/jhw7500/automation` API; and a credential-free public read attests its direct and
+peeled identities afterward. A concurrent ref creation makes the GitHub ref request fail
+without overwriting it (the unreachable duplicate tag object is harmless). Never move or
+delete the ref.
+
+The only authenticated publication channel is `gh api --hostname github.com` using the
+operator's existing GitHub CLI credential broker. No token is placed in an argument, URL,
+report, or file. The procedure never uses `origin`, `remote.origin.pushurl`, Git URL rewrites,
+or ambient Git push configuration. It does not create a local tag. The public identity reads
+and local verifier consume no host Git includes, filters, attributes, replace refs, SSH
+commands, credential helpers, askpass, agent, or provider/operator credentials. A private or
+forked automation remote remains unsupported without a separately reviewed explicit
+credential channel.
 
 - [ ] **Step 5: Run the full read-only fleet plan**
 

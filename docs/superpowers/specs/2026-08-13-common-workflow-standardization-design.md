@@ -246,9 +246,16 @@ merge or secret-mutation client. Temporary clones disable repository hooks, do n
 into submodules, and accept only the configured `github.com/jhw7500/<repo>` remote.
 
 The central release verifier is intentionally separate from those authenticated consumer
-operations. Its local resolve/show/ls-tree/archive subprocesses use absolute `/usr/bin/git`
-with a fixed nonexistent home/XDG root, system and global Git configuration disabled,
-prompts and askpass disabled, and no SSH agent. For remote tag attestation it reads only the
+operations. It discovers normal and linked-worktree metadata without Git, rejects
+alternates and promisor/shallow object stores, reads version tag refs directly, and creates
+an isolated temporary Git directory. Local raw object subprocesses use absolute
+`/usr/bin/git`, `GIT_OBJECT_DIRECTORY` for only the complete common object store,
+`GIT_NO_REPLACE_OBJECTS=1`, and a fixed nonexistent home/XDG root with system/global config,
+prompts, askpass, and SSH agent disabled. Source `.git/config`, `.git/info/attributes`,
+filters, hooks/helpers, and replacement refs do not enter object resolution. Archive bytes
+come from exact raw tree/blob OIDs in a deterministic Python-built tar, not `git archive`.
+
+For remote tag attestation it reads only the
 direct, no-include local `remote.origin.url`, accepts exactly the public automation HTTPS
 identity, canonicalizes it to `https://github.com/jhw7500/automation.git`, and performs
 credential-free public HTTPS outside the repository with only the HTTPS transport allowed.
