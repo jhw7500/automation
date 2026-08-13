@@ -1,970 +1,1144 @@
-#!/usr/bin/env python3
-from pathlib import Path
+"""Behavior tests for read-only fleet planning and PR-only publication."""
+
+from __future__ import annotations
+
+from contextlib import nullcontext
+from dataclasses import fields
 import json
-import os
+from pathlib import Path, PurePosixPath
 import subprocess
-import sys
-import tempfile
-import textwrap
-import unittest
-from unittest.mock import patch
-from unittest.mock import Mock
+from unittest import mock
+
+import pytest
+
+from scripts import rollout_workflow_fleet as rollout
+from scripts.prepare_workflow_rollout import FileChange, RenderPlan
+from scripts.workflow_fleet_git import PullRequest, RepositorySnapshot
+from scripts.workflow_catalog import load_catalog, load_fleet_config
+from scripts.workflow_release_bundle import ReleaseBundle
+
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
-from scripts.rollout_workflow_fleet import (
-    CommandError,
-    default_branch,
-    main,
-    materialize_release_contract,
-    prepare_with_prerequisites,
-    publish_repository,
-    rollout_branch,
-    secret_source,
-    sync_missing,
+COMMIT = "1" * 40
+BASE = "2" * 40
+HEAD = "3" * 40
+ALL_SECRETS = frozenset(
+    {"CLAUDE_CODE_OAUTH_TOKEN", "GEMINI_API_KEY", "ZHIPU_API_KEY", "APP_PRIVATE_KEY"}
 )
-from scripts.prepare_workflow_rollout import (
-    RolloutError,
-    RolloutResult,
-    SecretPrerequisiteError,
+ALL_VARIABLES = frozenset({"APP_ID"})
+
+
+@pytest.fixture
+def bundle() -> ReleaseBundle:
+    catalog = load_catalog(ROOT)
+    config = load_fleet_config(ROOT, catalog)
+    return ReleaseBundle(
+        root=ROOT,
+        ref="v1.40",
+        commit=COMMIT,
+        catalog=catalog,
+        config=config,
+        canonical=ROOT / config.canonical_dir,
+    )
+
+
+def marked_workspace(tmp_path: Path) -> Path:
+    workspace = tmp_path / "fleet"
+    workspace.mkdir()
+    (workspace / ".automation-fleet-workspace").write_text(
+        "managed disposable clones only\n", encoding="utf-8"
+    )
+    return workspace
+
+
+def outcome(repo: str, status: str = "planned") -> rollout.RepoOutcome:
+    return rollout.RepoOutcome(
+        repo=repo,
+        status=status,
+        detail="one managed file differs",
+        base_sha=BASE,
+        changed_paths=(".github/workflows/claude.yml",),
+    )
+
+
+def prepared(repo: str, status: str = "planned") -> rollout.PreparedRepo:
+    plan = RenderPlan(
+        "drift",
+        "one managed file differs",
+        (
+            FileChange(
+                PurePosixPath(".github/workflows/claude.yml"), b"old\n", b"new\n"
+            ),
+        ),
+        frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}),
+        frozenset(),
+    )
+    return rollout.PreparedRepo(repo, "create_branch", outcome(repo, status), plan)
+
+
+def fake_bundle_context(bundle: ReleaseBundle):
+    return nullcontext(bundle)
+
+
+def test_public_report_model_and_exact_release_text() -> None:
+    assert [item.name for item in fields(rollout.RepoOutcome)] == [
+        "repo",
+        "status",
+        "detail",
+        "base_sha",
+        "head_sha",
+        "pr_url",
+        "changed_paths",
+    ]
+    assert rollout.rollout_branch("v1.40") == "automation/common-workflows-v1.40"
+    assert rollout.rollout_branch("v2.3.4") == "automation/common-workflows-v2.3.4"
+    assert rollout.pr_title("v1.40") == "ci: adopt common automation workflows (v1.40)"
+    assert rollout.pr_body("v1.40", COMMIT, ("z.yml", "a.yml")) == (
+        "Standardize only the catalogued common AI workflow callers.\n\n"
+        "- automation tag: `v1.40`\n"
+        f"- automation commit: `{COMMIT}`\n"
+        "- managed paths:\n- `a.yml`\n- `z.yml`\n\n"
+        "Project-specific workflows are unchanged. This PR does not modify secrets. "
+        "Merge and recovery use this repository's normal GitHub controls.\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "ref", ["", "1.40", "v1", "v1.", "v1.40-rc1", " v1.40", "v1.40/main"]
 )
+def test_release_ref_parser_fails_closed(ref: str) -> None:
+    with pytest.raises(rollout.CommandError, match="invalid release ref"):
+        rollout.rollout_branch(ref)
 
 
-SECURE_WORKFLOW = """\
-on:
-  workflow_call:
-jobs:
-  check-enabled:
-    outputs:
-      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
-    steps:
-      - id: pr_scope
-        env:
-          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
-        run: gh api example
-  opencode-review:
-    if: >-
-      needs.check-enabled.outputs.safe_pr == 'true'
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-    env:
-      OPENCODE_VERSION: '1.18.17'
-      OPENCODE_ARCHIVE_SHA256: '3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a'
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: true
-      - name: Cache pinned OpenCode CLI archive
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-      - name: Install pinned OpenCode CLI
-        run: |
-          curl "releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
-          sha256sum --check -
-          "$install_dir/opencode" --version
-      - name: Run OpenCode PR review
-        run: opencode github run
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          USE_GITHUB_TOKEN: 'true'
-          MODEL: zai-coding-plan/glm-4.7
-"""
-
-SECURE_COMMAND_WORKFLOW = """\
-on:
-  workflow_call:
-jobs:
-  check-enabled:
-    outputs:
-      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
-    steps:
-      - id: pr_scope
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
-        run: gh api example
-  opencode:
-    if: needs.check-enabled.outputs.safe_pr == 'true'
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-    env:
-      OPENCODE_VERSION: '1.18.17'
-      OPENCODE_ARCHIVE_SHA256: '3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a'
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: true
-      - name: Cache pinned OpenCode CLI archive
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-      - name: Install pinned OpenCode CLI
-        run: |
-          curl "releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
-          sha256sum --check -
-          "$install_dir/opencode" --version
-      - name: Run opencode
-        run: opencode github run
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          USE_GITHUB_TOKEN: 'true'
-          MODEL: zai-coding-plan/glm-4.7
-"""
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--sync-missing-secrets",
+        "--allow-personal-oauth-fanout",
+        "--allow-env-secret",
+        "--refresh-secret",
+        "--config",
+    ],
+)
+def test_legacy_flags_are_rejected_before_any_command(
+    tmp_path: Path, flag: str
+) -> None:
+    with mock.patch("scripts.workflow_fleet_git.subprocess.run") as child:
+        with pytest.raises(SystemExit):
+            rollout.main(["--mode", "publish", "--workspace", str(tmp_path), flag])
+        child.assert_not_called()
 
 
-class RolloutWorkflowFleetTest(unittest.TestCase):
-    def test_branch_is_derived_from_release_ref(self) -> None:
-        self.assertEqual("codex/automation-v1.35-fleet", rollout_branch("v1.35"))
-        self.assertEqual("codex/automation-v1.36-fleet", rollout_branch("v1.36"))
-        self.assertNotEqual(rollout_branch("v1.35"), rollout_branch("v1.36"))
+def test_prepare_mode_is_rejected_before_any_command(tmp_path: Path) -> None:
+    with mock.patch("scripts.workflow_fleet_git.subprocess.run") as child:
+        with pytest.raises(SystemExit):
+            rollout.main(["--mode", "prepare", "--workspace", str(tmp_path)])
+        child.assert_not_called()
 
-    def test_prepare_mode_rejects_any_secret_sync_request_before_side_effects(self) -> None:
-        with tempfile.TemporaryDirectory() as temp, patch(
-            "scripts.rollout_workflow_fleet.materialize_release_contract"
-        ) as materialize:
-            with self.assertRaises(SystemExit):
-                main(
-                    [
-                        "--workspace",
-                        temp,
-                        "--mode",
-                        "prepare",
-                        "--sync-missing-secrets",
-                    ]
-                )
-            materialize.assert_not_called()
 
-    def test_personal_oauth_source_requires_explicit_fanout_consent(self) -> None:
-        with patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "test-token"}):
-            self.assertIsNone(secret_source("CLAUDE_CODE_OAUTH_TOKEN", False))
-            self.assertEqual(
-                "test-token", secret_source("CLAUDE_CODE_OAUTH_TOKEN", True)
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--mode", "publish", "--repo", "gstApp"],
+        ["--mode", "publish", "--confirm"],
+    ],
+)
+def test_publish_requires_confirmation_and_explicit_repo(
+    tmp_path: Path, argv: list[str]
+) -> None:
+    with mock.patch(
+        "scripts.rollout_workflow_fleet.materialize_release_bundle"
+    ) as load:
+        with pytest.raises(SystemExit):
+            rollout.main(["--workspace", str(tmp_path), *argv])
+        load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--repo", "wpa-supplicant"],
+        [
+            "--repo",
+            "wpa-supplicant",
+            "--repo",
+            "gstApp",
+            "--bootstrap-repo",
+            "wpa-supplicant",
+        ],
+        ["--repo", "wpa-supplicant", "--bootstrap-repo", "cts-email-mcp-server"],
+    ],
+)
+def test_bootstrap_requires_one_matching_allowed_repository_before_bundle_load(
+    tmp_path: Path, argv: list[str]
+) -> None:
+    if "--bootstrap-repo" not in argv:
+        argv = [*argv, "--bootstrap-repo", "gstApp"]
+    with mock.patch(
+        "scripts.rollout_workflow_fleet.materialize_release_bundle"
+    ) as load:
+        with pytest.raises(SystemExit):
+            rollout.main(["--workspace", str(tmp_path), *argv])
+        load.assert_not_called()
+
+
+def test_bootstrap_authorization_comes_from_release_profile(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(rollout, "prevalidate_repository") as prevalidate,
+    ):
+        with pytest.raises(SystemExit, match="2"):
+            rollout.main(
+                [
+                    "--workspace",
+                    str(workspace),
+                    "--repo",
+                    "gstApp",
+                    "--bootstrap-repo",
+                    "gstApp",
+                ]
             )
+        prevalidate.assert_not_called()
 
-    def test_ambient_environment_secret_requires_name_allowlist(self) -> None:
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "personal-key"}):
-            self.assertIsNone(secret_source("GEMINI_API_KEY", False, set()))
-            self.assertEqual(
-                "personal-key",
-                secret_source("GEMINI_API_KEY", False, {"GEMINI_API_KEY"}),
+
+def test_allowed_bootstrap_is_explicit_and_single_repository(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    seen: list[tuple[str, bool]] = []
+
+    def prevalidate(*_args, repo: str, bootstrap: bool, **_kwargs):
+        seen.append((repo, bootstrap))
+        return prepared(repo)
+
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(rollout, "prevalidate_repository", side_effect=prevalidate),
+    ):
+        assert (
+            rollout.main(
+                [
+                    "--workspace",
+                    str(workspace),
+                    "--repo",
+                    "wpa-supplicant",
+                    "--bootstrap-repo",
+                    "wpa-supplicant",
+                ]
             )
+            == 0
+        )
+    assert seen == [("wpa-supplicant", True)]
 
-    def test_refresh_secret_requires_publish_sync_and_exact_source_allowlist(self) -> None:
-        cases = [
-            ["--mode", "plan", "--refresh-secret", "ZHIPU_API_KEY"],
-            ["--mode", "publish", "--confirm", "--refresh-secret", "ZHIPU_API_KEY"],
+
+def test_plan_prevalidates_all_repositories_and_never_enters_publish(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    seen: list[str] = []
+
+    def prevalidate(*_args, repo: str, **_kwargs) -> rollout.PreparedRepo:
+        seen.append(repo)
+        return prepared(repo)
+
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(rollout, "prevalidate_repository", side_effect=prevalidate),
+        mock.patch.object(rollout, "publish_repository") as publish,
+    ):
+        rc = rollout.main(
+            [
+                "--mode",
+                "plan",
+                "--workspace",
+                str(workspace),
+                "--repo",
+                "gstApp",
+                "--repo",
+                "max9296",
+            ]
+        )
+
+    assert rc == 0
+    assert seen == ["gstApp", "max9296"]
+    publish.assert_not_called()
+    report = json.loads((workspace / "rollout-manifest.json").read_text())
+    assert [item["repo"] for item in report] == seen
+    assert all(item["authoritative"] is False for item in report)
+    assert all(item["release_commit"] == COMMIT for item in report)
+    assert report[0]["observed_base"] == BASE
+    assert report[0]["required_secrets"] == ["CLAUDE_CODE_OAUTH_TOKEN"]
+    assert report[0]["managed_diff_paths"] == [".github/workflows/claude.yml"]
+
+
+def test_publish_blocks_every_write_when_any_prevalidation_blocks(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    checked: list[str] = []
+
+    def prevalidate(*_args, repo: str, **_kwargs) -> rollout.PreparedRepo:
+        checked.append(repo)
+        if repo == "max9296":
+            return rollout.PreparedRepo(
+                repo,
+                "blocked",
+                rollout.RepoOutcome(repo, "blocked", "mismatched branch", BASE),
+                None,
+            )
+        return prepared(repo)
+
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(rollout, "prevalidate_repository", side_effect=prevalidate),
+        mock.patch.object(rollout, "publish_repository") as publish,
+    ):
+        rc = rollout.main(
             [
                 "--mode",
                 "publish",
                 "--confirm",
-                "--sync-missing-secrets",
-                "--refresh-secret",
-                "ZHIPU_API_KEY",
-            ],
-        ]
-        with tempfile.TemporaryDirectory() as temp, patch(
-            "scripts.rollout_workflow_fleet.materialize_release_contract"
-        ) as materialize:
-            for extra in cases:
-                with self.subTest(extra=extra), self.assertRaises(SystemExit):
-                    main(["--workspace", temp, *extra])
-            materialize.assert_not_called()
-
-    def test_refresh_secret_requires_an_explicit_repository_before_side_effects(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / ".automation-fleet-workspace").write_text("managed\n")
-            config = root / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "gh_owner": "owner",
-                        "repos": {"repo": {"workflows": True, "secrets": True}},
-                    }
-                )
-            )
-            with patch(
-                "scripts.rollout_workflow_fleet.materialize_release_contract"
-            ) as materialize, self.assertRaises(SystemExit):
-                main(
-                    [
-                        "--automation",
-                        str(ROOT),
-                        "--config",
-                        str(config),
-                        "--workspace",
-                        str(workspace),
-                        "--mode",
-                        "publish",
-                        "--confirm",
-                        "--sync-missing-secrets",
-                        "--allow-env-secret",
-                        "ZHIPU_API_KEY",
-                        "--refresh-secret",
-                        "ZHIPU_API_KEY",
-                    ]
-                )
-            materialize.assert_not_called()
-
-    def test_refresh_secret_requires_an_exact_allowed_source_before_side_effects(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / ".automation-fleet-workspace").write_text("managed\n")
-            config = root / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "gh_owner": "owner",
-                        "repos": {"repo": {"workflows": True, "secrets": True}},
-                    }
-                )
-            )
-            with patch(
-                "scripts.rollout_workflow_fleet.materialize_release_contract"
-            ) as materialize, self.assertRaises(SystemExit):
-                main(
-                    [
-                        "--automation",
-                        str(ROOT),
-                        "--config",
-                        str(config),
-                        "--workspace",
-                        str(workspace),
-                        "--mode",
-                        "publish",
-                        "--confirm",
-                        "--sync-missing-secrets",
-                        "--refresh-secret",
-                        "ZHIPU_API_KEY",
-                        "--repo",
-                        "repo",
-                    ]
-                )
-            materialize.assert_not_called()
-
-    def test_refresh_secret_overwrites_existing_value_via_stdin_only(self) -> None:
-        calls: list[tuple[list[str], str | None]] = []
-
-        def fake_run(args: list[str], **kwargs: object) -> str:
-            calls.append((args, kwargs.get("input_text")))  # type: ignore[arg-type]
-            return ""
-
-        with patch.dict(os.environ, {"ZHIPU_API_KEY": "rotated-value"}), patch(
-            "scripts.rollout_workflow_fleet.run", side_effect=fake_run
-        ):
-            from scripts.rollout_workflow_fleet import refresh_secrets
-
-            refreshed = refresh_secrets(
-                "owner",
-                "repo",
-                {"ZHIPU_API_KEY"},
-                False,
-                {"ZHIPU_API_KEY"},
-            )
-        self.assertEqual(("ZHIPU_API_KEY",), refreshed)
-        self.assertEqual("rotated-value", calls[0][1])
-        self.assertNotIn("rotated-value", calls[0][0])
-        self.assertNotIn("--body", calls[0][0])
-
-    def test_refresh_secret_reports_partial_writes_when_a_later_source_is_missing(self) -> None:
-        completed: list[str] = []
-        with patch(
-            "scripts.rollout_workflow_fleet.secret_source",
-            side_effect=["first-value", None],
-        ), patch("scripts.rollout_workflow_fleet.run") as run:
-            from scripts.rollout_workflow_fleet import refresh_secrets
-
-            with self.assertRaisesRegex(RolloutError, "no explicitly allowed source"):
-                refresh_secrets(
-                    "owner",
-                    "repo",
-                    {"FIRST", "SECOND"},
-                    False,
-                    {"FIRST", "SECOND"},
-                    completed,
-                )
-        self.assertEqual(["FIRST"], completed)
-        run.assert_called_once()
-
-    def test_missing_default_branch_becomes_a_command_error(self) -> None:
-        with patch(
-            "scripts.rollout_workflow_fleet.gh_json",
-            return_value={"defaultBranchRef": None},
-        ):
-            with self.assertRaisesRegex(CommandError, "default branch is unavailable"):
-                default_branch("owner", "empty-repo")
-
-    def test_sync_missing_passes_secret_via_stdin_and_never_argv(self) -> None:
-        calls: list[tuple[list[str], str | None]] = []
-
-        def fake_run(args: list[str], **kwargs: object) -> str:
-            calls.append((args, kwargs.get("input_text")))  # type: ignore[arg-type]
-            return ""
-
-        with patch("scripts.rollout_workflow_fleet.remote_names", return_value=set()), patch(
-            "scripts.rollout_workflow_fleet.secret_source", return_value="sensitive-value"
-        ), patch("scripts.rollout_workflow_fleet.run", side_effect=fake_run):
-            available, synced = sync_missing(
-                "owner", "repo", {"TOKEN"}, True, False, {"TOKEN"}
-            )
-        self.assertEqual({"TOKEN"}, available)
-        self.assertEqual(("TOKEN",), synced)
-        self.assertEqual("sensitive-value", calls[0][1])
-        self.assertNotIn("sensitive-value", calls[0][0])
-        self.assertNotIn("--body", calls[0][0])
-
-    def test_legacy_bulk_sync_reads_secret_from_stdin_not_literal_dash(self) -> None:
-        script = (ROOT / "scripts/sync-secrets.sh").read_text(encoding="utf-8")
-        self.assertNotIn("--body -", script)
-
-    def test_sync_missing_reports_partial_writes_when_a_later_write_fails(self) -> None:
-        completed: list[str] = []
-        with patch(
-            "scripts.rollout_workflow_fleet.remote_names", return_value=set()
-        ), patch(
-            "scripts.rollout_workflow_fleet.secret_source", return_value="value"
-        ), patch(
-            "scripts.rollout_workflow_fleet.run",
-            side_effect=["", CommandError("second write failed")],
-        ):
-            with self.assertRaisesRegex(CommandError, "second write failed"):
-                sync_missing(
-                    "owner",
-                    "repo",
-                    {"FIRST", "SECOND"},
-                    True,
-                    False,
-                    {"FIRST", "SECOND"},
-                    completed,
-                )
-        self.assertEqual(["FIRST"], completed)
-
-    def test_multiple_missing_secrets_are_synced_until_prepare_succeeds(self) -> None:
-        first = SecretPrerequisiteError("missing first", {"FIRST_TOKEN"})
-        second = SecretPrerequisiteError("missing second", {"SECOND_TOKEN"})
-        prepared = object()
-        with patch(
-            "scripts.rollout_workflow_fleet.remote_names",
-            side_effect=[set(), set()],
-        ), patch(
-            "scripts.rollout_workflow_fleet.prepare_repository",
-            side_effect=[first, second, prepared],
-        ), patch(
-            "scripts.rollout_workflow_fleet.sync_missing",
-            side_effect=[
-                ({"FIRST_TOKEN"}, ("FIRST_TOKEN",)),
-                ({"FIRST_TOKEN", "SECOND_TOKEN"}, ("SECOND_TOKEN",)),
-            ],
-        ) as sync:
-            result, synced = prepare_with_prerequisites(
-                Path("/tmp/repo"),
-                Path("/tmp/automation"),
-                "v1.35",
-                "owner",
-                "repo",
-                True,
-                False,
-                {"FIRST_TOKEN", "SECOND_TOKEN"},
-            )
-        self.assertIs(prepared, result)
-        self.assertEqual(("FIRST_TOKEN", "SECOND_TOKEN"), synced)
-        self.assertEqual(2, sync.call_count)
-
-    def test_deferred_refresh_secret_is_available_to_prepare_without_early_write(self) -> None:
-        prepared = object()
-        completed: list[str] = []
-        with patch(
-            "scripts.rollout_workflow_fleet.remote_names",
-            side_effect=[set(), set()],
-        ), patch(
-            "scripts.rollout_workflow_fleet.prepare_repository",
-            return_value=prepared,
-        ) as prepare, patch(
-            "scripts.rollout_workflow_fleet.sync_missing"
-        ) as sync:
-            result, synced = prepare_with_prerequisites(
-                Path("/tmp/repo"),
-                Path("/tmp/automation"),
-                "v1.35",
-                "owner",
-                "repo",
-                True,
-                False,
-                {"TOKEN"},
-                {"TOKEN"},
-                completed,
-            )
-        self.assertIs(prepared, result)
-        self.assertEqual((), synced)
-        self.assertEqual({"TOKEN"}, prepare.call_args.args[3])
-        sync.assert_not_called()
-
-    def test_release_contract_is_read_from_verified_tag_not_newer_head(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            remote = Path(temp) / "remote.git"
-            workflow = repo / ".github/workflows/opencode-auto-review.yml"
-            workflow.parent.mkdir(parents=True)
-            workflow.write_text(SECURE_WORKFLOW)
-            (workflow.parent / "opencode.yml").write_text(SECURE_COMMAND_WORKFLOW)
-            self.git(repo, "init", "-q")
-            self.git(repo, "config", "user.name", "Test")
-            self.git(repo, "config", "user.email", "test@example.com")
-            self.git(repo, "add", ".")
-            self.git(repo, "commit", "-qm", "v1.35 contract")
-            tagged = self.git(repo, "rev-parse", "HEAD").strip()
-            self.git(repo, "tag", "-a", "v1.35", "-m", "v1.35")
-            subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
-            self.git(repo, "remote", "add", "origin", str(remote))
-            self.git(repo, "push", "-q", "origin", "v1.35")
-
-            workflow.write_text(SECURE_WORKFLOW + "# newer untagged contract\n")
-            self.git(repo, "add", ".")
-            self.git(repo, "commit", "-qm", "newer head")
-
-            extracted_temp, extracted, commit = materialize_release_contract(repo, "v1.35")
-            try:
-                text = (
-                    extracted / ".github/workflows/opencode-auto-review.yml"
-                ).read_text()
-                self.assertEqual(tagged, commit)
-                self.assertNotIn("newer untagged", text)
-            finally:
-                extracted_temp.cleanup()
-
-    def test_release_contract_rejects_non_version_tag(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            workflow = repo / ".github/workflows/opencode-auto-review.yml"
-            workflow.parent.mkdir(parents=True)
-            workflow.write_text(SECURE_WORKFLOW)
-            (workflow.parent / "opencode.yml").write_text(SECURE_COMMAND_WORKFLOW)
-            self.git(repo, "init", "-q")
-            self.git(repo, "config", "user.name", "Test")
-            self.git(repo, "config", "user.email", "test@example.com")
-            self.git(repo, "add", ".")
-            self.git(repo, "commit", "-qm", "contract")
-            self.git(repo, "tag", "release-candidate")
-            with self.assertRaisesRegex(RuntimeError, "invalid release ref"):
-                materialize_release_contract(repo, "release-candidate")
-
-    def test_publish_uses_release_specific_branch_for_push_and_pr(self) -> None:
-        calls: list[list[str]] = []
-        outputs = iter(
-            [
-                "",
-                "",
-                "head-sha",
-                "remote-sha\trefs/heads/codex/automation-v1.36-fleet",
-                "",
-                "https://example.test/pr/1",
+                "--workspace",
+                str(workspace),
+                "--repo",
+                "gstApp",
+                "--repo",
+                "max9296",
             ]
         )
 
-        def fake_run(args: list[str], **_: object) -> str:
-            calls.append(args)
-            return next(outputs)
+    assert rc == 1
+    assert checked == ["gstApp", "max9296"]
+    publish.assert_not_called()
 
-        with patch("scripts.rollout_workflow_fleet.run", side_effect=fake_run), patch(
-            "scripts.rollout_workflow_fleet.gh_json", return_value=[]
-        ):
-            head, url = publish_repository(
-                Path("/tmp/repo"),
-                "owner",
-                "repo",
-                "main",
-                "v1.36",
-                "codex/automation-v1.36-fleet",
-            )
-        self.assertEqual("head-sha", head)
-        self.assertEqual("https://example.test/pr/1", url)
-        flattened = [item for command in calls for item in command]
-        self.assertIn("codex/automation-v1.36-fleet", flattened)
-        self.assertNotIn("codex/automation-v1.35-fleet", flattened)
-        self.assertIn(
-            "--force-with-lease=refs/heads/codex/automation-v1.36-fleet:remote-sha",
-            flattened,
+
+def test_prevalidation_block_preserves_observed_base_and_render_metadata(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    work = marked_workspace(tmp_path)
+    snap = snapshot(work)
+    plan = make_plan()
+    with (
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "refetch_default", return_value=BASE),
+        mock.patch.object(rollout, "git", return_value=""),
+        mock.patch.object(rollout, "_render", return_value=plan),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(
+            rollout,
+            "inspect_rollout",
+            side_effect=rollout.CommandError("mismatched branch"),
+        ),
+    ):
+        result = rollout.prevalidate_repository(
+            bundle, work, repo="gstApp", bootstrap=False, actionlint=Path("/bin/true")
         )
 
-    def test_main_publishes_one_repo_contains_next_failure_and_writes_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / ".automation-fleet-workspace").write_text("managed\n")
-            config = root / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "gh_owner": "owner",
-                        "repos": {
-                            "a-ready": {"workflows": True, "secrets": True},
-                            "b-broken": {"workflows": True, "secrets": True},
-                        },
-                    }
-                )
+    assert result.outcome.status == "blocked"
+    assert result.outcome.base_sha == BASE
+    assert result.plan is plan
+    record = rollout._plan_record(result, COMMIT)
+    assert record["managed_diff_paths"] == list(rollout._changed_paths(plan))
+
+
+def test_publish_repository_refetches_and_renders_again_before_inspection(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    snap = snapshot(workspace)
+    plan = make_plan()
+    calls: list[str] = []
+
+    def refetch(_snapshot):
+        calls.append("refetch")
+        return BASE
+
+    def render(*_args, **_kwargs):
+        calls.append("render")
+        return plan
+
+    def inspect(*_args, **_kwargs):
+        calls.append("inspect")
+        return rollout.RolloutInspection(
+            "reuse", HEAD, "https://github.com/jhw7500/gstApp/pull/1"
+        )
+
+    with (
+        mock.patch.object(
+            rollout, "_make_clone_workspace", return_value=nullcontext(str(workspace))
+        ),
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "refetch_default", side_effect=refetch),
+        mock.patch.object(rollout, "git", return_value=""),
+        mock.patch.object(rollout, "_render", side_effect=render),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(rollout, "inspect_rollout", side_effect=inspect),
+    ):
+        result = rollout.publish_repository(
+            bundle,
+            workspace,
+            repo="gstApp",
+            bootstrap=False,
+            actionlint=Path("/bin/true"),
+        )
+
+    assert result.status == "reused"
+    assert calls == ["refetch", "render", "inspect"]
+
+
+def test_push_success_pr_failure_preserves_fresh_branch_outcome(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    snap = snapshot(workspace)
+    plan = make_plan()
+    with (
+        mock.patch.object(
+            rollout,
+            "_make_clone_workspace",
+            return_value=nullcontext(str(workspace)),
+        ),
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "refetch_default", return_value=BASE),
+        mock.patch.object(rollout, "git", return_value=""),
+        mock.patch.object(rollout, "_render", return_value=plan),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(
+            rollout,
+            "inspect_rollout",
+            return_value=rollout.RolloutInspection("create_branch"),
+        ),
+        mock.patch.object(rollout, "publish_new_branch", return_value=HEAD),
+        mock.patch.object(
+            rollout.fleet_git,
+            "create_pull_request",
+            side_effect=rollout.FleetGitError("command failed (gh, rc=1)"),
+        ),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", return_value=()),
+    ):
+        result = rollout.publish_repository(
+            bundle,
+            workspace,
+            repo="gstApp",
+            bootstrap=False,
+            actionlint=Path("/bin/true"),
+        )
+
+    assert result.status == "blocked"
+    assert result.base_sha == BASE
+    assert result.head_sha == HEAD
+    assert result.changed_paths == rollout._changed_paths(plan)
+    assert "branch published" in result.detail
+
+
+def test_publish_refetches_each_repo_and_reports_partial_rerunnable_outcomes(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    calls: list[str] = []
+
+    def publish(*_args, repo: str, **_kwargs) -> rollout.RepoOutcome:
+        calls.append(repo)
+        if repo == "max9296":
+            raise rollout.CommandError("refetch failed")
+        return rollout.RepoOutcome(
+            repo,
+            "published" if repo == "gstApp" else "reused",
+            "pull request ready",
+            BASE,
+            HEAD,
+            f"https://github.com/jhw7500/{repo}/pull/1",
+            (".github/workflows/claude.yml",),
+        )
+
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(
+            rollout,
+            "prevalidate_repository",
+            side_effect=lambda *_a, repo, **_k: prepared(repo),
+        ),
+        mock.patch.object(rollout, "publish_repository", side_effect=publish),
+    ):
+        rc = rollout.main(
+            [
+                "--mode",
+                "publish",
+                "--confirm",
+                "--workspace",
+                str(workspace),
+                "--repo",
+                "gstApp",
+                "--repo",
+                "max9296",
+                "--repo",
+                "wlan-driver",
+            ]
+        )
+
+    assert rc == 1
+    assert calls == ["gstApp", "max9296", "wlan-driver"]
+    report = json.loads((workspace / "rollout-manifest.json").read_text())
+    assert [item["status"] for item in report] == ["published", "blocked", "reused"]
+    assert report[0]["pr_url"].endswith("/gstApp/pull/1")
+    assert "refetch failed" in report[1]["detail"]
+
+
+def make_plan() -> RenderPlan:
+    return RenderPlan(
+        "drift",
+        "managed bytes differ",
+        (
+            FileChange(PurePosixPath(".github/workflows/a.yml"), b"old\n", b"new\n"),
+            FileChange(PurePosixPath(".github/workflows/deleted.yml"), b"gone\n", None),
+        ),
+        frozenset(),
+        frozenset(),
+    )
+
+
+def snapshot(tmp_path: Path) -> RepositorySnapshot:
+    repo = tmp_path / "gstApp"
+    (repo / ".github/workflows").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (repo / ".github/workflows/a.yml").write_bytes(b"new\n")
+    return RepositorySnapshot(repo, "main", BASE, ALL_SECRETS, ALL_VARIABLES)
+
+
+def exact_pr(
+    body: str, *, state: str = "OPEN", title: str | None = None, base: str = "main"
+) -> PullRequest:
+    return PullRequest(
+        7,
+        "https://github.com/jhw7500/gstApp/pull/7",
+        state,
+        base,
+        "automation/common-workflows-v1.40",
+        title or rollout.pr_title("v1.40"),
+        body,
+    )
+
+
+def test_absent_branch_requests_creation_and_matching_branch_without_pr_requests_only_pr(
+    tmp_path: Path,
+) -> None:
+    snap = snapshot(tmp_path)
+    plan = make_plan()
+    body = rollout.pr_body("v1.40", COMMIT, tuple(str(c.path) for c in plan.changes))
+    with (
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=None),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", return_value=()),
+    ):
+        assert (
+            rollout.inspect_rollout(snap, BASE, "v1.40", COMMIT, plan).action
+            == "create_branch"
+        )
+
+    with (
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=HEAD),
+        mock.patch.object(rollout, "validate_existing_branch"),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", return_value=()),
+    ):
+        assert (
+            rollout.inspect_rollout(snap, BASE, "v1.40", COMMIT, plan).action
+            == "create_pr"
+        )
+
+    with (
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=HEAD),
+        mock.patch.object(rollout, "validate_existing_branch"),
+        mock.patch.object(
+            rollout.fleet_git, "list_rollout_prs", return_value=(exact_pr(body),)
+        ),
+    ):
+        state = rollout.inspect_rollout(snap, BASE, "v1.40", COMMIT, plan)
+        assert state.action == "reuse"
+        assert state.pr_url.endswith("/pull/7")
+
+
+def test_current_default_blocks_when_the_exact_rollout_branch_still_exists(
+    tmp_path: Path,
+) -> None:
+    snap = snapshot(tmp_path)
+    with mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=HEAD):
+        with pytest.raises(rollout.CommandError, match="branch"):
+            rollout.require_no_current_rollout_branch(snap, "v1.40")
+
+
+def test_existing_branch_is_validated_before_pr_read_and_rechecked_afterward(
+    tmp_path: Path,
+) -> None:
+    snap = snapshot(tmp_path)
+    plan = make_plan()
+    events: list[str] = []
+    body = rollout.pr_body(
+        "v1.40", COMMIT, tuple(str(item.path) for item in plan.changes)
+    )
+
+    def branch_sha(*_args, **_kwargs):
+        events.append("branch")
+        return HEAD
+
+    def validate(*_args, **_kwargs):
+        events.append("validate")
+
+    def requests(*_args, **_kwargs):
+        events.append("prs")
+        return (exact_pr(body),)
+
+    with (
+        mock.patch.object(
+            rollout.fleet_git, "remote_branch_sha", side_effect=branch_sha
+        ),
+        mock.patch.object(rollout, "validate_existing_branch", side_effect=validate),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", side_effect=requests),
+    ):
+        rollout.inspect_rollout(snap, BASE, "v1.40", COMMIT, plan)
+
+    assert events == ["branch", "validate", "prs", "branch"]
+
+
+@pytest.mark.parametrize("mismatch", ["base", "title", "body", "closed", "multiple"])
+def test_existing_pr_requires_one_exact_open_match(
+    tmp_path: Path, mismatch: str
+) -> None:
+    snap = snapshot(tmp_path)
+    plan = make_plan()
+    body = rollout.pr_body("v1.40", COMMIT, tuple(str(c.path) for c in plan.changes))
+    pr = exact_pr(body)
+    if mismatch == "base":
+        pr = exact_pr(body, base="develop")
+    elif mismatch == "title":
+        pr = exact_pr(body, title="wrong")
+    elif mismatch == "body":
+        pr = exact_pr("wrong")
+    elif mismatch == "closed":
+        pr = exact_pr(body, state="CLOSED")
+    prs = (pr, exact_pr(body)) if mismatch == "multiple" else (pr,)
+    with (
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=HEAD),
+        mock.patch.object(rollout, "validate_existing_branch"),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", return_value=prs),
+    ):
+        with pytest.raises(rollout.CommandError, match="pull request"):
+            rollout.inspect_rollout(snap, BASE, "v1.40", COMMIT, plan)
+
+
+@pytest.mark.parametrize("mismatch", ["parent", "paths", "blob", "deletion"])
+def test_existing_branch_requires_exact_parent_paths_and_managed_bytes(
+    tmp_path: Path, mismatch: str
+) -> None:
+    snap = snapshot(tmp_path)
+    plan = make_plan()
+    (snap.path / ".github/workflows/deleted.yml").unlink(missing_ok=True)
+
+    def git(args, *, cwd=None, stdin=None):
+        if args[:3] == ["rev-list", "--parents", "-n"]:
+            parent = "9" * 40 if mismatch == "parent" else BASE
+            return f"{HEAD} {parent}"
+        if args[:2] == ["diff-tree", "--no-commit-id"]:
+            paths = [str(item.path) for item in plan.changes]
+            if mismatch == "paths":
+                paths.append("project-owned.txt")
+            return "\n".join(paths)
+        if args[0] == "fetch":
+            return ""
+        if args[:2] == ["hash-object", "--stdin"]:
+            return "expected-blob"
+        if args[:2] == ["ls-tree", "--name-only"]:
+            return args[-1] if mismatch == "deletion" else ""
+        if args[0] == "rev-parse":
+            if ":" in args[-1]:
+                return "wrong-blob" if mismatch == "blob" else "expected-blob"
+            return HEAD
+        raise AssertionError(args)
+
+    with mock.patch.object(rollout, "git", side_effect=git):
+        with pytest.raises(rollout.CommandError, match="rollout"):
+            rollout.validate_existing_branch(snap, HEAD, BASE, plan)
+
+
+def test_new_commit_tree_is_byte_attested_before_push(tmp_path: Path) -> None:
+    snap = snapshot(tmp_path)
+    plan = make_plan()
+    (snap.path / ".github/workflows/deleted.yml").unlink(missing_ok=True)
+
+    def git(args, *, cwd=None, stdin=None):
+        if args[:3] == ["rev-list", "--parents", "-n"]:
+            return f"{HEAD} {BASE}"
+        if args[:2] == ["diff-tree", "--no-commit-id"]:
+            return "\n".join(str(item.path) for item in plan.changes)
+        if args[:2] == ["hash-object", "--stdin"]:
+            return "expected-blob"
+        if args[:2] == ["ls-tree", "--name-only"]:
+            return ""
+        if args[0] == "rev-parse":
+            return "expected-blob"
+        raise AssertionError(args)
+
+    with mock.patch.object(rollout, "git", side_effect=git):
+        rollout.validate_commit_tree(snap, HEAD, BASE, plan)
+
+
+def test_new_commit_tree_rejects_clean_filter_blob_transformation(
+    tmp_path: Path,
+) -> None:
+    snap = snapshot(tmp_path)
+    plan = make_plan()
+
+    def git(args, *, cwd=None, stdin=None):
+        if args[:3] == ["rev-list", "--parents", "-n"]:
+            return f"{HEAD} {BASE}"
+        if args[:2] == ["diff-tree", "--no-commit-id"]:
+            return "\n".join(str(item.path) for item in plan.changes)
+        if args[:2] == ["hash-object", "--stdin"]:
+            return "expected-blob"
+        if args[:2] == ["ls-tree", "--name-only"]:
+            return ""
+        if args[0] == "rev-parse":
+            return "transformed-blob"
+        raise AssertionError(args)
+
+    with mock.patch.object(rollout, "git", side_effect=git):
+        with pytest.raises(rollout.CommandError, match="blob"):
+            rollout.validate_commit_tree(snap, HEAD, BASE, plan)
+
+
+def test_new_branch_publication_uses_only_exact_non_force_refspec(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    snap = snapshot(tmp_path)
+    plan = make_plan()
+    calls: list[list[str]] = []
+
+    def git(args, *, cwd=None):
+        calls.append(list(args))
+        if args[:3] == ["diff", "--cached", "--name-only"]:
+            return "\n".join(str(item.path) for item in plan.changes)
+        if args == ["rev-parse", "HEAD"]:
+            return HEAD
+        if args[:3] == ["rev-list", "--parents", "-n"]:
+            return f"{HEAD} {BASE}"
+        return ""
+
+    with (
+        mock.patch.object(rollout, "git", side_effect=git),
+        mock.patch.object(
+            rollout,
+            "apply_release_plan",
+            return_value=tuple(item.path for item in plan.changes),
+        ),
+        mock.patch.object(rollout, "validate_commit_tree"),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=None),
+    ):
+        assert (
+            rollout.publish_new_branch(
+                snap, BASE, "v1.40", COMMIT, plan, Path("/bin/true"), bundle=bundle
             )
-            release_temp = Mock()
-            prepared = RolloutResult(
-                callers=1,
-                changed_files=(Path(".github/workflows/caller.yml"),),
-                required_secrets=frozenset({"TOKEN"}),
+            == HEAD
+        )
+
+    push = next(args for args in calls if args and args[0] == "push")
+    assert push == [
+        "push",
+        "--set-upstream",
+        "origin",
+        "HEAD:refs/heads/automation/common-workflows-v1.40",
+    ]
+    flattened = " ".join(" ".join(args) for args in calls)
+    for forbidden in (
+        "--force",
+        "--force-with-lease",
+        "merge",
+        "auto-merge",
+        "update-branch",
+        "secret set",
+        "variable set",
+        "HEAD:refs/heads/main",
+    ):
+        assert forbidden not in flattened
+
+
+def test_new_branch_revalidates_before_applying_to_the_publish_clone(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    snap = snapshot(tmp_path)
+    plan = make_plan()
+    events: list[str] = []
+
+    def git(args, *, cwd=None):
+        if args[:3] == ["diff", "--cached", "--name-only"]:
+            return "\n".join(str(item.path) for item in plan.changes)
+        if args == ["rev-parse", "HEAD"]:
+            return HEAD
+        if args[:3] == ["rev-list", "--parents", "-n"]:
+            return f"{HEAD} {BASE}"
+        return ""
+
+    with (
+        mock.patch.object(rollout, "git", side_effect=git),
+        mock.patch.object(
+            rollout,
+            "validate_managed_result",
+            side_effect=lambda *_a, **_k: events.append("validate"),
+        ),
+        mock.patch.object(
+            rollout,
+            "apply_release_plan",
+            side_effect=lambda *_a, **_k: (
+                events.append("apply") or tuple(item.path for item in plan.changes)
+            ),
+        ),
+        mock.patch.object(rollout, "validate_commit_tree"),
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=None),
+    ):
+        rollout.publish_new_branch(
+            snap, BASE, "v1.40", COMMIT, plan, Path("/bin/true"), bundle=bundle
+        )
+
+    assert events == ["validate", "apply"]
+
+
+def test_accepted_push_with_lost_response_is_reconciled_as_success(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    snap = snapshot(tmp_path)
+    plan = make_plan()
+
+    def git(args, *, cwd=None, stdin=None):
+        if args[:3] == ["diff", "--cached", "--name-only"]:
+            return "\n".join(str(item.path) for item in plan.changes)
+        if args == ["rev-parse", "HEAD"]:
+            return HEAD
+        if args[0] == "push":
+            raise rollout.FleetGitError("command failed (git, rc=1)")
+        return ""
+
+    with (
+        mock.patch.object(rollout, "git", side_effect=git),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(rollout, "apply_release_plan"),
+        mock.patch.object(rollout, "validate_commit_tree"),
+        mock.patch.object(
+            rollout.fleet_git,
+            "remote_branch_sha",
+            side_effect=[None, None, HEAD],
+        ),
+    ):
+        assert (
+            rollout.publish_new_branch(
+                snap, BASE, "v1.40", COMMIT, plan, Path("/bin/true"), bundle=bundle
             )
-            with patch(
-                "scripts.rollout_workflow_fleet.materialize_release_contract",
-                return_value=(release_temp, Path("/contract"), "release-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.default_branch",
-                side_effect=["main", ValueError("unexpected metadata shape")],
-            ), patch(
-                "scripts.rollout_workflow_fleet.clone_or_reset",
-                return_value=(Path("/clone/a-ready"), "base-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
-                return_value=(prepared, ()),
-            ), patch(
-                "scripts.rollout_workflow_fleet.validate_repository"
-            ), patch(
-                "scripts.rollout_workflow_fleet.publish_repository",
-                return_value=("head-sha", "https://example.test/pr/1"),
-            ):
-                rc = main(
-                    [
-                        "--automation",
-                        str(ROOT),
-                        "--config",
-                        str(config),
-                        "--workspace",
-                        str(workspace),
-                        "--mode",
-                        "publish",
-                        "--confirm",
-                    ]
-                )
-            self.assertEqual(1, rc)
-            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
-            self.assertEqual(["published", "blocked"], [item["status"] for item in manifest])
-            self.assertEqual("https://example.test/pr/1", manifest[0]["pr_url"])
-            self.assertIn("unexpected ValueError", manifest[1]["detail"])
-            release_temp.cleanup.assert_called_once()
+            == HEAD
+        )
 
-    def test_main_refreshes_existing_secret_before_current_contract_result(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / ".automation-fleet-workspace").write_text("managed\n")
-            config = root / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "gh_owner": "owner",
-                        "repos": {"repo": {"workflows": True, "secrets": True}},
-                    }
-                )
+
+@pytest.mark.parametrize(
+    "script", ["scripts/rollout_workflow_fleet.py", "scripts/audit_workflow_fleet.py"]
+)
+def test_cli_scripts_support_direct_help_execution(script: str) -> None:
+    completed = subprocess.run(
+        ["python3", script, "--help"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--workspace" in completed.stdout
+
+
+def test_actionlint_is_fail_closed_and_receives_only_managed_files(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    repo = tmp_path / "gstApp"
+    (repo / ".github/workflows").mkdir(parents=True)
+    (repo / ".github/workflows/project-owned.yml").write_text("on: push\n")
+    plan = RenderPlan(
+        "drift",
+        "diff",
+        (
+            FileChange(
+                PurePosixPath(".github/workflows/claude.yml"), None, b"on: push\n"
+            ),
+        ),
+        frozenset(),
+        frozenset(),
+    )
+    with pytest.raises(rollout.CommandError, match="actionlint"):
+        rollout.validate_managed_result(repo, bundle, plan, None, bootstrap=False)
+
+    observed: list[list[str]] = []
+    real_run = subprocess.run
+
+    def child(args, **kwargs):
+        observed.append(list(args))
+        if Path(args[0]).name == "actionlint":
+            return subprocess.CompletedProcess(
+                args, 1, stdout="diagnostic\n", stderr=""
             )
-            release_temp = Mock()
-            current = RolloutResult(1, (), frozenset({"ZHIPU_API_KEY"}))
+        return real_run(args, **kwargs)
 
-            def complete_refresh(*args: object) -> tuple[str, ...]:
-                completed = args[-1]
-                self.assertIsInstance(completed, list)
-                completed.append("ZHIPU_API_KEY")  # type: ignore[union-attr]
-                return ("ZHIPU_API_KEY",)
-
-            with patch(
-                "scripts.rollout_workflow_fleet.materialize_release_contract",
-                return_value=(release_temp, Path("/contract"), "release-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.refresh_secrets",
-                side_effect=complete_refresh,
-            ) as refresh, patch(
-                "scripts.rollout_workflow_fleet.default_branch", return_value="main"
-            ), patch(
-                "scripts.rollout_workflow_fleet.clone_or_reset",
-                return_value=(Path("/clone/repo"), "base-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
-                return_value=(current, ()),
-            ):
-                rc = main(
-                    [
-                        "--automation",
-                        str(ROOT),
-                        "--config",
-                        str(config),
-                        "--workspace",
-                        str(workspace),
-                        "--mode",
-                        "publish",
-                        "--confirm",
-                        "--sync-missing-secrets",
-                        "--allow-env-secret",
-                        "ZHIPU_API_KEY",
-                        "--refresh-secret",
-                        "ZHIPU_API_KEY",
-                        "--repo",
-                        "repo",
-                    ]
-                )
-            self.assertEqual(0, rc)
-            refresh.assert_called_once()
-            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
-            self.assertEqual("current", manifest[0]["status"])
-            self.assertEqual(["ZHIPU_API_KEY"], manifest[0]["synced_secrets"])
-            release_temp.cleanup.assert_called_once()
-
-    def test_main_blocks_refresh_when_secret_writes_are_disabled_by_config(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / ".automation-fleet-workspace").write_text("managed\n")
-            config = root / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "gh_owner": "owner",
-                        "repos": {"repo": {"workflows": True, "secrets": False}},
-                    }
-                )
+    actionlint = tmp_path / "actionlint"
+    actionlint.write_text("#!/bin/sh\nexit 0\n")
+    actionlint.chmod(0o755)
+    with (
+        mock.patch.object(
+            rollout,
+            "audit_repository",
+            return_value=mock.Mock(
+                status="current", detail="managed files are current"
+            ),
+        ),
+        mock.patch("scripts.workflow_fleet_git.subprocess.run", side_effect=child),
+    ):
+        with pytest.raises(rollout.CommandError, match="actionlint"):
+            rollout.validate_managed_result(
+                repo, bundle, plan, actionlint, bootstrap=False
             )
-            release_temp = Mock()
-            with patch(
-                "scripts.rollout_workflow_fleet.materialize_release_contract",
-                return_value=(release_temp, Path("/contract"), "release-sha"),
-            ), patch("scripts.rollout_workflow_fleet.refresh_secrets") as refresh:
-                rc = main(
-                    [
-                        "--automation",
-                        str(ROOT),
-                        "--config",
-                        str(config),
-                        "--workspace",
-                        str(workspace),
-                        "--mode",
-                        "publish",
-                        "--confirm",
-                        "--sync-missing-secrets",
-                        "--allow-env-secret",
-                        "ZHIPU_API_KEY",
-                        "--refresh-secret",
-                        "ZHIPU_API_KEY",
-                        "--repo",
-                        "repo",
-                    ]
-                )
-            self.assertEqual(1, rc)
-            refresh.assert_not_called()
-            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
-            self.assertEqual("blocked", manifest[0]["status"])
-            self.assertIn("secret writes are disabled", manifest[0]["detail"])
-            self.assertEqual([], manifest[0]["synced_secrets"])
-            release_temp.cleanup.assert_called_once()
+    action_call = next(args for args in observed if Path(args[0]).name == "actionlint")
+    assert any("claude.yml" in item for item in action_call)
+    assert all("project-owned.yml" not in item for item in action_call)
 
-    def test_main_skips_refresh_when_workflows_are_disabled_by_config(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / ".automation-fleet-workspace").write_text("managed\n")
-            config = root / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "gh_owner": "owner",
-                        "repos": {"repo": {"workflows": False, "secrets": True}},
-                    }
-                )
+
+def test_managed_result_passes_yaml_catalog_diff_and_local_actionlint_gates(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    repo = tmp_path / "gstApp"
+    (repo / ".github/workflows").mkdir(parents=True)
+    (repo / ".github/workflow-config.yml").write_text(
+        "automation_ref: v1.39\nreview:\n  auto: false\n", encoding="utf-8"
+    )
+    profile = bundle.config.profiles[repo.name]
+    plan = rollout.render_repository(
+        repo,
+        bundle.canonical,
+        bundle.catalog,
+        profile,
+        bundle.ref,
+        bundle.commit,
+        set(ALL_SECRETS),
+        set(ALL_VARIABLES),
+        bootstrap=False,
+    )
+    assert plan.status == "drift"
+
+    rollout.validate_managed_result(
+        repo, bundle, plan, Path("/bin/true"), bootstrap=False
+    )
+
+
+def test_initialize_workspace_refuses_to_mark_nonempty_directory(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "not-disposable"
+    workspace.mkdir()
+    (workspace / "valuable.txt").write_text("keep")
+    with mock.patch.object(rollout, "materialize_release_bundle") as load:
+        with pytest.raises(SystemExit):
+            rollout.main(
+                [
+                    "--mode",
+                    "plan",
+                    "--workspace",
+                    str(workspace),
+                    "--initialize-workspace",
+                    "--repo",
+                    "gstApp",
+                ]
             )
-            release_temp = Mock()
-            with patch(
-                "scripts.rollout_workflow_fleet.materialize_release_contract",
-                return_value=(release_temp, Path("/contract"), "release-sha"),
-            ), patch("scripts.rollout_workflow_fleet.refresh_secrets") as refresh:
-                rc = main(
-                    [
-                        "--automation",
-                        str(ROOT),
-                        "--config",
-                        str(config),
-                        "--workspace",
-                        str(workspace),
-                        "--mode",
-                        "publish",
-                        "--confirm",
-                        "--sync-missing-secrets",
-                        "--allow-env-secret",
-                        "ZHIPU_API_KEY",
-                        "--refresh-secret",
-                        "ZHIPU_API_KEY",
-                        "--repo",
-                        "repo",
-                    ]
-                )
-            self.assertEqual(0, rc)
-            refresh.assert_not_called()
-            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
-            self.assertEqual("skipped", manifest[0]["status"])
-            self.assertEqual([], manifest[0]["synced_secrets"])
-            release_temp.cleanup.assert_called_once()
+        load.assert_not_called()
+    assert (workspace / "valuable.txt").read_text() == "keep"
+    assert not (workspace / ".automation-fleet-workspace").exists()
 
-    def test_main_does_not_refresh_secret_when_repository_metadata_is_blocked(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / ".automation-fleet-workspace").write_text("managed\n")
-            config = root / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "gh_owner": "owner",
-                        "repos": {"repo": {"workflows": True, "secrets": True}},
-                    }
-                )
+
+def test_initialize_workspace_rejects_a_symlinked_parent_before_bundle_load(
+    tmp_path: Path,
+) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    workspace = linked_parent / "fleet"
+    with mock.patch.object(rollout, "materialize_release_bundle") as load:
+        with pytest.raises(SystemExit):
+            rollout.main(
+                [
+                    "--mode",
+                    "plan",
+                    "--workspace",
+                    str(workspace),
+                    "--initialize-workspace",
+                    "--repo",
+                    "gstApp",
+                ]
             )
-            release_temp = Mock()
+        load.assert_not_called()
+    assert not (real_parent / "fleet" / ".automation-fleet-workspace").exists()
 
-            with patch(
-                "scripts.rollout_workflow_fleet.materialize_release_contract",
-                return_value=(release_temp, Path("/contract"), "release-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.refresh_secrets",
-            ) as refresh, patch(
-                "scripts.rollout_workflow_fleet.default_branch",
-                side_effect=CommandError("metadata unavailable"),
-            ):
-                rc = main(
-                    [
-                        "--automation",
-                        str(ROOT),
-                        "--config",
-                        str(config),
-                        "--workspace",
-                        str(workspace),
-                        "--mode",
-                        "publish",
-                        "--confirm",
-                        "--sync-missing-secrets",
-                        "--allow-env-secret",
-                        "ZHIPU_API_KEY",
-                        "--refresh-secret",
-                        "ZHIPU_API_KEY",
-                        "--repo",
-                        "repo",
-                    ]
-                )
-            self.assertEqual(1, rc)
-            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
-            self.assertEqual("blocked", manifest[0]["status"])
-            self.assertEqual([], manifest[0]["synced_secrets"])
-            refresh.assert_not_called()
-            release_temp.cleanup.assert_called_once()
 
-    def test_main_records_refresh_when_publish_is_blocked_after_validation(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / ".automation-fleet-workspace").write_text("managed\n")
-            config = root / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "gh_owner": "owner",
-                        "repos": {"repo": {"workflows": True, "secrets": True}},
-                    }
-                )
+def test_manifest_sink_is_prevalidated_before_any_publish(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    missing_parent_manifest = tmp_path / "missing" / "report.json"
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(
+            rollout,
+            "prevalidate_repository",
+            side_effect=lambda *_a, repo, **_k: prepared(repo),
+        ),
+        mock.patch.object(rollout, "publish_repository") as publish,
+    ):
+        with pytest.raises(rollout.CommandError, match="manifest"):
+            rollout.main(
+                [
+                    "--mode",
+                    "publish",
+                    "--confirm",
+                    "--workspace",
+                    str(workspace),
+                    "--repo",
+                    "gstApp",
+                    "--manifest",
+                    str(missing_parent_manifest),
+                ]
             )
-            release_temp = Mock()
-            changed = RolloutResult(
-                1,
-                (Path(".github/workflows/opencode.yml"),),
-                frozenset({"ZHIPU_API_KEY"}),
-            )
-
-            def complete_refresh(*args: object) -> tuple[str, ...]:
-                completed = args[-1]
-                self.assertIsInstance(completed, list)
-                completed.append("ZHIPU_API_KEY")  # type: ignore[union-attr]
-                return ("ZHIPU_API_KEY",)
-
-            with patch(
-                "scripts.rollout_workflow_fleet.materialize_release_contract",
-                return_value=(release_temp, Path("/contract"), "release-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.default_branch", return_value="main"
-            ), patch(
-                "scripts.rollout_workflow_fleet.clone_or_reset",
-                return_value=(Path("/clone/repo"), "base-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
-                return_value=(changed, ()),
-            ), patch(
-                "scripts.rollout_workflow_fleet.validate_repository"
-            ) as validate, patch(
-                "scripts.rollout_workflow_fleet.refresh_secrets",
-                side_effect=complete_refresh,
-            ), patch(
-                "scripts.rollout_workflow_fleet.publish_repository",
-                side_effect=CommandError("push failed"),
-            ):
-                rc = main(
-                    [
-                        "--automation",
-                        str(ROOT),
-                        "--config",
-                        str(config),
-                        "--workspace",
-                        str(workspace),
-                        "--mode",
-                        "publish",
-                        "--confirm",
-                        "--sync-missing-secrets",
-                        "--allow-env-secret",
-                        "ZHIPU_API_KEY",
-                        "--refresh-secret",
-                        "ZHIPU_API_KEY",
-                        "--repo",
-                        "repo",
-                    ]
-                )
-            self.assertEqual(1, rc)
-            validate.assert_called_once()
-            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
-            self.assertEqual("blocked", manifest[0]["status"])
-            self.assertEqual(["ZHIPU_API_KEY"], manifest[0]["synced_secrets"])
-            release_temp.cleanup.assert_called_once()
-
-    def test_main_blocks_refresh_name_not_declared_by_managed_callers(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / ".automation-fleet-workspace").write_text("managed\n")
-            config = root / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "gh_owner": "owner",
-                        "repos": {"repo": {"workflows": True, "secrets": True}},
-                    }
-                )
-            )
-            release_temp = Mock()
-            current = RolloutResult(1, (), frozenset())
-            with patch(
-                "scripts.rollout_workflow_fleet.materialize_release_contract",
-                return_value=(release_temp, Path("/contract"), "release-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.default_branch", return_value="main"
-            ), patch(
-                "scripts.rollout_workflow_fleet.clone_or_reset",
-                return_value=(Path("/clone/repo"), "base-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
-                return_value=(current, ()),
-            ), patch(
-                "scripts.rollout_workflow_fleet.refresh_secrets"
-            ) as refresh:
-                rc = main(
-                    [
-                        "--automation",
-                        str(ROOT),
-                        "--config",
-                        str(config),
-                        "--workspace",
-                        str(workspace),
-                        "--mode",
-                        "publish",
-                        "--confirm",
-                        "--sync-missing-secrets",
-                        "--allow-env-secret",
-                        "ZHIPU_API_KEY",
-                        "--refresh-secret",
-                        "ZHIPU_API_KEY",
-                        "--repo",
-                        "repo",
-                    ]
-                )
-            self.assertEqual(1, rc)
-            refresh.assert_not_called()
-            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
-            self.assertEqual("blocked", manifest[0]["status"])
-            self.assertIn("not declared by managed callers", manifest[0]["detail"])
-
-    def test_main_records_partially_synced_secret_when_prepare_is_blocked(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / ".automation-fleet-workspace").write_text("managed\n")
-            config = root / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "gh_owner": "owner",
-                        "repos": {"repo": {"workflows": True, "secrets": True}},
-                    }
-                )
-            )
-            release_temp = Mock()
-
-            def fail_after_sync(*args: object) -> object:
-                completed = args[-1]
-                self.assertIsInstance(completed, list)
-                completed.append("FIRST")  # type: ignore[union-attr]
-                raise CommandError("second write failed")
-
-            with patch(
-                "scripts.rollout_workflow_fleet.materialize_release_contract",
-                return_value=(release_temp, Path("/contract"), "release-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.default_branch", return_value="main"
-            ), patch(
-                "scripts.rollout_workflow_fleet.clone_or_reset",
-                return_value=(Path("/clone/repo"), "base-sha"),
-            ), patch(
-                "scripts.rollout_workflow_fleet.prepare_with_prerequisites",
-                side_effect=fail_after_sync,
-            ):
-                rc = main(
-                    [
-                        "--automation",
-                        str(ROOT),
-                        "--config",
-                        str(config),
-                        "--workspace",
-                        str(workspace),
-                        "--mode",
-                        "publish",
-                        "--confirm",
-                        "--sync-missing-secrets",
-                    ]
-                )
-            self.assertEqual(1, rc)
-            manifest = json.loads((workspace / "rollout-manifest.json").read_text())
-            self.assertEqual("blocked", manifest[0]["status"])
-            self.assertEqual(["FIRST"], manifest[0]["synced_secrets"])
-            release_temp.cleanup.assert_called_once()
-
-    @staticmethod
-    def git(repo: Path, *args: str) -> str:
-        return subprocess.run(
-            ["git", "-C", str(repo), *args],
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-        ).stdout
+    publish.assert_not_called()
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_new_pull_request_is_attested_against_branch_and_exact_pr_metadata(
+    tmp_path: Path,
+) -> None:
+    snap = snapshot(tmp_path)
+    changed = (".github/workflows/claude.yml",)
+    body = rollout.pr_body("v1.40", COMMIT, changed)
+    request = exact_pr(body)
+    with (
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=HEAD),
+        mock.patch.object(
+            rollout.fleet_git, "list_rollout_prs", return_value=(request,)
+        ),
+    ):
+        rollout.attest_pull_request(snap, "v1.40", COMMIT, HEAD, changed, request)
+
+    with (
+        mock.patch.object(
+            rollout.fleet_git, "remote_branch_sha", return_value="9" * 40
+        ),
+        mock.patch.object(
+            rollout.fleet_git, "list_rollout_prs", return_value=(request,)
+        ),
+    ):
+        with pytest.raises(rollout.CommandError, match="branch"):
+            rollout.attest_pull_request(snap, "v1.40", COMMIT, HEAD, changed, request)
+
+
+def test_release_aware_applier_uses_bundle_catalog_not_current_checkout(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    repo = tmp_path / "gstApp"
+    path = repo / ".github/workflows/claude.yml"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"old\n")
+    plan = RenderPlan(
+        "drift",
+        "one managed file differs",
+        (
+            FileChange(
+                PurePosixPath(".github/workflows/claude.yml"), b"old\n", b"new\n"
+            ),
+        ),
+        frozenset(),
+        frozenset(),
+    )
+    with mock.patch(
+        "scripts.prepare_workflow_rollout.load_catalog",
+        side_effect=AssertionError("current checkout catalog must not be read"),
+    ):
+        assert rollout.apply_release_plan(repo, plan, bundle.catalog) == (
+            PurePosixPath(".github/workflows/claude.yml"),
+        )
+    assert path.read_bytes() == b"new\n"
+
+
+def test_release_aware_applier_prevalidates_every_change_before_writing(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    repo = tmp_path / "gstApp"
+    first = repo / ".github/workflows/claude.yml"
+    stale = repo / ".github/workflows/gemini-review.yml"
+    first.parent.mkdir(parents=True)
+    first.write_bytes(b"first-old\n")
+    stale.write_bytes(b"changed-after-render\n")
+    plan = RenderPlan(
+        "drift",
+        "two files differ",
+        (
+            FileChange(
+                PurePosixPath(".github/workflows/claude.yml"),
+                b"first-old\n",
+                b"first-new\n",
+            ),
+            FileChange(
+                PurePosixPath(".github/workflows/gemini-review.yml"),
+                b"stale-old\n",
+                b"stale-new\n",
+            ),
+        ),
+        frozenset(),
+        frozenset(),
+    )
+    with pytest.raises(rollout.RolloutError, match="changed since rendering"):
+        rollout.apply_release_plan(repo, plan, bundle.catalog)
+    assert first.read_bytes() == b"first-old\n"
+    assert stale.read_bytes() == b"changed-after-render\n"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["merge", "main"],
+        ["update-branch"],
+        ["secret", "set", "X"],
+        ["variable", "set", "X"],
+        ["push", "--force", "origin", "main"],
+    ],
+)
+def test_git_wrapper_rejects_forbidden_commands_before_child(
+    args: list[str],
+) -> None:
+    with mock.patch.object(rollout.fleet_git, "run") as child:
+        with pytest.raises(rollout.CommandError, match="not permitted"):
+            rollout.git(args)
+        child.assert_not_called()

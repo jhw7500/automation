@@ -1,40 +1,85 @@
 #!/usr/bin/env python3
-"""Orchestrate a fail-closed, per-repository workflow and secret rollout.
-
-The command keeps workflow delivery (Git PRs) and secret writes as separate phases in
-one run because GitHub cannot make them atomic. Secret prerequisites are checked first;
-only then are existing callers transformed, validated, committed, pushed and opened as
-independent PRs. No repository-owned trigger or permission block is replaced.
-"""
+"""Plan fleet workflow drift and publish creation-only rollout pull requests."""
 
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from dataclasses import asdict, dataclass
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
-import subprocess
+import stat
 import sys
 import tempfile
+from typing import Literal, Sequence
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.audit_workflow_fleet import audit_repository
-from scripts.prepare_workflow_rollout import (
+from scripts import workflow_fleet_git as fleet_git  # noqa: E402
+from scripts.audit_workflow_fleet import audit_repository  # noqa: E402
+from scripts.prepare_workflow_rollout import (  # noqa: E402
+    RenderPlan,
     RolloutError,
-    SecretPrerequisiteError,
-    prepare_repository,
+    render_repository,
 )
-from scripts.verify_workflow_release import verify_release
+from scripts.workflow_catalog import WorkflowCatalog  # noqa: E402
+from scripts.workflow_fleet_git import (  # noqa: E402
+    FleetGitError,
+    PullRequest,
+    RepositorySnapshot,
+)
+from scripts.workflow_release_bundle import (  # noqa: E402
+    ReleaseBundle,
+    materialize_release_bundle,
+)
 
 
-@dataclass
+VERSION_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
+OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+WORKSPACE_MARKER = ".automation-fleet-workspace"
+GIT_PREFIX = (
+    "git",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "submodule.recurse=false",
+)
+LOCAL_GIT_OPERATIONS = frozenset(
+    {
+        "add",
+        "commit",
+        "diff",
+        "diff-tree",
+        "fetch",
+        "hash-object",
+        "init",
+        "ls-tree",
+        "rev-list",
+        "rev-parse",
+        "switch",
+    }
+)
+
+
+class CommandError(RuntimeError):
+    """A fleet operation cannot safely continue."""
+
+
+class BranchPublishError(CommandError):
+    """A prepared local head did not produce a confirmed remote branch."""
+
+    def __init__(self, detail: str, head_sha: str) -> None:
+        super().__init__(detail)
+        self.head_sha = head_sha
+
+
+@dataclass(frozen=True)
 class RepoOutcome:
     repo: str
     status: str
@@ -42,636 +87,1063 @@ class RepoOutcome:
     base_sha: str = ""
     head_sha: str = ""
     pr_url: str = ""
-    synced_secrets: tuple[str, ...] = ()
+    changed_paths: tuple[str, ...] = ()
 
 
-class CommandError(RuntimeError):
-    pass
+@dataclass(frozen=True)
+class RolloutInspection:
+    action: Literal["create_branch", "create_pr", "reuse"]
+    branch_sha: str = ""
+    pr_url: str = ""
 
 
-def run(
-    args: list[str], *, cwd: Path | None = None, input_text: str | None = None
+@dataclass(frozen=True)
+class PreparedRepo:
+    repo: str
+    action: str
+    outcome: RepoOutcome
+    plan: RenderPlan | None
+
+
+def git(
+    args: Sequence[str], *, cwd: Path | None = None, stdin: str | None = None
 ) -> str:
-    result = subprocess.run(
-        args,
-        cwd=cwd,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={
-            key: value
-            for key, value in os.environ.items()
-            if key not in {"GITHUB_TOKEN", "GH_TOKEN"}
-        },
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise CommandError(f"{' '.join(args)}: {detail}")
-    return result.stdout.strip()
+    """Run Git through the credential-scrubbing adapter boundary."""
 
-
-def gh_json(args: list[str]) -> object:
-    output = run(["gh", *args])
-    return json.loads(output or "null")
-
-
-def default_branch(owner: str, repo: str) -> str:
-    data = gh_json(["repo", "view", f"{owner}/{repo}", "--json", "defaultBranchRef"])
-    if not isinstance(data, dict):
-        raise CommandError(f"{owner}/{repo}: unexpected repository metadata")
-    branch = data.get("defaultBranchRef")
-    if not isinstance(branch, dict) or not isinstance(branch.get("name"), str):
-        raise CommandError(f"{owner}/{repo}: default branch is unavailable")
-    return branch["name"]
-
-
-def remote_names(owner: str, repo: str, kind: str) -> set[str]:
-    data = gh_json([kind, "list", "-R", f"{owner}/{repo}", "--json", "name"])
-    if not isinstance(data, list):
-        raise CommandError(f"{owner}/{repo}: unexpected {kind} inventory")
-    names: set[str] = set()
-    for item in data:
-        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-            raise CommandError(f"{owner}/{repo}: malformed {kind} inventory item")
-        names.add(item["name"])
-    return names
-
-
-def secret_source(
-    name: str,
-    allow_personal_oauth_fanout: bool = False,
-    allowed_env_secrets: set[str] | None = None,
-) -> str | None:
-    if name == "CLAUDE_CODE_OAUTH_TOKEN":
-        if not allow_personal_oauth_fanout:
-            return None
-        value = os.environ.get(name)
-        if value:
-            return value
-    allowed_env_secrets = allowed_env_secrets or set()
-    value = os.environ.get(name) if name in allowed_env_secrets else None
-    if value:
-        return value
-    if name != "CLAUDE_CODE_OAUTH_TOKEN":
-        return None
-    credentials = Path.home() / ".claude/.credentials.json"
-    if not credentials.is_file():
-        return None
-    try:
-        data = json.loads(credentials.read_text(encoding="utf-8"))
-        value = data["claudeAiOauth"]["accessToken"]
-    except (KeyError, TypeError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, str) and value else None
+    if not args:
+        raise CommandError("Git operation is not permitted")
+    operation = args[0]
+    if operation == "push":
+        allowed = (
+            len(args) == 4
+            and args[1:3] == ["--set-upstream", "origin"]
+            and re.fullmatch(
+                r"HEAD:refs/heads/automation/common-workflows-v[0-9]+(?:\.[0-9]+)+",
+                args[3],
+            )
+            is not None
+        )
+        if not allowed:
+            raise CommandError("Git operation is not permitted")
+    elif operation not in LOCAL_GIT_OPERATIONS:
+        raise CommandError("Git operation is not permitted")
+    return fleet_git.run([*GIT_PREFIX, *args], cwd=cwd, stdin=stdin)
 
 
 def rollout_branch(ref: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", ref).strip("-")
-    if not safe:
-        raise RolloutError(f"invalid rollout ref: {ref!r}")
-    return f"codex/automation-{safe}-fleet"
+    if VERSION_REF.fullmatch(ref) is None:
+        raise CommandError(f"invalid release ref: {ref}")
+    return f"automation/common-workflows-{ref}"
 
 
-def clone_or_reset(
-    workspace: Path, owner: str, repo: str, default: str, rollout: str
-) -> tuple[Path, str]:
-    path = workspace / repo
-    if not (path / ".git").is_dir():
-        run(
-            [
-                "git",
-                "clone",
-                "--quiet",
-                "--filter=blob:none",
-                "--no-tags",
-                f"https://github.com/{owner}/{repo}.git",
-                str(path),
-            ]
-        )
-    run(["git", "fetch", "--no-tags", "origin", default], cwd=path)
-    base = run(["git", "rev-parse", f"origin/{default}"], cwd=path)
-    run(["git", "checkout", "-q", "-B", rollout, f"origin/{default}"], cwd=path)
-    run(["git", "reset", "--hard", "-q", f"origin/{default}"], cwd=path)
-    run(["git", "clean", "-fdq"], cwd=path)
-    return path, base
+def pr_title(ref: str) -> str:
+    return f"ci: adopt common automation workflows ({ref})"
 
 
-def preview_copy(repo: Path) -> tempfile.TemporaryDirectory[str]:
-    temp = tempfile.TemporaryDirectory()
-    target = Path(temp.name)
-    github = repo / ".github"
-    if github.is_dir():
-        shutil.copytree(github, target / ".github")
-    return temp
-
-
-def materialize_release_contract(
-    automation: Path, ref: str
-) -> tuple[tempfile.TemporaryDirectory[str], Path, str]:
-    expected = verify_release(automation, ref, ref, remote="origin")
-    temp = tempfile.TemporaryDirectory()
-    archive = subprocess.run(
-        ["git", "archive", ref, ".github/workflows"],
-        cwd=automation,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+def pr_body(ref: str, commit: str, changed_paths: Sequence[str]) -> str:
+    paths = "\n".join(f"- `{path}`" for path in sorted(changed_paths))
+    return (
+        "Standardize only the catalogued common AI workflow callers.\n\n"
+        f"- automation tag: `{ref}`\n- automation commit: `{commit}`\n"
+        f"- managed paths:\n{paths}\n\n"
+        "Project-specific workflows are unchanged. This PR does not modify secrets. "
+        "Merge and recovery use this repository's normal GitHub controls.\n"
     )
-    if archive.returncode != 0:
-        temp.cleanup()
-        raise CommandError(f"cannot archive release {ref}")
-    extract = subprocess.run(
-        ["tar", "-x", "-C", temp.name],
-        input=archive.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if extract.returncode != 0:
-        temp.cleanup()
-        raise CommandError(f"cannot extract release {ref}")
-    return temp, Path(temp.name), expected
 
 
-def sync_missing(
-    owner: str,
-    repo: str,
-    missing: set[str],
-    enabled: bool,
-    allow_personal_oauth_fanout: bool,
-    allowed_env_secrets: set[str],
-    completed: list[str] | None = None,
-) -> tuple[set[str], tuple[str, ...]]:
-    available = remote_names(owner, repo, "secret")
-    synced: list[str] = []
-    for name in sorted(missing - available):
-        value = (
-            secret_source(
-                name, allow_personal_oauth_fanout, allowed_env_secrets
-            )
-            if enabled
-            else None
-        )
-        if value is None:
-            continue
-        run(
-            ["gh", "secret", "set", name, "-R", f"{owner}/{repo}"],
-            input_text=value,
-        )
-        available.add(name)
-        synced.append(name)
-        if completed is not None:
-            completed.append(name)
-    return available, tuple(synced)
+def _changed_paths(plan: RenderPlan) -> tuple[str, ...]:
+    return tuple(sorted(change.path.as_posix() for change in plan.changes))
 
 
-def refresh_secrets(
-    owner: str,
-    repo: str,
-    names: set[str],
-    allow_personal_oauth_fanout: bool,
-    allowed_env_secrets: set[str],
-    completed: list[str] | None = None,
-) -> tuple[str, ...]:
-    refreshed: list[str] = []
-    for name in sorted(names):
-        value = secret_source(
-            name, allow_personal_oauth_fanout, allowed_env_secrets
-        )
-        if value is None:
-            raise RolloutError(
-                f"{owner}/{repo}: no explicitly allowed source for refresh secret {name}"
-            )
-        run(
-            ["gh", "secret", "set", name, "-R", f"{owner}/{repo}"],
-            input_text=value,
-        )
-        refreshed.append(name)
-        if completed is not None:
-            completed.append(name)
-    return tuple(refreshed)
+def _object_id(value: str, description: str) -> str:
+    if OBJECT_ID.fullmatch(value) is None:
+        raise CommandError(f"invalid {description}")
+    return value
 
 
-def prepare_with_prerequisites(
-    repo_path: Path,
-    automation: Path,
-    ref: str,
-    owner: str,
-    repo: str,
-    sync_missing_enabled: bool,
-    allow_personal_oauth_fanout: bool,
-    allowed_env_secrets: set[str],
-    deferred_secrets: set[str] | None = None,
-    completed: list[str] | None = None,
-) -> tuple[object, tuple[str, ...]]:
-    deferred_secrets = deferred_secrets or set()
-    secrets = remote_names(owner, repo, "secret") | deferred_secrets
-    variables = remote_names(owner, repo, "variable")
-    synced_all: list[str] = []
-    while True:
-        try:
-            result = prepare_repository(repo_path, automation, ref, secrets, variables)
-            return result, tuple(synced_all)
-        except SecretPrerequisiteError as error:
-            previous = set(secrets)
-            secrets, synced = sync_missing(
-                owner,
-                repo,
-                set(error.missing_secrets),
-                enabled=sync_missing_enabled,
-                allow_personal_oauth_fanout=allow_personal_oauth_fanout,
-                allowed_env_secrets=allowed_env_secrets,
-                completed=completed,
-            )
-            secrets |= deferred_secrets
-            synced_all.extend(name for name in synced if name not in synced_all)
-            if secrets == previous:
-                raise error
+def _workspace(path: Path, initialize: bool, parser: argparse.ArgumentParser) -> Path:
+    """Return a real marked disposable workspace, optionally creating an empty one."""
 
-
-def validate_repository(
-    repo: Path,
-    automation: Path,
-    actionlint: Path | None,
-    baseline_repo: Path | None = None,
-) -> None:
-    issues = audit_repository(repo, automation)
-    if issues:
-        raise CommandError("; ".join(issues))
-    if baseline_repo is None:
-        run(["git", "diff", "--check"], cwd=repo)
-    if actionlint is not None:
-        workflows = sorted((repo / ".github/workflows").glob("*.y*ml"))
-        if workflows:
-            current = actionlint_diagnostics(actionlint, repo)
-            if baseline_repo is not None:
-                baseline = actionlint_diagnostics(actionlint, baseline_repo)
-            else:
-                with tempfile.TemporaryDirectory() as temp:
-                    archive = subprocess.run(
-                        ["git", "archive", "HEAD", ".github/workflows"],
-                        cwd=repo,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                    if archive.returncode != 0:
-                        raise CommandError("unable to archive baseline workflows for actionlint")
-                    extract = subprocess.run(
-                        ["tar", "-x", "-C", temp],
-                        input=archive.stdout,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                    if extract.returncode != 0:
-                        raise CommandError("unable to extract baseline workflows for actionlint")
-                    baseline = actionlint_diagnostics(actionlint, Path(temp))
-            new_diagnostics = current - baseline
-            if new_diagnostics:
-                detail = "; ".join(
-                    f"{message} ({count})" for message, count in new_diagnostics.items()
+    try:
+        if path.exists():
+            absolute = Path(os.path.abspath(path))
+            resolved = path.resolve(strict=True)
+            if resolved != absolute or path.is_symlink() or not path.is_dir():
+                raise CommandError("workspace must be a real directory")
+        else:
+            if not initialize:
+                raise CommandError(
+                    f"workspace is not initialized: {path}; use --initialize-workspace "
+                    "only for a dedicated disposable directory"
                 )
-                raise CommandError(f"new actionlint diagnostics: {detail}")
+            path.mkdir(parents=True)
+            resolved = path.resolve(strict=True)
+            if resolved != Path(os.path.abspath(path)):
+                raise CommandError("workspace contains a symlink component")
+        marker = resolved / WORKSPACE_MARKER
+        if marker.exists() or marker.is_symlink():
+            mode = marker.lstat().st_mode
+            if marker.is_symlink() or not stat.S_ISREG(mode):
+                raise CommandError("workspace marker must be a regular file")
+        else:
+            if not initialize:
+                raise CommandError(
+                    f"workspace is not initialized: {resolved}; use --initialize-workspace "
+                    "only for a dedicated disposable directory"
+                )
+            if any(resolved.iterdir()):
+                raise CommandError(
+                    "refusing to mark a nonempty workspace as disposable"
+                )
+            marker.write_text("managed disposable clones only\n", encoding="utf-8")
+        return resolved
+    except (CommandError, OSError, RuntimeError) as exc:
+        parser.error(str(exc))
+    raise AssertionError("argparse.error must exit")
 
 
-def actionlint_diagnostics(actionlint: Path, root: Path) -> Counter[str]:
-    workflows = sorted((root / ".github/workflows").glob("*.y*ml"))
-    if not workflows:
-        return Counter()
-    result = subprocess.run(
-        [str(actionlint), "-shellcheck=", *map(str, workflows)],
-        cwd=root,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+def _make_clone_workspace(
+    workspace: Path, prefix: str
+) -> tempfile.TemporaryDirectory[str]:
+    temporary = tempfile.TemporaryDirectory(prefix=prefix, dir=workspace)
+    root = Path(temporary.name)
+    (root / WORKSPACE_MARKER).write_text(
+        "managed disposable clones only\n", encoding="utf-8"
     )
-    diagnostics: Counter[str] = Counter()
-    for line in result.stdout.splitlines():
-        if ".yml:" not in line and ".yaml:" not in line:
+    return temporary
+
+
+def _resolve_actionlint(requested: Path | None) -> Path | None:
+    candidate = requested
+    if candidate is None:
+        found = shutil.which("actionlint")
+        candidate = Path(found) if found else None
+    if candidate is None:
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        return None
+    return resolved
+
+
+def _copy_github_tree(source: Path, destination: Path) -> None:
+    destination.mkdir()
+    github = source / ".github"
+    if github.exists() or github.is_symlink():
+        shutil.copytree(github, destination / ".github", symlinks=True)
+
+
+def _symlink_component(repo: Path, relative: PurePosixPath) -> Path | None:
+    current = repo
+    for component in relative.parts:
+        current = current / component
+        try:
+            if stat.S_ISLNK(current.lstat().st_mode):
+                return current
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise CommandError("unable to inspect a managed path") from None
+    return None
+
+
+def _release_path(relative: PurePosixPath, catalog: WorkflowCatalog) -> bool:
+    return (
+        not relative.is_absolute()
+        and ".." not in relative.parts
+        and relative.parts[:1] == (".github",)
+        and relative in catalog.managed_paths
+    )
+
+
+def apply_release_plan(
+    repo: Path, plan: RenderPlan, catalog: WorkflowCatalog
+) -> tuple[PurePosixPath, ...]:
+    """Apply a plan using only its verified release-bundle catalog authority."""
+
+    if plan.status not in {"drift", "bootstrap_required"} or not plan.changes:
+        raise RolloutError(f"render plan is not actionable: {plan.status}")
+    entries = {entry.path: entry for entry in catalog.entries}
+    for managed in catalog.managed_paths:
+        if not _release_path(managed, catalog):
+            raise RolloutError(f"catalog path is unsafe: {managed}")
+        symlink = _symlink_component(repo, managed)
+        if symlink is not None:
+            raise RolloutError(
+                f"managed path contains symlink: {symlink.relative_to(repo)}"
+            )
+
+    seen: set[PurePosixPath] = set()
+    current: dict[PurePosixPath, bytes | None] = {}
+    modes: dict[PurePosixPath, int] = {}
+    for change in plan.changes:
+        if change.path in seen:
+            raise RolloutError(f"duplicate render path: {change.path}")
+        seen.add(change.path)
+        if not _release_path(change.path, catalog):
+            raise RolloutError(
+                f"render path is outside the release catalog: {change.path}"
+            )
+        entry = entries[change.path]
+        if change.after is None and entry.kind not in {"optional", "retired"}:
+            raise RolloutError(
+                f"render path is not catalogued for deletion: {change.path}"
+            )
+        path = repo.joinpath(*change.path.parts)
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            observed = None
+        except OSError:
+            raise RolloutError(
+                f"unable to inspect managed path: {change.path}"
+            ) from None
+        else:
+            if not stat.S_ISREG(mode):
+                raise RolloutError(f"managed path is not a regular file: {change.path}")
+            observed = path.read_bytes()
+            modes[change.path] = stat.S_IMODE(mode)
+        if observed != change.before:
+            raise RolloutError(f"{change.path}: changed since rendering")
+        current[change.path] = observed
+
+    changed: list[PurePosixPath] = []
+    for change in sorted(plan.changes, key=lambda item: item.path):
+        if current[change.path] == change.after:
             continue
-        normalized = line.replace(str(root) + "/", "")
-        normalized = re.sub(r":\d+:\d+:", ":", normalized, count=1)
-        diagnostics[normalized] += 1
-    return diagnostics
+        path = repo.joinpath(*change.path.parts)
+        if change.after is None:
+            path.unlink()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, filename = tempfile.mkstemp(
+                prefix=f".{path.name}.", dir=path.parent
+            )
+            temporary = Path(filename)
+            try:
+                os.fchmod(descriptor, modes.get(change.path, 0o644))
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(change.after)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        changed.append(change.path)
+    return tuple(changed)
+
+
+def _parse_managed_yaml(repo: Path, bundle: ReleaseBundle) -> None:
+    for relative in sorted(bundle.catalog.managed_paths):
+        if relative.suffix not in {".yml", ".yaml"}:
+            continue
+        path = repo.joinpath(*relative.parts)
+        if not path.exists():
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise CommandError(f"managed YAML is not a regular file: {relative}")
+        try:
+            document = yaml.load(
+                path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+            )
+        except (OSError, UnicodeError, yaml.YAMLError):
+            raise CommandError(f"managed YAML is invalid: {relative}") from None
+        if not isinstance(document, dict):
+            raise CommandError(f"managed YAML must be a mapping: {relative}")
+
+
+def _run_actionlint(actionlint: Path, repo: Path, bundle: ReleaseBundle) -> None:
+    workflows = tuple(
+        repo.joinpath(*relative.parts)
+        for relative in sorted(bundle.catalog.managed_paths)
+        if relative.parts[:2] == (".github", "workflows")
+        and relative.suffix in {".yml", ".yaml"}
+        and repo.joinpath(*relative.parts).is_file()
+    )
+    if not workflows:
+        return
+    try:
+        output = fleet_git.run(
+            [str(actionlint), "-shellcheck=", *(str(path) for path in workflows)],
+            cwd=repo,
+        )
+    except FleetGitError:
+        raise CommandError("actionlint validation failed") from None
+    if output:
+        raise CommandError("actionlint returned diagnostics")
+
+
+def validate_managed_result(
+    repo: Path,
+    bundle: ReleaseBundle,
+    plan: RenderPlan,
+    actionlint: Path | None,
+    *,
+    bootstrap: bool,
+) -> None:
+    """Validate the proposed managed result in an isolated local Git sandbox."""
+
+    if actionlint is None:
+        raise CommandError("actionlint is unavailable")
+    with tempfile.TemporaryDirectory(prefix="workflow-managed-result-") as temporary:
+        sandbox = Path(temporary) / repo.name
+        try:
+            _copy_github_tree(repo, sandbox)
+            git(["init", "-q"], cwd=sandbox)
+            git(["add", "--all"], cwd=sandbox)
+            apply_release_plan(sandbox, plan, bundle.catalog)
+            created = [
+                change.path.as_posix()
+                for change in plan.changes
+                if change.before is None and change.after is not None
+            ]
+            if created:
+                git(["add", "-N", "--", *created], cwd=sandbox)
+            _parse_managed_yaml(sandbox, bundle)
+            profile = bundle.config.profiles[repo.name]
+            result = audit_repository(
+                sandbox,
+                bundle,
+                profile,
+                set(plan.required_secrets),
+                set(plan.required_variables),
+            )
+            if result.status != "current":
+                raise CommandError(f"catalog audit failed: {result.detail}")
+            git(["diff", "--check"], cwd=sandbox)
+            _run_actionlint(actionlint, sandbox, bundle)
+        except CommandError:
+            raise
+        except (FleetGitError, RolloutError, OSError, KeyError):
+            raise CommandError("managed-result validation failed") from None
+
+
+def validate_existing_branch(
+    snapshot: RepositorySnapshot,
+    branch_sha: str,
+    base_sha: str,
+    plan: RenderPlan,
+    *,
+    branch: str | None = None,
+) -> None:
+    """Require one exact renderer-owned commit on the freshly observed base."""
+
+    branch_sha = _object_id(branch_sha, "rollout branch object")
+    base_sha = _object_id(base_sha, "default branch object")
+    if branch is not None:
+        remote_ref = f"refs/remotes/origin/{branch}"
+        git(
+            [
+                "fetch",
+                "--no-recurse-submodules",
+                "origin",
+                f"refs/heads/{branch}:{remote_ref}",
+            ],
+            cwd=snapshot.path,
+        )
+        fetched = _object_id(
+            git(["rev-parse", remote_ref], cwd=snapshot.path),
+            "fetched branch object",
+        )
+        if fetched != branch_sha:
+            raise CommandError("rollout branch changed while it was inspected")
+    parents = git(
+        ["rev-list", "--parents", "-n", "1", branch_sha], cwd=snapshot.path
+    ).split()
+    if parents != [branch_sha, base_sha]:
+        raise CommandError("rollout branch parent does not match the observed base")
+    observed_paths = tuple(
+        sorted(
+            filter(
+                None,
+                git(
+                    [
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        branch_sha,
+                    ],
+                    cwd=snapshot.path,
+                ).splitlines(),
+            )
+        )
+    )
+    if observed_paths != _changed_paths(plan):
+        raise CommandError("rollout branch changed paths do not match the render plan")
+
+    _validate_tree_contents(snapshot, branch_sha, plan)
+
+
+def _validate_tree_contents(
+    snapshot: RepositorySnapshot, revision: str, plan: RenderPlan
+) -> None:
+    for change in plan.changes:
+        revision_path = f"{revision}:{change.path.as_posix()}"
+        if change.after is None:
+            observed = git(
+                [
+                    "ls-tree",
+                    "--name-only",
+                    revision,
+                    "--",
+                    change.path.as_posix(),
+                ],
+                cwd=snapshot.path,
+            )
+            if observed:
+                raise CommandError(
+                    "rollout tree deletion does not match the render plan"
+                )
+            continue
+        try:
+            text = change.after.decode("utf-8")
+        except UnicodeDecodeError:
+            raise CommandError("managed result is not UTF-8") from None
+        expected_blob = git(["hash-object", "--stdin"], cwd=snapshot.path, stdin=text)
+        observed_blob = git(["rev-parse", revision_path], cwd=snapshot.path)
+        if observed_blob != expected_blob:
+            raise CommandError("rollout tree blob does not match the render plan")
+
+
+def validate_commit_tree(
+    snapshot: RepositorySnapshot,
+    head_sha: str,
+    base_sha: str,
+    plan: RenderPlan,
+) -> None:
+    """Attest one proposed commit's parent, paths, blobs, and deletions."""
+
+    head_sha = _object_id(head_sha, "rollout commit")
+    base_sha = _object_id(base_sha, "default branch object")
+    parents = git(
+        ["rev-list", "--parents", "-n", "1", head_sha], cwd=snapshot.path
+    ).split()
+    if parents != [head_sha, base_sha]:
+        raise CommandError("rollout commit is not a single child of the observed base")
+    paths = tuple(
+        sorted(
+            filter(
+                None,
+                git(
+                    [
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        head_sha,
+                    ],
+                    cwd=snapshot.path,
+                ).splitlines(),
+            )
+        )
+    )
+    if paths != _changed_paths(plan):
+        raise CommandError("rollout commit paths do not match the render plan")
+    _validate_tree_contents(snapshot, head_sha, plan)
+
+
+def _exact_pr(
+    request: PullRequest,
+    *,
+    base: str,
+    branch: str,
+    title: str,
+    body: str,
+) -> bool:
+    return (
+        request.state == "OPEN"
+        and request.base == base
+        and request.head == branch
+        and request.title == title
+        and request.body == body
+    )
+
+
+def inspect_rollout(
+    snapshot: RepositorySnapshot,
+    base_sha: str,
+    ref: str,
+    commit: str,
+    plan: RenderPlan,
+) -> RolloutInspection:
+    """Classify the exact release branch and pull-request identity."""
+
+    branch = rollout_branch(ref)
+    changed = _changed_paths(plan)
+    title = pr_title(ref)
+    body = pr_body(ref, commit, changed)
+    branch_sha = fleet_git.remote_branch_sha(snapshot, branch)
+    if branch_sha is None:
+        requests = fleet_git.list_rollout_prs(
+            fleet_git.OWNER, snapshot.path.name, branch
+        )
+        if requests:
+            raise CommandError("pull request history exists without its rollout branch")
+        return RolloutInspection("create_branch")
+
+    validate_existing_branch(snapshot, branch_sha, base_sha, plan, branch=branch)
+    requests = fleet_git.list_rollout_prs(fleet_git.OWNER, snapshot.path.name, branch)
+    if fleet_git.remote_branch_sha(snapshot, branch) != branch_sha:
+        raise CommandError("rollout branch changed while pull requests were inspected")
+    if not requests:
+        return RolloutInspection("create_pr", branch_sha)
+    if len(requests) != 1 or not _exact_pr(
+        requests[0],
+        base=snapshot.default_branch,
+        branch=branch,
+        title=title,
+        body=body,
+    ):
+        raise CommandError("pull request does not exactly match the rollout contract")
+    return RolloutInspection("reuse", branch_sha, requests[0].url)
+
+
+def require_no_current_rollout_branch(snapshot: RepositorySnapshot, ref: str) -> None:
+    """Refuse a stale exact release branch when the default is already current."""
+
+    if fleet_git.remote_branch_sha(snapshot, rollout_branch(ref)) is not None:
+        raise CommandError(
+            "rollout branch exists although the observed default is already current"
+        )
+
+
+def attest_pull_request(
+    snapshot: RepositorySnapshot,
+    ref: str,
+    commit: str,
+    head_sha: str,
+    changed_paths: Sequence[str],
+    request: PullRequest,
+) -> None:
+    """Re-read the release branch and exact PR before reporting publication."""
+
+    branch = rollout_branch(ref)
+    if fleet_git.remote_branch_sha(snapshot, branch) != head_sha:
+        raise CommandError("rollout branch changed after pull request creation")
+    requests = fleet_git.list_rollout_prs(fleet_git.OWNER, snapshot.path.name, branch)
+    if (
+        len(requests) != 1
+        or requests[0].number != request.number
+        or requests[0].url != request.url
+        or not _exact_pr(
+            requests[0],
+            base=snapshot.default_branch,
+            branch=branch,
+            title=pr_title(ref),
+            body=pr_body(ref, commit, changed_paths),
+        )
+    ):
+        raise CommandError("pull request attestation failed")
+
+
+def _render(
+    snapshot: RepositorySnapshot,
+    bundle: ReleaseBundle,
+    repo: str,
+    *,
+    bootstrap: bool,
+) -> RenderPlan:
+    return render_repository(
+        snapshot.path,
+        bundle.canonical,
+        bundle.catalog,
+        bundle.config.profiles[repo],
+        bundle.ref,
+        bundle.commit,
+        set(snapshot.secret_names),
+        set(snapshot.variable_names),
+        bootstrap=bootstrap,
+    )
+
+
+def _prepared_outcome(
+    repo: str,
+    base_sha: str,
+    plan: RenderPlan,
+    inspection: RolloutInspection | None,
+) -> RepoOutcome:
+    changed = _changed_paths(plan)
+    if plan.status == "current":
+        return RepoOutcome(repo, "current", plan.reason, base_sha)
+    assert inspection is not None
+    details = {
+        "create_branch": "would create an exact branch, commit, and pull request",
+        "create_pr": "matching branch exists; would create only the pull request",
+        "reuse": "exact open pull request is reusable",
+    }
+    status = "reusable" if inspection.action == "reuse" else "planned"
+    return RepoOutcome(
+        repo,
+        status,
+        details[inspection.action],
+        base_sha,
+        inspection.branch_sha,
+        inspection.pr_url,
+        changed,
+    )
+
+
+def prevalidate_repository(
+    bundle: ReleaseBundle,
+    workspace: Path,
+    *,
+    repo: str,
+    bootstrap: bool,
+    actionlint: Path | None,
+) -> PreparedRepo:
+    """Perform every read/render/validation gate without remote mutation."""
+
+    base_sha = ""
+    plan: RenderPlan | None = None
+    try:
+        snapshot = fleet_git.clone_default_branch(bundle.config.owner, repo, workspace)
+        base_sha = fleet_git.refetch_default(snapshot)
+        git(["switch", "--detach", base_sha], cwd=snapshot.path)
+        plan = _render(snapshot, bundle, repo, bootstrap=bootstrap)
+        if plan.status == "blocked":
+            return PreparedRepo(
+                repo,
+                "blocked",
+                RepoOutcome(repo, "blocked", plan.reason, base_sha),
+                plan,
+            )
+        if plan.status == "current":
+            require_no_current_rollout_branch(snapshot, bundle.ref)
+            return PreparedRepo(
+                repo, "current", _prepared_outcome(repo, base_sha, plan, None), plan
+            )
+        validate_managed_result(
+            snapshot.path, bundle, plan, actionlint, bootstrap=bootstrap
+        )
+        inspection = inspect_rollout(
+            snapshot, base_sha, bundle.ref, bundle.commit, plan
+        )
+        return PreparedRepo(
+            repo,
+            inspection.action,
+            _prepared_outcome(repo, base_sha, plan, inspection),
+            plan,
+        )
+    except (CommandError, FleetGitError, RolloutError) as exc:
+        return PreparedRepo(
+            repo,
+            "blocked",
+            RepoOutcome(repo, "blocked", str(exc), base_sha),
+            plan,
+        )
+    except (OSError, KeyError, ValueError):
+        return PreparedRepo(
+            repo,
+            "blocked",
+            RepoOutcome(repo, "blocked", "local prevalidation failed", base_sha),
+            plan,
+        )
+
+
+def publish_new_branch(
+    snapshot: RepositorySnapshot,
+    base_sha: str,
+    ref: str,
+    commit: str,
+    plan: RenderPlan,
+    actionlint: Path | None,
+    *,
+    bundle: ReleaseBundle | None,
+) -> str:
+    """Create one local commit and publish one previously absent exact branch."""
+
+    branch = rollout_branch(ref)
+    if bundle is not None:
+        validate_managed_result(
+            snapshot.path,
+            bundle,
+            plan,
+            actionlint,
+            bootstrap=plan.status == "bootstrap_required",
+        )
+    if fleet_git.remote_branch_sha(snapshot, branch) is not None:
+        raise CommandError("rollout branch appeared before publication")
+    git(["switch", "-c", branch, base_sha], cwd=snapshot.path)
+    if bundle is None:
+        raise CommandError("release bundle is required for publication")
+    apply_release_plan(snapshot.path, plan, bundle.catalog)
+    paths = list(_changed_paths(plan))
+    git(["add", "--all", "--", *paths], cwd=snapshot.path)
+    staged = tuple(
+        sorted(
+            filter(
+                None,
+                git(
+                    ["diff", "--cached", "--name-only", "--", *paths],
+                    cwd=snapshot.path,
+                ).splitlines(),
+            )
+        )
+    )
+    if staged != tuple(paths):
+        raise CommandError("staged paths do not exactly match the render plan")
+    git(["commit", "-m", pr_title(ref)], cwd=snapshot.path)
+    head_sha = _object_id(
+        git(["rev-parse", "HEAD"], cwd=snapshot.path), "rollout commit"
+    )
+    validate_commit_tree(snapshot, head_sha, base_sha, plan)
+    if fleet_git.remote_branch_sha(snapshot, branch) is not None:
+        raise CommandError("rollout branch appeared before push")
+    try:
+        git(
+            ["push", "--set-upstream", "origin", f"HEAD:refs/heads/{branch}"],
+            cwd=snapshot.path,
+        )
+    except FleetGitError:
+        try:
+            published = fleet_git.remote_branch_sha(snapshot, branch)
+        except FleetGitError:
+            raise BranchPublishError(
+                "branch publication result is unavailable", head_sha
+            ) from None
+        if published != head_sha:
+            raise BranchPublishError("branch publication failed", head_sha) from None
+    return head_sha
 
 
 def publish_repository(
-    repo: Path, owner: str, name: str, default: str, ref: str, branch: str
-) -> tuple[str, str]:
-    run(["git", "add", ".github"], cwd=repo)
-    run(
-        ["git", "commit", "-m", f"ci: restrict shared workflow secrets ({ref})"],
-        cwd=repo,
+    bundle: ReleaseBundle,
+    workspace: Path,
+    *,
+    repo: str,
+    bootstrap: bool,
+    actionlint: Path | None,
+) -> RepoOutcome:
+    """Refetch/recompute one repository and create or reuse only its exact PR."""
+
+    branch = rollout_branch(bundle.ref)
+    with _make_clone_workspace(workspace, f".publish-{repo}-") as temporary:
+        snapshot = fleet_git.clone_default_branch(
+            bundle.config.owner, repo, Path(temporary)
+        )
+        base_sha = fleet_git.refetch_default(snapshot)
+        git(["switch", "--detach", base_sha], cwd=snapshot.path)
+        plan = _render(snapshot, bundle, repo, bootstrap=bootstrap)
+        changed = _changed_paths(plan)
+        if plan.status == "blocked":
+            raise CommandError(plan.reason)
+        if plan.status == "current":
+            require_no_current_rollout_branch(snapshot, bundle.ref)
+            return RepoOutcome(repo, "current", plan.reason, base_sha)
+        validate_managed_result(
+            snapshot.path, bundle, plan, actionlint, bootstrap=bootstrap
+        )
+        inspection = inspect_rollout(
+            snapshot, base_sha, bundle.ref, bundle.commit, plan
+        )
+        body = pr_body(bundle.ref, bundle.commit, changed)
+        title = pr_title(bundle.ref)
+        if inspection.action == "reuse":
+            return RepoOutcome(
+                repo,
+                "reused",
+                "exact open pull request reused",
+                base_sha,
+                inspection.branch_sha,
+                inspection.pr_url,
+                changed,
+            )
+        if inspection.action == "create_branch":
+            try:
+                head_sha = publish_new_branch(
+                    snapshot,
+                    base_sha,
+                    bundle.ref,
+                    bundle.commit,
+                    plan,
+                    actionlint,
+                    bundle=bundle,
+                )
+            except BranchPublishError as exc:
+                return RepoOutcome(
+                    repo,
+                    "blocked",
+                    str(exc),
+                    base_sha,
+                    exc.head_sha,
+                    changed_paths=changed,
+                )
+        else:
+            head_sha = inspection.branch_sha
+        try:
+            request = fleet_git.create_pull_request(
+                bundle.config.owner,
+                repo,
+                snapshot.default_branch,
+                branch,
+                title,
+                body,
+            )
+        except FleetGitError:
+            try:
+                requests = fleet_git.list_rollout_prs(bundle.config.owner, repo, branch)
+                exact = tuple(
+                    item
+                    for item in requests
+                    if _exact_pr(
+                        item,
+                        base=snapshot.default_branch,
+                        branch=branch,
+                        title=title,
+                        body=body,
+                    )
+                )
+                if (
+                    len(requests) == 1
+                    and len(exact) == 1
+                    and fleet_git.remote_branch_sha(snapshot, branch) == head_sha
+                ):
+                    request = exact[0]
+                else:
+                    return RepoOutcome(
+                        repo,
+                        "blocked",
+                        "branch published but pull request creation failed",
+                        base_sha,
+                        head_sha,
+                        changed_paths=changed,
+                    )
+            except FleetGitError:
+                return RepoOutcome(
+                    repo,
+                    "blocked",
+                    "branch published but pull request state is unavailable",
+                    base_sha,
+                    head_sha,
+                    changed_paths=changed,
+                )
+        try:
+            attest_pull_request(
+                snapshot, bundle.ref, bundle.commit, head_sha, changed, request
+            )
+        except (CommandError, FleetGitError) as exc:
+            return RepoOutcome(
+                repo,
+                "blocked",
+                str(exc),
+                base_sha,
+                head_sha,
+                request.url,
+                changed,
+            )
+        detail = (
+            "new branch, commit, and pull request created"
+            if inspection.action == "create_branch"
+            else "matching branch reused; pull request created"
+        )
+        return RepoOutcome(
+            repo, "published", detail, base_sha, head_sha, request.url, changed
+        )
+
+
+def _plan_record(prepared: PreparedRepo, commit: str) -> dict[str, object]:
+    record: dict[str, object] = asdict(prepared.outcome)
+    plan = prepared.plan
+    record.update(
+        {
+            "authoritative": False,
+            "release_commit": commit,
+            "observed_base": prepared.outcome.base_sha,
+            "reason": prepared.outcome.detail,
+            "required_secrets": sorted(plan.required_secrets) if plan else [],
+            "required_variables": sorted(plan.required_variables) if plan else [],
+            "managed_diff_paths": list(_changed_paths(plan)) if plan else [],
+        }
     )
-    head = run(["git", "rev-parse", "HEAD"], cwd=repo)
-    remote_ref = f"refs/heads/{branch}"
-    remote_line = run(
-        ["git", "ls-remote", "--heads", "origin", remote_ref], cwd=repo
+    return record
+
+
+def _preflight_manifest(manifest: Path) -> Path:
+    """Prove the report sink is a real writable path before remote mutation."""
+
+    try:
+        absolute = Path(os.path.abspath(manifest))
+        parent = absolute.parent.resolve(strict=True)
+        if parent != Path(os.path.abspath(absolute.parent)) or not parent.is_dir():
+            raise OSError
+        target = parent / absolute.name
+        if target.exists() or target.is_symlink():
+            mode = target.lstat().st_mode
+            if target.is_symlink() or not stat.S_ISREG(mode):
+                raise OSError
+        descriptor, filename = tempfile.mkstemp(prefix=f".{target.name}.", dir=parent)
+        os.close(descriptor)
+        Path(filename).unlink()
+        return target
+    except (OSError, RuntimeError, ValueError):
+        raise CommandError("manifest destination is not a safe writable file") from None
+
+
+def _write_report(
+    manifest: Path,
+    outcomes: Sequence[RepoOutcome],
+    *,
+    mode: str,
+    commit: str,
+    prepared: Sequence[PreparedRepo],
+) -> None:
+    if mode == "plan":
+        records = [_plan_record(item, commit) for item in prepared]
+    else:
+        records = [asdict(item) for item in outcomes]
+    payload = json.dumps(records, ensure_ascii=False, indent=2) + "\n"
+    descriptor, filename = tempfile.mkstemp(
+        prefix=f".{manifest.name}.", dir=manifest.parent
     )
-    remote_sha = remote_line.split(maxsplit=1)[0] if remote_line else ""
-    lease = f"--force-with-lease={remote_ref}:{remote_sha}"
-    run(["git", "push", lease, "-u", "origin", branch], cwd=repo)
-    existing = gh_json(
-        [
-            "pr",
-            "list",
-            "-R",
-            f"{owner}/{name}",
-            "--head",
-            branch,
-            "--base",
-            default,
-            "--state",
-            "open",
-            "--json",
-            "url",
-        ]
-    )
-    if existing:
-        return head, existing[0]["url"]  # type: ignore[index]
-    body = (
-        f"Update existing reusable-workflow callers to verified automation@{ref} and "
-        "replace `secrets: inherit` with contract-derived explicit mappings. "
-        "Repository-owned triggers, guards and permissions are preserved.\n\n"
-        "Pre-push gates: required secret-name inventory, YAML parse, caller contract audit, "
-        "`git diff --check`, and actionlint when configured.\n\n"
-        "Rollback: restore the previous automation ref and `secrets: inherit` together; "
-        "do not move the release tag."
-    )
-    url = run(
-        [
-            "gh",
-            "pr",
-            "create",
-            "-R",
-            f"{owner}/{name}",
-            "--base",
-            default,
-            "--head",
-            branch,
-            "--title",
-            f"ci: restrict shared workflow secrets ({ref})",
-            "--body",
-            body,
-        ]
-    )
-    return head, url
+    temporary = Path(filename)
+    try:
+        os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if manifest.is_symlink():
+            raise CommandError("manifest destination became a symlink")
+        os.replace(temporary, manifest)
+    except OSError:
+        raise CommandError("manifest write failed") from None
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--automation", type=Path, default=ROOT)
+    parser.add_argument("--workspace", type=Path, required=True)
+    parser.add_argument("--ref", default="v1.40")
+    parser.add_argument("--mode", choices=("plan", "publish"), default="plan")
+    parser.add_argument("--repo", action="append", default=[])
+    parser.add_argument("--initialize-workspace", action="store_true")
+    parser.add_argument("--confirm", action="store_true")
+    parser.add_argument("--bootstrap-repo")
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--actionlint", type=Path)
+    return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--automation", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--config", type=Path)
-    parser.add_argument("--workspace", type=Path, required=True)
-    parser.add_argument("--ref", default="v1.35")
-    parser.add_argument("--mode", choices=("plan", "prepare", "publish"), default="plan")
-    parser.add_argument("--repo", action="append", default=[])
-    parser.add_argument("--sync-missing-secrets", action="store_true")
-    parser.add_argument(
-        "--allow-personal-oauth-fanout",
-        action="store_true",
-        help="explicitly allow ~/.claude OAuth token to fill missing repository secrets",
-    )
-    parser.add_argument(
-        "--allow-env-secret",
-        action="append",
-        default=[],
-        metavar="NAME",
-        help="allow this exact environment variable as a missing-secret source",
-    )
-    parser.add_argument(
-        "--refresh-secret",
-        action="append",
-        default=[],
-        metavar="NAME",
-        help="replace this existing or missing secret from an explicitly allowed source",
-    )
-    parser.add_argument("--actionlint", type=Path)
-    parser.add_argument("--confirm", action="store_true")
-    parser.add_argument("--manifest", type=Path)
-    parser.add_argument(
-        "--initialize-workspace",
-        action="store_true",
-        help="create the safety marker required before managed clones may be reset/cleaned",
-    )
+    parser = _parser()
     args = parser.parse_args(argv)
 
-    automation = args.automation.resolve()
-    config_path = args.config or automation / "scripts/workflow-config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    owner = config["gh_owner"]
-    repo_config = config["repos"]
-    configured = sorted(repo_config)
-    repos = args.repo or configured
-    unknown = sorted(set(repos) - set(configured))
-    if unknown:
-        parser.error(f"repositories not in config: {', '.join(unknown)}")
     if args.mode == "publish" and not args.confirm:
         parser.error("--mode publish requires --confirm")
-    if args.sync_missing_secrets and args.mode != "publish":
-        parser.error("--sync-missing-secrets is allowed only in --mode publish")
-    if args.allow_personal_oauth_fanout and not args.sync_missing_secrets:
-        parser.error("--allow-personal-oauth-fanout requires --sync-missing-secrets")
-    if args.allow_env_secret and not args.sync_missing_secrets:
-        parser.error("--allow-env-secret requires --sync-missing-secrets")
-    if args.refresh_secret and (
-        args.mode != "publish" or not args.sync_missing_secrets
+    if args.mode == "publish" and not args.repo:
+        parser.error("--mode publish requires at least one explicit --repo")
+    if len(args.repo) != len(set(args.repo)):
+        parser.error("--repo values must be unique")
+    if VERSION_REF.fullmatch(args.ref) is None:
+        parser.error(f"invalid release ref: {args.ref}")
+    if args.bootstrap_repo is not None and (
+        len(args.repo) != 1 or args.repo[0] != args.bootstrap_repo
     ):
         parser.error(
-            "--refresh-secret requires --mode publish and --sync-missing-secrets"
+            "--bootstrap-repo requires exactly one matching bootstrap-allowed --repo"
         )
-    if args.refresh_secret and not args.repo:
-        parser.error("--refresh-secret requires at least one explicit --repo")
-    invalid_env_names = [
-        name for name in args.allow_env_secret if re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None
-    ]
-    if invalid_env_names:
-        parser.error(f"invalid secret environment names: {', '.join(invalid_env_names)}")
-    invalid_refresh_names = [
-        name for name in args.refresh_secret if re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None
-    ]
-    if invalid_refresh_names:
-        parser.error(f"invalid refresh secret names: {', '.join(invalid_refresh_names)}")
-    refresh_without_source = sorted(
-        name
-        for name in set(args.refresh_secret)
-        if name not in set(args.allow_env_secret)
-        and not (
-            name == "CLAUDE_CODE_OAUTH_TOKEN"
-            and args.allow_personal_oauth_fanout
-        )
-    )
-    if refresh_without_source:
-        parser.error(
-            "--refresh-secret requires an exact --allow-env-secret source: "
-            + ", ".join(refresh_without_source)
-        )
+    workspace = _workspace(args.workspace, args.initialize_workspace, parser)
+    actionlint = _resolve_actionlint(args.actionlint)
+    manifest = _preflight_manifest(args.manifest or workspace / "rollout-manifest.json")
 
-    marker = args.workspace / ".automation-fleet-workspace"
-    if not marker.is_file():
-        if not args.initialize_workspace:
-            parser.error(
-                f"workspace is not initialized: {args.workspace}; "
-                "use --initialize-workspace only for a dedicated disposable directory"
-            )
-        args.workspace.mkdir(parents=True, exist_ok=True)
-        marker.write_text("managed disposable clones only\n", encoding="utf-8")
-    outcomes: list[RepoOutcome] = []
-    contract_temp, contract_source, release_commit = materialize_release_contract(
-        automation, args.ref
-    )
-    branch = rollout_branch(args.ref)
-    allowed_env_secrets = set(args.allow_env_secret)
-    if allowed_env_secrets:
-        print(
-            "ALLOWED ENV SECRET SOURCES: "
-            + ", ".join(sorted(allowed_env_secrets))
-        )
-    try:
-        for name in repos:
-            refreshed_progress: list[str] = []
-            synced_progress: list[str] = []
-            try:
-                if (
-                    args.refresh_secret
-                    and repo_config[name].get("secrets", True) is False
-                ):
-                    raise RolloutError(
-                        f"{name}: secret writes are disabled by config"
+    with materialize_release_bundle(
+        args.automation, args.ref, remote="origin"
+    ) as bundle:
+        configured = set(bundle.config.profiles)
+        repos = args.repo or sorted(configured)
+        unknown = sorted(set(repos) - configured)
+        if unknown:
+            parser.error(f"repositories not in release bundle: {', '.join(unknown)}")
+        if (
+            args.bootstrap_repo is not None
+            and not bundle.config.profiles[args.bootstrap_repo].bootstrap_allowed
+        ):
+            parser.error("release profile does not allow bootstrap")
+        branch = rollout_branch(bundle.ref)
+        del branch  # parsing the exact branch is an early fail-closed gate
+
+        prepared: list[PreparedRepo] = []
+        with _make_clone_workspace(workspace, ".prevalidate-") as temporary:
+            for repo in repos:
+                prepared.append(
+                    prevalidate_repository(
+                        bundle,
+                        Path(temporary),
+                        repo=repo,
+                        bootstrap=args.bootstrap_repo == repo,
+                        actionlint=actionlint,
                     )
-                if repo_config[name].get("workflows", True) is False:
+                )
+
+        if args.mode == "plan" or any(
+            item.outcome.status == "blocked" for item in prepared
+        ):
+            outcomes = [item.outcome for item in prepared]
+        else:
+            outcomes: list[RepoOutcome] = []
+            _write_report(
+                manifest,
+                outcomes,
+                mode=args.mode,
+                commit=bundle.commit,
+                prepared=prepared,
+            )
+            for item in prepared:
+                try:
+                    outcomes.append(
+                        publish_repository(
+                            bundle,
+                            workspace,
+                            repo=item.repo,
+                            bootstrap=args.bootstrap_repo == item.repo,
+                            actionlint=actionlint,
+                        )
+                    )
+                except (CommandError, FleetGitError, RolloutError) as exc:
                     outcomes.append(
                         RepoOutcome(
-                            name,
-                            "skipped",
-                            "workflows disabled by config",
+                            item.repo, "blocked", str(exc), item.outcome.base_sha
                         )
                     )
-                    continue
-                default = default_branch(owner, name)
-                repo, base = clone_or_reset(
-                    args.workspace, owner, name, default, branch
+                except (OSError, KeyError, ValueError):
+                    outcomes.append(
+                        RepoOutcome(
+                            item.repo,
+                            "blocked",
+                            "local publication failed",
+                            item.outcome.base_sha,
+                        )
+                    )
+                _write_report(
+                    manifest,
+                    outcomes,
+                    mode=args.mode,
+                    commit=bundle.commit,
+                    prepared=prepared,
                 )
-                preview = None
-                try:
-                    target = repo
-                    if args.mode == "plan":
-                        preview = preview_copy(repo)
-                        target = Path(preview.name)
-                    result, _ = prepare_with_prerequisites(
-                        target,
-                        contract_source,
-                        args.ref,
-                        owner,
-                        name,
-                        args.sync_missing_secrets
-                        and args.mode == "publish"
-                        and repo_config[name].get("secrets", True) is not False,
-                        args.allow_personal_oauth_fanout,
-                        allowed_env_secrets,
-                        set(args.refresh_secret),
-                        synced_progress,
-                    )
-                    if result.callers == 0:
-                        outcomes.append(
-                            RepoOutcome(
-                                name,
-                                "skipped",
-                                "no existing central callers",
-                                base,
-                                synced_secrets=tuple(synced_progress),
-                            )
-                        )
-                        continue
-                    undeclared_refresh = set(args.refresh_secret) - set(
-                        result.required_secrets
-                    )
-                    if undeclared_refresh:
-                        raise RolloutError(
-                            f"{name}: refresh secrets not declared by managed callers: "
-                            + ", ".join(sorted(undeclared_refresh))
-                        )
-                    if result.changed_files:
-                        validate_repository(
-                            target,
-                            contract_source,
-                            args.actionlint,
-                            baseline_repo=repo if args.mode == "plan" else None,
-                        )
-                    if args.refresh_secret:
-                        refresh_secrets(
-                            owner,
-                            name,
-                            set(args.refresh_secret),
-                            args.allow_personal_oauth_fanout,
-                            allowed_env_secrets,
-                            refreshed_progress,
-                        )
-                    written_secrets = tuple(
-                        dict.fromkeys(refreshed_progress + synced_progress)
-                    )
-                    if not result.changed_files:
-                        outcomes.append(
-                            RepoOutcome(
-                                name,
-                                "current",
-                                "already matches contract",
-                                base,
-                                synced_secrets=written_secrets,
-                            )
-                        )
-                    else:
-                        if args.mode == "publish":
-                            head, url = publish_repository(
-                                repo, owner, name, default, args.ref, branch
-                            )
-                            outcomes.append(
-                                RepoOutcome(name, "published", f"{result.callers} callers", base, head, url, written_secrets)
-                            )
-                        else:
-                            outcomes.append(
-                                RepoOutcome(name, args.mode, f"{result.callers} callers", base, synced_secrets=written_secrets)
-                            )
-                finally:
-                    if preview is not None:
-                        preview.cleanup()
-            except (CommandError, RolloutError, OSError, json.JSONDecodeError) as exc:
-                outcomes.append(
-                    RepoOutcome(
-                        name,
-                        "blocked",
-                        str(exc),
-                        synced_secrets=tuple(
-                            dict.fromkeys(refreshed_progress + synced_progress)
-                        ),
-                    )
-                )
-            except Exception as exc:
-                outcomes.append(
-                    RepoOutcome(
-                        name,
-                        "blocked",
-                        f"unexpected {type(exc).__name__}: {exc}",
-                        synced_secrets=tuple(
-                            dict.fromkeys(refreshed_progress + synced_progress)
-                        ),
-                    )
-                )
-    finally:
-        contract_temp.cleanup()
 
-    manifest = args.manifest or args.workspace / "rollout-manifest.json"
-    manifest.write_text(
-        json.dumps([asdict(item) for item in outcomes], ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    for item in outcomes:
-        suffix = f" {item.pr_url}" if item.pr_url else ""
-        print(f"{item.status.upper():9} {item.repo}: {item.detail}{suffix}")
-    blocked = sum(item.status == "blocked" for item in outcomes)
-    print(
-        f"SUMMARY ref={args.ref} commit={release_commit} "
-        f"total={len(outcomes)} blocked={blocked} manifest={manifest}"
-    )
-    return 1 if blocked else 0
+        _write_report(
+            manifest,
+            outcomes,
+            mode=args.mode,
+            commit=bundle.commit,
+            prepared=prepared,
+        )
+        for item in outcomes:
+            suffix = f" {item.pr_url}" if item.pr_url else ""
+            print(f"{item.status.upper():9} {item.repo}: {item.detail}{suffix}")
+        blocked = sum(item.status == "blocked" for item in outcomes)
+        print(
+            f"SUMMARY mode={args.mode} ref={bundle.ref} commit={bundle.commit} "
+            f"total={len(outcomes)} blocked={blocked} manifest={manifest}"
+        )
+        return 1 if blocked else 0
 
 
 if __name__ == "__main__":
