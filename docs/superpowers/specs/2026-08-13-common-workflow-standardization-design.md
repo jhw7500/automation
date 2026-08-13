@@ -103,11 +103,14 @@ The release bundle contains at least:
 - `examples/baseline-workflows/.github/`
 - the typed machine-readable catalog
 - `scripts/workflow-config.json` with the reviewed fleet profiles
+- `scripts/actionlint-empty.yaml`, the explicit verified empty actionlint policy
 - the recursive action/container/runtime-artifact lock manifest
 - `scripts/workflow-release-manifest.json`, which hashes every declared release-bundle
   file while excluding only itself to avoid a self-referential digest
 - `scripts/workflow_release_bootstrap.py`, a standard-library-only verified loader
 - `third_party/pyyaml/`, the reviewed pure-Python parser and its upstream license
+- an owner-reviewed manual consumer recovery runbook whose procedure is independent of
+  the `v1.40` writer and remains usable when that writer cannot run
 - `scripts/prepare_workflow_rollout.py`
 - `scripts/audit_workflow_fleet.py`
 - `scripts/rollout_workflow_fleet.py`
@@ -271,8 +274,13 @@ The operation has four deliberately separate evidence classes:
 
 1. Immutable `ApprovalPlan` (canonical JSON, externally approved SHA-256) records the
    release/tool/policy/profile/catalog/lock/actionlint identities and a discriminated entry
-   for every repository. All entries record repository/default-branch/base/profile/status
-   evidence. Only a publishable `drift` entry additionally records deterministic generated
+   for every repository in its declared scope. `scope: fleet` contains all 19 profiles;
+   `scope: repository_replan` contains exactly one stale repository plus the independently
+   supplied root fleet-plan digest it supersedes; `scope: bootstrap` contains exactly one
+   eligible bootstrap profile plus the independently supplied fleet-plan digest whose
+   `bootstrap_required` entry authorized it. All entries record
+   repository/default-branch/base/profile/status evidence. Only a publishable `drift` entry
+   additionally records deterministic generated
    tree and commit SHAs, fixed author/committer, message, timestamp/offset, planned
    path/blob/deletion set, preview digest, branch name, and PR metadata. `current` and
    `blocked` entries contain no synthetic generated commit. The generated commit object is
@@ -281,8 +289,17 @@ The operation has four deliberately separate evidence classes:
 2. Append-only `EffectJournal` records publish/merge/revert attempts and remote effects.
    Every event contains `root_approval_plan_sha256`, `change_plan_kind`
    (`approval` or `revert`), `change_plan_sha256`, repository, monotonic sequence,
-   prior-event digest, timestamp, operation (`branch-created`, `pr-opened`, `merged`,
-   `reverted`, or `blocked`), observed remote SHAs/IDs, and outcome. The tool writes each
+   prior-event digest, timestamp, operation (`branch-created`, `pr-opened`,
+   `merge-intent`, `merged`, `failed-merge`, `revert-plan-bound`, `revert-intent`,
+   `reverted`, `failed-revert`, `quarantined`, or `blocked`),
+   observed remote SHAs/IDs, and outcome. An intent event contains the canonical exact API
+   method/path/body and body digest, plan/base/head/PR identities, expected terminal kind,
+   an OS-CSPRNG nonce of at least 128 bits, and a non-self-referential
+   `intent_binding_sha256` before the corresponding merge request is sent. The binding is
+   computed over the root/change-plan/repository/base/head/PR/method/path/merge-method/nonce
+   fields, excluding the request body and journal-event digest. The request commit message
+   contains that binding and nonce; the completed request body is then stored in the event,
+   whose own digest is never part of the request. The tool writes each
    event under an exclusive `fcntl.flock` taken on the journal directory's fixed lock file.
    A mutating command holds that lock across the selected repository's complete
    read-validate-remote-effect-append cycle and revalidates the chain and remote state after
@@ -291,26 +308,70 @@ The operation has four deliberately separate evidence classes:
    final sequence/digest filename through no-replace `os.link`, fsyncs the directory, and
    removes the temporary link. It never uses overwrite/`os.replace`, edits ApprovalPlan or
    RevertPlan bytes, or changes an existing event.
-3. Immutable terminal merge evidence is always emitted once the merge API reports a remote
-   commit. A successful `PublishResult` is derived from the ApprovalPlan plus its verified
-   complete terminal journal chain and records the final branch head, PR URL/number, merge
-   method, actual merge commit/tree, and evidence digests. If any post-merge assertion
-   fails, the tool instead emits a discriminated `FailedMergeResult` with the same approved
-   identities, the actual response/parents/tree/first-parent diff, failure reason, and
-   journal digest. Neither form can be upgraded or overwritten; each external SHA-256 is
-   recorded.
-4. A rollback is a new immutable `RevertPlan`/`RevertResult` pair linked to the original
-   PublishResult or FailedMergeResult digest. It uses the same journal, branch, PR,
-   merge-attestation, and unmanaged-path rules; it is never an ad-hoc inverse commit.
+3. Immutable terminal merge evidence is eventually required for every durable merge intent
+   that produced a remote commit. A successful `PublishResult` (forward) or `RevertResult`
+   (reverse) is derived from the selected change plan, its durable intent, and refetched
+   live state. It records the final branch head, PR URL/number, merge method, actual merge
+   commit/tree, intent-event digest, and other non-circular evidence digests. If any
+   post-merge assertion
+   fails, the tool instead emits a discriminated `FailedMergeResult` with
+   `change_plan_kind: approval|revert`, the same approved identities, typed response state
+   and returned SHA when received, actual parents/tree/first-parent diff, failure reason,
+   and pre-terminal journal-head digest. A lost response is represented explicitly as
+   `response_state: lost_after_request`; it is never fabricated. None of these forms can be
+   upgraded or overwritten; each external SHA-256 is recorded.
+4. A rollback adds a new immutable `RevertPlan` linked to the original PublishResult or
+   forward FailedMergeResult digest. It uses the same journal, branch, PR,
+   merge-attestation, and unmanaged-path rules; it is never an ad-hoc inverse commit. Its
+   successful RevertResult or plan-kind-tagged FailedMergeResult belongs to class 3.
 
 Plan produces only object 1. Publish appends object-2 events but does not emit a final
-result. After a merge API effect, merge always appends a terminal event and emits exactly
-one object-3 success/failure result; no reported remote merge may be left without immutable
-evidence. Rollback produces object 4 through the corresponding plan, publish, and merge
-phases. An event/result is accepted only when its change-plan digest equals the externally
-supplied digest, its root approval digest is correct, and the complete hash chain verifies.
-Resume replays remote read-only state against that chain; it never rewrites prior evidence
-or treats an EffectJournal as a new approval plan.
+result. Merge durably appends intent before its API request. If the process survives, it
+materializes exactly one object-3 result and links it by appending the terminal event;
+after a crash, mandatory resume eventually does so from intent plus live state. A
+repository with an unresolved
+intent is operationally quarantined; the only permitted writer action is exact intent
+resume, and no new remote effect chain may begin. Revert-plan produces
+object 4; revert-publish and merge then add class-2/3 evidence. An event/result is
+accepted only when its change-plan digest equals the externally supplied digest, its root
+approval digest is correct, and the complete hash chain verifies. Resume replays remote
+read-only state against that chain; it never rewrites prior evidence or treats an
+EffectJournal as a new approval plan.
+
+Every evidence object uses the same release-owned canonical writer. ApprovalPlan,
+PublishResult, FailedMergeResult, RevertPlan, and RevertResult each has a required
+operator-owned evidence directory outside the release worktree, a canonical-byte digest, and
+the fixed content-addressed path `<type>-<sha256>.json`, where type is exactly
+`approval-plan`, `publish-result`, `failed-merge-result`, `revert-plan`, or
+`revert-result`. The evidence directory itself must
+be a real operator-owned mode-0700 directory; every ancestor must be a nonsymlink directory
+owned by the operator or root with no group/other write bit. All access is relative to one
+`O_DIRECTORY|O_NOFOLLOW` dirfd, and files are mode 0600. Before plan, a scratch probe under
+that dirfd must prove local same-device regular-file semantics for `O_EXCL`, hard-link
+no-replace, `flock`, file fsync, and directory fsync; a network/FUSE filesystem or failed
+capability probe blocks. Creation uses same-directory `O_CREAT|O_EXCL`, file fsync,
+no-replace `os.link`, directory fsync, and read-back. Existing exact bytes are idempotent;
+an existing mismatched path blocks. Crash-durability claims are bounded by those verified
+operating-system/filesystem fsync guarantees, not by an unverified remote mount.
+
+Merge result persistence is a recoverable two-phase local commit after durable remote
+intent. Because HTTP response bytes may be lost and are not stable replay inputs, canonical
+result bytes encode only `response_state`, returned merge SHA when received, and the
+refetched live API objects; raw headers/body are never part of identity. The controller
+constructs those bytes from intent plus live immutable state, materializes and fsyncs the
+content-addressed result first, then appends/fsyncs the terminal journal event
+containing its exact type/digest/path and complete canonical result payload. Resume handles
+only three cases: terminal event plus missing file recreates the payload bytes verbatim and
+verifies the digest; a unique orphan result whose root/plan/repository/intent nonce match an
+unresolved intent is fully revalidated and then linked by the terminal event;
+any differing result/event pair quarantines. Thus a crash may delay the link but cannot
+require an invented response or mutable result.
+Only after result and terminal event read-back succeeds does the command print exactly one
+typed digest line (`PUBLISH_RESULT_SHA256=<64-hex>`,
+`FAILED_MERGE_RESULT_SHA256=<64-hex>`, or `REVERT_RESULT_SHA256=<64-hex>`) plus its
+relative content-addressed path. Resume prints the same
+identity. FailedMergeResult remains a non-zero command outcome even though its evidence is
+durable.
 
 ### 1.5 Runtime provenance evidence
 
@@ -334,7 +395,13 @@ Expressions are forbidden directly inside `run:` and are allowed only in those t
 `env:` values. The constant shell invokes the embedded parser with
 `python3 -I -S -B` and a single-quoted heredoc; Python reads the three environment fields as
 data. There is no `eval`, command substitution, dynamic shell construction, or ref placed
-in shell source. All remaining jobs depend on the provenance job. The catalog and
+in shell source. Every non-provenance job includes `provenance` in `needs` and has a
+top-level `if` AST containing the non-bypassable conjunct
+`needs.provenance.result == 'success'`. This conjunct remains mandatory even when the job
+uses `always()`, `failure()`, `cancelled()`, or another status function; it is combined with
+the job's existing condition rather than replaced. A failed/skipped provenance job
+therefore prevents check-enabled, execution, fallback, notification, and token-mint jobs
+from running. The catalog and
 release-owned static tests require this exact
 job, env expression ASTs, parser digest, constant shell, and no-payload/no-secret
 structure; caller/profile overrides are forbidden. Canary validation retrieves the log
@@ -557,9 +624,12 @@ Bootstrap has a read-only preview and a separately confirmed publish form. Both 
 - the declared repository profile and required secret-name prerequisites;
 - the same verified release/tool context as normal rollout.
 
-`workflows plan --bootstrap-repo <name>` renders an exact temporary diff and
+`workflows plan --ref v1.40 --rollout-id <id> --evidence-dir <owned-dir>
+--bootstrap-repo <name> --fleet-approval-plan <path>
+--fleet-plan-sha256 <externally-preserved-digest>` renders an exact temporary diff and
 content-addressed ApprovalPlan without a remote write. After reviewing that diff, the operator
-records the printed external digest. `workflows publish --bootstrap-repo <name>
+records the printed external digest. `workflows publish --ref v1.40 --rollout-id <id>
+--evidence-dir <owned-dir> --bootstrap-repo <name>
 --approval-plan <path> --plan-sha256 <approved-64-hex-digest> --effect-journal <dir>
 --confirm` requires the exact
 approved plan bytes, preview bundle, release/profile/catalog hashes, and base SHA to
@@ -746,13 +816,18 @@ The rollout CLI separates target release identity from rollout identity:
 
 ```text
 workflows plan|publish|merge|revert-plan|revert-publish
-  --ref v1.40 --rollout-id common-ai-v1-v140
+  --ref v1.40 --rollout-id common-ai-v1-v140 --evidence-dir <owned-dir>
 ```
 
 The rollout ID is cosmetic metadata, never a security switch. Branches, commit messages,
 PR titles, and evidence objects use it. They do not reuse the old secret-hardening branch
 name or claim that repository-owned triggers and permissions were preserved when canonical
 replacement intentionally changes them.
+
+`--evidence-dir` is required for every command and is the parent of the ApprovalPlan,
+preview, plan-bound EffectJournal directory, and terminal/recovery result files. Any
+per-command path argument must resolve beneath that one verified real directory; implicit
+cwd output, absolute escape, `..`, or symlink is rejected.
 
 ### 7.1 Closed child environments and isolated Git transport
 
@@ -783,11 +858,21 @@ part of the declared host trust root. Neither receives `GH_TOKEN` or `GH_CONFIG_
 tests assert exact key/value equality for the Python, Git, gh, and helper environments, not
 merely absence of known secret names.
 
+The trusted deterministic commit-construction Git child is the sole schema refinement: in
+addition to the common Git keys it receives exactly
+`GIT_AUTHOR_NAME=workflow-fleet`, `GIT_AUTHOR_EMAIL=workflow-fleet@localhost`,
+`GIT_COMMITTER_NAME=workflow-fleet`, `GIT_COMMITTER_EMAIL=workflow-fleet@localhost`,
+`GIT_AUTHOR_DATE=<selected change-plan Git timestamp>`, and
+`GIT_COMMITTER_DATE=<same selected change-plan Git timestamp>`. No other Git identity/date
+variable is allowed. Plan/publish and revert-plan/revert-publish pass their respective
+byte-identical values, and tests prove `git commit-tree` returns the same SHA under
+different hostile host identities, clocks, timezones, and configurations.
+
 No proxy, Python, shell-startup, Git, package-manager, provider/model, or arbitrary
 operator environment variable is inherited. The tool never calls `gh auth login`, never
 consults stored host credentials, and never persists the token. Exact `/usr/bin/gh api`
-children authenticate from their child-only `GH_TOKEN`, which supports fine-grained PAT,
-classic PAT, and OAuth token forms without the `--with-token` classic-PAT ambiguity. They
+children authenticate from their child-only `GH_TOKEN`, using the required fine-grained PAT
+without the `--with-token` classic-PAT ambiguity. They
 first probe the viewer identity, every selected repository, and each phase's safe read
 endpoint; the expected owner is `jhw7500`. The private `GH_CONFIG_DIR` must remain free of a
 credential-bearing file and is recursively deleted on normal exit and signals. Child
@@ -797,13 +882,19 @@ journal, plan, preview, or result. The trusted broker and exact gh child environ
 the two declared in-memory exceptions; this is not an isolation claim against unrelated
 same-UID host processes.
 
-The documented fine-grained-token capability ceiling is repository access limited to the
+Production rollout requires a fine-grained PAT. Its documented capability ceiling is
+repository access limited to the
 19 configured repositories, with Metadata read, Contents write, Pull requests write,
 Workflows write, Actions read, Checks read, Commit statuses read, Secrets read, and
 Variables read. Plan uses only the read subset; branch/PR publish needs Contents,
 Workflows, and Pull requests write; merge needs Contents write; canary evidence needs
-Actions read. A classic token requires only the corresponding `repo` and `workflow`
-scopes, but fine-grained is preferred. The controller requests active branch rules through
+Actions read. A classic `repo`+`workflow` token is not a normal supported credential because
+its secret-write blast radius exceeds this operation; the tagged fleet writer always
+rejects it. The release-independent break-glass runbook may document separate owner tooling
+and a separately approved, single-incident credential with immediate revocation, but cannot
+turn that credential into a supported writer input. The broker validates the secret prefix
+as `github_pat_` in memory and rejects classic/OAuth prefixes before a child is spawned. The
+controller requests active branch rules through
 `GET /repos/{owner}/{repo}/rules/branches/{branch}` (Metadata read), not the
 Administration-protected branch-protection endpoint. A 200 response is parsed normally.
 The one typed exception is GitHub's exact private-repository feature-unavailable 403 for a
@@ -846,12 +937,14 @@ Fetch/push receive the credential only through that broker. Commit construction 
 plumbing, not `git commit`: write the approved preview blobs, construct exactly the planned
 tree, then `git commit-tree` with parent=`base_sha`, fixed author/committer identity,
 fixed UTF-8 message and fixed author/committer timestamp/offset stored in the
-ApprovalPlan. The timestamp is the UTC second when the plan begins, captured once before
-rendering and represented as canonical RFC 3339 plus its Git integer/`+0000` form; it does
-not depend on per-repository processing time. Plan performs the same pure object
+selected ApprovalPlan or RevertPlan. The timestamp is the UTC second when the corresponding
+plan begins, captured once before rendering and represented as canonical RFC 3339 plus its
+Git integer/`+0000` form; it does not depend on per-repository processing time. Plan and
+revert-plan perform the same pure object
 calculation without writing remote state, so it
-records both `generated_tree_sha` and deterministic `generated_commit_sha`. Publish requires
-both calculations to match, signs neither implicitly, and writes no hooks. Tests run with
+records both `generated_tree_sha` and deterministic `generated_commit_sha`. Publish and
+revert-publish require both calculations to match, sign neither implicitly, and write no
+hooks. Tests run with
 malicious system/global/local config, helpers, hooks, filters, includes, URL rewrites,
 proxy/env, and a token-only private-repository fixture; only the verified broker path may
 authenticate.
@@ -864,6 +957,25 @@ Plan mode is read-only for GitHub state. It fetches every default branch, render
 temporary preview, and collects outcomes for the full fleet. It may write only local
 disposable clones, previews, and the requested local ApprovalPlan outside the clean release
 worktree.
+
+The exact full-fleet form is:
+
+```text
+workflows plan --ref v1.40 --rollout-id <id> --evidence-dir <owned-dir>
+```
+
+An explicit stale-entry replan has the only narrowed form:
+
+```text
+workflows plan --ref v1.40 --rollout-id <new-id> --evidence-dir <owned-dir>
+  --repo <one-name> --supersedes-approval-plan <path>
+  --supersedes-plan-sha256 <externally-preserved-digest>
+```
+
+It verifies the original full-fleet ApprovalPlan and external digest before GitHub access,
+then emits a one-repository ApprovalPlan containing that root digest and the new base. The
+initial approval gate always uses the full-fleet form. Bootstrap uses the separately typed
+form in Section 4. No plan form accepts an EffectJournal or mutating confirmation.
 
 Required plan gates:
 
@@ -883,6 +995,11 @@ Required plan gates:
 - mandatory actionlint `1.7.12` using the official Linux AMD64 archive SHA-256
   `8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8`, with recorded
   version and fail-closed process status;
+- exact actionlint invocation uses explicit rendered/released file paths, a verified
+  release-owned empty config via `-config-file`, `-shellcheck=` and `-pyflakes=` to disable
+  ambient subprocess discovery, canonical JSON `-format`, the closed child environment,
+  and a neutral directory outside every consumer clone; it never auto-discovers consumer
+  `.github/actionlint.yaml`, host ShellCheck/Pyflakes, or current-directory policy;
 - zero actionlint diagnostics in released/canonical managed workflows and zero new
   diagnostics compared with the untouched project-owned baseline;
 - a zero unmanaged-path diff between each publishable drift entry's recorded base and
@@ -895,15 +1012,17 @@ metadata. A `current` entry records the observed managed blobs at its base, whil
 `blocked` entry records only the evidence needed for its reason; neither invents a commit
 that cannot be published.
 `bootstrap_required` is a failure reason, not persistent policy state. Plan exits 0 only
-when there is no blocked outcome, exits 3 when it produces a complete ApprovalPlan containing
-one or more blocked repositories, and exits 2 when it cannot produce a trustworthy full
-ApprovalPlan. It never hides a missing catalog behind `skipped`.
+when there is no blocked outcome, exits 3 when it produces a complete declared-scope
+ApprovalPlan containing one or more blocked repositories, and exits 2 when it cannot
+produce a trustworthy declared-scope ApprovalPlan. It never hides a missing catalog behind
+`skipped`.
 
 A complete plan emits canonical UTF-8 ApprovalPlan JSON plus a deterministic preview
 archive. The ApprovalPlan contains the preview archive SHA-256 and every planned
 file/deletion digest; its own SHA-256 is external and is printed as
-`APPROVAL_PLAN_SHA256=<64 lowercase hex>`. It is also copied to an operator-controlled,
-content-addressed evidence path `<sha256>.json`. The human/controller reviews the exact
+`APPROVAL_PLAN_SHA256=<64 lowercase hex>`. It is also copied to the fixed
+content-addressed evidence path `approval-plan-<sha256>.json`. The human/controller reviews
+the exact
 ApprovalPlan and preview, then preserves that digest in an approval record independent
 of the plan. Publish must receive it through `--plan-sha256`; it never trusts a digest
 stored inside the plan and never silently computes-and-accepts a replacement digest.
@@ -913,7 +1032,8 @@ stored inside the plan and never silently computes-and-accepts a replacement dig
 The exact normal form is:
 
 ```text
-workflows publish --approval-plan <path> --plan-sha256 <digest>
+workflows publish --ref v1.40 --rollout-id <id> --evidence-dir <owned-dir>
+  --approval-plan <path> --plan-sha256 <digest>
   --effect-journal <new-or-existing-plan-bound-dir> --repo <one-name> --confirm
 ```
 
@@ -952,10 +1072,15 @@ unknown branch. The allowed states are:
 Crash reconciliation is closed and evidence-preserving. After taking the journal lock, a
 resume may append a missing branch/PR event with `outcome: observed_after_crash` only when
 the live SHA and every approved PR field match uniquely. If the exact-head merge API
-succeeded but the controller crashed before its terminal event, `workflows merge` refetches
-the one recorded PR and merge commit, reruns the complete post-merge attestation, then
-appends the missing terminal event and creates the result. No other unjournaled remote
-effect is adopted; ambiguity or any mismatch appends `blocked` and stops.
+succeeded or timed out after the durable merge-intent but before its terminal event,
+`workflows merge` enters resume-only mode, refetches the one intent-bound PR and merge
+commit, and decides only from live immutable state. An unmerged open PR returns to the exact
+same intent-bound request path; a merged PR reruns complete post-merge attestation. A
+matching commit emits PublishResult/RevertResult, while any mismatching actual commit emits
+FailedMergeResult; a lost HTTP response remains typed as `lost_after_request`. If live state
+is not yet decisive, it appends no terminal assertion and remains quarantined for later
+mandatory resume. No other unjournaled remote effect is adopted; ambiguity or a second
+candidate appends `quarantined` and stops.
 
 Changes to non-selected repositories after the full-fleet plan do not alter the immutable
 plan hash and do not block publishing a selected entry. Each selected entry still requires
@@ -964,29 +1089,40 @@ After any first repository publish, stale remaining entries must be individually
 before their later publish if their own base changed; the new per-repository ApprovalPlan
 references the original fleet-plan digest for traceability.
 
+The merge API's `sha` field is a head compare-and-swap, not a base-SHA compare-and-swap.
+The controller therefore minimizes but cannot eliminate the interval after its base
+freshness check. A base advance in that interval must produce a different parent/tree and
+is detected by post-merge attestation, yielding FailedMergeResult plus quarantine/recovery;
+this unavoidable remote race is an explicit residual boundary, never treated as success.
+
 The workflow-standardization operation structurally has no secret option or secret-write
-code path, regardless of rollout ID. Every ApprovalPlan, PublishResult, RevertPlan, and
-RevertResult repository entry has `synced_secrets: []`, and any attempt to supply a
-secret-related flag is a parser error before GitHub access.
+code path, regardless of rollout ID. Every ApprovalPlan, PublishResult, FailedMergeResult,
+RevertPlan, and RevertResult repository entry has `synced_secrets: []`, and any attempt to
+supply a secret-related flag is a parser error before GitHub access.
 
 ### 8.3 Merge attestation
 
 The same tagged writer exposes the only two typed merge forms:
 
 ```text
-workflows merge --approval-plan <path> --plan-sha256 <digest> --effect-journal <dir>
+workflows merge --ref v1.40 --rollout-id <id> --evidence-dir <owned-dir>
+  --approval-plan <path> --plan-sha256 <digest> --effect-journal <dir>
   --repo <one-name> --confirm-merge
-workflows merge --revert-plan <path> --revert-plan-sha256 <digest> --effect-journal <dir>
+workflows merge --ref v1.40 --rollout-id <id> --evidence-dir <owned-dir>
+  --revert-plan <path> --revert-plan-sha256 <digest> --effect-journal <dir>
   --repo <one-name> --confirm-merge
 ```
 
 The two flag pairs are mutually exclusive. The parser validates the selected typed plan's
 external digest, root ApprovalPlan link, and complete EffectJournal before any API
-mutation; one invocation selects exactly one open PR/repository. With an ApprovalPlan it
-can emit only PublishResult; with a RevertPlan it can emit only RevertResult. The `merge`
+mutation; one invocation selects exactly one open PR/repository. A successful ApprovalPlan
+merge emits PublishResult and a successful RevertPlan merge emits RevertResult; either kind
+may instead emit a plan-kind-tagged FailedMergeResult after an unexpected actual effect. The `merge`
 parser has no arbitrary ref/direct-push operation, secret option, generic PR-number
 override, merge-method override, or admin-bypass option. UI/manual, auto, queue, and other
-merge paths are unsupported and make attestation fail.
+merge paths are unsupported. An already-merged PR may be adopted only when the journal has
+a preceding unresolved intent whose request digest, PR, base, and head match; without that
+intent, an identical-looking UI/manual merge remains foreign and makes attestation fail.
 
 The tagged writer permits only GitHub **merge-commit** merges through an exact-head API
 operation; squash, rebase, update-branch, auto-merge, queue, and force-push are disabled for
@@ -1005,11 +1141,31 @@ the returned merge commit and requires exactly two parents `[base_sha,
 generated_commit_sha]`, no octopus/rewrite, and a tree equal to the selected plan's
 `generated_tree_sha`.
 It recomputes `base_sha..merge_commit` and requires zero unmanaged paths and exact approved
-managed blobs/deletions. Only then does an ApprovalPlan merge append `merged` and emit
-PublishResult, or a RevertPlan merge append `reverted` and emit RevertResult. If the API
-reports a merge but any postcondition differs, the controller appends `blocked`, emits the
-immutable FailedMergeResult before returning failure, quarantines that repository, stops
-the fleet, and triggers the reviewed recovery policy.
+managed blobs/deletions. Only then does an ApprovalPlan merge materialize PublishResult and
+append the result-linked `merged` event, or a RevertPlan merge materialize RevertResult and
+append the result-linked `reverted` event. If the API
+reports a merge but any postcondition differs, the controller first materializes the
+immutable FailedMergeResult and then appends the result-linked `failed-merge` or
+`failed-revert` terminal event before returning failure. A forward failure whose actual
+first-parent effect is proved to contain only the approved managed path set enters
+`publish_failed` and may proceed only through an independently approved RevertPlan. Any
+other forward failure, and every reverse failure, then appends `quarantined`, enters
+`break_glass_required`, stops the fleet, and triggers the reviewed recovery policy.
+
+Immediately before that API request, while still holding the repository journal lock, the
+controller appends/fsyncs the plan-kind-specific merge/revert-intent and verifies it by
+read-back. The canonical request body fixes `merge_method: merge`, expected head SHA, and
+commit title/message containing the exact plan kind plus the high-entropy intent nonce and
+non-self-referential intent binding. The complete body and its digest are stored in the
+intent event before dispatch; the journal event digest is deliberately not embedded in
+the request. Post-merge attestation requires that exact merge message in addition to
+parents/tree; an ordinary UI/manual merge therefore cannot masquerade as crash recovery.
+The request cannot be sent without that durable predecessor. A crash or power
+loss after request dispatch may leave only intent; this is expected, not misreported as a
+terminal result. Subsequent invocations detect the unresolved intent before any other
+operation and may only execute the mandatory resume decision described above. Quarantine
+ends only after the terminal journal event and corresponding immutable result have both
+been fsynced and read-back verified.
 
 Final audit validates every repository's ApprovalPlan digest, complete EffectJournal hash
 chain, approved head, PR identity, merge method/commit/tree, and exact managed-only diff.
@@ -1023,10 +1179,14 @@ unapproved file in the rollout PR.
 Rollback uses the same tagged writer, never GitHub's UI revert button:
 
 ```text
-workflows revert-plan --publish-result <path> --result-sha256 <digest> --repo <one-name>
-workflows revert-plan --failed-merge-result <path> --result-sha256 <digest>
+workflows revert-plan --ref v1.40 --rollout-id <id> --evidence-dir <owned-dir>
+  --publish-result <path> --result-sha256 <digest> --effect-journal <dir>
   --repo <one-name>
-workflows revert-publish --revert-plan <path> --revert-plan-sha256 <digest>
+workflows revert-plan --ref v1.40 --rollout-id <id> --evidence-dir <owned-dir>
+  --failed-merge-result <path> --result-sha256 <digest> --effect-journal <dir>
+  --repo <one-name>
+workflows revert-publish --ref v1.40 --rollout-id <id> --evidence-dir <owned-dir>
+  --revert-plan <path> --revert-plan-sha256 <digest>
   --effect-journal <dir> --repo <one-name> --confirm
 ```
 
@@ -1043,8 +1203,21 @@ content-addressed RevertPlan with deterministic tree/commit, branch, PR metadata
 exactly one of `reverts_publish_result_sha256` or
 `reverts_failed_merge_result_sha256`.
 
-If a FailedMergeResult contains an unmanaged/unknown path, an extra or missing managed
-path, or an unverified before-image, the fleet writer must not silently reverse those
+Like ApprovalPlan, successful revert-plan writes canonical UTF-8 bytes to the fixed
+content-addressed `revert-plan-<sha256>.json` path and prints
+`REVERT_PLAN_SHA256=<64 lowercase hex>`. It performs no remote mutation. The human/operator
+reviews that exact RevertPlan and its inverse preview, then preserves the digest in an
+independent approval record. Revert-publish hashes the exact bytes before GitHub access and
+requires equality with the externally supplied `--revert-plan-sha256`, content-addressed
+filename, source result digest, preview digest, and independently preserved approval; it
+never computes-and-accepts a replacement digest.
+
+An ApprovalPlan-kind FailedMergeResult is eligible for the managed-only RevertPlan rules
+above. A RevertPlan-kind FailedMergeResult is terminally quarantined: the writer cannot
+recursively create a revert-of-revert from an already failed recovery contract. It records
+the actual first-parent effect and uses the same repository-owner break-glass path below.
+If either kind contains an unmanaged/unknown path, an extra or missing managed path, or an
+unverified before-image, the fleet writer must not silently reverse those
 bytes. It records `quarantine_requires_break_glass` and performs no mutation. The stop
 condition then requires repository-owner incident review
 and a separate manually reviewed recovery PR whose exact first-parent restoration is
@@ -1056,11 +1229,53 @@ unmanaged files.
 `revert-publish` opens the revert PR under the same absent/exact-head branch rules and
 appends effects to the same hash-chained journal. Its PR must then use the typed
 `workflows merge --revert-plan ... --revert-plan-sha256 ... --confirm-merge` form; merge
-attestation emits immutable RevertResult and appends `reverted`. Multi-repository recovery
-plans and merges in reverse original merge order, one repository at a time, refetching and
-replanning each new base. All five command parsers reject secret/mutation passthroughs.
-Tests cover intervening managed/unmanaged changes, wrong result/plan digest, forward-order
-attempt, UI/manual merge, partial journal, and exact successful recovery.
+attestation materializes immutable RevertResult before appending its result-linked
+`reverted` event. Multi-repository recovery
+is an operator procedure in reverse observed merge order, one repository at a time,
+refetching and replanning each new base. Each independent repository state machine enforces
+its own safety invariants; it does not claim to cryptographically order unrelated journals.
+The operator records the cross-repository order in the incident/rollout record. All five
+command parsers reject secret/mutation passthroughs. Tests cover intervening
+managed/unmanaged changes, wrong result/plan digest, UI/manual merge, partial journal, and
+exact successful recovery; cross-repository reverse order is a runbook/review checkpoint
+rather than a parser rejection.
+
+#### 8.3.2 Repository effect state machine
+
+Each repository has one closed state machine inside the ApprovalPlan-bound journal:
+
+```text
+approval_planned
+  -> approval_branch -> approval_pr -> approval_merge_intent
+  -> publish_succeeded | publish_failed
+publish_succeeded | publish_failed
+  -> one_revert_plan_bound -> revert_branch -> revert_pr -> revert_merge_intent
+  -> reverted | revert_failed
+publish_failed -> break_glass_required  # when no exact managed-only inverse is safe
+revert_failed -> break_glass_required
+any_foreign_or_ambiguous_effect -> break_glass_required
+```
+
+Only the transitions shown are accepted. `publish_succeeded`, `publish_failed`, `reverted`,
+and `revert_failed` are terminal for their change-plan digest. An unresolved intent remains
+in its intent state, operationally quarantines the repository, and permits only exact
+resume. A journal `quarantined` event transitions to `break_glass_required`, which permits
+no automated remote mutation. A `blocked` event is a non-transitioning gate observation:
+it records why an attempted operation stopped but does not bypass the current state's next
+allowed transition or permit a retry without complete revalidation. Once a forward
+terminal result exists, plan/publish/merge for that original ApprovalPlan entry can perform
+read-only idempotency verification but cannot append another remote effect. Binding a
+RevertPlan is one atomic journal event after verifying its external approval digest; at
+most one active RevertPlan digest may be bound to a source result. A competing digest,
+forward and reverse concurrent request, second terminal result, skipped state, or attempted
+transition after break-glass quarantine blocks. The exclusive lock covers state validation,
+transition intent, remote request, and terminal append. A `failed-merge` or `failed-revert`
+event is the terminal result link for its respective change-plan digest; a following
+`quarantined` event is required exactly when the diagram enters
+`break_glass_required`. Break-glass recovery terminates the automated chain as
+`quarantined`; it can be cleared only by recording the reviewed external recovery-PR
+evidence and producing a fresh ApprovalPlan and journal from the repaired base, never by
+resuming the old chain.
 
 ### 8.4 Tool failure
 
@@ -1116,6 +1331,9 @@ a failing regression test.
   `github_token` mode never mints; both token flows reach only the enumerated sinks;
 - missing/unknown inputs and wrong boolean, number, string, or forwarded-expression types
   fail in the static checker even when actionlint returns 0;
+- actionlint uses only its verified empty config and disables host ShellCheck/Pyflakes;
+  hostile consumer actionlint config, PATH tool, and current directory cannot alter output
+  or execute;
 - missing, unknown, inherited, and wrong-source secrets fail;
 - caller permissions, trigger, input, and same-repository guard drift fail;
 - out-of-catalog central callers fail;
@@ -1123,7 +1341,8 @@ a failing regression test.
   quotes/non-scalars, aliases, anchors, merges, tags, and multiple documents block;
 - only the two allowed existing-config scalar tokens change;
 - every canonical reusable workflow has the exact no-secret/no-permission provenance job
-  and all execution jobs depend on it;
+  and every other job both depends on it and requires its successful result, including
+  jobs with status functions and token-mint/fallback paths;
 - provenance uses only the exact two caller `env:` expressions plus `toJSON(job)`, never
   an expression in `run:`; the parser requires four identity keys, accepts/type-checks
   only the four documented optional raw keys, and emits only six canonical identity values;
@@ -1143,8 +1362,9 @@ a failing regression test.
   is normal drift, and config loss with partial callers remains blocked until a reviewed
   exact last-known-good config restoration;
 - bootstrap plan is read-only and bootstrap publish requires one repository, an external
-  `--plan-sha256` matching the reviewed content-addressed ApprovalPlan, one plan-bound
-  EffectJournal directory, and confirmation;
+  Gate 2 fleet-plan digest authorizing its exact `bootstrap_required` entry, an external
+  `--plan-sha256` matching the reviewed content-addressed bootstrap ApprovalPlan, one
+  plan-bound EffectJournal directory, and confirmation;
 - missing, malformed, plan-self-supplied, or mismatched plan digest blocks before
   GitHub access; exact external digest plus unchanged preview succeeds;
 - publish rejects an omitted journal, a journal with multiple/mismatched root bindings, or
@@ -1154,10 +1374,15 @@ a failing regression test.
   credential helper, hook, filter, protocol, URL rewrite, proxy, and provider variables
   cannot execute or leak, while the fd broker clones/fetches/pushes a private token-only
   fixture;
+- the commit-construction child receives only the six fixed Git identity/date additions,
+  and hostile identity, wall clock, timezone, or host config cannot change its SHA;
 - gh accepts a fine-grained token only in its exact child environment, leaves no stored
   credential, and rejects wrong viewer/repository access; active-rules tests distinguish
   public `200 []`, the exact verified private-plan feature-unavailable 403, and a true
   permission/authentication 403 that must block;
+- the production parser/preflight accepts only the `github_pat_` fine-grained token form
+  and rejects classic/OAuth tokens unconditionally; separate break-glass tooling is not a
+  writer mode;
 - archived/disabled/non-writable repositories or `allow_merge_commit: false` block at plan;
 - deterministic plan/publish object construction yields the same tree and commit SHA;
 - ApprovalPlan bytes never mutate; EffectJournal events use exclusive revalidation,
@@ -1165,15 +1390,30 @@ a failing regression test.
   broken-chain, or mismatched-plan tests block, and only attested merge emits a separate
   immutable PublishResult/RevertResult while every post-merge mismatch emits an immutable
   FailedMergeResult;
+- every plan/result object is canonicalized into its typed content-addressed mode-0600 path
+  beneath the verified evidence dir; symlink/ancestor/mismatched-existing-file attacks
+  block, while an exact existing object is idempotent;
+- merge-result fault injection proves result-file fsync precedes its result-linked terminal
+  event: terminal-event/missing-file is recreated from the embedded canonical payload, a
+  unique matching orphan result is linked after revalidation, and every mismatch enters
+  break-glass quarantine;
 - publish refetches and blocks a stale selected base or stale preview while unrelated
   non-selected repository advances do not invalidate the full-fleet plan;
 - branch absent/create and exact-head/open-PR reuse are idempotent; unknown head,
   mismatched/closed PR, and any force-push path block;
-- crash after exact branch creation, PR creation, or merge is reconciled only from a unique
-  byte/SHA-identical remote effect; missing-after-journal and ambiguous effects block;
+- crash after exact branch creation or PR creation is reconciled only from a unique
+  byte/SHA-identical remote effect; merge writes a durable exact-request intent first, and
+  crash/timeout resume derives one success/failure result from live state while the
+  repository remains quarantined; response loss is typed rather than fabricated;
+- the merge intent binding has no self-reference: fixtures recompute its closed-field
+  digest, exact request body/digest, and journal-event digest independently, then prove an
+  exact retry uses the stored body while a changed nonce, message, head, or body blocks;
 - merge requires one explicit repository, exactly one typed ApprovalPlan/RevertPlan flag
   pair and external digest, a verified journal, and `--confirm-merge`;
   UI/manual/admin/generic PR overrides and mixed plan flags block;
+- an already-merged PR is resumable only behind its durable matching intent; the same live
+  shape without intent or without the exact intent-bound merge message is a foreign/manual
+  merge and blocks;
 - merge attestation requires exact PR head/path/blob set, merge-commit two-parent tree,
   and zero unmanaged actual-merge diff; squash/rebase/update/queue and base advance block;
 - publish is fail-fast and resume is explicit;
@@ -1185,9 +1425,17 @@ a failing regression test.
   every mutation method/CLI sentinel fails the test if called;
 - RevertPlan/Result is linked to a PublishResult or FailedMergeResult, contains only a
   conflict-free exact inverse managed patch, publishes/merges through the same
-  attestations, and rejects wrong order, intervening changes, manual/UI action, or broken
-  journal; a failed merge with any unmanaged actual effect is quarantined for documented
+  attestations, and rejects invalid per-repository transitions, intervening changes,
+  manual/UI action, or broken journal; a failed merge with any unmanaged actual effect is
+  quarantined for documented
   repository-owner break-glass rather than auto-reverted;
+- a RevertPlan-kind FailedMergeResult is recorded and quarantined for reviewed break-glass,
+  never recursively auto-reverted;
+- RevertPlan prints an external digest, uses a content-addressed file and preview, and
+  revert-publish requires its independently preserved human-approval digest before access;
+- repository journal state permits only the closed forward/reverse transitions, binds at
+  most one active RevertPlan, forbids old-plan mutation after terminal state, serializes
+  competing operations, and requires a fresh plan after break-glass;
 - canary evidence rejects a caller SHA with wrong bytes or a called workflow provenance
   SHA other than the verified release;
 - all ApprovalPlan/PublishResult/FailedMergeResult/RevertPlan/RevertResult entries contain empty
@@ -1210,6 +1458,11 @@ a failing regression test.
    allowed.
 3. Run the full unit, YAML, archived-bundle, recursive-lock, static-contract, actionlint,
    and diff gates after each bounded PR.
+   Before tag creation, also run full remote-fixture fault injection for every effect-state
+   transition and every crash boundary around intent/API/result/journal fsync. Prove the
+   release-independent owner recovery runbook from an intentionally quarantined fixture,
+   archive its reviewed digest and operator-readable copy outside the release checkout, and
+   prove its manual GitHub/Git procedure does not invoke the `v1.40` Python writer.
 4. Merge in dependency order. The later PRs must not modify the pinned internal action
    trees. Fetch the final exact merge commit and rerun all pre-release gates from a clean
    detached checkout of that commit.
@@ -1259,8 +1512,9 @@ remains merged on success; only the harmless test PR/branch is removed.
    path, no App-token mint, no `APP_PRIVATE_KEY` mapping, exact built-in
    `${{ github.token }}` fallback to only the approved sinks, and no OIDC/GCP/Vertex/Code
    Assist path.
-3. `cts-email-mcp-server`: approve a separate explicit bootstrap plan/digest, publish and
-   merge the bootstrap PR, and verify the default-branch caller/config bytes. Invoke the
+3. `cts-email-mcp-server`: derive a separate explicit bootstrap plan from the preserved
+   Gate 2 fleet-plan digest, independently approve its digest, publish and merge the
+   bootstrap PR, and verify the default-branch caller/config bytes. Invoke the
    newly available `gemini-scheduled-triage` `workflow_dispatch`; require the central
    provenance job to run from `v1.40` and the execution job to skip because the bootstrap
    config explicitly disables it. No model or App credential may be consumed.
@@ -1276,8 +1530,8 @@ flow before retry; the immutable automation tag is never moved.
 The three successful managed canary PRs are already part of the target state. Publish
 independent PRs for the remaining sixteen repositories from their externally approved,
 unchanged ApprovalPlans. `wpa-supplicant` receives its own explicit bootstrap plan and
-confirmed publish; all of its common callers remain disabled until a separate reviewed
-enablement change.
+confirmed publish derived from the preserved Gate 2 fleet-plan digest; all of its common
+callers remain disabled until a separate reviewed enablement change.
 
 ### Gate 5: final audit
 
@@ -1307,13 +1561,18 @@ the next stage.
   After publication, never move/delete the tag: correct automation behavior through new
   reviewed commits and a new immutable tag.
 - Consumer rollback uses only `workflows revert-plan` → reviewed RevertPlan →
-  `revert-publish` → `merge`, one repository in reverse merge order. UI/manual revert is
-  not accepted evidence.
+  independently preserved `REVERT_PLAN_SHA256` → `revert-publish` → `merge`, one repository
+  at a time in operator-verified reverse merge order. UI/manual revert is not accepted
+  evidence.
 - A bootstrap RevertPlan removes only the managed `.github` paths that its PublishResult
   added and blocks if any were independently modified.
 - Restoring `bump-automation-ref.yml` requires a separate reviewed policy/release change;
   rollback does not silently revive the retired writer.
 - No secret value is changed, so secret-value rollback is not part of this rollout.
+- Workflow standardization and API-key/token synchronization intentionally remain separate
+  transactions; there is no combined “workflow + key” mutation command. The independent
+  `personal-ops/claude-token-sync` inventory currently has a different membership surface
+  and must be reconciled/audited by its own design before claiming fleet parity.
 
 ## 12. Acceptance Criteria
 
@@ -1349,6 +1608,9 @@ the next stage.
   canaries succeed with verified provenance and token sinks.
 - Built-in-token API-key-only and fail-closed bootstrap canaries satisfy their declared
   profiles.
+- Every merge request has a durable intent predecessor; no unresolved intent, competing
+  RevertPlan, or quarantine remains, and every terminal remote merge has exactly one
+  immutable success/failure result.
 - Final fleet state is `current=19`, `skipped=0`, `blocked=0`.
 - The operation policy is `secret_writes: deny`; allowlisted list responses are projected
   to names only, all secret/variable-mutation sentinels remain unused, and every
