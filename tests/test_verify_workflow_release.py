@@ -41,16 +41,27 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
                       contents: read
                       pull-requests: write
                       issues: write
+                    env:
+                      OPENCODE_VERSION: '1.18.17'
+                      OPENCODE_ARCHIVE_SHA256: '3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a'
                     steps:
                       - name: Checkout repository
-                        uses: actions/checkout@v4
+                        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
                         with:
                           persist-credentials: true
+                      - name: Cache pinned OpenCode CLI archive
+                        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+                      - name: Install pinned OpenCode CLI
+                        run: |
+                          curl "releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
+                          sha256sum --check -
+                          "$install_dir/opencode" --version
                       - name: Run OpenCode PR review
+                        run: opencode github run
                         env:
                           GITHUB_TOKEN: ${{ github.token }}
-                        with:
-                          use_github_token: true
+                          USE_GITHUB_TOKEN: 'true'
+                          MODEL: zai-coding-plan/glm-4.7
                 """
             )
         )
@@ -74,16 +85,27 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
                       contents: read
                       pull-requests: write
                       issues: write
+                    env:
+                      OPENCODE_VERSION: '1.18.17'
+                      OPENCODE_ARCHIVE_SHA256: '3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a'
                     steps:
                       - name: Checkout repository
-                        uses: actions/checkout@v4
+                        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
                         with:
                           persist-credentials: true
+                      - name: Cache pinned OpenCode CLI archive
+                        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+                      - name: Install pinned OpenCode CLI
+                        run: |
+                          curl "releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
+                          sha256sum --check -
+                          "$install_dir/opencode" --version
                       - name: Run opencode
+                        run: opencode github run
                         env:
                           GITHUB_TOKEN: ${{ github.token }}
-                        with:
-                          use_github_token: true
+                          USE_GITHUB_TOKEN: 'true'
+                          MODEL: zai-coding-plan/glm-4.7
                 """
             )
         )
@@ -142,6 +164,51 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseVerificationError, "permissions"):
             verify_release(self.repo, "v1.35", bad_commit)
 
+    def test_rejects_release_with_unpinned_checkout(self) -> None:
+        self.git("tag", "-d", "v1.35")
+        path = self.repo / ".github/workflows/opencode-auto-review.yml"
+        path.write_text(
+            path.read_text().replace(
+                "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+                "actions/checkout@v7",
+                1,
+            )
+        )
+        self.git("add", ".")
+        self.git("commit", "-qm", "unpin checkout")
+        bad_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-a", "v1.35", "-m", "bad")
+        with self.assertRaisesRegex(ReleaseVerificationError, "checkout reference"):
+            verify_release(self.repo, "v1.35", bad_commit)
+
+    def test_rejects_release_with_opencode_version_drift(self) -> None:
+        self.git("tag", "-d", "v1.35")
+        path = self.repo / ".github/workflows/opencode-auto-review.yml"
+        path.write_text(path.read_text().replace("1.18.17", "latest", 1))
+        self.git("add", ".")
+        self.git("commit", "-qm", "unpin opencode")
+        bad_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-a", "v1.35", "-m", "bad")
+        with self.assertRaisesRegex(ReleaseVerificationError, "approved OpenCode CLI"):
+            verify_release(self.repo, "v1.35", bad_commit)
+
+    def test_rejects_release_with_opencode_digest_drift(self) -> None:
+        self.git("tag", "-d", "v1.35")
+        path = self.repo / ".github/workflows/opencode-auto-review.yml"
+        path.write_text(
+            path.read_text().replace(
+                "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a",
+                "0" * 64,
+                1,
+            )
+        )
+        self.git("add", ".")
+        self.git("commit", "-qm", "change opencode digest")
+        bad_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-a", "v1.35", "-m", "bad")
+        with self.assertRaisesRegex(ReleaseVerificationError, "approved OpenCode CLI"):
+            verify_release(self.repo, "v1.35", bad_commit)
+
     def test_rejects_opencode_release_without_private_repo_fetch_auth(self) -> None:
         self.git("tag", "-d", "v1.35")
         path = self.repo / ".github/workflows/opencode-auto-review.yml"
@@ -195,13 +262,13 @@ class VerifyWorkflowReleaseTest(unittest.TestCase):
             "    permissions:\n      contents: read",
             "    permissions:\n      id-token: write\n      contents: read",
         )
-        text = text.replace("use_github_token: true", "use_github_token: false")
+        text = text.replace("USE_GITHUB_TOKEN: 'true'", "USE_GITHUB_TOKEN: 'false'")
         path.write_text(text)
         self.git("add", ".")
         self.git("commit", "-qm", "restore app token path")
         bad_commit = self.git("rev-parse", "HEAD").strip()
         self.git("tag", "-a", "v1.35", "-m", "bad")
-        with self.assertRaisesRegex(ReleaseVerificationError, "opencode.yml security"):
+        with self.assertRaisesRegex(ReleaseVerificationError, "opencode.yml"):
             verify_release(self.repo, "v1.35", bad_commit)
 
     def test_rejects_command_scope_without_inline_review_fallback(self) -> None:

@@ -108,7 +108,8 @@ class WorkflowSecretContractsTest(unittest.TestCase):
         run_step = next(
             step for step in job["steps"] if step.get("name") == "Run OpenCode PR review"
         )
-        self.assertEqual("true", run_step["with"]["use_github_token"])
+        self.assertEqual("opencode github run", run_step["run"])
+        self.assertEqual("true", run_step["env"]["USE_GITHUB_TOKEN"])
         self.assertEqual("${{ github.token }}", run_step["env"]["GITHUB_TOKEN"])
 
     def test_opencode_auto_review_keeps_read_only_checkout_auth_for_private_repos(self) -> None:
@@ -147,7 +148,8 @@ class WorkflowSecretContractsTest(unittest.TestCase):
         )
         self.assertIn("needs.check-enabled.outputs.safe_pr == 'true'", job["if"])
         run_step = next(step for step in job["steps"] if step.get("name") == "Run opencode")
-        self.assertEqual("true", run_step["with"]["use_github_token"])
+        self.assertEqual("opencode github run", run_step["run"])
+        self.assertEqual("true", run_step["env"]["USE_GITHUB_TOKEN"])
         self.assertEqual("${{ github.token }}", run_step["env"]["GITHUB_TOKEN"])
         scope_step = next(step for step in check["steps"] if step.get("id") == "pr_scope")
         self.assertEqual(

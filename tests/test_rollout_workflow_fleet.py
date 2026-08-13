@@ -50,16 +50,27 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+    env:
+      OPENCODE_VERSION: '1.18.17'
+      OPENCODE_ARCHIVE_SHA256: '3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a'
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: true
+      - name: Cache pinned OpenCode CLI archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      - name: Install pinned OpenCode CLI
+        run: |
+          curl "releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
+          sha256sum --check -
+          "$install_dir/opencode" --version
       - name: Run OpenCode PR review
+        run: opencode github run
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        with:
-          use_github_token: true
+          USE_GITHUB_TOKEN: 'true'
+          MODEL: zai-coding-plan/glm-4.7
 """
 
 SECURE_COMMAND_WORKFLOW = """\
@@ -80,16 +91,27 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+    env:
+      OPENCODE_VERSION: '1.18.17'
+      OPENCODE_ARCHIVE_SHA256: '3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a'
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: true
+      - name: Cache pinned OpenCode CLI archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      - name: Install pinned OpenCode CLI
+        run: |
+          curl "releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
+          sha256sum --check -
+          "$install_dir/opencode" --version
       - name: Run opencode
+        run: opencode github run
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        with:
-          use_github_token: true
+          USE_GITHUB_TOKEN: 'true'
+          MODEL: zai-coding-plan/glm-4.7
 """
 
 

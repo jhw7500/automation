@@ -71,7 +71,7 @@ jobs:
       enabled: ${{ steps.check.outputs.enabled }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github
 
@@ -95,7 +95,7 @@ jobs:
     steps:
       - name: 'Checkout repository (sparse)'
         if: vars.GEMINI_SPARSE_CHECKOUT == 'true' && vars.GEMINI_SPARSE_CHECKOUT_PATTERNS != ''
-        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           lfs: false
@@ -106,7 +106,7 @@ jobs:
 
       - name: 'Checkout repository'
         if: vars.GEMINI_SPARSE_CHECKOUT != 'true'
-        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           lfs: false
