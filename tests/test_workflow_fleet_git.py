@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import stat
 import subprocess
@@ -23,6 +22,26 @@ PROVIDER_KEYS = {
 }
 SHA = "1" * 40
 HEAD_SHA = "2" * 40
+PR_HEAD_SHA = "3" * 40
+
+
+def pr_item(**overrides: object) -> dict[str, object]:
+    item: dict[str, object] = {
+        "number": 7,
+        "url": "https://github.com/jhw7500/repo/pull/7",
+        "state": "OPEN",
+        "baseRefName": "main",
+        "headRefName": "release",
+        "headRefOid": PR_HEAD_SHA,
+        "headRepository": {"nameWithOwner": "jhw7500/repo"},
+        "headRepositoryOwner": {"login": "jhw7500"},
+        "title": "Roll out workflows",
+        "body": "Body",
+        "isDraft": False,
+        "mergedAt": None,
+    }
+    item.update(overrides)
+    return item
 
 
 def workspace(tmp_path: Path) -> Path:
@@ -263,9 +282,7 @@ def test_clone_reads_only_metadata_and_prerequisite_names(
 
     monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
 
-    result = workflow_fleet_git.clone_default_branch(
-        "jhw7500", "wlan-package", root
-    )
+    result = workflow_fleet_git.clone_default_branch("jhw7500", "wlan-package", root)
 
     assert result == workflow_fleet_git.RepositorySnapshot(
         path=root / "wlan-package",
@@ -274,7 +291,9 @@ def test_clone_reads_only_metadata_and_prerequisite_names(
         secret_names=frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}),
         variable_names=frozenset({"APP_ID"}),
     )
-    clone = next(git_payload(args) for args, _ in calls if args[0] == "git" and "clone" in args)
+    clone = next(
+        git_payload(args) for args, _ in calls if args[0] == "git" and "clone" in args
+    )
     assert clone == [
         "clone",
         "--no-recurse-submodules",
@@ -449,7 +468,12 @@ def test_push_new_branch_proves_absence_and_never_forces_or_pushes_default(
             ["remote", "get-url", "--push", "--all", "origin"],
         ]:
             return completed(args, "https://github.com/jhw7500/repo.git")
-        if payload == ["ls-remote", "--heads", "origin", "refs/heads/automation/common-workflows-v1.40"]:
+        if payload == [
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/automation/common-workflows-v1.40",
+        ]:
             return completed(args, "")
         if payload == ["rev-parse", "refs/remotes/origin/main"]:
             return completed(args, HEAD_SHA)
@@ -474,7 +498,12 @@ def test_push_new_branch_proves_absence_and_never_forces_or_pushes_default(
     assert not any("force" in item for item in push)
     assert all("main" not in item for item in push)
     assert calls.index(
-        ["ls-remote", "--heads", "origin", "refs/heads/automation/common-workflows-v1.40"]
+        [
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/automation/common-workflows-v1.40",
+        ]
     ) < calls.index(push)
     assert ["switch", "-c", "automation/common-workflows-v1.40", HEAD_SHA] in calls
 
@@ -521,8 +550,7 @@ def test_push_new_branch_rejects_default_branch_before_any_child(
     "redirected_push_url",
     [
         pytest.param(
-            "https://github.com/jhw7500/repo.git\n"
-            "https://github.com/attacker/repo.git",
+            "https://github.com/jhw7500/repo.git\nhttps://github.com/attacker/repo.git",
             id="remote-pushurl",
         ),
         pytest.param(
@@ -561,7 +589,9 @@ def test_snapshot_operation_rejects_effective_push_url_redirects(
 @pytest.mark.parametrize(
     "operation",
     [
-        pytest.param(lambda item: workflow_fleet_git.refetch_default(item), id="refetch"),
+        pytest.param(
+            lambda item: workflow_fleet_git.refetch_default(item), id="refetch"
+        ),
         pytest.param(
             lambda item: workflow_fleet_git.remote_branch_sha(item, "release"),
             id="remote-branch",
@@ -645,19 +675,7 @@ def test_list_rollout_prs_queries_all_states_for_exact_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[list[str]] = []
-    raw = [
-        {
-            "number": 7,
-            "url": "https://github.com/jhw7500/repo/pull/7",
-            "state": "OPEN",
-            "baseRefName": "main",
-            "headRefName": "automation/common-workflows-v1.40",
-            "title": "Roll out workflows",
-            "body": "Body",
-            "isDraft": False,
-            "mergedAt": None,
-        }
-    ]
+    raw = [pr_item(headRefName="automation/common-workflows-v1.40")]
 
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(args)
@@ -676,6 +694,8 @@ def test_list_rollout_prs_queries_all_states_for_exact_head(
             state="OPEN",
             base="main",
             head="automation/common-workflows-v1.40",
+            head_repo="jhw7500/repo",
+            head_sha=PR_HEAD_SHA,
             title="Roll out workflows",
             body="Body",
         ),
@@ -692,7 +712,8 @@ def test_list_rollout_prs_queries_all_states_for_exact_head(
             "--state",
             "all",
             "--json",
-            "number,url,state,baseRefName,headRefName,title,body,isDraft,mergedAt",
+            "number,url,state,baseRefName,headRefName,headRefOid,headRepository,"
+            "headRepositoryOwner,title,body,isDraft,mergedAt",
         ]
     ]
 
@@ -708,6 +729,9 @@ def test_list_rollout_prs_queries_all_states_for_exact_head(
         ("baseRefName", ""),
         ("baseRefName", "bad branch"),
         ("headRefName", "another-head"),
+        ("headRefOid", "not-an-object-id"),
+        ("headRepository", {"nameWithOwner": "fork-owner/repo"}),
+        ("headRepositoryOwner", {"login": "fork-owner"}),
         ("title", None),
         ("body", None),
         ("isDraft", "false"),
@@ -717,17 +741,7 @@ def test_list_rollout_prs_queries_all_states_for_exact_head(
 def test_list_rollout_prs_rejects_malformed_or_mismatched_metadata(
     monkeypatch: pytest.MonkeyPatch, field: str, value: object
 ) -> None:
-    item = {
-        "number": 7,
-        "url": "https://github.com/jhw7500/repo/pull/7",
-        "state": "OPEN",
-        "baseRefName": "main",
-        "headRefName": "release",
-        "title": "Roll out workflows",
-        "body": "Body",
-        "isDraft": False,
-        "mergedAt": None,
-    }
+    item = pr_item()
     item[field] = value
     monkeypatch.setattr(
         workflow_fleet_git.subprocess,
@@ -751,17 +765,7 @@ def test_list_rollout_prs_rejects_malformed_or_mismatched_metadata(
 def test_list_rollout_prs_rejects_inconsistent_merged_state(
     monkeypatch: pytest.MonkeyPatch, state: str, merged_at: object
 ) -> None:
-    item = {
-        "number": 7,
-        "url": "https://github.com/jhw7500/repo/pull/7",
-        "state": state,
-        "baseRefName": "main",
-        "headRefName": "release",
-        "title": "Roll out workflows",
-        "body": "Body",
-        "isDraft": False,
-        "mergedAt": merged_at,
-    }
+    item = pr_item(state=state, mergedAt=merged_at)
     monkeypatch.setattr(
         workflow_fleet_git.subprocess,
         "run",
@@ -772,21 +776,20 @@ def test_list_rollout_prs_rejects_inconsistent_merged_state(
         workflow_fleet_git.list_rollout_prs("jhw7500", "repo", "release")
 
 
-@pytest.mark.parametrize("missing", ["isDraft", "mergedAt"])
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "isDraft",
+        "mergedAt",
+        "headRefOid",
+        "headRepository",
+        "headRepositoryOwner",
+    ],
+)
 def test_list_rollout_prs_requires_auxiliary_metadata_fields(
     monkeypatch: pytest.MonkeyPatch, missing: str
 ) -> None:
-    item = {
-        "number": 7,
-        "url": "https://github.com/jhw7500/repo/pull/7",
-        "state": "OPEN",
-        "baseRefName": "main",
-        "headRefName": "release",
-        "title": "Roll out workflows",
-        "body": "Body",
-        "isDraft": False,
-        "mergedAt": None,
-    }
+    item = pr_item()
     del item[missing]
     monkeypatch.setattr(
         workflow_fleet_git.subprocess,
@@ -801,17 +804,7 @@ def test_list_rollout_prs_requires_auxiliary_metadata_fields(
 def test_list_rollout_prs_accepts_consistent_merged_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    item = {
-        "number": 7,
-        "url": "https://github.com/jhw7500/repo/pull/7",
-        "state": "MERGED",
-        "baseRefName": "main",
-        "headRefName": "release",
-        "title": "Roll out workflows",
-        "body": "Body",
-        "isDraft": False,
-        "mergedAt": "2026-08-13T00:00:00Z",
-    }
+    item = pr_item(state="MERGED", mergedAt="2026-08-13T00:00:00Z")
     monkeypatch.setattr(
         workflow_fleet_git.subprocess,
         "run",
@@ -825,6 +818,8 @@ def test_list_rollout_prs_accepts_consistent_merged_metadata(
             state="MERGED",
             base="main",
             head="release",
+            head_repo="jhw7500/repo",
+            head_sha=PR_HEAD_SHA,
             title="Roll out workflows",
             body="Body",
         ),
@@ -848,7 +843,13 @@ def test_create_pull_request_uses_0600_body_file_not_argv(
     monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
 
     result = workflow_fleet_git.create_pull_request(
-        "jhw7500", "repo", "main", "release", "Roll out workflows", body
+        "jhw7500",
+        "repo",
+        "main",
+        "release",
+        PR_HEAD_SHA,
+        "Roll out workflows",
+        body,
     )
 
     assert result == workflow_fleet_git.PullRequest(
@@ -857,6 +858,8 @@ def test_create_pull_request_uses_0600_body_file_not_argv(
         state="OPEN",
         base="main",
         head="release",
+        head_repo="jhw7500/repo",
+        head_sha=PR_HEAD_SHA,
         title="Roll out workflows",
         body=body,
     )

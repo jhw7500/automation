@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from typing import Literal, Sequence
@@ -65,6 +66,18 @@ LOCAL_GIT_OPERATIONS = frozenset(
         "switch",
     }
 )
+HERMETIC_GIT = Path("/usr/bin/git")
+HERMETIC_GIT_OPERATIONS = frozenset(
+    {
+        "commit-tree",
+        "hash-object",
+        "read-tree",
+        "symbolic-ref",
+        "update-index",
+        "update-ref",
+        "write-tree",
+    }
+)
 
 
 class CommandError(RuntimeError):
@@ -88,6 +101,7 @@ class RepoOutcome:
     head_sha: str = ""
     pr_url: str = ""
     changed_paths: tuple[str, ...] = ()
+    stage: str = ""
 
 
 @dataclass(frozen=True)
@@ -103,6 +117,33 @@ class PreparedRepo:
     action: str
     outcome: RepoOutcome
     plan: RenderPlan | None
+
+
+@dataclass
+class PublicationProgress:
+    stage: str = "clone"
+    base_sha: str = ""
+    head_sha: str = ""
+    changed_paths: tuple[str, ...] = ()
+
+
+def _publication_blocked(
+    repo: str,
+    progress: PublicationProgress,
+    detail: str,
+    *,
+    pr_url: str = "",
+) -> RepoOutcome:
+    return RepoOutcome(
+        repo,
+        "blocked",
+        f"{progress.stage} stage failed: {detail}",
+        progress.base_sha,
+        progress.head_sha,
+        pr_url,
+        progress.changed_paths,
+        progress.stage,
+    )
 
 
 def git(
@@ -164,6 +205,8 @@ def _object_id(value: str, description: str) -> str:
 def _workspace(path: Path, initialize: bool, parser: argparse.ArgumentParser) -> Path:
     """Return a real marked disposable workspace, optionally creating an empty one."""
 
+    created: list[Path] = []
+    remove_marker_on_failure = False
     try:
         if path.exists():
             absolute = Path(os.path.abspath(path))
@@ -176,9 +219,33 @@ def _workspace(path: Path, initialize: bool, parser: argparse.ArgumentParser) ->
                     f"workspace is not initialized: {path}; use --initialize-workspace "
                     "only for a dedicated disposable directory"
                 )
-            path.mkdir(parents=True)
-            resolved = path.resolve(strict=True)
-            if resolved != Path(os.path.abspath(path)):
+            absolute = Path(os.path.abspath(path))
+            components = (Path(absolute.anchor), *absolute.parents[-2::-1], absolute)
+            first_missing = len(components)
+            for index, component in enumerate(components):
+                try:
+                    mode = component.lstat().st_mode
+                except FileNotFoundError:
+                    first_missing = min(first_missing, index)
+                    continue
+                except OSError:
+                    raise CommandError(
+                        "unable to inspect workspace ancestors"
+                    ) from None
+                if stat.S_ISLNK(mode):
+                    raise CommandError("workspace contains a symlink component")
+                if not stat.S_ISDIR(mode):
+                    raise CommandError("workspace ancestor is not a directory")
+                if first_missing != len(components):
+                    raise CommandError("workspace ancestry changed while inspected")
+            for component in components[first_missing:]:
+                component.mkdir()
+                created.append(component)
+                mode = component.lstat().st_mode
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                    raise CommandError("workspace creation was not a real directory")
+            resolved = absolute.resolve(strict=True)
+            if resolved != absolute:
                 raise CommandError("workspace contains a symlink component")
         marker = resolved / WORKSPACE_MARKER
         if marker.exists() or marker.is_symlink():
@@ -195,9 +262,21 @@ def _workspace(path: Path, initialize: bool, parser: argparse.ArgumentParser) ->
                 raise CommandError(
                     "refusing to mark a nonempty workspace as disposable"
                 )
+            remove_marker_on_failure = True
             marker.write_text("managed disposable clones only\n", encoding="utf-8")
         return resolved
     except (CommandError, OSError, RuntimeError) as exc:
+        if initialize:
+            if remove_marker_on_failure:
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            for directory in reversed(created):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
         parser.error(str(exc))
     raise AssertionError("argparse.error must exit")
 
@@ -366,14 +445,28 @@ def _run_actionlint(actionlint: Path, repo: Path, bundle: ReleaseBundle) -> None
     if not workflows:
         return
     try:
-        output = fleet_git.run(
-            [str(actionlint), "-shellcheck=", *(str(path) for path in workflows)],
+        executable = actionlint.resolve(strict=True)
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise OSError
+        completed = subprocess.run(
+            [str(executable), "-shellcheck=", *(str(path) for path in workflows)],
             cwd=repo,
+            input=None,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(repo),
+                "TMPDIR": str(repo),
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            },
         )
-    except FleetGitError:
+    except (OSError, ValueError):
         raise CommandError("actionlint validation failed") from None
-    if output:
-        raise CommandError("actionlint returned diagnostics")
+    if completed.returncode or completed.stdout:
+        raise CommandError("actionlint validation failed")
 
 
 def validate_managed_result(
@@ -503,7 +596,11 @@ def _validate_tree_contents(
             text = change.after.decode("utf-8")
         except UnicodeDecodeError:
             raise CommandError("managed result is not UTF-8") from None
-        expected_blob = git(["hash-object", "--stdin"], cwd=snapshot.path, stdin=text)
+        expected_blob = git(
+            ["hash-object", "--stdin", "--no-filters"],
+            cwd=snapshot.path,
+            stdin=text,
+        )
         observed_blob = git(["rev-parse", revision_path], cwd=snapshot.path)
         if observed_blob != expected_blob:
             raise CommandError("rollout tree blob does not match the render plan")
@@ -546,11 +643,152 @@ def validate_commit_tree(
     _validate_tree_contents(snapshot, head_sha, plan)
 
 
+def _hermetic_git(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    stdin: bytes | None = None,
+) -> bytes:
+    """Run only filter/signing-free local plumbing with a closed environment."""
+
+    if not args or args[0] not in HERMETIC_GIT_OPERATIONS:
+        raise CommandError("hermetic Git operation is not permitted")
+    try:
+        executable = HERMETIC_GIT.resolve(strict=True)
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise OSError
+        completed = subprocess.run(
+            [
+                str(executable),
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "submodule.recurse=false",
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "user.name=workflow-fleet",
+                "-c",
+                "user.email=workflow-fleet@invalid",
+                *args,
+            ],
+            cwd=cwd,
+            input=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+    except (OSError, ValueError):
+        raise CommandError("rollout commit construction failed") from None
+    if completed.returncode:
+        raise CommandError("rollout commit construction failed")
+    return completed.stdout.strip()
+
+
+def construct_rollout_commit(
+    snapshot: RepositorySnapshot,
+    base_sha: str,
+    ref: str,
+    plan: RenderPlan,
+    catalog: WorkflowCatalog,
+) -> str:
+    """Build the exact managed commit through a private filter-free index."""
+
+    base_sha = _object_id(base_sha, "default branch object")
+    branch = rollout_branch(ref)
+    with tempfile.TemporaryDirectory(prefix="workflow-fleet-index-") as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        environment = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home),
+            "TMPDIR": str(root),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_INDEX_FILE": str(root / "index"),
+            "GIT_AUTHOR_NAME": "workflow-fleet",
+            "GIT_AUTHOR_EMAIL": "workflow-fleet@invalid",
+            "GIT_COMMITTER_NAME": "workflow-fleet",
+            "GIT_COMMITTER_EMAIL": "workflow-fleet@invalid",
+        }
+        _hermetic_git(
+            ["read-tree", base_sha], cwd=snapshot.path, environment=environment
+        )
+        apply_release_plan(snapshot.path, plan, catalog)
+        for change in sorted(plan.changes, key=lambda item: item.path):
+            relative = change.path.as_posix()
+            if change.after is None:
+                _hermetic_git(
+                    ["update-index", "--force-remove", "--", relative],
+                    cwd=snapshot.path,
+                    environment=environment,
+                )
+                continue
+            path = snapshot.path.joinpath(*change.path.parts)
+            try:
+                mode = path.lstat().st_mode
+            except OSError:
+                raise CommandError("managed commit path is unavailable") from None
+            if not stat.S_ISREG(mode):
+                raise CommandError("managed commit path is not a regular file")
+            blob = _object_id(
+                _hermetic_git(
+                    ["hash-object", "-w", "--stdin", "--no-filters"],
+                    cwd=snapshot.path,
+                    environment=environment,
+                    stdin=change.after,
+                ).decode("ascii"),
+                "managed blob",
+            )
+            git_mode = "100755" if stat.S_IMODE(mode) & 0o111 else "100644"
+            _hermetic_git(
+                ["update-index", "--add", "--cacheinfo", git_mode, blob, relative],
+                cwd=snapshot.path,
+                environment=environment,
+            )
+        tree = _object_id(
+            _hermetic_git(
+                ["write-tree"], cwd=snapshot.path, environment=environment
+            ).decode("ascii"),
+            "rollout tree",
+        )
+        head_sha = _object_id(
+            _hermetic_git(
+                ["commit-tree", tree, "-p", base_sha],
+                cwd=snapshot.path,
+                environment=environment,
+                stdin=(pr_title(ref) + "\n").encode("utf-8"),
+            ).decode("ascii"),
+            "rollout commit",
+        )
+        local_ref = f"refs/heads/{branch}"
+        try:
+            _hermetic_git(
+                ["update-ref", local_ref, head_sha, "0" * len(base_sha)],
+                cwd=snapshot.path,
+                environment=environment,
+            )
+            _hermetic_git(
+                ["symbolic-ref", "HEAD", local_ref],
+                cwd=snapshot.path,
+                environment=environment,
+            )
+        except CommandError as exc:
+            raise BranchPublishError(str(exc), head_sha) from None
+    return head_sha
+
+
 def _exact_pr(
     request: PullRequest,
     *,
     base: str,
     branch: str,
+    head_repo: str,
+    head_sha: str,
     title: str,
     body: str,
 ) -> bool:
@@ -558,6 +796,8 @@ def _exact_pr(
         request.state == "OPEN"
         and request.base == base
         and request.head == branch
+        and request.head_repo == head_repo
+        and request.head_sha == head_sha
         and request.title == title
         and request.body == body
     )
@@ -595,6 +835,8 @@ def inspect_rollout(
         requests[0],
         base=snapshot.default_branch,
         branch=branch,
+        head_repo=f"{fleet_git.OWNER}/{snapshot.path.name}",
+        head_sha=branch_sha,
         title=title,
         body=body,
     ):
@@ -633,6 +875,8 @@ def attest_pull_request(
             requests[0],
             base=snapshot.default_branch,
             branch=branch,
+            head_repo=f"{fleet_git.OWNER}/{snapshot.path.name}",
+            head_sha=head_sha,
             title=pr_title(ref),
             body=pr_body(ref, commit, changed_paths),
         )
@@ -767,32 +1011,15 @@ def publish_new_branch(
         )
     if fleet_git.remote_branch_sha(snapshot, branch) is not None:
         raise CommandError("rollout branch appeared before publication")
-    git(["switch", "-c", branch, base_sha], cwd=snapshot.path)
     if bundle is None:
         raise CommandError("release bundle is required for publication")
-    apply_release_plan(snapshot.path, plan, bundle.catalog)
-    paths = list(_changed_paths(plan))
-    git(["add", "--all", "--", *paths], cwd=snapshot.path)
-    staged = tuple(
-        sorted(
-            filter(
-                None,
-                git(
-                    ["diff", "--cached", "--name-only", "--", *paths],
-                    cwd=snapshot.path,
-                ).splitlines(),
-            )
-        )
-    )
-    if staged != tuple(paths):
-        raise CommandError("staged paths do not exactly match the render plan")
-    git(["commit", "-m", pr_title(ref)], cwd=snapshot.path)
-    head_sha = _object_id(
-        git(["rev-parse", "HEAD"], cwd=snapshot.path), "rollout commit"
-    )
-    validate_commit_tree(snapshot, head_sha, base_sha, plan)
-    if fleet_git.remote_branch_sha(snapshot, branch) is not None:
-        raise CommandError("rollout branch appeared before push")
+    head_sha = construct_rollout_commit(snapshot, base_sha, ref, plan, bundle.catalog)
+    try:
+        validate_commit_tree(snapshot, head_sha, base_sha, plan)
+        if fleet_git.remote_branch_sha(snapshot, branch) is not None:
+            raise CommandError("rollout branch appeared before push")
+    except (CommandError, FleetGitError) as exc:
+        raise BranchPublishError(str(exc), head_sha) from None
     try:
         git(
             ["push", "--set-upstream", "origin", f"HEAD:refs/heads/{branch}"],
@@ -810,13 +1037,14 @@ def publish_new_branch(
     return head_sha
 
 
-def publish_repository(
+def _publish_repository_fresh(
     bundle: ReleaseBundle,
     workspace: Path,
     *,
     repo: str,
     bootstrap: bool,
     actionlint: Path | None,
+    progress: PublicationProgress,
 ) -> RepoOutcome:
     """Refetch/recompute one repository and create or reuse only its exact PR."""
 
@@ -825,18 +1053,25 @@ def publish_repository(
         snapshot = fleet_git.clone_default_branch(
             bundle.config.owner, repo, Path(temporary)
         )
+        progress.stage = "refetch"
         base_sha = fleet_git.refetch_default(snapshot)
+        progress.base_sha = base_sha
         git(["switch", "--detach", base_sha], cwd=snapshot.path)
+        progress.stage = "render"
         plan = _render(snapshot, bundle, repo, bootstrap=bootstrap)
         changed = _changed_paths(plan)
+        progress.changed_paths = changed
         if plan.status == "blocked":
             raise CommandError(plan.reason)
         if plan.status == "current":
+            progress.stage = "branch"
             require_no_current_rollout_branch(snapshot, bundle.ref)
-            return RepoOutcome(repo, "current", plan.reason, base_sha)
+            return RepoOutcome(repo, "current", plan.reason, base_sha, stage="complete")
+        progress.stage = "validation"
         validate_managed_result(
             snapshot.path, bundle, plan, actionlint, bootstrap=bootstrap
         )
+        progress.stage = "branch"
         inspection = inspect_rollout(
             snapshot, base_sha, bundle.ref, bundle.commit, plan
         )
@@ -851,6 +1086,7 @@ def publish_repository(
                 inspection.branch_sha,
                 inspection.pr_url,
                 changed,
+                "complete",
             )
         if inspection.action == "create_branch":
             try:
@@ -864,22 +1100,19 @@ def publish_repository(
                     bundle=bundle,
                 )
             except BranchPublishError as exc:
-                return RepoOutcome(
-                    repo,
-                    "blocked",
-                    str(exc),
-                    base_sha,
-                    exc.head_sha,
-                    changed_paths=changed,
-                )
+                progress.head_sha = exc.head_sha
+                return _publication_blocked(repo, progress, str(exc))
         else:
             head_sha = inspection.branch_sha
+        progress.head_sha = head_sha
+        progress.stage = "pr"
         try:
             request = fleet_git.create_pull_request(
                 bundle.config.owner,
                 repo,
                 snapshot.default_branch,
                 branch,
+                head_sha,
                 title,
                 body,
             )
@@ -893,6 +1126,8 @@ def publish_repository(
                         item,
                         base=snapshot.default_branch,
                         branch=branch,
+                        head_repo=f"{bundle.config.owner}/{repo}",
+                        head_sha=head_sha,
                         title=title,
                         body=body,
                     )
@@ -904,45 +1139,64 @@ def publish_repository(
                 ):
                     request = exact[0]
                 else:
-                    return RepoOutcome(
+                    return _publication_blocked(
                         repo,
-                        "blocked",
+                        progress,
                         "branch published but pull request creation failed",
-                        base_sha,
-                        head_sha,
-                        changed_paths=changed,
                     )
             except FleetGitError:
-                return RepoOutcome(
+                return _publication_blocked(
                     repo,
-                    "blocked",
+                    progress,
                     "branch published but pull request state is unavailable",
-                    base_sha,
-                    head_sha,
-                    changed_paths=changed,
                 )
         try:
             attest_pull_request(
                 snapshot, bundle.ref, bundle.commit, head_sha, changed, request
             )
         except (CommandError, FleetGitError) as exc:
-            return RepoOutcome(
-                repo,
-                "blocked",
-                str(exc),
-                base_sha,
-                head_sha,
-                request.url,
-                changed,
-            )
+            return _publication_blocked(repo, progress, str(exc), pr_url=request.url)
         detail = (
             "new branch, commit, and pull request created"
             if inspection.action == "create_branch"
             else "matching branch reused; pull request created"
         )
         return RepoOutcome(
-            repo, "published", detail, base_sha, head_sha, request.url, changed
+            repo,
+            "published",
+            detail,
+            base_sha,
+            head_sha,
+            request.url,
+            changed,
+            "complete",
         )
+
+
+def publish_repository(
+    bundle: ReleaseBundle,
+    workspace: Path,
+    *,
+    repo: str,
+    bootstrap: bool,
+    actionlint: Path | None,
+) -> RepoOutcome:
+    """Publish one repository while preserving only fresh failure metadata."""
+
+    progress = PublicationProgress()
+    try:
+        return _publish_repository_fresh(
+            bundle,
+            workspace,
+            repo=repo,
+            bootstrap=bootstrap,
+            actionlint=actionlint,
+            progress=progress,
+        )
+    except (CommandError, FleetGitError, RolloutError) as exc:
+        return _publication_blocked(repo, progress, str(exc))
+    except Exception:
+        return _publication_blocked(repo, progress, "local publication failed")
 
 
 def _plan_record(prepared: PreparedRepo, commit: str) -> dict[str, object]:
@@ -1108,16 +1362,19 @@ def main(argv: list[str] | None = None) -> int:
                 except (CommandError, FleetGitError, RolloutError) as exc:
                     outcomes.append(
                         RepoOutcome(
-                            item.repo, "blocked", str(exc), item.outcome.base_sha
+                            item.repo,
+                            "blocked",
+                            f"unexpected stage failed: {exc}",
+                            stage="unexpected",
                         )
                     )
-                except (OSError, KeyError, ValueError):
+                except Exception:
                     outcomes.append(
                         RepoOutcome(
                             item.repo,
                             "blocked",
-                            "local publication failed",
-                            item.outcome.base_sha,
+                            "unexpected stage failed: local publication failed",
+                            stage="unexpected",
                         )
                     )
                 _write_report(

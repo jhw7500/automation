@@ -64,6 +64,8 @@ class PullRequest:
     state: str
     base: str
     head: str
+    head_repo: str
+    head_sha: str
     title: str
     body: str
 
@@ -84,9 +86,7 @@ __all__ = (
 def child_env() -> dict[str, str]:
     """Return the operator environment without model/provider credentials."""
 
-    return {
-        key: value for key, value in os.environ.items() if key not in PROVIDER_KEYS
-    }
+    return {key: value for key, value in os.environ.items() if key not in PROVIDER_KEYS}
 
 
 def run(
@@ -113,13 +113,9 @@ def run(
     except (OSError, ValueError):
         launch_failed = True
     if launch_failed:
-        raise FleetGitError(
-            f"command failed ({operation}, rc=unavailable)"
-        ) from None
+        raise FleetGitError(f"command failed ({operation}, rc=unavailable)") from None
     if completed.returncode:
-        raise FleetGitError(
-            f"command failed ({operation}, rc={completed.returncode})"
-        )
+        raise FleetGitError(f"command failed ({operation}, rc={completed.returncode})")
     return completed.stdout.strip()
 
 
@@ -159,9 +155,7 @@ def _validate_branch(branch: str) -> None:
         or any(character in branch for character in forbidden)
         or any(ord(character) < 32 or ord(character) == 127 for character in branch)
         or any(
-            not component
-            or component.startswith(".")
-            or component.endswith(".lock")
+            not component or component.startswith(".") or component.endswith(".lock")
             for component in components
         )
     ):
@@ -246,8 +240,7 @@ def _validate_repository_path(path: Path, repo: str) -> Path:
         or resolved.is_symlink()
         or not git_directory.is_dir()
         or git_directory.is_symlink()
-        or _resolved_without_symlinks(git_directory, "Git directory")
-        != git_directory
+        or _resolved_without_symlinks(git_directory, "Git directory") != git_directory
     ):
         raise FleetGitError("repository does not have clone-shaped Git state")
     return resolved
@@ -261,9 +254,7 @@ def _verify_origin(path: Path, repo: str) -> None:
     ):
         urls = _git(args, cwd=path).splitlines()
         if not urls or any(url not in permitted for url in urls):
-            raise FleetGitError(
-                "repository origin does not match the permitted target"
-            )
+            raise FleetGitError("repository origin does not match the permitted target")
 
 
 def _snapshot_repo(snapshot: RepositorySnapshot) -> tuple[str, Path]:
@@ -277,9 +268,7 @@ def _snapshot_repo(snapshot: RepositorySnapshot) -> tuple[str, Path]:
 
 
 def _inventory(owner: str, repo: str, kind: str) -> frozenset[str]:
-    data = _json(
-        ["gh", kind, "list", "-R", f"{owner}/{repo}", "--json", "name"]
-    )
+    data = _json(["gh", kind, "list", "-R", f"{owner}/{repo}", "--json", "name"])
     if not isinstance(data, list):
         raise FleetGitError("GitHub returned malformed prerequisite inventory")
     names: set[str] = set()
@@ -293,9 +282,7 @@ def _inventory(owner: str, repo: str, kind: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def clone_default_branch(
-    owner: str, repo: str, workspace: Path
-) -> RepositorySnapshot:
+def clone_default_branch(owner: str, repo: str, workspace: Path) -> RepositorySnapshot:
     """Clone exactly one permitted repository and inventory prerequisite names."""
 
     _validate_target(owner, repo)
@@ -306,9 +293,7 @@ def clone_default_branch(
     except OSError:
         pass
     if marker_mode is None:
-        raise FleetGitError(
-            "workspace is not marked for fleet automation"
-        ) from None
+        raise FleetGitError("workspace is not marked for fleet automation") from None
     if (
         workspace.is_symlink()
         or not workspace.is_dir()
@@ -438,27 +423,39 @@ def _pull_request(
         "state": str,
         "baseRefName": str,
         "headRefName": str,
+        "headRefOid": str,
+        "headRepository": dict,
+        "headRepositoryOwner": dict,
         "title": str,
         "body": str,
         "isDraft": bool,
     }
-    if any(
-        key not in item or not isinstance(item[key], expected)
-        for key, expected in fields.items()
-    ) or "mergedAt" not in item:
+    if (
+        any(
+            key not in item or not isinstance(item[key], expected)
+            for key, expected in fields.items()
+        )
+        or "mergedAt" not in item
+    ):
         raise FleetGitError("GitHub returned malformed pull request metadata")
     number = item["number"]
     if isinstance(number, bool) or number < 1:
         raise FleetGitError("GitHub returned malformed pull request metadata")
     expected_url = f"https://github.com/{owner}/{repo}/pull/{number}"
+    expected_head_repo = f"{owner}/{repo}"
     state = item["state"]
     base = item["baseRefName"]
+    head_repository = item["headRepository"]
+    head_repository_owner = item["headRepositoryOwner"]
+    head_sha = item["headRefOid"]
     merged_at = item.get("mergedAt")
     if (
         item["url"] != expected_url
         or state not in {"OPEN", "CLOSED", "MERGED"}
         or not base
         or item["headRefName"] != expected_head
+        or head_repository.get("nameWithOwner") != expected_head_repo
+        or head_repository_owner.get("login") != owner
         or (merged_at is not None and not isinstance(merged_at, str))
         or (state == "MERGED" and not isinstance(merged_at, str))
         or (state == "MERGED" and not merged_at)
@@ -466,12 +463,15 @@ def _pull_request(
     ):
         raise FleetGitError("GitHub returned inconsistent pull request metadata")
     _validate_branch(base)
+    _validate_object_id(head_sha)
     return PullRequest(
         number=number,
         url=item["url"],
         state=state,
         base=base,
         head=item["headRefName"],
+        head_repo=expected_head_repo,
+        head_sha=head_sha,
         title=item["title"],
         body=item["body"],
     )
@@ -494,7 +494,8 @@ def list_rollout_prs(owner: str, repo: str, branch: str) -> tuple[PullRequest, .
             "--state",
             "all",
             "--json",
-            "number,url,state,baseRefName,headRefName,title,body,isDraft,mergedAt",
+            "number,url,state,baseRefName,headRefName,headRefOid,headRepository,"
+            "headRepositoryOwner,title,body,isDraft,mergedAt",
         ]
     )
     if not isinstance(data, list):
@@ -510,6 +511,7 @@ def create_pull_request(
     repo: str,
     base: str,
     head: str,
+    head_sha: str,
     title: str,
     body: str,
 ) -> PullRequest:
@@ -518,6 +520,7 @@ def create_pull_request(
     _validate_target(owner, repo)
     _validate_branch(base)
     _validate_branch(head)
+    head_sha = _validate_object_id(head_sha)
     descriptor, filename = tempfile.mkstemp(prefix="workflow-fleet-pr-", text=True)
     body_path = Path(filename)
     try:
@@ -553,6 +556,8 @@ def create_pull_request(
         state="OPEN",
         base=base,
         head=head,
+        head_repo=f"{owner}/{repo}",
+        head_sha=head_sha,
         title=title,
         body=body,
     )

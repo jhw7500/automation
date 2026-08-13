@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 COMMIT = "1" * 40
 BASE = "2" * 40
 HEAD = "3" * 40
+FRESH_BASE = "4" * 40
+FRESH_HEAD = "5" * 40
 ALL_SECRETS = frozenset(
     {"CLAUDE_CODE_OAUTH_TOKEN", "GEMINI_API_KEY", "ZHIPU_API_KEY", "APP_PRIVATE_KEY"}
 )
@@ -89,6 +91,7 @@ def test_public_report_model_and_exact_release_text() -> None:
         "head_sha",
         "pr_url",
         "changed_paths",
+        "stage",
     ]
     assert rollout.rollout_branch("v1.40") == "automation/common-workflows-v1.40"
     assert rollout.rollout_branch("v2.3.4") == "automation/common-workflows-v2.3.4"
@@ -451,6 +454,248 @@ def test_push_success_pr_failure_preserves_fresh_branch_outcome(
     assert "branch published" in result.detail
 
 
+@pytest.mark.parametrize("stage", ["render", "validation", "branch", "pr"])
+def test_fresh_publication_failures_report_fresh_stage_metadata(
+    tmp_path: Path, bundle: ReleaseBundle, stage: str
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    snap = snapshot(workspace)
+    plan = make_plan()
+
+    def render(*_args, **_kwargs):
+        if stage == "render":
+            raise rollout.RolloutError("render stage sentinel")
+        return plan
+
+    def validate(*_args, **_kwargs):
+        if stage == "validation":
+            raise rollout.CommandError("validation stage sentinel")
+
+    def inspect(*_args, **_kwargs):
+        if stage == "branch":
+            raise rollout.CommandError("branch stage sentinel")
+        return rollout.RolloutInspection("create_branch")
+
+    patches = [
+        mock.patch.object(
+            rollout, "_make_clone_workspace", return_value=nullcontext(str(workspace))
+        ),
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(
+            rollout.fleet_git, "refetch_default", return_value=FRESH_BASE
+        ),
+        mock.patch.object(rollout, "git", return_value=""),
+        mock.patch.object(rollout, "_render", side_effect=render),
+        mock.patch.object(rollout, "validate_managed_result", side_effect=validate),
+        mock.patch.object(rollout, "inspect_rollout", side_effect=inspect),
+        mock.patch.object(rollout, "publish_new_branch", return_value=FRESH_HEAD),
+        mock.patch.object(
+            rollout.fleet_git,
+            "create_pull_request",
+            side_effect=rollout.FleetGitError("PR sentinel"),
+        ),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", return_value=()),
+    ]
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patches[6],
+        patches[7],
+        patches[8],
+        patches[9],
+    ):
+        result = rollout.publish_repository(
+            bundle,
+            workspace,
+            repo="gstApp",
+            bootstrap=False,
+            actionlint=Path("/bin/true"),
+        )
+
+    assert result.status == "blocked"
+    assert result.base_sha == FRESH_BASE
+    assert result.changed_paths == (
+        () if stage == "render" else rollout._changed_paths(plan)
+    )
+    assert result.head_sha == (FRESH_HEAD if stage == "pr" else "")
+    assert result.stage == stage
+    assert stage in result.detail
+
+
+def test_branch_failure_after_commit_reports_the_fresh_prepared_head(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    snap = snapshot(workspace)
+    plan = make_plan()
+    with (
+        mock.patch.object(
+            rollout, "_make_clone_workspace", return_value=nullcontext(str(workspace))
+        ),
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(
+            rollout.fleet_git, "refetch_default", return_value=FRESH_BASE
+        ),
+        mock.patch.object(rollout, "git", return_value=""),
+        mock.patch.object(rollout, "_render", return_value=plan),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(
+            rollout,
+            "inspect_rollout",
+            return_value=rollout.RolloutInspection("create_branch"),
+        ),
+        mock.patch.object(rollout, "construct_rollout_commit", return_value=FRESH_HEAD),
+        mock.patch.object(
+            rollout,
+            "validate_commit_tree",
+            side_effect=rollout.CommandError("commit validation sentinel"),
+        ),
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=None),
+    ):
+        result = rollout.publish_repository(
+            bundle,
+            workspace,
+            repo="gstApp",
+            bootstrap=False,
+            actionlint=Path("/bin/true"),
+        )
+
+    assert result.status == "blocked"
+    assert result.stage == "branch"
+    assert result.base_sha == FRESH_BASE
+    assert result.head_sha == FRESH_HEAD
+    assert result.changed_paths == rollout._changed_paths(plan)
+
+
+def test_publish_journal_uses_fresh_failure_metadata_not_prevalidation_base(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    fresh = rollout.RepoOutcome(
+        "gstApp",
+        "blocked",
+        "publication validation failed: sentinel",
+        FRESH_BASE,
+        "",
+        "",
+        (".github/workflows/claude.yml",),
+        "validation",
+    )
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(
+            rollout,
+            "prevalidate_repository",
+            return_value=prepared("gstApp"),
+        ),
+        mock.patch.object(rollout, "publish_repository", return_value=fresh),
+    ):
+        assert (
+            rollout.main(
+                [
+                    "--mode",
+                    "publish",
+                    "--confirm",
+                    "--workspace",
+                    str(workspace),
+                    "--repo",
+                    "gstApp",
+                ]
+            )
+            == 1
+        )
+    report = json.loads((workspace / "rollout-manifest.json").read_text())
+    assert report[0]["base_sha"] == FRESH_BASE
+    assert report[0]["base_sha"] != BASE
+    assert report[0]["changed_paths"] == [".github/workflows/claude.yml"]
+    assert report[0]["stage"] == "validation"
+
+
+@pytest.mark.parametrize("stage", ["render", "validation", "branch", "pr"])
+def test_main_journals_actual_fresh_stage_failure_after_prevalidation_base_moves(
+    tmp_path: Path, bundle: ReleaseBundle, stage: str
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    snap = snapshot(workspace)
+    plan = make_plan()
+
+    def render(*_args, **_kwargs):
+        if stage == "render":
+            raise rollout.RolloutError("render stage sentinel")
+        return plan
+
+    def validate(*_args, **_kwargs):
+        if stage == "validation":
+            raise rollout.CommandError("validation stage sentinel")
+
+    def inspect(*_args, **_kwargs):
+        if stage == "branch":
+            raise rollout.CommandError("branch stage sentinel")
+        return rollout.RolloutInspection("create_branch")
+
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(
+            rollout, "_make_clone_workspace", return_value=nullcontext(str(workspace))
+        ),
+        mock.patch.object(
+            rollout,
+            "prevalidate_repository",
+            return_value=prepared("gstApp"),
+        ),
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(
+            rollout.fleet_git, "refetch_default", return_value=FRESH_BASE
+        ),
+        mock.patch.object(rollout, "git", return_value=""),
+        mock.patch.object(rollout, "_render", side_effect=render),
+        mock.patch.object(rollout, "validate_managed_result", side_effect=validate),
+        mock.patch.object(rollout, "inspect_rollout", side_effect=inspect),
+        mock.patch.object(rollout, "publish_new_branch", return_value=FRESH_HEAD),
+        mock.patch.object(
+            rollout.fleet_git,
+            "create_pull_request",
+            side_effect=rollout.FleetGitError("PR stage sentinel"),
+        ),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", return_value=()),
+    ):
+        assert (
+            rollout.main(
+                [
+                    "--mode",
+                    "publish",
+                    "--confirm",
+                    "--workspace",
+                    str(workspace),
+                    "--repo",
+                    "gstApp",
+                ]
+            )
+            == 1
+        )
+
+    report = json.loads((workspace / "rollout-manifest.json").read_text())
+    assert report[0]["base_sha"] == FRESH_BASE
+    assert report[0]["base_sha"] != BASE
+    assert report[0]["stage"] == stage
+    assert report[0]["changed_paths"] == (
+        [] if stage == "render" else list(rollout._changed_paths(plan))
+    )
+    assert report[0]["head_sha"] == (FRESH_HEAD if stage == "pr" else "")
+
+
 def test_publish_refetches_each_repo_and_reports_partial_rerunnable_outcomes(
     tmp_path: Path, bundle: ReleaseBundle
 ) -> None:
@@ -530,7 +775,13 @@ def snapshot(tmp_path: Path) -> RepositorySnapshot:
 
 
 def exact_pr(
-    body: str, *, state: str = "OPEN", title: str | None = None, base: str = "main"
+    body: str,
+    *,
+    state: str = "OPEN",
+    title: str | None = None,
+    base: str = "main",
+    head_repo: str = "jhw7500/gstApp",
+    head_sha: str = HEAD,
 ) -> PullRequest:
     return PullRequest(
         7,
@@ -538,6 +789,8 @@ def exact_pr(
         state,
         base,
         "automation/common-workflows-v1.40",
+        head_repo,
+        head_sha,
         title or rollout.pr_title("v1.40"),
         body,
     )
@@ -622,7 +875,9 @@ def test_existing_branch_is_validated_before_pr_read_and_rechecked_afterward(
     assert events == ["branch", "validate", "prs", "branch"]
 
 
-@pytest.mark.parametrize("mismatch", ["base", "title", "body", "closed", "multiple"])
+@pytest.mark.parametrize(
+    "mismatch", ["base", "title", "body", "closed", "multiple", "fork", "head_sha"]
+)
 def test_existing_pr_requires_one_exact_open_match(
     tmp_path: Path, mismatch: str
 ) -> None:
@@ -638,6 +893,10 @@ def test_existing_pr_requires_one_exact_open_match(
         pr = exact_pr("wrong")
     elif mismatch == "closed":
         pr = exact_pr(body, state="CLOSED")
+    elif mismatch == "fork":
+        pr = exact_pr(body, head_repo="fork-owner/gstApp")
+    elif mismatch == "head_sha":
+        pr = exact_pr(body, head_sha="9" * 40)
     prs = (pr, exact_pr(body)) if mismatch == "multiple" else (pr,)
     with (
         mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=HEAD),
@@ -728,6 +987,140 @@ def test_new_commit_tree_rejects_clean_filter_blob_transformation(
             rollout.validate_commit_tree(snap, HEAD, BASE, plan)
 
 
+def initialized_repository(tmp_path: Path) -> tuple[RepositorySnapshot, RenderPlan]:
+    repo = tmp_path / "gstApp"
+    workflow = repo / ".github/workflows/claude.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_bytes(b"old\n")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "baseline"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "baseline@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "add", "--all"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "baseline"], cwd=repo, check=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    plan = RenderPlan(
+        "drift",
+        "one managed file differs",
+        (
+            FileChange(
+                PurePosixPath(".github/workflows/claude.yml"),
+                b"old\n",
+                b"new\n",
+            ),
+        ),
+        frozenset(),
+        frozenset(),
+    )
+    return RepositorySnapshot(repo, "main", base, frozenset(), frozenset()), plan
+
+
+def executable_sentinel(path: Path, marker: Path, *, passthrough: bool) -> None:
+    suffix = "cat\n" if passthrough else "exit 1\n"
+    path.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n{suffix}")
+    path.chmod(0o755)
+
+
+def test_commit_plumbing_never_executes_a_configured_clean_filter(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    snap, plan = initialized_repository(tmp_path)
+    marker = tmp_path / "clean-filter-ran"
+    helper = tmp_path / "clean-filter"
+    executable_sentinel(helper, marker, passthrough=True)
+    (snap.path / ".gitattributes").write_text(
+        ".github/workflows/claude.yml filter=tripwire\n"
+    )
+    subprocess.run(
+        ["git", "config", "filter.tripwire.clean", str(helper)],
+        cwd=snap.path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "filter.tripwire.smudge", "cat"],
+        cwd=snap.path,
+        check=True,
+    )
+
+    head = rollout.construct_rollout_commit(
+        snap, snap.base_sha, "v1.40", plan, bundle.catalog
+    )
+
+    assert not marker.exists()
+    committed = subprocess.run(
+        ["git", "cat-file", "blob", f"{head}:.github/workflows/claude.yml"],
+        cwd=snap.path,
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    assert committed == b"new\n"
+    subprocess.run(
+        [
+            "git",
+            "hash-object",
+            "-w",
+            "--path=.github/workflows/claude.yml",
+            "--stdin",
+        ],
+        cwd=snap.path,
+        check=True,
+        input=b"calibration\n",
+        stdout=subprocess.PIPE,
+    )
+    assert marker.read_text() == "ran"
+
+
+def test_commit_plumbing_never_executes_a_configured_signing_helper(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    snap, plan = initialized_repository(tmp_path)
+    marker = tmp_path / "signing-helper-ran"
+    helper = tmp_path / "signing-helper"
+    executable_sentinel(helper, marker, passthrough=False)
+    subprocess.run(
+        ["git", "config", "commit.gpgSign", "true"], cwd=snap.path, check=True
+    )
+    subprocess.run(
+        ["git", "config", "gpg.program", str(helper)], cwd=snap.path, check=True
+    )
+
+    head = rollout.construct_rollout_commit(
+        snap, snap.base_sha, "v1.40", plan, bundle.catalog
+    )
+
+    assert not marker.exists()
+    metadata = subprocess.run(
+        ["git", "show", "-s", "--format=%P%n%s%n%an%n%ae", head],
+        cwd=snap.path,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.splitlines()
+    assert metadata == [
+        snap.base_sha,
+        rollout.pr_title("v1.40"),
+        "workflow-fleet",
+        "workflow-fleet@invalid",
+    ]
+    calibration = subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "calibration"],
+        cwd=snap.path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert calibration.returncode != 0
+    assert marker.read_text() == "ran"
+
+
 def test_new_branch_publication_uses_only_exact_non_force_refspec(
     tmp_path: Path, bundle: ReleaseBundle
 ) -> None:
@@ -749,8 +1142,8 @@ def test_new_branch_publication_uses_only_exact_non_force_refspec(
         mock.patch.object(rollout, "git", side_effect=git),
         mock.patch.object(
             rollout,
-            "apply_release_plan",
-            return_value=tuple(item.path for item in plan.changes),
+            "construct_rollout_commit",
+            return_value=HEAD,
         ),
         mock.patch.object(rollout, "validate_commit_tree"),
         mock.patch.object(rollout, "validate_managed_result"),
@@ -809,10 +1202,8 @@ def test_new_branch_revalidates_before_applying_to_the_publish_clone(
         ),
         mock.patch.object(
             rollout,
-            "apply_release_plan",
-            side_effect=lambda *_a, **_k: (
-                events.append("apply") or tuple(item.path for item in plan.changes)
-            ),
+            "construct_rollout_commit",
+            side_effect=lambda *_a, **_k: events.append("construct") or HEAD,
         ),
         mock.patch.object(rollout, "validate_commit_tree"),
         mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=None),
@@ -821,7 +1212,7 @@ def test_new_branch_revalidates_before_applying_to_the_publish_clone(
             snap, BASE, "v1.40", COMMIT, plan, Path("/bin/true"), bundle=bundle
         )
 
-    assert events == ["validate", "apply"]
+    assert events == ["validate", "construct"]
 
 
 def test_accepted_push_with_lost_response_is_reconciled_as_success(
@@ -842,7 +1233,7 @@ def test_accepted_push_with_lost_response_is_reconciled_as_success(
     with (
         mock.patch.object(rollout, "git", side_effect=git),
         mock.patch.object(rollout, "validate_managed_result"),
-        mock.patch.object(rollout, "apply_release_plan"),
+        mock.patch.object(rollout, "construct_rollout_commit", return_value=HEAD),
         mock.patch.object(rollout, "validate_commit_tree"),
         mock.patch.object(
             rollout.fleet_git,
@@ -926,6 +1317,54 @@ def test_actionlint_is_fail_closed_and_receives_only_managed_files(
     assert all("project-owned.yml" not in item for item in action_call)
 
 
+def test_actionlint_child_receives_only_a_fixed_credential_free_environment(
+    tmp_path: Path, bundle: ReleaseBundle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "gstApp"
+    workflow = repo / ".github/workflows/claude.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("on: push\n")
+    actionlint = tmp_path / "actionlint"
+    actionlint.write_text("#!/bin/sh\nexit 0\n")
+    actionlint.chmod(0o755)
+    sensitive = {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "ZHIPU_API_KEY",
+        "APP_PRIVATE_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "UNRELATED_OPERATOR_SECRET",
+    }
+    for key in sensitive:
+        monkeypatch.setenv(key, f"sentinel-{key}")
+    observed: list[dict[str, object]] = []
+
+    def child(args, **kwargs):
+        observed.append({"args": list(args), **kwargs})
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    with mock.patch("scripts.rollout_workflow_fleet.subprocess.run", side_effect=child):
+        rollout._run_actionlint(actionlint.resolve(), repo, bundle)
+
+    assert len(observed) == 1
+    call = observed[0]
+    assert call["args"][0] == str(actionlint.resolve())
+    env = call["env"]
+    assert isinstance(env, dict)
+    assert set(env) == {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"}
+    assert env == {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(repo),
+        "TMPDIR": str(repo),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    assert not any(str(value).startswith("sentinel-") for value in env.values())
+
+
 def test_managed_result_passes_yaml_catalog_diff_and_local_actionlint_gates(
     tmp_path: Path, bundle: ReleaseBundle
 ) -> None:
@@ -999,7 +1438,38 @@ def test_initialize_workspace_rejects_a_symlinked_parent_before_bundle_load(
                 ]
             )
         load.assert_not_called()
-    assert not (real_parent / "fleet" / ".automation-fleet-workspace").exists()
+    assert list(real_parent.iterdir()) == []
+
+
+def test_initialize_workspace_cleans_up_created_directories_after_marker_failure(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "new-parent" / "fleet"
+    original_write = Path.write_text
+
+    def fail_marker(path: Path, *args, **kwargs):
+        if path.name == rollout.WORKSPACE_MARKER:
+            raise OSError("marker write sentinel")
+        return original_write(path, *args, **kwargs)
+
+    with (
+        mock.patch.object(Path, "write_text", fail_marker),
+        mock.patch.object(rollout, "materialize_release_bundle") as load,
+    ):
+        with pytest.raises(SystemExit):
+            rollout.main(
+                [
+                    "--mode",
+                    "plan",
+                    "--workspace",
+                    str(workspace),
+                    "--initialize-workspace",
+                    "--repo",
+                    "gstApp",
+                ]
+            )
+        load.assert_not_called()
+    assert not (tmp_path / "new-parent").exists()
 
 
 def test_manifest_sink_is_prevalidated_before_any_publish(
@@ -1062,6 +1532,109 @@ def test_new_pull_request_is_attested_against_branch_and_exact_pr_metadata(
     ):
         with pytest.raises(rollout.CommandError, match="branch"):
             rollout.attest_pull_request(snap, "v1.40", COMMIT, HEAD, changed, request)
+
+
+@pytest.mark.parametrize(
+    "observed",
+    [
+        exact_pr(
+            rollout.pr_body("v1.40", COMMIT, (".github/workflows/claude.yml",)),
+            head_repo="fork-owner/gstApp",
+        ),
+        exact_pr(
+            rollout.pr_body("v1.40", COMMIT, (".github/workflows/claude.yml",)),
+            head_sha="9" * 40,
+        ),
+    ],
+)
+def test_created_pr_attestation_rejects_fork_or_wrong_head_oid(
+    tmp_path: Path, observed: PullRequest
+) -> None:
+    snap = snapshot(tmp_path)
+    changed = (".github/workflows/claude.yml",)
+    with (
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=HEAD),
+        mock.patch.object(
+            rollout.fleet_git, "list_rollout_prs", return_value=(observed,)
+        ),
+    ):
+        with pytest.raises(rollout.CommandError, match="attestation"):
+            rollout.attest_pull_request(snap, "v1.40", COMMIT, HEAD, changed, observed)
+
+
+@pytest.mark.parametrize(
+    "reconciled",
+    [
+        exact_pr(
+            rollout.pr_body(
+                "v1.40",
+                COMMIT,
+                (
+                    ".github/workflows/a.yml",
+                    ".github/workflows/deleted.yml",
+                ),
+            ),
+            head_repo="fork-owner/gstApp",
+            head_sha=FRESH_HEAD,
+        ),
+        exact_pr(
+            rollout.pr_body(
+                "v1.40",
+                COMMIT,
+                (
+                    ".github/workflows/a.yml",
+                    ".github/workflows/deleted.yml",
+                ),
+            ),
+            head_sha="9" * 40,
+        ),
+    ],
+)
+def test_pr_creation_reconciliation_rejects_fork_or_wrong_head_oid(
+    tmp_path: Path, bundle: ReleaseBundle, reconciled: PullRequest
+) -> None:
+    workspace = marked_workspace(tmp_path)
+    snap = snapshot(workspace)
+    plan = make_plan()
+    with (
+        mock.patch.object(
+            rollout, "_make_clone_workspace", return_value=nullcontext(str(workspace))
+        ),
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(
+            rollout.fleet_git, "refetch_default", return_value=FRESH_BASE
+        ),
+        mock.patch.object(rollout, "git", return_value=""),
+        mock.patch.object(rollout, "_render", return_value=plan),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(
+            rollout,
+            "inspect_rollout",
+            return_value=rollout.RolloutInspection("create_branch"),
+        ),
+        mock.patch.object(rollout, "publish_new_branch", return_value=FRESH_HEAD),
+        mock.patch.object(
+            rollout.fleet_git,
+            "create_pull_request",
+            side_effect=rollout.FleetGitError("command failed (gh, rc=1)"),
+        ),
+        mock.patch.object(
+            rollout.fleet_git, "list_rollout_prs", return_value=(reconciled,)
+        ),
+        mock.patch.object(
+            rollout.fleet_git, "remote_branch_sha", return_value=FRESH_HEAD
+        ),
+    ):
+        result = rollout.publish_repository(
+            bundle,
+            workspace,
+            repo="gstApp",
+            bootstrap=False,
+            actionlint=Path("/bin/true"),
+        )
+    assert result.status == "blocked"
+    assert result.base_sha == FRESH_BASE
+    assert result.head_sha == FRESH_HEAD
 
 
 def test_release_aware_applier_uses_bundle_catalog_not_current_checkout(
