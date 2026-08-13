@@ -40,6 +40,9 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
        github.event.pull_request.user.login == github.event.sender.login)
     runs-on: ubuntu-latest
+    env:
+      # This job intentionally does not checkout the repository. Give gh explicit context.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Determine PR number
         id: pr

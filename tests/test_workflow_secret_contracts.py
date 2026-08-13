@@ -179,6 +179,14 @@ class WorkflowSecretContractsTest(unittest.TestCase):
                 text = path.read_text(encoding="utf-8")
                 self.assertIn("inputs.app_id || vars.APP_ID", text)
 
+    def test_auto_rereview_gh_cli_has_repository_context_without_checkout(self) -> None:
+        workflow = load_workflow(WORKFLOWS / "auto-rereview-request.yml")
+        job = workflow["jobs"]["notify-reviewers"]
+        self.assertEqual("${{ github.repository }}", job["env"]["GH_REPO"])
+        self.assertFalse(
+            any("actions/checkout@" in step.get("uses", "") for step in job["steps"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
