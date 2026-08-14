@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -623,6 +624,159 @@ def test_release_verification_docs_define_the_public_hermetic_git_boundary() -> 
     assert "GIT_ALLOW_PROTOCOL=https" in plan
     assert "/usr/bin/git -C / ls-remote" in plan
     assert "git ls-remote --tags origin refs/tags/v1.40" not in plan
+
+
+def test_patch_tag_github_api_uses_an_empty_environment_and_private_fd() -> None:
+    rollout = ROLLOUT_DOC.read_text(encoding="utf-8")
+    release_shell = rollout.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    github_api = release_shell.split("github_api() (", 1)[1].split(
+        "\nverify_annotated_tag()", 1
+    )[0]
+
+    assert "/usr/bin/python3 -I -S -B -c" in release_shell
+    assert 'os.execve(\n    "/bin/bash"' in release_shell
+    assert '["/bin/bash", "--noprofile", "--norc", "-s"]' in release_shell
+    assert "read_fd, write_fd = os.pipe()" in release_shell
+    assert "<<'PATCH_RELEASE_BASH'" in release_shell
+    assert release_shell.rstrip().endswith("PATCH_RELEASE_BASH")
+    assert "/usr/bin/env -i /usr/bin/python3 -I -S -B -c" in github_api
+    assert '3<<<"$RELEASE_GITHUB_TOKEN"' in github_api
+    assert 'with os.fdopen(3, "rb") as source:' in github_api
+    assert 'args = ["/usr/bin/gh", "api", "--hostname", "github.com"' in github_api
+    assert "os.execve(args[0], args, environment)" in github_api
+    assert "compgen -e" not in github_api
+    assert "export -n" not in github_api
+    assert "\n  exec " not in github_api
+
+
+def test_patch_tag_github_api_ignores_exported_exec_and_env_functions(
+    tmp_path: Path,
+) -> None:
+    rollout = ROLLOUT_DOC.read_text(encoding="utf-8")
+    release_shell = rollout.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    start = release_shell.index("github_api() (")
+    end = release_shell.index("\nverify_annotated_tag()", start)
+    github_api = release_shell[start:end]
+
+    capture = tmp_path / "capture.json"
+    fake_gh = tmp_path / "gh"
+    fake_gh.write_text(
+        "#!/usr/bin/python3\n"
+        "import json, os, pathlib, sys\n"
+        f"pathlib.Path({str(capture)!r}).write_text(\n"
+        "    json.dumps({'argv': sys.argv, 'env': dict(os.environ)}),\n"
+        "    encoding='utf-8',\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    github_api = github_api.replace('"/usr/bin/gh"', json.dumps(str(fake_gh)))
+    script = tmp_path / "run.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        "TOKEN_KEY=GITHUB_TOKEN\n"
+        "RELEASE_GITHUB_TOKEN=$GITHUB_TOKEN\n"
+        f"{github_api}\n"
+        "github_api rate_limit\n"
+    )
+
+    exec_marker = tmp_path / "exec-called"
+    env_marker = tmp_path / "env-called"
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "GITHUB_TOKEN": "github-token-sentinel",
+        "BASH_FUNC_exec%%": (
+            f"() {{ /usr/bin/printf called > {str(exec_marker)!r}; return 97; }}"
+        ),
+        "BASH_FUNC_env%%": (
+            f"() {{ /usr/bin/printf called > {str(env_marker)!r}; return 98; }}"
+        ),
+    }
+    completed = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", str(script)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not exec_marker.exists()
+    assert not env_marker.exists()
+    observed = json.loads(capture.read_text(encoding="utf-8"))
+    assert observed["argv"] == [
+        str(fake_gh),
+        "api",
+        "--hostname",
+        "github.com",
+        "rate_limit",
+    ]
+    assert observed["env"] == {
+        "GITHUB_TOKEN": "github-token-sentinel",
+        "HOME": "/nonexistent/automation-workflow-release/home",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "XDG_CONFIG_HOME": "/nonexistent/automation-workflow-release/xdg",
+    }
+
+
+def test_patch_tag_launcher_blocks_parent_xtrace_and_exported_functions(
+    tmp_path: Path,
+) -> None:
+    rollout = ROLLOUT_DOC.read_text(encoding="utf-8")
+    release_shell = rollout.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    launcher = release_shell.split(" <<'PATCH_RELEASE_BASH'", 1)[0]
+    token_capture = tmp_path / "token"
+    environment_capture = tmp_path / "environment"
+    exec_marker = tmp_path / "exec-called"
+    env_marker = tmp_path / "env-called"
+    set_marker = tmp_path / "set-called"
+    script = tmp_path / "launch.sh"
+    script.write_text(
+        f"{launcher} <<'PATCH_RELEASE_BASH'\n"
+        "IFS= read -r observed <&3\n"
+        f"/usr/bin/printf '%s' \"$observed\" > {str(token_capture)!r}\n"
+        f"/usr/bin/env > {str(environment_capture)!r}\n"
+        "PATCH_RELEASE_BASH\n",
+        encoding="utf-8",
+    )
+    token = "github-token-sentinel"
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "GITHUB_TOKEN": token,
+        "EXPECTED_PATCH_MERGE_SHA": "a" * 40,
+        "PROVIDER_SENTINEL": "must-not-reach-clean-bash",
+        "BASH_FUNC_exec%%": (
+            f"() {{ /usr/bin/printf called > {str(exec_marker)!r}; return 97; }}"
+        ),
+        "BASH_FUNC_env%%": (
+            f"() {{ /usr/bin/printf called > {str(env_marker)!r}; return 98; }}"
+        ),
+        "BASH_FUNC_set%%": (
+            f"() {{ /usr/bin/printf called > {str(set_marker)!r}; return 99; }}"
+        ),
+    }
+    completed = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-x", str(script)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert token not in completed.stdout
+    assert token not in completed.stderr
+    assert token_capture.read_text(encoding="utf-8") == token
+    assert not exec_marker.exists()
+    assert not env_marker.exists()
+    assert not set_marker.exists()
+    child_environment = environment_capture.read_text(encoding="utf-8")
+    assert "PROVIDER_SENTINEL=" not in child_environment
+    assert "BASH_FUNC_" not in child_environment
+    assert "GH_TOKEN=" not in child_environment
+    assert "GITHUB_TOKEN=" not in child_environment
 
 
 def test_task9_binds_release_creation_to_exact_github_repository_and_main() -> None:

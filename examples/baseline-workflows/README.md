@@ -51,7 +51,7 @@ The bootstrap config disables every common caller. For an existing repository, t
 renderer preserves comments, formatting, and all config keys except the release identity:
 
 ```yaml
-automation_ref: v1.40
+automation_ref: v1.40.1
 automation_commit: 0123456789abcdef0123456789abcdef01234567
 ```
 

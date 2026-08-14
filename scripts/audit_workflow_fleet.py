@@ -120,7 +120,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--automation", type=Path, default=ROOT)
     parser.add_argument("--workspace", type=Path, required=True)
-    parser.add_argument("--ref", default="v1.40")
+    parser.add_argument("--ref", default="v1.40.1")
     parser.add_argument("--repo", action="append", default=[])
     return parser
 

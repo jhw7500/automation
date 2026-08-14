@@ -33,7 +33,7 @@ uses: jhw7500/automation/.github/workflows/gemini-review.yml@0123456789abcdef012
 Tag text is retained only as human-readable identity in the consumer config:
 
 ```yaml
-automation_ref: v1.40
+automation_ref: v1.40.1
 automation_commit: 0123456789abcdef0123456789abcdef01234567
 ```
 

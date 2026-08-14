@@ -1517,6 +1517,21 @@ def test_rejects_coordinated_drift_from_approved_v140_policy(
         verify_release(repo, "v1.40", bad_commit)
 
 
+def test_patch_release_must_preserve_the_approved_v140_policy(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, _ = release_repo
+    config_path = repo / "scripts/workflow-config.json"
+    config = load_json(config_path)
+    config["automation_ref"] = "v1.40.1"
+    write_json(config_path, config)
+    bad_commit = commit(repo, "patch policy drift")
+    git(repo, "tag", "-a", "v1.40.1", "-m", "v1.40.1")
+
+    with pytest.raises(ReleaseVerificationError, match="approved v1.40 policy"):
+        verify_release(repo, "v1.40.1", bad_commit)
+
+
 @pytest.mark.parametrize(
     ("filename", "old", "new", "error", "count"),
     [

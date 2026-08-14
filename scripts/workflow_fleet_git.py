@@ -668,7 +668,7 @@ def create_rollout_branch(
         {
             "author": _commit_identity(),
             "committer": _commit_identity(),
-            "message": commit.message,
+            "message": f"{commit.message}\n",
             "parents": [commit.base_sha],
             "tree": commit.tree_sha,
         },

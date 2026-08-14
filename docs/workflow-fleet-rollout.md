@@ -5,9 +5,14 @@ managed diff, validates it, atomically creates a deterministic repository branch
 a pull request. It never merges, reverts, forces, updates a default branch, or writes an
 Actions secret or variable.
 
-The release input is an immutable annotated automation tag. For `v1.40`, the local and
+The release input is an immutable annotated automation tag. For `v1.40.1`, the local and
 remote tag objects must agree and resolve to one verified commit before any consumer is
 processed. Rendered callers pin that 40-character commit rather than the tag text.
+
+`v1.40.1` is the immutable tooling patch for the initial `v1.40` release. The `v1.40`
+tag remains unchanged, but its fleet publisher omitted the terminal newline required to
+make GitHub's commit object match the locally computed SHA. Do not publish consumer refs
+with the `v1.40` tool; use `v1.40.1` for plan, publish, and audit.
 
 ## Workflow PR rollout
 
@@ -45,22 +50,265 @@ CI pins and verifies actionlint itself, then runs its YAML schema and expression
 of optional host ShellCheck/Pyflakes installations; actionlint's own diagnostics remain
 fail-closed. The rollout validator uses the same actionlint boundary for managed callers.
 
+### Publish the `v1.40.1` patch tag
+
+After the patch PR is human-merged, publish `v1.40.1` from the new public `main`. The
+historical `v1.40` direct and peeled identities are fixed below and must remain unchanged.
+The patch ref must be absent before the first write. This procedure creates one annotated
+tag object and then one create-only ref through the literal GitHub API; it never uses Git
+push or an ambient remote for publication. Export `EXPECTED_PATCH_MERGE_SHA` from the
+human-reviewed patch PR merge result; the procedure rejects the old `v1.40` commit and any
+public `main` that does not equal that external review anchor. Authentication requires
+exactly one existing `GH_TOKEN` or `GITHUB_TOKEN`. An isolated standard-library launcher
+selects only that token and the reviewed merge anchor from the operator environment, passes
+the token through a private file descriptor rather than an argument, and replaces itself
+with a clean Bash process. The clean process uses a second isolated broker to replace itself
+with the absolute GitHub CLI under an exact environment containing only that selected token
+and fixed runtime variables. Parent shell tracing and exported functions therefore cannot
+observe or intercept the release body.
+
+```bash
+/usr/bin/python3 -I -S -B -c '
+import os
+import re
+
+token_keys = [key for key in ("GH_TOKEN", "GITHUB_TOKEN") if os.environ.get(key)]
+if len(token_keys) != 1:
+    os.write(2, b"ERROR: exactly one GitHub token variable is required\n")
+    raise SystemExit(1)
+token_key = token_keys[0]
+try:
+    token = os.environ[token_key].encode("ascii")
+except UnicodeEncodeError:
+    raise SystemExit(1) from None
+if not 0 < len(token) <= 4096 or b"\n" in token or b"\r" in token:
+    raise SystemExit(1)
+expected = os.environ.get("EXPECTED_PATCH_MERGE_SHA", "")
+if (
+    re.fullmatch(r"[0-9a-f]{40}", expected) is None
+    or expected == "3127d6a8e238bb426603d4b0feb5c7dd88299326"
+):
+    os.write(2, b"ERROR: reviewed patch merge identity is invalid\n")
+    raise SystemExit(1)
+read_fd, write_fd = os.pipe()
+try:
+    os.write(write_fd, token + b"\n")
+finally:
+    os.close(write_fd)
+if read_fd == 3:
+    os.set_inheritable(3, True)
+else:
+    os.dup2(read_fd, 3, inheritable=True)
+    os.close(read_fd)
+os.closerange(4, os.sysconf("SC_OPEN_MAX"))
+environment = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent/automation-workflow-release/home",
+    "XDG_CONFIG_HOME": "/nonexistent/automation-workflow-release/xdg",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "TOKEN_KEY": token_key,
+    "EXPECTED_PATCH_MERGE_SHA": expected,
+}
+os.execve(
+    "/bin/bash",
+    ["/bin/bash", "--noprofile", "--norc", "-s"],
+    environment,
+)
+' <<'PATCH_RELEASE_BASH'
+set -euo pipefail
+IFS= read -r RELEASE_GITHUB_TOKEN <&3
+if IFS= read -r _ <&3; then
+  printf '%s\n' 'ERROR: GitHub token must be a single line' >&2
+  exit 1
+fi
+exec 3<&-
+[[ -n "$RELEASE_GITHUB_TOKEN" && "$RELEASE_GITHUB_TOKEN" != *$'\r'* ]]
+AUTOMATION_URL=https://github.com/jhw7500/automation.git
+PATCH_CHECKOUT=/tmp/automation-v1.40.1-pretag
+[[ "$EXPECTED_PATCH_MERGE_SHA" =~ ^[0-9a-f]{40}$ \
+    && "$EXPECTED_PATCH_MERGE_SHA" != \
+      3127d6a8e238bb426603d4b0feb5c7dd88299326 ]]
+[[ ! -e "$PATCH_CHECKOUT" && ! -L "$PATCH_CHECKOUT" ]]
+
+public_git() {
+  /usr/bin/env -i PATH=/usr/bin:/bin \
+    HOME=/nonexistent/automation-workflow-release/home \
+    XDG_CONFIG_HOME=/nonexistent/automation-workflow-release/xdg \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+    GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false GCM_INTERACTIVE=Never \
+    GIT_ALLOW_PROTOCOL=https GIT_PROTOCOL_FROM_USER=0 \
+    GIT_CEILING_DIRECTORIES=/ \
+    /usr/bin/git -C / "$@"
+}
+
+github_api() (
+  /usr/bin/env -i /usr/bin/python3 -I -S -B -c '
+import os
+import sys
+
+if len(sys.argv) < 2 or sys.argv[1] not in {"GH_TOKEN", "GITHUB_TOKEN"}:
+    raise SystemExit(2)
+with os.fdopen(3, "rb") as source:
+    secret = source.read(4098)
+os.closerange(3, os.sysconf("SC_OPEN_MAX"))
+if (
+    not 1 < len(secret) <= 4097
+    or not secret.endswith(b"\n")
+    or b"\n" in secret[:-1]
+    or b"\r" in secret
+):
+    raise SystemExit(2)
+try:
+    token = secret[:-1].decode("ascii")
+except UnicodeDecodeError:
+    raise SystemExit(2)
+args = ["/usr/bin/gh", "api", "--hostname", "github.com", *sys.argv[2:]]
+environment = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent/automation-workflow-release/home",
+    "XDG_CONFIG_HOME": "/nonexistent/automation-workflow-release/xdg",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    sys.argv[1]: token,
+}
+os.execve(args[0], args, environment)
+' "$TOKEN_KEY" "$@" 3<<<"$RELEASE_GITHUB_TOKEN"
+)
+
+verify_annotated_tag() {
+  local tag="$1" expected_direct="$2" expected_peeled="$3" lines="$4"
+  local sha ref extra direct_count=0 peeled_count=0
+  while IFS=$'\t' read -r sha ref extra; do
+    [[ "$sha" =~ ^[0-9a-f]{40}$ && -z "${extra:-}" ]]
+    if [[ "$ref" == "refs/tags/$tag" ]]; then
+      [[ "$sha" == "$expected_direct" ]]
+      direct_count=$((direct_count + 1))
+    elif [[ "$ref" == "refs/tags/$tag^{}" ]]; then
+      [[ "$sha" == "$expected_peeled" ]]
+      peeled_count=$((peeled_count + 1))
+    else
+      return 1
+    fi
+  done <<< "$lines"
+  [[ "$direct_count" -eq 1 && "$peeled_count" -eq 1 ]]
+}
+
+OLD_TAGS="$(public_git ls-remote --tags "$AUTOMATION_URL" \
+  refs/tags/v1.40 'refs/tags/v1.40^{}')"
+verify_annotated_tag v1.40 \
+  9df0887ddfd43bb2dd96541a1b5d7147688e0471 \
+  3127d6a8e238bb426603d4b0feb5c7dd88299326 "$OLD_TAGS"
+
+PATCH_TAGS="$(public_git ls-remote --tags "$AUTOMATION_URL" \
+  refs/tags/v1.40.1 'refs/tags/v1.40.1^{}')"
+[[ -z "$PATCH_TAGS" ]]
+
+REMOTE_MAIN="$(public_git ls-remote --heads "$AUTOMATION_URL" refs/heads/main)"
+[[ -n "$REMOTE_MAIN" && "$REMOTE_MAIN" != *$'\n'* ]]
+IFS=$'\t' read -r MERGE_SHA MAIN_REF MAIN_EXTRA <<< "$REMOTE_MAIN"
+[[ "$MERGE_SHA" =~ ^[0-9a-f]{40}$ \
+    && "$MAIN_REF" == refs/heads/main \
+    && -z "${MAIN_EXTRA:-}" \
+    && "$MERGE_SHA" == "$EXPECTED_PATCH_MERGE_SHA" ]]
+
+public_git clone --no-recurse-submodules "$AUTOMATION_URL" "$PATCH_CHECKOUT"
+patch_git() {
+  /usr/bin/env -i PATH=/usr/bin:/bin \
+    HOME=/nonexistent/automation-workflow-release/home \
+    XDG_CONFIG_HOME=/nonexistent/automation-workflow-release/xdg \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+    GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false GCM_INTERACTIVE=Never \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+    /usr/bin/git -C "$PATCH_CHECKOUT" "$@"
+}
+[[ "$(patch_git rev-parse --is-shallow-repository)" == false ]]
+[[ "$(patch_git rev-parse --verify refs/heads/main)" == \
+  "$EXPECTED_PATCH_MERGE_SHA" ]]
+[[ "$(patch_git rev-parse --verify refs/remotes/origin/main)" == \
+  "$EXPECTED_PATCH_MERGE_SHA" ]]
+(
+  cd "$PATCH_CHECKOUT"
+  /usr/bin/env -i PATH=/usr/bin:/bin \
+    HOME=/nonexistent/automation-workflow-release/home \
+    XDG_CONFIG_HOME=/nonexistent/automation-workflow-release/xdg \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    /usr/bin/python3 -m scripts.verify_workflow_release \
+    --automation "$PATCH_CHECKOUT" --ref v1.40.1 \
+    --expected-commit "$EXPECTED_PATCH_MERGE_SHA" --commit-only
+)
+
+PREWRITE_MAIN="$(public_git ls-remote --heads \
+  "$AUTOMATION_URL" refs/heads/main)"
+[[ "$PREWRITE_MAIN" == "$REMOTE_MAIN" ]]
+PREWRITE_PATCH_TAGS="$(public_git ls-remote --tags "$AUTOMATION_URL" \
+  refs/tags/v1.40.1 'refs/tags/v1.40.1^{}')"
+[[ -z "$PREWRITE_PATCH_TAGS" ]]
+
+TAG_RESULT="$(
+  github_api --method POST \
+    repos/jhw7500/automation/git/tags \
+    -f tag=v1.40.1 \
+    -f message='automation workflow release v1.40.1' \
+    -f object="$EXPECTED_PATCH_MERGE_SHA" \
+    -f type=commit \
+    --jq '[.sha, .tag, .object.sha, .object.type] | @tsv'
+)"
+IFS=$'\t' read -r TAG_SHA TAG_NAME TAG_COMMIT TAG_TYPE TAG_EXTRA <<< "$TAG_RESULT"
+[[ "$TAG_SHA" =~ ^[0-9a-f]{40}$ \
+    && "$TAG_NAME" == v1.40.1 \
+    && "$TAG_COMMIT" == "$EXPECTED_PATCH_MERGE_SHA" \
+    && "$TAG_TYPE" == commit \
+    && -z "${TAG_EXTRA:-}" ]]
+
+REF_RESULT="$(
+  github_api --method POST \
+    repos/jhw7500/automation/git/refs \
+    -f ref=refs/tags/v1.40.1 \
+    -f sha="$TAG_SHA" \
+    --jq '[.ref, .object.sha] | @tsv'
+)"
+IFS=$'\t' read -r CREATED_REF CREATED_SHA REF_EXTRA <<< "$REF_RESULT"
+[[ "$CREATED_REF" == refs/tags/v1.40.1 \
+    && "$CREATED_SHA" == "$TAG_SHA" \
+    && -z "${REF_EXTRA:-}" ]]
+
+POST_PATCH_TAGS="$(public_git ls-remote --tags "$AUTOMATION_URL" \
+  refs/tags/v1.40.1 'refs/tags/v1.40.1^{}')"
+verify_annotated_tag v1.40.1 \
+  "$TAG_SHA" "$EXPECTED_PATCH_MERGE_SHA" "$POST_PATCH_TAGS"
+POST_OLD_TAGS="$(public_git ls-remote --tags "$AUTOMATION_URL" \
+  refs/tags/v1.40 'refs/tags/v1.40^{}')"
+verify_annotated_tag v1.40 \
+  9df0887ddfd43bb2dd96541a1b5d7147688e0471 \
+  3127d6a8e238bb426603d4b0feb5c7dd88299326 "$POST_OLD_TAGS"
+PATCH_RELEASE_BASH
+```
+
+A concurrent patch-ref creation makes the ref POST fail without moving it. The tag object
+created immediately before that failure is content-addressed and harmless. Never move or
+delete either release ref.
+
 After the immutable tag is published, do not run from the pre-merge checkout, which has no
-local `v1.40`. Materialize one full public clone from the literal canonical HTTPS URL in a
+local `v1.40.1`. Materialize one full public clone from the literal canonical HTTPS URL in a
 configuration-free, credential-free environment. The fixed clone and fleet paths must be
 absent, including dangling symlinks; clear only a previously reviewed disposable path in a
 separate operator step. The clone intentionally has no depth, filter, or single-branch flag:
 
 ```bash
 set -euo pipefail
-export AUTOMATION_RELEASE_ROOT=/tmp/automation-v1.40-public
-export FLEET_WORKSPACE=/tmp/automation-v1.40-fleet
+export AUTOMATION_RELEASE_ROOT=/tmp/automation-v1.40.1-public
+export FLEET_WORKSPACE=/tmp/automation-v1.40.1-fleet
 export ACTIONLINT=/tmp/actionlint-v1.7.12/actionlint
 [[ ! -e "$AUTOMATION_RELEASE_ROOT" && ! -L "$AUTOMATION_RELEASE_ROOT" ]]
 [[ ! -e "$FLEET_WORKSPACE" && ! -L "$FLEET_WORKSPACE" ]]
 
 public_git() {
-  env -i PATH=/usr/bin:/bin \
+  /usr/bin/env -i PATH=/usr/bin:/bin \
     HOME=/nonexistent/automation-workflow-release/home \
     XDG_CONFIG_HOME=/nonexistent/automation-workflow-release/xdg \
     LANG=C.UTF-8 LC_ALL=C.UTF-8 \
@@ -74,7 +322,7 @@ public_git clone --no-recurse-submodules \
   https://github.com/jhw7500/automation.git "$AUTOMATION_RELEASE_ROOT"
 
 release_git() {
-  env -i PATH=/usr/bin:/bin \
+  /usr/bin/env -i PATH=/usr/bin:/bin \
     HOME=/nonexistent/automation-workflow-release/home \
     XDG_CONFIG_HOME=/nonexistent/automation-workflow-release/xdg \
     LANG=C.UTF-8 LC_ALL=C.UTF-8 \
@@ -98,7 +346,7 @@ IFS=$'\t' read -r EXPECTED_MAIN MAIN_REF MAIN_EXTRA <<< "$REMOTE_MAIN"
     && "$MAIN_REF" == refs/heads/main && -z "${MAIN_EXTRA:-}" ]]
 REMOTE_TAGS="$(public_git ls-remote --tags \
   https://github.com/jhw7500/automation.git \
-  refs/tags/v1.40 'refs/tags/v1.40^{}')"
+  refs/tags/v1.40.1 'refs/tags/v1.40.1^{}')"
 EXPECTED_TAG=
 EXPECTED_PEELED=
 DIRECT_COUNT=0
@@ -106,11 +354,11 @@ PEELED_COUNT=0
 while IFS=$'\t' read -r SHA REF EXTRA; do
   [[ "$SHA" =~ ^[0-9a-f]{40}$ && -z "${EXTRA:-}" ]]
   case "$REF" in
-    refs/tags/v1.40)
+    refs/tags/v1.40.1)
       EXPECTED_TAG="$SHA"
       DIRECT_COUNT=$((DIRECT_COUNT + 1))
       ;;
-    refs/tags/v1.40^\{\})
+    refs/tags/v1.40.1^\{\})
       EXPECTED_PEELED="$SHA"
       PEELED_COUNT=$((PEELED_COUNT + 1))
       ;;
@@ -121,16 +369,17 @@ done <<< "$REMOTE_TAGS"
     && "$EXPECTED_PEELED" == "$EXPECTED_MAIN" ]]
 [[ "$(release_git rev-parse --verify refs/heads/main)" == "$EXPECTED_MAIN" ]]
 [[ "$(release_git rev-parse --verify refs/remotes/origin/main)" == "$EXPECTED_MAIN" ]]
-[[ "$(release_git rev-parse --verify refs/tags/v1.40)" == "$EXPECTED_TAG" ]]
-[[ "$(release_git rev-parse --verify 'refs/tags/v1.40^{}')" == "$EXPECTED_PEELED" ]]
+[[ "$(release_git rev-parse --verify refs/tags/v1.40.1)" == "$EXPECTED_TAG" ]]
+[[ "$(release_git rev-parse --verify 'refs/tags/v1.40.1^{}')" == "$EXPECTED_PEELED" ]]
 (cd "$AUTOMATION_RELEASE_ROOT" && python3 -m scripts.verify_workflow_release \
-  --automation "$AUTOMATION_RELEASE_ROOT" --ref v1.40 \
+  --automation "$AUTOMATION_RELEASE_ROOT" --ref v1.40.1 \
   --expected-commit "$EXPECTED_MAIN")
 ```
 
-The normative Task 9 block contains the same exact sequence. Every command below executes
-the released script from this non-shallow clone, passes the same directory as
-`--automation`, and uses only the marked `FLEET_WORKSPACE`.
+The original Task 9 block records the completed `v1.40` procedure. For this patch release,
+use the `v1.40.1` clone and verification block above instead. Every command below executes
+the released script from this non-shallow clone, passes the same directory as `--automation`,
+and uses only the marked `FLEET_WORKSPACE`.
 
 Do not place unrelated files or working repositories in `FLEET_WORKSPACE`.
 
@@ -144,7 +393,7 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
   --workspace "$FLEET_WORKSPACE" \
   --initialize-workspace \
   --mode plan \
-  --ref v1.40 \
+  --ref v1.40.1 \
   --actionlint "$ACTIONLINT"
 ```
 
@@ -181,14 +430,14 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
   --automation "$AUTOMATION_RELEASE_ROOT" \
   --workspace "$FLEET_WORKSPACE" \
   --mode publish \
-  --ref v1.40 \
+  --ref v1.40.1 \
   --repo wlan-package \
   --confirm \
   --actionlint "$ACTIONLINT"
 ```
 
-For `v1.40`, every repository uses the deterministic branch
-`automation/common-workflows-v1.40`. Publish computes exact blob, tree, and commit SHA-1
+For `v1.40.1`, every repository uses the deterministic branch
+`automation/common-workflows-v1.40.1`. Publish computes exact blob, tree, and commit SHA-1
 identities locally with fixed author, committer, timestamp, and message fields. JSON sent
 through stdin creates those detached objects only at the literal GitHub Git Data API
 endpoints `repos/jhw7500/<catalog-repo>/git/blobs`, `trees`, and `commits`; the final
@@ -200,8 +449,11 @@ do not cross the boundary.
 
 A concurrent ref creation makes `POST .../git/refs` fail without advancing or replacing
 the branch. A lost response is reconciled read-only only if the branch already equals the
-exact expected commit; otherwise publication blocks. Detached objects left unreachable by
-a failed ref creation are harmless, and no cleanup ref is created. There is no ordinary Git
+exact expected commit; otherwise publication blocks. Detached blobs, trees, or commits left
+unreachable by any validation failure before ref creation, including the initial `v1.40`
+commit-response mismatch, are harmless. A `v1.40.1` retry reuses matching
+content-addressed blobs and trees but creates its own release-bound commit identity; no
+cleanup ref is created. There is no ordinary Git
 branch push, force option, merge, auto-merge, update-branch, default-branch write,
 secret-write, variable-write, or revert operation.
 
@@ -232,7 +484,7 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
   --automation "$AUTOMATION_RELEASE_ROOT" \
   --workspace "$FLEET_WORKSPACE" \
   --mode publish \
-  --ref v1.40 \
+  --ref v1.40.1 \
   --repo cts-email-mcp-server \
   --bootstrap-repo cts-email-mcp-server \
   --confirm \
@@ -262,7 +514,7 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
   --automation "$AUTOMATION_RELEASE_ROOT" \
   --workspace "$FLEET_WORKSPACE" \
   --mode publish \
-  --ref v1.40 \
+  --ref v1.40.1 \
   --repo wpa-supplicant \
   --bootstrap-repo wpa-supplicant \
   --confirm \
@@ -277,7 +529,7 @@ Audit current default-branch content after reviewed merges:
 python3 "$AUTOMATION_RELEASE_ROOT/scripts/audit_workflow_fleet.py" \
   --automation "$AUTOMATION_RELEASE_ROOT" \
   --workspace "$FLEET_WORKSPACE" \
-  --ref v1.40
+  --ref v1.40.1
 ```
 
 Repeated `--repo NAME` arguments narrow the audit. Audit reports `current`, `drift`, or
