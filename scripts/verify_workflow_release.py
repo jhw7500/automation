@@ -186,6 +186,22 @@ EXPECTED_SETUP_GEMINI_AUTH = {
         ],
     },
 }
+MANUAL_GEMINI_FETCH_CONTRACTS = {
+    "gemini-issue-triage.yml": (
+        "Fetch issue",
+        "issue",
+        "ISSUE_NUMBER",
+        "${{ inputs.issue_number }}",
+        "gh issue view",
+    ),
+    "gemini-pr-review.yml": (
+        "Fetch PR",
+        "pr",
+        "PR_NUMBER",
+        "${{ inputs.pr_number }}",
+        "gh pr view",
+    ),
+}
 GEMINI_AUTH_OUTPUT = "${{ steps.auth.outputs.token }}"
 APPROVED_GEMINI_ACTIONS = frozenset(
     {
@@ -1405,6 +1421,72 @@ def _verify_tag_catalog(
         return catalog
 
 
+def _expected_manual_fetch_step(
+    contract: tuple[str, str, str, str, str],
+) -> dict[str, object]:
+    step_name, step_id, number_name, number_expression, command = contract
+    number_reference = f"${number_name}"
+    run = (
+        f'title="$({command} "{number_reference}" --repo "$REPO" '
+        '--json title --jq .title)"\n'
+        f'body="$({command} "{number_reference}" --repo "$REPO" '
+        '--json body --jq .body)"\n\n'
+        "write_output() {\n"
+        '  local name="$1"\n'
+        '  local value="$2"\n'
+        "  local delimiter='__AUTOMATION_OUTPUT__'\n"
+        '  while [[ "$value" == *"$delimiter"* ]]; do\n'
+        '    delimiter="${delimiter}_X"\n'
+        "  done\n"
+        "  {\n"
+        "    printf '%s<<%s\\n' \"$name\" \"$delimiter\"\n"
+        "    printf '%s\\n' \"$value\"\n"
+        "    printf '%s\\n' \"$delimiter\"\n"
+        '  } >> "$GITHUB_OUTPUT"\n'
+        "}\n\n"
+        'write_output title "$title"\n'
+        'write_output body "$body"\n'
+    )
+    return {
+        "name": step_name,
+        "id": step_id,
+        "env": {
+            "GH_TOKEN": "${{ github.token }}",
+            "REPO": "${{ github.repository }}",
+            number_name: number_expression,
+        },
+        "run": run,
+    }
+
+
+def _verify_manual_gemini_output_contract(
+    tree: VerifiedCommitTree, ref: str
+) -> None:
+    if _release_version(ref) < (1, 40, 2):
+        return
+    root = "examples/baseline-workflows/.github/workflows"
+    for filename, contract in MANUAL_GEMINI_FETCH_CONTRACTS.items():
+        path = f"{root}/{filename}"
+        try:
+            document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
+            steps = document["jobs"]["prepare"]["steps"]
+        except (ReleaseVerificationError, yaml.YAMLError, KeyError, TypeError):
+            raise ReleaseVerificationError(
+                f"{path} manual Gemini output contract is invalid"
+            ) from None
+        if not isinstance(steps, list) or not all(
+            isinstance(step, dict) for step in steps
+        ):
+            raise ReleaseVerificationError(
+                f"{path} manual Gemini output contract is invalid"
+            )
+        matches = [step for step in steps if step.get("id") == contract[1]]
+        if len(matches) != 1 or matches[0] != _expected_manual_fetch_step(contract):
+            raise ReleaseVerificationError(
+                f"{path} manual Gemini output contract is invalid"
+            )
+
+
 def _values(value: object) -> list[str]:
     result: list[str] = []
     if isinstance(value, dict):
@@ -1628,6 +1710,7 @@ def _verify_commit_content(
         _release_inventory(tree)
         _verify_setup_gemini_auth(tree)
     _verify_approved_v140_policy(tree, ref)
+    _verify_manual_gemini_output_contract(tree, ref)
     catalog = _verify_tag_catalog(tree, ref)
     names = [entry.path.as_posix() for entry in tree.files(".github/workflows")]
     workflows = [name for name in names if name.endswith((".yml", ".yaml"))]

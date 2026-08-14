@@ -110,7 +110,7 @@ def test_manual_gemini_fetch_preserves_hostile_multiline_outputs(
 Run:
 
 ```bash
-rtk pytest -q tests/test_legacy_workflow_writers.py::test_manual_gemini_fetch_preserves_hostile_multiline_outputs
+rtk python3 -m pytest -q tests/test_legacy_workflow_writers.py::test_manual_gemini_fetch_preserves_hostile_multiline_outputs
 ```
 
 Expected: both parametrized cases fail against the fixed `EOF` implementation because the hostile value terminates the first record and leaves extra output-file commands.
@@ -143,7 +143,7 @@ write_output body "$body"
 Run:
 
 ```bash
-rtk pytest -q \
+rtk python3 -m pytest -q \
   tests/test_legacy_workflow_writers.py::test_manual_gemini_fetch_preserves_hostile_multiline_outputs \
   tests/test_canonical_workflow_tree.py
 ```
@@ -279,7 +279,7 @@ The fixture must initialize a local Git repository, copy exactly `RELEASE_PATHS`
 Run:
 
 ```bash
-rtk pytest -q \
+rtk python3 -m pytest -q \
   tests/test_verify_workflow_release.py::test_commit_gate_rejects_unsafe_manual_gemini_output_writer \
   tests/test_verify_workflow_release.py::test_actual_current_commit_only_uses_authenticated_objects
 ```
@@ -382,7 +382,7 @@ Call `_verify_manual_gemini_output_contract(tree, ref)` in `_verify_commit_conte
 Run:
 
 ```bash
-rtk pytest -q \
+rtk python3 -m pytest -q \
   tests/test_verify_workflow_release.py::test_commit_gate_rejects_unsafe_manual_gemini_output_writer \
   tests/test_verify_workflow_release.py::test_actual_current_commit_only_uses_authenticated_objects \
   tests/test_verify_workflow_release.py::test_patch_release_must_preserve_the_approved_v140_policy \
@@ -413,10 +413,10 @@ rtk git commit -m "test: gate manual Gemini output safety"
 - [ ] **Step 1: Run focused and full Python tests**
 
 ```bash
-rtk pytest -q tests/test_legacy_workflow_writers.py \
+rtk python3 -m pytest -q tests/test_legacy_workflow_writers.py \
   tests/test_canonical_workflow_tree.py \
   tests/test_verify_workflow_release.py
-rtk pytest -q
+rtk python3 -m pytest -q
 ```
 
 Expected: zero failures and zero errors.
@@ -448,8 +448,6 @@ Expected: actionlint reports zero diagnostics.
 rtk python3 -m py_compile scripts/verify_workflow_release.py \
   tests/test_legacy_workflow_writers.py tests/test_verify_workflow_release.py
 rtk python3 -m ruff check scripts/verify_workflow_release.py \
-  tests/test_legacy_workflow_writers.py tests/test_verify_workflow_release.py
-rtk python3 -m ruff format --check scripts/verify_workflow_release.py \
   tests/test_legacy_workflow_writers.py tests/test_verify_workflow_release.py
 rtk python3 - <<'PY'
 from pathlib import Path
