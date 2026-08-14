@@ -611,7 +611,10 @@ def test_atomic_rollout_branch_creation_uses_only_literal_git_data_post_schemas(
             assert body == {
                 "author": identity,
                 "committer": identity,
-                "message": values["message"],
+                # GitHub hashes the message exactly as submitted.  The local
+                # commit-tree identity includes one terminal LF, while the API
+                # response presents the normalized subject without that LF.
+                "message": f"{values['message']}\n",
                 "parents": [values["base_sha"]],
                 "tree": values["tree_sha"],
             }

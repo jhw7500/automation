@@ -1232,7 +1232,7 @@ def verify_opencode_runtime(job: dict, step_name: str, workflow_name: str) -> di
 
 
 def _verify_approved_v140_policy(tree: VerifiedCommitTree, ref: str) -> None:
-    if ref != "v1.40":
+    if ref not in {"v1.40", "v1.40.1"}:
         return
     digest = hashlib.sha256()
     for path in APPROVED_V140_POLICY_FILES:
@@ -1242,7 +1242,7 @@ def _verify_approved_v140_policy(tree: VerifiedCommitTree, ref: str) -> None:
         digest.update(b"\0")
     if digest.hexdigest() != APPROVED_V140_POLICY_SHA256:
         raise ReleaseVerificationError(
-            "tag v1.40 differs from the approved v1.40 policy snapshot"
+            f"tag {ref} differs from the approved v1.40 policy snapshot"
         )
 
 

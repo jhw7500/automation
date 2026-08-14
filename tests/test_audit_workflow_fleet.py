@@ -29,6 +29,11 @@ COMMIT = "1" * 40
 BASE = "2" * 40
 
 
+def test_cli_defaults_to_the_current_patch_release(tmp_path: Path) -> None:
+    args = audit._parser().parse_args(["--workspace", str(tmp_path)])
+    assert args.ref == "v1.40.1"
+
+
 @pytest.fixture
 def bundle() -> ReleaseBundle:
     catalog = load_catalog(ROOT)
