@@ -18,6 +18,7 @@ jobs:
       issue_body: ${{ steps.issue.outputs.body }}
     steps:
       - name: Validate issue_number
+        shell: bash
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
         run: |
@@ -28,6 +29,7 @@ jobs:
 
       - name: Fetch issue
         id: issue
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

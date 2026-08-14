@@ -68,6 +68,13 @@ multiline outputs.
 The helper remains local to each workflow rather than introducing a composite action: two
 call sites do not justify another release artifact or runtime dependency.
 
+Both the validation step and fetch step declare `shell: bash`, so workflow or job defaults
+cannot reinterpret Bash-specific `[[ ... ]]` syntax. For `v1.40.2` and later, the release
+verifier binds the complete `prepare` job: runner, permissions, output mappings, exactly the
+validation and safe fetch steps, and the downstream reusable-job title/body expressions.
+An alternate writer, output rewiring, or loss of the explicit Bash execution context is a
+release-gate failure even if an unused copy of the safe step remains present.
+
 ## Validation
 
 Tests will execute the real embedded workflow steps with a controlled `gh` stub and a
@@ -82,9 +89,10 @@ The test parser must reconstruct exactly two outputs whose values equal the cont
 stub results and must not observe an injected output name. The test must fail against the
 current fixed-`EOF` implementation before production files change.
 
-Release-verifier coverage will reject restoration of the fixed delimiter or removal of the
-collision check. Existing YAML parsing, actionlint 1.7.12, focused tests, the full Python
-suite, Ruff, `py_compile`, and `git diff --check` remain required gates.
+Release-verifier coverage will reject restoration of the fixed delimiter, removal of the
+collision check, alternate-writer/output rewiring, downstream value rewiring, or loss of
+the explicit Bash context. Existing YAML parsing, actionlint 1.7.12, focused tests, the full
+Python suite, Ruff, `py_compile`, and `git diff --check` remain required gates.
 
 ## Delivery and Recovery
 

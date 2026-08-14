@@ -76,12 +76,13 @@ def restore_historical_v140_manual_outputs(repo: Path) -> None:
         path = root / filename
         text = path.read_text(encoding="utf-8")
         assert text.count(HARDENED_MANUAL_OUTPUT_BLOCK) == 1
+        assert text.count("        shell: bash\n") == 2
         path.write_text(
             text.replace(
                 HARDENED_MANUAL_OUTPUT_BLOCK,
                 LEGACY_MANUAL_OUTPUT_BLOCK,
                 1,
-            ),
+            ).replace("        shell: bash\n", "", 2),
             encoding="utf-8",
         )
 
@@ -574,11 +575,13 @@ def test_authenticated_release_objects_support_normal_storage_layouts(
     assert verify_release(checkout, "v1.40", release_commit) == release_commit
 
 
-def test_actual_current_commit_only_uses_authenticated_objects() -> None:
-    current = git(ROOT, "rev-parse", "HEAD")
+def test_current_release_commit_only_uses_authenticated_objects(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, current = current_release_repo
 
     assert (
-        release_verifier.verify_commit_content(ROOT, "v1.40.2", current)
+        release_verifier.verify_commit_content(repo, "v1.40.2", current)
         == current
     )
 
@@ -615,6 +618,102 @@ def test_commit_gate_rejects_unsafe_manual_gemini_output_writer(
         count=1,
     )
     bad_commit = commit(repo, "weaken manual Gemini output writer")
+
+    with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
+        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("filename", "step_id", "output_prefix"),
+    (
+        ("gemini-issue-triage.yml", "issue", "issue"),
+        ("gemini-pr-review.yml", "pr", "pr"),
+    ),
+)
+def test_commit_gate_rejects_manual_gemini_outputs_rewired_to_unsafe_step(
+    current_release_repo: tuple[Path, str],
+    filename: str,
+    step_id: str,
+    output_prefix: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / "examples/baseline-workflows/.github/workflows" / filename
+
+    def rewire(document: dict) -> None:
+        prepare = document["jobs"]["prepare"]
+        prepare["steps"].append(
+            {
+                "name": "Unsafe fixed-delimiter writer",
+                "id": "unsafe",
+                "run": (
+                    "printf 'title<<EOF\\nunsafe\\nEOF\\n' >> \"$GITHUB_OUTPUT\"\n"
+                    "printf 'body<<EOF\\nunsafe\\nEOF\\n' >> \"$GITHUB_OUTPUT\"\n"
+                ),
+            }
+        )
+        prepare["outputs"] = {
+            f"{output_prefix}_title": "${{ steps.unsafe.outputs.title }}",
+            f"{output_prefix}_body": "${{ steps.unsafe.outputs.body }}",
+        }
+        assert any(step.get("id") == step_id for step in prepare["steps"])
+
+    mutate_yaml(path, rewire)
+    bad_commit = commit(repo, "rewire manual Gemini outputs")
+
+    with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
+        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("filename", "step_id"),
+    (
+        ("gemini-issue-triage.yml", "issue"),
+        ("gemini-pr-review.yml", "pr"),
+    ),
+)
+def test_commit_gate_rejects_manual_gemini_fetch_without_explicit_bash(
+    current_release_repo: tuple[Path, str], filename: str, step_id: str
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / "examples/baseline-workflows/.github/workflows" / filename
+
+    def use_sh_default(document: dict) -> None:
+        document["defaults"] = {"run": {"shell": "sh"}}
+        fetch = next(
+            step
+            for step in document["jobs"]["prepare"]["steps"]
+            if step.get("id") == step_id
+        )
+        fetch.pop("shell", None)
+
+    mutate_yaml(path, use_sh_default)
+    bad_commit = commit(repo, "remove explicit Bash execution context")
+
+    with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
+        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("filename", "job_name", "title_key"),
+    (
+        ("gemini-issue-triage.yml", "triage", "issue_title"),
+        ("gemini-pr-review.yml", "review", "issue_title"),
+    ),
+)
+def test_commit_gate_rejects_manual_gemini_downstream_output_rewiring(
+    current_release_repo: tuple[Path, str],
+    filename: str,
+    job_name: str,
+    title_key: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / "examples/baseline-workflows/.github/workflows" / filename
+
+    def rewire(document: dict) -> None:
+        document["jobs"][job_name]["with"][title_key] = "unsafe literal"
+
+    mutate_yaml(path, rewire)
+    bad_commit = commit(repo, "rewire downstream manual Gemini title")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
         release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)

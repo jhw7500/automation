@@ -4,7 +4,7 @@
 
 **Goal:** Make the two canonical manual Gemini callers preserve arbitrary issue and pull-request title/body text in `$GITHUB_OUTPUT` without allowing a content line to terminate the output record.
 
-**Architecture:** Keep the change local to each existing fetch step: a Bash `write_output` helper derives a collision-free delimiter from the finite value, then emits the value only through quoted `printf`. Execute the actual YAML-embedded scripts in regression tests, and make the authenticated release verifier require the exact hardened fetch-step contract only for `v1.40.2` and later so immutable `v1.40`/`v1.40.1` remain verifiable.
+**Architecture:** Keep the change local to each existing fetch step: a Bash `write_output` helper derives a collision-free delimiter from the finite value, then emits the value only through quoted `printf`. Execute the actual YAML-embedded scripts in regression tests, and make the authenticated release verifier require the exact prepare job, output/downstream bindings, and Bash execution context only for `v1.40.2` and later so immutable `v1.40`/`v1.40.1` remain verifiable.
 
 **Tech Stack:** GitHub Actions YAML, Bash, Python 3, pytest, PyYAML, actionlint 1.7.12.
 
@@ -27,7 +27,7 @@
 
 **Interfaces:**
 - Consumes: `_workflow_step(path: Path, name: str) -> dict` and `_parse_github_outputs(text: str) -> dict[str, str]` from `tests/test_legacy_workflow_writers.py`.
-- Produces: both fetch steps expose exactly `title` and `body` outputs whose values are byte-for-byte equal after Bash command-substitution newline semantics; each step contains a local `write_output(name, value)` Bash function.
+- Produces: both fetch steps expose exactly `title` and `body` outputs whose values are byte-for-byte equal after Bash command-substitution newline semantics; each validation/fetch step declares `shell: bash`, and each fetch step contains a local `write_output(name, value)` Bash function.
 
 - [ ] **Step 1: Add the real-step hostile-content regression test**
 
@@ -117,7 +117,7 @@ Expected: both parametrized cases fail against the fixed `EOF` implementation be
 
 - [ ] **Step 3: Replace the fixed delimiters with the minimal helper in both workflows**
 
-Keep each existing pair of `gh ... --json title|body` commands, then use this exact helper and calls:
+Add `shell: bash` to both the validation and fetch steps. Keep each existing pair of `gh ... --json title|body` commands, then use this exact helper and calls:
 
 ```bash
 write_output() {
@@ -169,7 +169,7 @@ rtk git commit -m "fix: harden manual Gemini outputs"
 
 **Interfaces:**
 - Consumes: authenticated `VerifiedCommitTree`, `_release_version(ref)`, and YAML loaded with `yaml.BaseLoader`.
-- Produces: `_verify_manual_gemini_output_contract(tree: VerifiedCommitTree, ref: str) -> None`, called by `_verify_commit_content`; it accepts historical refs below `v1.40.2` and requires the exact two hardened fetch-step mappings for `v1.40.2` and later.
+- Produces: `_verify_manual_gemini_output_contract(tree: VerifiedCommitTree, ref: str) -> None`, called by `_verify_commit_content`; it accepts historical refs below `v1.40.2` and requires the exact prepare jobs plus downstream title/body bindings for `v1.40.2` and later.
 
 - [ ] **Step 1: Add negative release tests before changing the verifier**
 
@@ -272,7 +272,7 @@ def test_commit_gate_rejects_unsafe_manual_gemini_output_writer(
         release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
 ```
 
-The fixture must initialize a local Git repository, copy exactly `RELEASE_PATHS`, commit them, and return `(repo, commit_oid)`. Also change `test_actual_current_commit_only_uses_authenticated_objects` to verify current `HEAD` as `v1.40.2`; the historical `release_repo` tests remain on `v1.40`/`v1.40.1` and must still pass.
+The fixture must initialize a local Git repository, copy exactly `RELEASE_PATHS`, commit them, and return `(repo, commit_oid)`. Use it in `test_current_release_commit_only_uses_authenticated_objects` so the pre-commit working-tree release bytes are verified as `v1.40.2`; the historical `release_repo` tests remain on `v1.40`/`v1.40.1` and must still pass.
 
 - [ ] **Step 2: Run the new release tests and capture RED**
 
@@ -281,14 +281,14 @@ Run:
 ```bash
 rtk python3 -m pytest -q \
   tests/test_verify_workflow_release.py::test_commit_gate_rejects_unsafe_manual_gemini_output_writer \
-  tests/test_verify_workflow_release.py::test_actual_current_commit_only_uses_authenticated_objects
+  tests/test_verify_workflow_release.py::test_current_release_commit_only_uses_authenticated_objects
 ```
 
 Expected: the two mutation cases fail because the verifier has no manual-output contract yet; the current-commit case passes only if called with `v1.40.2` after Task 1.
 
-- [ ] **Step 3: Add an exact authenticated caller-step contract**
+- [ ] **Step 3: Add an exact authenticated end-to-end caller contract**
 
-In `scripts/verify_workflow_release.py`, define the expected fetch steps as ordinary Python mappings. Each expected mapping must include the current exact `name`, `id`, `env`, and full `run` string. The only differences are:
+In `scripts/verify_workflow_release.py`, define the expected prepare and downstream bindings as ordinary Python mappings. The closed differences are:
 
 ```python
 MANUAL_GEMINI_FETCH_STEPS = {
@@ -297,12 +297,18 @@ MANUAL_GEMINI_FETCH_STEPS = {
         "step_id": "issue",
         "number_env": ("ISSUE_NUMBER", "${{ inputs.issue_number }}"),
         "fetch": "gh issue view",
+        "permission": "issues",
+        "output_prefix": "issue",
+        "downstream_job": "triage",
     },
     "gemini-pr-review.yml": {
         "step_name": "Fetch PR",
         "step_id": "pr",
         "number_env": ("PR_NUMBER", "${{ inputs.pr_number }}"),
         "fetch": "gh pr view",
+        "permission": "pull-requests",
+        "output_prefix": "pr",
+        "downstream_job": "review",
     },
 }
 ```
@@ -341,6 +347,7 @@ def _expected_manual_fetch_step(contract: dict[str, object]) -> dict[str, object
     return {
         "name": contract["step_name"],
         "id": contract["step_id"],
+        "shell": "bash",
         "env": {
             "GH_TOKEN": "${{ github.token }}",
             "REPO": "${{ github.repository }}",
@@ -350,7 +357,7 @@ def _expected_manual_fetch_step(contract: dict[str, object]) -> dict[str, object
     }
 ```
 
-Implement the verifier with the following closed control flow:
+Construct the expected `prepare` job with exactly `runs-on: ubuntu-latest`, the one read permission from `permission`, the two `<output_prefix>_title|body` mappings to the safe step, and exactly two steps: the existing numeric validation step with `shell: bash`, followed by `_expected_manual_fetch_step(contract)`. Implement the verifier with this closed control flow:
 
 ```python
 def _verify_manual_gemini_output_contract(
@@ -363,19 +370,36 @@ def _verify_manual_gemini_output_contract(
         path = f"{root}/{filename}"
         try:
             document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
-            steps = document["jobs"]["prepare"]["steps"]
+            prepare = document["jobs"]["prepare"]
+            downstream = document["jobs"][contract["downstream_job"]]
+            downstream_with = downstream["with"]
         except (ReleaseVerificationError, yaml.YAMLError, KeyError, TypeError):
             raise ReleaseVerificationError(
                 f"{path} manual Gemini output contract is invalid"
             ) from None
-        matches = [step for step in steps if step.get("id") == contract["step_id"]]
-        if len(matches) != 1 or matches[0] != expected_manual_fetch_step(contract):
+        if prepare != _expected_manual_prepare_job(contract):
+            raise ReleaseVerificationError(
+                f"{path} manual Gemini output contract is invalid"
+            )
+        prefix = contract["output_prefix"]
+        expected_downstream = {
+            "issue_title": f"${{{{ needs.prepare.outputs.{prefix}_title }}}}",
+            "issue_body": f"${{{{ needs.prepare.outputs.{prefix}_body }}}}",
+        }
+        if (
+            downstream.get("needs") != "prepare"
+            or not isinstance(downstream_with, dict)
+            or any(
+                downstream_with.get(name) != value
+                for name, value in expected_downstream.items()
+            )
+        ):
             raise ReleaseVerificationError(
                 f"{path} manual Gemini output contract is invalid"
             )
 ```
 
-Call `_verify_manual_gemini_output_contract(tree, ref)` in `_verify_commit_content` after the authenticated inventory/setup checks and before returning the tree. Do not weaken `_verify_approved_v140_policy`; `v1.40` and `v1.40.1` must continue to use their existing immutable digest.
+Negative tests must cover collision-loop removal, fixed-`EOF` restoration, an extra unsafe writer plus `prepare.outputs` rewiring, downstream `with.issue_title` rewiring, and removal of the explicit fetch-step Bash shell under a `defaults.run.shell: sh` override. Call `_verify_manual_gemini_output_contract(tree, ref)` in `_verify_commit_content` after the authenticated inventory/setup checks and before returning the tree. Do not weaken `_verify_approved_v140_policy`; `v1.40` and `v1.40.1` must continue to use their existing immutable digest.
 
 - [ ] **Step 4: Run the release-verifier RED tests and historical compatibility tests**
 
@@ -384,7 +408,7 @@ Run:
 ```bash
 rtk python3 -m pytest -q \
   tests/test_verify_workflow_release.py::test_commit_gate_rejects_unsafe_manual_gemini_output_writer \
-  tests/test_verify_workflow_release.py::test_actual_current_commit_only_uses_authenticated_objects \
+  tests/test_verify_workflow_release.py::test_current_release_commit_only_uses_authenticated_objects \
   tests/test_verify_workflow_release.py::test_patch_release_must_preserve_the_approved_v140_policy \
   tests/test_verify_workflow_release.py::test_release_verifier_preserves_pre_inventory_v139_contract
 ```
