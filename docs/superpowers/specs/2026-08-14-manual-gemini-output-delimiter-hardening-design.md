@@ -1,6 +1,6 @@
 # Manual Gemini Output Delimiter Hardening Design
 
-**Status:** approved; implementation pending
+**Status:** implemented; review pending
 **Date:** 2026-08-14
 **Scope:** `automation` canonical consumer callers only
 
