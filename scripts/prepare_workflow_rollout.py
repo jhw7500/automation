@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Render the closed common-workflow policy into a repository.
 
-Rendering is side-effect free.  Only :func:`apply_render_plan` writes, and it first
-proves that every path still has the exact bytes observed by the renderer.
+Rendering is side-effect free. Only :func:`apply_render_plan` writes, and it first
+proves that every path still has the exact bytes and safe type observed by the renderer.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import subprocess
 import tempfile
 from typing import Literal
 
@@ -35,6 +37,10 @@ CENTRAL_USE = re.compile(
     r"jhw7500/automation/\.github/workflows/(?P<name>[^@\s'\"]+)@(?P<ref>[^\s'\"]+)"
 )
 _IDENTITY_KEYS = ("automation_ref", "automation_commit")
+_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_REGULAR_GIT_MODES = frozenset({"100644", "100755"})
+_MANAGED_GIT_MODE = "100644"
+_HERMETIC_GIT = Path("/usr/bin/git")
 
 
 class RolloutError(RuntimeError):
@@ -63,6 +69,27 @@ class FileChange:
     path: PurePosixPath
     before: bytes | None
     after: bytes | None
+    before_mode: str | None = None
+    after_mode: Literal["100644"] | None = None
+
+
+@dataclass(frozen=True)
+class ManagedResult:
+    """One path's complete canonical state in the proposed managed tree."""
+
+    path: PurePosixPath
+    content: bytes | None
+    mode: Literal["100644"] | None
+
+
+@dataclass(frozen=True)
+class GitTreeEntry:
+    """Exact tracked entry metadata read from the observed base tree."""
+
+    path: PurePosixPath
+    mode: str
+    object_type: str
+    oid: str
 
 
 @dataclass(frozen=True)
@@ -72,6 +99,8 @@ class RenderPlan:
     changes: tuple[FileChange, ...]
     required_secrets: frozenset[str]
     required_variables: frozenset[str]
+    managed_results: tuple[ManagedResult, ...] = ()
+    observed_revision: str | None = None
 
     def after(self, path: str) -> bytes | None:
         requested = PurePosixPath(path)
@@ -159,9 +188,16 @@ def _blocked(
     reason: str,
     required_secrets: frozenset[str],
     required_variables: frozenset[str],
+    observed_revision: str | None = None,
 ) -> RenderPlan:
     return RenderPlan(
-        "blocked", reason, (), required_secrets, required_variables
+        "blocked",
+        reason,
+        (),
+        required_secrets,
+        required_variables,
+        (),
+        observed_revision,
     )
 
 
@@ -173,6 +209,124 @@ def _safe_relative(path: PurePosixPath) -> bool:
     )
 
 
+def _tracked_git_entries(
+    repo: Path,
+    managed_paths: frozenset[PurePosixPath],
+    revision: str,
+) -> dict[PurePosixPath, GitTreeEntry]:
+    """Read exact managed entry metadata from one immutable observed tree."""
+
+    if _OBJECT_ID.fullmatch(revision) is None:
+        raise RolloutError("observed revision must be a Git object ID")
+    if any(not _safe_relative(path) for path in managed_paths):
+        raise RolloutError("managed Git metadata path is unsafe")
+    ancestors = frozenset(
+        PurePosixPath(*path.parts[:length])
+        for path in managed_paths
+        for length in range(1, len(path.parts))
+    )
+    inspected_paths = managed_paths | ancestors
+    try:
+        executable = _HERMETIC_GIT.resolve(strict=True)
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise OSError
+        with tempfile.TemporaryDirectory(prefix="workflow-tree-metadata-") as home:
+            environment = {
+                "PATH": "/usr/bin:/bin",
+                "HOME": home,
+                "XDG_CONFIG_HOME": home,
+                "LANG": "C",
+                "LC_ALL": "C",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+            }
+            prefix = [
+                str(executable),
+                "--no-replace-objects",
+                "--literal-pathspecs",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "submodule.recurse=false",
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                revision,
+                "--",
+            ]
+            completed = [
+                subprocess.run(
+                    [*prefix, *(path.as_posix() for path in sorted(managed_paths))],
+                    cwd=repo,
+                    input=None,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                ),
+                *(
+                    subprocess.run(
+                        [*prefix, ancestor.as_posix()],
+                        cwd=repo,
+                        input=None,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=environment,
+                    )
+                    for ancestor in sorted(ancestors)
+                ),
+            ]
+    except (OSError, ValueError):
+        raise RolloutError("unable to inspect managed Git entries") from None
+    if any(result.returncode for result in completed):
+        raise RolloutError("unable to inspect managed Git entries")
+    outputs = tuple(result.stdout for result in completed)
+    if any(output and not output.endswith(b"\0") for output in outputs):
+        raise RolloutError("managed Git entry listing is malformed")
+
+    entries: dict[PurePosixPath, GitTreeEntry] = {}
+    for raw_record in b"".join(outputs).split(b"\0")[:-1]:
+        if raw_record.count(b"\t") != 1:
+            raise RolloutError("managed Git entry listing is malformed")
+        raw_metadata, raw_path = raw_record.split(b"\t", 1)
+        fields = raw_metadata.split(b" ")
+        if len(fields) != 3:
+            raise RolloutError("managed Git entry listing is malformed")
+        try:
+            mode, object_type, oid = (
+                field.decode("ascii") for field in fields
+            )
+            path = PurePosixPath(raw_path.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise RolloutError("managed Git entry listing is malformed") from None
+        if (
+            path not in inspected_paths
+            or path in entries
+            or raw_path != path.as_posix().encode("utf-8")
+            or re.fullmatch(r"[0-7]{6}", mode) is None
+            or object_type not in {"blob", "commit", "tree"}
+            or _OBJECT_ID.fullmatch(oid) is None
+        ):
+            raise RolloutError("managed Git entry listing is malformed")
+        entries[path] = GitTreeEntry(path, mode, object_type, oid)
+    for managed in sorted(managed_paths):
+        for length in range(1, len(managed.parts)):
+            ancestor = PurePosixPath(*managed.parts[:length])
+            entry = entries.get(ancestor)
+            if entry is None:
+                break
+            if entry.mode != "040000" or entry.object_type != "tree":
+                raise RolloutError(
+                    f"{ancestor}: managed Git ancestor is not a tree"
+                )
+    return entries
+
+
+def _blob_oid(content: bytes, rendered_length: int) -> str:
+    algorithm = hashlib.sha1 if rendered_length == 40 else hashlib.sha256
+    header = f"blob {len(content)}\0".encode("ascii")
+    return algorithm(header + content).hexdigest()
+
+
 def _symlink_component(repo: Path, relative: PurePosixPath) -> Path | None:
     current = repo
     for part in relative.parts:
@@ -182,14 +336,18 @@ def _symlink_component(repo: Path, relative: PurePosixPath) -> Path | None:
     return None
 
 
-def _read_before(repo: Path, relative: PurePosixPath) -> bytes | None:
+def _read_before(
+    repo: Path, relative: PurePosixPath
+) -> tuple[bytes | None, str | None]:
     path = repo / relative
     if not path.exists():
-        return None
+        return None, None
     if not path.is_file():
         raise RolloutError(f"{relative}: managed path is not a regular file")
     try:
-        return path.read_bytes()
+        metadata = path.stat()
+        mode = "100755" if stat.S_IMODE(metadata.st_mode) & 0o111 else "100644"
+        return path.read_bytes(), mode
     except OSError as exc:
         raise RolloutError(f"{relative}: cannot read managed file: {exc}") from exc
 
@@ -471,6 +629,7 @@ def render_repository(
     variable_names: set[str],
     *,
     bootstrap: bool = False,
+    observed_revision: str | None = None,
 ) -> RenderPlan:
     """Return the complete deterministic change plan for one repository."""
 
@@ -491,54 +650,70 @@ def render_repository(
     )
     required_secrets, required_variables = _required_names(selected, profile)
 
-    for managed in catalog.managed_paths:
+    def block(reason: str) -> RenderPlan:
+        return _blocked(
+            reason,
+            required_secrets,
+            required_variables,
+            observed_revision,
+        )
+
+    for managed in sorted(catalog.managed_paths):
         if not _safe_relative(managed):
             raise RolloutError(f"{managed}: catalog path is unsafe")
+
+    tracked_entries: dict[PurePosixPath, GitTreeEntry] | None = None
+    if observed_revision is not None:
+        try:
+            tracked_entries = _tracked_git_entries(
+                repo, catalog.managed_paths, observed_revision
+            )
+        except RolloutError as exc:
+            return block(str(exc))
+        for managed in sorted(catalog.managed_paths):
+            tracked = tracked_entries.get(managed)
+            if tracked is None:
+                continue
+            if (
+                tracked.object_type != "blob"
+                or tracked.mode not in _REGULAR_GIT_MODES
+            ):
+                return block(
+                    f"{managed}: managed Git entry is not a regular blob"
+                )
+
+    for managed in sorted(catalog.managed_paths):
         symlink = _symlink_component(repo, managed)
         if symlink is not None:
             relative = symlink.relative_to(repo)
-            return _blocked(
-                f"managed path contains symlink: {relative}",
-                required_secrets,
-                required_variables,
-            )
+            return block(f"managed path contains symlink: {relative}")
 
     try:
         central_callers = _scan_central_callers(repo, catalog)
     except RolloutError as exc:
-        return _blocked(str(exc), required_secrets, required_variables)
+        return block(str(exc))
     catalog_caller_paths = frozenset(entry.path for entry in catalog.callers)
     unknown = tuple(
         path for path, _ in central_callers if path not in catalog_caller_paths
     )
     if unknown:
-        return _blocked(
-            f"unknown central caller path: {unknown[0]}",
-            required_secrets,
-            required_variables,
-        )
+        return block(f"unknown central caller path: {unknown[0]}")
 
     if bootstrap:
         if not profile.bootstrap_allowed:
-            return _blocked(
-                f"disabled bootstrap is not allowed for profile {profile.name}",
-                required_secrets,
-                required_variables,
+            return block(
+                f"disabled bootstrap is not allowed for profile {profile.name}"
             )
         if central_callers:
-            return _blocked(
-                f"bootstrap refuses existing central caller: {central_callers[0][0]}",
-                required_secrets,
-                required_variables,
+            return block(
+                f"bootstrap refuses existing central caller: {central_callers[0][0]}"
             )
     else:
         config_path = PurePosixPath(".github/workflow-config.yml")
         config_file = repo / config_path
         if not config_file.is_file():
-            return _blocked(
-                "workflow config is missing; explicit bootstrap is required",
-                required_secrets,
-                required_variables,
+            return block(
+                "workflow config is missing; explicit bootstrap is required"
             )
         missing = _prerequisite_reason(
             required_secrets,
@@ -547,15 +722,33 @@ def render_repository(
             variable_names,
         )
         if missing:
-            return _blocked(
-                missing, required_secrets, required_variables
-            )
+            return block(missing)
 
     selected_paths = frozenset(entry.path for entry in selected)
     changes: list[FileChange] = []
+    managed_results: list[ManagedResult] = []
     try:
         for entry in catalog.entries:
-            before = _read_before(repo, entry.path)
+            before, filesystem_mode = _read_before(repo, entry.path)
+            tracked = (
+                tracked_entries.get(entry.path)
+                if tracked_entries is not None
+                else None
+            )
+            if tracked_entries is not None:
+                if (tracked is None) != (before is None):
+                    raise RolloutError(
+                        f"{entry.path}: managed checkout does not match observed Git tree"
+                    )
+                if (
+                    tracked is not None
+                    and before is not None
+                    and _blob_oid(before, len(tracked.oid)) != tracked.oid
+                ):
+                    raise RolloutError(
+                        f"{entry.path}: managed checkout does not match observed Git blob"
+                    )
+            before_mode = tracked.mode if tracked is not None else filesystem_mode
             after: bytes | None
             if entry.kind in {"required", "optional"} and entry.path in selected_paths:
                 template = _canonical_bytes(canonical, entry)
@@ -573,19 +766,36 @@ def render_repository(
                     )
                 )
             elif bootstrap:
-                continue
+                after = None
             elif entry.kind in {"optional", "retired"}:
                 after = None
             else:
                 continue
-            if before != after:
-                changes.append(FileChange(entry.path, before, after))
+            after_mode: Literal["100644"] | None = (
+                _MANAGED_GIT_MODE if after is not None else None
+            )
+            managed_results.append(
+                ManagedResult(entry.path, after, after_mode)
+            )
+            if before != after or before_mode != after_mode:
+                changes.append(
+                    FileChange(
+                        entry.path,
+                        before,
+                        after,
+                        before_mode,
+                        after_mode,
+                    )
+                )
     except RolloutError as exc:
-        return _blocked(str(exc), required_secrets, required_variables)
+        return block(str(exc))
 
     if any(change.path not in catalog.managed_paths for change in changes):
         raise RolloutError("renderer proposed a path outside the workflow catalog")
-    change_tuple = tuple(changes)
+    change_tuple = tuple(sorted(changes, key=lambda change: change.path))
+    result_tuple = tuple(
+        sorted(managed_results, key=lambda result: result.path)
+    )
     if not change_tuple:
         return RenderPlan(
             "current",
@@ -593,6 +803,8 @@ def render_repository(
             (),
             required_secrets,
             required_variables,
+            result_tuple,
+            observed_revision,
         )
     if bootstrap:
         prerequisites = _prerequisite_reason(
@@ -614,13 +826,15 @@ def render_repository(
         change_tuple,
         required_secrets,
         required_variables,
+        result_tuple,
+        observed_revision,
     )
 
 
 def apply_render_plan(
     repo: Path, plan: RenderPlan
 ) -> tuple[PurePosixPath, ...]:
-    """Apply a renderer-owned plan after validating every observed byte."""
+    """Apply a renderer-owned plan after validating every observed file state."""
 
     if plan.status not in {"drift", "bootstrap_required"}:
         raise RolloutError(f"render plan is not actionable: {plan.status}")
@@ -631,7 +845,7 @@ def apply_render_plan(
         application_catalog = load_catalog(Path(__file__).resolve().parents[1])
     except CatalogError as exc:
         raise RolloutError(f"cannot load the workflow catalog: {exc}") from exc
-    for managed in application_catalog.managed_paths:
+    for managed in sorted(application_catalog.managed_paths):
         symlink = _symlink_component(repo, managed)
         if symlink is not None:
             raise RolloutError(
@@ -677,14 +891,31 @@ def apply_render_plan(
         current[change.path] = observed
         if observed != change.before:
             raise RolloutError(f"{change.path}: changed since rendering")
+        if (
+            plan.observed_revision is None
+            and change.before_mode is not None
+            and observed is not None
+        ):
+            observed_mode = "100755" if modes[change.path] & 0o111 else "100644"
+            if observed_mode != change.before_mode:
+                raise RolloutError(f"{change.path}: changed since rendering")
 
     changed: list[PurePosixPath] = []
     for change in sorted(plan.changes, key=lambda item: item.path):
-        if current[change.path] == change.after:
+        desired_mode = 0o644 if change.after is not None else None
+        if (
+            current[change.path] == change.after
+            and (
+                desired_mode is None
+                or modes.get(change.path) == desired_mode
+            )
+        ):
             continue
         path = repo / change.path
         if change.after is None:
             path.unlink()
+        elif current[change.path] == change.after:
+            os.chmod(path, desired_mode)
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             descriptor, temporary_name = tempfile.mkstemp(
@@ -696,7 +927,7 @@ def apply_render_plan(
                     handle.write(change.after)
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.chmod(temporary, modes.get(change.path, 0o644))
+                os.chmod(temporary, desired_mode)
                 os.replace(temporary, path)
             except BaseException:
                 temporary.unlink(missing_ok=True)

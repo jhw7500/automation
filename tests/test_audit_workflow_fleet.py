@@ -175,7 +175,7 @@ def test_fleet_cli_audits_all_profiles_with_refetch_and_no_remote_write(
         fetched.append(snapshot.path.name)
         return BASE
 
-    def classify(path, _bundle, _profile, _secrets, _variables):
+    def classify(path, _bundle, _profile, _secrets, _variables, **_kwargs):
         return AuditResult(
             path.name, "drift", "managed drift", (".github/workflows/claude.yml",)
         )
@@ -241,7 +241,7 @@ def test_fleet_cli_selects_repositories_and_blocks_only_on_blocked(
         mock.patch.object(
             audit,
             "audit_repository",
-            side_effect=lambda path, *_a: AuditResult(
+            side_effect=lambda path, *_a, **_k: AuditResult(
                 path.name, "blocked", "missing names", ()
             ),
         ),

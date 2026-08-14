@@ -12,7 +12,12 @@ from unittest import mock
 import pytest
 
 from scripts import rollout_workflow_fleet as rollout
-from scripts.prepare_workflow_rollout import FileChange, RenderPlan
+from scripts.prepare_workflow_rollout import (
+    FileChange,
+    ManagedResult,
+    RenderPlan,
+    apply_render_plan,
+)
 from scripts.workflow_fleet_git import PullRequest, RepositorySnapshot
 from scripts.workflow_catalog import load_catalog, load_fleet_config
 from scripts.workflow_release_bundle import ReleaseBundle
@@ -28,11 +33,12 @@ ALL_SECRETS = frozenset(
     {"CLAUDE_CODE_OAUTH_TOKEN", "GEMINI_API_KEY", "ZHIPU_API_KEY", "APP_PRIVATE_KEY"}
 )
 ALL_VARIABLES = frozenset({"APP_ID"})
+CATALOG = load_catalog(ROOT)
 
 
 @pytest.fixture
 def bundle() -> ReleaseBundle:
-    catalog = load_catalog(ROOT)
+    catalog = CATALOG
     config = load_fleet_config(ROOT, catalog)
     return ReleaseBundle(
         root=ROOT,
@@ -830,6 +836,14 @@ def make_plan() -> RenderPlan:
         ),
         frozenset(),
         frozenset(),
+        (
+            ManagedResult(
+                PurePosixPath(".github/workflows/a.yml"), b"new\n", "100644"
+            ),
+            ManagedResult(
+                PurePosixPath(".github/workflows/deleted.yml"), None, None
+            ),
+        ),
     )
 
 
@@ -1035,6 +1049,38 @@ def test_new_commit_tree_is_byte_attested_before_publication(tmp_path: Path) -> 
         rollout.validate_commit_tree(snap, HEAD, BASE, plan)
 
 
+def test_final_attestation_rejects_a_plan_without_complete_managed_results(
+    tmp_path: Path,
+) -> None:
+    snap = snapshot(tmp_path)
+    incomplete = RenderPlan(
+        "drift",
+        "incomplete",
+        (
+            FileChange(
+                PurePosixPath(".github/workflows/a.yml"), b"old\n", b"new\n"
+            ),
+        ),
+        frozenset(),
+        frozenset(),
+    )
+
+    def git(args, *, cwd=None, stdin=None):
+        if args[:3] == ["rev-list", "--parents", "-n"]:
+            return f"{HEAD} {BASE}"
+        if args[:2] == ["diff-tree", "--no-commit-id"]:
+            return ".github/workflows/a.yml"
+        if args[:2] == ["hash-object", "--stdin"]:
+            return "expected-blob"
+        if args[:2] == ["ls-tree", "-z"]:
+            return "100644 blob expected-blob\t.github/workflows/a.yml\0"
+        raise AssertionError(args)
+
+    with mock.patch.object(rollout, "git", side_effect=git):
+        with pytest.raises(rollout.CommandError, match="complete managed results"):
+            rollout.validate_commit_tree(snap, HEAD, BASE, incomplete)
+
+
 def test_new_commit_tree_rejects_clean_filter_blob_transformation(
     tmp_path: Path,
 ) -> None:
@@ -1093,8 +1139,372 @@ def initialized_repository(tmp_path: Path) -> tuple[RepositorySnapshot, RenderPl
         ),
         frozenset(),
         frozenset(),
+        tuple(
+            ManagedResult(
+                entry.path,
+                b"new\n"
+                if entry.path == PurePosixPath(".github/workflows/claude.yml")
+                else None,
+                "100644"
+                if entry.path == PurePosixPath(".github/workflows/claude.yml")
+                else None,
+            )
+            for entry in CATALOG.entries
+        ),
     )
     return RepositorySnapshot(repo, "main", base, frozenset(), frozenset()), plan
+
+
+def initialized_canonical_fleet_repository(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> RepositorySnapshot:
+    """Create a real base commit whose managed tree is initially canonical."""
+
+    repo = tmp_path / "gstApp"
+    (repo / ".github/workflows").mkdir(parents=True)
+    (repo / ".github/workflow-config.yml").write_text(
+        "automation_ref: v1.39\nreview:\n  auto: false\n", encoding="utf-8"
+    )
+    initial = rollout.render_repository(
+        repo,
+        bundle.canonical,
+        bundle.catalog,
+        bundle.config.profiles[repo.name],
+        bundle.ref,
+        bundle.commit,
+        set(ALL_SECRETS),
+        set(ALL_VARIABLES),
+    )
+    assert initial.status == "drift"
+    apply_render_plan(repo, initial)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "baseline"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "baseline@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "add", "--all"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "canonical"], cwd=repo, check=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    return RepositorySnapshot(
+        repo, "main", base, ALL_SECRETS, ALL_VARIABLES
+    )
+
+
+def commit_managed_fixture(repo: Path, message: str) -> str:
+    subprocess.run(["git", "commit", "-q", "-m", message], cwd=repo, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+
+
+def tree_entry(repo: Path, revision: str, relative: str) -> tuple[str, str, str]:
+    record = subprocess.run(
+        ["git", "ls-tree", revision, "--", relative],
+        cwd=repo,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    metadata, observed_path = record.split("\t", 1)
+    mode, object_type, oid = metadata.split(" ")
+    assert observed_path == relative
+    return mode, object_type, oid
+
+
+def replace_committed_tree_entry(
+    repo: Path,
+    base: str,
+    relative: str,
+    mode: str,
+    object_type: str,
+    oid: str,
+) -> str:
+    """Create a real commit with one raw nested tree entry replaced."""
+
+    def replace(tree_oid: str, components: tuple[str, ...]) -> str:
+        listing = subprocess.run(
+            ["git", "ls-tree", "-z", tree_oid],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        records = listing.split(b"\0")[:-1]
+        target = components[0].encode("utf-8")
+        replaced: list[bytes] = []
+        found = False
+        for record in records:
+            metadata, name = record.split(b"\t", 1)
+            if name != target:
+                replaced.append(record)
+                continue
+            found = True
+            if len(components) == 1:
+                replacement = f"{mode} {object_type} {oid}".encode("ascii")
+            else:
+                current_mode, current_type, current_oid = metadata.decode(
+                    "ascii"
+                ).split(" ")
+                assert current_mode == "040000" and current_type == "tree"
+                nested = replace(current_oid, components[1:])
+                replacement = f"040000 tree {nested}".encode("ascii")
+            replaced.append(replacement + b"\t" + name)
+        assert found
+        return subprocess.run(
+            ["git", "mktree", "-z"],
+            cwd=repo,
+            check=True,
+            input=b"\0".join(replaced) + b"\0",
+            stdout=subprocess.PIPE,
+        ).stdout.decode("ascii").strip()
+
+    root = subprocess.run(
+        ["git", "rev-parse", f"{base}^{{tree}}"],
+        cwd=repo,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    modified = replace(root, tuple(PurePosixPath(relative).parts))
+    head = subprocess.run(
+        ["git", "commit-tree", modified, "-p", base],
+        cwd=repo,
+        check=True,
+        input=b"tree type drift\n",
+        stdout=subprocess.PIPE,
+    ).stdout.decode("ascii").strip()
+    subprocess.run(["git", "update-ref", "HEAD", head, base], cwd=repo, check=True)
+    return head
+
+
+def test_real_rollout_repairs_content_and_separate_mode_drift_and_attests_all_managed(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    """The final reviewer fixture must not preserve an omitted executable entry."""
+
+    snap = initialized_canonical_fleet_repository(tmp_path, bundle)
+    content_path = ".github/workflows/claude.yml"
+    mode_path = ".github/workflows/gemini-triage.yml"
+    content = snap.path / content_path
+    content.write_bytes(content.read_bytes() + b"# content drift\n")
+    subprocess.run(["git", "add", "--", content_path], cwd=snap.path, check=True)
+    subprocess.run(
+        ["git", "update-index", "--chmod=+x", "--", mode_path],
+        cwd=snap.path,
+        check=True,
+    )
+    base = commit_managed_fixture(snap.path, "content and mode drift")
+    snap = RepositorySnapshot(
+        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names
+    )
+    assert tree_entry(snap.path, base, mode_path)[:2] == ("100755", "blob")
+
+    plan = rollout._render(snap, bundle, snap.path.name, bootstrap=False)
+    constructed = rollout.construct_rollout_commit(
+        snap, base, bundle.ref, plan, bundle.catalog
+    )
+    # Before the fix this returned successfully despite leaving mode_path at 100755.
+    rollout.validate_commit_tree(snap, constructed.head_sha, base, plan)
+
+    assert plan.status == "drift"
+    assert rollout._changed_paths(plan) == tuple(sorted((content_path, mode_path)))
+    assert tree_entry(snap.path, constructed.head_sha, mode_path)[:2] == (
+        "100644",
+        "blob",
+    )
+
+
+def test_real_mode_only_drift_is_planned_audited_and_published_as_a_repair(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    snap = initialized_canonical_fleet_repository(tmp_path, bundle)
+    relative = ".github/workflows/gemini-triage.yml"
+    subprocess.run(
+        ["git", "update-index", "--chmod=+x", "--", relative],
+        cwd=snap.path,
+        check=True,
+    )
+    base = commit_managed_fixture(snap.path, "mode-only drift")
+    snap = RepositorySnapshot(
+        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names
+    )
+
+    plan = rollout._render(snap, bundle, snap.path.name, bootstrap=False)
+    result = rollout.audit_repository(
+        snap.path,
+        bundle,
+        bundle.config.profiles[snap.path.name],
+        set(snap.secret_names),
+        set(snap.variable_names),
+        observed_revision=base,
+    )
+
+    assert plan.status == "drift"
+    assert plan.reason == "1 managed file(s) differ"
+    assert rollout._changed_paths(plan) == (relative,)
+    assert result.status == "drift"
+    assert result.changed_paths == (relative,)
+    published = rollout._prepared_outcome(
+        snap.path.name,
+        base,
+        plan,
+        rollout.RolloutInspection("create_branch"),
+    )
+    assert published.status == "planned"
+    assert published.changed_paths == (relative,)
+    change = plan.changes[0]
+    assert change.before == change.after
+    assert change.before_mode == "100755"
+    assert change.after_mode == "100644"
+
+    constructed = rollout.construct_rollout_commit(
+        snap, base, bundle.ref, plan, bundle.catalog
+    )
+    rollout.validate_commit_tree(snap, constructed.head_sha, base, plan)
+    rollout.fleet_git._validate_rollout_commit(
+        constructed, rollout.rollout_branch(bundle.ref)
+    )
+    assert tree_entry(snap.path, constructed.head_sha, relative)[:2] == (
+        "100644",
+        "blob",
+    )
+    changed = subprocess.run(
+        [
+            "git",
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            constructed.head_sha,
+        ],
+        cwd=snap.path,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.splitlines()
+    assert changed == [relative]
+
+
+@pytest.mark.parametrize(
+    ("mode", "object_type"),
+    (("120000", "blob"), ("160000", "commit"), ("040000", "tree")),
+)
+def test_real_tracked_nonregular_managed_entry_blocks_before_checkout_bytes_are_read(
+    tmp_path: Path,
+    bundle: ReleaseBundle,
+    mode: str,
+    object_type: str,
+) -> None:
+    snap = initialized_canonical_fleet_repository(tmp_path, bundle)
+    relative = ".github/workflows/gemini-triage.yml"
+    if mode == "120000":
+        oid = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"],
+            cwd=snap.path,
+            check=True,
+            input=b"../../outside-target",
+            stdout=subprocess.PIPE,
+        ).stdout.decode("ascii").strip()
+    elif mode == "160000":
+        oid = snap.base_sha
+    else:
+        child = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"],
+            cwd=snap.path,
+            check=True,
+            input=b"nested\n",
+            stdout=subprocess.PIPE,
+        ).stdout.decode("ascii").strip()
+        oid = subprocess.run(
+            ["git", "mktree"],
+            cwd=snap.path,
+            check=True,
+            input=f"100644 blob {child}\tnested.yml\n".encode("ascii"),
+            stdout=subprocess.PIPE,
+        ).stdout.decode("ascii").strip()
+    if mode == "040000":
+        base = replace_committed_tree_entry(
+            snap.path, snap.base_sha, relative, mode, object_type, oid
+        )
+    else:
+        subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", mode, oid, relative],
+            cwd=snap.path,
+            check=True,
+        )
+        base = commit_managed_fixture(snap.path, f"{object_type} type drift")
+    snap = RepositorySnapshot(
+        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names
+    )
+    assert tree_entry(snap.path, base, relative)[:2] == (mode, object_type)
+    # Deliberately leave canonical regular bytes in the checkout: only the observed
+    # base tree exposes the unsafe entry, so filesystem-only inspection would miss it.
+    assert (snap.path / relative).is_file()
+    assert not (snap.path / relative).is_symlink()
+
+    plan = rollout._render(snap, bundle, snap.path.name, bootstrap=False)
+
+    assert plan.status == "blocked"
+    assert plan.changes == ()
+    assert relative in plan.reason
+    assert "Git entry" in plan.reason
+
+
+@pytest.mark.parametrize(
+    ("mode", "object_type"), (("120000", "blob"), ("160000", "commit"))
+)
+def test_real_tracked_nonregular_managed_ancestor_blocks_before_checkout_scan(
+    tmp_path: Path,
+    bundle: ReleaseBundle,
+    mode: str,
+    object_type: str,
+) -> None:
+    snap = initialized_canonical_fleet_repository(tmp_path, bundle)
+    workflows = ".github/workflows"
+    # Replace the complete managed workflow directory in the observed tree with a
+    # gitlink, while retaining ordinary checkout files to prove leaf-only ls-tree
+    # queries and filesystem inspection cannot hide the unsafe ancestor.
+    if mode == "120000":
+        oid = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"],
+            cwd=snap.path,
+            check=True,
+            input=b"../../outside-workflows",
+            stdout=subprocess.PIPE,
+        ).stdout.decode("ascii").strip()
+    else:
+        oid = snap.base_sha
+    base = replace_committed_tree_entry(
+        snap.path,
+        snap.base_sha,
+        workflows,
+        mode,
+        object_type,
+        oid,
+    )
+    snap = RepositorySnapshot(
+        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names
+    )
+    assert tree_entry(snap.path, base, workflows)[:2] == (mode, object_type)
+    assert (snap.path / ".github/workflows/claude.yml").is_file()
+
+    plan = rollout._render(snap, bundle, snap.path.name, bootstrap=False)
+
+    assert plan.status == "blocked"
+    assert plan.changes == ()
+    assert workflows in plan.reason
+    assert "ancestor" in plan.reason
 
 
 @pytest.mark.parametrize(

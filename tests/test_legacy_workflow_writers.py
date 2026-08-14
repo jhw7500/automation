@@ -256,6 +256,16 @@ def test_design_is_approved_for_planned_implementation() -> None:
     )
 
 
+def test_rollout_docs_define_mode_drift_and_complete_managed_tree_attestation() -> None:
+    operator = ROLLOUT_DOC.read_text(encoding="utf-8")
+    design = DESIGN.read_text(encoding="utf-8")
+
+    for document in (operator, design):
+        assert "mode-only drift" in document
+        assert "`100644 blob`" in document
+        assert "complete managed set" in document
+
+
 def test_fleet_ci_covers_policy_canonical_code_tests_and_docs() -> None:
     workflow = yaml.load(CI_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     expected_paths = {

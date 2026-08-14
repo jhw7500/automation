@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 from scripts import workflow_fleet_git as fleet_git  # noqa: E402
 from scripts.audit_workflow_fleet import audit_repository  # noqa: E402
 from scripts.prepare_workflow_rollout import (  # noqa: E402
+    ManagedResult,
     RenderPlan,
     RolloutError,
     render_repository,
@@ -183,6 +184,24 @@ def _changed_paths(plan: RenderPlan) -> tuple[str, ...]:
     return tuple(sorted(change.path.as_posix() for change in plan.changes))
 
 
+def _managed_results(plan: RenderPlan) -> tuple[ManagedResult, ...]:
+    """Return the complete final managed set or reject an incomplete plan."""
+
+    if not plan.managed_results:
+        raise CommandError("render plan omits complete managed results")
+    results = plan.managed_results
+    seen: set[PurePosixPath] = set()
+    for result in results:
+        if result.path in seen:
+            raise CommandError(f"duplicate managed result path: {result.path}")
+        seen.add(result.path)
+        if (result.content is None) != (result.mode is None):
+            raise CommandError("managed result mode does not match its content")
+        if result.content is not None and result.mode != MANAGED_GIT_MODE:
+            raise CommandError("managed result mode is not canonical")
+    return tuple(sorted(results, key=lambda result: result.path))
+
+
 def _object_id(value: str, description: str) -> str:
     if OBJECT_ID.fullmatch(value) is None:
         raise CommandError(f"invalid {description}")
@@ -333,7 +352,7 @@ def apply_release_plan(
     if plan.status not in {"drift", "bootstrap_required"} or not plan.changes:
         raise RolloutError(f"render plan is not actionable: {plan.status}")
     entries = {entry.path: entry for entry in catalog.entries}
-    for managed in catalog.managed_paths:
+    for managed in sorted(catalog.managed_paths):
         if not _release_path(managed, catalog):
             raise RolloutError(f"catalog path is unsafe: {managed}")
         symlink = _symlink_component(repo, managed)
@@ -378,11 +397,20 @@ def apply_release_plan(
 
     changed: list[PurePosixPath] = []
     for change in sorted(plan.changes, key=lambda item: item.path):
-        if current[change.path] == change.after:
+        desired_mode = 0o644 if change.after is not None else None
+        if (
+            current[change.path] == change.after
+            and (
+                desired_mode is None
+                or modes.get(change.path) == desired_mode
+            )
+        ):
             continue
         path = repo.joinpath(*change.path.parts)
         if change.after is None:
             path.unlink()
+        elif current[change.path] == change.after:
+            os.chmod(path, desired_mode)
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             descriptor, filename = tempfile.mkstemp(
@@ -390,7 +418,7 @@ def apply_release_plan(
             )
             temporary = Path(filename)
             try:
-                os.fchmod(descriptor, modes.get(change.path, 0o644))
+                os.fchmod(descriptor, desired_mode)
                 with os.fdopen(descriptor, "wb") as stream:
                     stream.write(change.after)
                     stream.flush()
@@ -509,6 +537,8 @@ def validate_existing_branch(
 
     branch_sha = _object_id(branch_sha, "rollout branch object")
     base_sha = _object_id(base_sha, "default branch object")
+    if plan.observed_revision is not None and plan.observed_revision != base_sha:
+        raise CommandError("render plan does not match the observed base")
     if branch is not None:
         remote_ref = f"refs/remotes/origin/{branch}"
         git(
@@ -557,17 +587,17 @@ def validate_existing_branch(
 def _validate_tree_contents(
     snapshot: RepositorySnapshot, revision: str, plan: RenderPlan
 ) -> None:
-    for change in plan.changes:
-        path = change.path.as_posix()
+    for result in _managed_results(plan):
+        path = result.path.as_posix()
         observed = git(["ls-tree", "-z", revision, "--", path], cwd=snapshot.path)
-        if change.after is None:
+        if result.content is None:
             if observed:
                 raise CommandError(
-                    "rollout tree deletion does not match the render plan"
+                    "rollout tree managed absence does not match the render plan"
                 )
             continue
         try:
-            text = change.after.decode("utf-8")
+            text = result.content.decode("utf-8")
         except UnicodeDecodeError:
             raise CommandError("managed result is not UTF-8") from None
         expected_blob = git(
@@ -596,6 +626,8 @@ def validate_commit_tree(
 
     head_sha = _object_id(head_sha, "rollout commit")
     base_sha = _object_id(base_sha, "default branch object")
+    if plan.observed_revision is not None and plan.observed_revision != base_sha:
+        raise CommandError("render plan does not match the observed base")
     parents = git(
         ["rev-list", "--parents", "-n", "1", head_sha], cwd=snapshot.path
     ).split()
@@ -760,6 +792,23 @@ def construct_rollout_commit(
     """Build the exact managed commit through a private filter-free index."""
 
     base_sha = _object_id(base_sha, "default branch object")
+    if plan.observed_revision is not None and plan.observed_revision != base_sha:
+        raise RolloutError("render plan does not match the observed base")
+    managed_results = _managed_results(plan)
+    if {result.path for result in managed_results} != catalog.managed_paths:
+        raise RolloutError("render plan does not cover the complete managed catalog")
+    results_by_path = {result.path: result for result in managed_results}
+    for change in plan.changes:
+        result = results_by_path.get(change.path)
+        if (
+            result is None
+            or result.content != change.after
+            or (
+                change.after_mode is not None
+                and result.mode != change.after_mode
+            )
+        ):
+            raise RolloutError("render change does not match the managed result")
     branch = rollout_branch(ref)
     with tempfile.TemporaryDirectory(prefix="workflow-fleet-index-") as temporary:
         root = Path(temporary)
@@ -774,10 +823,10 @@ def construct_rollout_commit(
             "default branch tree",
         )
         apply_release_plan(snapshot.path, plan, catalog)
-        blobs: list[fleet_git.GitBlob] = []
-        for change in sorted(plan.changes, key=lambda item: item.path):
-            relative = change.path.as_posix()
-            if change.after is None:
+        managed_oids: dict[PurePosixPath, str] = {}
+        for result in managed_results:
+            relative = result.path.as_posix()
+            if result.content is None:
                 _hermetic_git(
                     ["update-index", "--remove", "--", relative],
                     cwd=snapshot.path,
@@ -789,13 +838,11 @@ def construct_rollout_commit(
                     ["hash-object", "-w", "--stdin", "--no-filters"],
                     cwd=snapshot.path,
                     environment=environment,
-                    stdin=change.after,
+                    stdin=result.content,
                 ).decode("ascii"),
                 "managed blob",
             )
-            blobs.append(
-                fleet_git.GitBlob(relative, MANAGED_GIT_MODE, blob, change.after)
-            )
+            managed_oids[result.path] = blob
             _hermetic_git(
                 [
                     "update-index",
@@ -808,6 +855,16 @@ def construct_rollout_commit(
                 cwd=snapshot.path,
                 environment=environment,
             )
+        blobs = [
+            fleet_git.GitBlob(
+                change.path.as_posix(),
+                MANAGED_GIT_MODE,
+                managed_oids[change.path],
+                change.after,
+            )
+            for change in sorted(plan.changes, key=lambda item: item.path)
+            if change.after is not None
+        ]
         tree = _object_id(
             _hermetic_git(
                 ["write-tree"], cwd=snapshot.path, environment=environment
@@ -971,6 +1028,7 @@ def _render(
         set(snapshot.secret_names),
         set(snapshot.variable_names),
         bootstrap=bootstrap,
+        observed_revision=snapshot.base_sha,
     )
 
 
@@ -1016,6 +1074,7 @@ def prevalidate_repository(
     try:
         snapshot = fleet_git.clone_default_branch(bundle.config.owner, repo, workspace)
         base_sha = fleet_git.refetch_default(snapshot)
+        snapshot = replace(snapshot, base_sha=base_sha)
         git(["switch", "--detach", base_sha], cwd=snapshot.path)
         plan = _render(snapshot, bundle, repo, bootstrap=bootstrap)
         if plan.status == "blocked":

@@ -301,6 +301,15 @@ requested safe `bootstrap_required` to public `planned` only after exact remote-
 inspection. A missing config without explicit bootstrap is `blocked`. Audit remains a
 separate content classifier and reports only `current`, `drift`, or `blocked`.
 
+Rendering binds its byte comparison to exact mode/type/OID metadata from the freshly
+observed base tree. A mode-only drift is therefore an actionable managed change, not
+`current`, and its path remains part of the deterministic report and PR identity. Managed
+symlink, gitlink, tree, and other nonregular entries fail closed before checkout content is
+read; a regular executable blob is safely normalized. Construction and final attestation
+inspect the complete managed set, requiring every desired present path to be the canonical
+`100644 blob` with canonical bytes, every desired deletion (including retired paths) to be
+absent, and every project-owned path to remain outside the plan.
+
 The report is not an approval token or transaction journal. Publish always refetches and
 recomputes the selected repository before writing.
 

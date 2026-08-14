@@ -281,9 +281,14 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/audit_workflow_fleet.py" \
 ```
 
 Repeated `--repo NAME` arguments narrow the audit. Audit reports `current`, `drift`, or
-`blocked` from managed bytes and contracts; it ignores project-owned workflow
-differences. During rollout, an unmerged repository legitimately remains `drift`. The
-completion condition is `current=19`, `drift=0`, and `blocked=0`.
+`blocked` from managed bytes, tracked Git entry metadata, and contracts; it ignores
+project-owned workflow differences. A mode-only drift is `drift`, appears in
+`changed_paths`, and is repaired to an exact `100644 blob`. Commit construction and final
+attestation cover the complete managed set: every required or selected optional/config
+file that is present has canonical bytes and mode/type, unselected optional and retired
+paths are absent, and no project-owned path is changed. During rollout, an unmerged
+repository legitimately remains `drift`. The completion condition is `current=19`,
+`drift=0`, and `blocked=0`.
 
 ### Review, merge, and recovery
 

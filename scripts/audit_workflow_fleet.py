@@ -55,6 +55,8 @@ def audit_repository(
     profile: RepoProfile,
     secret_names: set[str],
     variable_names: set[str],
+    *,
+    observed_revision: str | None = None,
 ) -> AuditResult:
     """Return a renderer-derived content classification without writing."""
 
@@ -69,6 +71,7 @@ def audit_repository(
             secret_names,
             variable_names,
             bootstrap=False,
+            observed_revision=observed_revision,
         )
     except RolloutError as exc:
         return AuditResult(repo.name, "blocked", str(exc), ())
@@ -160,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
                             bundle.config.profiles[repo],
                             set(snapshot.secret_names),
                             set(snapshot.variable_names),
+                            observed_revision=base_sha,
                         )
                     )
                 except (FleetGitError, RolloutError):
