@@ -24,7 +24,6 @@ OPENCODE_ARCHIVE_SHA256 = (
 )
 MANAGED_WORKFLOW_ROOTS = (
     ROOT / ".github" / "workflows",
-    ROOT / "examples" / "baseline-workflows" / "workflows",
     ROOT / "examples" / "baseline-workflows" / ".github" / "workflows",
 )
 

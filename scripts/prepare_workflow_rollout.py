@@ -1,464 +1,943 @@
 #!/usr/bin/env python3
-"""Prepare existing automation reusable-workflow callers for a safe fleet rollout.
+"""Render the closed common-workflow policy into a repository.
 
-This module deliberately does not add workflows or replace whole caller files. It keeps
-repository-owned triggers, guards, permissions and inputs, changing only the central
-release ref, secret mapping, optional app_id forwarding, approved action pins and
-automation_ref config.
+Rendering is side-effect free. Only :func:`apply_render_plan` writes, and it first
+proves that every path still has the exact bytes and safe type observed by the renderer.
 """
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
-from pathlib import Path
+import hashlib
+import os
+from pathlib import Path, PurePosixPath
 import re
-import sys
+import stat
+import subprocess
+import tempfile
+from typing import Literal
 
 import yaml
 
+from scripts.workflow_catalog import (
+    CatalogEntry,
+    CatalogError,
+    RepoProfile,
+    WorkflowCatalog,
+    expected_caller_jobs,
+    extract_caller_jobs,
+    load_catalog,
+)
 
-USE_RE = re.compile(
-    r"^(?P<indent> +)uses:\s*(?P<quote>['\"]?)"
-    r"jhw7500/automation/\.github/workflows/(?P<workflow>[^@\s'\"]+)@"
-    r"(?P<ref>[^\s'\"]+)(?P=quote)(?P<suffix>\s*(?:#.*)?)$"
-)
-CONFIG_REF_RE = re.compile(
-    r"(?m)^(?P<prefix>automation_ref:[ \t]*)\S+"
-    r"(?P<suffix>[ \t]*(?:#.*)?)$"
-)
-CHECKOUT_USE_RE = re.compile(
-    r"^(?P<prefix>[ \t]*(?:-[ \t]+)?uses:[ \t]*)(?P<quote>['\"]?)"
-    r"actions/checkout@(?P<ref>[^\s'\"#]+)(?P=quote)"
-    r"(?P<suffix>[ \t]*(?:#.*)?)(?P<newline>\r?\n?)$"
-)
+
+# Kept as the fleet-wide approved checkout pin consumed by test_action_pins.py.
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
-CHECKOUT_VERSION = "v7.0.1"
-BUMP_WORKFLOW = "bump-automation-ref.yml"
-GEMINI_AUTH_SECRETS = {"APP_PRIVATE_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"}
-OPENCODE_WORKFLOWS = {"opencode.yml", "opencode-auto-review.yml"}
-OPENCODE_CALLER_PERMISSIONS = (
-    ("contents", "read"),
-    ("pull-requests", "write"),
-    ("issues", "write"),
+SHA40 = re.compile(r"[0-9a-f]{40}")
+CENTRAL_USE = re.compile(
+    r"jhw7500/automation/\.github/workflows/(?P<name>[^@\s'\"]+)@(?P<ref>[^\s'\"]+)"
 )
+_IDENTITY_KEYS = ("automation_ref", "automation_commit")
+_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_REGULAR_GIT_MODES = frozenset({"100644", "100755"})
+_MANAGED_GIT_MODE = "100644"
+_HERMETIC_GIT = Path("/usr/bin/git")
 
 
 class RolloutError(RuntimeError):
-    pass
+    """The rollout cannot be rendered or safely applied."""
 
 
 class SecretPrerequisiteError(RolloutError):
+    """Compatibility error for the rollout orchestrator pending its renderer move."""
+
     def __init__(self, message: str, missing_secrets: set[str]) -> None:
         super().__init__(message)
         self.missing_secrets = frozenset(missing_secrets)
 
 
 @dataclass(frozen=True)
-class Contract:
-    declared: set[str]
-    required: set[str]
-    has_app_id: bool
-
-
-@dataclass(frozen=True)
 class RolloutResult:
+    """Compatibility result for callers that have not moved to RenderPlan yet."""
+
     callers: int
     changed_files: tuple[Path, ...]
     required_secrets: frozenset[str]
 
 
-def load_yaml(path: Path) -> dict:
-    data = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
-    return data if isinstance(data, dict) else {}
+@dataclass(frozen=True)
+class FileChange:
+    path: PurePosixPath
+    before: bytes | None
+    after: bytes | None
+    before_mode: str | None = None
+    after_mode: Literal["100644"] | None = None
 
 
-def workflow_contract(automation: Path, filename: str) -> Contract:
-    path = automation / ".github/workflows" / filename
-    if not path.is_file():
-        raise RolloutError(f"central workflow not found: {filename}")
-    workflow = load_yaml(path)
-    on = workflow.get("on", {})
-    if not isinstance(on, dict) or "workflow_call" not in on:
-        raise RolloutError(f"central workflow is not reusable: {filename}")
-    call = on.get("workflow_call") or {}
-    if not isinstance(call, dict):
-        raise RolloutError(f"invalid workflow_call contract: {filename}")
-    secrets = call.get("secrets", {})
-    inputs = call.get("inputs", {})
-    if not isinstance(secrets, dict):
-        secrets = {}
-    if not isinstance(inputs, dict):
-        inputs = {}
-    required = {
-        name
-        for name, values in secrets.items()
-        if isinstance(values, dict) and values.get("required", "false") == "true"
-    }
-    return Contract(set(secrets), required, "app_id" in inputs)
+@dataclass(frozen=True)
+class ManagedResult:
+    """One path's complete canonical state in the proposed managed tree."""
+
+    path: PurePosixPath
+    content: bytes | None
+    mode: Literal["100644"] | None
 
 
-def leading_spaces(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
+@dataclass(frozen=True)
+class GitTreeEntry:
+    """Exact tracked entry metadata read from the observed base tree."""
+
+    path: PurePosixPath
+    mode: str
+    object_type: str
+    oid: str
 
 
-def block_end(lines: list[str], start: int, parent_indent: int) -> int:
-    for index in range(start + 1, len(lines)):
-        stripped = lines[index].strip()
-        if not stripped:
-            continue
-        if leading_spaces(lines[index]) <= parent_indent:
-            return index
-    return len(lines)
+@dataclass(frozen=True)
+class RenderPlan:
+    status: Literal["current", "drift", "bootstrap_required", "blocked"]
+    reason: str
+    changes: tuple[FileChange, ...]
+    required_secrets: frozenset[str]
+    required_variables: frozenset[str]
+    managed_results: tuple[ManagedResult, ...] = ()
+    observed_revision: str | None = None
+
+    def after(self, path: str) -> bytes | None:
+        requested = PurePosixPath(path)
+        for change in self.changes:
+            if change.path == requested:
+                return change.after
+        raise KeyError(path)
 
 
-def validate_use_context(lines: list[str], index: int, indent: str, path: Path) -> int:
-    """Fail closed unless the line editor can safely own the caller job tail."""
-    width = len(indent)
-    parent_index = None
-    parent_width = -1
-    for candidate in range(index - 1, -1, -1):
-        stripped = lines[candidate].strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        candidate_width = leading_spaces(lines[candidate])
-        if candidate_width < width:
-            parent_index = candidate
-            parent_width = candidate_width
-            break
-    parent_is_mapping_key = (
-        parent_index is not None
-        and re.fullmatch(r"[^:#][^:]*:\s*(?:#.*)?", lines[parent_index].strip())
-        is not None
-    )
-    if parent_index is None or width - parent_width != 2 or not parent_is_mapping_key:
-        raise RolloutError(
-            f"{path.name}: reusable workflow uses must be indented exactly "
-            "two spaces below its job key"
+def selected_entries(
+    catalog: WorkflowCatalog, profile: RepoProfile
+) -> tuple[CatalogEntry, ...]:
+    """Return the catalog entries owned by a normal profile render."""
+
+    return tuple(
+        entry
+        for entry in catalog.entries
+        if entry.kind in {"required", "config"}
+        or (
+            entry.kind == "optional"
+            and entry.path.name in profile.optional_workflows
         )
-
-    for line in lines[parent_index + 1 : index]:
-        if leading_spaces(line) != width:
-            continue
-        if re.match(r"(?:secrets|with)\s*:", line.strip()):
-            raise RolloutError(
-                f"{path.name}: secrets/with must follow uses for safe rewriting"
-            )
-    return parent_index
-
-
-def enforce_opencode_permissions(
-    lines: list[str], parent_index: int, use_index: int, indent: str, filename: str
-) -> int:
-    width = len(indent)
-    job_end = block_end(lines, parent_index, leading_spaces(lines[parent_index]))
-    permission_indices = [
-        index
-        for index in range(parent_index + 1, job_end)
-        if leading_spaces(lines[index]) == width
-        and re.match(r"permissions\s*:", lines[index].strip())
-    ]
-    if len(permission_indices) > 1:
-        raise RolloutError(f"{filename}: duplicate permissions blocks")
-    canonical = [f"{indent}permissions:\n"] + [
-        f"{indent}  {name}: {value}\n" for name, value in OPENCODE_CALLER_PERMISSIONS
-    ]
-    if permission_indices:
-        start = permission_indices[0]
-        end = block_end(lines, start, width)
-        lines[start:end] = canonical
-    else:
-        lines[use_index:use_index] = canonical
-
-    for index in range(parent_index + 1, block_end(lines, parent_index, leading_spaces(lines[parent_index]))):
-        match = USE_RE.match(lines[index].rstrip("\n"))
-        if match is not None and match.group("workflow") == filename:
-            return index
-    raise RolloutError(f"{filename}: reusable workflow use line lost during permission rewrite")
-
-
-def secret_names_for(
-    filename: str,
-    contract: Contract,
-    available_secrets: set[str],
-    available_variables: set[str],
-) -> tuple[list[str], bool]:
-    missing = contract.required - available_secrets
-    if missing:
-        raise SecretPrerequisiteError(
-            f"{filename}: missing required secrets: {', '.join(sorted(missing))}",
-            missing,
-        )
-
-    selected = contract.declared & available_secrets
-    has_gemini_auth_contract = GEMINI_AUTH_SECRETS <= contract.declared
-    app_enabled = "APP_ID" in available_variables
-    usable_app = app_enabled and "APP_PRIVATE_KEY" in available_secrets
-    if "APP_PRIVATE_KEY" in contract.declared and not usable_app:
-        selected.discard("APP_PRIVATE_KEY")
-
-    if has_gemini_auth_contract:
-        usable_api_key = bool({"GEMINI_API_KEY", "GOOGLE_API_KEY"} & available_secrets)
-        if not (usable_api_key or usable_app):
-            missing = {"APP_PRIVATE_KEY"} if app_enabled else {"GEMINI_API_KEY"}
-            raise SecretPrerequisiteError(
-                f"{filename}: no usable Gemini authentication path",
-                missing,
-            )
-
-    return sorted(selected), contract.has_app_id and usable_app
-
-
-def replace_job_segment(
-    segment: list[str],
-    indent: str,
-    new_ref: str,
-    names: list[str],
-    pass_app_id: bool,
-) -> list[str]:
-    use_match = USE_RE.match(segment[0].rstrip("\n"))
-    if use_match is None:
-        raise RolloutError("internal error: reusable workflow use line not found")
-    newline = "\n" if segment[0].endswith("\n") else ""
-    quote = use_match.group("quote")
-    suffix = use_match.group("suffix")
-    segment[0] = (
-        f"{indent}uses: {quote}jhw7500/automation/.github/workflows/"
-        f"{use_match.group('workflow')}@{new_ref}{quote}{suffix}{newline}"
     )
 
-    width = len(indent)
-    secret_index = None
-    secret_end = None
-    with_index = None
-    for index, line in enumerate(segment):
-        stripped = line.strip()
-        if leading_spaces(line) == width and re.match(r"secrets\s*:", stripped):
-            secret_index = index
-            secret_end = block_end(segment, index, width)
-        if leading_spaces(line) == width and stripped == "with:":
-            with_index = index
 
-    if secret_index is not None and secret_end is not None:
-        del segment[secret_index:secret_end]
-        if with_index is not None and secret_index < with_index:
-            with_index -= secret_end - secret_index
-
-    if pass_app_id:
-        app_line = f"{indent}  app_id: ${{{{ vars.APP_ID }}}}\n"
-        if with_index is None:
-            insertion = len(segment)
-            segment[insertion:insertion] = [f"{indent}with:\n", app_line]
-        else:
-            with_end = block_end(segment, with_index, width)
-            existing = any(
-                leading_spaces(line) > width and line.strip().startswith("app_id:")
-                for line in segment[with_index + 1 : with_end]
-            )
-            if not existing:
-                segment.insert(with_end, app_line)
-
-    if names:
-        mapping = [f"{indent}secrets:\n"] + [
-            f"{indent}  {name}: ${{{{ secrets.{name} }}}}\n" for name in names
-        ]
-        segment.extend(mapping)
-    return segment
+def replace_once(text: str, old: str, new: str) -> str:
+    if text.count(old) != 1:
+        raise RolloutError(f"expected exactly one {old!r}")
+    return text.replace(old, new, 1)
 
 
-def yaml_checkout_count(value: object) -> int:
-    if isinstance(value, dict):
-        count = int(
-            isinstance(value.get("uses"), str)
-            and value["uses"].startswith("actions/checkout@")
-        )
-        return count + sum(yaml_checkout_count(item) for item in value.values())
-    if isinstance(value, list):
-        return sum(yaml_checkout_count(item) for item in value)
-    return 0
+def delete_line_once(text: str, line: str) -> str:
+    pattern = re.compile(
+        rf"(?m)^[ \t]*{re.escape(line)}[ \t]*(?:\r?\n|$)"
+    )
+    matches = tuple(pattern.finditer(text))
+    if len(matches) != 1:
+        raise RolloutError(f"expected exactly one line {line!r}")
+    match = matches[0]
+    return text[: match.start()] + text[match.end() :]
 
 
-def ratchet_checkout_references(text: str, path: Path, workflow: dict) -> str:
-    """Pin every checkout step in a managed workflow or fail closed."""
-    lines = text.splitlines(keepends=True)
-    matches = [CHECKOUT_USE_RE.match(line) for line in lines]
-    editable = sum(match is not None for match in matches)
-    declared = yaml_checkout_count(workflow)
-    if editable != declared:
-        raise RolloutError(
-            f"{path.name}: found {declared} checkout action(s) but "
-            f"can safely rewrite only {editable}"
-        )
-
-    for index, match in enumerate(matches):
-        if match is None:
-            continue
-        lines[index] = (
-            f"{match.group('prefix')}{match.group('quote')}"
-            f"actions/checkout@{CHECKOUT_SHA}{match.group('quote')} "
-            f"# {CHECKOUT_VERSION}{match.group('newline')}"
-        )
-    return "".join(lines)
-
-
-def transform_workflow(
-    path: Path,
-    automation: Path,
-    new_ref: str,
-    available_secrets: set[str],
-    available_variables: set[str],
-) -> tuple[str, int, set[str]]:
-    original = path.read_text(encoding="utf-8")
-    lines = original.splitlines(keepends=True)
-    uses: list[tuple[int, re.Match[str]]] = []
-    for index, line in enumerate(lines):
-        match = USE_RE.match(line.rstrip("\n"))
-        if match is not None:
-            uses.append((index, match))
-
-    workflow = load_yaml(path)
-    jobs = workflow.get("jobs", {})
-    yaml_callers = 0
-    if isinstance(jobs, dict):
-        for job in jobs.values():
-            if not isinstance(job, dict):
-                continue
-            use = job.get("uses")
-            if isinstance(use, str) and re.fullmatch(
-                r"jhw7500/automation/\.github/workflows/[^@\s]+@[^\s]+", use
-            ):
-                yaml_callers += 1
-    if yaml_callers != len(uses):
-        raise RolloutError(
-            f"{path.name}: found {yaml_callers} YAML caller(s) but "
-            f"can safely rewrite only {len(uses)}"
-        )
-
-    required: set[str] = set()
-    for index, match in reversed(uses):
-        indent = match.group("indent")
-        parent_index = validate_use_context(lines, index, indent, path)
-        filename = match.group("workflow")
-        if filename in OPENCODE_WORKFLOWS:
-            index = enforce_opencode_permissions(
-                lines, parent_index, index, indent, filename
-            )
-            match = USE_RE.match(lines[index].rstrip("\n"))
-            if match is None:
-                raise RolloutError(f"{path.name}: OpenCode use line became invalid")
-        end = block_end(lines, index, len(indent) - 2)
-        contract = workflow_contract(automation, filename)
-        names, pass_app_id = secret_names_for(
-            filename, contract, available_secrets, available_variables
-        )
-        required.update(names)
-        segment = replace_job_segment(lines[index:end], indent, new_ref, names, pass_app_id)
-        lines[index:end] = segment
-
-    transformed = "".join(lines)
-    if uses or path.name == BUMP_WORKFLOW:
-        transformed_workflow = yaml.load(transformed, Loader=yaml.BaseLoader)
-        if not isinstance(transformed_workflow, dict):
-            transformed_workflow = {}
-        transformed = ratchet_checkout_references(
-            transformed, path, transformed_workflow
-        )
-    return transformed, len(uses), required
-
-
-def prepare_repository(
-    repo: Path,
-    automation: Path,
-    new_ref: str,
-    available_secrets: set[str],
-    available_variables: set[str],
-) -> RolloutResult:
-    repo = repo.resolve()
-    automation = automation.resolve()
-    workflow_dir = repo / ".github/workflows"
-    planned: dict[Path, str] = {}
-    caller_count = 0
-    required: set[str] = set()
-
-    if workflow_dir.is_dir():
-        for path in sorted(workflow_dir.glob("*.y*ml")):
-            transformed, callers, names = transform_workflow(
-                path, automation, new_ref, available_secrets, available_variables
-            )
-            caller_count += callers
-            required.update(names)
-            if transformed != path.read_text(encoding="utf-8"):
-                planned[path] = transformed
-
-    if caller_count == 0:
-        return RolloutResult(0, (), frozenset())
-
-    config = repo / ".github/workflow-config.yml"
-    if config.is_file():
-        old_config = config.read_text(encoding="utf-8")
-        matches = list(CONFIG_REF_RE.finditer(old_config))
-        if len(matches) > 1:
-            raise RolloutError(f"duplicate automation_ref keys: {config}")
-        if matches:
-            new_config = CONFIG_REF_RE.sub(
-                lambda match: (
-                    match.group("prefix") + new_ref + match.group("suffix")
-                ),
-                old_config,
-                count=1,
-            )
-        else:
-            new_config = f"automation_ref: {new_ref}\n" + old_config
-    else:
-        new_config = f"automation_ref: {new_ref}\n"
-    if not config.is_file() or new_config != config.read_text(encoding="utf-8"):
-        planned[config] = new_config
-
-    # Validate all generated YAML before writing any file.
-    for path, text in planned.items():
-        try:
-            yaml.load(text, Loader=yaml.BaseLoader)
-        except yaml.YAMLError as exc:
-            raise RolloutError(f"generated invalid YAML for {path}: {exc}") from exc
-
-    for path, text in planned.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-
-    changed = tuple(sorted(path.relative_to(repo) for path in planned))
-    return RolloutResult(caller_count, changed, frozenset(required))
-
-
-def csv_set(value: str) -> set[str]:
-    return {item for item in value.split(",") if item}
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--repo", type=Path, required=True)
-    parser.add_argument("--automation", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--ref", default="v1.35")
-    parser.add_argument("--available-secrets", default="")
-    parser.add_argument("--available-variables", default="")
-    args = parser.parse_args(argv)
+def render_caller(
+    template: bytes,
+    entry: CatalogEntry,
+    profile: RepoProfile,
+    release_commit: str,
+) -> bytes:
+    if SHA40.fullmatch(release_commit) is None:
+        raise RolloutError("release commit must be 40 lowercase hex characters")
     try:
-        result = prepare_repository(
-            args.repo,
-            args.automation,
-            args.ref,
-            csv_set(args.available_secrets),
-            csv_set(args.available_variables),
+        text = template.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RolloutError(f"{entry.path}: canonical caller is not UTF-8") from exc
+    if text.count("@__AUTOMATION_COMMIT__") != 1:
+        raise RolloutError(f"{entry.path}: expected one commit placeholder")
+    text = text.replace("@__AUTOMATION_COMMIT__", f"@{release_commit}")
+    if entry.auth_family == "gemini" and profile.repo_write_auth == "github_token":
+        text = replace_once(
+            text,
+            "repo_write_auth: github_app",
+            "repo_write_auth: github_token",
         )
-    except RolloutError as exc:
-        print(f"FAIL {args.repo}: {exc}", file=sys.stderr)
-        return 1
-    print(
-        f"PASS {args.repo}: {result.callers} caller(s), "
-        f"{len(result.changed_files)} changed file(s), "
-        f"secrets={','.join(sorted(result.required_secrets)) or 'none'}"
+        text = delete_line_once(text, "app_id: ${{ vars.APP_ID }}")
+        text = delete_line_once(
+            text, "APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}"
+        )
+    return text.encode("utf-8")
+
+
+def _required_names(
+    selected: tuple[CatalogEntry, ...], profile: RepoProfile
+) -> tuple[frozenset[str], frozenset[str]]:
+    required_secrets = {"CLAUDE_CODE_OAUTH_TOKEN", "GEMINI_API_KEY"}
+    if any(entry.auth_family == "opencode" for entry in selected):
+        required_secrets.add("ZHIPU_API_KEY")
+    required_variables: set[str] = set()
+    if profile.repo_write_auth == "github_app":
+        required_secrets.add("APP_PRIVATE_KEY")
+        required_variables.add("APP_ID")
+    return frozenset(required_secrets), frozenset(required_variables)
+
+
+def _blocked(
+    reason: str,
+    required_secrets: frozenset[str],
+    required_variables: frozenset[str],
+    observed_revision: str | None = None,
+) -> RenderPlan:
+    return RenderPlan(
+        "blocked",
+        reason,
+        (),
+        required_secrets,
+        required_variables,
+        (),
+        observed_revision,
     )
-    return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def _safe_relative(path: PurePosixPath) -> bool:
+    return (
+        not path.is_absolute()
+        and ".." not in path.parts
+        and path.parts[:1] == (".github",)
+    )
+
+
+def _tracked_git_entries(
+    repo: Path,
+    managed_paths: frozenset[PurePosixPath],
+    revision: str,
+) -> dict[PurePosixPath, GitTreeEntry]:
+    """Read exact managed entry metadata from one immutable observed tree."""
+
+    if _OBJECT_ID.fullmatch(revision) is None:
+        raise RolloutError("observed revision must be a Git object ID")
+    if any(not _safe_relative(path) for path in managed_paths):
+        raise RolloutError("managed Git metadata path is unsafe")
+    ancestors = frozenset(
+        PurePosixPath(*path.parts[:length])
+        for path in managed_paths
+        for length in range(1, len(path.parts))
+    )
+    inspected_paths = managed_paths | ancestors
+    try:
+        executable = _HERMETIC_GIT.resolve(strict=True)
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise OSError
+        with tempfile.TemporaryDirectory(prefix="workflow-tree-metadata-") as home:
+            environment = {
+                "PATH": "/usr/bin:/bin",
+                "HOME": home,
+                "XDG_CONFIG_HOME": home,
+                "LANG": "C",
+                "LC_ALL": "C",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+            }
+            prefix = [
+                str(executable),
+                "--no-replace-objects",
+                "--literal-pathspecs",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "submodule.recurse=false",
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                revision,
+                "--",
+            ]
+            completed = [
+                subprocess.run(
+                    [*prefix, *(path.as_posix() for path in sorted(managed_paths))],
+                    cwd=repo,
+                    input=None,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                ),
+                *(
+                    subprocess.run(
+                        [*prefix, ancestor.as_posix()],
+                        cwd=repo,
+                        input=None,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=environment,
+                    )
+                    for ancestor in sorted(ancestors)
+                ),
+            ]
+    except (OSError, ValueError):
+        raise RolloutError("unable to inspect managed Git entries") from None
+    if any(result.returncode for result in completed):
+        raise RolloutError("unable to inspect managed Git entries")
+    outputs = tuple(result.stdout for result in completed)
+    if any(output and not output.endswith(b"\0") for output in outputs):
+        raise RolloutError("managed Git entry listing is malformed")
+
+    entries: dict[PurePosixPath, GitTreeEntry] = {}
+    for raw_record in b"".join(outputs).split(b"\0")[:-1]:
+        if raw_record.count(b"\t") != 1:
+            raise RolloutError("managed Git entry listing is malformed")
+        raw_metadata, raw_path = raw_record.split(b"\t", 1)
+        fields = raw_metadata.split(b" ")
+        if len(fields) != 3:
+            raise RolloutError("managed Git entry listing is malformed")
+        try:
+            mode, object_type, oid = (
+                field.decode("ascii") for field in fields
+            )
+            path = PurePosixPath(raw_path.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise RolloutError("managed Git entry listing is malformed") from None
+        if (
+            path not in inspected_paths
+            or path in entries
+            or raw_path != path.as_posix().encode("utf-8")
+            or re.fullmatch(r"[0-7]{6}", mode) is None
+            or object_type not in {"blob", "commit", "tree"}
+            or _OBJECT_ID.fullmatch(oid) is None
+        ):
+            raise RolloutError("managed Git entry listing is malformed")
+        entries[path] = GitTreeEntry(path, mode, object_type, oid)
+    for managed in sorted(managed_paths):
+        for length in range(1, len(managed.parts)):
+            ancestor = PurePosixPath(*managed.parts[:length])
+            entry = entries.get(ancestor)
+            if entry is None:
+                break
+            if entry.mode != "040000" or entry.object_type != "tree":
+                raise RolloutError(
+                    f"{ancestor}: managed Git ancestor is not a tree"
+                )
+    return entries
+
+
+def _blob_oid(content: bytes, rendered_length: int) -> str:
+    algorithm = hashlib.sha1 if rendered_length == 40 else hashlib.sha256
+    header = f"blob {len(content)}\0".encode("ascii")
+    return algorithm(header + content).hexdigest()
+
+
+def _symlink_component(repo: Path, relative: PurePosixPath) -> Path | None:
+    current = repo
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
+
+
+def _read_before(
+    repo: Path, relative: PurePosixPath
+) -> tuple[bytes | None, str | None]:
+    path = repo / relative
+    if not path.exists():
+        return None, None
+    if not path.is_file():
+        raise RolloutError(f"{relative}: managed path is not a regular file")
+    try:
+        metadata = path.stat()
+        mode = "100755" if stat.S_IMODE(metadata.st_mode) & 0o111 else "100644"
+        return path.read_bytes(), mode
+    except OSError as exc:
+        raise RolloutError(f"{relative}: cannot read managed file: {exc}") from exc
+
+
+def _canonical_bytes(canonical: Path, entry: CatalogEntry) -> bytes:
+    try:
+        relative = entry.path.relative_to(".github")
+    except ValueError as exc:
+        raise RolloutError(f"{entry.path}: managed path is outside .github") from exc
+    components = (canonical,) + tuple(
+        canonical.joinpath(*relative.parts[:index])
+        for index in range(1, len(relative.parts) + 1)
+    )
+    for index, component in enumerate(components):
+        try:
+            metadata = component.lstat()
+        except OSError as exc:
+            raise RolloutError(
+                f"{entry.path}: canonical path is missing or unsafe"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RolloutError(
+                f"{entry.path}: canonical path contains a symlink"
+            )
+        if index < len(components) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            raise RolloutError(
+                f"{entry.path}: canonical path component is not a directory"
+            )
+        if index == len(components) - 1 and not stat.S_ISREG(metadata.st_mode):
+            raise RolloutError(
+                f"{entry.path}: canonical path is not a regular file"
+            )
+    path = components[-1]
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise RolloutError(f"{entry.path}: cannot read canonical file: {exc}") from exc
+
+
+def _validate_caller(
+    rendered: bytes, entry: CatalogEntry, profile: RepoProfile
+) -> None:
+    try:
+        value = yaml.load(rendered.decode("utf-8"), Loader=yaml.BaseLoader)
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise RolloutError(f"{entry.path}: rendered caller is invalid YAML") from exc
+    if not isinstance(value, dict):
+        raise RolloutError(f"{entry.path}: rendered caller must be a mapping")
+    if value.get("on") != entry.trigger:
+        raise RolloutError(f"{entry.path}: rendered trigger violates the catalog")
+    try:
+        actual_jobs = extract_caller_jobs(value)
+    except CatalogError as exc:
+        raise RolloutError(f"{entry.path}: invalid rendered caller jobs: {exc}") from exc
+    if actual_jobs != expected_caller_jobs(entry, profile):
+        raise RolloutError(f"{entry.path}: rendered caller jobs violate the catalog")
+    uses = tuple(CENTRAL_USE.finditer(rendered.decode("utf-8")))
+    if (
+        len(uses) != 1
+        or uses[0].group("name") != entry.central_workflow
+    ):
+        raise RolloutError(f"{entry.path}: rendered central target violates the catalog")
+
+
+def _scan_central_callers(
+    repo: Path, catalog: WorkflowCatalog
+) -> tuple[tuple[PurePosixPath, str], ...]:
+    workflow_root = repo / ".github/workflows"
+    if not workflow_root.exists() or not workflow_root.is_dir():
+        return ()
+    callers: list[tuple[PurePosixPath, str]] = []
+    try:
+        candidates = sorted(
+            path
+            for path in workflow_root.rglob("*")
+            if path.is_file() and path.suffix in {".yml", ".yaml"}
+        )
+    except OSError as exc:
+        raise RolloutError(f"cannot scan repository workflows: {exc}") from exc
+    for path in candidates:
+        try:
+            text = path.read_bytes().decode("utf-8", errors="ignore")
+        except OSError as exc:
+            raise RolloutError(f"cannot scan {path.relative_to(repo)}: {exc}") from exc
+        relative = PurePosixPath(path.relative_to(repo).as_posix())
+        callers.extend((relative, match.group("name")) for match in CENTRAL_USE.finditer(text))
+    return tuple(callers)
+
+
+def _identity_nodes(
+    text: str,
+) -> dict[str, tuple[yaml.nodes.ScalarNode, yaml.nodes.ScalarNode]]:
+    try:
+        document = yaml.compose(text, Loader=yaml.BaseLoader)
+    except yaml.YAMLError as exc:
+        raise RolloutError("rendered workflow config identity is malformed") from exc
+    if not isinstance(document, yaml.nodes.MappingNode):
+        raise RolloutError("rendered workflow config identity is malformed")
+    found: dict[str, list[tuple[yaml.nodes.ScalarNode, yaml.nodes.ScalarNode]]] = {
+        key: [] for key in _IDENTITY_KEYS
+    }
+    for key_node, value_node in document.value:
+        if not isinstance(key_node, yaml.nodes.ScalarNode):
+            raise RolloutError("workflow config identity has a non-scalar key")
+        if key_node.value == "<<" and key_node.style is None:
+            raise RolloutError("workflow config identity does not allow YAML merges")
+        if key_node.value not in found:
+            continue
+        if not isinstance(value_node, yaml.nodes.ScalarNode):
+            raise RolloutError(
+                f"workflow config identity {key_node.value} must be a scalar"
+            )
+        found[key_node.value].append((key_node, value_node))
+    if len(found["automation_ref"]) != 1:
+        raise RolloutError(
+            "workflow config identity requires exactly one top-level automation_ref"
+        )
+    if len(found["automation_commit"]) > 1:
+        raise RolloutError(
+            "workflow config identity allows at most one top-level automation_commit"
+        )
+    return {key: values[0] for key, values in found.items() if values}
+
+
+def _scalar_replacement(text: str, node: yaml.nodes.ScalarNode, value: str) -> str:
+    original = text[node.start_mark.index : node.end_mark.index]
+    if node.style is None and original == node.value:
+        return value
+    if node.style == "'" and original.startswith("'") and original.endswith("'"):
+        return "'" + value.replace("'", "''") + "'"
+    if node.style == '"' and original.startswith('"') and original.endswith('"'):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    raise RolloutError("workflow config identity scalar uses unsupported YAML syntax")
+
+
+def _identity_line_span(
+    text: str,
+    key: yaml.nodes.ScalarNode,
+    value: yaml.nodes.ScalarNode,
+) -> tuple[int, int]:
+    start = text.rfind("\n", 0, key.start_mark.index) + 1
+    newline = text.find("\n", value.end_mark.index)
+    end = len(text) if newline < 0 else newline + 1
+    if (
+        key.start_mark.index != start
+        or key.start_mark.line != value.start_mark.line
+        or value.start_mark.line != value.end_mark.line
+        or value.start_mark.index <= key.end_mark.index
+    ):
+        raise RolloutError("workflow config identity must use one-line scalar entries")
+    key_source = text[key.start_mark.index : key.end_mark.index]
+    if key.style is None:
+        valid_key = key_source == key.value
+    elif key.style == "'":
+        valid_key = key_source.startswith("'") and key_source.endswith("'")
+    elif key.style == '"':
+        valid_key = key_source.startswith('"') and key_source.endswith('"')
+    else:
+        valid_key = False
+    if not valid_key:
+        raise RolloutError("workflow config identity key uses unsupported YAML syntax")
+    return start, end
+
+
+def _replace_node_in_line(
+    text: str,
+    span: tuple[int, int],
+    node: yaml.nodes.ScalarNode,
+    replacement: str,
+) -> str:
+    start, end = span
+    return (
+        text[start : node.start_mark.index]
+        + replacement
+        + text[node.end_mark.index : end]
+    )
+
+
+def _render_existing_config(
+    original: bytes, release_ref: str, release_commit: str
+) -> bytes:
+    try:
+        text = original.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RolloutError("rendered workflow config identity is malformed") from exc
+    identity = _identity_nodes(text)
+    ref_key, ref_value = identity["automation_ref"]
+    ref_span = _identity_line_span(text, ref_key, ref_value)
+    ref_line = _replace_node_in_line(
+        text,
+        ref_span,
+        ref_value,
+        _scalar_replacement(text, ref_value, release_ref),
+    )
+    newline = "\r\n" if ref_line.endswith("\r\n") else "\n"
+    if not ref_line.endswith(("\n", "\r")):
+        ref_line += newline
+
+    commit_entry = identity.get("automation_commit")
+    spans = [ref_span]
+    if commit_entry is None:
+        commit_line = f"automation_commit: {release_commit}{newline}"
+    else:
+        commit_key, commit_value = commit_entry
+        commit_span = _identity_line_span(text, commit_key, commit_value)
+        spans.append(commit_span)
+        commit_line = _replace_node_in_line(
+            text,
+            commit_span,
+            commit_value,
+            _scalar_replacement(text, commit_value, release_commit),
+        )
+        if not commit_line.endswith(("\n", "\r")):
+            commit_line += newline
+
+    insertion = ref_span[0] - sum(
+        end - start for start, end in spans if start < ref_span[0]
+    )
+    retained = text
+    for start, end in sorted(spans, reverse=True):
+        retained = retained[:start] + retained[end:]
+    rendered_text = retained[:insertion] + ref_line + commit_line + retained[insertion:]
+    proposed = _identity_nodes(rendered_text)
+    if (
+        proposed["automation_ref"][1].value != release_ref
+        or proposed.get("automation_commit") is None
+        or proposed["automation_commit"][1].value != release_commit
+    ):
+        raise RolloutError("rendered workflow config has invalid identity values")
+    return rendered_text.encode("utf-8")
+
+
+def _render_bootstrap_config(
+    template: bytes, release_ref: str, release_commit: str
+) -> bytes:
+    try:
+        text = template.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RolloutError("canonical workflow config is not UTF-8") from exc
+    text = replace_once(text, "__AUTOMATION_REF__", release_ref)
+    text = replace_once(text, "__AUTOMATION_COMMIT__", release_commit)
+    try:
+        document = yaml.load(text, Loader=yaml.BaseLoader)
+    except yaml.YAMLError as exc:
+        raise RolloutError("rendered bootstrap config is invalid YAML") from exc
+    if not isinstance(document, dict):
+        raise RolloutError("rendered bootstrap config must be a mapping")
+    if document.get("automation_ref") != release_ref:
+        raise RolloutError("rendered bootstrap config has the wrong automation_ref")
+    if document.get("automation_commit") != release_commit:
+        raise RolloutError("rendered bootstrap config has the wrong automation_commit")
+    return text.encode("utf-8")
+
+
+def _prerequisite_reason(
+    required_secrets: frozenset[str],
+    required_variables: frozenset[str],
+    secret_names: set[str],
+    variable_names: set[str],
+) -> str:
+    parts: list[str] = []
+    missing_secrets = sorted(required_secrets - secret_names)
+    missing_variables = sorted(required_variables - variable_names)
+    if missing_secrets:
+        parts.append(f"missing secrets: {', '.join(missing_secrets)}")
+    if missing_variables:
+        parts.append(f"missing variables: {', '.join(missing_variables)}")
+    return "; ".join(parts)
+
+
+def render_repository(
+    repo: Path,
+    canonical: Path,
+    catalog: WorkflowCatalog,
+    profile: RepoProfile,
+    release_ref: str,
+    release_commit: str,
+    secret_names: set[str],
+    variable_names: set[str],
+    *,
+    bootstrap: bool = False,
+    observed_revision: str | None = None,
+) -> RenderPlan:
+    """Return the complete deterministic change plan for one repository."""
+
+    if SHA40.fullmatch(release_commit) is None:
+        raise RolloutError("release commit must be 40 lowercase hex characters")
+    if not release_ref or any(character.isspace() for character in release_ref):
+        raise RolloutError("release ref must be one non-whitespace value")
+
+    normal_selected = selected_entries(catalog, profile)
+    selected = (
+        tuple(
+            entry
+            for entry in catalog.entries
+            if entry.kind in {"required", "config"}
+        )
+        if bootstrap
+        else normal_selected
+    )
+    required_secrets, required_variables = _required_names(selected, profile)
+
+    def block(reason: str) -> RenderPlan:
+        return _blocked(
+            reason,
+            required_secrets,
+            required_variables,
+            observed_revision,
+        )
+
+    for managed in sorted(catalog.managed_paths):
+        if not _safe_relative(managed):
+            raise RolloutError(f"{managed}: catalog path is unsafe")
+
+    tracked_entries: dict[PurePosixPath, GitTreeEntry] | None = None
+    if observed_revision is not None:
+        try:
+            tracked_entries = _tracked_git_entries(
+                repo, catalog.managed_paths, observed_revision
+            )
+        except RolloutError as exc:
+            return block(str(exc))
+        for managed in sorted(catalog.managed_paths):
+            tracked = tracked_entries.get(managed)
+            if tracked is None:
+                continue
+            if (
+                tracked.object_type != "blob"
+                or tracked.mode not in _REGULAR_GIT_MODES
+            ):
+                return block(
+                    f"{managed}: managed Git entry is not a regular blob"
+                )
+
+    for managed in sorted(catalog.managed_paths):
+        symlink = _symlink_component(repo, managed)
+        if symlink is not None:
+            relative = symlink.relative_to(repo)
+            return block(f"managed path contains symlink: {relative}")
+
+    try:
+        central_callers = _scan_central_callers(repo, catalog)
+    except RolloutError as exc:
+        return block(str(exc))
+    catalog_caller_paths = frozenset(entry.path for entry in catalog.callers)
+    unknown = tuple(
+        path for path, _ in central_callers if path not in catalog_caller_paths
+    )
+    if unknown:
+        return block(f"unknown central caller path: {unknown[0]}")
+
+    if bootstrap:
+        if not profile.bootstrap_allowed:
+            return block(
+                f"disabled bootstrap is not allowed for profile {profile.name}"
+            )
+        if central_callers:
+            return block(
+                f"bootstrap refuses existing central caller: {central_callers[0][0]}"
+            )
+    else:
+        config_path = PurePosixPath(".github/workflow-config.yml")
+        config_file = repo / config_path
+        if not config_file.is_file():
+            return block(
+                "workflow config is missing; explicit bootstrap is required"
+            )
+        missing = _prerequisite_reason(
+            required_secrets,
+            required_variables,
+            secret_names,
+            variable_names,
+        )
+        if missing:
+            return block(missing)
+
+    selected_paths = frozenset(entry.path for entry in selected)
+    changes: list[FileChange] = []
+    managed_results: list[ManagedResult] = []
+    try:
+        for entry in catalog.entries:
+            before, filesystem_mode = _read_before(repo, entry.path)
+            tracked = (
+                tracked_entries.get(entry.path)
+                if tracked_entries is not None
+                else None
+            )
+            if tracked_entries is not None:
+                if (tracked is None) != (before is None):
+                    raise RolloutError(
+                        f"{entry.path}: managed checkout does not match observed Git tree"
+                    )
+                if (
+                    tracked is not None
+                    and before is not None
+                    and _blob_oid(before, len(tracked.oid)) != tracked.oid
+                ):
+                    raise RolloutError(
+                        f"{entry.path}: managed checkout does not match observed Git blob"
+                    )
+            before_mode = tracked.mode if tracked is not None else filesystem_mode
+            after: bytes | None
+            if entry.kind in {"required", "optional"} and entry.path in selected_paths:
+                template = _canonical_bytes(canonical, entry)
+                after = render_caller(template, entry, profile, release_commit)
+                _validate_caller(after, entry, profile)
+            elif entry.kind == "config" and entry.path in selected_paths:
+                template = _canonical_bytes(canonical, entry)
+                after = (
+                    _render_bootstrap_config(template, release_ref, release_commit)
+                    if bootstrap
+                    else _render_existing_config(
+                        before if before is not None else b"",
+                        release_ref,
+                        release_commit,
+                    )
+                )
+            elif bootstrap:
+                after = None
+            elif entry.kind in {"optional", "retired"}:
+                after = None
+            else:
+                continue
+            after_mode: Literal["100644"] | None = (
+                _MANAGED_GIT_MODE if after is not None else None
+            )
+            managed_results.append(
+                ManagedResult(entry.path, after, after_mode)
+            )
+            if before != after or before_mode != after_mode:
+                changes.append(
+                    FileChange(
+                        entry.path,
+                        before,
+                        after,
+                        before_mode,
+                        after_mode,
+                    )
+                )
+    except RolloutError as exc:
+        return block(str(exc))
+
+    if any(change.path not in catalog.managed_paths for change in changes):
+        raise RolloutError("renderer proposed a path outside the workflow catalog")
+    change_tuple = tuple(sorted(changes, key=lambda change: change.path))
+    result_tuple = tuple(
+        sorted(managed_results, key=lambda result: result.path)
+    )
+    if not change_tuple:
+        return RenderPlan(
+            "current",
+            "managed files are current",
+            (),
+            required_secrets,
+            required_variables,
+            result_tuple,
+            observed_revision,
+        )
+    if bootstrap:
+        prerequisites = _prerequisite_reason(
+            required_secrets,
+            required_variables,
+            secret_names,
+            variable_names,
+        )
+        reason = "disabled bootstrap required"
+        if prerequisites:
+            reason += f"; non-blocking prerequisites: {prerequisites}"
+        status: Literal["drift", "bootstrap_required"] = "bootstrap_required"
+    else:
+        reason = f"{len(change_tuple)} managed file(s) differ"
+        status = "drift"
+    return RenderPlan(
+        status,
+        reason,
+        change_tuple,
+        required_secrets,
+        required_variables,
+        result_tuple,
+        observed_revision,
+    )
+
+
+def apply_render_plan(
+    repo: Path, plan: RenderPlan
+) -> tuple[PurePosixPath, ...]:
+    """Apply a renderer-owned plan after validating every observed file state."""
+
+    if plan.status not in {"drift", "bootstrap_required"}:
+        raise RolloutError(f"render plan is not actionable: {plan.status}")
+    if not plan.changes:
+        raise RolloutError("render plan is not actionable: no changes")
+
+    try:
+        application_catalog = load_catalog(Path(__file__).resolve().parents[1])
+    except CatalogError as exc:
+        raise RolloutError(f"cannot load the workflow catalog: {exc}") from exc
+    for managed in sorted(application_catalog.managed_paths):
+        symlink = _symlink_component(repo, managed)
+        if symlink is not None:
+            raise RolloutError(
+                f"managed path contains symlink: {symlink.relative_to(repo)}"
+            )
+
+    seen: set[PurePosixPath] = set()
+    current: dict[PurePosixPath, bytes | None] = {}
+    modes: dict[PurePosixPath, int] = {}
+    entries_by_path = {
+        entry.path: entry for entry in application_catalog.entries
+    }
+    for change in plan.changes:
+        if change.path in seen:
+            raise RolloutError(f"duplicate render path: {change.path}")
+        seen.add(change.path)
+        if not _safe_relative(change.path):
+            raise RolloutError(f"unsafe render path: {change.path}")
+        if change.path not in application_catalog.managed_paths:
+            raise RolloutError(
+                f"render path is outside the workflow catalog: {change.path}"
+            )
+        if (
+            change.after is None
+            and entries_by_path[change.path].kind not in {"optional", "retired"}
+        ):
+            raise RolloutError(
+                f"render path is not catalogued for deletion: {change.path}"
+            )
+        symlink = _symlink_component(repo, change.path)
+        if symlink is not None:
+            raise RolloutError(
+                f"managed path contains symlink: {symlink.relative_to(repo)}"
+            )
+        path = repo / change.path
+        if path.exists():
+            if not path.is_file():
+                raise RolloutError(f"{change.path}: managed path is not a regular file")
+            observed = path.read_bytes()
+            modes[change.path] = stat.S_IMODE(path.stat().st_mode)
+        else:
+            observed = None
+        current[change.path] = observed
+        if observed != change.before:
+            raise RolloutError(f"{change.path}: changed since rendering")
+        if (
+            plan.observed_revision is None
+            and change.before_mode is not None
+            and observed is not None
+        ):
+            observed_mode = "100755" if modes[change.path] & 0o111 else "100644"
+            if observed_mode != change.before_mode:
+                raise RolloutError(f"{change.path}: changed since rendering")
+
+    changed: list[PurePosixPath] = []
+    for change in sorted(plan.changes, key=lambda item: item.path):
+        desired_mode = 0o644 if change.after is not None else None
+        if (
+            current[change.path] == change.after
+            and (
+                desired_mode is None
+                or modes.get(change.path) == desired_mode
+            )
+        ):
+            continue
+        path = repo / change.path
+        if change.after is None:
+            path.unlink()
+        elif current[change.path] == change.after:
+            os.chmod(path, desired_mode)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(change.after)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temporary, desired_mode)
+                os.replace(temporary, path)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+        changed.append(change.path)
+    return tuple(changed)
+
+
+def prepare_repository(*args: object, **kwargs: object) -> RolloutResult:
+    """Reject the retired in-place editor while older orchestrator code is migrated."""
+
+    del args, kwargs
+    raise RolloutError("prepare_repository was replaced by render_repository")

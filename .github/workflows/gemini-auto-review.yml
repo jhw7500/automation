@@ -3,6 +3,15 @@ name: Gemini Auto PR Review
 on:
   workflow_call:
     inputs:
+      repo_write_auth:
+        description: 'Repository write authentication: github_app or github_token'
+        type: string
+        required: true
+      app_id:
+        description: 'GitHub App ID; used only when repo_write_auth is github_app'
+        type: string
+        required: false
+        default: ''
       pr_number:
         description: 'Pull request number (optional; defaults to event PR number)'
         type: string
@@ -14,12 +23,17 @@ on:
         default: false
 
     secrets:
+      APP_PRIVATE_KEY:
+        description: 'GitHub App private key; used only for github_app mode'
+        required: false
       GEMINI_API_KEY:
         description: 'Gemini API key'
         required: true
 
 jobs:
   check-enabled:
+    permissions:
+      contents: read
     name: Check if enabled
     runs-on: ubuntu-latest
     outputs:
@@ -71,7 +85,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write
 
     steps:
       - name: Checkout repository
@@ -79,10 +92,44 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate repository-write auth
+        shell: bash
+        env:
+          MODE: ${{ inputs.repo_write_auth }}
+          APP_ID: ${{ inputs.app_id }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          case "$MODE" in
+            github_app)
+              test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {
+                echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2
+                exit 1
+              }
+              ;;
+            github_token)
+              test -z "$APP_ID" && test -z "$APP_PRIVATE_KEY" || {
+                echo 'github_token forbids App credentials' >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "invalid repo_write_auth: $MODE" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve repository-write token
+        id: auth
+        uses: jhw7500/automation/.github/actions/setup-gemini-auth@2254f13aab44585c78954d20749f4fb677a8c2f1
+        with:
+          app-id: ${{ inputs.repo_write_auth == 'github_app' && inputs.app_id || '' }}
+          private-key: ${{ inputs.repo_write_auth == 'github_app' && secrets.APP_PRIVATE_KEY || '' }}
+          fallback-token: ${{ inputs.repo_write_auth == 'github_token' && github.token || '' }}
+
       - name: Get PR details
         id: pr-details
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
 
@@ -235,7 +282,7 @@ jobs:
       - name: Post review comment
         if: success()
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
 
@@ -262,12 +309,13 @@ jobs:
       - name: Handle review failure
         if: failure()
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
           gh pr comment $PR_NUMBER --body "⚠️ Gemini auto-review failed. Please check the workflow logs for details."
 
   skipped:
+    permissions: {}
     name: Workflow Skipped
     needs: check-enabled
     if: needs.check-enabled.outputs.enabled != 'true' || needs.check-enabled.outputs.auto_enabled != 'true'

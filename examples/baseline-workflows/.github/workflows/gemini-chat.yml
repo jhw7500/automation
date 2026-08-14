@@ -11,15 +11,14 @@ on:
 jobs:
   gemini-chat:
     permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-      id-token: write
       actions: read
-    uses: jhw7500/automation/.github/workflows/gemini-chat.yml@v1.36
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: jhw7500/automation/.github/workflows/gemini-chat.yml@__AUTOMATION_COMMIT__
     with:
+      repo_write_auth: github_app
       app_id: ${{ vars.APP_ID }}
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}

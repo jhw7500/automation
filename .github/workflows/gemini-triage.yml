@@ -3,8 +3,12 @@ name: '🔀 Gemini Triage'
 on:
   workflow_call:
     inputs:
+      repo_write_auth:
+        description: 'Repository write authentication: github_app or github_token'
+        type: string
+        required: true
       app_id:
-        description: 'GitHub App ID; falls back to caller vars.APP_ID for compatibility'
+        description: 'GitHub App ID; used only when repo_write_auth is github_app'
         type: string
         required: false
         default: ''
@@ -32,14 +36,11 @@ on:
 
     secrets:
       APP_PRIVATE_KEY:
-        description: 'GitHub App private key; required when app_id or legacy vars.APP_ID is set'
+        description: 'GitHub App private key; used only for github_app mode'
         required: false
       GEMINI_API_KEY:
-        description: 'Gemini API key for API-key authentication'
-        required: false
-      GOOGLE_API_KEY:
-        description: 'Google API key for compatible Gemini authentication'
-        required: false
+        description: 'Gemini API key'
+        required: true
 
 concurrency:
   group: '${{ github.workflow }}-triage-${{ github.event_name }}-${{ inputs.issue_number || github.event.issue.number || github.event.pull_request.number }}'
@@ -51,6 +52,8 @@ defaults:
 
 jobs:
   check-enabled:
+    permissions:
+      contents: read
     name: Check if enabled
     runs-on: ubuntu-latest
     outputs:
@@ -81,7 +84,6 @@ jobs:
       selected_labels: '${{ steps.gemini_analysis.outputs.summary }}'
     permissions:
       contents: 'read'
-      id-token: 'write'
       issues: 'read'
       pull-requests: 'read'
     steps:
@@ -122,17 +124,10 @@ jobs:
           ISSUE_BODY: '${{ inputs.issue_body || github.event.issue.body }}'
           AVAILABLE_LABELS: '${{ steps.get_labels.outputs.available_labels }}'
         with:
-          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
-          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
-          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
-          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
           gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
           gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
           gemini_model: '${{ vars.GEMINI_MODEL }}'
-          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
-          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
-          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
           upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
           workflow_name: 'gemini-triage'
           settings: |-
@@ -170,13 +165,39 @@ jobs:
         with:
           sparse-checkout: .github
 
-      - name: 'Setup authentication'
-        id: 'auth'
-        uses: 'jhw7500/automation/.github/actions/setup-gemini-auth@v1.1'
+      - name: Validate repository-write auth
+        shell: bash
+        env:
+          MODE: ${{ inputs.repo_write_auth }}
+          APP_ID: ${{ inputs.app_id }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          case "$MODE" in
+            github_app)
+              test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {
+                echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2
+                exit 1
+              }
+              ;;
+            github_token)
+              test -z "$APP_ID" && test -z "$APP_PRIVATE_KEY" || {
+                echo 'github_token forbids App credentials' >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "invalid repo_write_auth: $MODE" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve repository-write token
+        id: auth
+        uses: jhw7500/automation/.github/actions/setup-gemini-auth@2254f13aab44585c78954d20749f4fb677a8c2f1
         with:
-          app-id: '${{ inputs.app_id || vars.APP_ID }}'
-          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ github.token }}'
+          app-id: ${{ inputs.repo_write_auth == 'github_app' && inputs.app_id || '' }}
+          private-key: ${{ inputs.repo_write_auth == 'github_app' && secrets.APP_PRIVATE_KEY || '' }}
+          fallback-token: ${{ inputs.repo_write_auth == 'github_token' && github.token || '' }}
 
       - name: 'Apply labels'
         env:
@@ -216,6 +237,7 @@ jobs:
             }
 
   skipped:
+    permissions: {}
     name: Workflow Skipped
     needs: check-enabled
     if: needs.check-enabled.outputs.enabled != 'true'

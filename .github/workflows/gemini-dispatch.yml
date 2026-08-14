@@ -3,8 +3,12 @@ name: '🔀 Gemini Dispatch'
 on:
   workflow_call:
     inputs:
+      repo_write_auth:
+        description: 'Repository write authentication: github_app or github_token'
+        type: string
+        required: true
       app_id:
-        description: 'GitHub App ID; falls back to caller vars.APP_ID for compatibility'
+        description: 'GitHub App ID; used only when repo_write_auth is github_app'
         type: string
         required: false
         default: ''
@@ -16,14 +20,11 @@ on:
 
     secrets:
       APP_PRIVATE_KEY:
-        description: 'GitHub App private key; required when app_id or legacy vars.APP_ID is set'
+        description: 'GitHub App private key; used only for github_app mode'
         required: false
       GEMINI_API_KEY:
-        description: 'Gemini API key for API-key authentication'
-        required: false
-      GOOGLE_API_KEY:
-        description: 'Google API key for compatible Gemini authentication'
-        required: false
+        description: 'Gemini API key'
+        required: true
 
 defaults:
   run:
@@ -37,6 +38,8 @@ concurrency:
 
 jobs:
   check-enabled:
+    permissions:
+      contents: read
     name: Check if enabled
     runs-on: ubuntu-latest
     outputs:
@@ -128,17 +131,39 @@ jobs:
           fi
           echo "auto_pr_review_enabled=${auto_pr_review_enabled}" >> $GITHUB_OUTPUT
 
-      - name: 'Mint identity token'
-        id: 'mint_identity_token'
-        if: |-
-          ${{ inputs.app_id || vars.APP_ID }}
-        uses: 'actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b' # ratchet:actions/create-github-app-token@v2
+      - name: Validate repository-write auth
+        shell: bash
+        env:
+          MODE: ${{ inputs.repo_write_auth }}
+          APP_ID: ${{ inputs.app_id }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          case "$MODE" in
+            github_app)
+              test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {
+                echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2
+                exit 1
+              }
+              ;;
+            github_token)
+              test -z "$APP_ID" && test -z "$APP_PRIVATE_KEY" || {
+                echo 'github_token forbids App credentials' >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "invalid repo_write_auth: $MODE" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve repository-write token
+        id: auth
+        uses: jhw7500/automation/.github/actions/setup-gemini-auth@2254f13aab44585c78954d20749f4fb677a8c2f1
         with:
-          app-id: '${{ inputs.app_id || vars.APP_ID }}'
-          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          permission-contents: 'read'
-          permission-issues: 'write'
-          permission-pull-requests: 'write'
+          app-id: ${{ inputs.repo_write_auth == 'github_app' && inputs.app_id || '' }}
+          private-key: ${{ inputs.repo_write_auth == 'github_app' && secrets.APP_PRIVATE_KEY || '' }}
+          fallback-token: ${{ inputs.repo_write_auth == 'github_token' && github.token || '' }}
 
       - name: 'Extract command'
         id: 'extract_command'
@@ -251,7 +276,7 @@ jobs:
       - name: 'Acknowledge request'
         if: steps.extract_command.outputs.command != 'noop' && steps.extract_command.outputs.command != 'unauthorized'
         env:
-          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || github.token }}'
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           MESSAGE: |-
             ## 🤖 Gemini CLI (명령어 기반)
@@ -270,20 +295,45 @@ jobs:
     timeout-minutes: 7
     permissions:
       contents: read
-      id-token: write
       issues: write
       pull-requests: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Setup authentication
+      - name: Validate repository-write auth
+        shell: bash
+        env:
+          MODE: ${{ inputs.repo_write_auth }}
+          APP_ID: ${{ inputs.app_id }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          case "$MODE" in
+            github_app)
+              test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {
+                echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2
+                exit 1
+              }
+              ;;
+            github_token)
+              test -z "$APP_ID" && test -z "$APP_PRIVATE_KEY" || {
+                echo 'github_token forbids App credentials' >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "invalid repo_write_auth: $MODE" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve repository-write token
         id: auth
-        uses: jhw7500/automation/.github/actions/setup-gemini-auth@v1.1
+        uses: jhw7500/automation/.github/actions/setup-gemini-auth@2254f13aab44585c78954d20749f4fb677a8c2f1
         with:
-          app-id: '${{ inputs.app_id || vars.APP_ID }}'
-          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ github.token }}'
+          app-id: ${{ inputs.repo_write_auth == 'github_app' && inputs.app_id || '' }}
+          private-key: ${{ inputs.repo_write_auth == 'github_app' && secrets.APP_PRIVATE_KEY || '' }}
+          fallback-token: ${{ inputs.repo_write_auth == 'github_token' && github.token || '' }}
 
       - name: Run Gemini pull request review (primary)
         id: gemini_review_primary
@@ -299,17 +349,10 @@ jobs:
           PATCH: '${{ needs.dispatch.outputs.patch }}'
           INCREMENTAL: '${{ needs.dispatch.outputs.incremental }}'
         with:
-          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
-          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
-          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
-          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
           gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
           gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
           gemini_model: '${{ vars.GEMINI_MODEL }}'
-          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
-          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
-          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
           upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
           workflow_name: 'gemini-review'
           settings: |-
@@ -353,27 +396,22 @@ jobs:
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
           FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
-          ERRORS: '${{ steps.gemini_review_primary.outputs.gemini_errors }}'
+          ERRORS: '${{ steps.gemini_review_primary.outputs.error }}'
           REPOSITORY: '${{ github.repository }}'
         run: |-
-          cat > /tmp/error_comment.md <<'EOF'
-          ## ⚠️ Primary Model Failed
-
-          **Primary Model:** $PRIMARY_MODEL
-          **Attempting Fallback:** $FALLBACK_MODEL
-
-          <details>
-          <summary>Error Details</summary>
-
-          ```
-          $ERRORS
-          ```
-
-          </details>
-          EOF
+          error_comment="${RUNNER_TEMP}/gemini-review-primary-error.md"
+          umask 077
+          {
+            printf '%s\n\n' '## ⚠️ Primary Model Failed'
+            printf '**Primary Model:** %s\n' "$PRIMARY_MODEL"
+            printf '**Attempting Fallback:** %s\n\n' "$FALLBACK_MODEL"
+            printf '%s\n' '<details>' '<summary>Error Details</summary>' '' '```'
+            printf '%s\n' "$ERRORS"
+            printf '%s\n' '```' '' '</details>'
+          } > "$error_comment"
 
           gh issue comment "${ISSUE_NUMBER}" \
-            --body-file /tmp/error_comment.md \
+            --body-file "$error_comment" \
             --repo "${REPOSITORY}"
 
       - name: Run Gemini pull request review (fallback)
@@ -391,17 +429,10 @@ jobs:
           PATCH: '${{ needs.dispatch.outputs.patch }}'
           INCREMENTAL: '${{ needs.dispatch.outputs.incremental }}'
         with:
-          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
-          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
-          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
-          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
           gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
           gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
           gemini_model: '${{ vars.GEMINI_FALLBACK_MODEL }}'
-          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
-          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
-          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
           upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
           workflow_name: 'gemini-review'
           settings: |-
@@ -442,23 +473,53 @@ jobs:
       - name: Set final review result
         id: final_review
         if: always()
+        env:
+          PRIMARY_OUTCOME: '${{ steps.gemini_review_primary.outcome }}'
+          PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
+          PRIMARY_RESPONSE: '${{ steps.gemini_review_primary.outputs.summary }}'
+          PRIMARY_ERRORS: '${{ steps.gemini_review_primary.outputs.error }}'
+          FALLBACK_OUTCOME: '${{ steps.gemini_review_fallback.outcome }}'
+          FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
+          FALLBACK_RESPONSE: '${{ steps.gemini_review_fallback.outputs.summary }}'
+          FALLBACK_ERRORS: '${{ steps.gemini_review_fallback.outputs.error }}'
         run: |-
-          if [[ "${{ steps.gemini_review_primary.outcome }}" == "success" ]]; then
-            echo "outcome=success" >> $GITHUB_OUTPUT
-            echo "model=${{ vars.GEMINI_MODEL }}" >> $GITHUB_OUTPUT
-            echo "response=${{ steps.gemini_review_primary.outputs.gemini_response }}" >> $GITHUB_OUTPUT
-            echo "errors=${{ steps.gemini_review_primary.outputs.gemini_errors }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ steps.gemini_review_fallback.outcome }}" == "success" ]]; then
-            echo "outcome=success" >> $GITHUB_OUTPUT
-            echo "model=${{ vars.GEMINI_FALLBACK_MODEL }}" >> $GITHUB_OUTPUT
-            echo "response=${{ steps.gemini_review_fallback.outputs.gemini_response }}" >> $GITHUB_OUTPUT
-            echo "errors=${{ steps.gemini_review_fallback.outputs.gemini_errors }}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          write_output() {
+            local name="$1"
+            local value="$2"
+            local delimiter='__AUTOMATION_OUTPUT__'
+            while [[ "$value" == *"$delimiter"* ]]; do
+              delimiter="${delimiter}_X"
+            done
+            {
+              printf '%s<<%s\n' "$name" "$delimiter"
+              printf '%s\n' "$value"
+              printf '%s\n' "$delimiter"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          if [[ "$PRIMARY_OUTCOME" == "success" ]]; then
+            outcome='success'
+            model="$PRIMARY_MODEL"
+            response="$PRIMARY_RESPONSE"
+            errors="$PRIMARY_ERRORS"
+          elif [[ "$FALLBACK_OUTCOME" == "success" ]]; then
+            outcome='success'
+            model="$FALLBACK_MODEL"
+            response="$FALLBACK_RESPONSE"
+            errors="$FALLBACK_ERRORS"
           else
-            echo "outcome=failure" >> $GITHUB_OUTPUT
-            echo "model=${{ vars.GEMINI_MODEL }}" >> $GITHUB_OUTPUT
-            echo "response=" >> $GITHUB_OUTPUT
-            echo "errors=${{ steps.gemini_review_primary.outputs.gemini_errors }}" >> $GITHUB_OUTPUT
+            outcome='failure'
+            model="$PRIMARY_MODEL"
+            response=''
+            errors="$PRIMARY_ERRORS"
           fi
+
+          write_output outcome "$outcome"
+          write_output model "$model"
+          write_output response "$response"
+          write_output errors "$errors"
 
       - name: Upsert PR comment (Gemini Review)
         if: always()
@@ -471,7 +532,7 @@ jobs:
           RESPONSE: '${{ steps.final_review.outputs.response }}'
           ERRORS: '${{ steps.final_review.outputs.errors }}'
         with:
-          github-token: '${{ github.token }}'
+          github-token: '${{ steps.auth.outputs.token }}'
           script: |
             const marker = '<!-- automation:gemini-review -->';
             const issueNumber = Number(process.env.ISSUE_NUMBER);
@@ -548,7 +609,6 @@ jobs:
     timeout-minutes: 7
     permissions:
       contents: read
-      id-token: write
       issues: write
       pull-requests: write
     steps:
@@ -584,17 +644,10 @@ jobs:
           ISSUE_BODY: '${{ github.event.issue.body }}'
           AVAILABLE_LABELS: '${{ steps.get_labels.outputs.available_labels }}'
         with:
-          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
-          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
-          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
-          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
           gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
           gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
           gemini_model: '${{ vars.GEMINI_MODEL }}'
-          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
-          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
-          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
           upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
           workflow_name: 'gemini-triage'
           settings: |-
@@ -610,13 +663,39 @@ jobs:
         with:
           sparse-checkout: .github
 
-      - name: Setup authentication
+      - name: Validate repository-write auth
+        shell: bash
+        env:
+          MODE: ${{ inputs.repo_write_auth }}
+          APP_ID: ${{ inputs.app_id }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          case "$MODE" in
+            github_app)
+              test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {
+                echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2
+                exit 1
+              }
+              ;;
+            github_token)
+              test -z "$APP_ID" && test -z "$APP_PRIVATE_KEY" || {
+                echo 'github_token forbids App credentials' >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "invalid repo_write_auth: $MODE" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve repository-write token
         id: auth
-        uses: jhw7500/automation/.github/actions/setup-gemini-auth@v1.1
+        uses: jhw7500/automation/.github/actions/setup-gemini-auth@2254f13aab44585c78954d20749f4fb677a8c2f1
         with:
-          app-id: '${{ inputs.app_id || vars.APP_ID }}'
-          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ github.token }}'
+          app-id: ${{ inputs.repo_write_auth == 'github_app' && inputs.app_id || '' }}
+          private-key: ${{ inputs.repo_write_auth == 'github_app' && secrets.APP_PRIVATE_KEY || '' }}
+          fallback-token: ${{ inputs.repo_write_auth == 'github_token' && github.token || '' }}
 
       - name: Apply labels
         env:
@@ -657,7 +736,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
       issues: write
       pull-requests: write
     steps:
@@ -666,13 +744,39 @@ jobs:
         with:
           sparse-checkout: .github
 
-      - name: Setup authentication
+      - name: Validate repository-write auth
+        shell: bash
+        env:
+          MODE: ${{ inputs.repo_write_auth }}
+          APP_ID: ${{ inputs.app_id }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          case "$MODE" in
+            github_app)
+              test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {
+                echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2
+                exit 1
+              }
+              ;;
+            github_token)
+              test -z "$APP_ID" && test -z "$APP_PRIVATE_KEY" || {
+                echo 'github_token forbids App credentials' >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "invalid repo_write_auth: $MODE" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve repository-write token
         id: auth
-        uses: jhw7500/automation/.github/actions/setup-gemini-auth@v1.1
+        uses: jhw7500/automation/.github/actions/setup-gemini-auth@2254f13aab44585c78954d20749f4fb677a8c2f1
         with:
-          app-id: '${{ inputs.app_id || vars.APP_ID }}'
-          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          fallback-token: '${{ github.token }}'
+          app-id: ${{ inputs.repo_write_auth == 'github_app' && inputs.app_id || '' }}
+          private-key: ${{ inputs.repo_write_auth == 'github_app' && secrets.APP_PRIVATE_KEY || '' }}
+          fallback-token: ${{ inputs.repo_write_auth == 'github_token' && github.token || '' }}
 
       - name: Run Gemini CLI (primary)
         id: gemini_invoke_primary
@@ -688,17 +792,10 @@ jobs:
           REPOSITORY: '${{ github.repository }}'
           ADDITIONAL_CONTEXT: '${{ needs.dispatch.outputs.additional_context }}'
         with:
-          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
-          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
-          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
-          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
           gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
           gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
           gemini_model: '${{ vars.GEMINI_MODEL }}'
-          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
-          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
-          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
           upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
           workflow_name: 'gemini-invoke'
           settings: |-
@@ -724,27 +821,22 @@ jobs:
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
           FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
-          ERRORS: '${{ steps.gemini_invoke_primary.outputs.gemini_errors }}'
+          ERRORS: '${{ steps.gemini_invoke_primary.outputs.error }}'
           REPOSITORY: '${{ github.repository }}'
         run: |-
-          cat > /tmp/error_comment.md <<'EOF'
-          ## ⚠️ Primary Model Failed
-
-          **Primary Model:** $PRIMARY_MODEL
-          **Attempting Fallback:** $FALLBACK_MODEL
-
-          <details>
-          <summary>Error Details</summary>
-
-          ```
-          $ERRORS
-          ```
-
-          </details>
-          EOF
+          error_comment="${RUNNER_TEMP}/gemini-invoke-primary-error.md"
+          umask 077
+          {
+            printf '%s\n\n' '## ⚠️ Primary Model Failed'
+            printf '**Primary Model:** %s\n' "$PRIMARY_MODEL"
+            printf '**Attempting Fallback:** %s\n\n' "$FALLBACK_MODEL"
+            printf '%s\n' '<details>' '<summary>Error Details</summary>' '' '```'
+            printf '%s\n' "$ERRORS"
+            printf '%s\n' '```' '' '</details>'
+          } > "$error_comment"
 
           gh issue comment "${ISSUE_NUMBER}" \
-            --body-file /tmp/error_comment.md \
+            --body-file "$error_comment" \
             --repo "${REPOSITORY}"
 
       - name: Run Gemini CLI (fallback)
@@ -761,17 +853,10 @@ jobs:
           REPOSITORY: '${{ github.repository }}'
           ADDITIONAL_CONTEXT: '${{ needs.dispatch.outputs.additional_context }}'
         with:
-          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
-          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
-          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
-          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
           gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
           gemini_debug: "${{ vars.GEMINI_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}"
           gemini_model: '${{ vars.GEMINI_FALLBACK_MODEL }}'
-          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
-          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
-          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
           upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
           workflow_name: 'gemini-invoke'
           settings: |-
@@ -791,6 +876,7 @@ jobs:
           prompt: '/gemini-invoke'
 
   skipped:
+    permissions: {}
     name: Workflow Skipped
     needs: check-enabled
     if: needs.check-enabled.outputs.enabled != 'true'
@@ -818,21 +904,43 @@ jobs:
       issues: 'write'
       pull-requests: 'write'
     steps:
-      - name: 'Mint identity token'
-        id: 'mint_identity_token'
-        if: |-
-          ${{ inputs.app_id || vars.APP_ID }}
-        uses: 'actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b' # ratchet:actions/create-github-app-token@v2
+      - name: Validate repository-write auth
+        shell: bash
+        env:
+          MODE: ${{ inputs.repo_write_auth }}
+          APP_ID: ${{ inputs.app_id }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          case "$MODE" in
+            github_app)
+              test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {
+                echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2
+                exit 1
+              }
+              ;;
+            github_token)
+              test -z "$APP_ID" && test -z "$APP_PRIVATE_KEY" || {
+                echo 'github_token forbids App credentials' >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "invalid repo_write_auth: $MODE" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve repository-write token
+        id: auth
+        uses: jhw7500/automation/.github/actions/setup-gemini-auth@2254f13aab44585c78954d20749f4fb677a8c2f1
         with:
-          app-id: '${{ inputs.app_id || vars.APP_ID }}'
-          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          permission-contents: 'read'
-          permission-issues: 'write'
-          permission-pull-requests: 'write'
+          app-id: ${{ inputs.repo_write_auth == 'github_app' && inputs.app_id || '' }}
+          private-key: ${{ inputs.repo_write_auth == 'github_app' && secrets.APP_PRIVATE_KEY || '' }}
+          fallback-token: ${{ inputs.repo_write_auth == 'github_token' && github.token || '' }}
 
       - name: 'Send failure comment'
         env:
-          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || github.token }}'
+          GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           COMMAND: '${{ needs.dispatch.outputs.command }}'
           REPOSITORY: '${{ github.repository }}'

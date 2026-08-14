@@ -7,13 +7,12 @@ jobs:
   triage:
     permissions:
       contents: read
-      id-token: write
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-scheduled-triage.yml@v1.36
+    uses: jhw7500/automation/.github/workflows/gemini-scheduled-triage.yml@__AUTOMATION_COMMIT__
     with:
+      repo_write_auth: github_app
       app_id: ${{ vars.APP_ID }}
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}

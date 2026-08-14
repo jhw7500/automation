@@ -1,189 +1,191 @@
 #!/usr/bin/env python3
-"""Audit consumer repositories that call jhw7500/automation workflows."""
+"""Classify one repository or the configured fleet without remote mutation."""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
+import stat
 import sys
+import tempfile
+from typing import Literal
 
-import yaml
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-
-AUTOMATION_WORKFLOW_USE = re.compile(
-    r"jhw7500/automation/\.github/workflows/([^@\s'\"]+)@([^\s'\"]+)"
+from scripts import workflow_fleet_git as fleet_git  # noqa: E402
+from scripts.prepare_workflow_rollout import (  # noqa: E402
+    RolloutError,
+    render_repository,
+)
+from scripts.workflow_fleet_git import FleetGitError  # noqa: E402
+from scripts.workflow_catalog import RepoProfile  # noqa: E402
+from scripts.workflow_release_bundle import (  # noqa: E402
+    ReleaseBundle,
+    materialize_release_bundle,
 )
 
 
-def load_yaml(path: Path) -> dict:
-    data = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
-    return data if isinstance(data, dict) else {}
+VERSION_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
+WORKSPACE_MARKER = ".automation-fleet-workspace"
+GIT_PREFIX = (
+    "git",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "submodule.recurse=false",
+)
 
 
-def configured_ref(repo: Path) -> str | None:
-    path = repo / ".github" / "workflow-config.yml"
-    if not path.is_file():
-        return None
-    value = load_yaml(path).get("automation_ref")
-    return value if isinstance(value, str) and value else None
-
-
-def workflow_contract(automation: Path, filename: str) -> tuple[set[str], set[str]] | None:
-    path = automation / ".github" / "workflows" / filename
-    if not path.is_file():
-        return None
-    workflow = load_yaml(path)
-    call = workflow.get("on", {}).get("workflow_call", {})
-    declarations = call.get("secrets", {}) if isinstance(call, dict) else {}
-    if not isinstance(declarations, dict):
-        declarations = {}
-    declared = set(declarations)
-    required = {
-        name
-        for name, config in declarations.items()
-        if isinstance(config, dict) and config.get("required", "false") == "true"
-    }
-    return declared, required
-
-
-def audit_template_contract(repo: Path, template: Path) -> list[str]:
-    issues: list[str] = []
-    if not template.is_dir():
-        return [f"managed template directory missing: {template}"]
-    canonical_paths = sorted(template.glob("*.y*ml"))
-    if not canonical_paths:
-        return [f"managed template contains no workflow YAML: {template}"]
-    target_dir = repo / ".github" / "workflows"
-    for canonical_path in canonical_paths:
-        target_path = target_dir / canonical_path.name
-        location = f".github/workflows/{canonical_path.name}"
-        if not target_path.is_file():
-            issues.append(f"{location}: managed caller missing")
-            continue
-        canonical = load_yaml(canonical_path)
-        target = load_yaml(target_path)
-        if canonical.get("on") != target.get("on"):
-            issues.append(f"{location}: trigger drift from managed template")
-
-        canonical_jobs = canonical.get("jobs", {})
-        target_jobs = target.get("jobs", {})
-        if not isinstance(canonical_jobs, dict) or not isinstance(target_jobs, dict):
-            continue
-        for job_name, canonical_job in canonical_jobs.items():
-            if not isinstance(canonical_job, dict):
-                continue
-            use = canonical_job.get("uses")
-            if not isinstance(use, str) or AUTOMATION_WORKFLOW_USE.fullmatch(
-                use.strip("'\"")
-            ) is None:
-                continue
-            target_job = target_jobs.get(job_name)
-            if not isinstance(target_job, dict):
-                issues.append(f"{location}:job {job_name}: managed caller job missing")
-                continue
-            if canonical_job.get("permissions", {}) != target_job.get("permissions", {}):
-                issues.append(
-                    f"{location}:job {job_name}: permissions drift from managed template"
-                )
-    return issues
+@dataclass(frozen=True)
+class AuditResult:
+    repo: str
+    status: Literal["current", "drift", "blocked"]
+    detail: str
+    changed_paths: tuple[str, ...]
 
 
 def audit_repository(
-    repo: Path, automation: Path, template: Path | None = None
-) -> list[str]:
-    issues: list[str] = []
-    expected_ref = configured_ref(repo)
-    if expected_ref is None:
-        issues.append(".github/workflow-config.yml: missing automation_ref")
+    repo: Path,
+    bundle: ReleaseBundle,
+    profile: RepoProfile,
+    secret_names: set[str],
+    variable_names: set[str],
+    *,
+    observed_revision: str | None = None,
+) -> AuditResult:
+    """Return a renderer-derived content classification without writing."""
 
-    workflows = repo / ".github" / "workflows"
-    if not workflows.is_dir():
-        return issues + [".github/workflows: directory missing"]
+    try:
+        plan = render_repository(
+            repo,
+            bundle.canonical,
+            bundle.catalog,
+            profile,
+            bundle.ref,
+            bundle.commit,
+            secret_names,
+            variable_names,
+            bootstrap=False,
+            observed_revision=observed_revision,
+        )
+    except RolloutError as exc:
+        return AuditResult(repo.name, "blocked", str(exc), ())
 
-    for path in sorted(workflows.glob("*.y*ml")):
-        relative = path.relative_to(repo)
-        text = path.read_text(encoding="utf-8")
-        for lineno, line in enumerate(text.splitlines(), 1):
-            for match in AUTOMATION_WORKFLOW_USE.finditer(line):
-                actual_ref = match.group(2)
-                if expected_ref is not None and actual_ref != expected_ref:
-                    issues.append(
-                        f"{relative}:{lineno}: ref drift: configured {expected_ref}, uses {actual_ref}"
-                    )
+    if plan.status == "blocked":
+        return AuditResult(repo.name, "blocked", plan.reason, ())
+    changed_paths = tuple(sorted(change.path.as_posix() for change in plan.changes))
+    if plan.status in {"drift", "bootstrap_required"}:
+        return AuditResult(repo.name, "drift", plan.reason, changed_paths)
+    return AuditResult(repo.name, "current", plan.reason, ())
 
-        workflow = load_yaml(path)
-        jobs = workflow.get("jobs", {})
-        if not isinstance(jobs, dict):
-            continue
-        for job_name, job in jobs.items():
-            if not isinstance(job, dict):
-                continue
-            use = job.get("uses")
-            if not isinstance(use, str):
-                continue
-            match = AUTOMATION_WORKFLOW_USE.fullmatch(use.strip("'\""))
-            if match is None:
-                continue
-            filename = match.group(1)
-            contract = workflow_contract(automation, filename)
-            location = f"{relative}:job {job_name}"
-            if contract is None:
-                issues.append(f"{location}: central workflow not found: {filename}")
-                continue
-            declared, required = contract
-            passed = job.get("secrets", {})
-            if passed == "inherit":
-                issues.append(f"{location}: secrets: inherit exposes all caller secrets")
-                continue
-            if passed is None:
-                passed = {}
-            if not isinstance(passed, dict):
-                issues.append(f"{location}: invalid secrets mapping")
-                continue
-            passed_names = set(passed)
-            missing = sorted(required - passed_names)
-            unknown = sorted(passed_names - declared)
-            if missing:
-                issues.append(f"{location}: missing required secrets: {', '.join(missing)}")
-            if unknown:
-                issues.append(f"{location}: undeclared secret mapping: {', '.join(unknown)}")
-            for name, value in passed.items():
-                if name not in declared or not isinstance(value, str):
-                    continue
-                expected_source = re.compile(
-                    rf"^\$\{{\{{\s*secrets\.{re.escape(name)}\s*\}}\}}$"
-                )
-                if expected_source.fullmatch(value) is None:
-                    issues.append(
-                        f"{location}: secret source mismatch for {name}; "
-                        f"expected secrets.{name}"
-                    )
-    if template is not None:
-        issues.extend(audit_template_contract(repo, template))
-    return issues
+
+def git(args: list[str], *, cwd: Path | None = None) -> str:
+    """Run read-only local Git operations through the scrubbed adapter."""
+
+    if (
+        len(args) != 3
+        or args[:2] != ["switch", "--detach"]
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", args[2]) is None
+    ):
+        raise FleetGitError("audit Git operation is not permitted")
+    return fleet_git.run([*GIT_PREFIX, *args], cwd=cwd)
+
+
+def _workspace(path: Path, parser: argparse.ArgumentParser) -> Path:
+    try:
+        absolute = Path(os.path.abspath(path))
+        resolved = path.resolve(strict=True)
+        marker = resolved / WORKSPACE_MARKER
+        mode = marker.lstat().st_mode
+        if (
+            resolved != absolute
+            or path.is_symlink()
+            or not resolved.is_dir()
+            or marker.is_symlink()
+            or not stat.S_ISREG(mode)
+        ):
+            raise OSError
+        return resolved
+    except (OSError, RuntimeError):
+        parser.error("audit workspace must be a real marked disposable directory")
+    raise AssertionError("argparse.error must exit")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--automation", type=Path, default=ROOT)
+    parser.add_argument("--workspace", type=Path, required=True)
+    parser.add_argument("--ref", default="v1.40")
+    parser.add_argument("--repo", action="append", default=[])
+    return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--repo", type=Path, required=True)
-    parser.add_argument("--automation", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument(
-        "--template",
-        type=Path,
-        help="optional managed caller directory for missing/trigger/permission drift checks",
-    )
+    parser = _parser()
     args = parser.parse_args(argv)
+    if VERSION_REF.fullmatch(args.ref) is None:
+        parser.error(f"invalid release ref: {args.ref}")
+    if len(args.repo) != len(set(args.repo)):
+        parser.error("--repo values must be unique")
+    workspace = _workspace(args.workspace, parser)
 
-    template = args.template.resolve() if args.template is not None else None
-    issues = audit_repository(args.repo.resolve(), args.automation.resolve(), template)
-    if issues:
-        print(f"FAIL {args.repo}: {len(issues)} issue(s)")
-        for issue in issues:
-            print(f"- {issue}")
-        return 1
-    print(f"PASS {args.repo}: caller refs and secret mappings match central contracts")
-    return 0
+    with materialize_release_bundle(
+        args.automation, args.ref, remote="origin"
+    ) as bundle:
+        configured = set(bundle.config.profiles)
+        repos = args.repo or sorted(configured)
+        unknown = sorted(set(repos) - configured)
+        if unknown:
+            parser.error(f"repositories not in release bundle: {', '.join(unknown)}")
+
+        outcomes: list[AuditResult] = []
+        with tempfile.TemporaryDirectory(prefix=".audit-", dir=workspace) as temporary:
+            clone_workspace = Path(temporary)
+            (clone_workspace / WORKSPACE_MARKER).write_text(
+                "managed disposable clones only\n", encoding="utf-8"
+            )
+            for repo in repos:
+                try:
+                    snapshot = fleet_git.clone_default_branch(
+                        bundle.config.owner, repo, clone_workspace
+                    )
+                    base_sha = fleet_git.refetch_default(snapshot)
+                    git(["switch", "--detach", base_sha], cwd=snapshot.path)
+                    outcomes.append(
+                        audit_repository(
+                            snapshot.path,
+                            bundle,
+                            bundle.config.profiles[repo],
+                            set(snapshot.secret_names),
+                            set(snapshot.variable_names),
+                            observed_revision=base_sha,
+                        )
+                    )
+                except (FleetGitError, RolloutError):
+                    outcomes.append(
+                        AuditResult(repo, "blocked", "repository audit failed", ())
+                    )
+                except (OSError, KeyError, ValueError):
+                    outcomes.append(
+                        AuditResult(repo, "blocked", "local audit failed", ())
+                    )
+
+        for outcome in outcomes:
+            print(f"{outcome.status.upper():7} {outcome.repo}: {outcome.detail}")
+        counts = {
+            status: sum(item.status == status for item in outcomes)
+            for status in ("current", "drift", "blocked")
+        }
+        print(
+            f"SUMMARY ref={bundle.ref} commit={bundle.commit} total={len(outcomes)} "
+            f"current={counts['current']} drift={counts['drift']} blocked={counts['blocked']}"
+        )
+        return 1 if counts["blocked"] else 0
 
 
 if __name__ == "__main__":

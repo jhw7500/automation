@@ -32,10 +32,9 @@ jobs:
   invoke:
     permissions:
       contents: read
-      id-token: write
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-invoke.yml@v1.36
+    uses: jhw7500/automation/.github/workflows/gemini-invoke.yml@__AUTOMATION_COMMIT__
     with:
       item_number: ${{ inputs.item_number }}
       item_title: ${{ inputs.item_title }}
@@ -43,8 +42,8 @@ jobs:
       event_name: ${{ inputs.event_name }}
       is_pull_request: ${{ inputs.is_pull_request }}
       additional_context: ${{ inputs.additional_context }}
+      repo_write_auth: github_app
       app_id: ${{ vars.APP_ID }}
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}

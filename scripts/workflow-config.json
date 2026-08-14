@@ -1,51 +1,152 @@
 {
+  "schema_version": 1,
   "gh_owner": "jhw7500",
-  "automation_ref": "v1.35",
-  "template_dir": "examples/baseline-workflows",
-
-  "workflows": [
-    "claude.yml",
-    "claude-code-review.yml",
-    "gemini-auto-review.yml",
-    "gemini-scheduled-triage.yml",
-    "gemini-dispatch.yml",
-    "gemini-invoke.yml",
-    "gemini-review.yml",
-    "gemini-triage.yml",
-    "gemini-issue-triage.yml",
-    "gemini-pr-review.yml",
-    "bump-automation-ref.yml"
-  ],
-
-  "extra_files": [
-    "README.md",
-    "workflow-config.yml"
-  ],
-
-  "secrets": [
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "GEMINI_API_KEY"
-  ],
-
+  "automation_ref": "v1.40",
+  "canonical_dir": "examples/baseline-workflows/.github",
+  "catalog": "scripts/workflow-catalog.json",
   "repos": {
-    "wlan-package":         { "workflows": true, "secrets": true },
-    "wlan-driver":          { "workflows": true, "secrets": true },
-    "wlan-driver-v2":       { "workflows": true, "secrets": true },
-    "wlan-bridge":          { "workflows": true, "secrets": true },
-    "wlan-opc":             { "workflows": true, "secrets": true },
-    "pcap-analyzer":        { "workflows": true, "secrets": true },
-    "wpa-supplicant":       { "workflows": true, "secrets": true },
-    "pim-package-jhw":      { "workflows": true, "secrets": true },
-    "gstApp":               { "workflows": true, "secrets": true },
-    "sc16is7xx":            { "workflows": true, "secrets": true },
-    "max9296":              { "workflows": true, "secrets": true },
-    "pim-check":            { "workflows": true, "secrets": true },
-    "redmine":              { "workflows": true, "secrets": true },
-    "jhw-notion":           { "workflows": true, "secrets": true },
-    "personal-ops":         { "workflows": true, "secrets": true },
-    "cts-email-mcp-server": { "workflows": true, "secrets": true },
-    "cts-ta-mcp-server":    { "workflows": true, "secrets": true },
-    "cts-ta-webapp":        { "workflows": true, "secrets": true },
-    "claude-config":        { "workflows": true, "secrets": true }
+    "gstApp": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [
+        "auto-rereview-request.yml",
+        "gemini-chat.yml",
+        "opencode.yml",
+        "opencode-auto-review.yml"
+      ],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "max9296": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [
+        "auto-rereview-request.yml",
+        "gemini-chat.yml",
+        "opencode.yml",
+        "opencode-auto-review.yml"
+      ],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "wlan-driver": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [
+        "auto-rereview-request.yml",
+        "opencode.yml",
+        "opencode-auto-review.yml"
+      ],
+      "repo_write_auth": "github_token",
+      "bootstrap_allowed": false
+    },
+    "wlan-driver-v2": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [
+        "auto-rereview-request.yml",
+        "opencode.yml",
+        "opencode-auto-review.yml"
+      ],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "wlan-bridge": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [
+        "gemini-chat.yml",
+        "opencode.yml",
+        "opencode-auto-review.yml"
+      ],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "wlan-package": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [
+        "opencode.yml",
+        "opencode-auto-review.yml"
+      ],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "pim-package-jhw": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [
+        "opencode-auto-review.yml"
+      ],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "wlan-opc": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [
+        "opencode.yml"
+      ],
+      "repo_write_auth": "github_token",
+      "bootstrap_allowed": false
+    },
+    "pcap-analyzer": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "wpa-supplicant": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_token",
+      "bootstrap_allowed": true
+    },
+    "sc16is7xx": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "pim-check": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_token",
+      "bootstrap_allowed": false
+    },
+    "redmine": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "jhw-notion": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "personal-ops": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_app",
+      "bootstrap_allowed": false
+    },
+    "cts-email-mcp-server": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_token",
+      "bootstrap_allowed": true
+    },
+    "cts-ta-mcp-server": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_token",
+      "bootstrap_allowed": false
+    },
+    "cts-ta-webapp": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_token",
+      "bootstrap_allowed": false
+    },
+    "claude-config": {
+      "profile": "common-ai-v1",
+      "optional_workflows": [],
+      "repo_write_auth": "github_token",
+      "bootstrap_allowed": false
+    }
   }
 }
