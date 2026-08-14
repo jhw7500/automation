@@ -28,6 +28,9 @@ DESIGN = (
 )
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "test-fleet-tools.yml"
 CENTRAL_WORKFLOWS = ROOT / ".github" / "workflows"
+CANONICAL_WORKFLOWS = (
+    ROOT / "examples" / "baseline-workflows" / ".github" / "workflows"
+)
 IMPLEMENTATION_PLAN = (
     ROOT
     / "docs"
@@ -406,6 +409,73 @@ def _parse_github_outputs(text: str) -> dict[str, str]:
         parsed[name] = "\n".join(value)
         index += 1
     return parsed
+
+
+@pytest.mark.parametrize(
+    ("filename", "step_name"),
+    (
+        ("gemini-issue-triage.yml", "Fetch issue"),
+        ("gemini-pr-review.yml", "Fetch PR"),
+    ),
+)
+def test_manual_gemini_fetch_preserves_hostile_multiline_outputs(
+    tmp_path: Path, filename: str, step_name: str
+) -> None:
+    step = _workflow_step(CANONICAL_WORKFLOWS / filename, step_name)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        "while (($#)); do\n"
+        "  if [[ $1 == --json ]]; then\n"
+        "    case $2 in\n"
+        "      title) printf '%s' \"$HOSTILE_TITLE\" ;;\n"
+        "      body) printf '%s' \"$HOSTILE_BODY\" ;;\n"
+        "      *) exit 96 ;;\n"
+        "    esac\n"
+        "    exit 0\n"
+        "  fi\n"
+        "  shift\n"
+        "done\n"
+        "exit 97\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    title = (
+        "title-before\nEOF\ninjected_title=value\n"
+        "__AUTOMATION_OUTPUT__\n__AUTOMATION_OUTPUT___X\ntitle-after"
+    )
+    body = (
+        "body-before\nEOF\ninjected_body=value\n"
+        "__AUTOMATION_OUTPUT__\n__AUTOMATION_OUTPUT___X\nbody-after"
+    )
+    output = tmp_path / "github-output"
+    completed = subprocess.run(
+        ["/bin/bash", "-eu", "-o", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "GITHUB_OUTPUT": str(output),
+            "HOSTILE_TITLE": title,
+            "HOSTILE_BODY": body,
+            "GH_TOKEN": "sentinel-token",
+            "REPO": "jhw7500/example",
+            "ISSUE_NUMBER": "17",
+            "PR_NUMBER": "19",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert _parse_github_outputs(output.read_text(encoding="utf-8")) == {
+        "title": title,
+        "body": body,
+    }
 
 
 def test_final_gemini_selection_treats_adversarial_model_output_as_data(

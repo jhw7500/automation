@@ -18,6 +18,7 @@ jobs:
       issue_body: ${{ steps.issue.outputs.body }}
     steps:
       - name: Validate issue_number
+        shell: bash
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
         run: |
@@ -28,6 +29,7 @@ jobs:
 
       - name: Fetch issue
         id: issue
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -36,13 +38,22 @@ jobs:
           title="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title --jq .title)"
           body="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json body --jq .body)"
 
-          echo "title<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$title" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          write_output() {
+            local name="$1"
+            local value="$2"
+            local delimiter='__AUTOMATION_OUTPUT__'
+            while [[ "$value" == *"$delimiter"* ]]; do
+              delimiter="${delimiter}_X"
+            done
+            {
+              printf '%s<<%s\n' "$name" "$delimiter"
+              printf '%s\n' "$value"
+              printf '%s\n' "$delimiter"
+            } >> "$GITHUB_OUTPUT"
+          }
 
-          echo "body<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$body" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          write_output title "$title"
+          write_output body "$body"
 
   triage:
     needs: prepare

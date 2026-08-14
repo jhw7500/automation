@@ -43,6 +43,49 @@ HERMETIC_REMOTE_GIT_ENV = {
     "GIT_PROTOCOL_FROM_USER": "0",
     "GIT_CEILING_DIRECTORIES": "/",
 }
+HARDENED_MANUAL_OUTPUT_BLOCK = """          write_output() {
+            local name="$1"
+            local value="$2"
+            local delimiter='__AUTOMATION_OUTPUT__'
+            while [[ "$value" == *"$delimiter"* ]]; do
+              delimiter="${delimiter}_X"
+            done
+            {
+              printf '%s<<%s\\n' "$name" "$delimiter"
+              printf '%s\\n' "$value"
+              printf '%s\\n' "$delimiter"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          write_output title "$title"
+          write_output body "$body"
+"""
+LEGACY_MANUAL_OUTPUT_BLOCK = """          echo "title<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$title" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$body" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+"""
+
+
+def restore_historical_v140_manual_outputs(repo: Path) -> None:
+    root = repo / "examples/baseline-workflows/.github/workflows"
+    for filename in ("gemini-issue-triage.yml", "gemini-pr-review.yml"):
+        path = root / filename
+        text = path.read_text(encoding="utf-8")
+        assert text.count(HARDENED_MANUAL_OUTPUT_BLOCK) == 1
+        assert text.count("        shell: bash\n") == 2
+        path.write_text(
+            text.replace(
+                HARDENED_MANUAL_OUTPUT_BLOCK,
+                LEGACY_MANUAL_OUTPUT_BLOCK,
+                1,
+            ).replace("        shell: bash\n", "", 2),
+            encoding="utf-8",
+        )
+
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(
@@ -71,6 +114,7 @@ def release_repo(tmp_path: Path) -> tuple[Path, Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_historical_v140_manual_outputs(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -81,6 +125,24 @@ def release_repo(tmp_path: Path) -> tuple[Path, Path, str]:
     git(repo, "remote", "add", "origin", str(remote))
     git(repo, "push", "-q", "origin", "v1.40")
     return repo, remote, release_commit
+
+
+@pytest.fixture
+def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
+    repo = tmp_path / "current-automation"
+    repo.mkdir()
+    for relative in RELEASE_PATHS:
+        source = ROOT / relative
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            shutil.copy2(source, target)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    return repo, commit(repo, "current release")
 
 
 def replace(path: Path, old: str, new: str, *, count: int = -1) -> None:
@@ -513,13 +575,148 @@ def test_authenticated_release_objects_support_normal_storage_layouts(
     assert verify_release(checkout, "v1.40", release_commit) == release_commit
 
 
-def test_actual_current_commit_only_uses_authenticated_objects() -> None:
-    current = git(ROOT, "rev-parse", "HEAD")
+def test_current_release_commit_only_uses_authenticated_objects(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, current = current_release_repo
 
     assert (
-        release_verifier.verify_commit_content(ROOT, "v1.40", current)
+        release_verifier.verify_commit_content(repo, "v1.40.2", current)
         == current
     )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        (
+            '            while [[ "$value" == *"$delimiter"* ]]; do\n'
+            '              delimiter="${delimiter}_X"\n'
+            "            done\n",
+            "",
+        ),
+        (
+            '          write_output title "$title"\n',
+            "          printf 'title<<EOF\\n%s\\nEOF\\n' \"$title\" "
+            '>> "$GITHUB_OUTPUT"\n',
+        ),
+    ),
+    ids=("missing-collision-loop", "fixed-eof-restored"),
+)
+@pytest.mark.parametrize(
+    "filename",
+    ("gemini-issue-triage.yml", "gemini-pr-review.yml"),
+)
+def test_commit_gate_rejects_unsafe_manual_gemini_output_writer(
+    current_release_repo: tuple[Path, str], filename: str, old: str, new: str
+) -> None:
+    repo, _ = current_release_repo
+    replace(
+        repo / "examples/baseline-workflows/.github/workflows" / filename,
+        old,
+        new,
+        count=1,
+    )
+    bad_commit = commit(repo, "weaken manual Gemini output writer")
+
+    with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
+        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("filename", "step_id", "output_prefix"),
+    (
+        ("gemini-issue-triage.yml", "issue", "issue"),
+        ("gemini-pr-review.yml", "pr", "pr"),
+    ),
+)
+def test_commit_gate_rejects_manual_gemini_outputs_rewired_to_unsafe_step(
+    current_release_repo: tuple[Path, str],
+    filename: str,
+    step_id: str,
+    output_prefix: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / "examples/baseline-workflows/.github/workflows" / filename
+
+    def rewire(document: dict) -> None:
+        prepare = document["jobs"]["prepare"]
+        prepare["steps"].append(
+            {
+                "name": "Unsafe fixed-delimiter writer",
+                "id": "unsafe",
+                "run": (
+                    "printf 'title<<EOF\\nunsafe\\nEOF\\n' >> \"$GITHUB_OUTPUT\"\n"
+                    "printf 'body<<EOF\\nunsafe\\nEOF\\n' >> \"$GITHUB_OUTPUT\"\n"
+                ),
+            }
+        )
+        prepare["outputs"] = {
+            f"{output_prefix}_title": "${{ steps.unsafe.outputs.title }}",
+            f"{output_prefix}_body": "${{ steps.unsafe.outputs.body }}",
+        }
+        assert any(step.get("id") == step_id for step in prepare["steps"])
+
+    mutate_yaml(path, rewire)
+    bad_commit = commit(repo, "rewire manual Gemini outputs")
+
+    with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
+        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("filename", "step_id"),
+    (
+        ("gemini-issue-triage.yml", "issue"),
+        ("gemini-pr-review.yml", "pr"),
+    ),
+)
+def test_commit_gate_rejects_manual_gemini_fetch_without_explicit_bash(
+    current_release_repo: tuple[Path, str], filename: str, step_id: str
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / "examples/baseline-workflows/.github/workflows" / filename
+
+    def use_sh_default(document: dict) -> None:
+        document["defaults"] = {"run": {"shell": "sh"}}
+        fetch = next(
+            step
+            for step in document["jobs"]["prepare"]["steps"]
+            if step.get("id") == step_id
+        )
+        fetch.pop("shell", None)
+
+    mutate_yaml(path, use_sh_default)
+    bad_commit = commit(repo, "remove explicit Bash execution context")
+
+    with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
+        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("filename", "job_name", "title_key"),
+    (
+        ("gemini-issue-triage.yml", "triage", "issue_title"),
+        ("gemini-pr-review.yml", "review", "issue_title"),
+    ),
+)
+def test_commit_gate_rejects_manual_gemini_downstream_output_rewiring(
+    current_release_repo: tuple[Path, str],
+    filename: str,
+    job_name: str,
+    title_key: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / "examples/baseline-workflows/.github/workflows" / filename
+
+    def rewire(document: dict) -> None:
+        document["jobs"][job_name]["with"][title_key] = "unsafe literal"
+
+    mutate_yaml(path, rewire)
+    bad_commit = commit(repo, "rewire downstream manual Gemini title")
+
+    with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
+        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
 
 
 def test_release_verifier_preserves_pre_inventory_v139_contract(
