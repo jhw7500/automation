@@ -82,13 +82,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUM: ${{ steps.pr.outputs.number }}
         run: |
-          # 리뷰어 = PR review 작성자 ∪ automation sticky 코멘트 작성자.
+          # 리뷰어 = PR review 작성자 ∪ automation sticky 코멘트의 "봇" 작성자.
           # sticky upsert 전환으로 일부 자동 리뷰어(Claude 등)는 review 객체 대신 마커 달린
-          # issue comment만 남기므로, reviews만 보면 감지에서 빠진다.
-          REVIEWERS=$(gh pr view "$PR_NUM" --json reviews,comments \
-            --jq '([.reviews[].author.login]
-                   + [.comments[] | select((.body // "") | contains("<!-- automation:")) | .author.login])
-                  | unique | join(", @")')
+          # issue comment만 남기므로 reviews만으로는 감지에서 빠진다. 코멘트 쪽은 REST
+          # user.type 으로 봇만 채택한다 — 사람이 마커 문자열을 인용한 코멘트가 멘션 대상이
+          # 되지 않게 하기 위함이며, gh pr view(GraphQL)의 author에는 봇 여부 필드가 없어
+          # REST(/issues/N/comments)로 조회한다.
+          REVIEW_AUTHORS=$(gh pr view "$PR_NUM" --json reviews \
+            --jq '[.reviews[].author.login]' || printf '[]')
+          STICKY_BOT_AUTHORS=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments" --paginate 2>/dev/null \
+            | jq -s 'add // [] | [.[] | select(((.user.type // "") == "Bot")
+                     and ((.body // "") | contains("<!-- automation:"))) | .user.login]' \
+            || printf '[]')
+          REVIEWERS=$(jq -rn --argjson reviews "${REVIEW_AUTHORS:-[]}" --argjson stickies "${STICKY_BOT_AUTHORS:-[]}" \
+            '$reviews + $stickies | unique | join(", @")')
 
           if [ -n "$REVIEWERS" ]; then
             printf 'reviewers=@%s\n' "$REVIEWERS" >> "$GITHUB_OUTPUT"
