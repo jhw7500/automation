@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -168,6 +169,30 @@ def test_collect_handles_deleted_user_comments(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# self-review callers: secret + fork gates (dogfood 안전 계약)
+# ---------------------------------------------------------------------------
+
+
+def test_self_review_callers_gate_on_secret_and_fork():
+    for fname, secret, job_name in (
+        ("_self-gemini-auto-review.yml", "GEMINI_API_KEY", "gemini-review"),
+        ("_self-opencode-auto-review.yml", "ZHIPU_API_KEY", "opencode-review"),
+    ):
+        workflow = _load(fname)
+        jobs = workflow["jobs"]
+        check = jobs["check-secret"]
+        assert check["permissions"] == {"contents": "read"}
+        review_job = jobs[job_name]
+        condition = review_job["if"]
+        assert "needs.check-secret.outputs.has_key == 'true'" in condition
+        assert "github.event.pull_request.head.repo.fork == false" in condition
+        assert "head.repo.full_name == github.repository" in condition
+        assert review_job["uses"].startswith("./.github/workflows/")
+        text = (WORKFLOWS / fname).read_text(encoding="utf-8")
+        assert f"secrets.{secret}" in text
+
+
+# ---------------------------------------------------------------------------
 # incremental review: delta generation + Reviewed SHA round-trip
 # ---------------------------------------------------------------------------
 
@@ -238,6 +263,51 @@ def test_collect_skips_delta_when_head_equals_reviewed(tmp_path):
         pr_files=["a.py"],
     )
     assert not (tmp_path / "claude-review-delta.diff").exists()
+
+
+GEMINI_MARKER = "<!-- automation:gemini-auto-review -->"
+
+
+def test_gemini_incremental_delta_carries_wide_context(tmp_path):
+    """Gemini는 도구가 없어 diff 밖 코드를 못 보므로 delta에 -U20 컨텍스트를 싣는다."""
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.name", "Test")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    lines = [f"line{i:02d}\n" for i in range(1, 31)]
+    (tmp_path / "ctx.txt").write_text("".join(lines), encoding="utf-8")
+    _git(tmp_path, "add", "ctx.txt")
+    _git(tmp_path, "commit", "-qm", "c1")
+    sha1 = _git(tmp_path, "rev-parse", "HEAD")
+    lines[14] = "line15-changed\n"
+    (tmp_path / "ctx.txt").write_text("".join(lines), encoding="utf-8")
+    _git(tmp_path, "add", "ctx.txt")
+    _git(tmp_path, "commit", "-qm", "c2")
+    sha2 = _git(tmp_path, "rev-parse", "HEAD")
+
+    sticky = _bot(
+        "github-actions[bot]",
+        f"x\n{GEMINI_MARKER}\n- Status: success\n- Reviewed: {sha1}\nprev round",
+        1,
+    )
+    workflow = _load("gemini-auto-review.yml")
+    run = _step(workflow, "gemini-review", "Get PR details")["run"]
+    marker = "# 재리뷰 라운드 인식"
+    assert marker in run, (
+        "gemini-auto-review.yml의 delta 블록 시작 주석이 바뀌었습니다 — "
+        "이 테스트의 슬라이스 지점을 함께 갱신하세요"
+    )
+    sliced = run[run.index(marker):]
+    env = _gh_stub(tmp_path, [sticky], head_sha=sha2, pr_files=["ctx.txt"])
+    subprocess.run(
+        ["bash", "-c", sliced], cwd=tmp_path, env=env, check=True, capture_output=True
+    )
+
+    delta = (tmp_path / "pr_diff_delta.txt").read_text(encoding="utf-8")
+    assert "line15-changed" in delta
+    # 기본 -U3이면 line12~line18만 실리고, -U20이라야 변경점에서 10줄 이상 떨어진
+    # 주변 컨텍스트(기존 가드에 해당)까지 보인다.
+    assert "line05" in delta
+    assert "line25" in delta
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +529,70 @@ def test_dispatch_extract_ignores_forged_human_json_marker(tmp_path):
     )
     outputs = _dispatch_extract_outputs(tmp_path, [forged])
     assert "last_success_sha" not in outputs
+
+
+def _extract_gemini_python() -> str:
+    workflow = _load("gemini-auto-review.yml")
+    run = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
+    match = re.search(
+        r"cat > gemini_review\.py << 'PYTHON_EOF'\n(.*?)\nPYTHON_EOF", run, re.S
+    )
+    assert match, "gemini_review.py heredoc not found"
+    return match.group(1)
+
+
+def test_gemini_infra_lines_sanitized_from_output_and_context(tmp_path):
+    """모델이 sticky 헤더(marker, '- Reviewed:')를 에코해도 게시본·프롬프트에 남지 않는다."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class _R:\n"
+        "    text = (\"REPO: x\\nPR NUMBER: 7\\nReviewer: Gemini Auto (Diff Focus)\\n\"\n"
+        "            \"<!-- automation:gemini-auto-review -->\\n## 🔎 Gemini Code Review\\n\"\n"
+        "            \"- Status: success\\n- Run: url\\n- Reviewed: \" + \"ab\" * 20 + \"\\n\"\n"
+        "            \"\\nACTUAL REVIEW CONTENT\\n\\n*Reviewed by Gemini*\\n\")\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        pathlib.Path('captured_prompt.txt').write_text(prompt)\n"
+        "        return _R()\n",
+        encoding="utf-8",
+    )
+    fabricated_sha = "cd" * 20
+    fixtures = {
+        "pr_title.txt": "T",
+        "pr_body.txt": "B",
+        "pr_number.txt": "7",
+        "pr_diff.txt": "+x\n",
+        "prev_review.txt": (
+            f"REPO: x\n{GEMINI_MARKER}\n- Status: success\n"
+            f"- Reviewed: {fabricated_sha}\n\nPREV FINDINGS BODY"
+        ),
+        "human_comments.txt": "",
+    }
+    for name, content in fixtures.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    env = dict(os.environ)
+    env.update({"GEMINI_API_KEY": "stub", "PYTHONPATH": str(tmp_path / "stub")})
+    subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=env, check=True, capture_output=True,
+    )
+
+    saved = (tmp_path / "gemini_review.md").read_text(encoding="utf-8")
+    assert "ACTUAL REVIEW CONTENT" in saved
+    assert "automation:gemini-auto-review" not in saved
+    assert "- Reviewed:" not in saved
+    assert "REPO:" not in saved
+
+    prompt = (tmp_path / "captured_prompt.txt").read_text(encoding="utf-8")
+    assert "PREV FINDINGS BODY" in prompt
+    assert "automation:gemini-auto-review" not in prompt
+    assert fabricated_sha not in prompt
 
 
 # ---------------------------------------------------------------------------

@@ -184,6 +184,9 @@ jobs:
           # NOTE: gemini-auto-review.yml의 'Get PR details' 스텝에 같은 delta 블록이 있다
           # (파일명만 다름). 로직을 고치면 양쪽을 함께 고칠 것 — composite action 추출은
           # 액션이 참조 시점에 태그로 선발행돼야 하는 플릿 릴리즈 제약 때문에 보류.
+          # 의도된 차이 1건: gemini 쪽 git diff는 -U20(넓은 컨텍스트) — 그 리뷰어는 단발
+          # API 호출이라 diff 밖 코드를 못 보므로 보상이 필요하고, 이쪽(claude)은 에이전트형이라
+          # 주변 코드를 직접 조회할 수 있어 기본 컨텍스트를 유지한다.
           rm -f claude-review-delta.diff pr_head_sha.txt
           HEAD_SHA="$(gh pr view "$PR_NUM" --json headRefOid --jq '.headRefOid // ""' 2>/dev/null || printf '')"
           printf '%s' "$HEAD_SHA" > pr_head_sha.txt

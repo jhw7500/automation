@@ -1,0 +1,49 @@
+# Dogfood the OpenCode auto review on this repo's OWN PRs (same pattern as
+# _self-claude-review.yml): a LOCAL path (`./.github/...`) runs the reusable
+# workflow AS CHANGED IN THAT PR, not a pinned tag. 같은 저장소 PR 제한은
+# reusable workflow의 safe_pr 검사가 중앙에서 강제한다.
+# secrets 컨텍스트는 job-level if에서 못 쓰므로, ZHIPU_API_KEY 미등록 시 스킵은
+# check-secret 잡의 output으로 게이트한다.
+name: Self OpenCode Auto Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  check-secret:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      has_key: ${{ steps.check.outputs.has_key }}
+    steps:
+      - name: Check ZHIPU_API_KEY presence
+        id: check
+        env:
+          KEY: ${{ secrets.ZHIPU_API_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ZHIPU_API_KEY not configured; skipping self OpenCode review"
+          fi
+
+  opencode-review:
+    needs: check-secret
+    # fork 가드는 reusable workflow의 safe_pr(API 재조회)가 중앙에서 강제하지만,
+    # 호출부에서도 명시해 이중 방어 + _self-gemini 쪽과 조건을 통일한다.
+    if: >-
+      needs.check-secret.outputs.has_key == 'true' &&
+      github.event.pull_request.head.repo.fork == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/opencode-auto-review.yml
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+    secrets:
+      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}

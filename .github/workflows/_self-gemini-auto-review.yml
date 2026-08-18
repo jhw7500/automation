@@ -1,0 +1,49 @@
+# Dogfood the Gemini auto review on this repo's OWN PRs (same pattern as
+# _self-claude-review.yml): a LOCAL path (`./.github/...`) runs the reusable
+# workflow AS CHANGED IN THAT PR, not a pinned tag.
+# repo_write_auth=github_token: 자체 완결(App 자격증명 불필요) — 이 모드에선 app_id/
+# APP_PRIVATE_KEY를 넘기면 안 된다(검증이 거부). sticky 작성자는 github-actions[bot].
+# secrets 컨텍스트는 job-level if에서 못 쓰므로, GEMINI_API_KEY 미등록 시 스킵은
+# check-secret 잡의 output으로 게이트한다.
+name: Self Gemini Auto Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  check-secret:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      has_key: ${{ steps.check.outputs.has_key }}
+    steps:
+      - name: Check GEMINI_API_KEY presence
+        id: check
+        env:
+          KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GEMINI_API_KEY not configured; skipping self Gemini review"
+          fi
+
+  gemini-review:
+    needs: check-secret
+    if: >-
+      needs.check-secret.outputs.has_key == 'true' &&
+      github.event.pull_request.head.repo.fork == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/gemini-auto-review.yml
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+      repo_write_auth: github_token
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
