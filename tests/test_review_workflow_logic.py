@@ -240,6 +240,46 @@ def test_collect_skips_delta_when_head_equals_reviewed(tmp_path):
     assert not (tmp_path / "claude-review-delta.diff").exists()
 
 
+GEMINI_MARKER = "<!-- automation:gemini-auto-review -->"
+
+
+def test_gemini_incremental_delta_carries_wide_context(tmp_path):
+    """Gemini는 도구가 없어 diff 밖 코드를 못 보므로 delta에 -U20 컨텍스트를 싣는다."""
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.name", "Test")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    lines = [f"line{i:02d}\n" for i in range(1, 31)]
+    (tmp_path / "ctx.txt").write_text("".join(lines), encoding="utf-8")
+    _git(tmp_path, "add", "ctx.txt")
+    _git(tmp_path, "commit", "-qm", "c1")
+    sha1 = _git(tmp_path, "rev-parse", "HEAD")
+    lines[14] = "line15-changed\n"
+    (tmp_path / "ctx.txt").write_text("".join(lines), encoding="utf-8")
+    _git(tmp_path, "add", "ctx.txt")
+    _git(tmp_path, "commit", "-qm", "c2")
+    sha2 = _git(tmp_path, "rev-parse", "HEAD")
+
+    sticky = _bot(
+        "github-actions[bot]",
+        f"x\n{GEMINI_MARKER}\n- Status: success\n- Reviewed: {sha1}\nprev round",
+        1,
+    )
+    workflow = _load("gemini-auto-review.yml")
+    run = _step(workflow, "gemini-review", "Get PR details")["run"]
+    sliced = run[run.index("# 재리뷰 라운드 인식"):]
+    env = _gh_stub(tmp_path, [sticky], head_sha=sha2, pr_files=["ctx.txt"])
+    subprocess.run(
+        ["bash", "-c", sliced], cwd=tmp_path, env=env, check=True, capture_output=True
+    )
+
+    delta = (tmp_path / "pr_diff_delta.txt").read_text(encoding="utf-8")
+    assert "line15-changed" in delta
+    # 기본 -U3이면 line12~line18만 실리고, -U20이라야 변경점에서 10줄 이상 떨어진
+    # 주변 컨텍스트(기존 가드에 해당)까지 보인다.
+    assert "line05" in delta
+    assert "line25" in delta
+
+
 # ---------------------------------------------------------------------------
 # github-script upsert bodies (node)
 # ---------------------------------------------------------------------------
