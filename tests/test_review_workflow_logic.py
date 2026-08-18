@@ -64,7 +64,13 @@ def _human(login: str, body: str, comment_id: int = 2, created: str = "t") -> di
     }
 
 
-def _gh_stub(tmp_path: Path, comments: list[dict], reviews: list[dict] | None = None) -> dict:
+def _gh_stub(
+    tmp_path: Path,
+    comments: list[dict],
+    reviews: list[dict] | None = None,
+    head_sha: str = "",
+    pr_files: list[str] | None = None,
+) -> dict:
     """PATH-shimmed gh that serves the REST comments and GraphQL reviews fixtures."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -72,13 +78,19 @@ def _gh_stub(tmp_path: Path, comments: list[dict], reviews: list[dict] | None = 
     (tmp_path / "reviews.json").write_text(
         json.dumps({"reviews": reviews or []}), encoding="utf-8"
     )
+    (tmp_path / "head.json").write_text(json.dumps({"headRefOid": head_sha}), encoding="utf-8")
+    (tmp_path / "pr_files.txt").write_text("\n".join(pr_files or []), encoding="utf-8")
     gh = bin_dir / "gh"
     gh.write_text(
         "#!/usr/bin/env bash\n"
         "case \"$*\" in\n"
         f"  *'/comments --paginate'*) cat '{tmp_path}/comments.json' ;;\n"
+        "  *'--json headRefOid'*)\n"
+        f"    jq -r \"${{@: -1}}\" '{tmp_path}/head.json' ;;\n"
         "  *'pr view'*'--json reviews'*)\n"
         f"    jq \"${{@: -1}}\" '{tmp_path}/reviews.json' ;;\n"
+        "  *'pr diff'*'--name-only'*)\n"
+        f"    cat '{tmp_path}/pr_files.txt' ;;\n"
         "  *) echo \"unexpected gh call: $*\" >&2; exit 1 ;;\n"
         "esac\n",
         encoding="utf-8",
@@ -102,10 +114,15 @@ def _gh_stub(tmp_path: Path, comments: list[dict], reviews: list[dict] | None = 
 # ---------------------------------------------------------------------------
 
 
-def _run_collect(tmp_path: Path, comments: list[dict]) -> str | None:
+def _run_collect(
+    tmp_path: Path,
+    comments: list[dict],
+    head_sha: str = "",
+    pr_files: list[str] | None = None,
+) -> str | None:
     workflow = _load("claude-code-review.yml")
     run = _step(workflow, "claude-review", "Collect previous review context")["run"]
-    env = _gh_stub(tmp_path, comments)
+    env = _gh_stub(tmp_path, comments, head_sha=head_sha, pr_files=pr_files)
     env.update({"MARKER": CLAUDE_MARKER, "MAX_SECTION_CHARS": "6000"})
     subprocess.run(
         ["bash", "-c", run], cwd=tmp_path, env=env, check=True, capture_output=True
@@ -148,6 +165,79 @@ def test_collect_handles_deleted_user_comments(tmp_path):
     context = _run_collect(tmp_path, comments)
     assert context is not None
     assert "ghost user comment" in context
+
+
+# ---------------------------------------------------------------------------
+# incremental review: delta generation + Reviewed SHA round-trip
+# ---------------------------------------------------------------------------
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _two_commit_repo(tmp_path: Path) -> tuple[str, str]:
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.name", "Test")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    (tmp_path / "a.py").write_text("print('v1')\n", encoding="utf-8")
+    _git(tmp_path, "add", "a.py")
+    _git(tmp_path, "commit", "-qm", "c1")
+    sha1 = _git(tmp_path, "rev-parse", "HEAD")
+    (tmp_path / "a.py").write_text("print('v2')\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print('bee')\n", encoding="utf-8")
+    _git(tmp_path, "add", "a.py", "b.py")
+    _git(tmp_path, "commit", "-qm", "c2")
+    sha2 = _git(tmp_path, "rev-parse", "HEAD")
+    return sha1, sha2
+
+
+def _sticky_with_reviewed(sha: str) -> dict:
+    body = (
+        f"## Claude Code Review (latest)\n{CLAUDE_MARKER}\n\n"
+        f"- Status: success\n- Run: url\n- Reviewed: {sha}\n\nprev round findings"
+    )
+    return _bot("github-actions[bot]", body, 1)
+
+
+def test_collect_generates_delta_for_incremental_round(tmp_path):
+    sha1, sha2 = _two_commit_repo(tmp_path)
+    _run_collect(
+        tmp_path,
+        [_sticky_with_reviewed(sha1)],
+        head_sha=sha2,
+        pr_files=["a.py", "b.py"],
+    )
+    assert (tmp_path / "pr_head_sha.txt").read_text(encoding="utf-8") == sha2
+    delta = (tmp_path / "claude-review-delta.diff").read_text(encoding="utf-8")
+    assert "+print('v2')" in delta
+    assert "+print('bee')" in delta
+    assert "+print('v1')" not in delta
+
+
+def test_collect_falls_back_when_reviewed_sha_unusable(tmp_path):
+    _sha1, sha2 = _two_commit_repo(tmp_path)
+    bogus = "deadbeef" * 5
+    _run_collect(
+        tmp_path,
+        [_sticky_with_reviewed(bogus)],
+        head_sha=sha2,
+        pr_files=["a.py"],
+    )
+    assert not (tmp_path / "claude-review-delta.diff").exists()
+
+
+def test_collect_skips_delta_when_head_equals_reviewed(tmp_path):
+    _sha1, sha2 = _two_commit_repo(tmp_path)
+    _run_collect(
+        tmp_path,
+        [_sticky_with_reviewed(sha2)],
+        head_sha=sha2,
+        pr_files=["a.py"],
+    )
+    assert not (tmp_path / "claude-review-delta.diff").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +349,24 @@ def test_upsert_failure_without_existing_creates_error_sticky(tmp_path):
     creates = [c for c in calls if c[0] == "create"]
     assert len(creates) == 1
     assert "- Status: failure" in creates[0][1]["body"]
+    assert "- Reviewed:" not in creates[0][1]["body"]
+
+
+@node_required
+def test_upsert_records_reviewed_sha_on_success(tmp_path):
+    sha = "ab12" * 10
+    workdir = tmp_path / "with-sha"
+    workdir.mkdir()
+    (workdir / "claude-review.md").write_text("REVIEW BODY OK", encoding="utf-8")
+    (workdir / "pr_head_sha.txt").write_text(sha, encoding="utf-8")
+    env = {"PR_NUMBER": "7", "RUN_URL": "run-url", "REVIEW_OUTCOME": "success"}
+    calls = _run_upsert(
+        tmp_path, "claude-code-review.yml", "claude-review", "Upsert review comment",
+        env, [], cwd=workdir,
+    )
+    creates = [c for c in calls if c[0] == "create"]
+    assert len(creates) == 1
+    assert f"- Reviewed: {sha}" in creates[0][1]["body"]
 
 
 @node_required
