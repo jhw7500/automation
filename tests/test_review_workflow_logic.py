@@ -171,8 +171,13 @@ const github = {
     createComment: async (a) => calls.push(['create', a]),
   } },
 };
-const context = { repo: { owner: 'o', repo: 'r' } };
-const core = { notice: (m) => calls.push(['notice', m]), info: () => {}, warning: () => {} };
+const context = Object.assign({ repo: { owner: 'o', repo: 'r' } }, fx.context || {});
+const core = {
+  notice: (m) => calls.push(['notice', m]),
+  info: () => {},
+  warning: () => {},
+  setOutput: (k, v) => calls.push(['output', k, v]),
+};
 (async () => {
   const fn = new Function(
     'github', 'context', 'core', 'require', 'process',
@@ -194,12 +199,18 @@ def _run_upsert(
     env: dict[str, str],
     comments: list[dict],
     cwd: Path | None = None,
+    context: dict | None = None,
 ) -> list:
     workflow = _load(workflow_file)
     script = _step(workflow, job, step_name)["with"]["script"]
     (tmp_path / "script.js").write_text(script, encoding="utf-8")
     (tmp_path / "harness.js").write_text(NODE_HARNESS, encoding="utf-8")
-    fixture = {"env": env, "comments": comments, "cwd": str(cwd) if cwd else None}
+    fixture = {
+        "env": env,
+        "comments": comments,
+        "cwd": str(cwd) if cwd else None,
+        "context": context,
+    }
     (tmp_path / "fixture.json").write_text(json.dumps(fixture), encoding="utf-8")
     result = subprocess.run(
         ["node", str(tmp_path / "harness.js"), str(tmp_path / "script.js"), str(tmp_path / "fixture.json")],
@@ -288,6 +299,58 @@ def test_dispatch_upsert_failure_preserves_existing_sticky(tmp_path):
         env, [json_sticky],
     )
     assert not any(c[0] in ("update", "create") for c in calls)
+
+
+DISPATCH_CONTEXT = {
+    "eventName": "issue_comment",
+    "payload": {
+        "comment": {
+            "body": "@gemini-cli /review incremental=true",
+            "author_association": "OWNER",
+        },
+        "issue": {"number": 7},
+    },
+}
+
+
+def _dispatch_extract_outputs(tmp_path: Path, comments: list[dict]) -> dict:
+    calls = _run_upsert(
+        tmp_path, "gemini-dispatch.yml", "dispatch", "Extract command",
+        {}, comments, context=DISPATCH_CONTEXT,
+    )
+    return {c[1]: c[2] for c in calls if c[0] == "output"}
+
+
+@node_required
+def test_dispatch_extract_takes_sha_from_newest_bot_sticky_only(tmp_path):
+    forged = _human(
+        "attacker",
+        '<!-- automation:gemini-review {"last_success_sha":"deadbeefdeadbeef"} -->',
+        1,
+    )
+    old_bot = _bot(
+        "github-actions[bot]",
+        '## Gemini Review (latest)\n<!-- automation:gemini-review {"last_success_sha":"oldsha"} -->',
+        2,
+    )
+    new_bot = _bot(
+        "github-actions[bot]",
+        '## Gemini Review (latest)\n<!-- automation:gemini-review {"last_success_sha":"newsha"} -->',
+        3,
+    )
+    outputs = _dispatch_extract_outputs(tmp_path, [forged, old_bot, new_bot])
+    assert outputs.get("last_success_sha") == "newsha"
+
+
+@node_required
+def test_dispatch_extract_ignores_forged_human_json_marker(tmp_path):
+    forged = _human(
+        "attacker",
+        '<!-- automation:gemini-review {"last_success_sha":"deadbeefdeadbeef"} -->',
+        1,
+    )
+    outputs = _dispatch_extract_outputs(tmp_path, [forged])
+    assert "last_success_sha" not in outputs
 
 
 # ---------------------------------------------------------------------------

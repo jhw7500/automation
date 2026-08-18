@@ -242,7 +242,11 @@ jobs:
                 issue_number: issueNumber,
                 per_page: 100,
               });
-              const sticky = comments.find(c => (c.body || '').includes(marker));
+              // 봇 작성 + 마커 보유 중 최신 — upsert 조회들과 동일 규칙. 사람이 위조한
+              // JSON 마커 코멘트가 last_success_sha 소스로 채택되지 않게 한다(incremental
+              // 리뷰의 기준 SHA 오염 방지).
+              const stickies = comments.filter((c) => c.user?.type === 'Bot' && (c.body || '').includes(marker));
+              const sticky = stickies[stickies.length - 1];
               if (sticky) {
                 const jsonMatch = sticky.body.match(/<!-- automation:gemini-review (\{.*\}) -->/);
                 if (jsonMatch) {
