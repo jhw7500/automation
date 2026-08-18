@@ -220,6 +220,7 @@ jobs:
           # Create Python script for Gemini review
           cat > gemini_review.py << 'PYTHON_EOF'
           import os
+          import re
           import google.generativeai as genai
 
           # Configure Gemini
@@ -249,8 +250,21 @@ jobs:
               except FileNotFoundError:
                   return ''
 
+          # 인프라 예약 라인(sticky 헤더/메타)은 모델 입출력 양쪽에서 제거한다.
+          # 라운드 2에서 모델이 prev_review로 주입받은 자기 sticky 헤더(marker, "- Reviewed:")를
+          # 출력에 그대로 에코해 헤더가 중복 게시되고 조작된 Reviewed 라인이 본문에 섞였다.
+          # 주입 전 제거(에코 유혹 차단) + 게시 전 제거(하드 보장)의 이중 방어.
+          INFRA_LINE = re.compile(
+              r"^(REPO: |PR NUMBER: |Reviewer: |- Status: |- Run: |- Reviewed: "
+              r"|<!-- automation:|## 🔎 Gemini Code Review|\*Reviewed by Gemini\*)"
+          )
+
+          def strip_infra_lines(text):
+              kept = [l for l in text.splitlines() if not INFRA_LINE.match(l)]
+              return "\n".join(kept).strip()
+
           # Previous-round context prepared by the workflow step (empty on the first round).
-          prev_review = read_optional('prev_review.txt')
+          prev_review = strip_infra_lines(read_optional('prev_review.txt'))
           human_comments = read_optional('human_comments.txt')
 
           # 증분 리뷰: delta가 준비된 라운드는 전체 diff 대신 delta만 검토한다 — 변경 없는
@@ -387,7 +401,7 @@ jobs:
           # Get review from Gemini
           try:
               response = model.generate_content(prompt)
-              review_text = strip_outer_code_fence(response.text)
+              review_text = strip_infra_lines(strip_outer_code_fence(response.text))
 
               if diff_truncated:
                   review_text = (
