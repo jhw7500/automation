@@ -457,8 +457,10 @@ jobs:
           if [ "${{ steps.gemini_pr_review_fallback.outcome }}" = 'success' ]; then exit 0; fi
           exit 1
 
+      # !cancelled(): always()는 취소에도 true라, cancel-in-progress 취소가 정상 sticky를
+      # 에러로 덮어쓰는 사고를 막는다.
       - name: 'Notify and Persist on Finish'
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
           ISSUE_NUMBER: '${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}'
@@ -478,7 +480,10 @@ jobs:
         with:
           github-token: '${{ steps.auth.outputs.token }}'
           script: |
-            const marker = '<!-- automation:gemini-review -->';
+            // Prefix match (no closing '-->'): the sticky header embeds JSON after the marker
+            // name ('<!-- automation:gemini-review {"status":...} -->'), so matching the full
+            // closed marker never found the existing comment and every round appended a new one.
+            const markerPrefix = '<!-- automation:gemini-review ';
             const issueNumber = Number(process.env.ISSUE_NUMBER);
             const runUrl = process.env.RUN_URL;
 
@@ -541,7 +546,17 @@ jobs:
               per_page: 100,
             });
 
-            const existing = comments.find((c) => (c.body || '').includes(marker));
+            // 봇 작성 + 마커 보유 중 최신 — 사람이 마커 문자열을 인용한 코멘트를 sticky로
+            // 오인해 덮어쓰는 사고를 작성자 필터로 막는다.
+            const stickies = comments.filter((c) => c.user?.type === 'Bot' && (c.body || '').includes(markerPrefix));
+            const existing = stickies[stickies.length - 1];
+
+            if (!result.ok && existing) {
+              // 실패 라운드가 마지막 정상 리뷰(와 그 안의 last_success_sha)를 파괴하지 않게 보존.
+              core.notice(`Gemini review failed; keeping the previous sticky review. (${runUrl})`);
+              return;
+            }
+
             if (existing) {
               await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
             } else {
