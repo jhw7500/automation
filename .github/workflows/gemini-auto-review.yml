@@ -172,6 +172,10 @@ jobs:
           # HEAD의 조상이 아니면(rebase/force-push) 전체 리뷰로 폴백한다. delta는 PR 변경
           # 파일 경로로 한정해, 브랜치에 main을 merge해 들어온 upstream 변경이 리뷰 대상에
           # 섞이는 것을 줄인다.
+          # NOTE: claude-code-review.yml의 'Collect previous review context' 스텝에 같은
+          # delta 블록이 있다(파일명만 다름). 로직을 고치면 양쪽을 함께 고칠 것 — composite
+          # action 추출은 액션이 참조 시점에 태그로 선발행돼야 하는 플릿 릴리즈 제약 때문에 보류.
+          # (이 워크플로우는 기존부터 fetch-depth 0이라 unshallow 분기가 필요 없다.)
           rm -f pr_diff_delta.txt pr_head_sha.txt
           HEAD_SHA="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid // ""' 2>/dev/null || printf '')"
           printf '%s' "$HEAD_SHA" > pr_head_sha.txt
