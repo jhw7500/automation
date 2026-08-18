@@ -82,8 +82,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUM: ${{ steps.pr.outputs.number }}
         run: |
-          REVIEWERS=$(gh pr view "$PR_NUM" --json reviews \
-            --jq '[.reviews[].author.login] | unique | join(", @")')
+          # 리뷰어 = PR review 작성자 ∪ automation sticky 코멘트 작성자.
+          # sticky upsert 전환으로 일부 자동 리뷰어(Claude 등)는 review 객체 대신 마커 달린
+          # issue comment만 남기므로, reviews만 보면 감지에서 빠진다.
+          REVIEWERS=$(gh pr view "$PR_NUM" --json reviews,comments \
+            --jq '([.reviews[].author.login]
+                   + [.comments[] | select((.body // "") | contains("<!-- automation:")) | .author.login])
+                  | unique | join(", @")')
 
           if [ -n "$REVIEWERS" ]; then
             printf 'reviewers=@%s\n' "$REVIEWERS" >> "$GITHUB_OUTPUT"
