@@ -168,6 +168,30 @@ def test_collect_handles_deleted_user_comments(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# self-review callers: secret + fork gates (dogfood 안전 계약)
+# ---------------------------------------------------------------------------
+
+
+def test_self_review_callers_gate_on_secret_and_fork():
+    for fname, secret, job_name in (
+        ("_self-gemini-auto-review.yml", "GEMINI_API_KEY", "gemini-review"),
+        ("_self-opencode-auto-review.yml", "ZHIPU_API_KEY", "opencode-review"),
+    ):
+        workflow = _load(fname)
+        jobs = workflow["jobs"]
+        check = jobs["check-secret"]
+        assert check["permissions"] == {"contents": "read"}
+        review_job = jobs[job_name]
+        condition = review_job["if"]
+        assert "needs.check-secret.outputs.has_key == 'true'" in condition
+        assert "github.event.pull_request.head.repo.fork == false" in condition
+        assert "head.repo.full_name == github.repository" in condition
+        assert review_job["uses"].startswith("./.github/workflows/")
+        text = (WORKFLOWS / fname).read_text(encoding="utf-8")
+        assert f"secrets.{secret}" in text
+
+
+# ---------------------------------------------------------------------------
 # incremental review: delta generation + Reviewed SHA round-trip
 # ---------------------------------------------------------------------------
 
@@ -266,7 +290,12 @@ def test_gemini_incremental_delta_carries_wide_context(tmp_path):
     )
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Get PR details")["run"]
-    sliced = run[run.index("# 재리뷰 라운드 인식"):]
+    marker = "# 재리뷰 라운드 인식"
+    assert marker in run, (
+        "gemini-auto-review.yml의 delta 블록 시작 주석이 바뀌었습니다 — "
+        "이 테스트의 슬라이스 지점을 함께 갱신하세요"
+    )
+    sliced = run[run.index(marker):]
     env = _gh_stub(tmp_path, [sticky], head_sha=sha2, pr_files=["ctx.txt"])
     subprocess.run(
         ["bash", "-c", sliced], cwd=tmp_path, env=env, check=True, capture_output=True

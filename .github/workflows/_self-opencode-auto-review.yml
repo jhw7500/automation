@@ -13,6 +13,8 @@ on:
 jobs:
   check-secret:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       has_key: ${{ steps.check.outputs.has_key }}
     steps:
@@ -30,7 +32,12 @@ jobs:
 
   opencode-review:
     needs: check-secret
-    if: needs.check-secret.outputs.has_key == 'true'
+    # fork 가드는 reusable workflow의 safe_pr(API 재조회)가 중앙에서 강제하지만,
+    # 호출부에서도 명시해 이중 방어 + _self-gemini 쪽과 조건을 통일한다.
+    if: >-
+      needs.check-secret.outputs.has_key == 'true' &&
+      github.event.pull_request.head.repo.fork == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       issues: write

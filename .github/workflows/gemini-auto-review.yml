@@ -335,7 +335,7 @@ jobs:
             verify it: do NOT repeat the finding as if the rebuttal did not exist. Instead list
             it in one line under "Cannot verify (outside provided diff)".
           - Structure the review as: New findings / Still open (re-verified) / Resolved /
-            Cannot verify (one line each). Omit empty sections. Never restate resolved or
+            Cannot verify (one line per item). Omit empty sections. Never restate resolved or
             dropped findings.
           """
 
