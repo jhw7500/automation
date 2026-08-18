@@ -90,7 +90,13 @@ jobs:
           # REST(/issues/N/comments)로 조회한다.
           REVIEW_AUTHORS=$(gh pr view "$PR_NUM" --json reviews \
             --jq '[.reviews[].author.login]' || printf '[]')
-          STICKY_BOT_AUTHORS=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments" --paginate 2>/dev/null \
+          # fetch 실패는 조용히 삼키지 않는다 — REVIEWERS가 review 작성자만으로 축소된
+          # 이유를 로그에서 알 수 있어야 한다(폴백 자체는 안전).
+          if ! RAW_COMMENTS_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments" --paginate 2>/dev/null); then
+            echo "::warning::Failed to fetch PR comments; reviewer detection falls back to review authors only"
+            RAW_COMMENTS_JSON='[]'
+          fi
+          STICKY_BOT_AUTHORS=$(printf '%s' "$RAW_COMMENTS_JSON" \
             | jq -s 'add // [] | [.[] | select(((.user.type // "") == "Bot")
                      and ((.body // "") | contains("<!-- automation:"))) | .user.login]' \
             || printf '[]')
