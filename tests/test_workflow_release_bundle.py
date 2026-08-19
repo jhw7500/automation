@@ -114,6 +114,15 @@ def release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    # v1.40 태그 픽스처의 역사적 automation_ref 복원 (test_verify_workflow_release의
+    # restore_historical_v140_manual_outputs와 같은 취지 — 이 파일은 config 값만 필요).
+    config_path = repo / "scripts/workflow-config.json"
+    config_text = config_path.read_text(encoding="utf-8")
+    assert config_text.count('"automation_ref": "v1.41"') == 1
+    config_path.write_text(
+        config_text.replace('"automation_ref": "v1.41"', '"automation_ref": "v1.40"', 1),
+        encoding="utf-8",
+    )
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
