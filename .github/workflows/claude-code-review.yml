@@ -208,7 +208,10 @@ jobs:
           # 실패하고, 그때 모델이 저장소 파일 직접 읽기로 후퇴해 PR 밖 코드까지 리뷰하는
           # 사고가 있었다(redmine 신규 PR 첫 라운드 2/2 재현). 증분 라운드에서는 아래
           # delta 파일이 우선하므로 이 파일은 폴백 겸 첫 라운드 입력이다.
-          gh pr diff "$PR_NUM" > claude-review-full.diff 2>/dev/null || rm -f claude-review-full.diff
+          if ! gh pr diff "$PR_NUM" > claude-review-full.diff 2>/dev/null; then
+            echo "::warning::Failed to fetch the full PR diff; the reviewer will report the diff as unavailable"
+            rm -f claude-review-full.diff
+          fi
           PREV_SHA="$(printf '%s' "$PREV_META" | sed -n 's/^- Reviewed: \([0-9a-f]\{40\}\)$/\1/p' | head -1)"
           if [ -n "$PREV_SHA" ] && [ -n "$HEAD_SHA" ] && [ "$PREV_SHA" != "$HEAD_SHA" ]; then
             # shallow checkout(fetch-depth 1)은 조상 검증이 불가능하므로, 증분 라운드에만
