@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -29,9 +30,12 @@ COMMIT = "1" * 40
 BASE = "2" * 40
 
 
-def test_cli_defaults_to_the_current_patch_release(tmp_path: Path) -> None:
+def test_cli_defaults_to_the_configured_release(tmp_path: Path) -> None:
     args = audit._parser().parse_args(["--workspace", str(tmp_path)])
-    assert args.ref == "v1.40.1"
+    config = json.loads(
+        (ROOT / "scripts" / "workflow-config.json").read_text(encoding="utf-8")
+    )
+    assert args.ref == config["automation_ref"]
 
 
 @pytest.fixture

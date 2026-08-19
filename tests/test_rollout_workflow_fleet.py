@@ -59,9 +59,12 @@ def marked_workspace(tmp_path: Path) -> Path:
     return workspace
 
 
-def test_cli_defaults_to_the_current_patch_release(tmp_path: Path) -> None:
+def test_cli_defaults_to_the_configured_release(tmp_path: Path) -> None:
     args = rollout._parser().parse_args(["--workspace", str(tmp_path)])
-    assert args.ref == "v1.40.1"
+    config = json.loads(
+        (ROOT / "scripts" / "workflow-config.json").read_text(encoding="utf-8")
+    )
+    assert args.ref == config["automation_ref"]
 
 
 def outcome(repo: str, status: str = "planned") -> rollout.RepoOutcome:
