@@ -105,6 +105,8 @@ def _gh_stub(
         f"    jq \"${{@: -1}}\" '{tmp_path}/reviews.json' ;;\n"
         "  *'pr diff'*'--name-only'*)\n"
         f"    cat '{tmp_path}/pr_files_fixture.txt' ;;\n"
+        "  *'pr diff'*)\n"
+        "    printf 'FULL-DIFF-FIXTURE\\n' ;;\n"
         "  *) echo \"unexpected gh call: $*\" >&2; exit 1 ;;\n"
         "esac\n",
         encoding="utf-8",
@@ -179,6 +181,25 @@ def test_collect_handles_deleted_user_comments(tmp_path):
     context = _run_collect(tmp_path, comments)
     assert context is not None
     assert "ghost user comment" in context
+
+
+def test_collect_prepares_full_diff_file(tmp_path):
+    """전체 PR diff는 서버측에서 준비된다 — detached HEAD에서 모델의 번호 없는
+    `gh pr diff`가 실패해 저장소 전체를 리뷰하던 후퇴(redmine 2/2 재현)의 방지."""
+    _run_collect(tmp_path, [])
+    full = (tmp_path / "claude-review-full.diff").read_text(encoding="utf-8")
+    assert "FULL-DIFF-FIXTURE" in full
+
+
+def test_claude_prompt_pins_diff_source():
+    workflow = _load("claude-code-review.yml")
+    step = _step(workflow, "claude-review", "Run Claude Code Review")
+    prompt = step["with"]["prompt"]
+    assert "claude-review-full.diff" in prompt
+    # detached HEAD 대비: PR 번호를 프롬프트에 명시하고, diff 부재 시 저장소 파일
+    # 리뷰로 후퇴하는 것을 금지한다.
+    assert "${{ inputs.pr_number || github.event.pull_request.number }}" in prompt
+    assert "NEVER fall back to reviewing repository" in prompt
 
 
 def test_collect_strips_sticky_meta_from_injected_context(tmp_path):
@@ -793,6 +814,48 @@ def test_gemini_infra_lines_sanitized_from_output_and_context(tmp_path):
     assert "PREV FINDINGS BODY" in prompt
     assert "automation:gemini-auto-review" not in prompt
     assert fabricated_sha not in prompt
+
+
+def test_gemini_retries_on_429_then_succeeds(tmp_path):
+    """429는 분 단위 회복 — 한정 재시도로 흡수한다(redmine 성공률 ~50% 관측 대응)."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class _R:\n"
+        "    text = 'RETRY SURVIVOR REVIEW'\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        counter = pathlib.Path('attempts.txt')\n"
+        "        n = int(counter.read_text()) if counter.exists() else 0\n"
+        "        counter.write_text(str(n + 1))\n"
+        "        if n < 2:\n"
+        "            raise RuntimeError('429 You exceeded your current quota')\n"
+        "        return _R()\n",
+        encoding="utf-8",
+    )
+    fixtures = {
+        "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
+        "pr_diff.txt": "+x\n", "prev_review.txt": "", "human_comments.txt": "",
+    }
+    for name, content in fixtures.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    env = dict(os.environ)
+    env.update({
+        "GEMINI_API_KEY": "stub",
+        "PYTHONPATH": str(tmp_path / "stub"),
+        "GEMINI_429_RETRY_SLEEP": "0",
+    })
+    subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=env, check=True, capture_output=True,
+    )
+    assert (tmp_path / "attempts.txt").read_text() == "3"
+    assert "RETRY SURVIVOR REVIEW" in (tmp_path / "gemini_review.md").read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

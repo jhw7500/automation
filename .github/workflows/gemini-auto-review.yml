@@ -229,7 +229,10 @@ jobs:
           # Create Python script for Gemini review
           cat > gemini_review.py << 'PYTHON_EOF'
           import os
+          import random
           import re
+          import time
+
           import google.generativeai as genai
 
           # Configure Gemini
@@ -418,9 +421,38 @@ jobs:
           Exclude CI/CD commentary and avoid unrelated refactors or style nits.
           Format in GitHub-flavored Markdown with clear, concise sections."""
 
-          # Get review from Gemini
+          # Get review from Gemini.
+          # 무료 티어 429는 분 단위로 회복된다 — 플릿 동시 리뷰 물결에서 간헐 발생
+          # (redmine에서 성공률 ~50% 관측). 429에 한해 짧은 백오프로 최대 2회 재시도해
+          # 흡수하고, 그래도 실패하면 기존 실패 경로(sticky 보존 + Last attempt 스탬프)로
+          # 떨어진다. 슬립은 테스트에서 0으로 재정의할 수 있게 env로 뺀다.
+          RETRY_SLEEP = float(os.environ.get("GEMINI_429_RETRY_SLEEP", "35"))
+
+          # 429 판정은 SDK의 정식 예외 타입을 우선 보고, 메시지 문자열은 SDK 포맷 변화
+          # 대비 보조 조건으로 남긴다. google.api_core는 google-generativeai의 의존성이라
+          # 존재가 보장되지만, 스텁 테스트 환경을 위해 부재도 허용한다.
           try:
-              response = model.generate_content(prompt)
+              from google.api_core import exceptions as api_exceptions
+
+              def is_rate_limited(err):
+                  return isinstance(err, api_exceptions.ResourceExhausted) or "429" in str(err)
+          except ImportError:
+              def is_rate_limited(err):
+                  return "429" in str(err)
+
+          try:
+              for attempt in range(3):
+                  try:
+                      response = model.generate_content(prompt)
+                      break
+                  except Exception as error:
+                      if not is_rate_limited(error) or attempt == 2:
+                          raise
+                      # 지터: 같은 물결에서 429를 받은 job들이 정확히 같은 시각에 일제히
+                      # 재시도해 두 번째 물결을 만드는 것을 분산시킨다.
+                      delay = RETRY_SLEEP * random.uniform(0.5, 1.5)
+                      print(f"Rate limited (attempt {attempt + 1}/3): {error}; retrying in {delay:.0f}s")
+                      time.sleep(delay)
               review_text = strip_infra_lines(
                   strip_outer_code_fence(response.text), INFRA_LINE_OUTPUT
               )
