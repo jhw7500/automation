@@ -20,8 +20,6 @@ import scripts.verify_workflow_release as release_verifier
 from scripts.verify_workflow_release import ReleaseVerificationError, verify_release
 from scripts.workflow_release_inventory import RELEASE_PATHS
 
-from release_fixture_helpers import restore_historical_automation_ref
-
 ROOT = Path(__file__).resolve().parents[1]
 
 CANONICAL_REMOTE = "https://github.com/jhw7500/automation.git"
@@ -73,9 +71,12 @@ LEGACY_MANUAL_OUTPUT_BLOCK = """          echo "title<<EOF" >> "$GITHUB_OUTPUT"
 
 
 def restore_historical_v140_manual_outputs(repo: Path) -> None:
-    # v1.40 태그 픽스처는 그 시대의 fleet 상태를 담아야 한다: 라이브 트리의
-    # automation_ref 를 역사적 값으로 되돌려 v1.40 정책 스냅샷 해시를 보존한다.
-    restore_historical_automation_ref(repo, "v1.40")
+    # v1.40 태그 픽스처는 그 시대의 fleet 상태를 담아야 한다. v1.40 정책 스냅샷
+    # 해시는 workflow-config.json 전체 바이트를 커버하므로, 플릿 구성이 변한 뒤에는
+    # automation_ref 치환만으로 역사적 바이트를 재현할 수 없다 — 태그에서 뽑아 둔
+    # 스냅샷 픽스처(tests/fixtures/workflow-config-v1.40.json)를 통째로 복원한다.
+    snapshot = Path(__file__).parent / "fixtures" / "workflow-config-v1.40.json"
+    (repo / "scripts/workflow-config.json").write_bytes(snapshot.read_bytes())
     root = repo / "examples/baseline-workflows/.github/workflows"
     for filename in ("gemini-issue-triage.yml", "gemini-pr-review.yml"):
         path = root / filename

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPECTED = {
     "gstApp": ({"auto-rereview-request.yml", "gemini-chat.yml", "opencode.yml", "opencode-auto-review.yml"}, "github_app", False),
     "max9296": ({"auto-rereview-request.yml", "gemini-chat.yml", "opencode.yml", "opencode-auto-review.yml"}, "github_app", False),
-    "wlan-driver": ({"auto-rereview-request.yml", "opencode.yml", "opencode-auto-review.yml"}, "github_token", False),
+    "imx-vpu": ({"auto-rereview-request.yml", "gemini-chat.yml", "opencode.yml", "opencode-auto-review.yml"}, "github_token", False),
     "wlan-driver-v2": ({"auto-rereview-request.yml", "opencode.yml", "opencode-auto-review.yml"}, "github_app", False),
     "wlan-bridge": ({"gemini-chat.yml", "opencode.yml", "opencode-auto-review.yml"}, "github_app", False),
     "wlan-package": ({"opencode.yml", "opencode-auto-review.yml"}, "github_app", False),
@@ -25,9 +25,6 @@ EXPECTED = {
     "redmine": (set(), "github_app", False),
     "jhw-notion": (set(), "github_app", False),
     "personal-ops": (set(), "github_app", False),
-    "cts-email-mcp-server": (set(), "github_token", True),
-    "cts-ta-mcp-server": (set(), "github_token", False),
-    "cts-ta-webapp": (set(), "github_token", False),
     "claude-config": (set(), "github_token", False),
 }
 
@@ -100,7 +97,7 @@ def test_catalog_rejects_invalid_entries(tmp_path: Path, entries: list[dict]) ->
     ),
     (
         lambda config: config["repos"]["wlan-package"].__setitem__("bootstrap_allowed", True),
-        "invalid bootstrap repositories: [\'cts-email-mcp-server\', \'wlan-package\', \'wpa-supplicant\']",
+        "invalid bootstrap repositories: [\'wlan-package\', \'wpa-supplicant\']",
     ),
 ])
 def test_fleet_rejects_invalid_profiles(tmp_path: Path, change: object, message: str) -> None:
