@@ -87,7 +87,13 @@ def _gh_stub(
         json.dumps({"reviews": reviews or []}), encoding="utf-8"
     )
     (tmp_path / "head.json").write_text(json.dumps({"headRefOid": head_sha}), encoding="utf-8")
-    (tmp_path / "pr_files.txt").write_text("\n".join(pr_files or []), encoding="utf-8")
+    # 스크립트가 cwd의 pr_files.txt로 저장하므로 픽스처는 다른 이름이어야 한다 —
+    # 같은 이름이면 스텁의 cat이 자기 자신을 truncate-before-read로 비워, [ -s ] 폴백
+    # (전체 diff)만 실행되고 pathspec 분기가 테스트에서 한 번도 돌지 않는다
+    # (--pathspec-from-file 미지원 버그를 은폐했던 실제 사고).
+    (tmp_path / "pr_files_fixture.txt").write_text(
+        "\n".join(pr_files or []), encoding="utf-8"
+    )
     gh = bin_dir / "gh"
     gh.write_text(
         "#!/usr/bin/env bash\n"
@@ -98,7 +104,7 @@ def _gh_stub(
         "  *'pr view'*'--json reviews'*)\n"
         f"    jq \"${{@: -1}}\" '{tmp_path}/reviews.json' ;;\n"
         "  *'pr diff'*'--name-only'*)\n"
-        f"    cat '{tmp_path}/pr_files.txt' ;;\n"
+        f"    cat '{tmp_path}/pr_files_fixture.txt' ;;\n"
         "  *) echo \"unexpected gh call: $*\" >&2; exit 1 ;;\n"
         "esac\n",
         encoding="utf-8",
@@ -334,11 +340,14 @@ def test_collect_delta_includes_glob_special_filenames(tmp_path):
     _git(tmp_path, "config", "user.email", "test@example.com")
     (tmp_path / "pages").mkdir()
     target = tmp_path / "pages" / "[id].tsx"
+    decoy = tmp_path / "pages" / "i.tsx"  # glob 해석 시 [id] 문자클래스에 오매치되는 파일
     target.write_text("v1\n", encoding="utf-8")
+    decoy.write_text("d1\n", encoding="utf-8")
     _git(tmp_path, "add", "-A")
     _git(tmp_path, "commit", "-qm", "c1")
     sha1 = _git(tmp_path, "rev-parse", "HEAD")
     target.write_text("v2-glob\n", encoding="utf-8")
+    decoy.write_text("d2-decoy\n", encoding="utf-8")
     _git(tmp_path, "add", "-A")
     _git(tmp_path, "commit", "-qm", "c2")
     sha2 = _git(tmp_path, "rev-parse", "HEAD")
@@ -349,7 +358,8 @@ def test_collect_delta_includes_glob_special_filenames(tmp_path):
         pr_files=["pages/[id].tsx"],
     )
     delta = (tmp_path / "claude-review-delta.diff").read_text(encoding="utf-8")
-    assert "+v2-glob" in delta
+    assert "+v2-glob" in delta       # 리터럴 경로는 포함
+    assert "d2-decoy" not in delta   # 문자클래스 오매치 파일은 제외
 
 
 GEMINI_MARKER = "<!-- automation:gemini-auto-review -->"

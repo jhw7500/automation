@@ -217,11 +217,13 @@ jobs:
                && git merge-base --is-ancestor "$PREV_SHA" "$HEAD_SHA" 2>/dev/null; then
               gh pr diff "$PR_NUM" --name-only > pr_files.txt 2>/dev/null || : > pr_files.txt
               if [ -s pr_files.txt ]; then
-                # --literal-pathspecs + --pathspec-from-file: 파일명을 glob 패턴이 아닌 리터럴
-                # 경로로 다룬다 — 'pages/[id].tsx' 류 이름이 delta에서 조용히 빠지는 것과
-                # xargs ARG_MAX 분할로 diff가 쪼개지는 것을 함께 막는다.
-                git --literal-pathspecs diff "$PREV_SHA".."$HEAD_SHA" \
-                  --pathspec-from-file=pr_files.txt > claude-review-delta.diff \
+                # --literal-pathspecs: 파일명을 glob 패턴이 아닌 리터럴 경로로 다룬다 —
+                # 'pages/[id].tsx' 류 이름이 문자클래스로 해석돼 delta가 엉뚱한 파일을
+                # 매치하는 것을 막는다. 주의: git diff는 --pathspec-from-file을 지원하지
+                # 않는다(add/commit 계열 전용 — usage 오류 129로 죽어 매 라운드 전체
+                # 리뷰로 폴백된다, PR #34 라운드 2에서 실증). xargs 분할(ARG_MAX)은 PR
+                # 변경 파일 목록 규모에선 도달하지 않는 알려진 한계로 수용한다.
+                xargs -d '\n' -a pr_files.txt git --literal-pathspecs diff "$PREV_SHA".."$HEAD_SHA" -- > claude-review-delta.diff \
                   || rm -f claude-review-delta.diff
               else
                 git diff "$PREV_SHA".."$HEAD_SHA" > claude-review-delta.diff || rm -f claude-review-delta.diff
