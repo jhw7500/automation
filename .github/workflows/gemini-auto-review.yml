@@ -230,6 +230,8 @@ jobs:
           cat > gemini_review.py << 'PYTHON_EOF'
           import os
           import re
+          import time
+
           import google.generativeai as genai
 
           # Configure Gemini
@@ -418,9 +420,22 @@ jobs:
           Exclude CI/CD commentary and avoid unrelated refactors or style nits.
           Format in GitHub-flavored Markdown with clear, concise sections."""
 
-          # Get review from Gemini
+          # Get review from Gemini.
+          # 무료 티어 429는 분 단위로 회복된다 — 플릿 동시 리뷰 물결에서 간헐 발생
+          # (redmine에서 성공률 ~50% 관측). 429에 한해 짧은 백오프로 최대 2회 재시도해
+          # 흡수하고, 그래도 실패하면 기존 실패 경로(sticky 보존 + Last attempt 스탬프)로
+          # 떨어진다. 슬립은 테스트에서 0으로 재정의할 수 있게 env로 뺀다.
+          RETRY_SLEEP = float(os.environ.get("GEMINI_429_RETRY_SLEEP", "35"))
           try:
-              response = model.generate_content(prompt)
+              for attempt in range(3):
+                  try:
+                      response = model.generate_content(prompt)
+                      break
+                  except Exception as error:
+                      if "429" not in str(error) or attempt == 2:
+                          raise
+                      print(f"429 rate limit; retrying in {RETRY_SLEEP:.0f}s ({attempt + 1}/2)")
+                      time.sleep(RETRY_SLEEP)
               review_text = strip_infra_lines(
                   strip_outer_code_fence(response.text), INFRA_LINE_OUTPUT
               )
