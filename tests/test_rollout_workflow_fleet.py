@@ -184,7 +184,7 @@ def test_publish_requires_confirmation_and_explicit_repo(
             "--bootstrap-repo",
             "wpa-supplicant",
         ],
-        ["--repo", "wpa-supplicant", "--bootstrap-repo", "cts-email-mcp-server"],
+        ["--repo", "wpa-supplicant", "--bootstrap-repo", "pim-check"],
     ],
 )
 def test_bootstrap_requires_one_matching_allowed_repository_before_bundle_load(
@@ -822,12 +822,12 @@ def test_publish_refetches_each_repo_and_reports_partial_rerunnable_outcomes(
                 "--repo",
                 "max9296",
                 "--repo",
-                "wlan-driver",
+                "wlan-bridge",
             ]
         )
 
     assert rc == 1
-    assert calls == ["gstApp", "max9296", "wlan-driver"]
+    assert calls == ["gstApp", "max9296", "wlan-bridge"]
     report = json.loads((workspace / "rollout-manifest.json").read_text())
     assert [item["status"] for item in report] == ["published", "blocked", "reused"]
     assert report[0]["pr_url"].endswith("/gstApp/pull/1")

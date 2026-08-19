@@ -277,8 +277,10 @@ def test_quoted_literal_merge_spelling_is_preserved(
     assert quoted_merge in plan.after(".github/workflow-config.yml")
 
 
-def test_all_19_profiles_render_deterministically(tmp_path: Path) -> None:
-    assert len(PROFILES) == 19
+def test_all_16_profiles_render_deterministically(tmp_path: Path) -> None:
+    # 2026-08-19 구성 변경: wlan-driver(레거시)·cts-email/ta-mcp-server·cts-ta-webapp
+    # 제외, imx-vpu 추가 — 19 → 16.
+    assert len(PROFILES) == 16
     for name in PROFILES:
         first = render_profile(make_existing_repo(tmp_path / "first" / name), name)
         second = render_profile(make_existing_repo(tmp_path / "second" / name), name)
@@ -485,7 +487,7 @@ def test_missing_prerequisite_names_block_normal_repositories(tmp_path: Path) ->
     assert "APP_ID" in plan.reason
 
 
-@pytest.mark.parametrize("name", ["wpa-supplicant", "cts-email-mcp-server"])
+@pytest.mark.parametrize("name", ["wpa-supplicant"])
 def test_allowed_disabled_bootstrap_renders_required_callers_and_config_only(
     tmp_path: Path, name: str
 ) -> None:

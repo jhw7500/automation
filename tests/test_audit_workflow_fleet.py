@@ -214,7 +214,7 @@ def test_fleet_cli_audits_all_profiles_with_refetch_and_no_remote_write(
     assert fetched == cloned
     assert all(command[:2] == ["switch", "--detach"] for command in commands)
     output = capsys.readouterr().out
-    assert "total=19" in output and "drift=19" in output and "blocked=0" in output
+    assert "total=16" in output and "drift=16" in output and "blocked=0" in output
     flattened = " ".join(" ".join(command) for command in commands)
     for forbidden in (
         "push",

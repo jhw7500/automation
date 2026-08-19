@@ -5,7 +5,7 @@ import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Literal, Mapping
+from typing import Literal, Mapping, NamedTuple
 
 
 class CatalogError(ValueError):
@@ -14,13 +14,37 @@ class CatalogError(ValueError):
 
 _CANONICAL_DIR = PurePosixPath("examples/baseline-workflows/.github")
 _CATALOG_PATH = "scripts/workflow-catalog.json"
-_REPOSITORY_NAMES = frozenset({
-    "gstApp", "max9296", "wlan-driver", "wlan-driver-v2", "wlan-bridge",
-    "wlan-package", "pim-package-jhw", "wlan-opc", "pcap-analyzer",
-    "wpa-supplicant", "sc16is7xx", "pim-check", "redmine", "jhw-notion",
-    "personal-ops", "cts-email-mcp-server", "cts-ta-mcp-server",
-    "cts-ta-webapp", "claude-config",
-})
+class _FleetGeneration(NamedTuple):
+    repos: frozenset[str]
+    bootstrap: frozenset[str]
+
+
+# 승인된 플릿 구성 세대. 릴리즈 검증기는 역사적 태그의 config도 현재 코드로 검증하므로,
+# 구성 변경은 새 세대를 추가하고 이전 세대를 보존한다 — 각 세대 안에서는 정확 일치
+# (닫힌 집합)를 유지한다.
+_FLEET_GENERATIONS = (
+    # v1.40 ~ v1.43 (19 repos)
+    _FleetGeneration(
+        repos=frozenset({
+            "gstApp", "max9296", "wlan-driver", "wlan-driver-v2", "wlan-bridge",
+            "wlan-package", "pim-package-jhw", "wlan-opc", "pcap-analyzer",
+            "wpa-supplicant", "sc16is7xx", "pim-check", "redmine", "jhw-notion",
+            "personal-ops", "cts-email-mcp-server", "cts-ta-mcp-server",
+            "cts-ta-webapp", "claude-config",
+        }),
+        bootstrap=frozenset({"wpa-supplicant", "cts-email-mcp-server"}),
+    ),
+    # v1.44+ (2026-08-19: wlan-driver 레거시 제외, cts-* 3종 미사용 제외, imx-vpu 추가)
+    _FleetGeneration(
+        repos=frozenset({
+            "gstApp", "max9296", "imx-vpu", "wlan-driver-v2", "wlan-bridge",
+            "wlan-package", "pim-package-jhw", "wlan-opc", "pcap-analyzer",
+            "wpa-supplicant", "sc16is7xx", "pim-check", "redmine", "jhw-notion",
+            "personal-ops", "claude-config",
+        }),
+        bootstrap=frozenset({"wpa-supplicant"}),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -185,7 +209,10 @@ def load_fleet_config(root: Path, catalog: WorkflowCatalog) -> FleetConfig:
     if _string(raw["catalog"], "catalog") != _CATALOG_PATH:
         raise CatalogError(f"invalid catalog path: {raw['catalog']}")
     repos = _mapping(raw["repos"], "repos")
-    if set(repos) != _REPOSITORY_NAMES:
+    generation = next(
+        (entry for entry in _FLEET_GENERATIONS if set(repos) == entry.repos), None
+    )
+    if generation is None:
         raise CatalogError(f"invalid repository set: {sorted(repos)}")
     optional_names = {entry.path.name for entry in catalog.entries if entry.kind == "optional"}
     profiles: dict[str, RepoProfile] = {}
@@ -209,7 +236,7 @@ def load_fleet_config(root: Path, catalog: WorkflowCatalog) -> FleetConfig:
         if allowed:
             bootstrap.add(name)
         profiles[name] = RepoProfile(name, "common-ai-v1", frozenset(optional), auth, allowed)
-    if bootstrap != {"wpa-supplicant", "cts-email-mcp-server"}:
+    if bootstrap != generation.bootstrap:
         raise CatalogError(f"invalid bootstrap repositories: {sorted(bootstrap)}")
     return FleetConfig(_string(raw["gh_owner"], "gh_owner"), _string(raw["automation_ref"], "automation_ref"), canonical_dir, profiles)
 
