@@ -71,6 +71,15 @@ LEGACY_MANUAL_OUTPUT_BLOCK = """          echo "title<<EOF" >> "$GITHUB_OUTPUT"
 
 
 def restore_historical_v140_manual_outputs(repo: Path) -> None:
+    # v1.40 태그 픽스처는 그 시대의 fleet 상태를 담아야 한다: 라이브 트리의
+    # automation_ref(v1.41)를 역사적 값으로 되돌려 v1.40 정책 스냅샷 해시를 보존한다.
+    config_path = repo / "scripts/workflow-config.json"
+    config_text = config_path.read_text(encoding="utf-8")
+    assert config_text.count('"automation_ref": "v1.41"') == 1
+    config_path.write_text(
+        config_text.replace('"automation_ref": "v1.41"', '"automation_ref": "v1.40"', 1),
+        encoding="utf-8",
+    )
     root = repo / "examples/baseline-workflows/.github/workflows"
     for filename in ("gemini-issue-triage.yml", "gemini-pr-review.yml"):
         path = root / filename
