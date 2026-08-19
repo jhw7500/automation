@@ -272,7 +272,7 @@ jobs:
           )
           INFRA_LINE_OUTPUT = re.compile(
               r"^(REPO: \S+$|PR NUMBER: [0-9]+$|Reviewer: Gemini"
-              r"|- Status: (success|failure)$|- Run: https?://|- Reviewed: [0-9a-f]{40}$"
+              r"|- Status: (success|failure)$|- Run: https?://\S+$|- Reviewed: [0-9a-f]{40}$"
               r"|- Last attempt: |<!-- automation:[A-Za-z0-9_-]+"
               r"|## 🔎 Gemini Code Review$|\*Reviewed by Gemini\*$)"
           )

@@ -737,7 +737,8 @@ def test_gemini_infra_lines_sanitized_from_output_and_context(tmp_path):
         "            \"- Status: success\\n- Run: https://ci.example/run/1\\n\"\n"
         "            \"- Reviewed: \" + \"ab\" * 20 + \"\\n\"\n"
         "            \"\\nACTUAL REVIEW CONTENT\\n\"\n"
-        "            \"- Run: `pytest -q` before merging\\n\\n*Reviewed by Gemini*\\n\")\n"
+        "            \"- Run: `pytest -q` before merging\\n\"\n"
+        "            \"- Run: https://example.com/details then check the logs\\n\\n*Reviewed by Gemini*\\n\")\n"
         "class GenerativeModel:\n"
         "    def __init__(self, name): pass\n"
         "    def generate_content(self, prompt):\n"
@@ -775,6 +776,8 @@ def test_gemini_infra_lines_sanitized_from_output_and_context(tmp_path):
     # 출력측 제거는 에코 형태만 정밀 매치한다 — 예약 프리픽스와 겹치는 정상 리뷰 라인은
     # 살아남는다(넓은 프리픽스 매치가 조용히 지우던 회귀 방지).
     assert "- Run: `pytest -q` before merging" in saved
+    # URL 뒤에 설명이 이어지는 정상 라인도 생존 — 에코(URL 단독 라인)만 앵커 매치로 제거
+    assert "- Run: https://example.com/details then check the logs" in saved
 
     prompt = (tmp_path / "captured_prompt.txt").read_text(encoding="utf-8")
     assert "PREV FINDINGS BODY" in prompt
@@ -834,6 +837,10 @@ def test_opencode_prompt_requires_server_side_context():
     assert "list the existing reviews" not in prompt
     ctx = _step(workflow, "opencode-review", "Collect previous review context")
     assert ctx["env"]["MARKER"] == OPENCODE_MARKER
+    # pr_scope와 동일한 3-way 폴백 — issue_comment 경로 호출에서도 컨텍스트 주입이 동작
+    assert ctx["env"]["PR_NUMBER"] == (
+        "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}"
+    )
 
 
 def test_opencode_prompt_requires_verified_evidence():

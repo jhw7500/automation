@@ -116,7 +116,7 @@ jobs:
         id: ctx
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
           # 아래 PROMPT의 마커 라인과 반드시 동일하게 유지.
           MARKER: '<!-- automation:opencode-auto-review -->'
           MAX_SECTION_CHARS: '6000'

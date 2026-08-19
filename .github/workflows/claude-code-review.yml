@@ -404,7 +404,7 @@ jobs:
             // 에코가 아니면 사실상 매치될 수 없는 엄격한 형태만 거른다(gemini 출력측과
             // 동일 규칙). 메타 파싱은 수집 스텝이 헤더 영역으로 한정하므로 이 필터는
             // 표시 오염(가짜 헤더/메타 중복 게시) 방지가 목적이다.
-            const infraLine = /^(- Status: (success|failure)$|- Run: https?:\/\/|- Reviewed: [0-9a-f]{40}$|- Last attempt: |<!-- automation:[A-Za-z0-9_-]+|## Claude Code Review \(latest\)$)/;
+            const infraLine = /^(- Status: (success|failure)$|- Run: https?:\/\/\S+$|- Reviewed: [0-9a-f]{40}$|- Last attempt: |<!-- automation:[A-Za-z0-9_-]+|## Claude Code Review \(latest\)$)/;
             review = review.split('\n').filter((l) => !infraLine.test(l)).join('\n').trim();
 
             const header = `## Claude Code Review (latest)\n${marker}`;
