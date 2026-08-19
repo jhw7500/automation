@@ -19,6 +19,8 @@ import scripts.workflow_release_bundle as release_bundle
 from scripts.workflow_release_bundle import materialize_release_bundle
 from scripts.workflow_release_inventory import EXACT_RELEASE_ROOTS, RELEASE_PATHS
 
+from release_fixture_helpers import restore_historical_automation_ref
+
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_REF = "v1.40.2"
 
@@ -114,15 +116,11 @@ def release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
-    # v1.40 태그 픽스처의 역사적 automation_ref 복원 (test_verify_workflow_release의
-    # restore_historical_v140_manual_outputs와 같은 취지 — 이 파일은 config 값만 필요).
-    config_path = repo / "scripts/workflow-config.json"
-    config_text = config_path.read_text(encoding="utf-8")
-    assert config_text.count('"automation_ref": "v1.41"') == 1
-    config_path.write_text(
-        config_text.replace('"automation_ref": "v1.41"', '"automation_ref": "v1.40"', 1),
-        encoding="utf-8",
-    )
+    # 역사적 automation_ref 복원. test_verify_workflow_release 의
+    # restore_historical_v140_manual_outputs 와 달리 config 값만 되돌린다 — 이 파일의
+    # 태그(v1.40.2)는 manual-output contract 게이트(>=1.40.2) 대상이라 hardened 블록을
+    # 유지해야 하기 때문이다(전체 v1.40 복원을 쓰면 검증이 실패한다).
+    restore_historical_automation_ref(repo, "v1.40")
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")

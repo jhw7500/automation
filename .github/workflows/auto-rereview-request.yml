@@ -82,12 +82,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUM: ${{ steps.pr.outputs.number }}
         run: |
-          # 리뷰어 = PR review 작성자 ∪ automation sticky 코멘트의 "봇" 작성자.
-          # sticky upsert 전환으로 일부 자동 리뷰어(Claude 등)는 review 객체 대신 마커 달린
-          # issue comment만 남기므로 reviews만으로는 감지에서 빠진다. 코멘트 쪽은 REST
-          # user.type 으로 봇만 채택한다 — 사람이 마커 문자열을 인용한 코멘트가 멘션 대상이
-          # 되지 않게 하기 위함이며, gh pr view(GraphQL)의 author에는 봇 여부 필드가 없어
-          # REST(/issues/N/comments)로 조회한다.
+          # 리뷰어 = PR review 작성자(@멘션) ∪ automation sticky 마커에서 추출한 리뷰어
+          # 워크플로우 이름(코드 표기). sticky는 전부 게시 토큰의 봇(github-actions[bot])이
+          # 작성하므로 코멘트 작성자 로그인으로는 리뷰어를 구분할 수 없다 — 전원이
+          # @github-actions[bot] 하나로 붕괴하고, 그 멘션은 GitHub이 어디에도 전달하지
+          # 못한다. 리뷰어 정체성은 마커 '<!-- automation:<name> -->'의 <name>이다.
+          # 봇 작성 코멘트만 채택하는 이유(사람의 마커 인용 배제)와 REST 조회 이유
+          # (GraphQL author에는 봇 여부 필드가 없음)는 기존과 동일.
           REVIEW_AUTHORS=$(gh pr view "$PR_NUM" --json reviews \
             --jq '[.reviews[].author.login]' || printf '[]')
           # fetch 실패는 조용히 삼키지 않는다 — REVIEWERS가 review 작성자만으로 축소된
@@ -96,15 +97,18 @@ jobs:
             echo "::warning::Failed to fetch PR comments; reviewer detection falls back to review authors only"
             RAW_COMMENTS_JSON='[]'
           fi
-          STICKY_BOT_AUTHORS=$(printf '%s' "$RAW_COMMENTS_JSON" \
+          STICKY_REVIEWERS=$(printf '%s' "$RAW_COMMENTS_JSON" \
             | jq -s 'add // [] | [.[] | select(((.user.type // "") == "Bot")
-                     and ((.body // "") | contains("<!-- automation:"))) | .user.login]' \
+                     and ((.body // "") | test("<!-- automation:[A-Za-z0-9_-]+")))
+                     | (.body | capture("<!-- automation:(?<name>[A-Za-z0-9_-]+)").name)]' \
             || printf '[]')
-          REVIEWERS=$(jq -rn --argjson reviews "${REVIEW_AUTHORS:-[]}" --argjson stickies "${STICKY_BOT_AUTHORS:-[]}" \
-            '$reviews + $stickies | unique | join(", @")')
+          # sticky 리뷰어는 실제 계정이 아니라 멘션이 불가능하다 — push 시 자동으로
+          # 재리뷰가 돌기 때문에 사람에게는 "누가 리뷰했는지"를 알리는 정보성 표기다.
+          REVIEWERS=$(jq -rn --argjson reviews "${REVIEW_AUTHORS:-[]}" --argjson stickies "${STICKY_REVIEWERS:-[]}" \
+            '(($reviews | map("@" + .)) + ($stickies | map("`" + . + "`"))) | unique | join(", ")')
 
           if [ -n "$REVIEWERS" ]; then
-            printf 'reviewers=@%s\n' "$REVIEWERS" >> "$GITHUB_OUTPUT"
+            printf 'reviewers=%s\n' "$REVIEWERS" >> "$GITHUB_OUTPUT"
             echo "has_reviewers=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_reviewers=false" >> "$GITHUB_OUTPUT"

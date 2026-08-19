@@ -586,8 +586,19 @@ jobs:
             const existing = stickies[stickies.length - 1];
 
             if (!ok && existing) {
-              // 실패 라운드가 마지막 정상 리뷰(와 last_success_sha)를 파괴하지 않게 보존한다.
-              core.notice(`Gemini review failed; keeping the previous sticky review. (${runUrl})`);
+              // 실패 라운드는 마지막 정상 리뷰(와 JSON 마커의 last_success_sha)를 보존하되,
+              // '- Last attempt: failure' 라인을 메타에 갱신 삽입해 최신 실행이 실패했음을
+              // PR에서 볼 수 있게 한다(런 로그 notice만으로는 사람이 알 수 없다). 마커와
+              // 기존 메타는 건드리지 않으므로 incremental 기준 SHA 승계도 그대로다.
+              const attemptLine = `- Last attempt: failure (${runUrl})`;
+              const lines = (existing.body || '').split('\n').filter((l) => !l.startsWith('- Last attempt: '));
+              let insertAt = 0;
+              for (let i = 0; i < Math.min(lines.length, 12); i++) {
+                if (/^- (Status|Model|Run|Reviewed): /.test(lines[i])) insertAt = i + 1;
+              }
+              lines.splice(insertAt, 0, attemptLine);
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body: lines.join('\n') });
+              core.notice(`Gemini review failed; kept the previous sticky review and stamped the failed attempt. (${runUrl})`);
               return;
             }
 

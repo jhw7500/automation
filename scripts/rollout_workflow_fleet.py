@@ -1394,11 +1394,19 @@ def _write_report(
         temporary.unlink(missing_ok=True)
 
 
+def _default_ref() -> str:
+    # 릴리즈 정체성의 단일 출처는 scripts/workflow-config.json이다. CLI 기본값을 여기서
+    # 읽어, 버전 범프 때 하드코딩 기본값이 직전 릴리즈로 남는 사고(--ref 없이 publish가
+    # 소비 리포 19곳을 구버전으로 재핀하는 PR을 여는 것)를 구조적으로 없앤다.
+    config_path = ROOT / "scripts" / "workflow-config.json"
+    return str(json.loads(config_path.read_text(encoding="utf-8"))["automation_ref"])
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--automation", type=Path, default=ROOT)
     parser.add_argument("--workspace", type=Path, required=True)
-    parser.add_argument("--ref", default="v1.40.1")
+    parser.add_argument("--ref", default=_default_ref())
     parser.add_argument("--mode", choices=("plan", "publish"), default="plan")
     parser.add_argument("--repo", action="append", default=[])
     parser.add_argument("--initialize-workspace", action="store_true")

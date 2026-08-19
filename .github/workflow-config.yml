@@ -35,6 +35,12 @@ workflows:
     description: "Issue triage and labeling"
     timeout_minutes: 7
 
+  # _self-gemini-auto-review.yml(dogfood)이 호출하는 reusable workflow의 킬 스위치 —
+  # 등록이 없으면 fail-open 기본값(true)으로만 돌아 중앙에서 끌 수 없다.
+  gemini-auto-review:
+    enabled: true
+    description: "Gemini auto PR review (sticky comment; self-dogfood caller)"
+
   # === Claude AI Workflows ===
   claude:
     enabled: true
@@ -43,6 +49,13 @@ workflows:
   claude-code-review:
     enabled: true
     description: "Claude code review"
+
+  # === OpenCode AI Workflows ===
+  # _self-opencode-auto-review.yml(dogfood)이 호출하는 reusable workflow의 킬 스위치 —
+  # 등록이 없으면 fail-open 기본값(true)으로만 돌아 중앙에서 끌 수 없다.
+  opencode-auto-review:
+    enabled: true
+    description: "OpenCode auto PR review (sticky comment; self-dogfood caller)"
 
   # === Automation Workflows ===
   auto-rereview-request:

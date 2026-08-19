@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import difflib
 import errno
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -15,7 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, NamedTuple
 
 import yaml
 
@@ -186,26 +188,37 @@ EXPECTED_SETUP_GEMINI_AUTH = {
         ],
     },
 }
+class ManualGeminiContract(NamedTuple):
+    step_name: str
+    step_id: str
+    number_name: str
+    number_expression: str
+    view_command: str
+    permission_name: str
+    output_prefix: str
+    downstream_job: str
+
+
 MANUAL_GEMINI_FETCH_CONTRACTS = {
-    "gemini-issue-triage.yml": (
-        "Fetch issue",
-        "issue",
-        "ISSUE_NUMBER",
-        "${{ inputs.issue_number }}",
-        "gh issue view",
-        "issues",
-        "issue",
-        "triage",
+    "gemini-issue-triage.yml": ManualGeminiContract(
+        step_name="Fetch issue",
+        step_id="issue",
+        number_name="ISSUE_NUMBER",
+        number_expression="${{ inputs.issue_number }}",
+        view_command="gh issue view",
+        permission_name="issues",
+        output_prefix="issue",
+        downstream_job="triage",
     ),
-    "gemini-pr-review.yml": (
-        "Fetch PR",
-        "pr",
-        "PR_NUMBER",
-        "${{ inputs.pr_number }}",
-        "gh pr view",
-        "pull-requests",
-        "pr",
-        "review",
+    "gemini-pr-review.yml": ManualGeminiContract(
+        step_name="Fetch PR",
+        step_id="pr",
+        number_name="PR_NUMBER",
+        number_expression="${{ inputs.pr_number }}",
+        view_command="gh pr view",
+        permission_name="pull-requests",
+        output_prefix="pr",
+        downstream_job="review",
     ),
 }
 GEMINI_AUTH_OUTPUT = "${{ steps.auth.outputs.token }}"
@@ -1254,6 +1267,11 @@ def verify_opencode_runtime(job: dict, step_name: str, workflow_name: str) -> di
 
 
 def _verify_approved_v140_policy(tree: VerifiedCommitTree, ref: str) -> None:
+    # 이 게이트는 의도적으로 v1.40 계열 두 태그에 닫힌 집합이다: 목적이 "그 두 역사적
+    # 태그의 정책 파일이 승인 당시 스냅샷 그대로인지"의 사후 변조 방지이기 때문이다.
+    # v1.41+ 태그의 내용 승인은 운영자가 명시적으로 넘기는 --expected-commit 핀이
+    # 담당하므로 새 태그를 여기에 추가하는 것은 자동 확장이 아니라 별도의 스냅샷 승인
+    # 절차다(라이브 트리를 태그로 쓰는 테스트 픽스처와도 충돌하므로 자동화하지 않는다).
     if ref not in {"v1.40", "v1.40.1"}:
         return
     digest = hashlib.sha256()
@@ -1428,9 +1446,13 @@ def _verify_tag_catalog(
 
 
 def _expected_manual_fetch_step(
-    contract: tuple[str, str, str, str, str, str, str, str],
+    contract: ManualGeminiContract,
 ) -> dict[str, object]:
-    step_name, step_id, number_name, number_expression, command, _, _, _ = contract
+    step_name = contract.step_name
+    step_id = contract.step_id
+    number_name = contract.number_name
+    number_expression = contract.number_expression
+    command = contract.view_command
     number_reference = f"${number_name}"
     run = (
         f'title="$({command} "{number_reference}" --repo "$REPO" '
@@ -1467,18 +1489,13 @@ def _expected_manual_fetch_step(
 
 
 def _expected_manual_prepare_job(
-    contract: tuple[str, str, str, str, str, str, str, str],
+    contract: ManualGeminiContract,
 ) -> dict[str, object]:
-    (
-        _,
-        step_id,
-        number_name,
-        number_expression,
-        _,
-        permission_name,
-        output_prefix,
-        _,
-    ) = contract
+    step_id = contract.step_id
+    number_name = contract.number_name
+    number_expression = contract.number_expression
+    permission_name = contract.permission_name
+    output_prefix = contract.output_prefix
     input_name = number_name.lower()
     number_reference = f"${number_name}"
     validation = {
@@ -1516,17 +1533,34 @@ def _verify_manual_gemini_output_contract(
         try:
             document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
             prepare = document["jobs"]["prepare"]
-            downstream = document["jobs"][contract[7]]
+            downstream = document["jobs"][contract.downstream_job]
             downstream_with = downstream["with"]
         except (ReleaseVerificationError, yaml.YAMLError, KeyError, TypeError):
             raise ReleaseVerificationError(
                 f"{path} manual Gemini output contract is invalid"
             ) from None
         if prepare != _expected_manual_prepare_job(contract):
-            raise ReleaseVerificationError(
-                f"{path} manual Gemini output contract is invalid"
+            # 셀프서비스 진단: 무엇이 승인된 형태와 다른지 보여준다 — 이 지점은 플릿
+            # 릴리즈 전체를 막는 게이트라, 단서 없는 실패는 곧바로 릴리즈 중단 비용이 된다.
+            expected_text = json.dumps(
+                _expected_manual_prepare_job(contract), indent=1, sort_keys=True
             )
-        output_prefix = contract[6]
+            actual_text = json.dumps(prepare, indent=1, sort_keys=True, default=str)
+            delta = "\n".join(
+                difflib.unified_diff(
+                    expected_text.splitlines(),
+                    actual_text.splitlines(),
+                    "approved prepare job",
+                    "tagged prepare job",
+                    lineterm="",
+                    n=2,
+                )
+            )
+            raise ReleaseVerificationError(
+                f"{path} manual Gemini output contract is invalid; "
+                f"prepare job differs from the approved shape:\n{delta[:4000]}"
+            )
+        output_prefix = contract.output_prefix
         expected_downstream = {
             "issue_title": (
                 f"${{{{ needs.prepare.outputs.{output_prefix}_title }}}}"
