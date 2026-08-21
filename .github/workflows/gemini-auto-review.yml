@@ -145,13 +145,30 @@ jobs:
           # shell (script injection / RCE). Fetch via gh so the values are handled as data.
           rm -f pr_diff.txt pr_diff_delta.txt pr_head_sha.txt review_diff_ready.txt review_full_diff_sha256.txt
           printf 'false' > review_diff_ready.txt
-          if gh pr diff "$PR_NUMBER" > pr_diff.txt 2>/dev/null && [ -s pr_diff.txt ]; then
-            printf 'true' > review_diff_ready.txt
-            sha256sum pr_diff.txt | cut -d' ' -f1 > review_full_diff_sha256.txt
+          : > review_full_diff_sha256.txt
+          ATTEMPT_HEAD=""
+          is_sha() {
+            [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+          }
+          # Bind the server-generated full diff to one immutable PR head. A push during
+          # retrieval would otherwise let an old diff and its hash be published as coverage
+          # for a newer head. Delta preparation below continues to use this validated head.
+          HEAD_BEFORE="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid // ""' 2>/dev/null || printf '')"
+          if ! is_sha "$HEAD_BEFORE"; then
+            echo '::warning::PR head before full-diff preparation is missing or malformed; Gemini will not run'
+          elif gh pr diff "$PR_NUMBER" > pr_diff.txt 2>/dev/null && [ -s pr_diff.txt ]; then
+            HEAD_AFTER="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid // ""' 2>/dev/null || printf '')"
+            if is_sha "$HEAD_AFTER" && [ "$HEAD_BEFORE" = "$HEAD_AFTER" ]; then
+              ATTEMPT_HEAD="$HEAD_AFTER"
+              printf 'true' > review_diff_ready.txt
+              sha256sum pr_diff.txt | cut -d' ' -f1 > review_full_diff_sha256.txt
+            else
+              echo '::warning::PR head changed or became malformed during full-diff preparation; Gemini will not run'
+              rm -f pr_diff.txt
+            fi
           else
             echo '::warning::Failed to fetch a non-empty full PR diff; Gemini will not run'
             rm -f pr_diff.txt
-            : > review_full_diff_sha256.txt
           fi
           gh pr view "$PR_NUMBER" --json title --jq '.title // ""' > pr_title.txt
           gh pr view "$PR_NUMBER" --json body  --jq '.body  // ""' > pr_body.txt
@@ -242,7 +259,7 @@ jobs:
           # delta 블록이 있다(파일명만 다름). 로직을 고치면 양쪽을 함께 고칠 것 — composite
           # action 추출은 액션이 참조 시점에 태그로 선발행돼야 하는 플릿 릴리즈 제약 때문에 보류.
           # (이 워크플로우는 기존부터 fetch-depth 0이라 unshallow 분기가 필요 없다.)
-          HEAD_SHA="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid // ""' 2>/dev/null || printf '')"
+          HEAD_SHA="$ATTEMPT_HEAD"
           printf '%s' "$HEAD_SHA" > pr_head_sha.txt
           if [ -n "$PREV_SHA" ] && [ -n "$HEAD_SHA" ] && [ "$PREV_SHA" != "$HEAD_SHA" ]; then
             git cat-file -e "$PREV_SHA^{commit}" 2>/dev/null || git fetch -q origin "$PREV_SHA" 2>/dev/null || true
@@ -285,7 +302,7 @@ jobs:
           fi
           {
             printf 'diff_ready=%s\n' "$(cat review_diff_ready.txt)"
-            printf 'attempt_head=%s\n' "$HEAD_SHA"
+            printf 'attempt_head=%s\n' "$ATTEMPT_HEAD"
             printf 'full_diff_sha256=%s\n' "$(cat review_full_diff_sha256.txt)"
             printf 'diff_mode=%s\n' "$DIFF_MODE"
           } >> "$GITHUB_OUTPUT"

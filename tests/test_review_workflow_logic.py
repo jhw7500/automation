@@ -125,6 +125,7 @@ def _gh_stub(
     comments: list[dict],
     reviews: list[dict] | None = None,
     head_sha: str = "",
+    head_shas: list[str] | None = None,
     pr_files: list[str] | None = None,
 ) -> dict:
     """PATH-shimmed gh that serves the REST comments and GraphQL reviews fixtures."""
@@ -135,6 +136,9 @@ def _gh_stub(
         json.dumps({"reviews": reviews or []}), encoding="utf-8"
     )
     (tmp_path / "head.json").write_text(json.dumps({"headRefOid": head_sha}), encoding="utf-8")
+    (tmp_path / "head_responses.txt").write_text(
+        "\n".join(head_shas or [head_sha]), encoding="utf-8"
+    )
     # 스크립트가 cwd의 pr_files.txt로 저장하므로 픽스처는 다른 이름이어야 한다 —
     # 같은 이름이면 스텁의 cat이 자기 자신을 truncate-before-read로 비워, [ -s ] 폴백
     # (전체 diff)만 실행되고 pathspec 분기가 테스트에서 한 번도 돌지 않는다
@@ -148,7 +152,14 @@ def _gh_stub(
         "case \"$*\" in\n"
         f"  *'/comments --paginate'*) cat '{tmp_path}/comments.json' ;;\n"
         "  *'--json headRefOid'*)\n"
-        f"    jq -r \"${{@: -1}}\" '{tmp_path}/head.json' ;;\n"
+        f"    count_file='{tmp_path}/head_count.txt'\n"
+        "    count=$(cat \"$count_file\" 2>/dev/null || printf 0)\n"
+        "    printf '%s' $((count + 1)) > \"$count_file\"\n"
+        f"    head=$(sed -n \"$((count + 1))p\" '{tmp_path}/head_responses.txt')\n"
+        f"    [ -n \"$head\" ] || head=$(tail -n 1 '{tmp_path}/head_responses.txt')\n"
+        "    printf '{\"headRefOid\":\"%s\"}\\n' \"$head\" | jq -r \"${@: -1}\" ;;\n"
+        "  *'--json title'*) printf 'fixture title\\n' ;;\n"
+        "  *'--json body'*) printf 'fixture body\\n' ;;\n"
         "  *'pr view'*'--json reviews'*)\n"
         f"    jq \"${{@: -1}}\" '{tmp_path}/reviews.json' ;;\n"
         "  *'pr diff'*'--name-only'*)\n"
@@ -737,7 +748,14 @@ def test_gemini_incremental_delta_carries_wide_context(tmp_path):
     start = run.index(marker)
     sliced = run[start:run.index("DIFF_MODE=\"full\"", start)]
     env = _gh_stub(tmp_path, [sticky], head_sha=sha2, pr_files=["ctx.txt"])
-    env.update({"HEADER": GEMINI_HEADER, "MARKER": GEMINI_V2_MARKER, "REVIEWER": "gemini"})
+    env.update(
+        {
+            "HEADER": GEMINI_HEADER,
+            "MARKER": GEMINI_V2_MARKER,
+            "REVIEWER": "gemini",
+            "ATTEMPT_HEAD": sha2,
+        }
+    )
     subprocess.run(
         ["bash", "-c", sliced], cwd=tmp_path, env=env, check=True, capture_output=True
     )
@@ -802,20 +820,48 @@ def test_gemini_canonical_v2_collection_and_readiness_contract(tmp_path):
         ),
         _bot(
             "github-actions[bot]",
-            _v2_body(GEMINI_HEADER, GEMINI_V2_MARKER, _state_line("gemini", 7, 20, head), "HIGHEST"),
+            _v2_body(GEMINI_HEADER, GEMINI_V2_MARKER, _state_line("claude", 7, 99, head), "FOREIGN REVIEWER"),
             3,
         ),
         _bot(
             "github-actions[bot]",
-            _v2_body(GEMINI_HEADER, GEMINI_V2_MARKER, _state_line("gemini", 7, 10, head), "LOWER"),
+            _v2_body(GEMINI_HEADER, GEMINI_V2_MARKER, _state_line("gemini", 8, 99, head), "MISMATCHED PR"),
             4,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                GEMINI_HEADER,
+                GEMINI_V2_MARKER,
+                _state_line("gemini", 7, 20, head, run_attempt=1),
+                "FIRST ATTEMPT",
+            ),
+            5,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                GEMINI_HEADER,
+                GEMINI_V2_MARKER,
+                _state_line("gemini", 7, 20, head, run_attempt=2),
+                "SECOND ATTEMPT",
+            ),
+            6,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(GEMINI_HEADER, GEMINI_V2_MARKER, _state_line("gemini", 7, 10, head), "LOWER"),
+            7,
         ),
     ]
     previous = _run_gemini_collection(tmp_path, comments)
 
-    assert "HIGHEST" in previous
+    assert "SECOND ATTEMPT" in previous
+    assert "FIRST ATTEMPT" not in previous
     assert "LOWER" not in previous
     assert "BAD" not in previous
+    assert "FOREIGN REVIEWER" not in previous
+    assert "MISMATCHED PR" not in previous
     workflow = _load("gemini-auto-review.yml")
     job = workflow["jobs"]["gemini-review"]
     details = _step(workflow, "gemini-review", "Get PR details")["run"]
@@ -844,6 +890,37 @@ def test_gemini_model_step_fails_closed_without_prepared_diff(tmp_path):
 
     assert result.returncode != 0
     assert "skipping model invocation" in result.stderr
+    assert not (tmp_path / "gemini_review.py").exists()
+
+
+@pytest.mark.parametrize(
+    "heads",
+    [
+        ("ab" * 20, "cd" * 20),
+        ("not-a-sha", "not-a-sha"),
+        ("ab" * 20, "not-a-sha"),
+    ],
+)
+def test_gemini_preparation_rejects_changed_or_malformed_head_before_model(tmp_path, heads):
+    workflow = _load("gemini-auto-review.yml")
+    preparation = _step(workflow, "gemini-review", "Get PR details")["run"]
+    output = tmp_path / "github-output"
+    env = _gh_stub(tmp_path, [], head_shas=list(heads))
+    env["GITHUB_OUTPUT"] = str(output)
+
+    subprocess.run(["bash", "-c", preparation], cwd=tmp_path, env=env, check=True, capture_output=True)
+
+    outputs = output.read_text(encoding="utf-8")
+    assert "diff_ready=false" in outputs
+    assert "attempt_head=\n" in outputs
+    assert "full_diff_sha256=\n" in outputs
+    assert "diff_mode=unavailable" in outputs
+    assert not (tmp_path / "pr_diff.txt").exists()
+
+    model = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
+    gate = model[:model.index("# Install dependencies")]
+    result = subprocess.run(["bash", "-c", gate], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode != 0
     assert not (tmp_path / "gemini_review.py").exists()
 
 
