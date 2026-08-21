@@ -152,14 +152,14 @@ manifest has schema `1`, repository, PR number, merge-base SHA, head SHA, and fi
 
 The underlying CLI prints one JSON object with `diff_ready`, `diff_mode`, `head_sha`, `base_sha`,
 `full_diff_sha256`, `unchanged_since_previous`, and `warning`. The composite output bridge exposes
-the five workflow-facing scalars above without changing stdout. `warning` records a safe fallback,
-such as local-diff failure followed by a numbered full diff; it does not by itself make a ready
-result unavailable. `unchanged_since_previous` is true only in `unchanged` mode.
+the five workflow-facing scalars above without changing stdout. `warning` records a safe
+incremental fallback to the already prepared immutable full diff; it does not by itself make a
+ready result unavailable. `unchanged_since_previous` is true only in `unchanged` mode.
 
 | Mode | Artifacts and selection | Reviewer/checkpoint behavior |
 | --- | --- | --- |
-| `full` | `diff-ready=true`; full diff and manifest exist; delta is absent. This covers a first review, an unusable/non-ancestor previous SHA, an empty delta whose full hash changed, or the explicit numbered-PR fallback. | Claude and Gemini read the full diff. OpenCode always reads the sealed full diff. A model result can advance only after the ordinary output, head, and generation gates. |
-| `delta` | `diff-ready=true`; full diff, non-empty ancestor-to-head delta, and manifest all exist. The previous successful SHA is an available ancestor and the PR file list was retrieved. | Claude and Gemini read the delta as their exclusive changed set. OpenCode still reads the full diff. The stored hash is always the full-diff hash. |
+| `full` | `diff-ready=true`; the unrestricted local `merge-base..captured-head` full diff and local manifest exist; delta is absent. This covers a first review, an unusable/non-ancestor previous SHA, an empty delta whose full hash changed, or an incremental preparation/argv failure. | Claude and Gemini read the full diff. OpenCode always reads the sealed full diff. A model result can advance only after the ordinary output, head, and generation gates. |
+| `delta` | `diff-ready=true`; full diff, non-empty ancestor-to-head delta, and manifest all exist. The previous successful SHA is an available ancestor, and the delta is restricted to paths present in the immutable final full-range manifest. | Claude and Gemini read the delta as their exclusive changed set. OpenCode still reads the full diff. The stored hash is always the full-diff hash. |
 | `unchanged` | `diff-ready=true`; full diff and manifest exist, delta is absent, and the full-diff hash equals the validated previous full hash. | No model runs. The prior non-empty body is preserved, and the successful head/hash may advance only when authenticated prior success, exact hash equality, current-head, and run-generation checks all pass. |
 | `unavailable` | `diff-ready=false`; the mode is `unavailable`, the full hash is empty, and staged full/delta/manifest outputs are removed. | No model runs and no `Reviewed` checkpoint advances. A latest-head failure/stale record may be written only through the normal head/generation gate; a head that changed during preparation causes the later head gate to reject comment mutation. |
 
@@ -171,29 +171,36 @@ body/head/hash but does not claim coverage of the attempted head.
 
 ### Full and incremental preparation
 
-The helper reads PR base/head metadata before and after the mutable preparation inputs. It fetches
-and verifies the required commit objects, computes the merge base, and locally diffs
-`merge-base..head` only across the REST Pulls Files path set. A different or malformed final
-base/head snapshot removes all outputs and returns `unavailable`.
+The helper captures PR base/head metadata, fetches and verifies those exact commit objects,
+computes the merge base, and prepares both authoritative artifacts only from the local immutable
+`merge-base..captured-head` graph. The full diff is unrestricted; the manifest is parsed from
+`git diff --name-status -z --find-renames` without a record ceiling. Neither Pulls Files nor
+`gh pr diff` supplies, repairs, or restricts checkpoint scope. Consequently ABA-shaped server
+views and PRs beyond the Pulls Files 3,000-file limit cannot omit a locally changed path. A final
+metadata read is only a base/head equality gate; a different or malformed snapshot removes all
+outputs and returns `unavailable`. Every diff forces `--ignore-submodules=none`, and commit,
+merge-base, ancestor, and diff identity operations use `--no-replace-objects`, so local Git
+configuration cannot hide a submodule pointer or replace an authoritative object.
 
-If the PR file list or local PR-scoped diff is unavailable—including an unsafe argument-vector
-size—the only fallback is `gh pr diff <explicit-pr-number>`. Metadata is checked again after that
-fallback. If the numbered diff also fails, preparation is unavailable. A file-list failure cannot
-fall back to an unrestricted `previous..head`; an unavailable/non-ancestor previous SHA or any
-incremental failure uses the already prepared full PR diff instead. The helper never batches path
-fragments in a way that could split rename identity.
+An incremental `previous..captured-head` diff is attempted only when the previous commit is a
+local ancestor and is restricted to the old/current path identities in the immutable final
+manifest. Thus a path changed after the previous checkpoint but restored to merge-base content by
+the captured head is excluded. If incremental preparation is unavailable—including an unsafe
+argument-vector size—the helper uses the already prepared immutable full diff. If exact objects,
+the local full diff, or the local manifest cannot be prepared, the result is unavailable; there is
+no mutable server-diff fallback.
 
-Pulls Files JSON is decoded directly into Python strings. Each filename remains one subprocess
-argument to `git --literal-pathspecs diff`, so Unicode, embedded newlines, glob-like characters,
-leading dashes, and other legal path strings represented by the API are not reinterpreted through
-a newline-delimited file or shell. A rename is valid only with `previous_filename`; both the old
-and current names are de-duplicated into the literal path restriction, and both identities remain
-in the manifest record. Deletions, binary changes, executable modes, symlink targets, submodule
-pointers, and rename metadata therefore remain part of the prepared input.
+Git's NUL-delimited records are decoded strictly as UTF-8 and transported directly as Python
+strings. Each delta filename remains one subprocess argument to `git --literal-pathspecs diff`, so
+Unicode, embedded newlines, glob-like characters, leading dashes, and other legal UTF-8 path
+strings are not reinterpreted through a newline-delimited file or shell. Rename/copy records retain
+both old and current names in one manifest record and both are de-duplicated into the literal path
+restriction. Malformed or non-UTF-8 records fail closed. Deletions, binary changes, executable
+modes, symlink targets, submodule pointers, and rename metadata remain part of the prepared input.
 
 ### Changed-anchor contract
 
-All three reviewers are instructed that every new finding needs a changed `path:line` anchor.
+All three reviewers are instructed that every new finding needs a changed path-and-line anchor.
 Unchanged surrounding code is supporting evidence only after a concrete causal explanation from
 that anchor. A real current line without PR causality is insufficient; a disproven prior claim is
 `Retracted`, while `Resolved` requires a code change.
@@ -201,8 +208,11 @@ that anchor. A real current line without PR causality is insufficient; a disprov
 Claude and Gemini enforce this as a prompt contract over their exclusive prepared artifact.
 OpenCode additionally enforces it in the clean canonicalizer. A candidate must contain exactly one
 `### New findings` section whose body is exactly `None` or one or more `####` finding blocks. Every
-block needs at least one exact `- Changed anchor: path:line` line (optional backticks). The parser
-splits at the final `:<decimal line>` delimiter, preserving legal colons inside the path. It then:
+block needs at least one canonical one-line JSON anchor, exactly
+`- Changed anchor: {"path":"path/to/file","line":1}`. JSON string escaping makes every UTF-8
+path reversible, including embedded newlines, backticks, colons, Unicode, and leading dashes.
+Duplicate keys, extra keys, alternate/noncanonical serialization, malformed JSON, empty paths,
+and non-positive or unsafe line integers fail closed. The parser then:
 
 1. verifies the sealed full diff and manifest hashes and their repository, PR, merge-base, and head
    identity;
@@ -212,11 +222,9 @@ splits at the final `:<decimal line>` delimiter, preserving legal colons inside 
    closed provider-free environment, accepting only added-side line ranges.
 
 Rename preparation consequently transports both old and current identities, but a reportable
-anchor names a changed added-side line in the current filename. A numbered-full fallback may have
-an empty or otherwise non-verifying file manifest: it can still support a strict `None` result, but
-it cannot authenticate a new finding without a manifest-verifiable changed anchor. The workflow
-machine-checks anchor form and changed-line membership; the causal explanation for supporting
-unchanged evidence remains a semantic review requirement.
+anchor names a changed added-side line in the current filename. The workflow machine-checks anchor
+form and changed-line membership; the causal explanation for supporting unchanged evidence remains
+a semantic review requirement.
 
 ## Canonical automated-review state (v2)
 
@@ -269,16 +277,27 @@ OpenCode uses three jobs. A read-only prepare job captures prior comments and pr
 prepares the diff, and uploads one immutable handoff. The handoff is selected by server-issued
 artifact ID, with the upload's raw SHA-256 output, the REST `sha256:` digest, repository/run
 identity, an exact conditional file inventory, and per-file hashes all checked. The model job
-has no Actions, Checks, OIDC, or contents-write permission. The pinned CLI is expected to emit
-one legacy raw comment containing the sealed per-attempt candidate nonce exactly once; every
-marker-bearing model-window mutation remains untrusted and subject to quarantine. A clean
-privileged job re-downloads the exact artifact ID, validates it, checks out the sealed PR head, and uses
-`/usr/bin/git` with a closed provider-free environment for changed-anchor validation.
+has empty job permissions, no repository checkout, and no `GITHUB_TOKEN`, `GH_TOKEN`, or
+`USE_GITHUB_TOKEN`. It runs pinned OpenCode 1.18.17's generic `opencode run` in a fresh
+non-repository directory, sends the prompt on stdin, attaches only `review-full.diff` and
+`review-scope.json`, and enables pure/project-config-disabled mode with sharing and all tools
+denied. Every non-empty stdout line must be a JSON object; the last completed text event becomes
+an untrusted `review.md` candidate, while malformed JSONL or no text event fails closed. The
+candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name artifact.
 
-The canonicalizer treats every model-window marker-bearing new or changed comment as
-untrusted. It restores the newest previously attested fallback, quarantines forgeries, admits
-exactly one new-ID nonce-bound raw candidate, and creates a new canonical comment. It then
-completes a dedicated Check Run only after exact-byte refetch. The receipt binds repository,
+A clean privileged job downloads that artifact by its exact server-issued ID and verifies the
+reported and REST digest, repository/run identity, exact run-scoped name, one-file inventory,
+regular-file/no-symlink type, 1..60,000-byte size, and strict UTF-8 decoding before parsing it.
+It separately re-downloads the sealed handoff, checks out the sealed PR head, and uses
+`/usr/bin/git` with a closed provider-free environment for changed-anchor validation. Before any
+comment mutation it also constructs the final canonical body and requires at most 65,536 UTF-8
+bytes, matching the repository's GitHub comment-publication contract.
+
+The canonicalizer treats every model-window marker-bearing new or changed comment as untrusted
+cleanup material; none can supply the model result. It restores the newest previously attested
+fallback, bounds cleanup to 20 hostile comments (with the historical single-candidate allowance),
+and creates a canonical comment only from the validated candidate artifact. It then completes a
+dedicated Check Run only after exact-byte refetch. The receipt binds repository,
 workflow, PR, attempt head, the server-authored Actions workflow-run head, successful head,
 run ID/attempt, comment ID, body/state digests,
 the actual caller workflow path/event, and the referenced central workflow path/SHA. A later
@@ -319,7 +338,8 @@ State, generation ordering, the completed canonicalizer job, and the receipt's `
 always bind the current rerun attempt.
 
 Physical cleanup is also bounded: the exact single nonce candidate has one reserved cleanup
-slot, while at most 20 other untrusted marker-bearing comments are tombstoned per run. Overflow
+slot, while at most 20 other untrusted marker-bearing comments are tombstoned per run; multiple
+exact-nonce lookalikes share that same 20-comment ceiling. Overflow
 remains unattested and therefore ignored by collectors; later runs can drain it without allowing
 comment volume to drive unbounded privileged writes.
 

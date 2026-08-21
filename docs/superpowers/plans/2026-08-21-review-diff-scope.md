@@ -10,6 +10,39 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-21-review-state-scope-hardening-design.md`
 
+## Final-audit amendment (normative)
+
+This amendment supersedes any conflicting implementation detail in the task transcript below:
+
+- `review-full.diff` is the unrestricted local Git diff of the exact verified
+  `merge-base..captured-head` object graph. `review-scope.json` is parsed NUL-safely from the same
+  range's local `--name-status -z --find-renames` output. Pulls Files and `gh pr diff` are not
+  preparation inputs or fallbacks. The final metadata read is only an equality gate. Delta paths
+  come from the immutable final manifest; an incremental/argv failure reuses the prepared full
+  diff, while a local full/manifest/object failure is unavailable. All diffs override submodule
+  ignore configuration and object-identity probes ignore replace refs. Tests cover ABA, 3,001
+  files, restored-out delta paths, malformed paths, and non-UTF-8 fail-closed behavior.
+- The OpenCode model job has empty permissions, no checkout or GitHub token, and runs pinned
+  v1.18.17's generic `opencode run` in a fresh non-repository directory with the prompt on stdin,
+  only the sealed full diff/scope attachments, pure/project-config-disabled mode, disabled sharing,
+  and denied tools. Every non-empty stdout line must be a JSON object and the last completed text
+  event becomes an untrusted candidate artifact.
+- The clean canonicalizer accepts only the exact candidate artifact ID/digest/run/name, exact
+  one-regular-file inventory, strict UTF-8, and 1..60,000 bytes. It validates the completed
+  canonical body at no more than 65,536 UTF-8 bytes before mutation. Comment-shaped model-window
+  bytes never supply the candidate, and cleanup remains bounded under exact-nonce floods.
+- First reviews forbid `Still open`, `Resolved`, and `Retracted`. Rereview carryover headings must
+  bind one-to-one to a unique active finding from authenticated prior state; `Still open` also
+  needs a current changed anchor and an old active heading cannot be laundered into `New findings`.
+- OpenCode anchors use the exact canonical one-line JSON form
+  `- Changed anchor: {"path":"path/to/file","line":1}`. Strict canonical serialization, exact
+  keys/types, manifest identity, and literal Git argv make all UTF-8 paths reversible while
+  duplicate keys and malformed/noncanonical encodings fail closed.
+
+The remaining checkbox steps document the original execution sequence. Where their Pulls Files,
+numbered-diff, model-comment, or `path:line` instructions conflict with this amendment, they are
+historical and must not be reintroduced.
+
 ## Global Constraints
 
 - This plan starts only after `2026-08-21-review-state-integrity.md` passes.

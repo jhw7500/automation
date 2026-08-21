@@ -1,7 +1,7 @@
 # Review State and Scope Hardening Design
 
 Date: 2026-08-21  
-Status: approved in chat; implementation pending
+Status: implemented and locally validated; external rollout not performed
 
 ## 1. Decision
 
@@ -19,6 +19,36 @@ Delivery is split into two reviewable slices. The first establishes trustworthy 
 completion ordering. The second centralizes PR diff preparation and closes remaining scope
 and unusual-path gaps. Both slices are required before fleet rollout because fixing only
 the state bugs would leave the observed out-of-diff OpenCode finding possible.
+
+### 1.1 Final-audit scope amendment (normative)
+
+The final audit tightened four boundaries and supersedes conflicting details later in this design:
+
+1. The authoritative full diff and scope manifest are complete deterministic functions of the
+   exact locally verified `merge-base..captured-head` Git object graph. The full diff is
+   unrestricted, and the manifest comes from strict NUL-delimited local name-status records.
+   Pulls Files and numbered PR diffs are never scope inputs or fallbacks; the final mutable PR read
+   is only an equality gate. Delta restriction uses the final manifest, including both identities
+   for rename/copy records. Diffs explicitly override submodule-ignore configuration and identity
+   probes ignore replace refs. This closes ABA skew, the 3,000-file ceiling, restored-out paths,
+   hidden submodule pointers, and replacement-object influence.
+2. The OpenCode model boundary is a tokenless, checkout-free generic v1.18.17 run in a fresh
+   non-repository directory. It receives only the prompt on stdin plus sealed full-diff/scope
+   attachments under pure/project-config-disabled, sharing-disabled, deny-all settings. Strict
+   JSONL selects the last completed text event. The clean privileged canonicalizer alone validates
+   the exact-ID/digest/run/name one-file candidate artifact and publishes it; the candidate is
+   strict UTF-8 and at most 60,000 bytes, and the final body is at most 65,536 UTF-8 bytes.
+3. Carryover is authenticated state, not free prose. A first review forbids every carryover
+   section. On rereview each carryover heading binds exactly once to a unique previously active
+   authenticated heading, `Still open` also requires a current changed anchor, and an old active
+   heading cannot appear as a new finding.
+4. An OpenCode changed anchor is one exact canonical JSON line containing only a non-empty UTF-8
+   `path` and positive safe-integer `line`. Canonical serialization rejects duplicate keys and
+   ambiguous encodings; exact decoded manifest comparison and literal Git argv preserve newlines,
+   backticks, colons, Unicode, and leading dashes without normalization.
+
+Any later reference to REST file selection, numbered-diff fallback, model-authored comments as
+candidate transport, or final-colon `path:line` parsing is historical and non-normative.
 
 ## 2. Goals
 
@@ -178,18 +208,17 @@ output filenames, and context-line count. It writes:
 
 ### 7.2 Full PR input
 
-The helper fetches PR base/head metadata before and after every mutable PR API input needed
-for preparation, including the paginated Pulls Files response and any numbered server-diff
-fallback. It produces a ready result only when both validated metadata snapshots have the
-same base and head. JSON decoding produces real path strings; filenames are never
-transported through a newline-delimited shell file. It fetches the required commits,
-verifies the head object, and prepares a merge-base-to-head diff. The local full diff is
-restricted to the API's PR file set, including both `filename` and `previous_filename` for
-renames.
+The helper captures PR base/head metadata, fetches and verifies the exact objects without
+replacement refs, computes the merge base, and prepares an unrestricted local
+merge-base-to-head diff. It derives the manifest independently from strict NUL-delimited
+local Git name-status output over that same range, with no API record ceiling. All diff
+calls explicitly include submodule pointer changes even if repository or local configuration
+sets `ignoreSubmodules=all`. A final PR metadata read is only an equality gate. It produces a
+ready result only when both validated metadata snapshots have the same base and head.
 
-If local preparation is unavailable, an explicitly numbered `gh pr diff <pr>` is the only
-fallback. If both mechanisms fail, `diff_ready=false`; the model does not run and no
-checkpoint advances.
+Pulls Files and numbered server-diff bytes are never authoritative or fallback inputs. If
+exact object, local full-diff, or local manifest preparation is unavailable,
+`diff_ready=false`; the model does not run and no checkpoint advances.
 
 ### 7.3 Incremental input
 
@@ -198,12 +227,13 @@ An incremental diff is permitted only when:
 - the previous state is valid and has a successful SHA;
 - that SHA and the captured head are available commits;
 - the previous SHA is an ancestor of the captured head; and
-- the PR file list was fetched successfully.
+- its old/current path identities are present in the immutable final full-range manifest.
 
 Python passes decoded paths as an argument vector to `git --literal-pathspecs diff`, so
-Unicode and embedded-newline names remain single path arguments. Renames include both old
-and new names. If filename retrieval fails, the helper uses the already prepared full PR
-diff; it never runs an unrestricted `previous..head` diff.
+Unicode and embedded-newline names remain single path arguments. Rename/copy records include both
+old and new names. Malformed or non-UTF-8 local records fail closed. If incremental preparation or
+its argument vector is unsafe, the helper uses the already prepared immutable full diff; it never
+runs an unrestricted `previous..head` diff.
 
 If the full PR diff hash equals the prior successful state's hash, the run is
 `unchanged_since_previous`: the model is skipped, the previous body is preserved, and the
@@ -239,18 +269,21 @@ full review rather than claiming no change.
 - Prepare an authoritative full PR diff before invoking the CLI; a missing input skips the
   CLI and fails closed.
 - Tell the reviewer to treat that file as the exclusive set of changes under review.
-- Require every new finding to provide a changed anchor, formatted as `path:line`, and allow
+- Require every new finding to provide an exact canonical one-line JSON changed anchor, and allow
   unchanged lines only as supporting evidence with an explicit causal explanation.
 - Require disproven prior findings to be reported as `Retracted`, not `Resolved`.
-- Snapshot comments before the CLI call. Pinned OpenCode 1.18.17 creates a fresh working
-  comment per run, so after the call identify exactly one marker-bearing bot comment whose ID
-  is absent from that snapshot. Strip reserved lines and wrap it in the machine-generated v2
-  envelope. Zero, multiple, reused, or unverified candidates fail closed and produce no
-  trusted state. If a future pinned CLI changes to update an existing comment, this deliberate
-  compatibility cost is a fail-closed review until the lifecycle contract is revalidated and
-  revised.
+- Run pinned OpenCode 1.18.17 generically in a fresh non-repository directory with empty job
+  permissions, no checkout/GitHub credential, strict hardened configuration, and only the sealed
+  full diff/scope attachments. Strict JSONL extraction writes the last completed text event to a
+  separately uploaded untrusted artifact.
+- Admit only a strict UTF-8, 1..60,000-byte `review.md` from the exact artifact
+  ID/digest/run/name and exact one-regular-file inventory. Only the clean privileged canonicalizer
+  may publish it, and only after a 65,536-byte final-body preflight.
 - Previous context is drawn only from that canonical envelope; arbitrary marker-containing
   comments are ignored.
+- Carryover blocks bind exact headings one-to-one to unique authenticated prior active findings;
+  first-run carryover, unmatched/ambiguous carryover, active-heading laundering into `New
+  findings`, and unanchored `Still open` fail closed.
 
 ## 9. Finding Scope Contract
 
@@ -266,11 +299,12 @@ All three prompts use the same semantic rule:
 
 Prompt-contract tests assert these requirements. The project does not attempt to prove the
 semantic explanation automatically, but OpenCode's canonicalization step rejects a new
-finding section that lacks the required changed-anchor form. It parses the final
-`:<decimal line>` delimiter so legal colons in Git paths remain supported, verifies the path
-against the scope manifest, and verifies the line against an added-side hunk derived from
-the recorded merge-base and head. Claude and Gemini remain bounded by their prepared diff
-input and receive the same instruction.
+finding section that lacks the exact
+`- Changed anchor: {"path":"path/to/file","line":1}` form. Canonical JSON serialization and exact
+keys/types reject duplicate or ambiguous encodings while reversibly representing every UTF-8 path.
+The decoded path is matched exactly against the scope manifest and passed as one literal Git argv
+element; the line must belong to an added-side hunk from the recorded merge-base and head. Claude
+and Gemini remain bounded by their prepared diff input and receive the same semantic instruction.
 
 ## 10. Failure Behavior
 
@@ -287,9 +321,9 @@ input and receive the same instruction.
 | Delta empty but full hash changed | yes, full review | normal success/failure path | gated |
 
 Human-comment API failure removes discussion context but does not broaden code scope.
-PR-metadata or head-validation failure cannot produce a successful checkpoint. PR-file,
-commit, or local-diff failure may continue only when the explicitly numbered server-side
-full PR diff fallback succeeds.
+PR-metadata or head-validation failure cannot produce a successful checkpoint. Exact-object,
+local-full-diff, or local-manifest failure is unavailable; only incremental failure may reuse the
+already prepared immutable full diff.
 
 ## 11. Implementation Slices
 
@@ -377,9 +411,9 @@ work outside this design.
   GitHub-hosted cloud Actions, where `$/` is documented.
 - **One forced full review during migration:** accepted as a safe, bounded cost; legacy
   metadata is not trusted.
-- **OpenCode comment-shape variance:** snapshot and post-run candidate identification must
-  require exactly one candidate and fail closed otherwise.
-- **Additional API calls:** paginate PR files once per run and clip human context as today;
-  exact-prefix and schema checks remain local after the existing comment fetch.
+- **OpenCode output-shape variance:** strict JSONL requires every non-empty line to be an object
+  and selects the last completed text event; pinned-CLI drift fails closed before artifact upload.
+- **Additional API calls:** mutable PR files are not fetched for scope; existing bounded comment,
+  Actions-run, exact-attempt, job, Check, and artifact identity calls remain the provenance cost.
 - **Prompt non-compliance:** machine gates own state and scope; malformed OpenCode new-finding
   output is not accepted as a trusted successful review.

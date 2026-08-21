@@ -535,29 +535,20 @@ jobs:
       needs.check-enabled.outputs.safe_pr == 'true' &&
       needs.opencode-prepare.result == 'success'
     runs-on: ubuntu-latest
-    permissions:
-      # Deliberately no actions/checks/id-token permission. The pinned same-run download
-      # uses the runner artifact service; the model cannot publish canonical attestations.
-      contents: read
-      pull-requests: write
-      issues: write
+    permissions: {}
     env:
       OPENCODE_VERSION: '1.18.17'
       OPENCODE_ARCHIVE_SHA256: '3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a'
     outputs:
       review_outcome: ${{ steps.opencode-review.outcome }}
+      candidate_artifact_id: ${{ steps.upload-candidate.outputs.artifact-id }}
+      candidate_artifact_digest: ${{ steps.upload-candidate.outputs.artifact-digest }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-
       - name: Download sealed review handoff
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           artifact-ids: ${{ needs.opencode-prepare.outputs.handoff_artifact_id }}
-          path: ${{ github.workspace }}
+          path: ${{ runner.temp }}/opencode-model-handoff
           merge-multiple: true
 
       - name: Validate sealed review handoff
@@ -565,13 +556,15 @@ jobs:
         shell: bash
         env:
           HANDOFF_ARTIFACT_DIGEST: ${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}
+          MODEL_HANDOFF: ${{ runner.temp }}/opencode-model-handoff
         run: |
           set -euo pipefail
           [[ "$HANDOFF_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
-          test "$(find . -maxdepth 1 -type l -print -quit)" = ''
+          test "$(find "$MODEL_HANDOFF" -maxdepth 1 -type l -print -quit)" = ''
+          test "$(find "$MODEL_HANDOFF" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = $'handoff.json\nopencode-attestations-before.json\nopencode-comments-before.json\nreview-full.diff\nreview-scope.json'
           for file in opencode-comments-before.json opencode-attestations-before.json review-full.diff review-scope.json; do
-            expected="$(jq -er --arg file "$file" '.files[$file]' handoff.json)"
-            echo "${expected}  ${file}" | sha256sum --check -
+            expected="$(jq -er --arg file "$file" '.files[$file]' "$MODEL_HANDOFF/handoff.json")"
+            echo "${expected}  ${MODEL_HANDOFF}/${file}" | sha256sum --check -
           done
 
       - name: Cache pinned OpenCode CLI archive
@@ -600,23 +593,17 @@ jobs:
           [[ "$("$install_dir/opencode" --version)" == "$OPENCODE_VERSION" ]]
           echo "$install_dir" >> "$GITHUB_PATH"
 
-      # USE_GITHUB_TOKEN: OIDC 교환(api.opencode.ai → opencode-agent App 토큰)을 건너뛰고
-      # 이 잡의 GITHUB_TOKEN 을 쓴다. App 토큰은 App 설치 권한만 따르므로 위 permissions
-      # 블록(contents: read)이 무력했다 — 실제로 자동 리뷰가 PR 브랜치에 코드 커밋을 푸시한
-      # 사례가 있다(wlan-package #163, 게다가 실패하는 테스트였다). GITHUB_TOKEN 으로
-      # 바꾸면 permissions 블록이 그대로 강제되어 리뷰는 쓰되(pull-requests/issues: write)
-      # 코드는 못 쓴다(contents: read).
-      # CLI에는 GITHUB_TOKEN과 USE_GITHUB_TOKEN을 모두 명시한다.
       - name: Run OpenCode PR review
         id: opencode-review
         if: needs.opencode-prepare.outputs.diff_ready == 'true' && needs.opencode-prepare.outputs.diff_mode != 'unchanged'
         continue-on-error: true
-        run: opencode github run
+        shell: bash
         env:
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
-          GITHUB_TOKEN: ${{ github.token }}
-          USE_GITHUB_TOKEN: 'true'
-          MODEL: zai-coding-plan/glm-4.7
+          OPENCODE_PURE: 'true'
+          OPENCODE_DISABLE_PROJECT_CONFIG: 'true'
+          OPENCODE_CONFIG_CONTENT: '{"share":"disabled","snapshot":false,"permission":{"*":"deny"}}'
+          MODEL_HANDOFF: ${{ runner.temp }}/opencode-model-handoff
           PROMPT: |
             ${{ needs.opencode-prepare.outputs.prev_context }}
 
@@ -630,7 +617,8 @@ jobs:
             - concrete, actionable suggestions
             Keep it concise and high-signal.
 
-            Every new finding must identify a Changed anchor at path:line from the prepared diff.
+            Every new finding must identify a one-line JSON Changed anchor from the prepared diff,
+            exactly `- Changed anchor: {"path":"path/to/file","line":1}`.
             An unchanged line is supporting evidence only and requires a concrete causal explanation.
             You must quote the exact current line for each cited location. If a real changed anchor and
             exact line cannot be verified, do not report it.
@@ -671,10 +659,15 @@ jobs:
             Output grammar after the marker is strict:
             - Include exactly one `### New findings` section. Its body is exactly `None`, or
               one or more `####` finding blocks.
-            - Every finding block has at least one line `- Changed anchor: path:line` (optional
-              backticks around path:line). Every anchor line must name an added-side line.
+            - Every finding block has at least one exact one-line JSON anchor
+              `- Changed anchor: {"path":"path/to/file","line":1}`. Escape the path as JSON;
+              every anchor must name an added-side line.
             - The only other allowed top-level sections are `### Still open`, `### Resolved`,
-              and `### Retracted`, each at most once and never empty.
+              and `### Retracted`, each at most once, containing only `####` finding blocks.
+              Omit all three on a first review. On a re-review, copy each carryover block's exact
+              `####` heading from one unique active finding in the authenticated previous review.
+              Every `Still open` block also needs a current JSON Changed anchor. Never reuse an
+              active prior heading under `New findings`.
             - Put no prose before the first `###` heading and no prose before the first finding
               block in `### New findings`.
 
@@ -683,6 +676,43 @@ jobs:
             mode is delta. Do not use an unnumbered or model-side diff fallback, another diff file,
             commit range, repository history, or working-tree discovery as an alternative input.
             Do not review repository files or run an unnumbered `gh pr diff` as fallback scope.
+        run: |
+          set -euo pipefail
+          sandbox="$RUNNER_TEMP/opencode-model-sandbox"
+          candidate_dir="$RUNNER_TEMP/opencode-candidate"
+          isolated_home="$RUNNER_TEMP/opencode-model-home"
+          isolated_xdg="$RUNNER_TEMP/opencode-model-xdg"
+          mkdir -m 0700 "$sandbox" "$candidate_dir" "$isolated_home" "$isolated_xdg"
+          cp -- "$MODEL_HANDOFF/review-full.diff" "$sandbox/review-full.diff"
+          cp -- "$MODEL_HANDOFF/review-scope.json" "$sandbox/review-scope.json"
+          chmod 0400 "$sandbox/review-full.diff" "$sandbox/review-scope.json"
+          cd "$sandbox"
+          test ! -e .git
+          printf '%s\n' "$PROMPT" | env -i \
+            PATH="$PATH" HOME="$isolated_home" XDG_CONFIG_HOME="$isolated_xdg" \
+            XDG_DATA_HOME="$isolated_xdg/data" XDG_CACHE_HOME="$isolated_xdg/cache" \
+            ZHIPU_API_KEY="$ZHIPU_API_KEY" OPENCODE_PURE="$OPENCODE_PURE" \
+            OPENCODE_DISABLE_PROJECT_CONFIG="$OPENCODE_DISABLE_PROJECT_CONFIG" \
+            OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_CONTENT" \
+            opencode run --model zai-coding-plan/glm-4.7 --format json --file review-full.diff --file review-scope.json \
+            > "$RUNNER_TEMP/opencode-review.jsonl"
+          jq -Rrs 'split("\n") | map(select(length > 0)) | map(fromjson) | if any(.[]; type != "object") then error("non-object OpenCode JSON event") else [.[] | select(.type == "text") | .part.text | select(type == "string")] | if length == 0 then error("no completed OpenCode text event") else last end end' \
+            "$RUNNER_TEMP/opencode-review.jsonl" > "$candidate_dir/review.md"
+          test -s "$candidate_dir/review.md"
+          test "$(wc -c < "$candidate_dir/review.md")" -le 60000
+          chmod 0400 "$candidate_dir/review.md"
+
+      - name: Upload untrusted OpenCode candidate
+        id: upload-candidate
+        if: steps.opencode-review.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/opencode-candidate/review.md
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+          retention-days: 1
 
   opencode-canonicalize:
     name: opencode-canonicalize
@@ -718,6 +748,16 @@ jobs:
           path: ${{ runner.temp }}/opencode-handoff
           merge-multiple: true
 
+      - name: Download untrusted OpenCode candidate
+        id: download-candidate
+        if: ${{ always() && needs.opencode-review.outputs.candidate_artifact_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.opencode-review.outputs.candidate_artifact_id }}
+          path: ${{ runner.temp }}/opencode-candidate
+          merge-multiple: true
+
       - name: Canonicalize OpenCode review
         if: ${{ always() }}
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
@@ -734,6 +774,10 @@ jobs:
           FULL_DIFF_SHA256: ${{ needs.opencode-prepare.outputs.full_diff_sha256 }}
           HANDOFF_ARTIFACT_ID: ${{ needs.opencode-prepare.outputs.handoff_artifact_id }}
           HANDOFF_ARTIFACT_DIGEST: ${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.opencode-review.outputs.candidate_artifact_id }}
+          CANDIDATE_ARTIFACT_DIGEST: ${{ needs.opencode-review.outputs.candidate_artifact_digest }}
+          CANDIDATE_ARTIFACT_NAME: opencode-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          CANDIDATE_PATH: ${{ runner.temp }}/opencode-candidate/review.md
           HANDOFF_PATH: ${{ runner.temp }}/opencode-handoff/handoff.json
           SNAPSHOT_PATH: ${{ runner.temp }}/opencode-handoff/opencode-comments-before.json
           ATTESTATIONS_PATH: ${{ runner.temp }}/opencode-handoff/opencode-attestations-before.json
@@ -746,6 +790,7 @@ jobs:
           REVIEW_OUTCOME: ${{ needs.opencode-review.outputs.review_outcome }}
           MODEL_JOB_RESULT: ${{ needs.opencode-review.result }}
           ARTIFACT_DOWNLOAD_OUTCOME: ${{ steps.download-handoff.outcome }}
+          CANDIDATE_DOWNLOAD_OUTCOME: ${{ steps.download-candidate.outcome }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -767,6 +812,7 @@ jobs:
             const attestationsPath = process.env.ATTESTATIONS_PATH || '';
             const reviewDiffPath = process.env.REVIEW_DIFF_PATH || '';
             const reviewScopePath = process.env.REVIEW_SCOPE_PATH || '';
+            const candidatePath = process.env.CANDIDATE_PATH || '';
             const trustedWorkspace = process.env.TRUSTED_WORKSPACE || '';
             const serverUrl = process.env.SERVER_URL || '';
             const repository = process.env.REPOSITORY || '';
@@ -775,8 +821,6 @@ jobs:
             const diffMode = process.env.DIFF_MODE || '';
             const unchangedSincePrevious = process.env.UNCHANGED_SINCE_PREVIOUS === 'true';
             const safeInteger = (raw) => /^[1-9][0-9]*$/.test(raw) && Number.isSafeInteger(Number(raw));
-            const safeLineNumber = (raw) => /^[0-9]+$/.test(raw)
-              && Number.isSafeInteger(Number(raw)) && Number(raw) > 0;
             if (!Number.isInteger(issueNumber) || issueNumber <= 0
               || !safeInteger(runIdRaw) || !safeInteger(runAttemptRaw)
               || !/^[0-9a-f]{40}$/.test(attemptHead)
@@ -886,6 +930,48 @@ jobs:
               if (error.message === 'current workflow run identity mismatch'
                 || error.message === 'sealed prepare attempt is newer than current attempt') throw error;
               return;
+            }
+            let candidateArtifactValid = false;
+            let candidateReview = '';
+            if ((process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success') {
+              try {
+                const candidateIdRaw = process.env.CANDIDATE_ARTIFACT_ID || '';
+                const candidateDigest = process.env.CANDIDATE_ARTIFACT_DIGEST || '';
+                const candidateName = process.env.CANDIDATE_ARTIFACT_NAME || '';
+                if (!safeInteger(candidateIdRaw) || !/^[0-9a-f]{64}$/.test(candidateDigest)
+                  || candidateName !== `opencode-candidate-${runId}-${runAttempt}`
+                  || process.env.CANDIDATE_DOWNLOAD_OUTCOME !== 'success') {
+                  throw new Error('candidate artifact output identity mismatch');
+                }
+                const { data: candidateArtifact } = await github.rest.actions.getArtifact({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  artifact_id: Number(candidateIdRaw),
+                });
+                if (candidateArtifact.id !== Number(candidateIdRaw)
+                  || candidateArtifact.expired === true
+                  || candidateArtifact.digest !== `sha256:${candidateDigest}`
+                  || candidateArtifact.name !== candidateName
+                  || candidateArtifact.workflow_run?.id !== runId) {
+                  throw new Error('candidate artifact API identity/digest mismatch');
+                }
+                const path = require('path');
+                const candidateDir = fs.realpathSync(path.dirname(candidatePath));
+                const entries = fs.readdirSync(candidateDir, { withFileTypes: true });
+                if (entries.length !== 1 || entries[0].name !== 'review.md'
+                  || !entries[0].isFile() || entries[0].isSymbolicLink()) {
+                  throw new Error('candidate artifact inventory is not exact');
+                }
+                const candidateStat = fs.lstatSync(candidatePath);
+                if (!candidateStat.isFile() || candidateStat.isSymbolicLink()
+                  || candidateStat.size < 1 || candidateStat.size > 60000) {
+                  throw new Error('candidate artifact file is not a bounded regular file');
+                }
+                candidateReview = new TextDecoder('utf-8', { fatal: true })
+                  .decode(fs.readFileSync(candidatePath));
+                candidateArtifactValid = true;
+              } catch (error) {
+                core.warning(`Untrusted OpenCode candidate artifact rejected: ${error.message}`);
+              }
             }
             const after = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber, per_page: 100,
@@ -1162,7 +1248,8 @@ jobs:
                 }
               }
             };
-            const candidates = [];
+            const commentCandidates = [];
+            const neutralizedCommentCandidates = [];
             const maxUntrustedCleanupComments = 20;
             let untrustedCleanupComments = 0;
             let cleanupOverflowWarned = false;
@@ -1227,7 +1314,7 @@ jobs:
                 && rawLines.filter((line) => line === `<!-- automation-candidate:${handoff.candidate_nonce} -->`).length === 1
                 && !text.includes(marker);
               if (candidateLike) {
-                candidates.push({ ...comment });
+                commentCandidates.push({ ...comment });
                 continue;
               }
               if (untrustedCleanupComments >= maxUntrustedCleanupComments) {
@@ -1240,15 +1327,17 @@ jobs:
               untrustedCleanupComments += 1;
               await quarantineUntrusted(comment);
             }
-            if (candidates.length === 1) {
+            if (commentCandidates.length === 1) {
               // The only exact nonce-bound raw candidate is always neutralized regardless of
               // attacker-controlled ordering; it has its own one-comment cleanup allowance.
-              await quarantineUntrusted(candidates[0]);
+              await quarantineUntrusted(commentCandidates[0]);
+              neutralizedCommentCandidates.push(commentCandidates[0]);
             } else {
-              for (const raw of candidates.slice(0, Math.max(0,
+              for (const raw of commentCandidates.slice(0, Math.max(0,
                 maxUntrustedCleanupComments - untrustedCleanupComments))) {
                 untrustedCleanupComments += 1;
                 await quarantineUntrusted(raw);
+                neutralizedCommentCandidates.push(raw);
               }
             }
             const repaired = await github.paginate(github.rest.issues.listComments, {
@@ -1290,7 +1379,7 @@ jobs:
               core.notice(`Discarding stale OpenCode generation (${runId}, ${runAttempt})`);
               return;
             }
-            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Last attempt: failure \(https?:\/\/\S+\)$)/;
+            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Last attempt: failure \(https?:\/\/\S+\)$)/;
             const clean = (body) => (body || '').split('\n').filter((line) =>
               line !== `<!-- automation-candidate:${handoff.candidate_nonce} -->`
               && !reserved.test(line)).join('\n').trim();
@@ -1334,8 +1423,8 @@ jobs:
               }
             }
 
-            const parseReview = (review) => {
-              const lines = review.split('\n');
+            const splitSections = (text) => {
+              const lines = text.split('\n');
               if (!lines.length || !lines[0].startsWith('### ')) return null;
               const allowed = new Set(['New findings', 'Still open', 'Resolved', 'Retracted']);
               const sections = [];
@@ -1355,37 +1444,79 @@ jobs:
               if (sections.filter((item) => item.name === 'New findings').length !== 1
                 || new Set(sections.map((item) => item.name)).size !== sections.length
                 || sections.some((item) => !item.lines.join('\n').trim())) return null;
-              const newFindings = sections.find((item) => item.name === 'New findings');
-              const body = newFindings.lines.join('\n').trim();
-              if (body === 'None') return [];
+              return sections;
+            };
+            const sectionBlocks = (section) => {
+              const body = section.lines.join('\n').trim();
+              if (section.name === 'New findings' && body === 'None') return [];
               if (/^None(?:\s|$)/.test(body)) return null;
               const blocks = [];
               let block = null;
-              for (const line of newFindings.lines) {
+              for (const line of section.lines) {
                 if (line.startsWith('####')) {
                   if (!/^#### \S.*$/.test(line)) return null;
-                  block = [];
+                  block = { heading: line, lines: [] };
                   blocks.push(block);
                 } else if (!block) {
                   if (line.trim()) return null;
                 } else {
-                  block.push(line);
+                  block.lines.push(line);
                 }
               }
-              if (!blocks.length) return null;
-              const locations = [];
-              for (const item of blocks) {
-                let blockAnchors = 0;
-                for (const line of item) {
-                  if (!/changed anchor/i.test(line)) continue;
-                  const match = line.match(/^\s*- Changed anchor: (?:`([^`\n]+:[0-9]+)`|([^`\n]+:[0-9]+))\s*$/);
-                  if (!match) return null;
-                  locations.push(match[1] || match[2]);
-                  blockAnchors += 1;
+              return blocks.length ? blocks : null;
+            };
+            const priorActiveHeadings = new Map();
+            if (priorSuccess) {
+              const priorSections = splitSections(previousBody);
+              if (priorSections) {
+                for (const section of priorSections.filter((item) =>
+                  item.name === 'New findings' || item.name === 'Still open')) {
+                  const blocks = sectionBlocks(section);
+                  if (blocks) {
+                    for (const block of blocks) {
+                      priorActiveHeadings.set(block.heading,
+                        (priorActiveHeadings.get(block.heading) || 0) + 1);
+                    }
+                  }
                 }
-                if (!blockAnchors) return null;
               }
-              return locations;
+            }
+            const parseReview = (review) => {
+              const sections = splitSections(review);
+              if (!sections) return null;
+              const carryover = sections.filter((item) => item.name !== 'New findings');
+              if (carryover.length && !priorSuccess) return null;
+              const anchors = [];
+              const currentHeadings = new Set();
+              for (const section of sections) {
+                const blocks = sectionBlocks(section);
+                if (blocks === null) return null;
+                for (const block of blocks) {
+                  if (currentHeadings.has(block.heading)) return null;
+                  currentHeadings.add(block.heading);
+                  const priorMatches = priorActiveHeadings.get(block.heading) || 0;
+                  if (section.name === 'New findings' && priorMatches !== 0) return null;
+                  if (section.name !== 'New findings' && priorMatches !== 1) return null;
+                  let blockAnchors = 0;
+                  for (const line of block.lines) {
+                    if (!/changed anchor/i.test(line)) continue;
+                    const match = line.match(/^- Changed anchor: (\{.*\})$/);
+                    if (!match) return null;
+                    let anchor;
+                    try { anchor = JSON.parse(match[1]); } catch { return null; }
+                    if (!anchor || typeof anchor !== 'object' || Array.isArray(anchor)
+                      || JSON.stringify(anchor) !== match[1]
+                      || JSON.stringify(Object.keys(anchor).sort()) !== JSON.stringify(['line', 'path'])
+                      || typeof anchor.path !== 'string' || anchor.path.length === 0
+                      || !Number.isSafeInteger(anchor.line) || anchor.line <= 0) return null;
+                    anchors.push(anchor);
+                    blockAnchors += 1;
+                  }
+                  if ((section.name === 'New findings' || section.name === 'Still open')
+                    && blockAnchors === 0) return null;
+                }
+              }
+              return anchors;
             };
 
             const anchorsAreChanged = (locations) => {
@@ -1393,11 +1524,11 @@ jobs:
               const files = new Map(manifest.files.map((file) => [file.filename, file]));
               const anchors = [];
               for (const location of locations) {
-                const match = location.match(/^(.*):([0-9]+)$/);
-                if (!match || !match[1] || !safeLineNumber(match[2])) return false;
-                const file = files.get(match[1]);
+                if (!location || typeof location.path !== 'string'
+                  || !Number.isSafeInteger(location.line) || location.line <= 0) return false;
+                const file = files.get(location.path);
                 if (!file || file.status === 'removed') return false;
-                anchors.push({ path: match[1], line: Number(match[2]) });
+                anchors.push({ path: location.path, line: location.line });
               }
               const rangesByPath = new Map();
               for (const path of new Set(anchors.map((anchor) => anchor.path))) {
@@ -1427,15 +1558,15 @@ jobs:
                 .some(([start, end]) => anchor.line >= start && anchor.line <= end));
             };
 
-            const candidate = candidates.length === 1 ? candidates[0] : null;
+            const candidate = candidateArtifactValid ? { body: candidateReview } : null;
             const review = candidate ? clean(candidate.body) : '';
             const parsedReview = review ? parseReview(review) : null;
             const modelSucceeded = diffReady && ['full', 'delta'].includes(diffMode)
               && !unchangedSincePrevious && artifactsValid && modelOk
-              && candidates.length === 1 && parsedReview !== null
+              && candidateArtifactValid && parsedReview !== null
               && anchorsAreChanged(parsedReview);
             const unchangedSucceeded = diffReady && diffMode === 'unchanged'
-              && unchangedSincePrevious && artifactsValid && candidates.length === 0
+              && unchangedSincePrevious && artifactsValid && !candidateArtifactValid
               && priorSuccess && existing.state.full_diff_sha256 === fullDiffSha256;
             const succeeded = modelSucceeded || unchangedSucceeded;
             const recordedMode = ['full', 'delta', 'unchanged', 'unavailable'].includes(diffMode)
@@ -1458,6 +1589,10 @@ jobs:
                 };
             const status = succeeded ? 'success' : (priorSuccess ? 'stale' : 'failure');
             const displayBody = succeeded ? successBody : failureBody;
+            const bodyFor = (attestationId) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${attestationId}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})` : ''}\n\n${displayBody}`;
+            if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536) {
+              throw new Error('canonical OpenCode comment exceeds 65,536-byte publication limit');
+            }
             const preCreateComments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber, per_page: 100,
             });
@@ -1484,7 +1619,7 @@ jobs:
               output: { title: 'OpenCode canonical review pending', summary: 'Awaiting exact comment verification.' },
             });
             const stateText = JSON.stringify(state);
-            const body = `${header}\n${marker}\n<!-- automation-state:${stateText} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${pendingCheck.id}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})` : ''}\n\n${displayBody}`;
+            const body = bodyFor(pendingCheck.id);
             const { data: created } = await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber, body,
             });
@@ -1609,7 +1744,7 @@ jobs:
               await discardCreated();
               throw new Error('canonical comment changed after attestation publication');
             }
-            for (const raw of candidate ? [candidate] : []) {
+            for (const raw of neutralizedCommentCandidates) {
               try {
                 await github.rest.issues.deleteComment({
                   owner: context.repo.owner, repo: context.repo.repo, comment_id: raw.id,

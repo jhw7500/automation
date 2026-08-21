@@ -81,9 +81,13 @@ Runs periodic analysis of repository issues.
 Claude, Gemini, and OpenCode automatic reviews use the shared
 `$/.github/actions/prepare-review-diff` action. It prepares a PR-scoped full diff, a safe
 incremental diff when available, and a scope manifest from the same immutable automation commit
-as the reusable workflow. Missing authoritative input skips the model and cannot advance the
-review checkpoint. Claude and Gemini consume the selected full/incremental artifact; when its
-model runs, OpenCode consumes the sealed full PR diff and machine-validates new-finding anchors.
+as the reusable workflow. The authoritative full diff and manifest come only from the exact local
+`merge-base..captured-head` object graph—never Pulls Files or a numbered server diff—so ABA views
+and the 3,000-file API ceiling cannot narrow review scope. Missing authoritative input skips the
+model and cannot advance the review checkpoint. Claude and Gemini consume the selected
+full/incremental artifact. OpenCode consumes the sealed full diff through a tokenless generic run,
+returns an exact-ID/digest untrusted artifact to the clean canonicalizer, and machine-validates
+canonical one-line JSON changed anchors plus authenticated carryover identity.
 
 See [`docs/workflows/contracts.md`](../docs/workflows/contracts.md#deterministic-automated-review-input)
 for exact modes, state transitions, unusual-path handling, and fail-closed behavior.
@@ -147,7 +151,8 @@ review caller ceilings are:
 - Gemini: `contents: read`, `pull-requests: write`, `issues: write`.
 - OpenCode: `actions: read`, `checks: write`, `contents: read`, `pull-requests: write`,
   `issues: write`; no OIDC. Its reusable workflow narrows permissions by job so only the clean
-  canonicalizer can write the durable Check receipt.
+  canonicalizer can write comments or the durable Check receipt; the model job has empty
+  permissions, no checkout, and no GitHub token.
 
 Interactive and triage workflows have their own catalogued permissions. See
 [`docs/workflows/contracts.md`](../docs/workflows/contracts.md#triggers-inputs-and-permissions)

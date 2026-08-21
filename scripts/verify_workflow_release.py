@@ -1287,8 +1287,10 @@ def verify_remote_tag(repo: Path, remote: str, tag: AnnotatedTag) -> None:
         )
 
 
-def verify_opencode_runtime(job: dict, step_name: str, workflow_name: str) -> dict:
-    """Require a digest-verified CLI and the restricted repository token path."""
+def verify_opencode_runtime(
+    job: dict, step_name: str, workflow_name: str, *, generic_run: bool = False
+) -> dict:
+    """Require a digest-verified CLI and the workflow-specific command boundary."""
     try:
         cache = next(
             item
@@ -1311,6 +1313,24 @@ def verify_opencode_runtime(job: dict, step_name: str, workflow_name: str) -> di
     expected_url = (
         "releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
     )
+    run_script = run_step.get("run", "")
+    generic_contract = (
+        "opencode github run" not in run_script
+        and "opencode run --model zai-coding-plan/glm-4.7 --format json --file review-full.diff --file review-scope.json" in run_script
+        and "map(fromjson)" in run_script
+        and "fromjson?" not in run_script
+        and "else last end" in run_script
+        and run_step.get("env", {}).get("OPENCODE_PURE") == "true"
+        and run_step.get("env", {}).get("OPENCODE_DISABLE_PROJECT_CONFIG") == "true"
+        and run_step.get("env", {}).get("OPENCODE_CONFIG_CONTENT")
+        == '{"share":"disabled","snapshot":false,"permission":{"*":"deny"}}'
+        and not {"GITHUB_TOKEN", "GH_TOKEN", "USE_GITHUB_TOKEN"}
+        & set(run_step.get("env", {}))
+    )
+    github_contract = (
+        run_script == "opencode github run"
+        and run_step.get("env", {}).get("USE_GITHUB_TOKEN") == "true"
+    )
     runtime_is_pinned = (
         job_env.get("OPENCODE_VERSION") == OPENCODE_VERSION
         and job_env.get("OPENCODE_ARCHIVE_SHA256") == OPENCODE_ARCHIVE_SHA256
@@ -1318,9 +1338,8 @@ def verify_opencode_runtime(job: dict, step_name: str, workflow_name: str) -> di
         and expected_url in install_script
         and "sha256sum --check -" in install_script
         and '"$install_dir/opencode" --version' in install_script
-        and run_step.get("run") == "opencode github run"
-        and run_step.get("env", {}).get("USE_GITHUB_TOKEN") == "true"
-        and run_step.get("env", {}).get("MODEL") == "zai-coding-plan/glm-4.7"
+        and (generic_contract if generic_run else github_contract)
+        and (generic_run or run_step.get("env", {}).get("MODEL") == "zai-coding-plan/glm-4.7")
     )
     if not runtime_is_pinned:
         raise ReleaseVerificationError(
@@ -1394,6 +1413,40 @@ def _verify_prepare_review_diff_action(tree: VerifiedCommitTree) -> None:
     if document != EXPECTED_PREPARE_REVIEW_DIFF_ACTION:
         raise ReleaseVerificationError(
             "prepare-review-diff action contract is invalid"
+        )
+    try:
+        helper = tree.read_text(
+            ".github/actions/prepare-review-diff/prepare_review_diff.py"
+        )
+    except ReleaseVerificationError:
+        raise ReleaseVerificationError(
+            "prepare-review-diff immutable local Git scope contract is invalid"
+        ) from None
+    required = (
+        "def parse_name_status(",
+        "def local_scope(",
+        "def git_full_diff(",
+        '"--name-status"',
+        '"-z"',
+        '"--find-renames=50%"',
+        '"--ignore-submodules=none"',
+        '"--no-replace-objects"',
+        "full_diff = git_full_diff(merge_base_sha, head_sha",
+        "records = local_scope(merge_base_sha, head_sha",
+    )
+    forbidden = (
+        "def pr_files(",
+        "def numbered_pr_diff(",
+        "/pulls/{pr_number}/files",
+        '["gh", "pr", "diff"',
+    )
+    if (
+        not all(item in helper for item in required)
+        or helper.count('"--ignore-submodules=none"') != 3
+        or any(item in helper for item in forbidden)
+    ):
+        raise ReleaseVerificationError(
+            "prepare-review-diff immutable local Git scope contract is invalid"
         )
 
 
@@ -1993,24 +2046,25 @@ def _verify_commit_content(
     try:
         check_job = auto["jobs"]["check-enabled"]
         job = auto["jobs"]["opencode-review"]
-        checkout = next(
-            item for item in job["steps"] if item.get("name") == "Checkout repository"
-        )
-    except (KeyError, TypeError, StopIteration) as exc:
+    except (KeyError, TypeError) as exc:
         raise ReleaseVerificationError("OpenCode security structure is missing") from exc
+    modern_auto_review = release_supports_prepare_review_diff(ref)
     step = verify_opencode_runtime(
-        job, "Run OpenCode PR review", "opencode-auto-review.yml"
+        job,
+        "Run OpenCode PR review",
+        "opencode-auto-review.yml",
+        generic_run=modern_auto_review,
     )
-    expected_permissions = {
-        "contents": "read",
-        "pull-requests": "write",
-        "issues": "write",
-    }
+    expected_permissions: dict[str, str] = (
+        {}
+        if modern_auto_review
+        else {"contents": "read", "pull-requests": "write", "issues": "write"}
+    )
     if job.get("permissions") != expected_permissions:
         raise ReleaseVerificationError(
             f"OpenCode auto review permissions differ from {expected_permissions}"
         )
-    if release_supports_prepare_review_diff(ref):
+    if modern_auto_review:
         try:
             prepare = auto["jobs"]["opencode-prepare"]
             canonical = auto["jobs"]["opencode-canonicalize"]
@@ -2018,7 +2072,9 @@ def _verify_commit_content(
             upload = next(item for item in prepare["steps"] if item.get("name") == "Upload sealed canonicalization handoff")
             model_download = next(item for item in job["steps"] if item.get("name") == "Download sealed review handoff")
             model_validate = next(item for item in job["steps"] if item.get("name") == "Validate sealed review handoff")
+            candidate_upload = next(item for item in job["steps"] if item.get("name") == "Upload untrusted OpenCode candidate")
             canonical_download = next(item for item in canonical["steps"] if item.get("name") == "Download sealed canonicalization handoff")
+            candidate_download = next(item for item in canonical["steps"] if item.get("name") == "Download untrusted OpenCode candidate")
             canonical_step = next(item for item in canonical["steps"] if item.get("name") == "Canonicalize OpenCode review")
             canonical_checkout = next(item for item in canonical["steps"] if item.get("name") == "Checkout trusted repository")
         except (KeyError, TypeError, StopIteration) as exc:
@@ -2031,19 +2087,35 @@ def _verify_commit_content(
         artifact_contract = (
             prepare.get("permissions") == expected_prepare
             and canonical.get("permissions") == expected_canonical
-            and "checks" not in job.get("permissions", {}) and "actions" not in job.get("permissions", {})
+            and job.get("permissions") == {}
+            and not any("actions/checkout@" in item.get("uses", "") for item in job.get("steps", []))
             and prepare.get("needs") == "check-enabled"
             and job.get("needs") == ["check-enabled", "opencode-prepare"]
             and canonical.get("needs") == ["check-enabled", "opencode-prepare", "opencode-review"]
             and upload.get("uses") == UPLOAD_ARTIFACT_ACTION
             and upload.get("with", {}).get("overwrite") == "false"
-            and all(item.get("uses") == DOWNLOAD_ARTIFACT_ACTION for item in (model_download, canonical_download))
+            and candidate_upload.get("uses") == UPLOAD_ARTIFACT_ACTION
+            and candidate_upload.get("with", {}).get("name") == "opencode-candidate-${{ github.run_id }}-${{ github.run_attempt }}"
+            and candidate_upload.get("with", {}).get("path") == "${{ runner.temp }}/opencode-candidate/review.md"
+            and candidate_upload.get("with", {}).get("overwrite") == "false"
+            and all(item.get("uses") == DOWNLOAD_ARTIFACT_ACTION for item in (model_download, canonical_download, candidate_download))
             and all(item.get("with", {}).get("artifact-ids") == "${{ needs.opencode-prepare.outputs.handoff_artifact_id }}" for item in (model_download, canonical_download))
             and all(item.get("with", {}).get("merge-multiple") == "true" for item in (model_download, canonical_download))
+            and candidate_download.get("with", {}).get("artifact-ids") == "${{ needs.opencode-review.outputs.candidate_artifact_id }}"
+            and candidate_download.get("with", {}).get("merge-multiple") == "true"
+            and job.get("outputs", {}).get("candidate_artifact_id") == "${{ steps.upload-candidate.outputs.artifact-id }}"
+            and job.get("outputs", {}).get("candidate_artifact_digest") == "${{ steps.upload-candidate.outputs.artifact-digest }}"
             and model_validate.get("env", {}).get("HANDOFF_ARTIFACT_DIGEST") == "${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}"
             and '[[ "$HANDOFF_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]' in model_validation
             and canonical_step.get("env", {}).get("HANDOFF_ARTIFACT_DIGEST") == "${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}"
             and 'artifact.digest !== `sha256:${process.env.HANDOFF_ARTIFACT_DIGEST}`' in canonical_script
+            and 'candidateArtifact.digest !== `sha256:${candidateDigest}`' in canonical_script
+            and 'candidateArtifact.name !== candidateName' in canonical_script
+            and 'candidateArtifact.workflow_run?.id !== runId' in canonical_script
+            and "entries.length !== 1 || entries[0].name !== 'review.md'" in canonical_script
+            and "candidateStat.size > 60000" in canonical_script
+            and "Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536" in canonical_script
+            and "JSON.stringify(anchor) !== match[1]" in canonical_script
             and "github.rest.checks.create" in canonical_script
             and "github.rest.checks.update" in canonical_script
             and "github.rest.actions.listWorkflowRunsForRepo" in canonical_script
@@ -2075,6 +2147,8 @@ def _verify_commit_content(
             and "Deferring OpenCode repair while exact attempt provenance is pending" in canonical_script
             and "handoff.run_attempt > runAttempt" in canonical_script
             and "const maxUntrustedCleanupComments = 20;" in canonical_script
+            and "for (const raw of commentCandidates)" not in canonical_script
+            and "for (const raw of neutralizedCommentCandidates)" in canonical_script
             and 'gh api "repos/${GITHUB_REPOSITORY}/actions/runs" --method GET' in prepare_script
             and '-f event=pull_request -F per_page=100 -F page=1' in prepare_script
             and '-f status=success' not in prepare_script
@@ -2127,12 +2201,32 @@ def _verify_commit_content(
         raise ReleaseVerificationError(
             "OpenCode auto review lacks a central same-repository PR guard"
         )
-    if checkout.get("with", {}).get("persist-credentials") != "true":
-        raise ReleaseVerificationError(
-            "OpenCode auto review cannot authenticate private repository fetch"
-        )
-    if step.get("env", {}).get("GITHUB_TOKEN") != "${{ github.token }}":
-        raise ReleaseVerificationError("OpenCode auto review does not use github.token")
+    if modern_auto_review:
+        if {"GITHUB_TOKEN", "GH_TOKEN", "USE_GITHUB_TOKEN"} & set(step.get("env", {})):
+            raise ReleaseVerificationError("OpenCode auto review model receives a GitHub token")
+        if any(
+            "actions/checkout@" in item.get("uses", "")
+            for item in job.get("steps", [])
+        ):
+            raise ReleaseVerificationError("OpenCode auto review model receives a repository checkout")
+    else:
+        try:
+            checkout = next(
+                item
+                for item in job["steps"]
+                if item.get("name") == "Checkout repository"
+            )
+        except (KeyError, TypeError, StopIteration) as exc:
+            raise ReleaseVerificationError(
+                "OpenCode auto review checkout is missing"
+            ) from exc
+        if (
+            checkout.get("with", {}).get("persist-credentials") != "true"
+            or step.get("env", {}).get("GITHUB_TOKEN") != "${{ github.token }}"
+        ):
+            raise ReleaseVerificationError(
+                "OpenCode auto review cannot authenticate its historical private repository fetch"
+            )
 
     command = documents.get("opencode.yml")
     try:

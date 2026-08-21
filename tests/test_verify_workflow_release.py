@@ -638,10 +638,8 @@ def test_current_release_commit_only_uses_authenticated_objects(
         ),
         (
             ".github/workflows/opencode-auto-review.yml",
-            "      # Deliberately no actions/checks/id-token permission. The pinned same-run download\n"
-            "      # uses the runner artifact service; the model cannot publish canonical attestations.\n"
-            "      contents: read",
-            "      actions: read\n      checks: read\n"
+            "    permissions: {}",
+            "    permissions:\n      actions: read\n      checks: read\n"
             "      contents: read",
         ),
         (
@@ -715,6 +713,17 @@ def test_current_release_commit_only_uses_authenticated_objects(
             "const maxUntrustedCleanupComments = 200;",
         ),
         (
+            ".github/workflows/opencode-auto-review.yml",
+            "JSON.stringify(anchor) !== match[1]",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "const maxUntrustedCleanupComments = 20;",
+            "const maxUntrustedCleanupComments = 20;\n"
+            "            for (const raw of commentCandidates) {}",
+        ),
+        (
             "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml",
             "      actions: read\n      checks: write\n",
             "",
@@ -745,6 +754,8 @@ def test_current_release_commit_only_uses_authenticated_objects(
         "workflow-head-binding",
         "prepared-attempt-binding",
         "bounded-marker-cleanup",
+        "canonical-json-anchor",
+        "unbounded-candidate-cleanup",
         "baseline-caller-ceiling",
         "self-caller-ceiling",
     ),

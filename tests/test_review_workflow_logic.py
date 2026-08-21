@@ -1350,7 +1350,21 @@ const github = {
       },
     },
     actions: {
-      getArtifact: async (a) => ({ data: { id: a.artifact_id, expired: false, digest: `sha256:${process.env.HANDOFF_ARTIFACT_DIGEST}`, workflow_run: { id: Number(process.env.RUN_ID) } } }),
+      getArtifact: async (a) => {
+        if (a.artifact_id === Number(process.env.CANDIDATE_ARTIFACT_ID)) {
+          return { data: {
+            id: a.artifact_id, expired: false,
+            digest: `sha256:${process.env.CANDIDATE_ARTIFACT_DIGEST}`,
+            name: process.env.CANDIDATE_ARTIFACT_NAME,
+            workflow_run: { id: Number(process.env.RUN_ID) },
+          } };
+        }
+        return { data: {
+          id: a.artifact_id, expired: false,
+          digest: `sha256:${process.env.HANDOFF_ARTIFACT_DIGEST}`,
+          workflow_run: { id: Number(process.env.RUN_ID) },
+        } };
+      },
       listWorkflowRunsForRepo: async (a) => {
         calls.push(['list-runs', a]);
         const responses = fx.workflowRunListResponses;
@@ -2779,7 +2793,9 @@ def _opencode_review(*findings: str) -> str:
     if not findings:
         return f"{OPENCODE_MARKER}\n### New findings\nNone"
     blocks = "\n\n".join(
-        f"#### Finding {index}\n- Changed anchor: `{OPENCODE_SCOPE_PATH}:1`\n{finding}"
+        f"#### Finding {index}\n- Changed anchor: "
+        f"{json.dumps({'path': OPENCODE_SCOPE_PATH, 'line': 1}, ensure_ascii=False, separators=(',', ':'))}\n"
+        f"{finding}"
         for index, finding in enumerate(findings, 1)
     )
     return f"{OPENCODE_MARKER}\n### New findings\n{blocks}"
@@ -2882,13 +2898,10 @@ def test_opencode_model_and_privileged_canonicalization_have_separate_token_boun
         "pull-requests": "read",
         "issues": "read",
     }
-    assert model_job["permissions"] == {
-        "contents": "read",
-        "pull-requests": "write",
-        "issues": "write",
-    }
+    assert model_job["permissions"] == {}
     assert "actions" not in model_job["permissions"]
     assert "checks" not in model_job["permissions"]
+    assert not any("actions/checkout@" in step.get("uses", "") for step in model_job["steps"])
     assert canonical_job["permissions"] == {
         "actions": "read",
         "checks": "write",
@@ -2913,6 +2926,91 @@ def test_opencode_model_and_privileged_canonicalization_have_separate_token_boun
     assert not any(step.get("name") == "Canonicalize OpenCode review" for step in model_job["steps"])
     assert not any(step.get("name") == "Run OpenCode PR review" for step in prepare_job["steps"])
     assert model_job["steps"].index(model_download) < model_job["steps"].index(model)
+
+
+def test_opencode_model_is_tokenless_generic_run_with_exact_candidate_artifact():
+    """Restoring github-run or a repository/token boundary would re-enable model writes."""
+    workflow = _load("opencode-auto-review.yml")
+    model_job = workflow["jobs"]["opencode-review"]
+    model = _step(workflow, "opencode-review", "Run OpenCode PR review")
+    candidate_upload = _step(
+        workflow, "opencode-review", "Upload untrusted OpenCode candidate"
+    )
+    candidate_download = _step(
+        workflow, "opencode-canonicalize", "Download untrusted OpenCode candidate"
+    )
+
+    assert model_job["permissions"] == {}
+    assert not any("actions/checkout@" in step.get("uses", "") for step in model_job["steps"])
+    command = model["run"]
+    assert "opencode github run" not in command
+    assert (
+        "opencode run --model zai-coding-plan/glm-4.7 --format json "
+        "--file review-full.diff --file review-scope.json"
+    ) in command
+    assert "jq -Rrs" in command and 'select(.type == "text")' in command
+    assert "fromjson?" not in command and "map(fromjson)" in command
+    assert "else last end" in command
+    assert model["env"]["OPENCODE_PURE"] == "true"
+    assert model["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"
+    assert json.loads(model["env"]["OPENCODE_CONFIG_CONTENT"]) == {
+        "share": "disabled",
+        "snapshot": False,
+        "permission": {"*": "deny"},
+    }
+    for token in ("GITHUB_TOKEN", "GH_TOKEN", "USE_GITHUB_TOKEN"):
+        assert token not in model.get("env", {})
+    assert candidate_upload["uses"] == (
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+    )
+    assert candidate_upload["with"]["name"] == (
+        "opencode-candidate-${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+    assert candidate_upload["with"]["path"] == (
+        "${{ runner.temp }}/opencode-candidate/review.md"
+    )
+    assert candidate_download["with"]["artifact-ids"] == (
+        "${{ needs.opencode-review.outputs.candidate_artifact_id }}"
+    )
+    assert model_job["outputs"]["candidate_artifact_digest"] == (
+        "${{ steps.upload-candidate.outputs.artifact-digest }}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("jsonl", "expected", "ok"),
+    [
+        (
+            '\n'.join([
+                json.dumps({"type": "text", "part": {"text": "first"}}),
+                json.dumps({"type": "tool", "part": {"text": "ignored"}}),
+                json.dumps({"type": "text", "part": {"text": "last"}}),
+            ]),
+            "last",
+            True,
+        ),
+        ('{"type":"text","part":{"text":"valid"}}\nnot-json', None, False),
+        (json.dumps({"type": "tool", "part": {}}), None, False),
+        ('[]', None, False),
+    ],
+)
+def test_opencode_jsonl_parser_requires_all_json_objects_and_last_text(jsonl, expected, ok):
+    run = _step(
+        _load("opencode-auto-review.yml"), "opencode-review", "Run OpenCode PR review"
+    )["run"]
+    match = re.search(r"jq -Rrs '([^']+)'", run)
+    assert match
+
+    result = subprocess.run(
+        ["jq", "-Rrs", match.group(1)],
+        input=jsonl,
+        text=True,
+        capture_output=True,
+    )
+
+    assert (result.returncode == 0) is ok
+    if ok:
+        assert result.stdout.rstrip("\n") == expected
 
 
 def test_opencode_unavailable_handoff_builds_exact_conditional_inventory(tmp_path):
@@ -4012,6 +4110,7 @@ def _run_opencode_canonicalize(
     inject_candidate_nonce: bool = True,
     inject_comments_at_list_call: dict[int, list[dict]] | None = None,
     caller_event: str = "pull_request",
+    candidate_artifact_case: str = "valid",
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
     script = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")["with"]["script"]
@@ -4155,6 +4254,41 @@ def _run_opencode_canonicalize(
         encoding="utf-8",
     )
     git_shim.chmod(0o755)
+    after_with_nonce = []
+    for comment in after:
+        item = json.loads(json.dumps(comment))
+        if inject_candidate_nonce and item.get("body", "").startswith(f"{OPENCODE_MARKER}\n"):
+            item["body"] = item["body"].replace(
+                f"{OPENCODE_MARKER}\n",
+                f"{OPENCODE_MARKER}\n<!-- automation-candidate:{'66' * 32} -->\n",
+                1,
+            )
+        after_with_nonce.append(item)
+    before_ids = {comment["id"] for comment in before}
+    raw_candidates = [
+        comment
+        for comment in after_with_nonce
+        if comment["id"] not in before_ids
+        and comment.get("body", "").startswith(f"{OPENCODE_MARKER}\n")
+        and OPENCODE_V2_MARKER not in comment.get("body", "")
+    ]
+    candidate_dir = workdir / "candidate"
+    candidate_dir.mkdir()
+    candidate_path = candidate_dir / "review.md"
+    candidate_available = len(raw_candidates) == 1 and candidate_artifact_case != "absent"
+    if candidate_available:
+        candidate_path.write_text(raw_candidates[0]["body"], encoding="utf-8")
+        if candidate_artifact_case == "extra":
+            (candidate_dir / "extra.txt").write_text("extra", encoding="utf-8")
+        elif candidate_artifact_case == "symlink":
+            target = candidate_dir / "target.txt"
+            target.write_text("target", encoding="utf-8")
+            candidate_path.unlink()
+            candidate_path.symlink_to(target.name)
+        elif candidate_artifact_case == "oversized":
+            candidate_path.write_text("x" * 60001, encoding="utf-8")
+        elif candidate_artifact_case == "tampered":
+            candidate_path.write_bytes(b"\xff")
     env = {
         "PR_NUMBER": "7",
         "RUN_URL": f"https://github.com/example/repo/actions/runs/{run_id}",
@@ -4168,6 +4302,15 @@ def _run_opencode_canonicalize(
         "FULL_DIFF_SHA256": full_diff_sha256,
         "HANDOFF_ARTIFACT_ID": "1234",
         "HANDOFF_ARTIFACT_DIGEST": "56" * 32,
+        "CANDIDATE_ARTIFACT_ID": "5678" if candidate_available else "",
+        "CANDIDATE_ARTIFACT_DIGEST": "78" * 32 if candidate_available else "",
+        "CANDIDATE_ARTIFACT_NAME": (
+            "wrong-candidate-name"
+            if candidate_artifact_case == "wrong-name"
+            else f"opencode-candidate-{run_id}-{run_attempt}"
+        ),
+        "CANDIDATE_PATH": str(candidate_path),
+        "CANDIDATE_DOWNLOAD_OUTCOME": "success" if candidate_available else "skipped",
         "HANDOFF_PATH": str(handoff),
         "REVIEW_OUTCOME": outcome,
         "SNAPSHOT_PATH": str(snapshot_override or snapshot),
@@ -4183,16 +4326,6 @@ def _run_opencode_canonicalize(
         "GIT_DIFF_OUTPUT": str(git_output),
         "GIT_FAILURE": "true" if git_failure else "false",
     }
-    after_with_nonce = []
-    for comment in after:
-        item = json.loads(json.dumps(comment))
-        if inject_candidate_nonce and item.get("body", "").startswith(f"{OPENCODE_MARKER}\n"):
-            item["body"] = item["body"].replace(
-                f"{OPENCODE_MARKER}\n",
-                f"{OPENCODE_MARKER}\n<!-- automation-candidate:{'66' * 32} -->\n",
-                1,
-            )
-        after_with_nonce.append(item)
     return _run_upsert(
         tmp_path, "opencode-auto-review.yml", "opencode-canonicalize", "Canonicalize OpenCode review",
         env, after_with_nonce, cwd=workdir, current_head=current_head or attempt_head, expect_error=expect_error,
@@ -4269,8 +4402,272 @@ def test_opencode_scope_rejects_substantive_preamble_before_sections(tmp_path):
 
 
 @node_required
+@pytest.mark.parametrize("section", ["Still open", "Resolved", "Retracted"])
+def test_opencode_first_review_rejects_laundered_carryover_block(tmp_path, section):
+    """A first-run carryover label must not bypass new-finding scope enforcement."""
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### {section}\n#### Invented prior finding\n- Changed anchor: {anchor}\nbody"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [_bot("github-actions[bot]", review, 10, updated="u2")]
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+
+
+@node_required
+def test_opencode_rereview_accepts_exact_still_open_resolved_and_retracted_bindings(tmp_path):
+    head = "ab" * 20
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    prior_body = (
+        "### New findings\n"
+        f"#### Remains active\n- Changed anchor: {anchor}\nprior A\n"
+        f"#### Fixed now\n- Changed anchor: {anchor}\nprior B\n"
+        f"#### Was incorrect\n- Changed anchor: {anchor}\nprior C"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Still open\n#### Remains active\n- Changed anchor: {anchor}\nstill present\n"
+        "### Resolved\n#### Fixed now\ncurrent code proves the fix\n"
+        "### Retracted\n#### Was incorrect\nprior claim disproved"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+    assert "#### Remains active" in body
+    assert "#### Fixed now" in body
+    assert "#### Was incorrect" in body
+
+
+@node_required
+@pytest.mark.parametrize("case", ["ambiguous-prior", "new-finding-spoof"])
+def test_opencode_rereview_rejects_ambiguous_or_masquerading_active_identity(tmp_path, case):
+    head = "ab" * 20
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    prior_blocks = (
+        f"#### Active identity\n- Changed anchor: {anchor}\nprior"
+        + (
+            f"\n#### Active identity\n- Changed anchor: {anchor}\nduplicate"
+            if case == "ambiguous-prior"
+            else ""
+        )
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 1, head),
+            f"### New findings\n{prior_blocks}",
+        ),
+        1,
+    )
+    if case == "ambiguous-prior":
+        current = (
+            f"{OPENCODE_MARKER}\n### New findings\nNone\n### Still open\n"
+            f"#### Active identity\n- Changed anchor: {anchor}\nstill present"
+        )
+    else:
+        current = (
+            f"{OPENCODE_MARKER}\n### New findings\n#### Active identity\n"
+            f"- Changed anchor: {anchor}\npretends to be new"
+        )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+
+
+@node_required
+def test_opencode_rereview_rejects_unmatched_carryover_identity(tmp_path):
+    """A current carryover heading must bind one authenticated active prior heading."""
+    head = "ab" * 20
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    prior_body = (
+        f"### New findings\n#### Prior active finding\n- Changed anchor: {anchor}\nprior"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Still open\n#### Different invented finding\n- Changed anchor: {anchor}\nbody"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+        run_id="42",
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+
+
+@node_required
+@pytest.mark.parametrize(
+    "path",
+    [
+        "colon:name.py",
+        "line\nbreak.py",
+        "tick`name.py",
+        "unicode-한글-😀.py",
+        "space name.py",
+        "-leading.py",
+    ],
+)
+def test_opencode_one_line_json_anchor_round_trips_every_utf8_path(tmp_path, path):
+    """The structured anchor must decode the exact path before literal Git argv use."""
+    anchor = json.dumps(
+        {"path": path, "line": 1}, ensure_ascii=False, separators=(",", ":")
+    )
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\n#### Exact path\n"
+        f"- Changed anchor: {anchor}\nbody"
+    )
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": "ab" * 20,
+        "head_sha": "cd" * 20,
+        "files": [{"status": "modified", "filename": path}],
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [_bot("github-actions[bot]", review, 10, updated="u2")],
+        manifest=manifest,
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+
+
+@node_required
+@pytest.mark.parametrize(
+    "anchor",
+    [
+        '{"path":"src.py","line":1,"extra":true}',
+        f'{{"path":"{OPENCODE_SCOPE_PATH}","path":"{OPENCODE_SCOPE_PATH}","line":1}}',
+        '{"path":"src.py","line":0}',
+        '{"path":"","line":1}',
+        '{"path":"src.py","line":1',
+    ],
+)
+def test_opencode_json_anchor_rejects_extra_keys_and_malformed_values(tmp_path, anchor):
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\n#### Invalid anchor\n"
+        f"- Changed anchor: {anchor}\nbody"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [_bot("github-actions[bot]", review, 10, updated="u2")]
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+
+
+@node_required
+@pytest.mark.parametrize(
+    "candidate_artifact_case",
+    ["absent", "tampered", "extra", "symlink", "oversized", "wrong-name"],
+)
+def test_opencode_candidate_artifact_failures_publish_no_success(
+    tmp_path, candidate_artifact_case
+):
+    candidate = _bot(
+        "github-actions[bot]", _opencode_review("real finding"), 10, updated="u2"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [candidate],
+        candidate_artifact_case=candidate_artifact_case,
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+    assert not any(
+        call[0] == "update-check" and call[1].get("conclusion") == "success"
+        and "Reviewed:" in body
+        for call in calls
+    )
+
+
+@node_required
+def test_opencode_canonical_body_limit_fails_before_check_or_comment_mutation(tmp_path):
+    head = "ab" * 20
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 1, head),
+            "### New findings\nNone\n\n" + "x" * 65400,
+        ),
+        1,
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior],
+        outcome="failure",
+        expect_error=True,
+    )
+
+    assert not any(call[0] in {"create", "create-check"} for call in calls)
+
+
+@node_required
 @pytest.mark.parametrize("nonce_case", ("missing", "wrong", "duplicate"))
-def test_opencode_raw_candidate_requires_exactly_one_sealed_nonce(tmp_path, nonce_case):
+def test_opencode_candidate_artifact_no_longer_depends_on_model_nonce(tmp_path, nonce_case):
     exact = f"<!-- automation-candidate:{'66' * 32} -->"
     lines = [OPENCODE_MARKER]
     if nonce_case == "wrong":
@@ -4284,7 +4681,7 @@ def test_opencode_raw_candidate_requires_exactly_one_sealed_nonce(tmp_path, nonc
     )
     body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
-    assert state["attempt_status"] == "failure"
+    assert state["attempt_status"] == "success"
 
 
 @node_required
@@ -4649,6 +5046,24 @@ def test_opencode_invalid_marker_flood_has_bounded_cleanup_and_next_collector_tr
 
 
 @node_required
+def test_opencode_duplicate_exact_nonce_comments_keep_cleanup_bounded(tmp_path):
+    raw_candidates = [
+        _bot("github-actions[bot]", _opencode_review(), 3000 + index, updated="u2")
+        for index in range(60)
+    ]
+
+    calls = _run_opencode_canonicalize(tmp_path, [], raw_candidates)
+
+    touched_candidates = {
+        call[1]["comment_id"]
+        for call in calls
+        if call[0] in {"update", "delete"}
+        and 3000 <= call[1]["comment_id"] < 3060
+    }
+    assert len(touched_candidates) <= 20
+
+
+@node_required
 def test_opencode_marker_overflow_is_drained_by_later_bounded_run(tmp_path):
     stranded = [
         _bot("github-actions[bot]", f"junk {index}\n{OPENCODE_V2_MARKER}\nforged", 2000 + index, updated="u1")
@@ -4982,7 +5397,7 @@ def test_opencode_changed_anchor_scope_rejects_non_added_locations(
 
 
 @node_required
-def test_opencode_changed_anchor_uses_final_colon_and_literal_git_argv(tmp_path):
+def test_opencode_changed_anchor_uses_json_path_and_literal_git_argv(tmp_path):
     leading_dash_path = "-dir/a:b [x] 한글😀.js"
     manifest = {
         "schema": 1,
@@ -4994,7 +5409,8 @@ def test_opencode_changed_anchor_uses_final_colon_and_literal_git_argv(tmp_path)
     }
     candidate = _bot(
         "github-actions[bot]",
-        f"{OPENCODE_MARKER}\n### New findings\n#### Finding\n- Changed anchor: `{leading_dash_path}:0007`",
+        f"{OPENCODE_MARKER}\n### New findings\n#### Finding\n- Changed anchor: "
+        f"{json.dumps({'path': leading_dash_path, 'line': 7}, ensure_ascii=False, separators=(',', ':'))}",
         10,
         updated="u2",
     )
@@ -5056,7 +5472,10 @@ def test_opencode_absolute_git_accepts_genuine_added_unusual_path(tmp_path):
     manifest = {"schema": 1, "repository": "example/repo", "pr_number": 7,
                 "merge_base_sha": base, "head_sha": head,
                 "files": [{"status": "added", "filename": unusual}]}
-    raw = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\n### New findings\n#### Real\n- Changed anchor: `{unusual}:1`", 10, updated="u2")
+    anchor = json.dumps(
+        {"path": unusual, "line": 1}, ensure_ascii=False, separators=(",", ":")
+    )
+    raw = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\n### New findings\n#### Real\n- Changed anchor: {anchor}", 10, updated="u2")
     calls = _run_opencode_canonicalize(
         tmp_path, [], [raw], attempt_head=head, current_head=head,
         manifest=manifest, trusted_workspace=repo,

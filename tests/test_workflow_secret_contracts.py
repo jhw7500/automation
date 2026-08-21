@@ -94,27 +94,31 @@ class WorkflowSecretContractsTest(unittest.TestCase):
                 offenders.append(path.name)
         self.assertEqual([], offenders)
 
-    def test_opencode_auto_review_cannot_mint_an_oidc_app_token(self) -> None:
+    def test_opencode_auto_review_model_has_no_github_mutation_authority(self) -> None:
         path = WORKFLOWS / "opencode-auto-review.yml"
         workflow = load_workflow(path)
         job = workflow["jobs"]["opencode-review"]
         permissions = job["permissions"]
+        self.assertEqual({}, permissions)
         self.assertNotIn("id-token", permissions)
 
         run_step = next(
             step for step in job["steps"] if step.get("name") == "Run OpenCode PR review"
         )
-        self.assertEqual("opencode github run", run_step["run"])
-        self.assertEqual("true", run_step["env"]["USE_GITHUB_TOKEN"])
-        self.assertEqual("${{ github.token }}", run_step["env"]["GITHUB_TOKEN"])
+        self.assertNotIn("opencode github run", run_step["run"])
+        self.assertIn(
+            "opencode run --model zai-coding-plan/glm-4.7 --format json",
+            run_step["run"],
+        )
+        for token in ("USE_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+            self.assertNotIn(token, run_step.get("env", {}))
 
-    def test_opencode_auto_review_keeps_read_only_checkout_auth_for_private_repos(self) -> None:
+    def test_opencode_auto_review_model_has_no_repository_checkout(self) -> None:
         workflow = load_workflow(WORKFLOWS / "opencode-auto-review.yml")
         job = workflow["jobs"]["opencode-review"]
-        checkout = next(
-            step for step in job["steps"] if step.get("name") == "Checkout repository"
+        self.assertFalse(
+            any("actions/checkout@" in step.get("uses", "") for step in job["steps"])
         )
-        self.assertEqual("true", checkout["with"]["persist-credentials"])
 
     def test_opencode_auto_review_enforces_same_repository_prs_centrally(self) -> None:
         workflow = load_workflow(WORKFLOWS / "opencode-auto-review.yml")

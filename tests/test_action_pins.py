@@ -100,8 +100,24 @@ class ActionPinsTest(unittest.TestCase):
                 run_step = next(
                     step for step in job["steps"] if step.get("name") == run_name
                 )
-                self.assertEqual("opencode github run", run_step["run"])
-                self.assertEqual("true", run_step["env"]["USE_GITHUB_TOKEN"])
+                if filename == "opencode-auto-review.yml":
+                    self.assertNotIn("opencode github run", run_step["run"])
+                    self.assertIn(
+                        "opencode run --model zai-coding-plan/glm-4.7 --format json "
+                        "--file review-full.diff --file review-scope.json",
+                        run_step["run"],
+                    )
+                    self.assertEqual("true", run_step["env"]["OPENCODE_PURE"])
+                    self.assertEqual(
+                        "true", run_step["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"]
+                    )
+                    self.assertFalse(
+                        {"GITHUB_TOKEN", "GH_TOKEN", "USE_GITHUB_TOKEN"}
+                        & set(run_step["env"])
+                    )
+                else:
+                    self.assertEqual("opencode github run", run_step["run"])
+                    self.assertEqual("true", run_step["env"]["USE_GITHUB_TOKEN"])
 
 
 if __name__ == "__main__":

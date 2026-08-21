@@ -140,7 +140,11 @@ def configure_gh(
         json.dumps(
             {
                 "metadata": metadata or [snapshot, snapshot],
-                "files": [files or [{"status": "modified", "filename": "inside.txt"}]],
+                "files": [
+                    files
+                    if files is not None
+                    else [{"status": "modified", "filename": "inside.txt"}]
+                ],
                 "files_error": files_error,
                 "pr_diff_error": pr_diff_error,
                 "pr_diff": pr_diff,
@@ -208,7 +212,7 @@ def prepare_args(full: Path, delta: Path, manifest: Path, *extra: str) -> tuple[
 def test_first_round_writes_pr_scoped_full_diff_and_manifest(
     history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
 ) -> None:
-    """Removing path restriction would leak the decoy into the reviewed full input."""
+    """The full immutable merge-base range is the authoritative review input."""
     configure_gh(gh_fixture, base=history.base, head=history.head)
     full, delta, manifest = outputs(tmp_path)
 
@@ -226,7 +230,7 @@ def test_first_round_writes_pr_scoped_full_diff_and_manifest(
         "warning": "",
     }
     assert "after" in full.read_text(encoding="utf-8")
-    assert "OUT_OF_PR" not in full.read_text(encoding="utf-8")
+    assert "OUT_OF_PR" in full.read_text(encoding="utf-8")
     assert not delta.exists()
     assert json.loads(manifest.read_text(encoding="utf-8")) == {
         "schema": 1,
@@ -234,10 +238,13 @@ def test_first_round_writes_pr_scoped_full_diff_and_manifest(
         "pr_number": 7,
         "merge_base_sha": history.base,
         "head_sha": history.head,
-        "files": [{"status": "modified", "filename": "inside.txt"}],
+        "files": [
+            {"status": "added", "filename": "decoy.txt"},
+            {"status": "added", "filename": "inside.txt"},
+        ],
     }
     calls = [json.loads(line) for line in gh_fixture.log.read_text(encoding="utf-8").splitlines()]
-    assert [call[0] for call in calls] == ["api", "api", "api"]
+    assert [call[0] for call in calls] == ["api", "api"]
 
 
 def test_valid_previous_ancestor_writes_scoped_incremental_diff(
@@ -257,7 +264,7 @@ def test_valid_previous_ancestor_writes_scoped_incremental_diff(
     state = json.loads(result.stdout)
     assert state["diff_mode"] == "delta"
     assert "after" in delta.read_text(encoding="utf-8")
-    assert "OUT_OF_PR" not in delta.read_text(encoding="utf-8")
+    assert "OUT_OF_PR" in delta.read_text(encoding="utf-8")
     assert full.exists()
 
 
@@ -277,7 +284,7 @@ def test_non_ancestor_previous_falls_back_to_pr_scoped_full_diff(
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["diff_mode"] == "full"
     assert not delta.exists()
-    assert "OUT_OF_PR" not in full.read_text(encoding="utf-8")
+    assert "OUT_OF_PR" in full.read_text(encoding="utf-8")
 
 
 def test_unavailable_previous_commit_falls_back_to_pr_scoped_full_diff(
@@ -297,13 +304,13 @@ def test_unavailable_previous_commit_falls_back_to_pr_scoped_full_diff(
     state = json.loads(result.stdout)
     assert state["diff_ready"] is True
     assert state["diff_mode"] == "full"
-    assert "OUT_OF_PR" not in full.read_text(encoding="utf-8")
+    assert "OUT_OF_PR" in full.read_text(encoding="utf-8")
 
 
-def test_pr_files_failure_uses_numbered_full_diff_not_commit_range(
+def test_remote_file_and_numbered_diff_failures_do_not_affect_local_full_diff(
     history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
 ) -> None:
-    """An API file-list outage must use only GitHub's numbered authoritative diff."""
+    """Remote diff sources are irrelevant once exact local objects are available."""
     configure_gh(
         gh_fixture,
         base=history.base,
@@ -318,19 +325,20 @@ def test_pr_files_failure_uses_numbered_full_diff_not_commit_range(
     assert result.returncode == 0, result.stderr
     state = json.loads(result.stdout)
     assert state["diff_mode"] == "full"
-    assert "OUT_OF_PR" not in full.read_text(encoding="utf-8")
-    assert "server-only" in full.read_text(encoding="utf-8")
+    assert "OUT_OF_PR" in full.read_text(encoding="utf-8")
+    assert "server-only" not in full.read_text(encoding="utf-8")
     calls = [json.loads(line) for line in gh_fixture.log.read_text(encoding="utf-8").splitlines()]
-    assert ["pr", "diff", "7"] in calls
+    assert not any(call[0] == "api" and call[1].endswith("/files") for call in calls)
+    assert not any(call[:2] == ["pr", "diff"] for call in calls)
     scope = json.loads(manifest.read_text(encoding="utf-8"))
-    assert scope["files"] == []
+    assert {record["filename"] for record in scope["files"]} == {"decoy.txt", "inside.txt"}
     assert scope["merge_base_sha"] == history.base
 
 
-def test_renamed_file_without_previous_name_uses_numbered_full_diff(
+def test_malformed_remote_rename_record_cannot_replace_local_scope(
     history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
 ) -> None:
-    """Accepting a partial rename record can silently omit the old path from review."""
+    """A malformed mutable rename record never influences the local manifest."""
     configure_gh(
         gh_fixture,
         base=history.base,
@@ -346,19 +354,20 @@ def test_renamed_file_without_previous_name_uses_numbered_full_diff(
     state = json.loads(result.stdout)
     assert state["diff_ready"] is True
     assert state["diff_mode"] == "full"
-    assert full.read_text(encoding="utf-8").endswith("+server rename\n")
+    assert "server rename" not in full.read_text(encoding="utf-8")
     scope = json.loads(manifest.read_text(encoding="utf-8"))
     assert scope["merge_base_sha"] == history.base
-    assert scope["files"] == []
+    assert {record["filename"] for record in scope["files"]} == {"decoy.txt", "inside.txt"}
     calls = [json.loads(line) for line in gh_fixture.log.read_text(encoding="utf-8").splitlines()]
-    assert ["pr", "diff", "7"] in calls
+    assert not any(call[0] == "api" and call[1].endswith("/files") for call in calls)
+    assert not any(call[:2] == ["pr", "diff"] for call in calls)
 
 
-def test_total_preparation_failure_removes_stale_outputs(
+def test_unavailable_local_head_object_removes_stale_outputs(
     history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
 ) -> None:
-    """Publishing an old artifact after both full-diff sources fail is unsafe."""
-    configure_gh(gh_fixture, base=history.base, head=history.head, files_error=True, pr_diff_error=True)
+    """Missing captured objects fail closed without a mutable server-diff fallback."""
+    configure_gh(gh_fixture, base=history.base, head="f" * 40)
     full, delta, manifest = outputs(tmp_path)
     for output in (full, delta, manifest):
         output.write_text("stale", encoding="utf-8")
@@ -572,9 +581,11 @@ def test_rename_binary_mode_symlink_and_submodule_changes_are_preserved(
     )
     git(history.repo, "-C", "vendor/module", "checkout", updated_submodule)
     head = commit(history.repo, "object changes")
+    git(history.repo, "config", "diff.ignoreSubmodules", "all")
+    git(history.repo, "config", "submodule.vendor/module.ignore", "all")
     configure_gh(
         gh_fixture,
-        base=history.base,
+        base=previous,
         head=head,
         files=[
             {
@@ -611,13 +622,15 @@ def test_rename_binary_mode_symlink_and_submodule_changes_are_preserved(
     assert b"after-target" in diff
     assert f"-Subproject commit {previous_submodule}".encode() in diff
     assert f"+Subproject commit {updated_submodule}".encode() in diff
+    scope = json.loads(manifest.read_text(encoding="utf-8"))
+    assert "vendor/module" in {record["filename"] for record in scope["files"]}
     assert b"OUT_OF_PR" not in diff
 
 
-def test_oversized_unicode_path_argv_uses_numbered_full_diff(
+def test_oversized_delta_argv_uses_already_prepared_immutable_full_diff(
     history: RepositoryHistory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unsafe local argv must fall back without a broad commit-range diff."""
+    """An unsafe delta argv must reuse the already prepared immutable full diff."""
     spec = importlib.util.spec_from_file_location("prepare_review_diff_under_test", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -642,14 +655,14 @@ def test_oversized_unicode_path_argv_uses_numbered_full_diff(
 
     records = [{"status": "added", "filename": "emoji-한글-😀.py"}]
     monkeypatch.setattr(module, "metadata", lambda *arguments: (history.base, history.head))
-    monkeypatch.setattr(module, "pr_files", lambda *arguments: records)
-    numbered_calls: list[int] = []
-
-    def numbered(pr_number: int, cwd: Path) -> bytes:
-        numbered_calls.append(pr_number)
-        return b"diff --git a/inside.txt b/inside.txt\n+numbered-only\n"
-
-    monkeypatch.setattr(module, "numbered_pr_diff", numbered)
+    monkeypatch.setattr(module, "ensure_commit", lambda *arguments: None)
+    monkeypatch.setattr(module, "merge_base", lambda *arguments: history.base)
+    monkeypatch.setattr(module, "local_scope", lambda *arguments: records)
+    monkeypatch.setattr(
+        module,
+        "git_full_diff",
+        lambda *arguments: b"diff --git a/inside.txt b/inside.txt\n+immutable-full\n",
+    )
     original_git_diff = module.git_diff
 
     def limited_git_diff(*arguments: object) -> bytes:
@@ -665,7 +678,7 @@ def test_oversized_unicode_path_argv_uses_numbered_full_diff(
             "o/r",
             "--pr-number",
             "7",
-            *prepare_args(full, delta, manifest),
+            *prepare_args(full, delta, manifest, "--previous-sha", history.base),
         ]
     )
 
@@ -673,15 +686,39 @@ def test_oversized_unicode_path_argv_uses_numbered_full_diff(
 
     assert state.diff_ready is True
     assert state.diff_mode == "full"
-    assert "numbered PR diff" in state.warning
-    assert full.read_text(encoding="utf-8").endswith("+numbered-only\n")
-    assert numbered_calls == [7]
+    assert state.warning == "incremental diff unavailable; used full PR diff"
+    assert full.read_text(encoding="utf-8").endswith("+immutable-full\n")
+    assert not delta.exists()
 
 
-def test_cli_argv_overflow_uses_numbered_diff_without_running_git_diff(
+def test_non_utf8_local_git_path_fails_closed(
     history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
 ) -> None:
-    """The executable path must fail closed before a large local Git diff starts."""
+    """The UTF-8 JSON manifest must never lossy-decode a local Git pathname."""
+    raw_path = os.fsencode(history.repo) + b"/invalid-\xff.txt"
+    descriptor = os.open(raw_path, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        os.write(descriptor, b"NON_UTF8_PATH\n")
+    finally:
+        os.close(descriptor)
+    head = commit(history.repo, "non-UTF-8 path")
+    configure_gh(gh_fixture, base=history.base, head=head)
+    full, delta, manifest = outputs(tmp_path)
+
+    result = run_prepare(history.repo, gh_fixture, *prepare_args(full, delta, manifest))
+
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert state["diff_ready"] is False
+    assert state["diff_mode"] == "unavailable"
+    assert state["warning"] == "local Git scope contains a non-UTF-8 path"
+    assert all(not output.exists() for output in (full, delta, manifest))
+
+
+def test_cli_ignores_oversized_mutable_file_response(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """A hostile oversized server file response cannot select local Git argv."""
     component = "x" * 240
     filename = f"overflow/00000000/{component}/{component}/{component}/{component}"
     available = max(os.sysconf("SC_ARG_MAX") - 128 * 1024, 0)
@@ -716,13 +753,116 @@ def test_cli_argv_overflow_uses_numbered_diff_without_running_git_diff(
     state = json.loads(result.stdout)
     assert state["diff_ready"] is True
     assert state["diff_mode"] == "full"
-    assert "argument limit" in state["warning"]
-    assert full.read_bytes() == b"diff --git a/server-only.txt b/server-only.txt\n+server-only\n"
+    assert state["warning"] == ""
+    assert b"server-only" not in full.read_bytes()
+    assert b"OUT_OF_PR" in full.read_bytes()
     assert not delta.exists()
-    assert json.loads(manifest.read_text(encoding="utf-8"))["files"] == records
+    assert {record["filename"] for record in json.loads(manifest.read_text(encoding="utf-8"))["files"]} == {
+        "decoy.txt",
+        "inside.txt",
+    }
     gh_calls = [json.loads(line) for line in gh_fixture.log.read_text(encoding="utf-8").splitlines()]
-    assert ["pr", "diff", "7"] in gh_calls
+    assert not any(call[0] == "api" and call[1].endswith("/files") for call in gh_calls)
+    assert not any(call[:2] == ["pr", "diff"] for call in gh_calls)
     git_calls = [json.loads(line) for line in git_log.read_text(encoding="utf-8").splitlines()]
-    assert any(call[:2] == ["cat-file", "-e"] for call in git_calls)
-    assert any(call[:1] == ["merge-base"] for call in git_calls)
-    assert not any("diff" in call for call in git_calls)
+    assert any(call[:3] == ["--no-replace-objects", "cat-file", "-e"] for call in git_calls)
+    assert any(call[:2] == ["--no-replace-objects", "merge-base"] for call in git_calls)
+    assert any("diff" in call for call in git_calls)
+
+
+def test_h1_h2_h1_file_response_skew_cannot_change_prepared_h1_bytes(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """Mutable files from another head must not select bytes for the captured H1."""
+    configure_gh(
+        gh_fixture,
+        base=history.base,
+        head=history.head,
+        files=[{"status": "added", "filename": "side.txt"}],
+    )
+    full, delta, manifest = outputs(tmp_path)
+
+    result = run_prepare(history.repo, gh_fixture, *prepare_args(full, delta, manifest))
+
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert state["diff_ready"] is True
+    assert "after" in full.read_text(encoding="utf-8")
+    scope = json.loads(manifest.read_text(encoding="utf-8"))
+    assert {record["filename"] for record in scope["files"]} == {
+        "inside.txt",
+        "decoy.txt",
+    }
+    calls = [
+        json.loads(line)
+        for line in gh_fixture.log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert not any(call[0] == "api" and call[1].endswith("/files") for call in calls)
+    assert not any(call[:2] == ["pr", "diff"] for call in calls)
+
+
+def test_local_manifest_and_full_diff_include_file_beyond_server_3000_ceiling(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """A 3,000-record mutable server view must not silently omit file 3,001."""
+    filenames = [f"bulk/{index:04d}.txt" for index in range(3001)]
+    for index, filename in enumerate(filenames):
+        destination = history.repo / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(f"LOCAL_FILE_{index}\n", encoding="utf-8")
+    head = commit(history.repo, "3001 changed files")
+    configure_gh(
+        gh_fixture,
+        base=history.head,
+        head=head,
+        files=[{"status": "added", "filename": name} for name in filenames[:3000]],
+    )
+    full, delta, manifest = outputs(tmp_path)
+
+    result = run_prepare(history.repo, gh_fixture, *prepare_args(full, delta, manifest))
+
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert state["diff_ready"] is True
+    scope = json.loads(manifest.read_text(encoding="utf-8"))
+    assert len(scope["files"]) == 3001
+    assert scope["files"][-1]["filename"] == filenames[-1]
+    assert "LOCAL_FILE_3000" in full.read_text(encoding="utf-8")
+    calls = [
+        json.loads(line)
+        for line in gh_fixture.log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert not any(call[0] == "api" and call[1].endswith("/files") for call in calls)
+    assert not any(call[:2] == ["pr", "diff"] for call in calls)
+
+
+def test_delta_excludes_path_restored_out_of_immutable_final_scope(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """A delta-only removal restored to merge-base state is not final PR scope."""
+    (history.repo / "decoy.txt").unlink()
+    (history.repo / "target.txt").write_text("TARGET_CHANGE\n", encoding="utf-8")
+    head = commit(history.repo, "restore decoy and change target")
+    configure_gh(
+        gh_fixture,
+        base=history.base,
+        head=head,
+        files=[
+            {"status": "removed", "filename": "decoy.txt"},
+            {"status": "added", "filename": "target.txt"},
+        ],
+    )
+    full, delta, manifest = outputs(tmp_path)
+
+    result = run_prepare(
+        history.repo,
+        gh_fixture,
+        *prepare_args(full, delta, manifest, "--previous-sha", history.head),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["diff_mode"] == "delta"
+    scope = json.loads(manifest.read_text(encoding="utf-8"))
+    assert "decoy.txt" not in {record["filename"] for record in scope["files"]}
+    assert "TARGET_CHANGE" in delta.read_text(encoding="utf-8")
+    assert "decoy.txt" not in delta.read_text(encoding="utf-8")
