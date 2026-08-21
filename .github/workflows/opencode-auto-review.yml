@@ -1381,9 +1381,17 @@ jobs:
               return true;
             };
             const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Last attempt: failure \(https?:\/\/\S+\)$)/;
-            const clean = (body) => (body || '').split('\n').filter((line) =>
-              line !== `<!-- automation-candidate:${handoff.candidate_nonce} -->`
-              && !reserved.test(line)).join('\n').trim();
+            const clean = (body) => {
+              const lines = (body || '').split('\n').filter((line) =>
+                line !== `<!-- automation-candidate:${handoff.candidate_nonce} -->`
+                && !reserved.test(line));
+              // Models occasionally add a harmless one-line preamble before the
+              // required review sections. Drop only that preamble; parseReview
+              // remains the authority for the strict section grammar and anchors.
+              const firstSection = lines.findIndex((line) =>
+                /^### (New findings|Still open|Resolved|Retracted)$/.test(line));
+              return (firstSection >= 0 ? lines.slice(firstSection) : lines).join('\n').trim();
+            };
             const previousBody = existing ? clean(existing.comment.body) : '';
             const priorSuccess = existing && /^[0-9a-f]{40}$/.test(existing.state.successful_head || '')
               && /^[0-9a-f]{64}$/.test(existing.state.full_diff_sha256 || '') && Boolean(previousBody);

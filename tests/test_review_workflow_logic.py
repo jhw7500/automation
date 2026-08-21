@@ -2845,6 +2845,15 @@ def test_opencode_prompt_requires_verified_evidence():
     assert "Retracted" in prompt
 
 
+def test_opencode_canonicalizer_discards_only_model_preamble_before_sections():
+    workflow = _load("opencode-auto-review.yml")
+    script = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")["with"]["script"]
+    assert "Models occasionally add a harmless one-line preamble" in script
+    assert "firstSection = lines.findIndex" in script
+    assert "lines.slice(firstSection)" in script
+    assert "parseReview" in script
+
+
 def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
     workflow = _load("opencode-auto-review.yml")
     job = workflow["jobs"]["opencode-prepare"]
