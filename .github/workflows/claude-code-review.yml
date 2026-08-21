@@ -127,6 +127,8 @@ jobs:
           HEADER: '## Claude Code Review (latest)'
           MARKER: '<!-- automation:claude-code-review:v2 -->'
           REVIEWER: 'claude'
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
           MAX_SECTION_CHARS: '6000'
         run: |
           set -euo pipefail
@@ -150,7 +152,9 @@ jobs:
             --arg header "$HEADER" \
             --arg marker "$MARKER" \
             --arg reviewer "$REVIEWER" \
-            --arg pr "$PR_NUM" '
+            --arg pr "$PR_NUM" \
+            --arg server "$SERVER_URL" \
+            --arg repo "$REPOSITORY" '
               def sha1:
                 if type == "string" then test("^[0-9a-f]{40}$") else false end;
               def sha256:
@@ -165,26 +169,32 @@ jobs:
                 if .successful_head == null then .full_diff_sha256 == null
                 else (.successful_head | sha1) and (.full_diff_sha256 | sha256)
                 end;
-              def parsed_state($header; $marker; $reviewer; $pr):
+              def state_semantics:
+                if .attempt_status == "success" then
+                  .successful_head != null and .successful_head == .attempt_head and successful_pair
+                elif .attempt_status == "failure" then successful_pair
+                else false end;
+              def parsed_state($header; $marker; $reviewer; $pr; $server; $repo):
                 (.body // "") as $body
                 | ($body | split("\n")) as $lines
                 | select(.user.type == "Bot")
                 | select($lines[0] == $header and $lines[1] == $marker)
                 | (($lines[2]? // "") | (capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$")? | .json? | fromjson?)) as $s
                 | select(($s | type) == "object")
-                | select($s | has("schema") and has("reviewer") and has("pr") and has("run_id") and has("run_attempt") and has("attempt_head") and has("successful_head") and has("attempt_status") and has("diff_mode") and has("full_diff_sha256"))
+                | select(($s | keys | sort) == ["attempt_head", "attempt_status", "diff_mode", "full_diff_sha256", "pr", "reviewer", "run_attempt", "run_id", "schema", "successful_head"])
                 | select(($s.schema | type) == "number" and $s.schema == 2)
                 | select(($s.reviewer | type) == "string" and $s.reviewer == $reviewer)
                 | select(($s.pr | type) == "number" and $s.pr == ($pr | tonumber))
                 | select($s.run_id | positive_integer)
                 | select($s.run_attempt | positive_integer)
                 | select($s.attempt_head | sha1)
-                | select($s | successful_pair)
                 | select($s.attempt_status | attempt_status)
+                | select($s | state_semantics)
                 | select($s.diff_mode | diff_mode)
+                | select($lines | any(. == ("- Run: " + $server + "/" + $repo + "/actions/runs/" + ($s.run_id | tostring))))
                 | {comment: ., state: $s};
 
-              [.[] | parsed_state($header; $marker; $reviewer; $pr)]
+              [.[] | parsed_state($header; $marker; $reviewer; $pr; $server; $repo)]
               | sort_by(.state.run_id, .state.run_attempt)
               | last // null
             ' "$COMMENTS")"
@@ -211,7 +221,7 @@ jobs:
             | strip_reserved || true)"
           # A syntactically valid state without any remaining review prose cannot provide
           # either re-review context or an incremental base. Treat it as no prior state.
-          if [ -z "$PREV_REVIEW_CLEAN" ]; then
+          if [ -z "$PREV_SHA" ] || [ -z "$PREV_REVIEW_CLEAN" ]; then
             PREV_REVIEW=""
             PREV_STATE="{}"
             PREV_SHA=""
@@ -418,6 +428,8 @@ jobs:
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
           REVIEW_OUTCOME: ${{ steps.claude-review.outcome }}
           DIFF_READY: ${{ steps.prepare-review-input.outputs.diff_ready }}
           RUN_ID: ${{ github.run_id }}
@@ -434,6 +446,8 @@ jobs:
             const marker = '<!-- automation:claude-code-review:v2 -->';
             const issueNumber = Number(process.env.PR_NUMBER);
             const runUrl = process.env.RUN_URL;
+            const serverUrl = process.env.SERVER_URL || '';
+            const repository = process.env.REPOSITORY || '';
             const ok = (process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success';
             const diffReady = process.env.DIFF_READY === 'true';
             const runIdRaw = process.env.RUN_ID || '';
@@ -476,15 +490,20 @@ jobs:
             });
             const sha1 = (value) => /^[0-9a-f]{40}$/.test(value || '');
             const sha256 = (value) => /^[0-9a-f]{64}$/.test(value || '');
-            const validState = (state) => state && state.schema === 2
+            const expectedStateKeys = ['attempt_head', 'attempt_status', 'diff_mode', 'full_diff_sha256', 'pr', 'reviewer', 'run_attempt', 'run_id', 'schema', 'successful_head'];
+            const validState = (state) => state && typeof state === 'object' && !Array.isArray(state)
+              && JSON.stringify(Object.keys(state).sort()) === JSON.stringify(expectedStateKeys)
+              && state.schema === 2
               && state.reviewer === 'claude' && state.pr === issueNumber
               && Number.isSafeInteger(state.run_id) && state.run_id > 0
               && Number.isSafeInteger(state.run_attempt) && state.run_attempt > 0
               && sha1(state.attempt_head)
-              && (state.successful_head === null
+              && (state.attempt_status === 'success'
+                ? state.successful_head === state.attempt_head && state.successful_head !== null
+                  && sha1(state.successful_head) && sha256(state.full_diff_sha256)
+                : state.attempt_status === 'failure' && (state.successful_head === null
                 ? state.full_diff_sha256 === null
-                : sha1(state.successful_head) && sha256(state.full_diff_sha256))
-              && ['success', 'failure'].includes(state.attempt_status)
+                : sha1(state.successful_head) && sha256(state.full_diff_sha256)))
               && ['full', 'delta', 'unchanged', 'unavailable'].includes(state.diff_mode);
             const parseRecord = (comment) => {
               if (comment.user?.type !== 'Bot') return null;
@@ -494,7 +513,9 @@ jobs:
               if (!match) return null;
               try {
                 const state = JSON.parse(match[1]);
-                return validState(state) ? { comment, state } : null;
+                return validState(state)
+                  && lines.includes(`- Run: ${serverUrl}/${repository}/actions/runs/${state.run_id}`)
+                  ? { comment, state } : null;
               } catch (e) {
                 return null;
               }
@@ -503,7 +524,7 @@ jobs:
               a.state.run_id - b.state.run_id || a.state.run_attempt - b.state.run_attempt
             );
             const existing = records[records.length - 1];
-            if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead)) {
+            if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead) || !serverUrl || !repository) {
               core.notice('Claude review trusted attempt identity is invalid; left the existing sticky state unchanged.');
               return;
             }

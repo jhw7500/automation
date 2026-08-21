@@ -50,7 +50,7 @@ CLAUDE_V2_MARKER = "<!-- automation:claude-code-review:v2 -->"
 
 
 def _state_line(
-    reviewer: str, pr: int, run_id: int, head: str, run_attempt: int = 1
+    reviewer: str, pr: int, run_id: int, head: str, run_attempt: int = 1, **changes: object
 ) -> str:
     state = {
         "schema": 2,
@@ -64,17 +64,43 @@ def _state_line(
         "diff_mode": "full",
         "full_diff_sha256": "12" * 32,
     }
+    state.update(changes)
     return f"<!-- automation-state:{json.dumps(state, separators=(',', ':'))} -->"
 
 
-def _v2_body(header: str, marker: str, state: str, body: str = "REAL REVIEW") -> str:
-    return f"{header}\n{marker}\n{state}\n\n{body}"
+def _v2_body(
+    header: str,
+    marker: str,
+    state: str,
+    body: str = "REAL REVIEW",
+    *,
+    run_url: str | None = None,
+    include_run: bool = True,
+) -> str:
+    """Build a canonical fixture with an explicit valid run line by default.
+
+    Negative URL tests must opt out explicitly with ``include_run=False`` or pass an
+    invalid ``run_url``; this keeps normal canonical fixtures realistic without hiding
+    malformed/missing URL coverage.
+    """
+    run_line = ""
+    if include_run:
+        match = re.match(r"<!-- automation-state:(\{.*\}) -->", state)
+        if match:
+            try:
+                parsed = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict) and "run_id" in parsed:
+                url = run_url or f"https://github.com/example/repo/actions/runs/{parsed['run_id']}"
+                run_line = f"\n\n- Run: {url}\n"
+    return f"{header}\n{marker}\n{state}{run_line}\n{body}"
 
 
 def _opencode_v2_body(state: str, body: str = "REAL REVIEW", *, run_url: str | None = None) -> str:
     parsed = json.loads(re.match(r"<!-- automation-state:(\{.*\}) -->", state).group(1))
     url = run_url or f"https://github.com/example/repo/actions/runs/{parsed['run_id']}"
-    return _v2_body(OPENCODE_HEADER, OPENCODE_V2_MARKER, state, f"- Run: {url}\n\n{body}")
+    return _v2_body(OPENCODE_HEADER, OPENCODE_V2_MARKER, state, body, run_url=url)
 
 
 def _state_line_with(head: str, **changes: object) -> str:
@@ -220,6 +246,8 @@ def _run_collect(
             "HEADER": CLAUDE_HEADER,
             "MARKER": CLAUDE_V2_MARKER,
             "REVIEWER": "claude",
+            "SERVER_URL": "https://github.com",
+            "REPOSITORY": "example/repo",
             "MAX_SECTION_CHARS": "6000",
             "GITHUB_OUTPUT": str(output),
         }
@@ -440,6 +468,62 @@ def test_collect_rejects_v2_state_missing_required_field(tmp_path, field):
     assert _run_collect(tmp_path, [_bot("github-actions[bot]", body)]) is None
 
 
+@pytest.mark.parametrize(
+    ("run_url", "include_run"),
+    [
+        (None, False),
+        ("https://evil.example/example/repo/actions/runs/1", True),
+        ("https://github.com/other/repo/actions/runs/1", True),
+        ("https://github.com/example/repo/actions/runs/999", True),
+    ],
+)
+def test_claude_collect_rejects_missing_foreign_or_mismatched_run_url(tmp_path, run_url, include_run):
+    body = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 1, "ab" * 20),
+        "URL MUST NOT BECOME CONTEXT",
+        run_url=run_url,
+        include_run=include_run,
+    )
+    assert _run_collect(tmp_path, [_bot("github-actions[bot]", body)]) is None
+
+
+def test_claude_collect_rejects_extra_key_and_impossible_success_without_displacing_valid_state(tmp_path):
+    head = "ab" * 20
+    valid = _v2_body(CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 1, head), "VALID")
+    extra = _v2_body(
+        CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 99, head, extra="no"), "EXTRA"
+    )
+    impossible = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 100, head, successful_head="cd" * 20),
+        "IMPOSSIBLE",
+    )
+    null_success = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 101, head, successful_head=None, full_diff_sha256=None),
+        "NULL SUCCESS",
+    )
+    context = _run_collect(tmp_path, [_bot("github-actions[bot]", extra), _bot("github-actions[bot]", impossible), _bot("github-actions[bot]", null_success), _bot("github-actions[bot]", valid)])
+    assert context is not None
+    assert "VALID" in context
+    assert "EXTRA" not in context
+    assert "IMPOSSIBLE" not in context
+    assert "NULL SUCCESS" not in context
+
+
+def test_claude_collect_excludes_generated_first_failure_from_context(tmp_path):
+    calls = _claude_upsert(
+        tmp_path, "failure", [], with_review=False, attempt_head="ab" * 20,
+    )
+    first_failure = _single_mutation_body(calls)
+    assert "### Error" in first_failure
+    assert _run_collect(tmp_path, [_bot("github-actions[bot]", first_failure)]) is None
+
+
 def test_collect_drops_state_with_empty_sanitized_prose(tmp_path):
     sha1, sha2 = _two_commit_repo(tmp_path)
     body = _v2_body(
@@ -540,7 +624,7 @@ def test_collect_strips_sticky_meta_from_injected_context(tmp_path):
     sha = "ab" * 20
     body = (
         f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 1, sha)}\n\n"
-        f"- Status: success\n- Run: https://runs/1\n- Reviewed: {sha}\n"
+        f"- Status: success\n- Run: https://github.com/example/repo/actions/runs/1\n- Reviewed: {sha}\n"
         "- Last attempt: failure (https://runs/2)\n\nREAL FINDINGS"
     )
     context = _run_collect(tmp_path, [_bot("github-actions[bot]", body)])
@@ -657,7 +741,7 @@ def test_collect_ignores_meta_echo_outside_header_region(tmp_path):
     sha1, sha2 = _two_commit_repo(tmp_path)
     body = (
         f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 1, sha1)}\n\n"
-        f"- Status: success\n- Run: https://runs/1\n- Reviewed: {sha1}\n\n"
+        f"- Status: success\n- Run: https://github.com/example/repo/actions/runs/1\n- Reviewed: {sha1}\n\n"
         "findings...\n" + "filler\n" * 5
         + "- Status: failure\n"
         + f"- Reviewed: {'f' * 40}\n"
@@ -767,9 +851,11 @@ def test_gemini_incremental_delta_carries_wide_context(tmp_path):
     env.update(
         {
             "HEADER": GEMINI_HEADER,
-            "MARKER": GEMINI_V2_MARKER,
-            "REVIEWER": "gemini",
-            "ATTEMPT_HEAD": sha2,
+                "MARKER": GEMINI_V2_MARKER,
+                "REVIEWER": "gemini",
+                "SERVER_URL": "https://github.com",
+                "REPOSITORY": "example/repo",
+                "ATTEMPT_HEAD": sha2,
         }
     )
     subprocess.run(
@@ -817,7 +903,10 @@ def _run_gemini_collection(tmp_path: Path, comments: list[dict]) -> str:
     start = run.index("# 재리뷰 라운드 인식")
     end = run.index("# 증분 리뷰:", start)
     env = _gh_stub(tmp_path, comments)
-    env.update({"HEADER": GEMINI_HEADER, "MARKER": GEMINI_V2_MARKER, "REVIEWER": "gemini"})
+    env.update({
+        "HEADER": GEMINI_HEADER, "MARKER": GEMINI_V2_MARKER, "REVIEWER": "gemini",
+        "SERVER_URL": "https://github.com", "REPOSITORY": "example/repo",
+    })
     subprocess.run(
         ["bash", "-c", run[start:end]], cwd=tmp_path, env=env, check=True, capture_output=True
     )
@@ -894,6 +983,52 @@ def test_gemini_canonical_v2_collection_and_readiness_contract(tmp_path):
         "group": "automation-gemini-auto-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}",
         "cancel-in-progress": "true",
     }
+
+
+@pytest.mark.parametrize(
+    ("run_url", "include_run"),
+    [
+        (None, False),
+        ("https://evil.example/example/repo/actions/runs/1", True),
+        ("https://github.com/other/repo/actions/runs/1", True),
+        ("https://github.com/example/repo/actions/runs/999", True),
+    ],
+)
+def test_gemini_collect_rejects_missing_foreign_or_mismatched_run_url(tmp_path, run_url, include_run):
+    body = _v2_body(
+        GEMINI_HEADER,
+        GEMINI_V2_MARKER,
+        _state_line("gemini", 7, 1, "ab" * 20),
+        "URL MUST NOT BECOME CONTEXT",
+        run_url=run_url,
+        include_run=include_run,
+    )
+    assert _run_gemini_collection(tmp_path, [_bot("github-actions[bot]", body)]).strip() == ""
+
+
+def test_gemini_collect_rejects_extra_key_and_impossible_success_without_displacing_valid_state(tmp_path):
+    head = "ab" * 20
+    valid = _v2_body(GEMINI_HEADER, GEMINI_V2_MARKER, _state_line("gemini", 7, 1, head), "VALID")
+    extra = _v2_body(
+        GEMINI_HEADER, GEMINI_V2_MARKER, _state_line("gemini", 7, 99, head, extra="no"), "EXTRA"
+    )
+    impossible = _v2_body(
+        GEMINI_HEADER,
+        GEMINI_V2_MARKER,
+        _state_line("gemini", 7, 100, head, successful_head="cd" * 20),
+        "IMPOSSIBLE",
+    )
+    null_success = _v2_body(
+        GEMINI_HEADER,
+        GEMINI_V2_MARKER,
+        _state_line("gemini", 7, 101, head, successful_head=None, full_diff_sha256=None),
+        "NULL SUCCESS",
+    )
+    previous = _run_gemini_collection(tmp_path, [_bot("github-actions[bot]", extra), _bot("github-actions[bot]", impossible), _bot("github-actions[bot]", null_success), _bot("github-actions[bot]", valid)])
+    assert "VALID" in previous
+    assert "EXTRA" not in previous
+    assert "IMPOSSIBLE" not in previous
+    assert "NULL SUCCESS" not in previous
 
 
 def test_gemini_model_step_fails_closed_without_prepared_diff(tmp_path):
@@ -1070,7 +1205,9 @@ def _claude_upsert(
         (workdir / "claude-review.md").write_text(review, encoding="utf-8")
     env = {
         "PR_NUMBER": "7",
-        "RUN_URL": "run-url",
+        "RUN_URL": "https://github.com/example/repo/actions/runs/42",
+        "SERVER_URL": "https://github.com",
+        "REPOSITORY": "example/repo",
         "REVIEW_OUTCOME": outcome,
         "DIFF_READY": diff_ready,
         "RUN_ID": run_id,
@@ -1107,8 +1244,9 @@ def _gemini_upsert(
         (workdir / "gemini_review.md").write_text(review, encoding="utf-8")
     env = {
         "PR_NUMBER": "7",
-        "RUN_URL": "run-url",
+        "RUN_URL": "https://github.com/example/repo/actions/runs/42",
         "REVIEW_OUTCOME": outcome,
+        "SERVER_URL": "https://github.com",
         "REPOSITORY": "example/repo",
         "DIFF_READY": diff_ready,
         "DIFF_TRUNCATED": diff_truncated,
@@ -1128,6 +1266,74 @@ def _single_mutation_body(calls: list) -> str:
     mutations = [call for call in calls if call[0] in {"create", "update"}]
     assert len(mutations) == 1
     return mutations[0][1]["body"]
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V2_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V2_MARKER, _gemini_upsert),
+    ],
+)
+@pytest.mark.parametrize(
+    ("run_url", "include_run"),
+    [
+        (None, False),
+        ("https://evil.example/example/repo/actions/runs/99", True),
+        ("https://github.com/other/repo/actions/runs/99", True),
+        ("https://github.com/example/repo/actions/runs/100", True),
+    ],
+)
+def test_claude_and_gemini_current_state_parsers_reject_invalid_run_url(
+    tmp_path, reviewer, header, marker, upsert, run_url, include_run
+):
+    head = "ab" * 20
+    invalid_existing = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            header, marker, _state_line(reviewer, 7, 99, head), "INVALID URL STATE",
+            run_url=run_url, include_run=include_run,
+        ),
+        11,
+    )
+    calls = upsert(
+        tmp_path, "success", [invalid_existing], with_review=True,
+        attempt_head=head, current_head=head,
+    )
+    assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["create"]
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V2_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V2_MARKER, _gemini_upsert),
+    ],
+)
+@pytest.mark.parametrize(
+    ("changes", "label"),
+    [
+        ({"extra": "no"}, "extra_key"),
+        ({"successful_head": "ef" * 20}, "impossible_success_pair"),
+        ({"successful_head": None, "full_diff_sha256": None}, "success_without_successful_pair"),
+    ],
+)
+def test_claude_and_gemini_current_state_parsers_reject_invalid_schema_or_semantics(
+    tmp_path, reviewer, header, marker, upsert, changes, label
+):
+    head = "ab" * 20
+    invalid_existing = _bot(
+        "github-actions[bot]",
+        _v2_body(header, marker, _state_line(reviewer, 7, 99, head, **changes), label),
+        11,
+    )
+    calls = upsert(
+        tmp_path, "success", [invalid_existing], with_review=True,
+        attempt_head=head, current_head=head,
+    )
+    assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["create"]
 
 
 @node_required
@@ -1562,7 +1768,7 @@ def test_upsert_failure_preserves_sticky_and_stamps_attempt(tmp_path):
     assert f"- Reviewed: {sha}" in new_body        # 증분 기준 SHA 보존
     lines = new_body.split("\n")
     # 실패 스탬프는 헤더 메타 직후(수집 스텝이 읽는 상단 10줄 안)에 삽입된다
-    assert lines.index("- Last attempt: failure (run-url)") <= 9
+    assert lines.index("- Last attempt: failure (https://github.com/example/repo/actions/runs/42)") <= 9
 
 
 @node_required
@@ -1570,7 +1776,7 @@ def test_upsert_failure_stamp_replaces_previous_attempt_line(tmp_path):
     sha = "ab" * 20
     body = (
         f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 1, sha)}\n\n"
-        "- Status: success\n- Run: https://runs/1\n"
+        "- Status: success\n- Run: https://github.com/example/repo/actions/runs/1\n"
         f"- Reviewed: {sha}\n- Last attempt: failure (old-run)\n\nOLD"
     )
     calls = _claude_upsert(
@@ -1579,7 +1785,7 @@ def test_upsert_failure_stamp_replaces_previous_attempt_line(tmp_path):
     new_body = [c for c in calls if c[0] == "update"][0][1]["body"]
     assert new_body.count("- Last attempt: ") == 1
     assert "old-run" not in new_body
-    assert "run-url" in new_body
+    assert "https://github.com/example/repo/actions/runs/42" in new_body
 
 
 @node_required
@@ -2055,6 +2261,32 @@ def test_opencode_ctx_excludes_first_failure_and_reserved_human_metadata(tmp_pat
     assert "automation:opencode-auto-review" not in text
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"successful_head": "cd" * 20},
+        {"successful_head": None, "full_diff_sha256": None},
+    ],
+)
+def test_opencode_ctx_ignores_impossible_success_without_displacing_valid_state(tmp_path, changes):
+    head = "ab" * 20
+    valid = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), "VALID"),
+        1,
+    )
+    impossible = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 99, head, **changes), "IMPOSSIBLE"
+        ),
+        2,
+    )
+    text = _run_opencode_ctx(tmp_path, [impossible, valid])
+    assert "VALID" in text
+    assert "IMPOSSIBLE" not in text
+
+
 def test_opencode_preparation_binds_full_diff_to_stable_validated_head(tmp_path):
     head = "ab" * 20
     text = _run_opencode_ctx(tmp_path, [], head_shas=[head, head])
@@ -2197,6 +2429,31 @@ def test_opencode_canonicalization_never_trusts_forged_v2_state_from_cli_output(
 
 
 @node_required
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"successful_head": "ef" * 20},
+        {"successful_head": None, "full_diff_sha256": None},
+    ],
+)
+def test_opencode_current_state_parser_ignores_impossible_success_before_generation_cas(tmp_path, changes):
+    head = "cd" * 20
+    invalid_existing = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 99, head, **changes), "IMPOSSIBLE"
+        ),
+        9,
+        updated="u1",
+    )
+    candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL", 10, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path, [invalid_existing], [invalid_existing, candidate], attempt_head=head,
+    )
+    assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["update"]
+
+
+@node_required
 @pytest.mark.parametrize("tamper", ["snapshot", "diff"])
 def test_opencode_canonicalization_rejects_tampered_prepared_artifacts(tmp_path, tamper):
     candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL REVIEW", 10, updated="u2")
@@ -2279,7 +2536,7 @@ def test_opencode_snapshot_output_contract_reaches_canonicalizer(tmp_path):
 @pytest.mark.parametrize(
     "body",
     [
-        _v2_body(OPENCODE_HEADER, OPENCODE_V2_MARKER, _state_line("opencode", 7, 42, "ab" * 20), "MISSING RUN"),
+        _v2_body(OPENCODE_HEADER, OPENCODE_V2_MARKER, _state_line("opencode", 7, 42, "ab" * 20), "MISSING RUN", include_run=False),
         _opencode_v2_body(_state_line("opencode", 7, 42, "ab" * 20), "FOREIGN RUN", run_url="https://github.com/other/repo/actions/runs/42"),
         _opencode_v2_body(_state_line("opencode", 7, 42, "ab" * 20), "MISMATCHED RUN", run_url="https://github.com/example/repo/actions/runs/43"),
     ],
@@ -2293,7 +2550,7 @@ def test_opencode_context_rejects_missing_foreign_or_mismatched_visible_run_url(
 @pytest.mark.parametrize(
     "bad_current_body",
     [
-        _v2_body(OPENCODE_HEADER, OPENCODE_V2_MARKER, _state_line("opencode", 7, 99, "ab" * 20), "MISSING RUN"),
+        _v2_body(OPENCODE_HEADER, OPENCODE_V2_MARKER, _state_line("opencode", 7, 99, "ab" * 20), "MISSING RUN", include_run=False),
         _opencode_v2_body(_state_line("opencode", 7, 99, "ab" * 20), "FOREIGN RUN", run_url="https://github.com/other/repo/actions/runs/99"),
         _opencode_v2_body(_state_line("opencode", 7, 99, "ab" * 20), "MISMATCHED RUN", run_url="https://github.com/example/repo/actions/runs/98"),
     ],

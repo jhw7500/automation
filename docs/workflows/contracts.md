@@ -143,6 +143,9 @@ atomic in meaning: `successful_head` is a 40-hex reviewed head only when
 `full_diff_sha256` is its 64-hex full-input hash; otherwise both are `null`. The status is
 `success` or `failure`, and `diff_mode` is `full`, `delta`, `unchanged`, or `unavailable`
 (Slice 1 only advances a successful checkpoint from covered `full` or `delta` input).
+A `success` state requires the non-null successful pair and
+`successful_head == attempt_head`; a `failure` may carry either a null pair or a valid retained
+pair from an earlier success.
 
 The v2 contract requires the visible `- Run:` line to be the exact URL-only value
 `${{ github.server_url }}/${{ github.repository }}/actions/runs/<state.run_id>`; malformed,

@@ -345,16 +345,19 @@ inline preparation with the shared action.
 
 - [ ] **Step 4: Add post-run canonicalization**
 
-After `opencode github run`, refetch comments and select bot comments containing the
-OpenCode marker whose ID is new or whose `updated_at` differs from the snapshot. Require
-exactly one candidate. Strip any model-generated reserved lines, prepend the canonical
-header/marker/state, and update that candidate through the issue-comments API.
+After `opencode github run`, refetch comments and select the one bot comment containing the
+OpenCode marker whose ID is absent from the snapshot. Pinned OpenCode 1.18.17 creates a fresh
+working comment per run, so an updated pre-run ID is deliberately ineligible. Require exactly
+one candidate. Strip any model-generated reserved lines, prepend the canonical header/marker/
+state, and update that candidate through the issue-comments API. If a future pinned CLI reuses
+an ID, this fails closed until its lifecycle is explicitly revalidated and this contract is
+revised.
 
 ```javascript
 const candidates = after.filter((comment) => {
-  const beforeComment = beforeById.get(comment.id);
-  const changed = !beforeComment || beforeComment.updated_at !== comment.updated_at;
-  return changed && comment.user?.type === 'Bot' && (comment.body || '').includes(legacyMarker);
+  return !beforeById.has(comment.id)
+    && comment.user?.type === 'Bot'
+    && (comment.body || '').includes(legacyMarker);
 });
 if (candidates.length !== 1) throw new Error(`expected one OpenCode output, got ${candidates.length}`);
 ```

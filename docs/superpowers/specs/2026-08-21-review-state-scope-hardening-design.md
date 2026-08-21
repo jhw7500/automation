@@ -242,10 +242,13 @@ full review rather than claiming no change.
 - Require every new finding to provide a changed anchor, formatted as `path:line`, and allow
   unchanged lines only as supporting evidence with an explicit causal explanation.
 - Require disproven prior findings to be reported as `Retracted`, not `Resolved`.
-- Snapshot comments before the CLI call. After the call, identify exactly one new or updated
-  marker-bearing bot comment from the current attempt, strip reserved lines, and wrap it in
-  the machine-generated v2 envelope. Zero or multiple candidates fail closed and produce no
-  trusted state.
+- Snapshot comments before the CLI call. Pinned OpenCode 1.18.17 creates a fresh working
+  comment per run, so after the call identify exactly one marker-bearing bot comment whose ID
+  is absent from that snapshot. Strip reserved lines and wrap it in the machine-generated v2
+  envelope. Zero, multiple, reused, or unverified candidates fail closed and produce no
+  trusted state. If a future pinned CLI changes to update an existing comment, this deliberate
+  compatibility cost is a fail-closed review until the lifecycle contract is revalidated and
+  revised.
 - Previous context is drawn only from that canonical envelope; arbitrary marker-containing
   comments are ignored.
 

@@ -151,6 +151,11 @@ jobs:
               def successful_pair:
                 if .successful_head == null then .full_diff_sha256 == null
                 else (.successful_head | sha1) and (.full_diff_sha256 | sha256) end;
+              def state_semantics:
+                if .attempt_status == "success" then
+                  .successful_head != null and .successful_head == .attempt_head and successful_pair
+                elif .attempt_status == "failure" then successful_pair
+                else false end;
               def parsed_state:
                 (.body // "") as $body
                 | ($body | split("\n")) as $lines
@@ -165,8 +170,8 @@ jobs:
                 | select($s.run_id | positive_integer)
                 | select($s.run_attempt | positive_integer)
                 | select($s.attempt_head | sha1)
-                | select($s | successful_pair)
                 | select(($s.attempt_status | type) == "string" and ($s.attempt_status == "success" or $s.attempt_status == "failure"))
+                | select($s | state_semantics)
                 | select(($s.diff_mode | type) == "string" and ($s.diff_mode == "full" or $s.diff_mode == "delta" or $s.diff_mode == "unchanged" or $s.diff_mode == "unavailable"))
                 | select($lines | any(. == ("- Run: " + $server + "/" + $repo + "/actions/runs/" + ($s.run_id | tostring))))
                 | {comment: ., state: $s};
@@ -417,10 +422,13 @@ jobs:
               const validInteger = (value) => Number.isSafeInteger(value) && value > 0;
               const validPair = (state.successful_head === null && state.full_diff_sha256 === null)
                 || (/^[0-9a-f]{40}$/.test(state.successful_head || '') && /^[0-9a-f]{64}$/.test(state.full_diff_sha256 || ''));
+              const validSemantics = state.attempt_status === 'success'
+                ? state.successful_head !== null && state.successful_head === state.attempt_head && validPair
+                : state.attempt_status === 'failure' && validPair;
               if (state.schema !== 2 || state.reviewer !== reviewer || state.pr !== issueNumber
                 || !validInteger(state.run_id) || !validInteger(state.run_attempt)
                 || !/^[0-9a-f]{40}$/.test(state.attempt_head || '') || !validPair
-                || !['success', 'failure'].includes(state.attempt_status)
+                || !validSemantics
                 || !['full', 'delta', 'unchanged', 'unavailable'].includes(state.diff_mode)
                 || !lines.includes(`- Run: ${serverUrl}/${repository}/actions/runs/${state.run_id}`)) return null;
               return { comment, state };
