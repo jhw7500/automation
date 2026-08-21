@@ -103,10 +103,13 @@ An optional caller exists only when selected by that repository's declarative pr
 unexpected optional callers are removed by the managed PR.
 
 OpenCode callers accept only same-repository pull request content and fail closed for
-fork/external heads. Their jobs grant exactly `contents: read`, `pull-requests: write`, and
-`issues: write`, force the job-scoped GitHub token, and do not grant OIDC. Central
-workflows own the pinned OpenCode CLI archive and action versions; consumers do not add an
-installer.
+fork/external heads. Their caller ceiling is exactly `actions: read`, `checks: write`,
+`contents: read`, `pull-requests: write`, and `issues: write`; they force the job-scoped
+GitHub token and do not grant OIDC. The reusable workflow narrows each job below that ceiling:
+the prepare job has read-only API access, the model job has only the comment-write authority
+required by the pinned CLI, and only the clean canonicalizer can write the durable Check receipt.
+Central workflows own the pinned OpenCode CLI archive and action versions; consumers do not add
+an installer.
 
 Claude and Gemini callers retain only the catalogued permissions. Repository-specific
 trigger or permission changes require an explicit catalog/design change rather than an
@@ -126,6 +129,95 @@ Manual mention/comment and manual-dispatch behavior remains available when the a
 caller is enabled. The disabled bootstrap template uses `workflows.<name>.enabled: false`
 for every common caller; enabling any of them is a later repository-owned PR.
 
+## Deterministic automated-review input
+
+Claude, Gemini, and OpenCode call the same composite action:
+
+```yaml
+uses: $/.github/actions/prepare-review-diff
+```
+
+In a called reusable workflow, `$/` resolves the local action from the repository and commit
+that contain the called workflow, not from the consumer checkout. The workflow and helper
+therefore travel together at the immutable automation commit selected by the caller. Release
+verification requires both regular `100644` action files for `v1.45+` and rejects a workflow
+dependency without that inventory; the historical `v1.44` inventory remains unchanged.
+
+The action captures validated PR base/head metadata, prepares `review-full.diff`, optionally
+prepares `review-delta.diff`, and writes `review-scope.json`. Its composite outputs are
+`diff-ready`, `diff-mode`, `head-sha`, `full-diff-sha256`, and
+`unchanged-since-previous`. The hash is SHA-256 over the exact `review-full.diff` bytes. A ready
+manifest has schema `1`, repository, PR number, merge-base SHA, head SHA, and file records with
+`status`, `filename`, and optional `previous_filename`.
+
+The underlying CLI prints one JSON object with `diff_ready`, `diff_mode`, `head_sha`, `base_sha`,
+`full_diff_sha256`, `unchanged_since_previous`, and `warning`. The composite output bridge exposes
+the five workflow-facing scalars above without changing stdout. `warning` records a safe fallback,
+such as local-diff failure followed by a numbered full diff; it does not by itself make a ready
+result unavailable. `unchanged_since_previous` is true only in `unchanged` mode.
+
+| Mode | Artifacts and selection | Reviewer/checkpoint behavior |
+| --- | --- | --- |
+| `full` | `diff-ready=true`; full diff and manifest exist; delta is absent. This covers a first review, an unusable/non-ancestor previous SHA, an empty delta whose full hash changed, or the explicit numbered-PR fallback. | Claude and Gemini read the full diff. OpenCode always reads the sealed full diff. A model result can advance only after the ordinary output, head, and generation gates. |
+| `delta` | `diff-ready=true`; full diff, non-empty ancestor-to-head delta, and manifest all exist. The previous successful SHA is an available ancestor and the PR file list was retrieved. | Claude and Gemini read the delta as their exclusive changed set. OpenCode still reads the full diff. The stored hash is always the full-diff hash. |
+| `unchanged` | `diff-ready=true`; full diff and manifest exist, delta is absent, and the full-diff hash equals the validated previous full hash. | No model runs. The prior non-empty body is preserved, and the successful head/hash may advance only when authenticated prior success, exact hash equality, current-head, and run-generation checks all pass. |
+| `unavailable` | `diff-ready=false`; the mode is `unavailable`, the full hash is empty, and staged full/delta/manifest outputs are removed. | No model runs and no `Reviewed` checkpoint advances. A latest-head failure/stale record may be written only through the normal head/generation gate; a head that changed during preparation causes the later head gate to reject comment mutation. |
+
+Expected external or mutable-input failures return a controlled `unavailable` result so workflows
+can record fail-closed state; an invalid CLI invocation or internal corruption is nonzero. A
+successful full/delta model attempt additionally requires sanitized, non-empty output (and Gemini
+must not have truncated the prepared diff). Failure preserves a valid earlier successful
+body/head/hash but does not claim coverage of the attempted head.
+
+### Full and incremental preparation
+
+The helper reads PR base/head metadata before and after the mutable preparation inputs. It fetches
+and verifies the required commit objects, computes the merge base, and locally diffs
+`merge-base..head` only across the REST Pulls Files path set. A different or malformed final
+base/head snapshot removes all outputs and returns `unavailable`.
+
+If the PR file list or local PR-scoped diff is unavailable—including an unsafe argument-vector
+size—the only fallback is `gh pr diff <explicit-pr-number>`. Metadata is checked again after that
+fallback. If the numbered diff also fails, preparation is unavailable. A file-list failure cannot
+fall back to an unrestricted `previous..head`; an unavailable/non-ancestor previous SHA or any
+incremental failure uses the already prepared full PR diff instead. The helper never batches path
+fragments in a way that could split rename identity.
+
+Pulls Files JSON is decoded directly into Python strings. Each filename remains one subprocess
+argument to `git --literal-pathspecs diff`, so Unicode, embedded newlines, glob-like characters,
+leading dashes, and other legal path strings represented by the API are not reinterpreted through
+a newline-delimited file or shell. A rename is valid only with `previous_filename`; both the old
+and current names are de-duplicated into the literal path restriction, and both identities remain
+in the manifest record. Deletions, binary changes, executable modes, symlink targets, submodule
+pointers, and rename metadata therefore remain part of the prepared input.
+
+### Changed-anchor contract
+
+All three reviewers are instructed that every new finding needs a changed `path:line` anchor.
+Unchanged surrounding code is supporting evidence only after a concrete causal explanation from
+that anchor. A real current line without PR causality is insufficient; a disproven prior claim is
+`Retracted`, while `Resolved` requires a code change.
+
+Claude and Gemini enforce this as a prompt contract over their exclusive prepared artifact.
+OpenCode additionally enforces it in the clean canonicalizer. A candidate must contain exactly one
+`### New findings` section whose body is exactly `None` or one or more `####` finding blocks. Every
+block needs at least one exact `- Changed anchor: path:line` line (optional backticks). The parser
+splits at the final `:<decimal line>` delimiter, preserving legal colons inside the path. It then:
+
+1. verifies the sealed full diff and manifest hashes and their repository, PR, merge-base, and head
+   identity;
+2. matches the anchor against the current `filename` in the manifest (not
+   `previous_filename`) and rejects removed files; and
+3. derives zero-context `merge-base..head` hunks for that literal path with `/usr/bin/git` in a
+   closed provider-free environment, accepting only added-side line ranges.
+
+Rename preparation consequently transports both old and current identities, but a reportable
+anchor names a changed added-side line in the current filename. A numbered-full fallback may have
+an empty or otherwise non-verifying file manifest: it can still support a strict `None` result, but
+it cannot authenticate a new finding without a manifest-verifiable changed anchor. The workflow
+machine-checks anchor form and changed-line membership; the causal explanation for supporting
+unchanged evidence remains a semantic review requirement.
+
 ## Canonical automated-review state (v2)
 
 Claude, Gemini, and OpenCode publish review state in a workflow-generated v2 envelope.
@@ -142,10 +234,9 @@ The envelope fields are `schema` (always `2`), `reviewer`, `pr`, `run_id`, `run_
 atomic in meaning: `successful_head` is a 40-hex reviewed head only when
 `full_diff_sha256` is its 64-hex full-input hash; otherwise both are `null`. The status is
 `success` or `failure`, and `diff_mode` is `full`, `delta`, `unchanged`, or `unavailable`
-(Slice 1 only advances a successful checkpoint from covered `full` or `delta` input).
-A `success` state requires the non-null successful pair and
-`successful_head == attempt_head`; a `failure` may carry either a null pair or a valid retained
-pair from an earlier success.
+(`unavailable` is never a successful state). A `success` state requires the non-null successful
+pair and `successful_head == attempt_head`; a `failure` may carry either a null pair or a valid
+retained pair from an earlier success.
 
 The v2 contract requires the visible `- Run:` line to be the exact URL-only value
 `${{ github.server_url }}/${{ github.repository }}/actions/runs/<state.run_id>`; malformed,
@@ -158,12 +249,15 @@ Legacy comments may be reused only as an exact legacy display target. Their mark
 `Reviewed` text never supply input state. The first v2 run performs a full review and
 establishes canonical v2 state; historical unstructured OpenCode comments are ignored.
 
-A successful checkpoint requires a prepared covered input, a successful model step, non-empty
-sanitized prose, and a valid current write gate. A failure preserves a prior successful body
-and successful pair only when both remain valid, records the failed `attempt_head`, and shows
-`Status: stale` plus `Last attempt: failure`; without prior success it is `Status: failure`
-with no `Reviewed` checkpoint. A stale run, missing/invalid input, empty sanitized output, or
-invalid prior state cannot advance coverage (invalid prior state falls back to a full review).
+A successful `full` or `delta` checkpoint requires a prepared covered input, a successful model
+step, non-empty sanitized prose, and a valid current write gate. A successful `unchanged`
+checkpoint instead requires the action's exact full hash to match an authenticated prior
+successful hash and preserves that prior non-empty prose while skipping the model. A failure
+preserves a prior successful body and successful pair only when both remain valid, records the
+failed `attempt_head`, and shows `Status: stale` plus `Last attempt: failure`; without prior
+success it is `Status: failure` with no `Reviewed` checkpoint. A stale run, missing/invalid input,
+empty sanitized output, or invalid prior state cannot advance coverage (invalid prior state falls
+back to a full review).
 
 Immediately before comment mutation, each reviewer refetches the PR head and requires it to
 equal `attempt_head`; it also refuses to write unless stored `(run_id, run_attempt)` is
