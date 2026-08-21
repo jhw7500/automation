@@ -47,8 +47,11 @@ The final audit tightened four boundaries and supersedes conflicting details lat
    ambiguous encodings, including reversed key order. The canonicalizer re-derives one exact
    NUL-delimited status/path record and its added hunks from the same immutable graph; rename/copy
    records use both old and current paths, and every query disables replace objects, external
-   diff/text conversion, and submodule-ignore configuration. Exact decoded comparison and literal
-   Git argv preserve newlines, backticks, colons, Unicode, and leading dashes without normalization.
+   diff/text conversion, and submodule-ignore configuration. The hunk query also disables color and
+   inter-hunk merging. A strict old/new-counter parser accepts only actual `+` body records—not a
+   header span, context, deletion, or no-newline control—and rejects malformed/truncated patches.
+   Exact decoded comparison and literal Git argv preserve newlines, backticks, colons, Unicode, and
+   leading dashes without normalization.
 5. Before any cleanup or GitHub comment/Check mutation, canonicalization computes the complete
    output state and worst-case fully wrapped body and enforces the 65,536-byte limit. Oversize input
    fails without modifying even untrusted marker comments.
@@ -312,9 +315,11 @@ keys/types reject duplicate or ambiguous encodings while reversibly representing
 The decoded path is matched exactly against the scope manifest and passed as one literal Git argv
 element. The canonicalizer first requires one exact NUL-delimited status/path record from the same
 recorded merge-base/head graph, including both endpoints for a rename/copy, then accepts only a line
-in that record's added-side hunk. Both queries disable replace objects, external diff/text
-conversion, and submodule-ignore configuration. Claude and Gemini remain bounded by their prepared
-diff input and receive the same semantic instruction.
+consumed by an actual `+` record in that record's added-side hunk. Both queries disable replace
+objects, external diff/text conversion, and submodule-ignore configuration; the hunk query also
+forces no color and zero inter-hunk context. Header spans, context, deletions, no-newline controls,
+and count-incomplete patches cannot satisfy an anchor. Claude and Gemini remain bounded by their
+prepared diff input and receive the same semantic instruction.
 
 ## 10. Failure Behavior
 

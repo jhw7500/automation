@@ -732,9 +732,36 @@ def test_current_release_commit_only_uses_authenticated_objects(
         (
             ".github/workflows/opencode-auto-review.yml",
             "'diff', '--no-ext-diff', '--no-textconv', '--find-renames=50%',\n"
-            "                  '--ignore-submodules=none', '-U0',",
+            "                  '--ignore-submodules=none', '--inter-hunk-context=0', "
+            "'--no-color', '-U0',",
             "'diff', '--no-ext-diff', '--find-renames=50%',\n"
-            "                  '--ignore-submodules=none', '-U0',",
+            "                  '--ignore-submodules=none', '--inter-hunk-context=0', "
+            "'--no-color', '-U0',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'--ignore-submodules=none', '--inter-hunk-context=0', '--no-color', '-U0',",
+            "'--ignore-submodules=none', '--no-color', '-U0',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'--ignore-submodules=none', '--inter-hunk-context=0', '--no-color', '-U0',",
+            "'--ignore-submodules=none', '--inter-hunk-context=0', '-U0',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "} else if (line.startsWith('+')) {",
+            "} else if (line.startsWith(' ')) {",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "const ranges = parseAddedRanges(result.stdout);",
+            "const ranges = [[1, Number.MAX_SAFE_INTEGER]];",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "if (inHunk && (oldRemaining !== 0 || newRemaining !== 0)) return null;",
+            "if (false) return null;",
         ),
         (
             ".github/workflows/opencode-auto-review.yml",
@@ -798,6 +825,11 @@ def test_current_release_commit_only_uses_authenticated_objects(
         "canonical-rename-endpoints",
         "canonical-name-status-flags",
         "canonical-hunk-flags",
+        "canonical-inter-hunk-zero",
+        "canonical-no-color",
+        "canonical-plus-lines-only",
+        "canonical-body-parser-call",
+        "canonical-hunk-count-exhaustion",
         "canonical-same-graph-range",
         "canonical-exact-scope-record",
         "canonical-size-before-repair",

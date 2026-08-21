@@ -2108,7 +2108,8 @@ def _verify_commit_content(
             and (
                 "'diff', '--no-ext-diff', '--no-textconv', "
                 "'--find-renames=50%',\n      "
-                "'--ignore-submodules=none', '-U0',"
+                "'--ignore-submodules=none', '--inter-hunk-context=0', "
+                "'--no-color', '-U0',"
             )
             in canonical_script
             and canonical_script.count(anchor_range) == 2
@@ -2120,6 +2121,17 @@ def _verify_commit_content(
                 "(file.previous_filename || null)"
             )
             in canonical_script
+            and "const parseAddedRanges = (patch) => {" in canonical_script
+            and "if (!patch.endsWith('\\n')) return null;" in canonical_script
+            and "} else if (line.startsWith('+')) {" in canonical_script
+            and "addLine(newLine);" in canonical_script
+            and canonical_script.count(
+                "if (inHunk && (oldRemaining !== 0 || newRemaining !== 0)) "
+                "return null;"
+            )
+            == 2
+            and "const ranges = parseAddedRanges(result.stdout);" in canonical_script
+            and "const start = Number(match[1]);" not in canonical_script
         )
         body_limit_gate = canonical_script.find(
             "if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') "

@@ -5508,6 +5508,67 @@ def _published_opencode_state(calls: list) -> dict:
     return json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
 
 
+def _run_opencode_added_range_parser(patch: str):
+    workflow = _load("opencode-auto-review.yml")
+    script = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )["with"]["script"]
+    match = re.search(
+        r"(const parseAddedRanges = \(patch\) => \{.*?\n\s+return ranges;\n\s+\};)"
+        r"\n\s+const anchors = \[\];",
+        script,
+        re.DOTALL,
+    )
+    assert match
+    program = (
+        f"{match.group(1)}\n"
+        "const fs = require('fs');\n"
+        "process.stdout.write(JSON.stringify(parseAddedRanges(fs.readFileSync(0, 'utf8'))));"
+    )
+    result = subprocess.run(
+        ["node", "-e", program],
+        input=patch,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("patch", "expected"),
+    (
+        (
+            "diff --git a/file b/file\n--- a/file\n+++ b/file\n"
+            "@@ -1,3 +1,3 @@\n-before one\n+after one\n unchanged bridge\n"
+            "-before three\n\\ No newline at end of file\n"
+            "+after three\n\\ No newline at end of file\n",
+            [[1, 1], [3, 3]],
+        ),
+        ("@@ -1 +1 @@\n-before\n", None),
+        ("@@ -1 +1 @@\n-before\n+after\n unexpected\n", None),
+        (
+            "@@ -1 +1 @@\n-before\n+after\n\\ No newline at end of file\n"
+            "\\ No newline at end of file\n",
+            None,
+        ),
+        ("@@ -1 +1 @@\n-before\n+after", None),
+        ("similarity index 100%\nrename from old\nrename to new\n", []),
+    ),
+    ids=(
+        "actual-plus-lines",
+        "truncated-count",
+        "extra-body",
+        "duplicate-no-newline-control",
+        "missing-terminal-newline",
+        "metadata-only",
+    ),
+)
+def test_opencode_added_range_parser_fails_closed(patch, expected):
+    assert _run_opencode_added_range_parser(patch) == expected
+
+
 @node_required
 def test_opencode_pure_rename_does_not_turn_unchanged_destination_lines_into_additions(
     tmp_path,
@@ -5660,6 +5721,77 @@ def test_opencode_gitlink_anchor_ignores_hostile_submodule_ignore_configuration(
         tmp_path,
         [],
         [_anchor_candidate("vendor/module", 1, "Gitlink pointer")],
+        attempt_head=head,
+        current_head=head,
+        manifest=manifest,
+        trusted_workspace=repo,
+    )
+
+    assert _published_opencode_state(calls)["attempt_status"] == "success"
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("line", "expected_status"),
+    ((1, "success"), (2, "failure"), (3, "success")),
+    ids=("first-change", "unchanged-bridge", "last-change-no-newline"),
+)
+def test_opencode_anchor_uses_only_added_lines_under_hostile_inter_hunk_context(
+    tmp_path, line, expected_status
+):
+    repo = tmp_path / "repo"
+    _init_anchor_repo(repo)
+    path = "-bridge:한글😀.txt"
+    (repo / path).write_text("before one\nunchanged bridge\nbefore three", encoding="utf-8")
+    base = _commit_anchor_repo(repo, "base")
+    (repo / path).write_text("after one\nunchanged bridge\nafter three", encoding="utf-8")
+    head = _commit_anchor_repo(repo, "two changes with bridge")
+    _git(repo, "config", "diff.interHunkContext", "1")
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": base,
+        "head_sha": head,
+        "files": [{"status": "modified", "filename": path}],
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [_anchor_candidate(path, line, "Inter-hunk bridge")],
+        attempt_head=head,
+        current_head=head,
+        manifest=manifest,
+        trusted_workspace=repo,
+    )
+
+    assert _published_opencode_state(calls)["attempt_status"] == expected_status
+
+
+@node_required
+def test_opencode_anchor_diff_forces_no_color(tmp_path):
+    repo = tmp_path / "repo"
+    _init_anchor_repo(repo)
+    path = "colored.txt"
+    (repo / path).write_text("before\n", encoding="utf-8")
+    base = _commit_anchor_repo(repo, "base")
+    (repo / path).write_text("after\n", encoding="utf-8")
+    head = _commit_anchor_repo(repo, "change")
+    _git(repo, "config", "color.ui", "always")
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": base,
+        "head_sha": head,
+        "files": [{"status": "modified", "filename": path}],
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [_anchor_candidate(path, 1, "Colored diff")],
         attempt_head=head,
         current_head=head,
         manifest=manifest,

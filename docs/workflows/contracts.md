@@ -223,15 +223,20 @@ and non-positive or unsafe line integers fail closed. The parser then:
    records, and requires its status and path identities to equal the sealed record; and
 4. derives zero-context hunks for that same record and graph with `/usr/bin/git`,
    `--no-replace-objects`, `--no-ext-diff`, `--no-textconv`, `--find-renames=50%`, and
-   `--ignore-submodules=none`, accepting only added-side line ranges.
+   `--ignore-submodules=none`. It also forces `--inter-hunk-context=0` and `--no-color`, then
+   validates every hunk's old/new counters through the complete patch body and accepts only line
+   numbers consumed by actual `+` records. Context, deletions, and the no-newline control record
+   never become anchors; malformed, truncated, or count-mismatched output fails closed.
 
 Rename preparation consequently transports both old and current identities, but a reportable
 anchor names a changed added-side line in the current filename. A pure 100% rename has no such
 line, while a renamed file with a real addition can cite that addition. The explicit submodule
 override keeps a changed gitlink reportable even when tracked or local configuration says to ignore
 submodules. Exact-record matching prevents another path's hunk from satisfying the anchor. The
-workflow machine-checks anchor form and changed-line membership; the causal explanation for
-supporting unchanged evidence remains a semantic review requirement.
+workflow does not infer additions from a hunk header's whole new-side span, so repository-local
+inter-hunk merging cannot turn an unchanged bridge line into a valid anchor. It machine-checks
+anchor form and changed-line membership; the causal explanation for supporting unchanged evidence
+remains a semantic review requirement.
 
 ## Canonical automated-review state (v2)
 

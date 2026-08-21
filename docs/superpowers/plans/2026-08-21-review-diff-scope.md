@@ -41,7 +41,11 @@ This amendment supersedes any conflicting implementation detail in the task tran
   canonicalizer re-derives one exact NUL-delimited name-status record and its added hunks from the
   same immutable merge-base/head graph. Rename/copy checks use both old and current paths, and both
   queries force no replace objects, external diff/text conversion, 50% rename detection, and
-  `--ignore-submodules=none`; a pure rename therefore contributes no reportable added line.
+  `--ignore-submodules=none`; the hunk query additionally forces zero inter-hunk context and no
+  color. Canonicalization validates old/new counters through each complete unified hunk and records
+  only actual `+` lines, never the hunk header's full span, context, deletion, or no-newline control
+  records. A pure rename therefore contributes no reportable added line, and malformed/truncated
+  patch output fails closed.
 - The complete canonical state and worst-case fully wrapped 65,536-byte body are computed and
   checked before any cleanup or GitHub comment/Check mutation. An oversize prior body leaves even
   hostile marker comments untouched and fails closed.
