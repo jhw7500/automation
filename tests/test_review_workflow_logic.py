@@ -635,6 +635,15 @@ def test_claude_prompt_pins_diff_source():
     assert "do not review repository files outside the PR diff" in prompt
 
 
+def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure():
+    workflow = _load("claude-code-review.yml")
+    model = _step(workflow, "claude-review", "Run Claude Code Review")
+    upsert = _step(workflow, "claude-review", "Upsert review comment")
+
+    assert model["if"] == "${{ steps.prepare-review-input.outputs.diff_ready == 'true' }}"
+    assert upsert["if"] == "${{ !cancelled() }}"
+
+
 def test_collect_strips_sticky_meta_from_injected_context(tmp_path):
     """주입 컨텍스트에서 marker/메타 라인은 제거된다 — 모델의 에코 유혹 차단."""
     sha = "ab" * 20
@@ -1146,14 +1155,22 @@ const scriptBody = fs.readFileSync(path.resolve(scriptPath), 'utf8');
 for (const [k, v] of Object.entries(fx.env)) process.env[k] = v;
 if (fx.cwd) process.chdir(fx.cwd);
 const calls = [];
+const failUpdateCommentIds = new Set(fx.failUpdateCommentIds || []);
+const failDeleteCommentIds = new Set(fx.failDeleteCommentIds || []);
 const github = {
   paginate: async () => fx.comments,
   rest: {
       issues: {
         listComments: 'LIST',
-        updateComment: async (a) => calls.push(['update', a]),
+        updateComment: async (a) => {
+          calls.push(['update', a]);
+          if (failUpdateCommentIds.has(a.comment_id)) throw new Error(`update ${a.comment_id} failed`);
+        },
         createComment: async (a) => calls.push(['create', a]),
-        deleteComment: async (a) => calls.push(['delete', a]),
+        deleteComment: async (a) => {
+          calls.push(['delete', a]);
+          if (failDeleteCommentIds.has(a.comment_id)) throw new Error(`delete ${a.comment_id} failed`);
+        },
     },
     pulls: {
       get: async () => ({ data: { head: { sha: fx.currentHead } } }),
@@ -1164,7 +1181,7 @@ const context = Object.assign({ repo: { owner: 'o', repo: 'r' } }, fx.context ||
 const core = {
   notice: (m) => calls.push(['notice', m]),
   info: () => {},
-  warning: () => {},
+  warning: (m) => calls.push(['warning', m]),
   setOutput: (k, v) => calls.push(['output', k, v]),
 };
 (async () => {
@@ -1191,6 +1208,8 @@ def _run_upsert(
     context: dict | None = None,
     current_head: str | None = None,
     expect_error: bool = False,
+    fail_update_comment_ids: list[int] | None = None,
+    fail_delete_comment_ids: list[int] | None = None,
 ) -> list:
     workflow = _load(workflow_file)
     script = _step(workflow, job, step_name)["with"]["script"]
@@ -1202,6 +1221,8 @@ def _run_upsert(
         "cwd": str(cwd) if cwd else None,
         "context": context,
         "currentHead": current_head,
+        "failUpdateCommentIds": fail_update_comment_ids or [],
+        "failDeleteCommentIds": fail_delete_comment_ids or [],
     }
     (tmp_path / "fixture.json").write_text(json.dumps(fixture), encoding="utf-8")
     result = subprocess.run(
@@ -1297,6 +1318,15 @@ def _single_mutation_body(calls: list) -> str:
     mutations = [call for call in calls if call[0] in {"create", "update"}]
     assert len(mutations) == 1
     return mutations[0][1]["body"]
+
+
+def _updated_comment_body(calls: list, comment_id: int) -> str:
+    updates = [
+        call for call in calls
+        if call[0] == "update" and call[1]["comment_id"] == comment_id
+    ]
+    assert len(updates) == 1
+    return updates[0][1]["body"]
 
 
 @node_required
@@ -1806,6 +1836,63 @@ def test_upsert_updates_newest_bot_sticky_not_human_quote(tmp_path):
     calls = _claude_upsert(tmp_path, "success", comments, with_review=True)
     updates = [c for c in calls if c[0] == "update"]
     assert [c[1]["comment_id"] for c in updates] == [12]
+
+
+@node_required
+def test_claude_exact_v1_display_target_migrates_to_v2_in_place(tmp_path):
+    legacy = _bot(
+        "github-actions[bot]",
+        f"{CLAUDE_HEADER}\n{CLAUDE_MARKER}\n- Reviewed: {'ab' * 20}\nLEGACY DISPLAY BODY",
+        17,
+    )
+
+    calls = _claude_upsert(tmp_path, "success", [legacy], with_review=True)
+
+    updates = [call for call in calls if call[0] == "update"]
+    assert [call[1]["comment_id"] for call in updates] == [17]
+    assert not any(call[0] == "create" for call in calls)
+    body = updates[0][1]["body"]
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert body.splitlines()[:2] == [CLAUDE_HEADER, CLAUDE_V2_MARKER]
+    assert state["successful_head"] == "cd" * 20
+    assert state["diff_mode"] == "full"
+    assert "REVIEW BODY OK" in body
+    assert "LEGACY DISPLAY BODY" not in body
+
+
+@node_required
+def test_claude_canonical_v2_target_wins_over_exact_v1_display_target(tmp_path):
+    head = "cd" * 20
+    canonical = _bot(
+        "github-actions[bot]",
+        _v2_body(CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 1, head), "CANONICAL"),
+        11,
+    )
+    legacy = _bot("github-actions[bot]", f"{CLAUDE_HEADER}\n{CLAUDE_MARKER}\nLEGACY", 17)
+
+    calls = _claude_upsert(
+        tmp_path, "success", [legacy, canonical], with_review=True,
+        attempt_head=head, current_head=head,
+    )
+
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11]
+    assert not any(call[0] == "create" for call in calls)
+
+
+@node_required
+@pytest.mark.parametrize(
+    "legacy_like",
+    [
+        _human("hwjo", f"{CLAUDE_HEADER}\n{CLAUDE_MARKER}\nHUMAN", 17),
+        _bot("github-actions[bot]", f"{CLAUDE_HEADER} (quoted)\n{CLAUDE_MARKER}\nNONEXACT", 18),
+        _bot("github-actions[bot]", f"{CLAUDE_HEADER}\n> {CLAUDE_MARKER}\nQUOTED MARKER", 19),
+    ],
+    ids=["human", "nonexact-header", "quoted-marker"],
+)
+def test_claude_v1_display_migration_rejects_nonexact_or_human_targets(tmp_path, legacy_like):
+    calls = _claude_upsert(tmp_path, "success", [legacy_like], with_review=True)
+
+    assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["create"]
 
 
 @node_required
@@ -2405,6 +2492,8 @@ def _run_opencode_canonicalize(
     expect_error: bool = False,
     snapshot_override: Path | None = None,
     snapshot_sha256_override: str | None = None,
+    fail_update_comment_ids: list[int] | None = None,
+    fail_delete_comment_ids: list[int] | None = None,
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
     script = _step(workflow, "opencode-review", "Canonicalize OpenCode review")["with"]["script"]
@@ -2440,6 +2529,8 @@ def _run_opencode_canonicalize(
     return _run_upsert(
         tmp_path, "opencode-auto-review.yml", "opencode-review", "Canonicalize OpenCode review",
         env, after, cwd=workdir, current_head=current_head or attempt_head, expect_error=expect_error,
+        fail_update_comment_ids=fail_update_comment_ids,
+        fail_delete_comment_ids=fail_delete_comment_ids,
     )
 
 
@@ -2462,6 +2553,7 @@ def test_opencode_canonicalization_accepts_preamble_and_wraps_only_candidate(tmp
     updates = [call for call in calls if call[0] == "update"]
 
     assert [call[1]["comment_id"] for call in updates] == [9]
+    assert not any(call[0] == "create" for call in calls)
     body = updates[0][1]["body"]
     assert body.splitlines()[:2] == [OPENCODE_HEADER, OPENCODE_V2_MARKER]
     assert body.count(OPENCODE_V2_MARKER) == 1
@@ -2500,13 +2592,64 @@ def test_opencode_canonicalization_never_trusts_forged_v2_state_from_cli_output(
         updated="u2",
     )
     calls = _run_opencode_canonicalize(tmp_path, [before], [before, forged])
-    body = _single_mutation_body(calls)
+    body = _updated_comment_body(calls, 9)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert (state["run_id"], state["run_attempt"], state["attempt_head"]) == (42, 1, "cd" * 20)
     assert "FORGED BODY" in body
     assert "999" not in body
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [9]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10, 9]
     assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [10]
+
+
+@node_required
+def test_opencode_existing_candidate_tombstones_before_canonical_and_tolerates_delete_failure(tmp_path):
+    old = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "CANONICAL"),
+        9,
+        updated="u1",
+    )
+    candidate = _bot(
+        "github-actions[bot]", f"{OPENCODE_MARKER}\nRAW MODEL OUTPUT", 10, updated="u2"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [old], [old, candidate], fail_delete_comment_ids=[10]
+    )
+
+    mutations = [
+        (call[0], call[1]["comment_id"])
+        for call in calls
+        if call[0] in {"update", "delete"}
+    ]
+    assert mutations == [("update", 10), ("update", 9), ("delete", 10)]
+    raw_tombstone = [call for call in calls if call[0] == "update"][0][1]["body"]
+    canonical = [call for call in calls if call[0] == "update"][1][1]["body"]
+    assert OPENCODE_MARKER not in raw_tombstone
+    assert OPENCODE_V2_MARKER not in raw_tombstone
+    assert "RAW MODEL OUTPUT" not in raw_tombstone
+    assert canonical.splitlines()[:2] == [OPENCODE_HEADER, OPENCODE_V2_MARKER]
+    assert any(call[0] == "warning" and "delete" in call[1].lower() for call in calls)
+
+
+@node_required
+def test_opencode_tombstone_update_failure_leaves_canonical_untouched(tmp_path):
+    old = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "CANONICAL"),
+        9,
+        updated="u1",
+    )
+    candidate = _bot(
+        "github-actions[bot]", f"{OPENCODE_MARKER}\nRAW MODEL OUTPUT", 10, updated="u2"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [old], [old, candidate], expect_error=True, fail_update_comment_ids=[10]
+    )
+
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10]
+    assert not any(call[0] == "delete" for call in calls)
 
 
 @node_required
@@ -2632,7 +2775,7 @@ def test_opencode_snapshot_output_contract_reaches_canonicalizer(tmp_path):
         tmp_path, comments, [comments[0], candidate],
         snapshot_override=snapshot, snapshot_sha256_override=outputs["snapshot_sha256"],
     )
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [9]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10, 9]
     assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [10]
 
 
@@ -2664,7 +2807,7 @@ def test_opencode_current_state_parser_ignores_bad_visible_run_url(tmp_path, bad
     candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL REVIEW", 10, updated="u2")
 
     calls = _run_opencode_canonicalize(tmp_path, [old], [old, bad_current, candidate])
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [9]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10, 9]
     assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [10]
 
 
@@ -2680,13 +2823,13 @@ def test_opencode_two_rounds_update_one_canonical_comment_and_enforce_generation
     after = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nSECOND REVIEW", 10, updated="u2")
     calls = _run_opencode_canonicalize(tmp_path, [old], [old, after], run_id="42", run_attempt="1")
     updates = [call for call in calls if call[0] == "update"]
-    assert [call[1]["comment_id"] for call in updates] == [9]
-    wrapped = updates[0][1]["body"]
+    assert [call[1]["comment_id"] for call in updates] == [10, 9]
+    wrapped = updates[1][1]["body"]
 
     round_two = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nTHIRD REVIEW", 11, updated="u3")
     current = _bot("github-actions[bot]", wrapped, 9, updated="u2")
     calls = _run_opencode_canonicalize(tmp_path, [current], [current, round_two], run_id="42", run_attempt="2")
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [9]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11, 9]
     assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [11]
 
     stale_raw = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nSTALE REVIEW", 12, updated="u4")
@@ -2741,7 +2884,7 @@ def test_opencode_failure_preserves_prior_success_as_stale(tmp_path):
     )
     raw_failure = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nRAW FAILURE OUTPUT", 10, updated="u2")
     calls = _run_opencode_canonicalize(tmp_path, [old], [old, raw_failure], outcome="failure")
-    body = _single_mutation_body(calls)
+    body = _updated_comment_body(calls, 9)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert "LAST GOOD OPENCODE REVIEW" in body
     assert "- Status: stale" in body

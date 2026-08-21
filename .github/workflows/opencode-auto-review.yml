@@ -482,20 +482,30 @@ jobs:
                 };
             const status = succeeded ? 'success' : (priorSuccess ? 'stale' : 'failure');
             const body = `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})` : ''}${(succeeded ? review : previousBody) ? `\n\n${succeeded ? review : previousBody}` : ''}`;
-            // OpenCode creates a fresh working comment per run. Preserve exactly one
-            // canonical sticky by updating the pre-existing canonical record first, then
-            // removing this run's transient raw candidate. On the first run the candidate
-            // itself becomes the canonical record.
-            const target = existing ? existing.comment : candidate;
-            if (target) {
+            // OpenCode creates a fresh working comment per run. With an existing canonical
+            // record, scrub the untrusted raw candidate before mutating canonical state. A
+            // failed scrub leaves canonical unchanged; a failed best-effort delete leaves a
+            // marker-free tombstone that cannot be selected by a later run. On the first run,
+            // the fresh candidate itself becomes the canonical record.
+            if (existing) {
+              const tombstone = 'This transient OpenCode review output was superseded by the canonical review.';
               await github.rest.issues.updateComment({
-                owner: context.repo.owner, repo: context.repo.repo, comment_id: target.id, body,
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: candidate.id, body: tombstone,
               });
-              if (existing && existing.comment.id !== candidate.id) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.comment.id, body,
+              });
+              try {
                 await github.rest.issues.deleteComment({
                   owner: context.repo.owner, repo: context.repo.repo, comment_id: candidate.id,
                 });
+              } catch (error) {
+                core.warning(`OpenCode transient tombstone could not be deleted: ${error.message}`);
               }
+            } else if (candidate) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: candidate.id, body,
+              });
             } else {
               await github.rest.issues.createComment({
                 owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber, body,

@@ -329,6 +329,7 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
+        if: ${{ steps.prepare-review-input.outputs.diff_ready == 'true' }}
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -445,6 +446,7 @@ jobs:
             // 'Collect previous review context' 스텝의 HEADER/MARKER와 반드시 동일하게 유지.
             const header = '## Claude Code Review (latest)';
             const marker = '<!-- automation:claude-code-review:v2 -->';
+            const legacyMarker = '<!-- automation:claude-code-review -->';
             const issueNumber = Number(process.env.PR_NUMBER);
             const runUrl = process.env.RUN_URL;
             const serverUrl = process.env.SERVER_URL || '';
@@ -526,6 +528,14 @@ jobs:
               a.state.run_id - b.state.run_id || a.state.run_attempt - b.state.run_attempt
             );
             const existing = records[records.length - 1];
+            // Migration is display-only: a v1 body is never parsed as trusted state or
+            // context. If no canonical record exists, reuse only the exact bot-authored
+            // v1 display envelope as the location for the first v2 record.
+            const legacyTarget = existing ? null : comments.find((comment) => {
+              if (comment.user?.type !== 'Bot') return false;
+              const lines = (comment.body || '').split('\n');
+              return lines[0] === header && lines[1] === legacyMarker;
+            });
             if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead) || !serverUrl || !repository) {
               core.notice('Claude review trusted attempt identity is invalid; left the existing sticky state unchanged.');
               return;
@@ -581,8 +591,9 @@ jobs:
                 : `\n\n${trim(review)}`;
             const body = `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n\n${meta}${content}`;
 
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.comment.id, body });
+            const target = existing?.comment || legacyTarget;
+            if (target) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: target.id, body });
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
             }
