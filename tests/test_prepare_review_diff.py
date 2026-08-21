@@ -640,13 +640,24 @@ def test_cli_argv_overflow_uses_numbered_diff_without_running_git_diff(
     history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
 ) -> None:
     """The executable path must fail closed before a large local Git diff starts."""
-    filename = f"overflow/00000000-{'x' * 240}"
+    component = "x" * 240
+    filename = f"overflow/00000000/{component}/{component}/{component}/{component}"
     available = max(os.sysconf("SC_ARG_MAX") - 128 * 1024, 0)
-    record_count = max(1, available // (len(os.fsencode(filename)) + 1) + 2)
+    record_count = min(3000, max(1, available // (len(os.fsencode(filename)) + 1) + 2))
     records = [
-        {"status": "modified", "filename": f"overflow/{index:08d}-{'x' * 240}"}
+        {
+            "status": "modified",
+            "filename": f"overflow/{index:08d}/{component}/{component}/{component}/{component}",
+        }
         for index in range(record_count)
     ]
+    assert record_count <= 3000
+    assert len(os.fsencode(filename)) < 4096
+    assert all(
+        0 < len(os.fsencode(path_component)) <= 255
+        for path_component in filename.split("/")
+    )
+    assert sum(len(os.fsencode(record["filename"])) + 1 for record in records) > available
     configure_gh(
         gh_fixture,
         base=history.base,
