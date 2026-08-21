@@ -18,6 +18,7 @@ from typing import Literal, Sequence
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+ARG_MAX_ENVIRONMENT_ALLOWANCE = 128 * 1024
 
 
 @dataclass(frozen=True)
@@ -178,19 +179,25 @@ def ensure_commit(sha: str, cwd: Path) -> None:
 def git_diff(left: str, right: str, context_lines: int, paths: Sequence[str], cwd: Path) -> bytes:
     if not paths:
         return b""
+    argv = [
+        "git",
+        "--literal-pathspecs",
+        "diff",
+        "--find-renames",
+        f"-U{context_lines}",
+        f"{left}..{right}",
+        "--",
+        *paths,
+    ]
     try:
-        return run(
-            [
-                "git",
-                "--literal-pathspecs",
-                "diff",
-                f"-U{context_lines}",
-                f"{left}..{right}",
-                "--",
-                *paths,
-            ],
-            cwd=cwd,
-        ).stdout
+        arg_max = os.sysconf("SC_ARG_MAX")
+        encoded_size = sum(len(os.fsencode(argument)) + 1 for argument in argv)
+    except (AttributeError, OSError, ValueError, UnicodeError) as error:
+        raise PreparationUnavailable("local PR-scoped diff argument limit is unavailable") from error
+    if encoded_size > arg_max - ARG_MAX_ENVIRONMENT_ALLOWANCE:
+        raise PreparationUnavailable("local PR-scoped diff exceeds executable argument limit")
+    try:
+        return run(argv, cwd=cwd).stdout
     except (OSError, subprocess.CalledProcessError) as error:
         raise PreparationUnavailable("local PR-scoped diff is unavailable") from error
 

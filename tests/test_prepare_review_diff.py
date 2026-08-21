@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -416,3 +418,195 @@ def test_invalid_invocation_is_nonzero_and_does_not_call_gh(
 
     assert result.returncode != 0
     assert not gh_fixture.log.exists()
+
+
+def test_unicode_and_newline_paths_stay_scoped_in_incremental_diff(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """Path quoting or shell transport must not drop unusual PR paths."""
+    special_paths = [
+        "pages/[id].tsx",
+        "emoji-한글-😀.py",
+        "line\nbreak.py",
+        "leading-dash/-n.txt",
+    ]
+    records = [{"status": "modified", "filename": "normal.py"}]
+    (history.repo / "normal.py").write_text("NORMAL_CHANGE\n", encoding="utf-8")
+    for index, path in enumerate(special_paths):
+        destination = history.repo / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(f"SPECIAL_CHANGE_{index}\n", encoding="utf-8")
+        records.append({"status": "added", "filename": path})
+    head = commit(history.repo, "unusual paths")
+    configure_gh(gh_fixture, base=history.base, head=head, files=records)
+    full, delta, manifest = outputs(tmp_path)
+
+    result = run_prepare(
+        history.repo,
+        gh_fixture,
+        *prepare_args(full, delta, manifest, "--previous-sha", history.head),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["diff_mode"] == "delta"
+    diff = delta.read_text(encoding="utf-8")
+    assert "NORMAL_CHANGE" in diff
+    for index in range(len(special_paths)):
+        assert f"SPECIAL_CHANGE_{index}" in diff
+    assert "OUT_OF_PR" not in diff
+
+
+def test_rename_binary_mode_symlink_and_submodule_changes_are_preserved(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """Scope both rename endpoints so Git retains object and rename semantics."""
+    (history.repo / "rename-from.txt").write_text("rename me\n", encoding="utf-8")
+    (history.repo / "deleted.txt").write_text("delete me\n", encoding="utf-8")
+    (history.repo / "binary.bin").write_bytes(b"\x00before\xff")
+    executable = history.repo / "executable.sh"
+    executable.write_text("#!/bin/sh\necho executable\n", encoding="utf-8")
+    executable.chmod(0o644)
+    link = history.repo / "target-link"
+    link.symlink_to("before-target")
+    source = tmp_path / "submodule-source"
+    source.mkdir()
+    git(source, "init", "-b", "main")
+    git(source, "config", "user.name", "Test User")
+    git(source, "config", "user.email", "test@example.invalid")
+    (source / "module.txt").write_text("before\n", encoding="utf-8")
+    previous_submodule = commit(source, "submodule before")
+    git(
+        history.repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(source),
+        "vendor/module",
+    )
+    previous = commit(history.repo, "object baseline")
+
+    git(history.repo, "mv", "rename-from.txt", "rename-to.txt")
+    (history.repo / "deleted.txt").unlink()
+    (history.repo / "binary.bin").write_bytes(b"\x00after\xfe")
+    executable.chmod(0o755)
+    link.unlink()
+    link.symlink_to("after-target")
+    (source / "module.txt").write_text("after\n", encoding="utf-8")
+    updated_submodule = commit(source, "submodule after")
+    git(
+        history.repo,
+        "-c",
+        "protocol.file.allow=always",
+        "-C",
+        "vendor/module",
+        "fetch",
+        "origin",
+        updated_submodule,
+    )
+    git(history.repo, "-C", "vendor/module", "checkout", updated_submodule)
+    head = commit(history.repo, "object changes")
+    configure_gh(
+        gh_fixture,
+        base=history.base,
+        head=head,
+        files=[
+            {
+                "status": "renamed",
+                "filename": "rename-to.txt",
+                "previous_filename": "rename-from.txt",
+            },
+            {"status": "removed", "filename": "deleted.txt"},
+            {"status": "modified", "filename": "binary.bin"},
+            {"status": "modified", "filename": "executable.sh"},
+            {"status": "modified", "filename": "target-link"},
+            {"status": "modified", "filename": "vendor/module"},
+        ],
+    )
+    full, delta, manifest = outputs(tmp_path)
+
+    result = run_prepare(
+        history.repo,
+        gh_fixture,
+        *prepare_args(full, delta, manifest, "--previous-sha", previous),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["diff_mode"] == "delta"
+    diff = delta.read_bytes()
+    assert b"rename from rename-from.txt" in diff
+    assert b"rename to rename-to.txt" in diff
+    assert b"new file mode" not in diff
+    assert b"deleted file mode 100644" in diff
+    assert b"Binary files a/binary.bin and b/binary.bin differ" in diff
+    assert b"old mode 100644" in diff
+    assert b"new mode 100755" in diff
+    assert b"before-target" in diff
+    assert b"after-target" in diff
+    assert f"-Subproject commit {previous_submodule}".encode() in diff
+    assert f"+Subproject commit {updated_submodule}".encode() in diff
+    assert b"OUT_OF_PR" not in diff
+
+
+def test_oversized_unicode_path_argv_uses_numbered_full_diff(
+    history: RepositoryHistory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unsafe local argv must fall back without a broad commit-range diff."""
+    spec = importlib.util.spec_from_file_location("prepare_review_diff_under_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    limited_os = types.SimpleNamespace(
+        fsencode=os.fsencode,
+        fsync=os.fsync,
+        replace=os.replace,
+        sysconf=lambda name: 131072,
+    )
+    with monkeypatch.context() as size_limit:
+        size_limit.setattr(module, "os", limited_os)
+        with pytest.raises(module.PreparationUnavailable, match="argument limit"):
+            module.git_diff(
+                history.base,
+                history.head,
+                3,
+                ["emoji-한글-😀.py"],
+                history.repo,
+            )
+
+    records = [{"status": "added", "filename": "emoji-한글-😀.py"}]
+    monkeypatch.setattr(module, "metadata", lambda *arguments: (history.base, history.head))
+    monkeypatch.setattr(module, "pr_files", lambda *arguments: records)
+    numbered_calls: list[int] = []
+
+    def numbered(pr_number: int, cwd: Path) -> bytes:
+        numbered_calls.append(pr_number)
+        return b"diff --git a/inside.txt b/inside.txt\n+numbered-only\n"
+
+    monkeypatch.setattr(module, "numbered_pr_diff", numbered)
+    original_git_diff = module.git_diff
+
+    def limited_git_diff(*arguments: object) -> bytes:
+        with monkeypatch.context() as size_limit:
+            size_limit.setattr(module, "os", limited_os)
+            return original_git_diff(*arguments)
+
+    monkeypatch.setattr(module, "git_diff", limited_git_diff)
+    full, delta, manifest = outputs(tmp_path)
+    args = module.parse_args(
+        [
+            "--repository",
+            "o/r",
+            "--pr-number",
+            "7",
+            *prepare_args(full, delta, manifest),
+        ]
+    )
+
+    state = module.prepare(args, history.repo)
+
+    assert state.diff_ready is True
+    assert state.diff_mode == "full"
+    assert "numbered PR diff" in state.warning
+    assert full.read_text(encoding="utf-8").endswith("+numbered-only\n")
+    assert numbered_calls == [7]
