@@ -183,12 +183,14 @@ def _run_collect(
     workflow = _load("claude-code-review.yml")
     run = _step(workflow, "claude-review", "Collect previous review context")["run"]
     env = _gh_stub(tmp_path, comments, head_sha=head_sha, pr_files=pr_files)
+    output = tmp_path / "github-output"
     env.update(
         {
             "HEADER": CLAUDE_HEADER,
             "MARKER": CLAUDE_V2_MARKER,
             "REVIEWER": "claude",
             "MAX_SECTION_CHARS": "6000",
+            "GITHUB_OUTPUT": str(output),
         }
     )
     subprocess.run(
@@ -463,7 +465,7 @@ def test_claude_prompt_pins_diff_source():
     # detached HEAD 대비: PR 번호를 프롬프트에 명시하고, diff 부재 시 저장소 파일
     # 리뷰로 후퇴하는 것을 금지한다.
     assert "${{ inputs.pr_number || github.event.pull_request.number }}" in prompt
-    assert "NEVER fall back to reviewing repository" in prompt
+    assert "do not review repository files outside the PR diff" in prompt
 
 
 def test_collect_strips_sticky_meta_from_injected_context(tmp_path):
@@ -770,12 +772,31 @@ def _run_upsert(
     return json.loads(result.stdout)
 
 
-def _claude_upsert(tmp_path: Path, outcome: str, comments: list[dict], with_review: bool) -> list:
+def _claude_upsert(
+    tmp_path: Path,
+    outcome: str,
+    comments: list[dict],
+    with_review: bool,
+    *,
+    review: str = "REVIEW BODY OK",
+    diff_ready: str = "true",
+    run_id: str = "42",
+    attempt_head: str = "cd" * 20,
+    full_diff_sha256: str = "34" * 32,
+) -> list:
     workdir = tmp_path / ("with-review" if with_review else "without-review")
     workdir.mkdir()
     if with_review:
-        (workdir / "claude-review.md").write_text("REVIEW BODY OK", encoding="utf-8")
-    env = {"PR_NUMBER": "7", "RUN_URL": "run-url", "REVIEW_OUTCOME": outcome}
+        (workdir / "claude-review.md").write_text(review, encoding="utf-8")
+    env = {
+        "PR_NUMBER": "7",
+        "RUN_URL": "run-url",
+        "REVIEW_OUTCOME": outcome,
+        "DIFF_READY": diff_ready,
+        "RUN_ID": run_id,
+        "ATTEMPT_HEAD": attempt_head,
+        "FULL_DIFF_SHA256": full_diff_sha256,
+    }
     return _run_upsert(
         tmp_path, "claude-code-review.yml", "claude-review", "Upsert review comment",
         env, comments, cwd=workdir,
@@ -783,11 +804,86 @@ def _claude_upsert(tmp_path: Path, outcome: str, comments: list[dict], with_revi
 
 
 @node_required
+@pytest.mark.parametrize(
+    ("outcome", "diff_ready", "review", "expected_status"),
+    [
+        ("success", "false", "diff unavailable", "failure"),
+        ("success", "true", "", "failure"),
+        ("success", "true", "<!-- automation:x -->", "failure"),
+        ("success", "true", "REAL FINDING", "success"),
+    ],
+)
+def test_claude_checkpoint_requires_coverage_and_sanitized_body(
+    tmp_path, outcome, diff_ready, review, expected_status
+):
+    calls = _claude_upsert(
+        tmp_path,
+        outcome,
+        [],
+        with_review=bool(review),
+        review=review,
+        diff_ready=diff_ready,
+    )
+    body = [c for c in calls if c[0] == "create"][0][1]["body"]
+    assert f"- Status: {expected_status}" in body
+    states = re.findall(r"^<!-- automation-state:(\{.*\}) -->$", body, re.M)
+    assert len(states) == 1
+    state = json.loads(states[0])
+    assert state["attempt_status"] == expected_status
+    assert state["schema"] == 2
+    assert state["reviewer"] == "claude"
+    assert state["pr"] == 7
+    assert state["run_id"] == 42
+    assert state["attempt_head"] == "cd" * 20
+    assert state["full_diff_sha256"] == "34" * 32
+    if expected_status == "success":
+        assert state["successful_head"] == "cd" * 20
+        assert "REAL FINDING" in body
+    else:
+        assert state["successful_head"] is None
+        assert "- Reviewed:" not in body
+
+
+@node_required
+def test_claude_infra_only_output_preserves_prior_success_as_stale(tmp_path):
+    old_head = "ab" * 20
+    old_body = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 1, old_head),
+        "LAST GOOD REVIEW",
+    )
+    calls = _claude_upsert(
+        tmp_path,
+        "success",
+        [_bot("github-actions[bot]", old_body, 11)],
+        with_review=True,
+        review="<!-- automation:x -->",
+    )
+    new_body = [c for c in calls if c[0] == "update"][0][1]["body"]
+    assert "LAST GOOD REVIEW" in new_body
+    assert "- Status: stale" in new_body
+    assert new_body.count("<!-- automation-state:") == 1
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", new_body).group(1))
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] == old_head
+
+
+@node_required
 def test_upsert_updates_newest_bot_sticky_not_human_quote(tmp_path):
+    head = "ab" * 20
     comments = [
-        _human("hwjo", f"quote: {CLAUDE_MARKER}", 5),
-        _bot("github-actions[bot]", f"x\n{CLAUDE_MARKER}\nold", 11),
-        _bot("github-actions[bot]", f"x\n{CLAUDE_MARKER}\nnewer", 12),
+        _human("hwjo", f"quote: {CLAUDE_V2_MARKER}", 5),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 1, head), "old"),
+            11,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 2, head), "newer"),
+            12,
+        ),
     ]
     calls = _claude_upsert(tmp_path, "success", comments, with_review=True)
     updates = [c for c in calls if c[0] == "update"]
@@ -797,9 +893,11 @@ def test_upsert_updates_newest_bot_sticky_not_human_quote(tmp_path):
 @node_required
 def test_upsert_failure_preserves_sticky_and_stamps_attempt(tmp_path):
     sha = "ab" * 20
-    body = (
-        f"## Claude Code Review (latest)\n{CLAUDE_MARKER}\n\n"
-        f"- Status: success\n- Run: https://runs/1\n- Reviewed: {sha}\n\nOLD REVIEW BODY"
+    body = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 1, sha),
+        f"- Status: success\n- Run: https://runs/1\n- Reviewed: {sha}\n\nOLD REVIEW BODY",
     )
     comments = [_bot("github-actions[bot]", body, 11)]
     calls = _claude_upsert(tmp_path, "failure", comments, with_review=False)
@@ -808,7 +906,7 @@ def test_upsert_failure_preserves_sticky_and_stamps_attempt(tmp_path):
     assert not any(c[0] == "create" for c in calls)
     new_body = updates[0][1]["body"]
     assert "OLD REVIEW BODY" in new_body           # 직전 정상 리뷰 본문 보존
-    assert "- Status: success" in new_body         # 다음 라운드 재리뷰 컨텍스트 유지
+    assert "- Status: stale" in new_body            # 최신 attempt는 실패했음을 노출
     assert f"- Reviewed: {sha}" in new_body        # 증분 기준 SHA 보존
     lines = new_body.split("\n")
     # 실패 스탬프는 헤더 메타 직후(수집 스텝이 읽는 상단 10줄 안)에 삽입된다
@@ -817,10 +915,11 @@ def test_upsert_failure_preserves_sticky_and_stamps_attempt(tmp_path):
 
 @node_required
 def test_upsert_failure_stamp_replaces_previous_attempt_line(tmp_path):
+    sha = "ab" * 20
     body = (
-        f"## Claude Code Review (latest)\n{CLAUDE_MARKER}\n\n"
+        f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 1, sha)}\n\n"
         "- Status: success\n- Run: https://runs/1\n"
-        "- Last attempt: failure (old-run)\n\nOLD"
+        f"- Reviewed: {sha}\n- Last attempt: failure (old-run)\n\nOLD"
     )
     calls = _claude_upsert(
         tmp_path, "failure", [_bot("github-actions[bot]", body, 11)], with_review=False
@@ -834,26 +933,21 @@ def test_upsert_failure_stamp_replaces_previous_attempt_line(tmp_path):
 @node_required
 def test_upsert_strips_echoed_meta_from_review_output(tmp_path):
     """에코된 헤더/메타 형태만 정밀 제거하고 정상 리뷰 라인은 살린다."""
-    workdir = tmp_path / "echo"
-    workdir.mkdir()
-    (workdir / "claude-review.md").write_text(
-        "## Claude Code Review (latest)\n"
-        f"{CLAUDE_MARKER}\n"
+    review = (
+        f"{CLAUDE_HEADER}\n"
+        f"{CLAUDE_V2_MARKER}\n"
         "- Status: success\n"
         f"- Reviewed: {'cd' * 20}\n"
         "REAL FINDING\n"
-        "- Run: `pytest -q` to reproduce\n",
-        encoding="utf-8",
+        "- Run: `pytest -q` to reproduce\n"
     )
-    env = {"PR_NUMBER": "7", "RUN_URL": "run-url", "REVIEW_OUTCOME": "success"}
-    calls = _run_upsert(
-        tmp_path, "claude-code-review.yml", "claude-review", "Upsert review comment",
-        env, [], cwd=workdir,
+    calls = _claude_upsert(
+        tmp_path, "success", [], with_review=True, review=review, attempt_head="ab" * 20
     )
     body = [c for c in calls if c[0] == "create"][0][1]["body"]
     assert "REAL FINDING" in body
     assert "- Run: `pytest -q` to reproduce" in body   # 정상 리뷰 라인 생존
-    assert body.count(CLAUDE_MARKER) == 1              # 워크플로우 헤더의 마커만
+    assert body.count(CLAUDE_V2_MARKER) == 1           # 워크플로우 헤더의 마커만
     assert body.count("## Claude Code Review (latest)") == 1
     assert f"- Reviewed: {'cd' * 20}" not in body      # 에코 Reviewed 제거
 
@@ -870,15 +964,7 @@ def test_upsert_failure_without_existing_creates_error_sticky(tmp_path):
 @node_required
 def test_upsert_records_reviewed_sha_on_success(tmp_path):
     sha = "ab12" * 10
-    workdir = tmp_path / "with-sha"
-    workdir.mkdir()
-    (workdir / "claude-review.md").write_text("REVIEW BODY OK", encoding="utf-8")
-    (workdir / "pr_head_sha.txt").write_text(sha, encoding="utf-8")
-    env = {"PR_NUMBER": "7", "RUN_URL": "run-url", "REVIEW_OUTCOME": "success"}
-    calls = _run_upsert(
-        tmp_path, "claude-code-review.yml", "claude-review", "Upsert review comment",
-        env, [], cwd=workdir,
-    )
+    calls = _claude_upsert(tmp_path, "success", [], with_review=True, attempt_head=sha)
     creates = [c for c in calls if c[0] == "create"]
     assert len(creates) == 1
     assert f"- Reviewed: {sha}" in creates[0][1]["body"]
