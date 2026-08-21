@@ -655,6 +655,26 @@ def test_current_release_commit_only_uses_authenticated_objects(
             "github.rest.checks.listForRef",
         ),
         (
+            ".github/workflows/opencode-auto-review.yml",
+            "github.rest.actions.listWorkflowRunsForRepo",
+            "github.rest.actions.getWorkflowRunAttempt",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "name: 'automation/opencode-canonical-review', head_sha: workflowHead",
+            "name: 'automation/opencode-canonical-review', head_sha: attemptHead",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "prepared_run_attempt: handoff.run_attempt",
+            "prepared_run_attempt: runAttempt",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "const maxUntrustedCleanupComments = 20;",
+            "const maxUntrustedCleanupComments = 200;",
+        ),
+        (
             "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml",
             "      actions: read\n      checks: write\n",
             "",
@@ -673,6 +693,10 @@ def test_current_release_commit_only_uses_authenticated_objects(
         "model-checks-actions",
         "canonical-checks",
         "check-protocol",
+        "server-run-discovery",
+        "workflow-head-binding",
+        "prepared-attempt-binding",
+        "bounded-marker-cleanup",
         "baseline-caller-ceiling",
         "self-caller-ceiling",
     ),

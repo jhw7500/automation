@@ -2014,6 +2014,7 @@ def _verify_commit_content(
         try:
             prepare = auto["jobs"]["opencode-prepare"]
             canonical = auto["jobs"]["opencode-canonicalize"]
+            prepare_collect = next(item for item in prepare["steps"] if item.get("name") == "Collect previous review context")
             upload = next(item for item in prepare["steps"] if item.get("name") == "Upload sealed canonicalization handoff")
             model_download = next(item for item in job["steps"] if item.get("name") == "Download sealed review handoff")
             model_validate = next(item for item in job["steps"] if item.get("name") == "Validate sealed review handoff")
@@ -2025,6 +2026,7 @@ def _verify_commit_content(
         expected_prepare = {"actions": "read", "checks": "read", "contents": "read", "pull-requests": "read", "issues": "read"}
         expected_canonical = {"actions": "read", "checks": "write", "contents": "read", "pull-requests": "write", "issues": "write"}
         canonical_script = canonical_step.get("with", {}).get("script", "")
+        prepare_script = prepare_collect.get("run", "")
         model_validation = model_validate.get("run", "")
         artifact_contract = (
             prepare.get("permissions") == expected_prepare
@@ -2044,6 +2046,24 @@ def _verify_commit_content(
             and 'artifact.digest !== `sha256:${process.env.HANDOFF_ARTIFACT_DIGEST}`' in canonical_script
             and "github.rest.checks.create" in canonical_script
             and "github.rest.checks.update" in canonical_script
+            and "github.rest.actions.listWorkflowRunsForRepo" in canonical_script
+            and "github.rest.checks.listForRef" in canonical_script
+            and "response.data.workflow_runs.filter((run) =>" in canonical_script
+            and ").length === 1).slice(0, 20)" in canonical_script
+            and "check_run_id: record.attestationId" not in canonical_script
+            and "event: 'pull_request', status: 'success', per_page: 100, page: 1" in canonical_script
+            and "check_name: 'automation/opencode-canonical-review'" in canonical_script
+            and "name: 'automation/opencode-canonical-review', head_sha: workflowHead" in canonical_script
+            and "workflow_head: workflowHead" in canonical_script
+            and "prepared_run_attempt: handoff.run_attempt" in canonical_script
+            and "github.rest.actions.getWorkflowRunAttempt" in canonical_script
+            and "handoff.run_attempt > runAttempt" in canonical_script
+            and "const maxUntrustedCleanupComments = 20;" in canonical_script
+            and 'gh api "repos/${GITHUB_REPOSITORY}/actions/runs" --method GET' in prepare_script
+            and 'commits/${workflow_head}/check-runs' in prepare_script
+            and 'check-runs/${check_id}' not in prepare_script
+            and prepare.get("outputs", {}).get("workflow_head_sha") == "${{ steps.build-handoff.outputs.workflow_head_sha }}"
+            and canonical_step.get("env", {}).get("WORKFLOW_HEAD") == "${{ needs.opencode-prepare.outputs.workflow_head_sha }}"
             and "automation-attestation" in canonical_script
             and canonical_checkout.get("with", {}).get("persist-credentials") == "false"
             and canonical_checkout.get("with", {}).get("ref") == "${{ needs.opencode-prepare.outputs.head_sha }}"

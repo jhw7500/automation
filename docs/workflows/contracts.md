@@ -185,12 +185,35 @@ The canonicalizer treats every model-window marker-bearing new or changed commen
 untrusted. It restores the newest previously attested fallback, quarantines forgeries, admits
 exactly one new-ID nonce-bound raw candidate, and creates a new canonical comment. It then
 completes a dedicated Check Run only after exact-byte refetch. The receipt binds repository,
-workflow, PR, attempt head, successful head, run ID/attempt, comment ID, body/state digests,
+workflow, PR, attempt head, the server-authored Actions workflow-run head, successful head,
+run ID/attempt, comment ID, body/state digests,
 the actual caller workflow path/event, and the referenced central workflow path/SHA. A later
 collector also requires that bound run attempt and its reusable canonicalizer job to have
 completed successfully; cancelled runs therefore leave no trusted state. Older attested
 comments may be marker-free tombstoned, but the newest prior fallback is retained until a
 future completed run can authenticate the successor.
+
+Receipt discovery never starts from a comment-provided Check ID. Both prepare and live
+canonicalization first query a bounded horizon of recent successful `pull_request` Actions
+runs, retain only runs with the exact central reusable-workflow path and SHA, then list the
+exact named Check Runs on each server-authored workflow-run head. Comment receipt IDs are used
+only for equality after that discovery. An authentic receipt outside the horizon safely causes
+one full review; its next completed canonicalizer receipt returns the state to the horizon.
+The API page is bounded at 100 recent successful PR runs, central reusable-workflow identity is
+filtered before the newest 20 central runs are selected, and each selected head/job query is
+single-page bounded.
+
+A partial GitHub rerun may reuse the immutable handoff produced by an earlier attempt of the
+same run. The handoff's producer attempt is retained as `prepared_run_attempt`; the clean job
+accepts it only when it is no newer than the current attempt and the current server run still
+matches the sealed workflow head, caller path/event, and central reusable workflow identity.
+State, generation ordering, the completed canonicalizer job, and the receipt's `run_attempt`
+always bind the current rerun attempt.
+
+Physical cleanup is also bounded: the exact single nonce candidate has one reserved cleanup
+slot, while at most 20 other untrusted marker-bearing comments are tombstoned per run. Overflow
+remains unattested and therefore ignored by collectors; later runs can drain it without allowing
+comment volume to drive unbounded privileged writes.
 
 Checks are a canonicalizer-only receipt under this workflow's fixed least-privilege caller
 ceiling, not a universal signature against an unrelated workflow independently granted
