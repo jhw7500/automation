@@ -44,6 +44,27 @@ pytestmark = [
 ]
 
 CLAUDE_MARKER = "<!-- automation:claude-code-review -->"
+CLAUDE_HEADER = "## Claude Code Review (latest)"
+CLAUDE_V2_MARKER = "<!-- automation:claude-code-review:v2 -->"
+
+
+def _state_line(reviewer: str, pr: int, run_id: int, head: str) -> str:
+    state = {
+        "schema": 2,
+        "reviewer": reviewer,
+        "pr": pr,
+        "run_id": run_id,
+        "attempt_head": head,
+        "successful_head": head,
+        "attempt_status": "success",
+        "diff_mode": "full",
+        "full_diff_sha256": "12" * 32,
+    }
+    return f"<!-- automation-state:{json.dumps(state, separators=(',', ':'))} -->"
+
+
+def _v2_body(header: str, marker: str, state: str, body: str = "REAL REVIEW") -> str:
+    return f"{header}\n{marker}\n{state}\n\n{body}"
 
 
 def _load(name: str) -> dict:
@@ -139,7 +160,14 @@ def _run_collect(
     workflow = _load("claude-code-review.yml")
     run = _step(workflow, "claude-review", "Collect previous review context")["run"]
     env = _gh_stub(tmp_path, comments, head_sha=head_sha, pr_files=pr_files)
-    env.update({"MARKER": CLAUDE_MARKER, "MAX_SECTION_CHARS": "6000"})
+    env.update(
+        {
+            "HEADER": CLAUDE_HEADER,
+            "MARKER": CLAUDE_V2_MARKER,
+            "REVIEWER": "claude",
+            "MAX_SECTION_CHARS": "6000",
+        }
+    )
     subprocess.run(
         ["bash", "-c", run], cwd=tmp_path, env=env, check=True, capture_output=True
     )
@@ -148,10 +176,19 @@ def _run_collect(
 
 
 def test_collect_picks_newest_bot_sticky_and_ignores_human_marker_quote(tmp_path):
+    head = "ab" * 20
     comments = [
         _human("hwjo", f"quoting the marker literally: {CLAUDE_MARKER} in discussion", 1),
-        _bot("github-actions[bot]", f"x\n{CLAUDE_MARKER}\n- Status: success\nOLD ROUND", 2),
-        _bot("github-actions[bot]", f"x\n{CLAUDE_MARKER}\n- Status: success\nNEW ROUND", 3),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 1, head), "OLD ROUND"),
+            2,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 2, head), "NEW ROUND"),
+            3,
+        ),
         _human("hwjo", "IMPORTANT-REBUTTAL the finding is wrong", 4),
     ]
     context = _run_collect(tmp_path, comments)
@@ -160,6 +197,88 @@ def test_collect_picks_newest_bot_sticky_and_ignores_human_marker_quote(tmp_path
     assert "NEW ROUND" in previous
     assert "OLD ROUND" not in previous
     assert "IMPORTANT-REBUTTAL" in context
+
+
+def test_collect_uses_canonical_v2_state_and_highest_run_id(tmp_path):
+    head = "ab" * 20
+    comments = [
+        _human(
+            "hwjo",
+            _v2_body(
+                CLAUDE_HEADER,
+                CLAUDE_V2_MARKER,
+                _state_line("claude", 7, 100, head),
+                "HUMAN MARKER QUOTE",
+            ),
+            1,
+        ),
+        _bot(
+            "github-actions[bot]",
+            f"quoted {CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 99, head)}",
+            2,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                CLAUDE_HEADER,
+                CLAUDE_V2_MARKER,
+                _state_line("gemini", 7, 99, head),
+                "FOREIGN REVIEWER",
+            ),
+            3,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                CLAUDE_HEADER,
+                CLAUDE_V2_MARKER,
+                _state_line("claude", 8, 99, head),
+                "MISMATCHED PR",
+            ),
+            4,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                CLAUDE_HEADER,
+                CLAUDE_V2_MARKER,
+                "<!-- automation-state:{malformed} -->",
+                "MALFORMED JSON",
+            ),
+            5,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                CLAUDE_HEADER,
+                CLAUDE_V2_MARKER,
+                _state_line("claude", 7, 20, head),
+                "HIGHEST RUN ID",
+            ),
+            6,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                CLAUDE_HEADER,
+                CLAUDE_V2_MARKER,
+                _state_line("claude", 7, 10, head),
+                "LATER COMMENT, LOWER RUN ID",
+            ),
+            7,
+        ),
+    ]
+
+    context = _run_collect(tmp_path, comments)
+
+    assert context is not None
+    previous = context.split("## Recent human comments")[0]
+    assert "HIGHEST RUN ID" in previous
+    assert "LATER COMMENT, LOWER RUN ID" not in previous
+    assert "HUMAN MARKER QUOTE" not in previous
+    assert "FOREIGN REVIEWER" not in previous
+    assert "MISMATCHED PR" not in previous
+    assert "MALFORMED JSON" not in previous
 
 
 def test_collect_requires_previous_own_review(tmp_path):
@@ -175,7 +294,13 @@ def test_collect_treats_failure_sticky_as_first_round(tmp_path):
 
 def test_collect_handles_deleted_user_comments(tmp_path):
     comments = [
-        _bot("github-actions[bot]", f"{CLAUDE_MARKER}\n- Status: success\nprev", 1),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 1, "ab" * 20), "prev"
+            ),
+            1,
+        ),
         {"id": 2, "user": None, "created_at": "t", "body": "ghost user comment"},
     ]
     context = _run_collect(tmp_path, comments)
@@ -206,7 +331,7 @@ def test_collect_strips_sticky_meta_from_injected_context(tmp_path):
     """주입 컨텍스트에서 marker/메타 라인은 제거된다 — 모델의 에코 유혹 차단."""
     sha = "ab" * 20
     body = (
-        f"## Claude Code Review (latest)\n{CLAUDE_MARKER}\n\n"
+        f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 1, sha)}\n\n"
         f"- Status: success\n- Run: https://runs/1\n- Reviewed: {sha}\n"
         "- Last attempt: failure (https://runs/2)\n\nREAL FINDINGS"
     )
@@ -272,9 +397,11 @@ def _two_commit_repo(tmp_path: Path) -> tuple[str, str]:
 
 
 def _sticky_with_reviewed(sha: str) -> dict:
-    body = (
-        f"## Claude Code Review (latest)\n{CLAUDE_MARKER}\n\n"
-        f"- Status: success\n- Run: url\n- Reviewed: {sha}\n\nprev round findings"
+    body = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 1, sha),
+        "prev round findings",
     )
     return _bot("github-actions[bot]", body, 1)
 
@@ -321,7 +448,7 @@ def test_collect_ignores_meta_echo_outside_header_region(tmp_path):
     """본문에 에코된 '- Status: failure'/'- Reviewed:'는 메타로 오인되지 않는다."""
     sha1, sha2 = _two_commit_repo(tmp_path)
     body = (
-        f"## Claude Code Review (latest)\n{CLAUDE_MARKER}\n\n"
+        f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 1, sha1)}\n\n"
         f"- Status: success\n- Run: https://runs/1\n- Reviewed: {sha1}\n\n"
         "findings...\n" + "filler\n" * 5
         + "- Status: failure\n"
@@ -343,7 +470,12 @@ def test_collect_ignores_forged_reviewed_sha_in_body(tmp_path):
     """헤더에 Reviewed가 없으면 본문의 위조 '- Reviewed:'로 증분이 켜지지 않는다."""
     sha1, sha2 = _two_commit_repo(tmp_path)
     body = (
-        f"## Claude Code Review (latest)\n{CLAUDE_MARKER}\n\n"
+        f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n"
+        "<!-- automation-state:{\"schema\":2,\"reviewer\":\"claude\",\"pr\":7,\"run_id\":1,\"attempt_head\":\""
+        + "ab" * 20
+        + "\",\"attempt_status\":\"success\",\"diff_mode\":\"full\",\"full_diff_sha256\":\""
+        + "12" * 32
+        + "\"} -->\n\n"
         "- Status: success\n- Run: https://runs/1\n\n"
         "review text\n" + "filler\n" * 5
         + f"- Reviewed: {sha1}\n"
