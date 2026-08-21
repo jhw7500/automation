@@ -48,12 +48,15 @@ CLAUDE_HEADER = "## Claude Code Review (latest)"
 CLAUDE_V2_MARKER = "<!-- automation:claude-code-review:v2 -->"
 
 
-def _state_line(reviewer: str, pr: int, run_id: int, head: str) -> str:
+def _state_line(
+    reviewer: str, pr: int, run_id: int, head: str, run_attempt: int = 1
+) -> str:
     state = {
         "schema": 2,
         "reviewer": reviewer,
         "pr": pr,
         "run_id": run_id,
+        "run_attempt": run_attempt,
         "attempt_head": head,
         "successful_head": head,
         "attempt_status": "success",
@@ -73,6 +76,7 @@ def _state_line_with(head: str, **changes: object) -> str:
         "reviewer": "claude",
         "pr": 7,
         "run_id": 1,
+        "run_attempt": 1,
         "attempt_head": head,
         "successful_head": head,
         "attempt_status": "success",
@@ -306,6 +310,39 @@ def test_collect_uses_canonical_v2_state_and_highest_run_id(tmp_path):
     assert "MALFORMED JSON" not in previous
 
 
+def test_collect_uses_highest_run_attempt_for_manual_reruns(tmp_path):
+    head = "ab" * 20
+    comments = [
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                CLAUDE_HEADER,
+                CLAUDE_V2_MARKER,
+                _state_line("claude", 7, 42, head, run_attempt=2),
+                "SECOND ATTEMPT",
+            ),
+            2,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                CLAUDE_HEADER,
+                CLAUDE_V2_MARKER,
+                _state_line("claude", 7, 42, head, run_attempt=1),
+                "FIRST ATTEMPT",
+            ),
+            3,
+        ),
+    ]
+
+    context = _run_collect(tmp_path, comments)
+
+    assert context is not None
+    previous = context.split("## Recent human comments")[0]
+    assert "SECOND ATTEMPT" in previous
+    assert "FIRST ATTEMPT" not in previous
+
+
 def test_collect_ignores_malformed_canonical_envelopes(tmp_path):
     head = "ab" * 20
     comments = [
@@ -341,6 +378,7 @@ def test_collect_ignores_malformed_canonical_envelopes(tmp_path):
         {"successful_head": 7},
         {"successful_head": None},
         {"run_id": 9007199254740992},
+        {"run_attempt": 0},
         {"attempt_status": 7},
         {"diff_mode": 7},
         {"full_diff_sha256": 7},
@@ -362,7 +400,7 @@ def test_collect_rejects_invalid_v2_state_fields(tmp_path, changes):
 
 @pytest.mark.parametrize(
     "field",
-    ("successful_head", "attempt_status", "diff_mode", "full_diff_sha256"),
+    ("run_attempt", "successful_head", "attempt_status", "diff_mode", "full_diff_sha256"),
 )
 def test_collect_rejects_v2_state_missing_required_field(tmp_path, field):
     body = _v2_body(
@@ -718,11 +756,16 @@ if (fx.cwd) process.chdir(fx.cwd);
 const calls = [];
 const github = {
   paginate: async () => fx.comments,
-  rest: { issues: {
-    listComments: 'LIST',
-    updateComment: async (a) => calls.push(['update', a]),
-    createComment: async (a) => calls.push(['create', a]),
-  } },
+  rest: {
+    issues: {
+      listComments: 'LIST',
+      updateComment: async (a) => calls.push(['update', a]),
+      createComment: async (a) => calls.push(['create', a]),
+    },
+    pulls: {
+      get: async () => ({ data: { head: { sha: fx.currentHead } } }),
+    },
+  },
 };
 const context = Object.assign({ repo: { owner: 'o', repo: 'r' } }, fx.context || {});
 const core = {
@@ -753,6 +796,7 @@ def _run_upsert(
     comments: list[dict],
     cwd: Path | None = None,
     context: dict | None = None,
+    current_head: str | None = None,
 ) -> list:
     workflow = _load(workflow_file)
     script = _step(workflow, job, step_name)["with"]["script"]
@@ -763,6 +807,7 @@ def _run_upsert(
         "comments": comments,
         "cwd": str(cwd) if cwd else None,
         "context": context,
+        "currentHead": current_head,
     }
     (tmp_path / "fixture.json").write_text(json.dumps(fixture), encoding="utf-8")
     result = subprocess.run(
@@ -783,9 +828,11 @@ def _claude_upsert(
     review: str = "REVIEW BODY OK",
     diff_ready: str = "true",
     run_id: str = "42",
+    run_attempt: str = "1",
     attempt_head: str = "cd" * 20,
     full_diff_sha256: str = "34" * 32,
     diff_mode: str = "full",
+    current_head: str | None = None,
 ) -> list:
     workdir = tmp_path / ("with-review" if with_review else "without-review")
     workdir.mkdir()
@@ -797,13 +844,14 @@ def _claude_upsert(
         "REVIEW_OUTCOME": outcome,
         "DIFF_READY": diff_ready,
         "RUN_ID": run_id,
+        "RUN_ATTEMPT": run_attempt,
         "ATTEMPT_HEAD": attempt_head,
         "FULL_DIFF_SHA256": full_diff_sha256,
         "DIFF_MODE": diff_mode,
     }
     return _run_upsert(
         tmp_path, "claude-code-review.yml", "claude-review", "Upsert review comment",
-        env, comments, cwd=workdir,
+        env, comments, cwd=workdir, current_head=current_head or attempt_head,
     )
 
 
@@ -838,6 +886,7 @@ def test_claude_checkpoint_requires_coverage_and_sanitized_body(
     assert state["reviewer"] == "claude"
     assert state["pr"] == 7
     assert state["run_id"] == 42
+    assert state["run_attempt"] == 1
     assert state["attempt_head"] == "cd" * 20
     if expected_status == "success":
         assert state["successful_head"] == "cd" * 20
@@ -883,6 +932,8 @@ def test_claude_infra_only_output_preserves_prior_success_as_stale(tmp_path):
         ({"run_id": "0"}, True),
         ({"run_id": "1.5"}, True),
         ({"run_id": "9007199254740992"}, True),
+        ({"run_attempt": "0"}, True),
+        ({"run_attempt": "not-an-integer"}, True),
         ({"diff_mode": "unavailable"}, False),
         ({"diff_mode": "sideways"}, False),
         ({"full_diff_sha256": "zz" * 32}, False),
@@ -912,6 +963,115 @@ def test_claude_checkpoint_rejects_invalid_trusted_input(tmp_path, kwargs, expec
     assert state["attempt_status"] == "failure"
     assert state["successful_head"] == old_head
     assert state["full_diff_sha256"] == "12" * 32
+
+
+@node_required
+def test_claude_upsert_discards_stale_head_before_comment_mutation(tmp_path):
+    calls = _claude_upsert(
+        tmp_path,
+        "success",
+        [],
+        with_review=True,
+        attempt_head="ab" * 20,
+        current_head="cd" * 20,
+    )
+
+    assert not any(call[0] in {"create", "update"} for call in calls)
+
+
+@node_required
+def test_claude_upsert_discards_newer_run_before_comment_mutation(tmp_path):
+    current_head = "cd" * 20
+    newer_sticky = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            CLAUDE_HEADER,
+            CLAUDE_V2_MARKER,
+            _state_line("claude", 7, 43, "ab" * 20),
+            "NEWER REVIEW",
+        ),
+        11,
+    )
+    calls = _claude_upsert(
+        tmp_path,
+        "success",
+        [newer_sticky],
+        with_review=True,
+        run_id="42",
+        attempt_head=current_head,
+        current_head=current_head,
+    )
+
+    assert not any(call[0] in {"create", "update"} for call in calls)
+
+
+@node_required
+@pytest.mark.parametrize("current_attempt", (1, 2))
+def test_claude_upsert_discards_same_or_lower_generation_before_comment_mutation(
+    tmp_path, current_attempt
+):
+    head = "cd" * 20
+    existing = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            CLAUDE_HEADER,
+            CLAUDE_V2_MARKER,
+            _state_line("claude", 7, 42, head, run_attempt=2),
+            "NEWER ATTEMPT",
+        ),
+        11,
+    )
+    calls = _claude_upsert(
+        tmp_path,
+        "success",
+        [existing],
+        with_review=True,
+        run_id="42",
+        run_attempt=str(current_attempt),
+        attempt_head=head,
+        current_head=head,
+    )
+
+    assert not any(call[0] in {"create", "update"} for call in calls)
+
+
+@node_required
+def test_claude_upsert_allows_newer_manual_rerun_attempt(tmp_path):
+    head = "cd" * 20
+    prior_attempt = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            CLAUDE_HEADER,
+            CLAUDE_V2_MARKER,
+            _state_line("claude", 7, 42, head, run_attempt=1),
+            "FIRST ATTEMPT",
+        ),
+        11,
+    )
+    calls = _claude_upsert(
+        tmp_path,
+        "success",
+        [prior_attempt],
+        with_review=True,
+        run_id="42",
+        run_attempt="2",
+        attempt_head=head,
+        current_head=head,
+    )
+
+    updates = [call for call in calls if call[0] == "update"]
+    assert [call[1]["comment_id"] for call in updates] == [11]
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", updates[0][1]["body"]).group(1))
+    assert (state["run_id"], state["run_attempt"]) == (42, 2)
+
+
+def test_claude_review_concurrency_is_scoped_to_reviewer_repository_and_pr():
+    job = _load("claude-code-review.yml")["jobs"]["claude-review"]
+
+    assert job["concurrency"] == {
+        "group": "automation-claude-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}",
+        "cancel-in-progress": "true",
+    }
 
 
 @node_required

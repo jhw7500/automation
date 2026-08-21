@@ -91,6 +91,9 @@ jobs:
   claude-review:
     needs: check-enabled
     if: needs.check-enabled.outputs.enabled == 'true' && needs.check-enabled.outputs.auto_enabled == 'true'
+    concurrency:
+      group: automation-claude-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}
+      cancel-in-progress: true
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
@@ -141,7 +144,8 @@ jobs:
 
           # 정확한 v2 envelope만 수집한다. marker를 본문 어딘가에 인용한 사람/다른 봇의
           # 코멘트, 다른 reviewer/PR의 envelope, 손상된 JSON은 모두 후보가 아니다.
-          # GitHub의 댓글 정렬 순서가 아닌 state.run_id가 가장 큰 정식 레코드를 고른다.
+          # GitHub의 댓글 정렬 순서가 아닌 (state.run_id, state.run_attempt)가 가장 큰
+          # 정식 레코드를 고른다. 수동 재실행은 run_id가 같고 run_attempt만 증가한다.
           PREV_RECORD="$(jq -c \
             --arg header "$HEADER" \
             --arg marker "$MARKER" \
@@ -168,11 +172,12 @@ jobs:
                 | select($lines[0] == $header and $lines[1] == $marker)
                 | (($lines[2]? // "") | (capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$")? | .json? | fromjson?)) as $s
                 | select(($s | type) == "object")
-                | select($s | has("schema") and has("reviewer") and has("pr") and has("run_id") and has("attempt_head") and has("successful_head") and has("attempt_status") and has("diff_mode") and has("full_diff_sha256"))
+                | select($s | has("schema") and has("reviewer") and has("pr") and has("run_id") and has("run_attempt") and has("attempt_head") and has("successful_head") and has("attempt_status") and has("diff_mode") and has("full_diff_sha256"))
                 | select(($s.schema | type) == "number" and $s.schema == 2)
                 | select(($s.reviewer | type) == "string" and $s.reviewer == $reviewer)
                 | select(($s.pr | type) == "number" and $s.pr == ($pr | tonumber))
                 | select($s.run_id | positive_integer)
+                | select($s.run_attempt | positive_integer)
                 | select($s.attempt_head | sha1)
                 | select($s | successful_pair)
                 | select($s.attempt_status | attempt_status)
@@ -180,7 +185,7 @@ jobs:
                 | {comment: ., state: $s};
 
               [.[] | parsed_state($header; $marker; $reviewer; $pr)]
-              | sort_by(.state.run_id)
+              | sort_by(.state.run_id, .state.run_attempt)
               | last // null
             ' "$COMMENTS")"
           # State and prose are deliberately exported separately: later checkpoints consume
@@ -416,6 +421,7 @@ jobs:
           REVIEW_OUTCOME: ${{ steps.claude-review.outcome }}
           DIFF_READY: ${{ steps.prepare-review-input.outputs.diff_ready }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           ATTEMPT_HEAD: ${{ steps.prepare-review-input.outputs.attempt_head }}
           FULL_DIFF_SHA256: ${{ steps.prepare-review-input.outputs.full_diff_sha256 }}
           DIFF_MODE: ${{ steps.prepare-review-input.outputs.diff_mode }}
@@ -434,6 +440,10 @@ jobs:
             const runIdIsValid = /^[1-9][0-9]*$/.test(runIdRaw)
               && Number.isSafeInteger(Number(runIdRaw));
             const runId = runIdIsValid ? Number(runIdRaw) : NaN;
+            const runAttemptRaw = process.env.RUN_ATTEMPT || '';
+            const runAttemptIsValid = /^[1-9][0-9]*$/.test(runAttemptRaw)
+              && Number.isSafeInteger(Number(runAttemptRaw));
+            const runAttempt = runAttemptIsValid ? Number(runAttemptRaw) : NaN;
             const attemptHead = process.env.ATTEMPT_HEAD || '';
             const fullDiffSha256 = process.env.FULL_DIFF_SHA256 || '';
             const diffMode = process.env.DIFF_MODE || (diffReady ? 'full' : 'unavailable');
@@ -469,6 +479,7 @@ jobs:
             const validState = (state) => state && state.schema === 2
               && state.reviewer === 'claude' && state.pr === issueNumber
               && Number.isSafeInteger(state.run_id) && state.run_id > 0
+              && Number.isSafeInteger(state.run_attempt) && state.run_attempt > 0
               && sha1(state.attempt_head)
               && (state.successful_head === null
                 ? state.full_diff_sha256 === null
@@ -488,14 +499,22 @@ jobs:
                 return null;
               }
             };
-            const records = comments.map(parseRecord).filter(Boolean).sort((a, b) => a.state.run_id - b.state.run_id);
+            const records = comments.map(parseRecord).filter(Boolean).sort((a, b) =>
+              a.state.run_id - b.state.run_id || a.state.run_attempt - b.state.run_attempt
+            );
             const existing = records[records.length - 1];
-            if (!runIdIsValid || !sha1(attemptHead)) {
+            if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead)) {
               core.notice('Claude review trusted attempt identity is invalid; left the existing sticky state unchanged.');
               return;
             }
-            if (existing && existing.state.run_id >= runId) {
-              core.notice(`Claude review run ${runId} is stale; kept newer sticky state from run ${existing.state.run_id}.`);
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: issueNumber });
+            if (pr.head?.sha !== attemptHead) {
+              core.notice(`Discarding stale review for ${attemptHead}; current head is ${pr.head?.sha || 'unknown'}`);
+              return;
+            }
+            if (existing && (existing.state.run_id > runId
+              || (existing.state.run_id === runId && existing.state.run_attempt >= runAttempt))) {
+              core.notice(`Discarding stale review generation (${runId}, ${runAttempt}); state is already at (${existing.state.run_id}, ${existing.state.run_attempt}).`);
               return;
             }
 
@@ -517,6 +536,7 @@ jobs:
               reviewer: 'claude',
               pr: issueNumber,
               run_id: runId,
+              run_attempt: runAttempt,
               attempt_head: attemptHead,
               successful_head: successfulHead,
               attempt_status: checkpointFailed ? 'failure' : 'success',
