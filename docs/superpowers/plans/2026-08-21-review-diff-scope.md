@@ -38,7 +38,7 @@
 
 - [ ] **Step 1: Write subprocess-backed unit tests**
 
-Create local Git repositories and a PATH-shimmed `gh` fixture. Cover first-round full diff, valid incremental diff, previous non-ancestor fallback, PR-files API failure with numbered full-diff fallback, and total preparation failure.
+Create local Git repositories and a PATH-shimmed `gh` fixture. Cover first-round full diff, valid incremental diff, previous non-ancestor fallback, PR-files API failure with numbered full-diff fallback, total preparation failure, equal metadata snapshots around mutable PR reads, and changed-head/base snapshots that fail closed.
 
 ```python
 def run_prepare(repo: Path, gh_fixture: GhFixture, *extra: str) -> subprocess.CompletedProcess[str]:
@@ -86,7 +86,7 @@ Validate repository syntax, positive PR number, SHA/hash formats, non-negative c
 
 - [ ] **Step 4: Implement metadata and PR-file retrieval**
 
-Call `gh api repos/o/r/pulls/7` and `gh api repos/o/r/pulls/7/files --paginate --slurp`. Flatten page arrays, require string `filename`, include string `previous_filename` for renamed files, de-duplicate while preserving order, and retain decoded Python strings unchanged.
+Call `gh api repos/o/r/pulls/7` before and after the mutable PR inputs, and call `gh api repos/o/r/pulls/7/files --paginate --slurp` between those snapshots. Flatten page arrays, require string `filename`, include string `previous_filename` for renamed files, de-duplicate while preserving order, and retain decoded Python strings unchanged. Require both metadata responses to contain valid, identical base/head SHAs before returning any ready result; a changed or malformed snapshot removes staged outputs and returns `unavailable`.
 
 - [ ] **Step 5: Implement full and incremental diff generation**
 
@@ -99,7 +99,7 @@ argv = [
 ]
 ```
 
-For the full diff use `merge_base..head`; for delta use `previous..head` only after ancestor validation and only with a successfully fetched PR path set. If local full preparation fails, invoke `gh pr diff 7` with the explicit PR number. Atomically replace output files only after command success.
+For the full diff use `merge_base..head`; for delta use `previous..head` only after ancestor validation and only with a successfully fetched PR path set. If local full preparation fails, invoke `gh pr diff 7` with the explicit PR number. The final metadata snapshot must occur after any numbered fallback so its mutable bytes are covered by the same equality check. Atomically replace output files only after command success and snapshot agreement.
 
 - [ ] **Step 6: Implement hashes and unchanged behavior**
 

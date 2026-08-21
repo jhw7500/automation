@@ -275,6 +275,12 @@ Run: `python3 -m pytest tests/test_review_workflow_logic.py -k 'gemini and (cano
 
 Replace `gh pr diff ... || echo "No diff available" > pr_diff.txt` with an explicit readiness file and SHA-256 file. Parse only the exact Gemini v2 prefix and state schema. Keep the existing 429 retry loop and `-U20` context.
 
+Read and validate the PR head immediately before and after `gh pr diff`. Mark the input
+ready and bind `attempt_head` only when both 40-hex values match; otherwise remove the diff,
+leave its hash empty, and skip the model. Add executable positive and negative preparation
+fixtures for stable, changed, and malformed heads. A `DIFF_LIMIT`-truncated prompt is partial
+coverage and must take the failure/stale transition rather than advancing a checkpoint.
+
 ```bash
 if gh pr diff "$PR_NUMBER" > pr_diff.txt 2>/dev/null && [ -s pr_diff.txt ]; then
   printf 'true' > review_diff_ready.txt
@@ -330,9 +336,10 @@ Expected: foreign bot quote still displaces the genuine review before implementa
 - [ ] **Step 3: Snapshot comments and prepare the attempt input**
 
 During context collection, save the fetched comment IDs and update timestamps to
-`opencode-comments-before.json`. Fetch and validate the PR head into
-`opencode-attempt-head.txt`. Prepare `opencode-review-full.diff` with an explicitly numbered
-`gh pr diff`, record readiness and its SHA-256, and skip the CLI if preparation fails.
+`opencode-comments-before.json`. Fetch and validate the PR head before and after preparing
+`opencode-review-full.diff` with an explicitly numbered `gh pr diff`; write
+`opencode-attempt-head.txt`, readiness, and SHA-256 only when the two heads match. Skip the
+CLI and leave the attempt identity untrusted if either head is malformed or changed.
 Previous context uses only a validated v2 envelope. The second plan replaces this temporary
 inline preparation with the shared action.
 

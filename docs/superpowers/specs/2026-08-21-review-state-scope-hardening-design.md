@@ -178,11 +178,14 @@ output filenames, and context-line count. It writes:
 
 ### 7.2 Full PR input
 
-The helper fetches PR base/head metadata and the paginated Pulls Files REST response. JSON
-decoding produces real path strings; filenames are never transported through a
-newline-delimited shell file. It fetches the required commits, verifies the head object,
-and prepares a merge-base-to-head diff. The local full diff is restricted to the API's PR
-file set, including both `filename` and `previous_filename` for renames.
+The helper fetches PR base/head metadata before and after every mutable PR API input needed
+for preparation, including the paginated Pulls Files response and any numbered server-diff
+fallback. It produces a ready result only when both validated metadata snapshots have the
+same base and head. JSON decoding produces real path strings; filenames are never
+transported through a newline-delimited shell file. It fetches the required commits,
+verifies the head object, and prepares a merge-base-to-head diff. The local full diff is
+restricted to the API's PR file set, including both `filename` and `previous_filename` for
+renames.
 
 If local preparation is unavailable, an explicitly numbered `gh pr diff <pr>` is the only
 fallback. If both mechanisms fail, `diff_ready=false`; the model does not run and no
@@ -226,6 +229,10 @@ full review rather than claiming no change.
 - Retain bounded 429 retry behavior, but cancellation and generation checks prevent a
   delayed retry from overwriting a newer result.
 - Sanitize before success evaluation exactly as Claude does.
+- Bind the inline Slice 1 full diff to equal validated head reads before and after fetch;
+  Slice 2 moves that invariant into the shared helper.
+- A prompt truncated by Gemini's bounded input limit is partial coverage: its model body
+  cannot advance `successful_head` or the stored full-diff hash.
 
 ### 8.3 OpenCode
 
@@ -269,7 +276,8 @@ input and receive the same instruction.
 | Full PR input unavailable | no | latest-head failure/stale stamp only | unchanged |
 | Model/action failure | attempted | latest-head failure/stale stamp only | unchanged |
 | Sanitized output empty | attempted | latest-head failure/stale stamp only | unchanged |
-| PR head changed during run | result discarded | none | unchanged |
+| PR head changed during input preparation | no | none | unchanged |
+| PR head changed after preparation | result discarded | none | unchanged |
 | Stored run is newer | result discarded | none | unchanged |
 | Previous state invalid | yes, full review | success only after normal gates | current head |
 | Full diff hash unchanged | no | preserve body, advance canonical state | current head |
@@ -321,6 +329,7 @@ Tests execute the production parser/helper paths rather than string-only stand-i
 - diff-unavailable text cannot become success;
 - H1/H2 success/failure completion in every ordering;
 - head changes immediately before upsert;
+- head changes during diff preparation, plus the stable-head positive preparation path;
 - failed latest attempt preserves body and successful SHA but records stale state.
 
 ### Diff preparation
@@ -328,6 +337,8 @@ Tests execute the production parser/helper paths rather than string-only stand-i
 - first-round full review and valid incremental review;
 - shallow clone recovery and force-push/non-ancestor fallback;
 - PR-files API failure and full-diff failure;
+- different valid PR metadata snapshots around mutable API reads fail closed, while equal
+  snapshots bind the exact head and full hash;
 - mixed ASCII plus Unicode and embedded-newline filenames;
 - glob-like paths such as `[id].tsx`;
 - rename, deletion, binary, executable-mode, symlink, and submodule changes;
