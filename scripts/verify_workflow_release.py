@@ -290,6 +290,7 @@ PREPARE_REVIEW_DIFF_ACTION = (
 REVIEW_DIFF_DEPENDENCY_WORKFLOWS = (
     "claude-code-review.yml",
     "gemini-auto-review.yml",
+    "opencode-auto-review.yml",
 )
 GIT_EXECUTABLE = "/usr/bin/git"
 CANONICAL_AUTOMATION_REMOTE = "https://github.com/jhw7500/automation.git"

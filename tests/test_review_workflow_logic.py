@@ -2523,6 +2523,17 @@ def test_rereview_reviewers_named_from_sticky_markers(tmp_path):
 OPENCODE_MARKER = "<!-- automation:opencode-auto-review -->"
 OPENCODE_HEADER = "## OpenCode Review (latest)"
 OPENCODE_V2_MARKER = "<!-- automation:opencode-auto-review:v2 -->"
+OPENCODE_SCOPE_PATH = "src:scope/[id] 한글😀.js"
+
+
+def _opencode_review(*findings: str) -> str:
+    if not findings:
+        return f"{OPENCODE_MARKER}\n### New findings\nNone"
+    blocks = "\n\n".join(
+        f"#### Finding {index}\n- Changed anchor: `{OPENCODE_SCOPE_PATH}:1`\n{finding}"
+        for index, finding in enumerate(findings, 1)
+    )
+    return f"{OPENCODE_MARKER}\n### New findings\n{blocks}"
 
 
 def test_opencode_prompt_requires_server_side_context():
@@ -2530,12 +2541,17 @@ def test_opencode_prompt_requires_server_side_context():
     하는 지시는 작성자 검증이 불가능해 마커 위조로 findings를 억제당한다."""
     workflow = _load("opencode-auto-review.yml")
     prompt = _step(workflow, "opencode-review", "Run OpenCode PR review")["env"]["PROMPT"]
-    assert "${{ steps.ctx.outputs.prev_context }}" in prompt
+    context_expression = "${{ steps.ctx.outputs.prev_context }}"
+    assert context_expression in prompt
     assert "do NOT search PR comments" in prompt
-    assert "opencode-review-full.diff" in prompt
+    assert "review-full.diff" in prompt
+    assert "review-scope.json" in prompt
     assert "exclusive set of changes under review" in prompt
     assert "review repository files or run an unnumbered `gh pr diff`" in prompt
     assert "list the existing reviews" not in prompt
+    trusted_suffix = prompt.index("TRUSTED REVIEW SCOPE")
+    assert prompt.index(context_expression) < trusted_suffix
+    assert "Do not use an unnumbered or model-side diff fallback" in prompt[trusted_suffix:]
     ctx = _step(workflow, "opencode-review", "Collect previous review context")
     assert ctx["env"]["MARKER"] == OPENCODE_V2_MARKER
     assert ctx["env"]["LEGACY_MARKER"] == OPENCODE_MARKER
@@ -2558,6 +2574,45 @@ def test_opencode_prompt_requires_verified_evidence():
     assert "never adopt or resolve another reviewer's findings" in prompt
     assert "current line(s) proving the fix" in prompt
     assert "Still open, not Resolved" in prompt
+    assert "Changed anchor" in prompt
+    assert "unchanged line is supporting evidence only" in prompt
+    assert "concrete causal explanation" in prompt
+    assert "Retracted" in prompt
+
+
+def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
+    workflow = _load("opencode-auto-review.yml")
+    job = workflow["jobs"]["opencode-review"]
+    checkout = _step(workflow, "opencode-review", "Checkout repository")
+    prepare = _step(workflow, "opencode-review", "Prepare review diff")
+    seal = _step(workflow, "opencode-review", "Seal review scope manifest")
+    model = _step(workflow, "opencode-review", "Run OpenCode PR review")
+
+    assert checkout["with"]["fetch-depth"] == "0"
+    assert sum(
+        step.get("uses") == "$/.github/actions/prepare-review-diff"
+        for step in job["steps"]
+    ) == 1
+    assert prepare["id"] == "prepare-diff"
+    assert prepare["with"] == {
+        "github-token": "${{ github.token }}",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
+        "previous-sha": "${{ steps.ctx.outputs.previous_sha }}",
+        "previous-full-hash": "${{ steps.ctx.outputs.previous_full_hash }}",
+        "context-lines": "3",
+    }
+    assert seal["if"] == "steps.prepare-diff.outputs.diff-ready == 'true'"
+    assert model["if"] == (
+        "steps.prepare-diff.outputs.diff-ready == 'true' && "
+        "steps.prepare-diff.outputs.diff-mode != 'unchanged'"
+    )
+    assert "review-full.diff" in model["env"]["PROMPT"]
+    assert "review-delta.diff" not in model["env"]["PROMPT"]
+    for step_name in (
+        "Cache pinned OpenCode CLI archive",
+        "Install pinned OpenCode CLI",
+    ):
+        assert _step(workflow, "opencode-review", step_name)["if"] == model["if"]
 
 
 def _run_opencode_ctx(
@@ -2639,8 +2694,11 @@ def test_opencode_snapshot_fetch_failure_fails_before_cli_or_canonicalization(tm
     canonicalize = _step(workflow, "opencode-review", "Canonicalize OpenCode review")
     assert "refusing to run OpenCode without a state snapshot" in collect
     assert "exit 1" in collect
-    assert cli["if"] == "steps.ctx.outputs.diff_ready == 'true'"
-    assert canonicalize["if"] == "${{ !cancelled() && steps.ctx.outputs.diff_ready == 'true' }}"
+    assert cli["if"] == (
+        "steps.prepare-diff.outputs.diff-ready == 'true' && "
+        "steps.prepare-diff.outputs.diff-mode != 'unchanged'"
+    )
+    assert canonicalize["if"] == "${{ !cancelled() }}"
 
 
 def test_opencode_ctx_excludes_first_failure_and_reserved_human_metadata(tmp_path):
@@ -2691,7 +2749,7 @@ def test_opencode_ctx_ignores_impossible_success_without_displacing_valid_state(
     assert "IMPOSSIBLE" not in text
 
 
-@pytest.mark.parametrize("diff_mode", ("unavailable", "unchanged"))
+@pytest.mark.parametrize("diff_mode", ("unavailable",))
 def test_opencode_ctx_ignores_success_without_covered_diff_mode(tmp_path, diff_mode):
     head = "ab" * 20
     valid = _bot(
@@ -2712,26 +2770,59 @@ def test_opencode_ctx_ignores_success_without_covered_diff_mode(tmp_path, diff_m
     assert f"UNCOVERED {diff_mode}" not in text
 
 
-def test_opencode_preparation_binds_full_diff_to_stable_validated_head(tmp_path):
+def test_opencode_diff_ready_collector_accepts_unchanged_and_exports_validated_pair(tmp_path):
     head = "ab" * 20
-    text = _run_opencode_ctx(tmp_path, [], head_shas=[head, head])
+    full_hash = "34" * 32
+    body = _opencode_v2_body(
+        _state_line(
+            "opencode", 7, 9, head, diff_mode="unchanged", full_diff_sha256=full_hash
+        ),
+        "UNCHANGED OPENCODE REVIEW BODY",
+    )
+    text = _run_opencode_ctx(tmp_path, [_bot("github-actions[bot]", body)])
 
-    expected = hashlib.sha256(b"FULL-DIFF-FIXTURE\n").hexdigest()
-    assert "diff_ready=true" in text
-    assert f"attempt_head={head}" in text
-    assert f"full_diff_sha256={expected}" in text
-    assert (tmp_path / "opencode-review-full.diff").read_text(encoding="utf-8") == "FULL-DIFF-FIXTURE\n"
-    assert (tmp_path / "head_count.txt").read_text(encoding="utf-8") == "2"
+    assert "UNCHANGED OPENCODE REVIEW BODY" in text
+    assert f"previous_sha={head}" in text
+    assert f"previous_full_hash={full_hash}" in text
 
 
-@pytest.mark.parametrize("heads", [("ab" * 20, "cd" * 20), ("not-a-sha", "not-a-sha")])
-def test_opencode_preparation_rejects_changed_or_malformed_head(tmp_path, heads):
-    text = _run_opencode_ctx(tmp_path, [], head_shas=list(heads))
+def test_opencode_diff_ready_collector_exports_preserved_pair_from_failure_envelope(tmp_path):
+    head = "ab" * 20
+    failed_head = "cd" * 20
+    full_hash = "34" * 32
+    body = _opencode_v2_body(
+        _state_line(
+            "opencode",
+            7,
+            9,
+            failed_head,
+            successful_head=head,
+            attempt_status="failure",
+            diff_mode="unavailable",
+            full_diff_sha256=full_hash,
+        ),
+        "PRESERVED OPENCODE REVIEW BODY",
+    )
+    text = _run_opencode_ctx(tmp_path, [_bot("github-actions[bot]", body)])
 
-    assert "diff_ready=false" in text
-    assert "attempt_head=\n" in text
-    assert "full_diff_sha256=\n" in text
-    assert not (tmp_path / "opencode-review-full.diff").exists()
+    assert "PRESERVED OPENCODE REVIEW BODY" in text
+    assert f"previous_sha={head}" in text
+    assert f"previous_full_hash={full_hash}" in text
+
+
+def test_opencode_collector_no_longer_prepares_diff_inline(tmp_path):
+    text = _run_opencode_ctx(tmp_path, [])
+    collect = _step(
+        _load("opencode-auto-review.yml"),
+        "opencode-review",
+        "Collect previous review context",
+    )["run"]
+
+    assert "previous_sha=\n" in text
+    assert "previous_full_hash=\n" in text
+    assert "gh pr diff" not in collect
+    assert "headRefOid" not in collect
+    assert "diff_ready" not in collect
 
 
 def _run_opencode_canonicalize(
@@ -2744,8 +2835,16 @@ def _run_opencode_canonicalize(
     attempt_head: str = "cd" * 20,
     current_head: str | None = None,
     outcome: str = "success",
+    diff_ready: str = "true",
+    diff_mode: str = "full",
+    unchanged_since_previous: str = "false",
     tamper_snapshot: list[dict] | None = None,
     tamper_diff: bool = False,
+    tamper_manifest: bool = False,
+    manifest: dict | None = None,
+    git_diff: str = "@@ -1,0 +1,1 @@\n+changed\n",
+    git_failure: bool = False,
+    remove_prepared_artifacts: bool = False,
     expect_error: bool = False,
     snapshot_override: Path | None = None,
     snapshot_sha256_override: str | None = None,
@@ -2763,25 +2862,64 @@ def _run_opencode_canonicalize(
     snapshot_sha256 = hashlib.sha256(snapshot_bytes).hexdigest()
     if tamper_snapshot is not None:
         snapshot.write_text(json.dumps(tamper_snapshot), encoding="utf-8")
-    full_diff = workdir / "opencode-review-full.diff"
+    full_diff = workdir / "review-full.diff"
     full_diff.write_text("TRUSTED FULL DIFF\n", encoding="utf-8")
     full_diff_sha256 = hashlib.sha256(full_diff.read_bytes()).hexdigest()
     if tamper_diff:
         full_diff.write_text("TAMPERED DIFF\n", encoding="utf-8")
+    scope = workdir / "review-scope.json"
+    scope_document = manifest or {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": "ab" * 20,
+        "head_sha": attempt_head,
+        "files": [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}],
+    }
+    scope_bytes = json.dumps(scope_document, ensure_ascii=False).encode("utf-8")
+    scope.write_bytes(scope_bytes)
+    scope_sha256 = hashlib.sha256(scope_bytes).hexdigest()
+    if tamper_manifest:
+        scope.write_text('{"schema":1,"tampered":true}', encoding="utf-8")
+    if remove_prepared_artifacts:
+        full_diff.unlink()
+        scope.unlink()
+    bin_dir = workdir / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    git_output = workdir / "git-output.txt"
+    git_output.write_text(git_diff, encoding="utf-8")
+    git_log = workdir / "git-argv.txt"
+    git_shim = bin_dir / "git"
+    git_shim.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$@\" > \"$GIT_ARGV_LOG\"\n"
+        "if [[ \"$GIT_FAILURE\" == true ]]; then exit 1; fi\n"
+        "cat \"$GIT_DIFF_OUTPUT\"\n",
+        encoding="utf-8",
+    )
+    git_shim.chmod(0o755)
     env = {
         "PR_NUMBER": "7",
         "RUN_URL": "https://github.com/example/repo/actions/runs/42",
         "RUN_ID": run_id,
         "RUN_ATTEMPT": run_attempt,
         "ATTEMPT_HEAD": attempt_head,
-        "DIFF_READY": "true",
+        "DIFF_READY": diff_ready,
+        "DIFF_MODE": diff_mode,
+        "UNCHANGED_SINCE_PREVIOUS": unchanged_since_previous,
         "FULL_DIFF_SHA256": full_diff_sha256,
+        "MANIFEST_SHA256": scope_sha256,
         "REVIEW_OUTCOME": outcome,
         "SNAPSHOT_PATH": str(snapshot_override or snapshot),
         "SNAPSHOT_SHA256": snapshot_sha256_override or snapshot_sha256,
         "REVIEW_DIFF_PATH": str(full_diff),
+        "REVIEW_SCOPE_PATH": str(scope),
         "SERVER_URL": "https://github.com",
         "REPOSITORY": "example/repo",
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "GIT_ARGV_LOG": str(git_log),
+        "GIT_DIFF_OUTPUT": str(git_output),
+        "GIT_FAILURE": "true" if git_failure else "false",
     }
     return _run_upsert(
         tmp_path, "opencode-auto-review.yml", "opencode-review", "Canonicalize OpenCode review",
@@ -2793,44 +2931,46 @@ def _run_opencode_canonicalize(
 
 @node_required
 @pytest.mark.parametrize("after", [[], [_bot("github-actions[bot]", f"preamble\n{OPENCODE_MARKER}\nreview", 9, updated="u2"), _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nsecond", 10, updated="u2")]])
-def test_opencode_canonicalization_requires_exactly_one_current_run_candidate(tmp_path, after):
-    calls = _run_opencode_canonicalize(tmp_path, [], after, expect_error=True)
-    assert not any(call[0] in {"create", "update", "delete"} for call in calls)
+def test_opencode_canonicalization_records_failure_for_unsafe_candidate_count(tmp_path, after):
+    calls = _run_opencode_canonicalize(tmp_path, [], after)
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [
+        comment["id"] for comment in after
+    ]
 
 
 @node_required
-def test_opencode_canonicalization_accepts_preamble_and_wraps_only_candidate(tmp_path):
+def test_opencode_scope_rejects_substantive_preamble_before_sections(tmp_path):
     candidate = _bot(
         "github-actions[bot]",
-        f"model preamble\n{OPENCODE_MARKER}\n- Status: success\nREAL OPENCODE FINDING",
+        f"{OPENCODE_MARKER}\nmodel preamble\n### New findings\nNone",
         9,
         updated="u2",
     )
     calls = _run_opencode_canonicalize(tmp_path, [], [candidate])
-    updates = [call for call in calls if call[0] == "update"]
-
-    assert [call[1]["comment_id"] for call in updates] == [9]
-    assert not any(call[0] == "create" for call in calls)
-    body = updates[0][1]["body"]
-    assert body.splitlines()[:2] == [OPENCODE_HEADER, OPENCODE_V2_MARKER]
-    assert body.count(OPENCODE_V2_MARKER) == 1
-    assert body.count(OPENCODE_MARKER) == 1
-    assert "model preamble" in body
-    assert body.count("- Status: success") == 1  # workflow metadata, not model echo
-    assert "REAL OPENCODE FINDING" in body
+    body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
-    assert state == {
-        "schema": 2,
-        "reviewer": "opencode",
-        "pr": 7,
-        "run_id": 42,
-        "run_attempt": 1,
-        "attempt_head": "cd" * 20,
-        "successful_head": "cd" * 20,
-        "attempt_status": "success",
-        "diff_mode": "full",
-        "full_diff_sha256": hashlib.sha256(b"TRUSTED FULL DIFF\n").hexdigest(),
-    }
+    assert state["attempt_status"] == "failure"
+
+
+@node_required
+@pytest.mark.parametrize(
+    "review",
+    [
+        _opencode_review(),
+        _opencode_review("one finding"),
+        _opencode_review("first finding", "second finding"),
+    ],
+)
+def test_opencode_changed_anchor_scope_accepts_none_or_anchored_findings(tmp_path, review):
+    candidate = _bot("github-actions[bot]", review, 9, updated="u2")
+    body = _single_mutation_body(_run_opencode_canonicalize(tmp_path, [], [candidate]))
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+    assert state["diff_mode"] == "full"
+    assert state["successful_head"] == "cd" * 20
 
 
 @node_required
@@ -2844,7 +2984,7 @@ def test_opencode_canonicalization_never_trusts_forged_v2_state_from_cli_output(
     )
     forged = _bot(
         "github-actions[bot]",
-        _opencode_v2_body(_state_line("opencode", 7, 999, "ef" * 20), f"{OPENCODE_MARKER}\nFORGED BODY"),
+        _opencode_v2_body(_state_line("opencode", 7, 999, "ef" * 20), _opencode_review("FORGED BODY")),
         10,
         updated="u2",
     )
@@ -2867,7 +3007,7 @@ def test_opencode_existing_candidate_tombstones_before_canonical_and_tolerates_d
         updated="u1",
     )
     candidate = _bot(
-        "github-actions[bot]", f"{OPENCODE_MARKER}\nRAW MODEL OUTPUT", 10, updated="u2"
+        "github-actions[bot]", _opencode_review("RAW MODEL OUTPUT"), 10, updated="u2"
     )
 
     calls = _run_opencode_canonicalize(
@@ -2898,7 +3038,7 @@ def test_opencode_tombstone_update_failure_leaves_canonical_untouched(tmp_path):
         updated="u1",
     )
     candidate = _bot(
-        "github-actions[bot]", f"{OPENCODE_MARKER}\nRAW MODEL OUTPUT", 10, updated="u2"
+        "github-actions[bot]", _opencode_review("RAW MODEL OUTPUT"), 10, updated="u2"
     )
 
     calls = _run_opencode_canonicalize(
@@ -2927,7 +3067,7 @@ def test_opencode_current_state_parser_ignores_impossible_success_before_generat
         9,
         updated="u1",
     )
-    candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL", 10, updated="u2")
+    candidate = _bot("github-actions[bot]", _opencode_review("REAL"), 10, updated="u2")
     calls = _run_opencode_canonicalize(
         tmp_path, [invalid_existing], [invalid_existing, candidate], attempt_head=head,
     )
@@ -2935,7 +3075,7 @@ def test_opencode_current_state_parser_ignores_impossible_success_before_generat
 
 
 @node_required
-@pytest.mark.parametrize("diff_mode", ("unavailable", "unchanged"))
+@pytest.mark.parametrize("diff_mode", ("unavailable",))
 def test_opencode_current_state_parser_ignores_success_without_covered_diff_mode_before_generation_cas(
     tmp_path, diff_mode
 ):
@@ -2949,7 +3089,7 @@ def test_opencode_current_state_parser_ignores_success_without_covered_diff_mode
         9,
         updated="u1",
     )
-    candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL", 10, updated="u2")
+    candidate = _bot("github-actions[bot]", _opencode_review("REAL"), 10, updated="u2")
     calls = _run_opencode_canonicalize(
         tmp_path, [uncovered_existing], [uncovered_existing, candidate], attempt_head=head,
     )
@@ -2957,12 +3097,187 @@ def test_opencode_current_state_parser_ignores_success_without_covered_diff_mode
 
 
 @node_required
-@pytest.mark.parametrize("tamper", ["snapshot", "diff"])
-def test_opencode_canonicalization_rejects_tampered_prepared_artifacts(tmp_path, tamper):
-    candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL REVIEW", 10, updated="u2")
-    kwargs = {f"tamper_{tamper}": ([_bot("github-actions[bot]", "FORGED SNAPSHOT", 777)] if tamper == "snapshot" else True)}
+def test_opencode_current_state_parser_accepts_success_unchanged_before_generation_cas(tmp_path):
+    head = "cd" * 20
+    existing = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 99, head, diff_mode="unchanged"),
+            "UNCHANGED COVERED",
+        ),
+        9,
+        updated="u1",
+    )
+    candidate = _bot("github-actions[bot]", _opencode_review("REAL"), 10, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path, [existing], [existing, candidate], attempt_head=head
+    )
+    assert not any(call[0] in {"create", "update", "delete"} for call in calls)
 
-    calls = _run_opencode_canonicalize(tmp_path, [], [candidate], expect_error=True, **kwargs)
+
+@node_required
+@pytest.mark.parametrize(
+    "review",
+    [
+        f"{OPENCODE_MARKER}\n### Still open\nNone",
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n### New findings\nNone",
+        f"{OPENCODE_MARKER}\n### Unknown\nNone\n### New findings\nNone",
+        f"{OPENCODE_MARKER}\n### New findings\n",
+        f"{OPENCODE_MARKER}\n### New findings\ntext before block\n#### Finding\n- Changed anchor: `{OPENCODE_SCOPE_PATH}:1`",
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n#### Finding\n- Changed anchor: `{OPENCODE_SCOPE_PATH}:1`",
+        f"{OPENCODE_MARKER}\n### New findings\n#### Anchored\n- Changed anchor: `{OPENCODE_SCOPE_PATH}:1`\n#### Missing anchor\nbody",
+        f"{OPENCODE_MARKER}\n### New findings\n#### Anchored\n- Changed anchor: `{OPENCODE_SCOPE_PATH}:1`\n#### Malformed\n- Changed anchor: path:not-a-line",
+    ],
+)
+def test_opencode_changed_anchor_scope_rejects_invalid_output_grammar(tmp_path, review):
+    candidate = _bot("github-actions[bot]", review, 10, updated="u2")
+    body = _single_mutation_body(_run_opencode_canonicalize(tmp_path, [], [candidate]))
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] is None
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("anchor", "manifest_files", "git_diff", "git_failure"),
+    [
+        ("old-name.js:1", [{"status": "renamed", "filename": OPENCODE_SCOPE_PATH, "previous_filename": "old-name.js"}], "@@ -1,0 +1,1 @@\n+x\n", False),
+        ("deleted.js:1", [{"status": "removed", "filename": "deleted.js"}], "@@ -1 +0,0 @@\n-x\n", False),
+        ("absent.js:1", [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}], "@@ -1,0 +1,1 @@\n+x\n", False),
+        (f"{OPENCODE_SCOPE_PATH}:2", [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}], "@@ -1,0 +1,1 @@\n+x\n", False),
+        (f"{OPENCODE_SCOPE_PATH}:1", [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}], "not a hunk\n", False),
+        (f"{OPENCODE_SCOPE_PATH}:1", [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}], "@@ -1,0 +1,1 @@\n+x\n", True),
+    ],
+    ids=("previous-rename", "deleted", "out-of-scope", "unchanged-line", "malformed-hunk", "git-failure"),
+)
+def test_opencode_changed_anchor_scope_rejects_non_added_locations(
+    tmp_path, anchor, manifest_files, git_diff, git_failure
+):
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": "ab" * 20,
+        "head_sha": "cd" * 20,
+        "files": manifest_files,
+    }
+    candidate = _bot(
+        "github-actions[bot]",
+        f"{OPENCODE_MARKER}\n### New findings\n#### Finding\n- Changed anchor: `{anchor}`",
+        10,
+        updated="u2",
+    )
+    body = _single_mutation_body(
+        _run_opencode_canonicalize(
+            tmp_path, [], [candidate], manifest=manifest, git_diff=git_diff, git_failure=git_failure
+        )
+    )
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+
+
+@node_required
+def test_opencode_changed_anchor_uses_final_colon_and_literal_git_argv(tmp_path):
+    leading_dash_path = "-dir/a:b [x] 한글😀.js"
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": "ab" * 20,
+        "head_sha": "cd" * 20,
+        "files": [{"status": "modified", "filename": leading_dash_path}],
+    }
+    candidate = _bot(
+        "github-actions[bot]",
+        f"{OPENCODE_MARKER}\n### New findings\n#### Finding\n- Changed anchor: `{leading_dash_path}:0007`",
+        10,
+        updated="u2",
+    )
+    body = _single_mutation_body(
+        _run_opencode_canonicalize(
+            tmp_path, [], [candidate], manifest=manifest, git_diff="@@ -2,0 +7,1 @@\n+x\n"
+        )
+    )
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+    argv = (tmp_path / "opencode-canonicalize" / "git-argv.txt").read_text(encoding="utf-8").splitlines()
+    assert argv == [
+        "--no-replace-objects",
+        "--literal-pathspecs",
+        "-c",
+        "diff.external=",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "-U0",
+        f"{'ab' * 20}..{'cd' * 20}",
+        "--",
+        leading_dash_path,
+    ]
+
+
+@node_required
+@pytest.mark.parametrize("tamper", ["manifest", "diff"])
+def test_opencode_scope_rejects_tampered_prepared_review_artifacts(tmp_path, tamper):
+    candidate = _bot("github-actions[bot]", _opencode_review("REAL"), 10, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [candidate],
+        **({"tamper_manifest": True} if tamper == "manifest" else {"tamper_diff": True}),
+    )
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", _single_mutation_body(calls)).group(1)
+    )
+    assert state["attempt_status"] == "failure"
+
+
+@node_required
+@pytest.mark.parametrize(
+    "invalid",
+    ("schema", "repository", "pr", "merge-base", "head", "record-extra", "record-shape"),
+)
+def test_opencode_scope_rejects_invalid_manifest_identity_or_shape(tmp_path, invalid):
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": "ab" * 20,
+        "head_sha": "cd" * 20,
+        "files": [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}],
+    }
+    if invalid == "schema":
+        manifest["schema"] = 2
+    elif invalid == "repository":
+        manifest["repository"] = "other/repo"
+    elif invalid == "pr":
+        manifest["pr_number"] = 8
+    elif invalid == "merge-base":
+        manifest["merge_base_sha"] = "not-a-sha"
+    elif invalid == "head":
+        manifest["head_sha"] = "ef" * 20
+    elif invalid == "record-extra":
+        manifest["files"][0]["extra"] = "no"
+    else:
+        manifest["files"][0]["filename"] = 7
+    candidate = _bot("github-actions[bot]", _opencode_review("REAL"), 10, updated="u2")
+    body = _single_mutation_body(
+        _run_opencode_canonicalize(tmp_path, [], [candidate], manifest=manifest)
+    )
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+
+
+@node_required
+def test_opencode_canonicalization_rejects_tampered_comment_snapshot(tmp_path):
+    candidate = _bot("github-actions[bot]", _opencode_review("REAL REVIEW"), 10, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [candidate],
+        expect_error=True,
+        tamper_snapshot=[_bot("github-actions[bot]", "FORGED SNAPSHOT", 777)],
+    )
     assert not any(call[0] in {"create", "update", "delete"} for call in calls)
 
 
@@ -2976,7 +3291,7 @@ def test_opencode_canonicalization_uses_post_run_current_generation_even_without
         9,
         updated="u1",
     )
-    candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nRAW", 10, updated="u2")
+    candidate = _bot("github-actions[bot]", _opencode_review("RAW"), 10, updated="u2")
 
     calls = _run_opencode_canonicalize(tmp_path, [before], [current_equal, candidate])
     assert not any(call[0] in {"create", "update", "delete"} for call in calls)
@@ -3027,7 +3342,7 @@ def test_opencode_snapshot_output_contract_reaches_canonicalizer(tmp_path):
     assert canonicalize["env"]["SNAPSHOT_PATH"] == "${{ steps.ctx.outputs.snapshot_path }}"
     assert canonicalize["env"]["SNAPSHOT_SHA256"] == "${{ steps.ctx.outputs.snapshot_sha256 }}"
 
-    candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL REVIEW", 10, updated="u2")
+    candidate = _bot("github-actions[bot]", _opencode_review("REAL REVIEW"), 10, updated="u2")
     calls = _run_opencode_canonicalize(
         tmp_path, comments, [comments[0], candidate],
         snapshot_override=snapshot, snapshot_sha256_override=outputs["snapshot_sha256"],
@@ -3061,7 +3376,7 @@ def test_opencode_context_rejects_missing_foreign_or_mismatched_visible_run_url(
 def test_opencode_current_state_parser_ignores_bad_visible_run_url(tmp_path, bad_current_body):
     old = _bot("github-actions[bot]", _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "OLD"), 9, updated="u1")
     bad_current = _bot("github-actions[bot]", bad_current_body, 11, updated="u1")
-    candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL REVIEW", 10, updated="u2")
+    candidate = _bot("github-actions[bot]", _opencode_review("REAL REVIEW"), 10, updated="u2")
 
     calls = _run_opencode_canonicalize(tmp_path, [old], [old, bad_current, candidate])
     assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10, 9]
@@ -3077,31 +3392,33 @@ def test_opencode_two_rounds_update_one_canonical_comment_and_enforce_generation
         9,
         updated="u1",
     )
-    after = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nSECOND REVIEW", 10, updated="u2")
+    after = _bot("github-actions[bot]", _opencode_review("SECOND REVIEW"), 10, updated="u2")
     calls = _run_opencode_canonicalize(tmp_path, [old], [old, after], run_id="42", run_attempt="1")
     updates = [call for call in calls if call[0] == "update"]
     assert [call[1]["comment_id"] for call in updates] == [10, 9]
     wrapped = updates[1][1]["body"]
 
-    round_two = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nTHIRD REVIEW", 11, updated="u3")
+    round_two = _bot("github-actions[bot]", _opencode_review("THIRD REVIEW"), 11, updated="u3")
     current = _bot("github-actions[bot]", wrapped, 9, updated="u2")
     calls = _run_opencode_canonicalize(tmp_path, [current], [current, round_two], run_id="42", run_attempt="2")
     assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11, 9]
     assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [11]
 
-    stale_raw = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nSTALE REVIEW", 12, updated="u4")
+    stale_raw = _bot("github-actions[bot]", _opencode_review("STALE REVIEW"), 12, updated="u4")
     calls = _run_opencode_canonicalize(tmp_path, [current], [current, stale_raw], run_id="42", run_attempt="1")
     assert not any(call[0] in {"create", "update", "delete"} for call in calls)
 
 
 @node_required
-def test_opencode_canonicalization_discards_stale_head_and_unchanged_candidate(tmp_path):
-    candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREVIEW", 9, updated="u2")
+def test_opencode_canonicalization_discards_stale_head_and_allows_zero_fresh_candidate_failure(tmp_path):
+    candidate = _bot("github-actions[bot]", _opencode_review("REVIEW"), 9, updated="u2")
     stale = _run_opencode_canonicalize(tmp_path, [], [candidate], current_head="ef" * 20)
     assert not any(call[0] in {"create", "update"} for call in stale)
 
-    calls = _run_opencode_canonicalize(tmp_path, [candidate], [candidate], expect_error=True)
-    assert not any(call[0] in {"create", "update", "delete"} for call in calls)
+    calls = _run_opencode_canonicalize(tmp_path, [candidate], [candidate])
+    body = _single_mutation_body(calls)
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
 
 
 @node_required
@@ -3110,7 +3427,7 @@ def test_opencode_canonicalization_discards_stale_head_and_unchanged_candidate(t
     [
         ("failure", f"{OPENCODE_MARKER}\nCLI FAILURE OUTPUT", "failure"),
         ("success", f"{OPENCODE_MARKER}\n- Status: success", "failure"),
-        ("success", f"{OPENCODE_MARKER}\nREAL FINDING", "success"),
+        ("success", _opencode_review("REAL FINDING"), "success"),
     ],
 )
 def test_opencode_checkpoint_requires_cli_success_and_sanitized_candidate(
@@ -3151,10 +3468,136 @@ def test_opencode_failure_preserves_prior_success_as_stale(tmp_path):
 
 
 @node_required
+def test_opencode_unchanged_advances_without_cli_candidate_and_preserves_body(tmp_path):
+    old_head = "ab" * 20
+    new_head = "cd" * 20
+    full_hash = hashlib.sha256(b"TRUSTED FULL DIFF\n").hexdigest()
+    old = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line(
+                "opencode", 7, 41, old_head, full_diff_sha256=full_hash
+            ),
+            "LAST GOOD OPENCODE REVIEW",
+        ),
+        9,
+        updated="u1",
+    )
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [old],
+        [old],
+        outcome="skipped",
+        diff_mode="unchanged",
+        unchanged_since_previous="true",
+        attempt_head=new_head,
+    )
+    body = _updated_comment_body(calls, 9)
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert "LAST GOOD OPENCODE REVIEW" in body
+    assert state["attempt_status"] == "success"
+    assert state["diff_mode"] == "unchanged"
+    assert state["successful_head"] == new_head
+    assert state["full_diff_sha256"] == full_hash
+
+
+@node_required
+@pytest.mark.parametrize("invalid", ("hash-mismatch", "empty-body", "missing"))
+def test_opencode_unchanged_invalid_prior_does_not_advance(tmp_path, invalid):
+    new_head = "cd" * 20
+    action_hash = hashlib.sha256(b"TRUSTED FULL DIFF\n").hexdigest()
+    prior_hash = "12" * 32 if invalid == "hash-mismatch" else action_hash
+    comments = []
+    if invalid != "missing":
+        comments = [
+            _bot(
+                "github-actions[bot]",
+                _opencode_v2_body(
+                    _state_line("opencode", 7, 41, "ab" * 20, full_diff_sha256=prior_hash),
+                    "" if invalid == "empty-body" else "LAST GOOD",
+                ),
+                9,
+                updated="u1",
+            )
+        ]
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        comments,
+        comments,
+        outcome="skipped",
+        diff_mode="unchanged",
+        unchanged_since_previous="true",
+        attempt_head=new_head,
+    )
+    body = _single_mutation_body(calls)
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] != new_head
+
+
+@node_required
+@pytest.mark.parametrize("gate", ("stale-head", "newer-generation"))
+def test_opencode_unchanged_obeys_head_and_generation_gates(tmp_path, gate):
+    old_head = "ab" * 20
+    new_head = "cd" * 20
+    full_hash = hashlib.sha256(b"TRUSTED FULL DIFF\n").hexdigest()
+    run_id = 43 if gate == "newer-generation" else 41
+    old = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, run_id, old_head, full_diff_sha256=full_hash),
+            "LAST GOOD",
+        ),
+        9,
+        updated="u1",
+    )
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [old],
+        [old],
+        outcome="skipped",
+        diff_mode="unchanged",
+        unchanged_since_previous="true",
+        attempt_head=new_head,
+        current_head=old_head if gate == "stale-head" else new_head,
+    )
+    assert not any(call[0] in {"create", "update", "delete"} for call in calls)
+
+
+@node_required
+def test_opencode_unavailable_preserves_prior_success_as_stale_without_artifacts(tmp_path):
+    old = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 41, "ab" * 20),
+            "LAST GOOD OPENCODE REVIEW",
+        ),
+        9,
+        updated="u1",
+    )
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [old],
+        [old],
+        outcome="skipped",
+        diff_ready="false",
+        diff_mode="unavailable",
+        attempt_head="cd" * 20,
+        remove_prepared_artifacts=True,
+    )
+    body = _updated_comment_body(calls, 9)
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert "LAST GOOD OPENCODE REVIEW" in body
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] == "ab" * 20
+    assert state["diff_mode"] == "unavailable"
+
+
+@node_required
 def test_opencode_output_sanitizer_preserves_normal_last_attempt_prose(tmp_path):
     candidate = _bot(
         "github-actions[bot]",
-        f"{OPENCODE_MARKER}\n- Last attempt: failure (explain why this remains risky)\nREAL FINDING",
+        _opencode_review("- Last attempt: failure (explain why this remains risky)"),
         9,
         updated="u2",
     )

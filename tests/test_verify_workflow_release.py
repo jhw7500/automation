@@ -20,7 +20,10 @@ import scripts.verify_workflow_release as release_verifier
 import scripts.workflow_release_inventory as release_inventory
 from scripts.verify_workflow_release import ReleaseVerificationError, verify_release
 from scripts.workflow_release_inventory import RELEASE_PATHS
-from release_fixture_helpers import restore_historical_review_workflows
+from release_fixture_helpers import (
+    HISTORICAL_REVIEW_WORKFLOWS,
+    restore_historical_review_workflows,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -639,7 +642,11 @@ def test_historical_review_workflows_restore_without_invoking_git(
     restore_historical_review_workflows(repo)
 
     fixture_root = Path(__file__).parent / "fixtures/review-workflows-v1.44"
-    for filename in ("claude-code-review.yml", "gemini-auto-review.yml"):
+    for filename in (
+        "claude-code-review.yml",
+        "gemini-auto-review.yml",
+        "opencode-auto-review.yml",
+    ):
         assert (workflow_root / filename).read_bytes() == (
             fixture_root / filename
         ).read_bytes()
@@ -827,7 +834,10 @@ def test_v140_release_without_prepare_dependency_or_action_files_passes(
     )
 
 
-@pytest.mark.parametrize("workflow", ("claude-code-review.yml", "gemini-auto-review.yml"))
+@pytest.mark.parametrize(
+    "workflow",
+    ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"),
+)
 @pytest.mark.parametrize("action_files_present", (True, False))
 def test_pre_v145_rejects_prepare_dependency_regardless_of_future_action_files(
     current_release_repo: tuple[Path, str],
@@ -835,12 +845,10 @@ def test_pre_v145_rejects_prepare_dependency_regardless_of_future_action_files(
     action_files_present: bool,
 ) -> None:
     repo, _ = current_release_repo
-    other = (
-        "gemini-auto-review.yml"
-        if workflow == "claude-code-review.yml"
-        else "claude-code-review.yml"
+    restore_historical_review_workflows(
+        repo,
+        tuple(name for name in HISTORICAL_REVIEW_WORKFLOWS if name != workflow),
     )
-    restore_historical_review_workflows(repo, (other,))
     if not action_files_present:
         for relative in (
             ".github/actions/prepare-review-diff/action.yml",
@@ -853,7 +861,10 @@ def test_pre_v145_rejects_prepare_dependency_regardless_of_future_action_files(
         release_verifier.verify_commit_content(repo, "v1.44", bad_commit)
 
 
-@pytest.mark.parametrize("workflow", ("claude-code-review.yml", "gemini-auto-review.yml"))
+@pytest.mark.parametrize(
+    "workflow",
+    ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"),
+)
 @pytest.mark.parametrize(
     "replacement",
     (
@@ -878,7 +889,10 @@ def test_v145_rejects_nonexact_local_review_action_dependencies(
         release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
-@pytest.mark.parametrize("workflow", ("claude-code-review.yml", "gemini-auto-review.yml"))
+@pytest.mark.parametrize(
+    "workflow",
+    ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"),
+)
 @pytest.mark.parametrize(
     "reference",
     (
@@ -898,7 +912,10 @@ def test_v145_rejects_appended_local_review_action_dependencies(
         release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
-@pytest.mark.parametrize("workflow", ("claude-code-review.yml", "gemini-auto-review.yml"))
+@pytest.mark.parametrize(
+    "workflow",
+    ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"),
+)
 def test_pre_v145_rejects_appended_dot_local_review_action_dependency(
     current_release_repo: tuple[Path, str], workflow: str
 ) -> None:

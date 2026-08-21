@@ -17,6 +17,7 @@ HISTORICAL_REVIEW_FIXTURE_ROOT = (
 HISTORICAL_REVIEW_WORKFLOWS = (
     "claude-code-review.yml",
     "gemini-auto-review.yml",
+    "opencode-auto-review.yml",
 )
 
 
