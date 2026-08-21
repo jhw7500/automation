@@ -429,9 +429,8 @@ jobs:
               throw new Error(`expected one OpenCode output, got ${candidates.length}`);
             }
             const candidate = candidates[0] || null;
-            const previousRecords = before.map(parseRecord).filter(Boolean);
-            if (previousRecords.some((record) => record.comment.id === candidate.id)) {
-              throw new Error('OpenCode candidate reused a prior canonical comment ID');
+            if (beforeById.has(candidate.id)) {
+              throw new Error('OpenCode candidate reused a pre-run comment ID');
             }
             // The raw candidate is model-authored/untrusted even if it imitates a v2
             // envelope. All other POST-run comments are current state, including a newer

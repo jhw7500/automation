@@ -2090,6 +2090,8 @@ def _run_opencode_canonicalize(
     tamper_snapshot: list[dict] | None = None,
     tamper_diff: bool = False,
     expect_error: bool = False,
+    snapshot_override: Path | None = None,
+    snapshot_sha256_override: str | None = None,
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
     script = _step(workflow, "opencode-review", "Canonicalize OpenCode review")["with"]["script"]
@@ -2116,8 +2118,8 @@ def _run_opencode_canonicalize(
         "DIFF_READY": "true",
         "FULL_DIFF_SHA256": full_diff_sha256,
         "REVIEW_OUTCOME": outcome,
-        "SNAPSHOT_PATH": str(snapshot),
-        "SNAPSHOT_SHA256": snapshot_sha256,
+        "SNAPSHOT_PATH": str(snapshot_override or snapshot),
+        "SNAPSHOT_SHA256": snapshot_sha256_override or snapshot_sha256,
         "REVIEW_DIFF_PATH": str(full_diff),
         "SERVER_URL": "https://github.com",
         "REPOSITORY": "example/repo",
@@ -2227,6 +2229,51 @@ def test_opencode_canonicalization_rejects_candidate_reusing_prior_canonical_id(
 
     calls = _run_opencode_canonicalize(tmp_path, [before], [reused], expect_error=True)
     assert not any(call[0] in {"create", "update", "delete"} for call in calls)
+
+
+@node_required
+@pytest.mark.parametrize(
+    "prior_body",
+    [
+        _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "VALID CANONICAL"),
+        f"{OPENCODE_MARKER}\nLEGACY MARKER",
+        f"{OPENCODE_HEADER}\n{OPENCODE_V2_MARKER}\n<!-- automation-state:{{oops}} -->\nMALFORMED V2",
+        _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "FOREIGN RUN", run_url="https://github.com/other/repo/actions/runs/41"),
+    ],
+)
+def test_opencode_canonicalization_rejects_any_candidate_reusing_preexisting_id(tmp_path, prior_body):
+    before = _bot("github-actions[bot]", prior_body, 9, updated="u1")
+    reused = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nRAW", 9, updated="u2")
+
+    calls = _run_opencode_canonicalize(tmp_path, [before], [reused], expect_error=True)
+    assert not any(call[0] in {"create", "update", "delete"} for call in calls)
+
+
+@node_required
+def test_opencode_snapshot_output_contract_reaches_canonicalizer(tmp_path):
+    comments = [_bot("github-actions[bot]", _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "EXISTING"), 9, updated="u1")]
+    output = _run_opencode_ctx(tmp_path, comments, head_shas=["ab" * 20, "ab" * 20])
+    outputs = dict(line.split("=", 1) for line in output.splitlines() if "=" in line and not line.startswith("prev_context"))
+    snapshot = Path(outputs["snapshot_path"])
+    expected_bytes = subprocess.run(
+        ["jq", "-s", "add // []"], input=json.dumps(comments), text=True, capture_output=True, check=True
+    ).stdout.encode("utf-8")
+
+    assert snapshot == tmp_path / "runner-temp" / "opencode-comments-before.json"
+    assert snapshot.read_bytes() == expected_bytes
+    assert outputs["snapshot_sha256"] == hashlib.sha256(expected_bytes).hexdigest()
+    workflow = _load("opencode-auto-review.yml")
+    canonicalize = _step(workflow, "opencode-review", "Canonicalize OpenCode review")
+    assert canonicalize["env"]["SNAPSHOT_PATH"] == "${{ steps.ctx.outputs.snapshot_path }}"
+    assert canonicalize["env"]["SNAPSHOT_SHA256"] == "${{ steps.ctx.outputs.snapshot_sha256 }}"
+
+    candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL REVIEW", 10, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path, comments, [comments[0], candidate],
+        snapshot_override=snapshot, snapshot_sha256_override=outputs["snapshot_sha256"],
+    )
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [9]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [10]
 
 
 @pytest.mark.parametrize(
