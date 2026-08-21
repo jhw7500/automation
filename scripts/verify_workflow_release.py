@@ -225,16 +225,16 @@ EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
                     "CONTEXT_LINES": "${{ inputs.context-lines }}",
                 },
                 "run": (
-                    'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py"\n'
-                    '  --repository "$GITHUB_REPOSITORY"\n'
-                    '  --pr-number "$PR_NUMBER"\n'
-                    '  --previous-sha "$PREVIOUS_SHA"\n'
-                    '  --previous-full-hash "$PREVIOUS_FULL_HASH"\n'
-                    '  --context-lines "$CONTEXT_LINES"\n'
-                    '  --full-output "$GITHUB_WORKSPACE/review-full.diff"\n'
-                    '  --delta-output "$GITHUB_WORKSPACE/review-delta.diff"\n'
-                    '  --manifest-output "$GITHUB_WORKSPACE/review-scope.json"\n'
-                    '  --github-output "$GITHUB_OUTPUT"\n'
+                    'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" '
+                    '--repository "$GITHUB_REPOSITORY" '
+                    '--pr-number "$PR_NUMBER" '
+                    '--previous-sha "$PREVIOUS_SHA" '
+                    '--previous-full-hash "$PREVIOUS_FULL_HASH" '
+                    '--context-lines "$CONTEXT_LINES" '
+                    '--full-output "$GITHUB_WORKSPACE/review-full.diff" '
+                    '--delta-output "$GITHUB_WORKSPACE/review-delta.diff" '
+                    '--manifest-output "$GITHUB_WORKSPACE/review-scope.json" '
+                    '--github-output "$GITHUB_OUTPUT"'
                 ),
             }
         ],

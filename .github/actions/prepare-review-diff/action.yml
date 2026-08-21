@@ -36,14 +36,14 @@ runs:
         PREVIOUS_SHA: ${{ inputs.previous-sha }}
         PREVIOUS_FULL_HASH: ${{ inputs.previous-full-hash }}
         CONTEXT_LINES: ${{ inputs.context-lines }}
-      run: |
+      run: >-
         python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py"
-          --repository "$GITHUB_REPOSITORY"
-          --pr-number "$PR_NUMBER"
-          --previous-sha "$PREVIOUS_SHA"
-          --previous-full-hash "$PREVIOUS_FULL_HASH"
-          --context-lines "$CONTEXT_LINES"
-          --full-output "$GITHUB_WORKSPACE/review-full.diff"
-          --delta-output "$GITHUB_WORKSPACE/review-delta.diff"
-          --manifest-output "$GITHUB_WORKSPACE/review-scope.json"
-          --github-output "$GITHUB_OUTPUT"
+        --repository "$GITHUB_REPOSITORY"
+        --pr-number "$PR_NUMBER"
+        --previous-sha "$PREVIOUS_SHA"
+        --previous-full-hash "$PREVIOUS_FULL_HASH"
+        --context-lines "$CONTEXT_LINES"
+        --full-output "$GITHUB_WORKSPACE/review-full.diff"
+        --delta-output "$GITHUB_WORKSPACE/review-delta.diff"
+        --manifest-output "$GITHUB_WORKSPACE/review-scope.json"
+        --github-output "$GITHUB_OUTPUT"

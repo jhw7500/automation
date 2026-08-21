@@ -5,6 +5,7 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 import json
+import os
 import shutil
 import subprocess
 import tarfile
@@ -72,21 +73,86 @@ def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() ->
                         "CONTEXT_LINES": "${{ inputs.context-lines }}",
                     },
                     "run": (
-                        'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py"\n'
-                        '  --repository "$GITHUB_REPOSITORY"\n'
-                        '  --pr-number "$PR_NUMBER"\n'
-                        '  --previous-sha "$PREVIOUS_SHA"\n'
-                        '  --previous-full-hash "$PREVIOUS_FULL_HASH"\n'
-                        '  --context-lines "$CONTEXT_LINES"\n'
-                        '  --full-output "$GITHUB_WORKSPACE/review-full.diff"\n'
-                        '  --delta-output "$GITHUB_WORKSPACE/review-delta.diff"\n'
-                        '  --manifest-output "$GITHUB_WORKSPACE/review-scope.json"\n'
-                        '  --github-output "$GITHUB_OUTPUT"\n'
+                        'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" '
+                        '--repository "$GITHUB_REPOSITORY" '
+                        '--pr-number "$PR_NUMBER" '
+                        '--previous-sha "$PREVIOUS_SHA" '
+                        '--previous-full-hash "$PREVIOUS_FULL_HASH" '
+                        '--context-lines "$CONTEXT_LINES" '
+                        '--full-output "$GITHUB_WORKSPACE/review-full.diff" '
+                        '--delta-output "$GITHUB_WORKSPACE/review-delta.diff" '
+                        '--manifest-output "$GITHUB_WORKSPACE/review-scope.json" '
+                        '--github-output "$GITHUB_OUTPUT"'
                     ),
                 }
             ],
         },
     }
+
+
+def test_prepare_review_diff_action_run_passes_quoted_environment_values_to_helper(
+    tmp_path: Path,
+) -> None:
+    """Runner-style Bash receives one helper command with every fixed artifact flag."""
+    document = yaml.load(
+        PREPARE_REVIEW_DIFF_ACTION.read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    run = document["runs"]["steps"][0]["run"]
+    action_path = tmp_path / "action"
+    action_path.mkdir()
+    captured = tmp_path / "argv.json"
+    (action_path / "prepare_review_diff.py").write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['ARGV_CAPTURE']).write_text(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    github_output = tmp_path / "github-output"
+    pr_number = "7; still-one-quoted-value"
+    environment = {
+        **os.environ,
+        "ARGV_CAPTURE": str(captured),
+        "GITHUB_ACTION_PATH": str(action_path),
+        "GITHUB_REPOSITORY": "owner/repository",
+        "GITHUB_WORKSPACE": str(workspace),
+        "GITHUB_OUTPUT": str(github_output),
+        "PR_NUMBER": pr_number,
+        "PREVIOUS_SHA": "a" * 40,
+        "PREVIOUS_FULL_HASH": "b" * 64,
+        "CONTEXT_LINES": "20",
+    }
+
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", run],
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(captured.read_text(encoding="utf-8")) == [
+        "--repository",
+        "owner/repository",
+        "--pr-number",
+        pr_number,
+        "--previous-sha",
+        "a" * 40,
+        "--previous-full-hash",
+        "b" * 64,
+        "--context-lines",
+        "20",
+        "--full-output",
+        str(workspace / "review-full.diff"),
+        "--delta-output",
+        str(workspace / "review-delta.diff"),
+        "--manifest-output",
+        str(workspace / "review-scope.json"),
+        "--github-output",
+        str(github_output),
+    ]
 
 
 def test_prepare_review_diff_action_is_bundled_as_regular_release_files() -> None:
