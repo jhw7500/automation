@@ -85,15 +85,21 @@ TREE_RELEASE_ROOTS = tuple(root for root in RELEASE_ROOTS if root.kind == "tree"
 _OID = re.compile(r"[0-9a-f]{40}")
 _TREE_FILE_MODES = frozenset({"100644", "100755"})
 _RELEASE_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
-_PREPARE_REVIEW_DIFF_RELEASE = (1, 45)
+PREPARE_REVIEW_DIFF_RELEASE = (1, 45)
+
+
+def release_supports_prepare_review_diff(ref: str) -> bool:
+    """Return whether ``ref`` owns and may use the shared review-diff action."""
+
+    if _RELEASE_REF.fullmatch(ref) is None:
+        raise ValueError("invalid release ref")
+    version = tuple(int(part) for part in ref.removeprefix("v").split("."))
+    return version >= PREPARE_REVIEW_DIFF_RELEASE
 
 
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:
     """Select the authenticated inventory that existed at ``ref``'s release line."""
-    if _RELEASE_REF.fullmatch(ref) is None:
-        raise ValueError("invalid release ref")
-    version = tuple(int(part) for part in ref.removeprefix("v").split("."))
-    if version >= _PREPARE_REVIEW_DIFF_RELEASE:
+    if release_supports_prepare_review_diff(ref):
         return RELEASE_ROOTS
     return HISTORICAL_RELEASE_ROOTS
 

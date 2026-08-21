@@ -33,6 +33,7 @@ from scripts.workflow_release_inventory import (
     SETUP_GEMINI_AUTH_ROOT,
     release_paths_for,
     release_roots_for,
+    release_supports_prepare_review_diff,
     validate_release_listing,
 )
 
@@ -282,6 +283,13 @@ APPROVED_GEMINI_ACTIONS = frozenset(
         "jhw7500/automation/.github/actions/check-workflow-enabled@v1.1",
         SETUP_GEMINI_AUTH,
     }
+)
+PREPARE_REVIEW_DIFF_ACTION = (
+    f"$/{PREPARE_REVIEW_DIFF_ACTION_ROOT.path.parent.as_posix()}"
+)
+REVIEW_DIFF_DEPENDENCY_WORKFLOWS = (
+    "claude-code-review.yml",
+    "gemini-auto-review.yml",
 )
 GIT_EXECUTABLE = "/usr/bin/git"
 CANONICAL_AUTOMATION_REMOTE = "https://github.com/jhw7500/automation.git"
@@ -1691,6 +1699,35 @@ def _action_references(value: object) -> list[str]:
     return result
 
 
+def _verify_prepare_review_diff_dependencies(
+    ref: str, documents: dict[str, dict]
+) -> None:
+    supported = release_supports_prepare_review_diff(ref)
+    for name in REVIEW_DIFF_DEPENDENCY_WORKFLOWS:
+        document = documents.get(name)
+        if document is None:
+            if supported:
+                raise ReleaseVerificationError(
+                    f"{name} prepare-review-diff dependency is missing"
+                )
+            continue
+        references = _action_references(document)
+        local_references = [
+            reference for reference in references if reference.startswith("$/")
+        ]
+        if supported:
+            valid = (
+                references.count(PREPARE_REVIEW_DIFF_ACTION) == 1
+                and local_references == [PREPARE_REVIEW_DIFF_ACTION]
+            )
+        else:
+            valid = not local_references
+        if not valid:
+            raise ReleaseVerificationError(
+                f"{name} prepare-review-diff dependency contract is invalid"
+            )
+
+
 def _verify_token_mapping(
     name: str, location: str, mapping: object, *, allow_empty: bool = False
 ) -> int:
@@ -1714,7 +1751,7 @@ def _verify_token_mapping(
     return sinks
 
 
-def _verify_gemini_workflow(name: str, document: dict) -> None:
+def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
     try:
         call = document["on"]["workflow_call"]
         inputs = call["inputs"]
@@ -1762,9 +1799,10 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
         raise ReleaseVerificationError(
             f"{name} must not grant workflow-level write permissions"
         )
-    unapproved_actions = sorted(
-        set(_action_references(document)) - APPROVED_GEMINI_ACTIONS
-    )
+    approved_actions = APPROVED_GEMINI_ACTIONS
+    if release_supports_prepare_review_diff(ref):
+        approved_actions |= {PREPARE_REVIEW_DIFF_ACTION}
+    unapproved_actions = sorted(set(_action_references(document)) - approved_actions)
     if unapproved_actions:
         raise ReleaseVerificationError(
             f"{name} uses a resolver/action outside the approved action allowlist: "
@@ -1869,7 +1907,7 @@ def _verify_commit_content(
     if _release_version(ref) >= (1, 40):
         _release_inventory(tree, ref)
         _verify_setup_gemini_auth(tree)
-    if _release_version(ref) >= (1, 45):
+    if release_supports_prepare_review_diff(ref):
         _verify_prepare_review_diff_action(tree)
     _verify_approved_v140_policy(tree, ref)
     _verify_manual_gemini_output_contract(tree, ref)
@@ -1893,6 +1931,8 @@ def _verify_commit_content(
         data = yaml.load(text, Loader=yaml.BaseLoader)
         documents[Path(name).name] = data if isinstance(data, dict) else {}
 
+    _verify_prepare_review_diff_dependencies(ref, documents)
+
     if catalog is not None:
         gemini_targets = sorted(
             {
@@ -1906,7 +1946,7 @@ def _verify_commit_content(
                 raise ReleaseVerificationError(
                     f"central Gemini workflow is missing: {target}"
                 )
-            _verify_gemini_workflow(target, documents[target])
+            _verify_gemini_workflow(target, documents[target], ref)
 
         for entry in catalog.callers:
             assert entry.central_workflow is not None

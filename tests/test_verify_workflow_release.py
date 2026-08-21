@@ -17,8 +17,10 @@ import pytest
 import yaml
 
 import scripts.verify_workflow_release as release_verifier
+import scripts.workflow_release_inventory as release_inventory
 from scripts.verify_workflow_release import ReleaseVerificationError, verify_release
 from scripts.workflow_release_inventory import RELEASE_PATHS
+from release_fixture_helpers import restore_historical_review_workflows
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -124,6 +126,9 @@ def release_repo(tmp_path: Path) -> tuple[Path, Path, str]:
         else:
             shutil.copy2(source, target)
     restore_historical_v140_manual_outputs(repo)
+    # This synthetic v1.40 fixture uses genuine committed v1.44 central review bytes,
+    # the last release before prepare-review-diff became a release dependency.
+    restore_historical_review_workflows(repo, ROOT)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -590,8 +595,25 @@ def test_current_release_commit_only_uses_authenticated_objects(
     repo, current = current_release_repo
 
     assert (
-        release_verifier.verify_commit_content(repo, "v1.40.2", current)
+        release_verifier.verify_commit_content(repo, "v1.45", current)
         == current
+    )
+
+
+def test_prepare_diff_capability_boundary_is_shared_with_release_inventory() -> None:
+    capability = getattr(
+        release_inventory, "release_supports_prepare_review_diff", None
+    )
+    assert callable(capability)
+    assert capability("v1.44") is False
+    assert capability("v1.45") is True
+    assert (
+        release_inventory.PREPARE_REVIEW_DIFF_ACTION_ROOT
+        not in release_inventory.release_roots_for("v1.44")
+    )
+    assert (
+        release_inventory.PREPARE_REVIEW_DIFF_ACTION_ROOT
+        in release_inventory.release_roots_for("v1.45")
     )
 
 
@@ -629,7 +651,7 @@ def test_commit_gate_rejects_unsafe_manual_gemini_output_writer(
     bad_commit = commit(repo, "weaken manual Gemini output writer")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -670,7 +692,7 @@ def test_commit_gate_rejects_manual_gemini_outputs_rewired_to_unsafe_step(
     bad_commit = commit(repo, "rewire manual Gemini outputs")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -699,7 +721,7 @@ def test_commit_gate_rejects_manual_gemini_fetch_without_explicit_bash(
     bad_commit = commit(repo, "remove explicit Bash execution context")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -725,7 +747,7 @@ def test_commit_gate_rejects_manual_gemini_downstream_output_rewiring(
     bad_commit = commit(repo, "rewire downstream manual Gemini title")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 def test_release_verifier_preserves_pre_inventory_v139_contract(
@@ -733,6 +755,7 @@ def test_release_verifier_preserves_pre_inventory_v139_contract(
 ) -> None:
     repo = tmp_path / "historical-automation"
     shutil.copytree(ROOT / ".github/workflows", repo / ".github/workflows")
+    restore_historical_review_workflows(repo, ROOT)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -747,6 +770,7 @@ def test_v144_release_keeps_the_historical_inventory_without_prepare_diff_action
 ) -> None:
     """Adding a v1.45 action must not retroactively invalidate immutable v1.44 tags."""
     repo, _ = current_release_repo
+    restore_historical_review_workflows(repo, ROOT)
     for relative in (
         ".github/actions/prepare-review-diff/action.yml",
         ".github/actions/prepare-review-diff/prepare_review_diff.py",
@@ -756,6 +780,74 @@ def test_v144_release_keeps_the_historical_inventory_without_prepare_diff_action
     git(repo, "tag", "-a", "v1.44", "-m", "v1.44")
 
     assert verify_release(repo, "v1.44", historical_commit) == historical_commit
+
+
+def test_v140_release_without_prepare_dependency_or_action_files_passes(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, _ = release_repo
+    for relative in (
+        ".github/actions/prepare-review-diff/action.yml",
+        ".github/actions/prepare-review-diff/prepare_review_diff.py",
+    ):
+        (repo / relative).unlink()
+    historical_commit = commit(repo, "v1.40 without future review action")
+
+    assert (
+        release_verifier.verify_commit_content(repo, "v1.40", historical_commit)
+        == historical_commit
+    )
+
+
+@pytest.mark.parametrize("workflow", ("claude-code-review.yml", "gemini-auto-review.yml"))
+@pytest.mark.parametrize("action_files_present", (True, False))
+def test_pre_v145_rejects_prepare_dependency_regardless_of_future_action_files(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    action_files_present: bool,
+) -> None:
+    repo, _ = current_release_repo
+    other = (
+        "gemini-auto-review.yml"
+        if workflow == "claude-code-review.yml"
+        else "claude-code-review.yml"
+    )
+    restore_historical_review_workflows(repo, ROOT, (other,))
+    if not action_files_present:
+        for relative in (
+            ".github/actions/prepare-review-diff/action.yml",
+            ".github/actions/prepare-review-diff/prepare_review_diff.py",
+        ):
+            (repo / relative).unlink()
+    bad_commit = commit(repo, f"pre-v1.45 {workflow} dependency")
+
+    with pytest.raises(ReleaseVerificationError, match="prepare-review-diff dependency"):
+        release_verifier.verify_commit_content(repo, "v1.44", bad_commit)
+
+
+@pytest.mark.parametrize("workflow", ("claude-code-review.yml", "gemini-auto-review.yml"))
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "$/.github/actions/prepare-review-diff/action.yml",
+        "$/.github/actions/check-workflow-enabled",
+    ),
+    ids=("near-match", "other-local-action"),
+)
+def test_v145_rejects_nonexact_local_review_action_dependencies(
+    current_release_repo: tuple[Path, str], workflow: str, replacement: str
+) -> None:
+    repo, _ = current_release_repo
+    replace(
+        repo / ".github/workflows" / workflow,
+        "$/.github/actions/prepare-review-diff",
+        replacement,
+        count=1,
+    )
+    bad_commit = commit(repo, f"invalid {workflow} local action")
+
+    with pytest.raises(ReleaseVerificationError, match="prepare-review-diff dependency"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 @pytest.mark.parametrize("unsupported", ("alternates", "promisor"))
