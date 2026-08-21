@@ -67,6 +67,29 @@ def _v2_body(header: str, marker: str, state: str, body: str = "REAL REVIEW") ->
     return f"{header}\n{marker}\n{state}\n\n{body}"
 
 
+def _state_line_with(head: str, **changes: object) -> str:
+    state = {
+        "schema": 2,
+        "reviewer": "claude",
+        "pr": 7,
+        "run_id": 1,
+        "attempt_head": head,
+        "successful_head": head,
+        "attempt_status": "success",
+        "diff_mode": "full",
+        "full_diff_sha256": "12" * 32,
+    }
+    state.update(changes)
+    return f"<!-- automation-state:{json.dumps(state, separators=(',', ':'))} -->"
+
+
+def _state_line_without(head: str, field: str) -> str:
+    prefix = "<!-- automation-state:"
+    state = json.loads(_state_line_with(head)[len(prefix):-4])
+    state.pop(field)
+    return f"{prefix}{json.dumps(state, separators=(',', ':'))} -->"
+
+
 def _load(name: str) -> dict:
     return yaml.load((WORKFLOWS / name).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
@@ -279,6 +302,122 @@ def test_collect_uses_canonical_v2_state_and_highest_run_id(tmp_path):
     assert "FOREIGN REVIEWER" not in previous
     assert "MISMATCHED PR" not in previous
     assert "MALFORMED JSON" not in previous
+
+
+def test_collect_ignores_malformed_canonical_envelopes(tmp_path):
+    head = "ab" * 20
+    comments = [
+        _bot("github-actions[bot]", f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}", 1),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                CLAUDE_HEADER,
+                CLAUDE_V2_MARKER,
+                "<!-- automation-state:[\"not an object\"] -->",
+                "NOT A STATE OBJECT",
+            ),
+            2,
+        ),
+        _bot(
+            "github-actions[bot]",
+            _v2_body(
+                CLAUDE_HEADER,
+                CLAUDE_V2_MARKER,
+                _state_line_with(head, attempt_head=7),
+                "NON-STRING SHA",
+            ),
+            3,
+        ),
+    ]
+
+    assert _run_collect(tmp_path, comments) is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"successful_head": 7},
+        {"attempt_status": 7},
+        {"diff_mode": 7},
+        {"full_diff_sha256": 7},
+        {"attempt_status": "pending"},
+        {"diff_mode": "sideways"},
+        {"full_diff_sha256": "12" * 31},
+    ],
+)
+def test_collect_rejects_invalid_v2_state_fields(tmp_path, changes):
+    body = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line_with("ab" * 20, **changes),
+        "INVALID STATE MUST NOT BECOME CONTEXT",
+    )
+
+    assert _run_collect(tmp_path, [_bot("github-actions[bot]", body)]) is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("successful_head", "attempt_status", "diff_mode", "full_diff_sha256"),
+)
+def test_collect_rejects_v2_state_missing_required_field(tmp_path, field):
+    body = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line_without("ab" * 20, field),
+        "MISSING FIELD MUST NOT BECOME CONTEXT",
+    )
+
+    assert _run_collect(tmp_path, [_bot("github-actions[bot]", body)]) is None
+
+
+def test_collect_drops_state_with_empty_sanitized_prose(tmp_path):
+    sha1, sha2 = _two_commit_repo(tmp_path)
+    body = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 1, sha1),
+        f"- Status: success\n- Reviewed: {sha1}",
+    )
+
+    context = _run_collect(
+        tmp_path,
+        [_bot("github-actions[bot]", body)],
+        head_sha=sha2,
+        pr_files=["a.py"],
+    )
+
+    assert context is None
+    assert not (tmp_path / "claude-review-delta.diff").exists()
+
+
+def test_collect_strips_reserved_lines_from_human_context(tmp_path):
+    sha = "ab" * 20
+    human_body = (
+        f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 9, sha)}\n"
+        f"- Status: success\n- Run: https://runs/9\n- Reviewed: {sha}\n"
+        "- Last attempt: failure (https://runs/10)\nHUMAN REBUTTAL"
+    )
+    comments = [
+        _bot(
+            "github-actions[bot]",
+            _v2_body(CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 1, sha)),
+            1,
+        ),
+        _human("hwjo", human_body, 2),
+    ]
+
+    context = _run_collect(tmp_path, comments)
+
+    assert context is not None
+    assert "HUMAN REBUTTAL" in context
+    assert CLAUDE_HEADER not in context
+    assert CLAUDE_V2_MARKER not in context
+    assert "automation-state:" not in context
+    assert "- Status:" not in context
+    assert "- Run:" not in context
+    assert "- Reviewed:" not in context
+    assert "- Last attempt:" not in context
 
 
 def test_collect_requires_previous_own_review(tmp_path):

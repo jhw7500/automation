@@ -146,15 +146,35 @@ jobs:
             --arg marker "$MARKER" \
             --arg reviewer "$REVIEWER" \
             --arg pr "$PR_NUM" '
+              def sha1:
+                if type == "string" then test("^[0-9a-f]{40}$") else false end;
+              def nullable_sha1:
+                if . == null then true else sha1 end;
+              def sha256:
+                if type == "string" then test("^[0-9a-f]{64}$") else false end;
+              def positive_integer:
+                if type == "number" then . > 0 and floor == . else false end;
+              def attempt_status:
+                type == "string" and (. == "success" or . == "failure");
+              def diff_mode:
+                type == "string" and (. == "full" or . == "delta" or . == "unchanged" or . == "unavailable");
               def parsed_state($header; $marker; $reviewer; $pr):
                 (.body // "") as $body
                 | ($body | split("\n")) as $lines
                 | select(.user.type == "Bot")
                 | select($lines[0] == $header and $lines[1] == $marker)
-                | ($lines[2] | capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$").json? | fromjson?) as $s
-                | select($s.schema == 2 and $s.reviewer == $reviewer and $s.pr == ($pr | tonumber))
-                | select(($s.run_id | type) == "number" and $s.run_id > 0)
-                | select(($s.attempt_head | test("^[0-9a-f]{40}$")))
+                | (($lines[2]? // "") | (capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$")? | .json? | fromjson?)) as $s
+                | select(($s | type) == "object")
+                | select($s | has("schema") and has("reviewer") and has("pr") and has("run_id") and has("attempt_head") and has("successful_head") and has("attempt_status") and has("diff_mode") and has("full_diff_sha256"))
+                | select(($s.schema | type) == "number" and $s.schema == 2)
+                | select(($s.reviewer | type) == "string" and $s.reviewer == $reviewer)
+                | select(($s.pr | type) == "number" and $s.pr == ($pr | tonumber))
+                | select($s.run_id | positive_integer)
+                | select($s.attempt_head | sha1)
+                | select($s.successful_head | nullable_sha1)
+                | select($s.attempt_status | attempt_status)
+                | select($s.diff_mode | diff_mode)
+                | select($s.full_diff_sha256 | sha256)
                 | {comment: ., state: $s};
 
               [.[] | parsed_state($header; $marker; $reviewer; $pr)]
@@ -166,17 +186,29 @@ jobs:
           PREV_REVIEW="$(printf '%s\n' "$PREV_RECORD" | jq -r '.comment.body // ""')"
           PREV_STATE="$(printf '%s\n' "$PREV_RECORD" | jq -c '.state // {}')"
           PREV_SHA="$(printf '%s\n' "$PREV_STATE" | jq -r '(.successful_head // "") | if test("^[0-9a-f]{40}$") then . else "" end')"
+          # Every context-input lane uses this same sanitizer. It removes only reserved
+          # workflow-owned lines, leaving normal reviewer findings and human rebuttals.
+          strip_reserved() {
+            grep -vE '^(- Status: |- Run: |- Reviewed: |- Last attempt: |<!-- automation:|<!-- automation-state:|## Claude Code Review \(latest\))'
+          }
           # 코멘트별 1,500자 선클립 후 join — 한 개의 초장문 코멘트가 나머지 최신 반박들을
           # 섹션 상한 밖으로 밀어내지 못하게 한다.
           HUMAN_COMMENTS="$(jq -r \
             '[.[] | select((.user.type // "") != "Bot")] | .[-10:]
              | map("@" + (.user.login // "ghost") + " (" + (.created_at // "") + "):\n" + ((.body // "") | .[0:1500]))
-             | join("\n\n---\n\n")' "$COMMENTS")"
+             | join("\n\n---\n\n")' "$COMMENTS" | strip_reserved || true)"
 
           # 인프라 예약 라인(sticky header, marker, state와 legacy meta)은 주입 전에 모두
           # 제거한다 — 모델이 envelope를 에코해 다음 라운드 본문을 오염시키지 못하게 한다.
           PREV_REVIEW_CLEAN="$(printf '%s\n' "$PREV_REVIEW" \
-            | grep -vE '^(- Status: |- Run: |- Reviewed: |- Last attempt: |<!-- automation:|<!-- automation-state:|## Claude Code Review \(latest\))' || true)"
+            | strip_reserved || true)"
+          # A syntactically valid state without any remaining review prose cannot provide
+          # either re-review context or an incremental base. Treat it as no prior state.
+          if [ -z "$PREV_REVIEW_CLEAN" ]; then
+            PREV_REVIEW=""
+            PREV_STATE="{}"
+            PREV_SHA=""
+          fi
 
           clip() {
             local text="$1"
