@@ -2848,7 +2848,8 @@ def test_opencode_prompt_requires_verified_evidence():
 def test_opencode_canonicalizer_discards_only_model_preamble_before_sections():
     workflow = _load("opencode-auto-review.yml")
     script = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")["with"]["script"]
-    assert "Models occasionally add a harmless one-line preamble" in script
+    assert "OpenCode may emit this exact harmless preamble" in script
+    assert "knownPreamble" in script
     assert "firstSection = lines.findIndex" in script
     assert "lines.slice(firstSection)" in script
     assert "parseReview" in script

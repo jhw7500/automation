@@ -1385,12 +1385,17 @@ jobs:
               const lines = (body || '').split('\n').filter((line) =>
                 line !== `<!-- automation-candidate:${handoff.candidate_nonce} -->`
                 && !reserved.test(line));
-              // Models occasionally add a harmless one-line preamble before the
-              // required review sections. Drop only that preamble; parseReview
-              // remains the authority for the strict section grammar and anchors.
+              // OpenCode may emit this exact harmless preamble before the required
+              // sections. Drop only that known line; arbitrary prose and unknown
+              // sections remain subject to the strict parser below.
               const firstSection = lines.findIndex((line) =>
                 /^### (New findings|Still open|Resolved|Retracted)$/.test(line));
-              return (firstSection >= 0 ? lines.slice(firstSection) : lines).join('\n').trim();
+              const prefix = firstSection >= 0
+                ? lines.slice(0, firstSection).filter((line) => line.trim()) : [];
+              const knownPreamble = 'Looking at the diff for security and correctness issues:';
+              const normalized = firstSection >= 0 && prefix.length === 1
+                && prefix[0] === knownPreamble ? lines.slice(firstSection) : lines;
+              return normalized.join('\n').trim();
             };
             const previousBody = existing ? clean(existing.comment.body) : '';
             const priorSuccess = existing && /^[0-9a-f]{40}$/.test(existing.state.successful_head || '')
