@@ -339,6 +339,8 @@ def test_collect_ignores_malformed_canonical_envelopes(tmp_path):
     "changes",
     [
         {"successful_head": 7},
+        {"successful_head": None},
+        {"run_id": 9007199254740992},
         {"attempt_status": 7},
         {"diff_mode": 7},
         {"full_diff_sha256": 7},
@@ -783,6 +785,7 @@ def _claude_upsert(
     run_id: str = "42",
     attempt_head: str = "cd" * 20,
     full_diff_sha256: str = "34" * 32,
+    diff_mode: str = "full",
 ) -> list:
     workdir = tmp_path / ("with-review" if with_review else "without-review")
     workdir.mkdir()
@@ -796,6 +799,7 @@ def _claude_upsert(
         "RUN_ID": run_id,
         "ATTEMPT_HEAD": attempt_head,
         "FULL_DIFF_SHA256": full_diff_sha256,
+        "DIFF_MODE": diff_mode,
     }
     return _run_upsert(
         tmp_path, "claude-code-review.yml", "claude-review", "Upsert review comment",
@@ -835,12 +839,13 @@ def test_claude_checkpoint_requires_coverage_and_sanitized_body(
     assert state["pr"] == 7
     assert state["run_id"] == 42
     assert state["attempt_head"] == "cd" * 20
-    assert state["full_diff_sha256"] == "34" * 32
     if expected_status == "success":
         assert state["successful_head"] == "cd" * 20
+        assert state["full_diff_sha256"] == "34" * 32
         assert "REAL FINDING" in body
     else:
         assert state["successful_head"] is None
+        assert state["full_diff_sha256"] is None
         assert "- Reviewed:" not in body
 
 
@@ -867,6 +872,55 @@ def test_claude_infra_only_output_preserves_prior_success_as_stale(tmp_path):
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", new_body).group(1))
     assert state["attempt_status"] == "failure"
     assert state["successful_head"] == old_head
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("kwargs", "expect_noop"),
+    [
+        ({"attempt_head": ""}, True),
+        ({"attempt_head": "AB" * 20}, True),
+        ({"run_id": "0"}, True),
+        ({"run_id": "1.5"}, True),
+        ({"run_id": "9007199254740992"}, True),
+        ({"diff_mode": "unavailable"}, False),
+        ({"diff_mode": "sideways"}, False),
+        ({"full_diff_sha256": "zz" * 32}, False),
+    ],
+)
+def test_claude_checkpoint_rejects_invalid_trusted_input(tmp_path, kwargs, expect_noop):
+    old_head = "ab" * 20
+    old_body = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 1, old_head),
+        "LAST GOOD REVIEW",
+    )
+    calls = _claude_upsert(
+        tmp_path,
+        "success",
+        [_bot("github-actions[bot]", old_body, 11)],
+        with_review=True,
+        **kwargs,
+    )
+    if expect_noop:
+        assert not any(call[0] in {"create", "update"} for call in calls)
+        return
+    body = [call for call in calls if call[0] == "update"][0][1]["body"]
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert "- Status: stale" in body
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] == old_head
+    assert state["full_diff_sha256"] == "12" * 32
+
+
+@node_required
+def test_claude_first_failure_records_null_success_hash(tmp_path):
+    calls = _claude_upsert(tmp_path, "failure", [], with_review=False)
+    body = [call for call in calls if call[0] == "create"][0][1]["body"]
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["successful_head"] is None
+    assert state["full_diff_sha256"] is None
 
 
 @node_required

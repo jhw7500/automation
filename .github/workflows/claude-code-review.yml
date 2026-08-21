@@ -149,16 +149,18 @@ jobs:
             --arg pr "$PR_NUM" '
               def sha1:
                 if type == "string" then test("^[0-9a-f]{40}$") else false end;
-              def nullable_sha1:
-                if . == null then true else sha1 end;
               def sha256:
                 if type == "string" then test("^[0-9a-f]{64}$") else false end;
               def positive_integer:
-                if type == "number" then . > 0 and floor == . else false end;
+                if type == "number" then . > 0 and . <= 9007199254740991 and floor == . else false end;
               def attempt_status:
                 type == "string" and (. == "success" or . == "failure");
               def diff_mode:
                 type == "string" and (. == "full" or . == "delta" or . == "unchanged" or . == "unavailable");
+              def successful_pair:
+                if .successful_head == null then .full_diff_sha256 == null
+                else (.successful_head | sha1) and (.full_diff_sha256 | sha256)
+                end;
               def parsed_state($header; $marker; $reviewer; $pr):
                 (.body // "") as $body
                 | ($body | split("\n")) as $lines
@@ -172,10 +174,9 @@ jobs:
                 | select(($s.pr | type) == "number" and $s.pr == ($pr | tonumber))
                 | select($s.run_id | positive_integer)
                 | select($s.attempt_head | sha1)
-                | select($s.successful_head | nullable_sha1)
+                | select($s | successful_pair)
                 | select($s.attempt_status | attempt_status)
                 | select($s.diff_mode | diff_mode)
-                | select($s.full_diff_sha256 | sha256)
                 | {comment: ., state: $s};
 
               [.[] | parsed_state($header; $marker; $reviewer; $pr)]
@@ -429,7 +430,10 @@ jobs:
             const runUrl = process.env.RUN_URL;
             const ok = (process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success';
             const diffReady = process.env.DIFF_READY === 'true';
-            const runId = Number(process.env.RUN_ID);
+            const runIdRaw = process.env.RUN_ID || '';
+            const runIdIsValid = /^[1-9][0-9]*$/.test(runIdRaw)
+              && Number.isSafeInteger(Number(runIdRaw));
+            const runId = runIdIsValid ? Number(runIdRaw) : NaN;
             const attemptHead = process.env.ATTEMPT_HEAD || '';
             const fullDiffSha256 = process.env.FULL_DIFF_SHA256 || '';
             const diffMode = process.env.DIFF_MODE || (diffReady ? 'full' : 'unavailable');
@@ -464,12 +468,13 @@ jobs:
             const sha256 = (value) => /^[0-9a-f]{64}$/.test(value || '');
             const validState = (state) => state && state.schema === 2
               && state.reviewer === 'claude' && state.pr === issueNumber
-              && Number.isInteger(state.run_id) && state.run_id > 0
+              && Number.isSafeInteger(state.run_id) && state.run_id > 0
               && sha1(state.attempt_head)
-              && (state.successful_head === null || sha1(state.successful_head))
+              && (state.successful_head === null
+                ? state.full_diff_sha256 === null
+                : sha1(state.successful_head) && sha256(state.full_diff_sha256))
               && ['success', 'failure'].includes(state.attempt_status)
-              && ['full', 'delta', 'unchanged', 'unavailable'].includes(state.diff_mode)
-              && sha256(state.full_diff_sha256);
+              && ['full', 'delta', 'unchanged', 'unavailable'].includes(state.diff_mode);
             const parseRecord = (comment) => {
               if (comment.user?.type !== 'Bot') return null;
               const lines = (comment.body || '').split('\n');
@@ -485,16 +490,26 @@ jobs:
             };
             const records = comments.map(parseRecord).filter(Boolean).sort((a, b) => a.state.run_id - b.state.run_id);
             const existing = records[records.length - 1];
+            if (!runIdIsValid || !sha1(attemptHead)) {
+              core.notice('Claude review trusted attempt identity is invalid; left the existing sticky state unchanged.');
+              return;
+            }
             if (existing && existing.state.run_id >= runId) {
               core.notice(`Claude review run ${runId} is stale; kept newer sticky state from run ${existing.state.run_id}.`);
               return;
             }
 
+            const reviewedInputIsValid = ['full', 'delta'].includes(diffMode) && sha256(fullDiffSha256);
+            const checkpointFailed = failed || !reviewedInputIsValid;
+            const stateDiffMode = ['full', 'delta', 'unchanged', 'unavailable'].includes(diffMode)
+              ? diffMode
+              : 'unavailable';
+
             const preservedProse = existing
               ? (existing.comment.body || '').split('\n').filter((line) => !infraLine.test(line)).join('\n').trim()
               : '';
-            const preserveSuccess = failed && existing && sha1(existing.state.successful_head) && preservedProse;
-            const successfulHead = failed
+            const preserveSuccess = checkpointFailed && existing && sha1(existing.state.successful_head) && preservedProse;
+            const successfulHead = checkpointFailed
               ? (preserveSuccess ? existing.state.successful_head : null)
               : attemptHead;
             const state = {
@@ -504,21 +519,21 @@ jobs:
               run_id: runId,
               attempt_head: attemptHead,
               successful_head: successfulHead,
-              attempt_status: failed ? 'failure' : 'success',
-              diff_mode: diffMode,
-              full_diff_sha256: sha256(fullDiffSha256)
-                ? fullDiffSha256
-                : (existing?.state.full_diff_sha256 || '0'.repeat(64)),
+              attempt_status: checkpointFailed ? 'failure' : 'success',
+              diff_mode: stateDiffMode,
+              full_diff_sha256: successfulHead === null
+                ? null
+                : (checkpointFailed ? existing.state.full_diff_sha256 : fullDiffSha256),
             };
             const meta = [
-              `- Status: ${preserveSuccess ? 'stale' : (failed ? 'failure' : 'success')}`,
+              `- Status: ${preserveSuccess ? 'stale' : (checkpointFailed ? 'failure' : 'success')}`,
               `- Run: ${runUrl}`,
               sha1(successfulHead) ? `- Reviewed: ${successfulHead}` : null,
-              failed ? `- Last attempt: failure (${runUrl})` : null,
+              checkpointFailed ? `- Last attempt: failure (${runUrl})` : null,
             ].filter(Boolean).join('\n');
             const content = preserveSuccess
               ? `\n\n${trim(preservedProse)}`
-              : failed
+              : checkpointFailed
                 ? `\n\n### Error\n\nClaude review did not produce a valid covered review. (See run logs: ${runUrl})`
                 : `\n\n${trim(review)}`;
             const body = `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n\n${meta}${content}`;
