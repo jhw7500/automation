@@ -80,6 +80,9 @@ jobs:
   gemini-review:
     needs: check-enabled
     if: needs.check-enabled.outputs.enabled == 'true' && needs.check-enabled.outputs.auto_enabled == 'true'
+    concurrency:
+      group: automation-gemini-auto-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -132,12 +135,24 @@ jobs:
           GH_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
+          HEADER='## 🔎 Gemini Code Review'
+          MARKER='<!-- automation:gemini-auto-review:v2 -->'
+          REVIEWER='gemini'
 
           # Save PR details directly to files (safer than variables for large content).
           # SECURITY: never interpolate github.event.* expression values into this run: body —
           # GitHub renders them before bash runs, so a crafted PR title/body would execute as
           # shell (script injection / RCE). Fetch via gh so the values are handled as data.
-          gh pr diff "$PR_NUMBER" > pr_diff.txt || echo "No diff available" > pr_diff.txt
+          rm -f pr_diff.txt pr_diff_delta.txt pr_head_sha.txt review_diff_ready.txt review_full_diff_sha256.txt
+          printf 'false' > review_diff_ready.txt
+          if gh pr diff "$PR_NUMBER" > pr_diff.txt 2>/dev/null && [ -s pr_diff.txt ]; then
+            printf 'true' > review_diff_ready.txt
+            sha256sum pr_diff.txt | cut -d' ' -f1 > review_full_diff_sha256.txt
+          else
+            echo '::warning::Failed to fetch a non-empty full PR diff; Gemini will not run'
+            rm -f pr_diff.txt
+            : > review_full_diff_sha256.txt
+          fi
           gh pr view "$PR_NUMBER" --json title --jq '.title // ""' > pr_title.txt
           gh pr view "$PR_NUMBER" --json body  --jq '.body  // ""' > pr_body.txt
           echo "$PR_NUMBER" > pr_number.txt
@@ -152,23 +167,71 @@ jobs:
           fi
           # --paginate 는 페이지별 JSON 배열을 연달아 출력하므로 slurp 후 병합한다.
           jq -s 'add // []' "$RAW_COMMENTS" > pr_comments.json
-          # 봇 작성 + 마커 보유 중 최신 — upsert 스텝의 선택 규칙과 반드시 동일해야 한다.
-          # 사람이 마커 문자열을 인용한 코멘트를 sticky로 오인하지 않도록 작성자를 필터링한다.
-          jq -r '([.[] | select(((.user.type // "") == "Bot") and ((.body // "") | contains("<!-- automation:gemini-auto-review -->")))] | last // {}) | .body // ""' \
-            pr_comments.json > prev_review.txt
-          # sticky 메타(Status/Reviewed)는 워크플로우가 만든 헤더 영역(상단 12줄)에서만 읽는다.
-          # 리뷰 본문에 에코·인용된 '- Status: failure'/'- Reviewed:' 라인이 메타로 오인되면
-          # 재리뷰 컨텍스트와 증분 기준 SHA가 통째로 사라진다(claude 쪽 head -10 파싱과 동일 규칙).
-          # 실패 sticky(에러 배너)는 이전 리뷰로 취급하지 않는다 — 재리뷰 규칙이 에러 문구를
-          # 대상으로 돌지 않게 한다.
-          if head -12 prev_review.txt | grep -q '^- Status: failure$'; then
-            : > prev_review.txt
+          # Exact v2 envelopes are the only trusted state. A quoted marker, another reviewer,
+          # malformed JSON, or a different PR cannot become re-review context or a delta base.
+          PREV_RECORD="$(jq -c \
+            --arg header "$HEADER" \
+            --arg marker "$MARKER" \
+            --arg reviewer "$REVIEWER" \
+            --arg pr "$PR_NUMBER" '
+              def sha1:
+                if type == "string" then test("^[0-9a-f]{40}$") else false end;
+              def sha256:
+                if type == "string" then test("^[0-9a-f]{64}$") else false end;
+              def positive_integer:
+                if type == "number" then . > 0 and . <= 9007199254740991 and floor == . else false end;
+              def attempt_status:
+                type == "string" and (. == "success" or . == "failure");
+              def diff_mode:
+                type == "string" and (. == "full" or . == "delta" or . == "unchanged" or . == "unavailable");
+              def successful_pair:
+                if .successful_head == null then .full_diff_sha256 == null
+                else (.successful_head | sha1) and (.full_diff_sha256 | sha256)
+                end;
+              def parsed_state($header; $marker; $reviewer; $pr):
+                (.body // "") as $body
+                | ($body | split("\n")) as $lines
+                | select(.user.type == "Bot")
+                | select($lines[0] == $header and $lines[1] == $marker)
+                | (($lines[2]? // "") | (capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$")? | .json? | fromjson?)) as $s
+                | select(($s | type) == "object")
+                | select($s | has("schema") and has("reviewer") and has("pr") and has("run_id") and has("run_attempt") and has("attempt_head") and has("successful_head") and has("attempt_status") and has("diff_mode") and has("full_diff_sha256"))
+                | select(($s.schema | type) == "number" and $s.schema == 2)
+                | select(($s.reviewer | type) == "string" and $s.reviewer == $reviewer)
+                | select(($s.pr | type) == "number" and $s.pr == ($pr | tonumber))
+                | select($s.run_id | positive_integer)
+                | select($s.run_attempt | positive_integer)
+                | select($s.attempt_head | sha1)
+                | select($s | successful_pair)
+                | select($s.attempt_status | attempt_status)
+                | select($s.diff_mode | diff_mode)
+                | {comment: ., state: $s};
+
+              [.[] | parsed_state($header; $marker; $reviewer; $pr)]
+              | sort_by(.state.run_id, .state.run_attempt)
+              | last // null
+            ' pr_comments.json)"
+          PREV_REVIEW="$(printf '%s\n' "$PREV_RECORD" | jq -r '.comment.body // ""')"
+          PREV_STATE="$(printf '%s\n' "$PREV_RECORD" | jq -c '.state // {}')"
+          PREV_SHA="$(printf '%s\n' "$PREV_STATE" | jq -r '(.successful_head // "") | if test("^[0-9a-f]{40}$") then . else "" end')"
+          strip_reserved() {
+            grep -vE '^(- Status: |- Run: |- Reviewed: |- Last attempt: |<!-- automation:|<!-- automation-state:|## 🔎 Gemini Code Review$|REPO: |PR NUMBER: |Reviewer: Gemini|\*Reviewed by Gemini\*)'
+          }
+          PREV_REVIEW_CLEAN="$(printf '%s\n' "$PREV_REVIEW" | strip_reserved || true)"
+          # A first failure has no successful pair and cannot provide incremental context.
+          if [ -z "$PREV_SHA" ] || [ -z "$PREV_REVIEW_CLEAN" ]; then
+            PREV_REVIEW=""
+            PREV_SHA=""
+          else
+            PREV_REVIEW="$PREV_REVIEW_CLEAN"
           fi
+          printf '%s\n' "$PREV_REVIEW" > prev_review.txt
           # 코멘트별 2,000자 선클립 후 join — 한 개의 초장문 코멘트가 나머지 최신 반박들을
           # 섹션 상한 밖으로 밀어내지 못하게 한다.
-          jq -r '[.[] | select((.user.type // "") != "Bot")] | .[-10:]
+          HUMAN_COMMENTS="$(jq -r '[.[] | select((.user.type // "") != "Bot")] | .[-10:]
                  | map("@" + (.user.login // "ghost") + " (" + (.created_at // "") + "):\n" + ((.body // "") | .[0:2000]))
-                 | join("\n\n---\n\n")' pr_comments.json > human_comments.txt
+                 | join("\n\n---\n\n")' pr_comments.json | strip_reserved || true)"
+          printf '%s\n' "$HUMAN_COMMENTS" > human_comments.txt
 
           # 증분 리뷰: 직전 성공 리뷰가 sticky에 남긴 "- Reviewed: <sha>"를 회수해, 그 이후
           # push된 delta만 담은 diff 파일을 준비한다. SHA가 없거나(라운드 1/실패 라운드)
@@ -179,10 +242,8 @@ jobs:
           # delta 블록이 있다(파일명만 다름). 로직을 고치면 양쪽을 함께 고칠 것 — composite
           # action 추출은 액션이 참조 시점에 태그로 선발행돼야 하는 플릿 릴리즈 제약 때문에 보류.
           # (이 워크플로우는 기존부터 fetch-depth 0이라 unshallow 분기가 필요 없다.)
-          rm -f pr_diff_delta.txt pr_head_sha.txt
           HEAD_SHA="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid // ""' 2>/dev/null || printf '')"
           printf '%s' "$HEAD_SHA" > pr_head_sha.txt
-          PREV_SHA="$(head -12 prev_review.txt | sed -n 's/^- Reviewed: \([0-9a-f]\{40\}\)$/\1/p' | head -1)"
           if [ -n "$PREV_SHA" ] && [ -n "$HEAD_SHA" ] && [ "$PREV_SHA" != "$HEAD_SHA" ]; then
             git cat-file -e "$PREV_SHA^{commit}" 2>/dev/null || git fetch -q origin "$PREV_SHA" 2>/dev/null || true
             git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null || git fetch -q origin "$HEAD_SHA" 2>/dev/null || true
@@ -216,6 +277,18 @@ jobs:
               echo "Previous reviewed SHA unusable (missing or not an ancestor); falling back to a full review"
             fi
           fi
+          DIFF_MODE="full"
+          if [ -s pr_diff_delta.txt ]; then
+            DIFF_MODE="delta"
+          elif [ "$(cat review_diff_ready.txt)" != "true" ]; then
+            DIFF_MODE="unavailable"
+          fi
+          {
+            printf 'diff_ready=%s\n' "$(cat review_diff_ready.txt)"
+            printf 'attempt_head=%s\n' "$HEAD_SHA"
+            printf 'full_diff_sha256=%s\n' "$(cat review_full_diff_sha256.txt)"
+            printf 'diff_mode=%s\n' "$DIFF_MODE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Run Gemini Code Review
         id: gemini-review
@@ -223,6 +296,10 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3-flash-preview' }}
         run: |
+          if [ "$(cat review_diff_ready.txt 2>/dev/null || printf 'false')" != 'true' ]; then
+            echo 'Gemini review input is unavailable; skipping model invocation.' >&2
+            exit 1
+          fi
           # Install dependencies
           pip install -q google-generativeai
 
@@ -276,7 +353,7 @@ jobs:
               r"|- Last attempt: |<!-- automation:|## 🔎 Gemini Code Review|\*Reviewed by Gemini\*)"
           )
           INFRA_LINE_OUTPUT = re.compile(
-              r"^(REPO: \S+$|PR NUMBER: [0-9]+$|Reviewer: Gemini"
+              r"^(REPO: \S+$|PR NUMBER: [0-9]+$|Reviewer: Gemini Auto \(Diff Focus\)$"
               r"|- Status: (success|failure)$|- Run: https?://\S+$|- Reviewed: [0-9a-f]{40}$"
               r"|- Last attempt: |<!-- automation:[A-Za-z0-9_-]+"
               r"|## 🔎 Gemini Code Review$|\*Reviewed by Gemini\*$)"
@@ -339,6 +416,9 @@ jobs:
               diff_for_prompt = pr_diff
               truncation_note = ""
               diff_truncated = False
+
+          with open('review_diff_truncated.txt', 'w') as f:
+              f.write('true' if diff_truncated else 'false')
 
           # Previous-round context: keep the injected sections bounded so token overhead stays
           # roughly constant per round (the sticky comment is one review, not an append log).
@@ -477,6 +557,7 @@ jobs:
 
           # Run the review script
           python gemini_review.py
+          printf 'diff_truncated=%s\n' "$(cat review_diff_truncated.txt 2>/dev/null || printf 'false')" >> "$GITHUB_OUTPUT"
 
       # 리뷰 게시는 marker 달린 sticky 코멘트 하나로 upsert 한다(라운드마다 새 코멘트가 쌓이지
       # 않음). 실패 시 기존 정상 리뷰는 보존한다(교체 금지).
@@ -489,15 +570,37 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           REVIEW_OUTCOME: ${{ steps.gemini-review.outcome }}
           REPOSITORY: ${{ github.repository }}
+          DIFF_READY: ${{ steps.pr-details.outputs.diff_ready }}
+          DIFF_TRUNCATED: ${{ steps.gemini-review.outputs.diff_truncated }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ATTEMPT_HEAD: ${{ steps.pr-details.outputs.attempt_head }}
+          FULL_DIFF_SHA256: ${{ steps.pr-details.outputs.full_diff_sha256 }}
+          DIFF_MODE: ${{ steps.pr-details.outputs.diff_mode }}
         with:
           github-token: ${{ steps.auth.outputs.token }}
           script: |
             const fs = require('fs');
-            // 'Get PR details' 스텝의 prev_review 조회 marker와 반드시 동일하게 유지.
-            const marker = '<!-- automation:gemini-auto-review -->';
+            // 'Get PR details' 스텝의 canonical collection prefix와 반드시 동일하게 유지.
+            const header = '## 🔎 Gemini Code Review';
+            const marker = '<!-- automation:gemini-auto-review:v2 -->';
+            const legacyMarker = '<!-- automation:gemini-auto-review -->';
             const issueNumber = Number(process.env.PR_NUMBER);
             const runUrl = process.env.RUN_URL;
             const ok = (process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success';
+            const diffReady = process.env.DIFF_READY === 'true';
+            const diffTruncated = process.env.DIFF_TRUNCATED === 'true';
+            const runIdRaw = process.env.RUN_ID || '';
+            const runIdIsValid = /^[1-9][0-9]*$/.test(runIdRaw)
+              && Number.isSafeInteger(Number(runIdRaw));
+            const runId = runIdIsValid ? Number(runIdRaw) : NaN;
+            const runAttemptRaw = process.env.RUN_ATTEMPT || '';
+            const runAttemptIsValid = /^[1-9][0-9]*$/.test(runAttemptRaw)
+              && Number.isSafeInteger(Number(runAttemptRaw));
+            const runAttempt = runAttemptIsValid ? Number(runAttemptRaw) : NaN;
+            const attemptHead = process.env.ATTEMPT_HEAD || '';
+            const fullDiffSha256 = process.env.FULL_DIFF_SHA256 || '';
+            const diffMode = process.env.DIFF_MODE || (diffReady ? 'full' : 'unavailable');
 
             const maxLen = 60000;
             const trim = (s) => {
@@ -508,18 +611,15 @@ jobs:
 
             let review = '';
             try {
-              review = fs.readFileSync('gemini_review.md', 'utf8').trim();
+              review = fs.readFileSync('gemini_review.md', 'utf8');
             } catch (e) {
               review = '';
             }
-            // 이번에 리뷰한 head SHA — 다음 라운드가 증분 delta의 기준으로 회수한다.
-            // 성공 라운드에만 기록하므로 "마지막 성공 리뷰 SHA" 의미가 유지된다.
-            let reviewedSha = '';
-            try {
-              reviewedSha = fs.readFileSync('pr_head_sha.txt', 'utf8').trim();
-            } catch (e) {
-              reviewedSha = '';
-            }
+            // Sanitization precedes success evaluation: model-echoed workflow metadata cannot
+            // turn an infrastructure-only response into a successful checkpoint.
+            const infraLine = /^(REPO: \S+$|PR NUMBER: [0-9]+$|Reviewer: Gemini Auto \(Diff Focus\)$|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Reviewed: [0-9a-f]{40}$|- Last attempt: |<!-- automation:[A-Za-z0-9_-]+|<!-- automation-state:|## 🔎 Gemini Code Review$|\*Reviewed by Gemini\*$)/;
+            review = review.split('\n').filter((line) => !infraLine.test(line)).join('\n').trim();
+            const failed = !ok || !diffReady || diffTruncated || !review;
 
             const { owner, repo } = context.repo;
             const comments = await github.paginate(github.rest.issues.listComments, {
@@ -528,48 +628,101 @@ jobs:
               issue_number: issueNumber,
               per_page: 100,
             });
-            // 봇 작성 + 마커 보유 중 최신 — 수집 스텝의 jq 선택 규칙과 동일. 사람이 마커
-            // 문자열을 인용한 코멘트를 sticky로 오인해 덮어쓰는 사고를 작성자 필터로 막는다.
-            const matches = comments.filter((c) => c.user?.type === 'Bot' && (c.body || '').includes(marker));
-            const existing = matches[matches.length - 1];
-
-            const failed = !ok || !review;
-            if (failed && existing) {
-              // 실패 라운드는 직전 정상 리뷰 본문·메타('- Status: success', '- Reviewed:')를
-              // 보존하되, '- Last attempt: failure' 라인을 헤더 메타에 갱신 삽입해 최신
-              // 커밋이 리뷰되지 않았음을 PR에서 볼 수 있게 한다(런 로그 notice만으로는
-              // 사람이 알 수 없다). Status가 success로 남으므로 다음 라운드의 재리뷰
-              // 컨텍스트와 증분 기준 SHA도 그대로 유지된다.
-              const attemptLine = `- Last attempt: failure (${runUrl})`;
-              const lines = (existing.body || '').split('\n').filter((l) => !l.startsWith('- Last attempt: '));
-              let insertAt = 0;
-              for (let i = 0; i < Math.min(lines.length, 12); i++) {
-                if (/^- (Status|Model|Run|Reviewed): /.test(lines[i])) insertAt = i + 1;
+            const sha1 = (value) => /^[0-9a-f]{40}$/.test(value || '');
+            const sha256 = (value) => /^[0-9a-f]{64}$/.test(value || '');
+            const validState = (state) => state && state.schema === 2
+              && state.reviewer === 'gemini' && state.pr === issueNumber
+              && Number.isSafeInteger(state.run_id) && state.run_id > 0
+              && Number.isSafeInteger(state.run_attempt) && state.run_attempt > 0
+              && sha1(state.attempt_head)
+              && (state.successful_head === null
+                ? state.full_diff_sha256 === null
+                : sha1(state.successful_head) && sha256(state.full_diff_sha256))
+              && ['success', 'failure'].includes(state.attempt_status)
+              && ['full', 'delta', 'unchanged', 'unavailable'].includes(state.diff_mode);
+            const parseRecord = (comment) => {
+              if (comment.user?.type !== 'Bot') return null;
+              const lines = (comment.body || '').split('\n');
+              if (lines[0] !== header || lines[1] !== marker) return null;
+              const match = (lines[2] || '').match(/^<!-- automation-state:(\{.*\}) -->$/);
+              if (!match) return null;
+              try {
+                const state = JSON.parse(match[1]);
+                return validState(state) ? { comment, state } : null;
+              } catch (e) {
+                return null;
               }
-              lines.splice(insertAt, 0, attemptLine);
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body: lines.join('\n') });
-              core.notice(`Gemini auto-review produced no output; kept the previous sticky review and stamped the failed attempt. (${runUrl})`);
+            };
+            const records = comments.map(parseRecord).filter(Boolean).sort((a, b) =>
+              a.state.run_id - b.state.run_id || a.state.run_attempt - b.state.run_attempt
+            );
+            const existing = records[records.length - 1];
+            const legacyTarget = comments.find((comment) => {
+              if (comment.user?.type !== 'Bot') return false;
+              const lines = (comment.body || '').split('\n');
+              return lines[0] === `REPO: ${process.env.REPOSITORY}`
+                && lines[1] === `PR NUMBER: ${issueNumber}`
+                && lines[2] === 'Reviewer: Gemini Auto (Diff Focus)'
+                && lines[3] === legacyMarker
+                && lines[4] === header;
+            });
+            if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead)) {
+              core.notice('Gemini review trusted attempt identity is invalid; left the existing sticky state unchanged.');
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: issueNumber });
+            if (pr.head?.sha !== attemptHead) {
+              core.notice(`Discarding stale Gemini review for ${attemptHead}; current head is ${pr.head?.sha || 'unknown'}`);
+              return;
+            }
+            if (existing && (existing.state.run_id > runId
+              || (existing.state.run_id === runId && existing.state.run_attempt >= runAttempt))) {
+              core.notice(`Discarding stale Gemini generation (${runId}, ${runAttempt}); state is already at (${existing.state.run_id}, ${existing.state.run_attempt}).`);
               return;
             }
 
-            const header = [
-              `REPO: ${process.env.REPOSITORY}`,
-              `PR NUMBER: ${issueNumber}`,
-              'Reviewer: Gemini Auto (Diff Focus)',
-              marker,
-              '## 🔎 Gemini Code Review',
-              '',
-              `- Status: ${failed ? 'failure' : 'success'}`,
+            const reviewedInputIsValid = ['full', 'delta'].includes(diffMode) && sha256(fullDiffSha256);
+            const checkpointFailed = failed || !reviewedInputIsValid;
+            const stateDiffMode = ['full', 'delta', 'unchanged', 'unavailable'].includes(diffMode)
+              ? diffMode
+              : 'unavailable';
+            const preservedProse = existing
+              ? (existing.comment.body || '').split('\n').filter((line) => !infraLine.test(line)).join('\n').trim()
+              : '';
+            const preserveSuccess = checkpointFailed && existing && sha1(existing.state.successful_head) && preservedProse;
+            const successfulHead = checkpointFailed
+              ? (preserveSuccess ? existing.state.successful_head : null)
+              : attemptHead;
+            const state = {
+              schema: 2,
+              reviewer: 'gemini',
+              pr: issueNumber,
+              run_id: runId,
+              run_attempt: runAttempt,
+              attempt_head: attemptHead,
+              successful_head: successfulHead,
+              attempt_status: checkpointFailed ? 'failure' : 'success',
+              diff_mode: stateDiffMode,
+              full_diff_sha256: successfulHead === null
+                ? null
+                : (checkpointFailed ? existing.state.full_diff_sha256 : fullDiffSha256),
+            };
+            const meta = [
+              `- Status: ${preserveSuccess ? 'stale' : (checkpointFailed ? 'failure' : 'success')}`,
               `- Run: ${runUrl}`,
-              !failed && /^[0-9a-f]{40}$/.test(reviewedSha) ? `- Reviewed: ${reviewedSha}` : null,
+              sha1(successfulHead) ? `- Reviewed: ${successfulHead}` : null,
+              checkpointFailed ? `- Last attempt: failure (${runUrl})` : null,
             ].filter(Boolean).join('\n');
-            const content = failed
-              ? `\n\n⚠️ Gemini auto-review produced no output. Please check the workflow logs.`
-              : `\n\n${trim(review)}`;
-            const body = `${header}${content}\n\n---\n*Reviewed by Gemini*`;
+            const content = preserveSuccess
+              ? `\n\n${trim(preservedProse)}`
+              : checkpointFailed
+                ? `\n\n### Error\n\nGemini review did not produce a valid covered review. (See run logs: ${runUrl})`
+                : `\n\n${trim(review)}`;
+            const body = `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n\n${meta}${content}`;
+            const target = existing?.comment || legacyTarget;
 
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            if (target) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: target.id, body });
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
             }
