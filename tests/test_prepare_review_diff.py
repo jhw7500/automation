@@ -8,6 +8,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import types
@@ -147,6 +148,29 @@ def configure_gh(
         ),
         encoding="utf-8",
     )
+
+
+def install_git_log_shim(gh_fixture: GhFixture, tmp_path: Path) -> Path:
+    """Log exact Git argv while continuing to use the local Git executable."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    log = tmp_path / "git.log"
+    shim = Path(gh_fixture.env["PATH"].split(os.pathsep)[0]) / "git"
+    shim.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+with open(os.environ["GIT_FIXTURE_LOG"], "a", encoding="utf-8") as output:
+    output.write(json.dumps(sys.argv[1:]) + "\\n")
+os.execv(os.environ["REAL_GIT"], [os.environ["REAL_GIT"], *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    gh_fixture.env.update({"GIT_FIXTURE_LOG": str(log), "REAL_GIT": real_git})
+    return log
 
 
 def outputs(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -610,3 +634,42 @@ def test_oversized_unicode_path_argv_uses_numbered_full_diff(
     assert "numbered PR diff" in state.warning
     assert full.read_text(encoding="utf-8").endswith("+numbered-only\n")
     assert numbered_calls == [7]
+
+
+def test_cli_argv_overflow_uses_numbered_diff_without_running_git_diff(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """The executable path must fail closed before a large local Git diff starts."""
+    filename = f"overflow/00000000-{'x' * 240}"
+    available = max(os.sysconf("SC_ARG_MAX") - 128 * 1024, 0)
+    record_count = max(1, available // (len(os.fsencode(filename)) + 1) + 2)
+    records = [
+        {"status": "modified", "filename": f"overflow/{index:08d}-{'x' * 240}"}
+        for index in range(record_count)
+    ]
+    configure_gh(
+        gh_fixture,
+        base=history.base,
+        head=history.head,
+        files=records,
+        pr_diff="diff --git a/server-only.txt b/server-only.txt\n+server-only\n",
+    )
+    git_log = install_git_log_shim(gh_fixture, tmp_path)
+    full, delta, manifest = outputs(tmp_path)
+
+    result = run_prepare(history.repo, gh_fixture, *prepare_args(full, delta, manifest))
+
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert state["diff_ready"] is True
+    assert state["diff_mode"] == "full"
+    assert "argument limit" in state["warning"]
+    assert full.read_bytes() == b"diff --git a/server-only.txt b/server-only.txt\n+server-only\n"
+    assert not delta.exists()
+    assert json.loads(manifest.read_text(encoding="utf-8"))["files"] == records
+    gh_calls = [json.loads(line) for line in gh_fixture.log.read_text(encoding="utf-8").splitlines()]
+    assert ["pr", "diff", "7"] in gh_calls
+    git_calls = [json.loads(line) for line in git_log.read_text(encoding="utf-8").splitlines()]
+    assert any(call[:2] == ["cat-file", "-e"] for call in git_calls)
+    assert any(call[:1] == ["merge-base"] for call in git_calls)
+    assert not any("diff" in call for call in git_calls)
