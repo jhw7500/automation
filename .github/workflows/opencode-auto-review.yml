@@ -84,6 +84,9 @@ jobs:
       needs.check-enabled.outputs.auto_enabled == 'true' &&
       needs.check-enabled.outputs.safe_pr == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: automation-opencode-auto-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
     permissions:
       # id-token 없음(의도) — 이게 있으면 액션이 OIDC 토큰을 발급받아
       # api.opencode.ai 에서 App 토큰으로 교환할 수 있고, 그 토큰은 아래 contents: read
@@ -106,42 +109,81 @@ jobs:
           # limited to review output. Consumer callers admit same-repository PRs only.
           persist-credentials: true
 
-      # 재리뷰 컨텍스트는 서버측에서 조회해 프롬프트로 주입한다. 모델이 PR 코멘트에서
-      # 마커 문자열로 "자기 이전 리뷰"를 스스로 찾게 하면 작성자 검증이 불가능해, 임의의
-      # 코멘터가 마커로 시작하는 코멘트를 위조해 실제 findings를 Resolved로 억제시킬 수
-      # 있다. 선택 규칙은 다른 리뷰어들과 동일(봇 작성 + 마커 보유 중 최신). untrusted
-      # 코멘트 본문을 output에 실으므로 randomized heredoc delimiter를 쓴다(고정
-      # delimiter는 코멘트 본문으로 추가 output을 주입할 수 있다).
+      # Context and the review input are prepared before the CLI starts. Only an exact v2
+      # envelope is state; the legacy marker exists solely for OpenCode's sticky-comment
+      # compatibility and for identifying this run's raw output after the CLI returns.
       - name: Collect previous review context
         id: ctx
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
-          # 아래 PROMPT의 마커 라인과 반드시 동일하게 유지.
-          MARKER: '<!-- automation:opencode-auto-review -->'
+          HEADER: '## OpenCode Review (latest)'
+          MARKER: '<!-- automation:opencode-auto-review:v2 -->'
+          LEGACY_MARKER: '<!-- automation:opencode-auto-review -->'
+          REVIEWER: 'opencode'
           MAX_SECTION_CHARS: '6000'
         run: |
           set -euo pipefail
           RAW="$(mktemp)"
           if ! gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate > "$RAW" 2>/dev/null; then
-            echo "::warning::Failed to fetch PR comments; proceeding without re-review context"
-            echo '[]' > "$RAW"
+            echo "::error::Failed to fetch PR comments; refusing to run OpenCode without a state snapshot"
+            exit 1
           fi
           COMMENTS="$(mktemp)"
-          # --paginate 는 페이지별 JSON 배열을 연달아 출력하므로 slurp 후 병합한다.
+          # --paginate emits one JSON array per page. Keep the complete pre-run snapshot so
+          # post-run canonicalization can identify new/updated output by id + updated_at.
           jq -s 'add // []' "$RAW" > "$COMMENTS"
-          # 봇 작성 + 마커 보유 중 최신 — 사람이 마커 문자열을 인용·위조한 코멘트는 제외.
-          PREV_REVIEW="$(jq -r --arg m "$MARKER" \
-            '([.[] | select(((.user.type // "") == "Bot") and ((.body // "") | contains($m)))] | last // {}) | .body // ""' "$COMMENTS")"
-          # 마커 라인은 주입 전에 제거 — 모델이 컨텍스트 속 마커를 자기 출력 마커와
-          # 혼동하거나 에코하지 않게 한다.
-          PREV_REVIEW="$(printf '%s\n' "$PREV_REVIEW" | grep -v '^<!-- automation:' || true)"
+          cp "$COMMENTS" opencode-comments-before.json
+          PREV_RECORD="$(jq -c \
+            --arg header "$HEADER" \
+            --arg marker "$MARKER" \
+            --arg reviewer "$REVIEWER" \
+            --arg pr "$PR_NUMBER" '
+              def sha1: if type == "string" then test("^[0-9a-f]{40}$") else false end;
+              def sha256: if type == "string" then test("^[0-9a-f]{64}$") else false end;
+              def positive_integer:
+                if type == "number" then . > 0 and . <= 9007199254740991 and floor == . else false end;
+              def successful_pair:
+                if .successful_head == null then .full_diff_sha256 == null
+                else (.successful_head | sha1) and (.full_diff_sha256 | sha256) end;
+              def parsed_state:
+                (.body // "") as $body
+                | ($body | split("\n")) as $lines
+                | select(.user.type == "Bot")
+                | select($lines[0] == $header and $lines[1] == $marker)
+                | (($lines[2]? // "") | (capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$")? | .json? | fromjson?)) as $s
+                | select(($s | type) == "object")
+                | select(($s | keys | sort) == ["attempt_head", "attempt_status", "diff_mode", "full_diff_sha256", "pr", "reviewer", "run_attempt", "run_id", "schema", "successful_head"])
+                | select(($s.schema | type) == "number" and $s.schema == 2)
+                | select(($s.reviewer | type) == "string" and $s.reviewer == $reviewer)
+                | select(($s.pr | type) == "number" and $s.pr == ($pr | tonumber))
+                | select($s.run_id | positive_integer)
+                | select($s.run_attempt | positive_integer)
+                | select($s.attempt_head | sha1)
+                | select($s | successful_pair)
+                | select(($s.attempt_status | type) == "string" and ($s.attempt_status == "success" or $s.attempt_status == "failure"))
+                | select(($s.diff_mode | type) == "string" and ($s.diff_mode == "full" or $s.diff_mode == "delta" or $s.diff_mode == "unchanged" or $s.diff_mode == "unavailable"))
+                | {comment: ., state: $s};
+              [.[] | parsed_state]
+              | sort_by(.state.run_id, .state.run_attempt)
+              | last // null
+            ' "$COMMENTS")"
+          PREV_REVIEW="$(printf '%s\n' "$PREV_RECORD" | jq -r '.comment.body // ""')"
+          PREV_SUCCESSFUL_HEAD="$(printf '%s\n' "$PREV_RECORD" | jq -r '.state.successful_head // ""')"
+          # Reserved workflow-owned text is never model input, even from a validated record.
+          PREV_REVIEW="$(printf '%s\n' "$PREV_REVIEW" | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Last attempt: )' || true)"
+          # A first failure has no checkpoint and must not become re-review context. A stale
+          # failure is useful only when it retained a validated successful checkpoint/body.
+          if ! [[ "$PREV_SUCCESSFUL_HEAD" =~ ^[0-9a-f]{40}$ ]] || [ -z "$PREV_REVIEW" ]; then
+            PREV_REVIEW=""
+          fi
           # 코멘트별 1,500자 선클립 후 join — 한 개의 초장문 코멘트가 나머지 최신 반박들을
           # 섹션 상한 밖으로 밀어내지 못하게 한다.
           HUMAN_COMMENTS="$(jq -r \
             '[.[] | select((.user.type // "") != "Bot")] | .[-10:]
              | map("@" + (.user.login // "ghost") + " (" + (.created_at // "") + "):\n" + ((.body // "") | .[0:1500]))
-             | join("\n\n---\n\n")' "$COMMENTS")"
+             | join("\n\n---\n\n")' "$COMMENTS" \
+            | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Last attempt: )' || true)"
 
           clip() {
             local text="$1"
@@ -159,6 +201,33 @@ jobs:
           fi
           DELIM="EOF_$(openssl rand -hex 12)"
           { printf 'prev_context<<%s\n' "$DELIM"; printf '%s\n' "$CONTEXT"; printf '%s\n' "$DELIM"; } >> "$GITHUB_OUTPUT"
+
+          # Bind the explicitly numbered server PR diff to the same validated head on both
+          # sides of the fetch. A changed/malformed head never reaches the model.
+          rm -f opencode-review-full.diff opencode-attempt-head.txt review_diff_ready.txt review_full_diff_sha256.txt
+          printf 'false' > review_diff_ready.txt
+          : > review_full_diff_sha256.txt
+          is_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
+          HEAD_BEFORE="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid // ""' 2>/dev/null || printf '')"
+          if is_sha "$HEAD_BEFORE" && gh pr diff "$PR_NUMBER" > opencode-review-full.diff 2>/dev/null && [ -s opencode-review-full.diff ]; then
+            HEAD_AFTER="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid // ""' 2>/dev/null || printf '')"
+            if is_sha "$HEAD_AFTER" && [ "$HEAD_BEFORE" = "$HEAD_AFTER" ]; then
+              printf '%s' "$HEAD_AFTER" > opencode-attempt-head.txt
+              printf 'true' > review_diff_ready.txt
+              sha256sum opencode-review-full.diff | cut -d' ' -f1 > review_full_diff_sha256.txt
+            else
+              echo '::warning::PR head changed or became malformed during OpenCode full-diff preparation; skipping CLI'
+              rm -f opencode-review-full.diff
+            fi
+          else
+            echo '::warning::Failed to fetch a non-empty numbered PR diff; skipping CLI'
+            rm -f opencode-review-full.diff
+          fi
+          {
+            printf 'diff_ready=%s\n' "$(cat review_diff_ready.txt)"
+            printf 'attempt_head=%s\n' "$(cat opencode-attempt-head.txt 2>/dev/null || true)"
+            printf 'full_diff_sha256=%s\n' "$(cat review_full_diff_sha256.txt)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Cache pinned OpenCode CLI archive
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -192,6 +261,8 @@ jobs:
       # 코드는 못 쓴다(contents: read).
       # CLI에는 GITHUB_TOKEN과 USE_GITHUB_TOKEN을 모두 명시한다.
       - name: Run OpenCode PR review
+        id: opencode-review
+        if: steps.ctx.outputs.diff_ready == 'true'
         run: opencode github run
         env:
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
@@ -199,7 +270,13 @@ jobs:
           USE_GITHUB_TOKEN: 'true'
           MODEL: zai-coding-plan/glm-4.7
           PROMPT: |
-            Review this pull request. Focus on:
+            Review this pull request using `opencode-review-full.diff` in the workspace as the
+            exclusive set of changes under review. If that file is absent or unreadable, do not
+            review repository files or run an unnumbered `gh pr diff`; produce no comment.
+            You may read surrounding code only to verify a causal path for a finding, but every
+            new finding must anchor to a changed line in that prepared diff.
+
+            Focus on:
             - correctness and regressions
             - security issues
             - performance pitfalls
@@ -242,6 +319,141 @@ jobs:
               (one line each); omit empty sections. On a first review, review normally.
 
             ${{ steps.ctx.outputs.prev_context }}
+
+      - name: Canonicalize OpenCode review
+        if: ${{ !cancelled() && steps.ctx.outputs.diff_ready == 'true' }}
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ATTEMPT_HEAD: ${{ steps.ctx.outputs.attempt_head }}
+          DIFF_READY: ${{ steps.ctx.outputs.diff_ready }}
+          FULL_DIFF_SHA256: ${{ steps.ctx.outputs.full_diff_sha256 }}
+          REVIEW_OUTCOME: ${{ steps.opencode-review.outcome }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const header = '## OpenCode Review (latest)';
+            const marker = '<!-- automation:opencode-auto-review:v2 -->';
+            const legacyMarker = '<!-- automation:opencode-auto-review -->';
+            const reviewer = 'opencode';
+            const issueNumber = Number(process.env.PR_NUMBER);
+            const runIdRaw = process.env.RUN_ID || '';
+            const runAttemptRaw = process.env.RUN_ATTEMPT || '';
+            const attemptHead = process.env.ATTEMPT_HEAD || '';
+            const fullDiffSha256 = process.env.FULL_DIFF_SHA256 || '';
+            const safeInteger = (raw) => /^[1-9][0-9]*$/.test(raw) && Number.isSafeInteger(Number(raw));
+            if (process.env.DIFF_READY !== 'true' || !Number.isInteger(issueNumber) || issueNumber <= 0
+              || !safeInteger(runIdRaw) || !safeInteger(runAttemptRaw)
+              || !/^[0-9a-f]{40}$/.test(attemptHead) || !/^[0-9a-f]{64}$/.test(fullDiffSha256)) {
+              core.notice('Discarding OpenCode output with invalid prepared input identity');
+              return;
+            }
+            const runId = Number(runIdRaw);
+            const runAttempt = Number(runAttemptRaw);
+            let before;
+            try {
+              before = JSON.parse(fs.readFileSync('opencode-comments-before.json', 'utf8'));
+              if (!Array.isArray(before)) throw new Error('not an array');
+            } catch (error) {
+              throw new Error(`cannot validate pre-run OpenCode comment snapshot: ${error.message}`);
+            }
+            const after = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber, per_page: 100,
+            });
+            const beforeById = new Map(before.map((comment) => [comment.id, comment]));
+            const candidates = after.filter((comment) => {
+              const prior = beforeById.get(comment.id);
+              const changed = !prior || prior.updated_at !== comment.updated_at;
+              return changed && comment.user?.type === 'Bot' && (comment.body || '').includes(legacyMarker);
+            });
+            const modelOk = (process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success';
+            const parseRecord = (comment) => {
+              const lines = (comment.body || '').split('\n');
+              if (comment.user?.type !== 'Bot' || lines[0] !== header || lines[1] !== marker) return null;
+              const stateMatch = (lines[2] || '').match(/^<!-- automation-state:(\{.*\}) -->$/);
+              if (!stateMatch) return null;
+              let state;
+              try { state = JSON.parse(stateMatch[1]); } catch { return null; }
+              const expected = ['attempt_head', 'attempt_status', 'diff_mode', 'full_diff_sha256', 'pr', 'reviewer', 'run_attempt', 'run_id', 'schema', 'successful_head'];
+              if (!state || typeof state !== 'object' || Array.isArray(state)
+                || JSON.stringify(Object.keys(state).sort()) !== JSON.stringify(expected)) return null;
+              const validInteger = (value) => Number.isSafeInteger(value) && value > 0;
+              const validPair = (state.successful_head === null && state.full_diff_sha256 === null)
+                || (/^[0-9a-f]{40}$/.test(state.successful_head || '') && /^[0-9a-f]{64}$/.test(state.full_diff_sha256 || ''));
+              if (state.schema !== 2 || state.reviewer !== reviewer || state.pr !== issueNumber
+                || !validInteger(state.run_id) || !validInteger(state.run_attempt)
+                || !/^[0-9a-f]{40}$/.test(state.attempt_head || '') || !validPair
+                || !['success', 'failure'].includes(state.attempt_status)
+                || !['full', 'delta', 'unchanged', 'unavailable'].includes(state.diff_mode)) return null;
+              return { comment, state };
+            };
+            // Only the pre-run snapshot is a state baseline. The CLI's changed output is
+            // model-authored/untrusted even if it imitates an exact v2 envelope; it becomes
+            // state only after the workflow strips and wraps it below.
+            const records = before.map(parseRecord).filter(Boolean)
+              .sort((a, b) => a.state.run_id - b.state.run_id || a.state.run_attempt - b.state.run_attempt);
+            const existing = records.at(-1) || null;
+            if (candidates.length !== 1) {
+              throw new Error(`expected one OpenCode output, got ${candidates.length}`);
+            }
+            const candidate = candidates[0] || null;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: issueNumber,
+            });
+            if (pr.head?.sha !== attemptHead) {
+              core.notice(`Discarding stale OpenCode review for ${attemptHead}; current head is ${pr.head?.sha || 'unknown'}`);
+              return;
+            }
+            if (existing && (existing.state.run_id > runId
+              || (existing.state.run_id === runId && existing.state.run_attempt >= runAttempt))) {
+              core.notice(`Discarding stale OpenCode generation (${runId}, ${runAttempt})`);
+              return;
+            }
+            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Reviewed: [0-9a-f]{40}$|- Last attempt: failure \(https?:\/\/\S+\)$)/;
+            const clean = (body) => (body || '').split('\n').filter((line) => !reserved.test(line)).join('\n').trim();
+            const review = candidate ? clean(candidate.body) : '';
+            const succeeded = modelOk && candidates.length === 1 && Boolean(review);
+            const previousBody = existing ? clean(existing.comment.body) : '';
+            const priorSuccess = existing && /^[0-9a-f]{40}$/.test(existing.state.successful_head || '')
+              && /^[0-9a-f]{64}$/.test(existing.state.full_diff_sha256 || '') && Boolean(previousBody);
+            const state = succeeded
+              ? {
+                  schema: 2, reviewer, pr: issueNumber, run_id: runId, run_attempt: runAttempt,
+                  attempt_head: attemptHead, successful_head: attemptHead, attempt_status: 'success',
+                  diff_mode: 'full', full_diff_sha256: fullDiffSha256,
+                }
+              : {
+                  schema: 2, reviewer, pr: issueNumber, run_id: runId, run_attempt: runAttempt,
+                  attempt_head: attemptHead,
+                  successful_head: priorSuccess ? existing.state.successful_head : null,
+                  attempt_status: 'failure', diff_mode: 'full',
+                  full_diff_sha256: priorSuccess ? existing.state.full_diff_sha256 : null,
+                };
+            const status = succeeded ? 'success' : (priorSuccess ? 'stale' : 'failure');
+            const body = `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})` : ''}${(succeeded ? review : previousBody) ? `\n\n${succeeded ? review : previousBody}` : ''}`;
+            // OpenCode creates a fresh working comment per run. Preserve exactly one
+            // canonical sticky by updating the pre-existing canonical record first, then
+            // removing this run's transient raw candidate. On the first run the candidate
+            // itself becomes the canonical record.
+            const target = existing ? existing.comment : candidate;
+            if (target) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: target.id, body,
+              });
+              if (existing && existing.comment.id !== candidate.id) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner, repo: context.repo.repo, comment_id: candidate.id,
+                });
+              }
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber, body,
+              });
+            }
 
   skipped:
     name: Workflow Skipped
