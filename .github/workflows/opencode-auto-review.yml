@@ -121,6 +121,8 @@ jobs:
           MARKER: '<!-- automation:opencode-auto-review:v2 -->'
           LEGACY_MARKER: '<!-- automation:opencode-auto-review -->'
           REVIEWER: 'opencode'
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
           MAX_SECTION_CHARS: '6000'
         run: |
           set -euo pipefail
@@ -129,16 +131,19 @@ jobs:
             echo "::error::Failed to fetch PR comments; refusing to run OpenCode without a state snapshot"
             exit 1
           fi
-          COMMENTS="$(mktemp)"
+          COMMENTS="$RUNNER_TEMP/opencode-comments-before.json"
           # --paginate emits one JSON array per page. Keep the complete pre-run snapshot so
           # post-run canonicalization can identify new/updated output by id + updated_at.
           jq -s 'add // []' "$RAW" > "$COMMENTS"
-          cp "$COMMENTS" opencode-comments-before.json
+          chmod 0444 "$COMMENTS"
+          SNAPSHOT_SHA256="$(sha256sum "$COMMENTS" | cut -d' ' -f1)"
           PREV_RECORD="$(jq -c \
             --arg header "$HEADER" \
             --arg marker "$MARKER" \
             --arg reviewer "$REVIEWER" \
-            --arg pr "$PR_NUMBER" '
+            --arg pr "$PR_NUMBER" \
+            --arg server "$SERVER_URL" \
+            --arg repo "$REPOSITORY" '
               def sha1: if type == "string" then test("^[0-9a-f]{40}$") else false end;
               def sha256: if type == "string" then test("^[0-9a-f]{64}$") else false end;
               def positive_integer:
@@ -163,6 +168,7 @@ jobs:
                 | select($s | successful_pair)
                 | select(($s.attempt_status | type) == "string" and ($s.attempt_status == "success" or $s.attempt_status == "failure"))
                 | select(($s.diff_mode | type) == "string" and ($s.diff_mode == "full" or $s.diff_mode == "delta" or $s.diff_mode == "unchanged" or $s.diff_mode == "unavailable"))
+                | select($lines | any(. == ("- Run: " + $server + "/" + $repo + "/actions/runs/" + ($s.run_id | tostring))))
                 | {comment: ., state: $s};
               [.[] | parsed_state]
               | sort_by(.state.run_id, .state.run_attempt)
@@ -227,6 +233,8 @@ jobs:
             printf 'diff_ready=%s\n' "$(cat review_diff_ready.txt)"
             printf 'attempt_head=%s\n' "$(cat opencode-attempt-head.txt 2>/dev/null || true)"
             printf 'full_diff_sha256=%s\n' "$(cat review_full_diff_sha256.txt)"
+            printf 'snapshot_path=%s\n' "$COMMENTS"
+            printf 'snapshot_sha256=%s\n' "$SNAPSHOT_SHA256"
           } >> "$GITHUB_OUTPUT"
 
       - name: Cache pinned OpenCode CLI archive
@@ -331,11 +339,17 @@ jobs:
           ATTEMPT_HEAD: ${{ steps.ctx.outputs.attempt_head }}
           DIFF_READY: ${{ steps.ctx.outputs.diff_ready }}
           FULL_DIFF_SHA256: ${{ steps.ctx.outputs.full_diff_sha256 }}
+          SNAPSHOT_PATH: ${{ steps.ctx.outputs.snapshot_path }}
+          SNAPSHOT_SHA256: ${{ steps.ctx.outputs.snapshot_sha256 }}
+          REVIEW_DIFF_PATH: ${{ github.workspace }}/opencode-review-full.diff
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
           REVIEW_OUTCOME: ${{ steps.opencode-review.outcome }}
         with:
           github-token: ${{ github.token }}
           script: |
             const fs = require('fs');
+            const crypto = require('crypto');
             const header = '## OpenCode Review (latest)';
             const marker = '<!-- automation:opencode-auto-review:v2 -->';
             const legacyMarker = '<!-- automation:opencode-auto-review -->';
@@ -345,6 +359,11 @@ jobs:
             const runAttemptRaw = process.env.RUN_ATTEMPT || '';
             const attemptHead = process.env.ATTEMPT_HEAD || '';
             const fullDiffSha256 = process.env.FULL_DIFF_SHA256 || '';
+            const snapshotPath = process.env.SNAPSHOT_PATH || '';
+            const snapshotSha256 = process.env.SNAPSHOT_SHA256 || '';
+            const reviewDiffPath = process.env.REVIEW_DIFF_PATH || '';
+            const serverUrl = process.env.SERVER_URL || '';
+            const repository = process.env.REPOSITORY || '';
             const safeInteger = (raw) => /^[1-9][0-9]*$/.test(raw) && Number.isSafeInteger(Number(raw));
             if (process.env.DIFF_READY !== 'true' || !Number.isInteger(issueNumber) || issueNumber <= 0
               || !safeInteger(runIdRaw) || !safeInteger(runAttemptRaw)
@@ -356,10 +375,24 @@ jobs:
             const runAttempt = Number(runAttemptRaw);
             let before;
             try {
-              before = JSON.parse(fs.readFileSync('opencode-comments-before.json', 'utf8'));
+              const snapshotBytes = fs.readFileSync(snapshotPath);
+              const actualSnapshotSha256 = crypto.createHash('sha256').update(snapshotBytes).digest('hex');
+              if (!/^[0-9a-f]{64}$/.test(snapshotSha256) || actualSnapshotSha256 !== snapshotSha256) {
+                throw new Error('snapshot SHA-256 mismatch');
+              }
+              before = JSON.parse(snapshotBytes.toString('utf8'));
               if (!Array.isArray(before)) throw new Error('not an array');
             } catch (error) {
               throw new Error(`cannot validate pre-run OpenCode comment snapshot: ${error.message}`);
+            }
+            let reviewDiff;
+            try {
+              reviewDiff = fs.readFileSync(reviewDiffPath);
+            } catch (error) {
+              throw new Error(`cannot validate prepared OpenCode diff: ${error.message}`);
+            }
+            if (!reviewDiff.length || crypto.createHash('sha256').update(reviewDiff).digest('hex') !== fullDiffSha256) {
+              throw new Error('prepared OpenCode diff is missing, empty, or changed after preparation');
             }
             const after = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber, per_page: 100,
@@ -388,19 +421,24 @@ jobs:
                 || !validInteger(state.run_id) || !validInteger(state.run_attempt)
                 || !/^[0-9a-f]{40}$/.test(state.attempt_head || '') || !validPair
                 || !['success', 'failure'].includes(state.attempt_status)
-                || !['full', 'delta', 'unchanged', 'unavailable'].includes(state.diff_mode)) return null;
+                || !['full', 'delta', 'unchanged', 'unavailable'].includes(state.diff_mode)
+                || !lines.includes(`- Run: ${serverUrl}/${repository}/actions/runs/${state.run_id}`)) return null;
               return { comment, state };
             };
-            // Only the pre-run snapshot is a state baseline. The CLI's changed output is
-            // model-authored/untrusted even if it imitates an exact v2 envelope; it becomes
-            // state only after the workflow strips and wraps it below.
-            const records = before.map(parseRecord).filter(Boolean)
-              .sort((a, b) => a.state.run_id - b.state.run_id || a.state.run_attempt - b.state.run_attempt);
-            const existing = records.at(-1) || null;
             if (candidates.length !== 1) {
               throw new Error(`expected one OpenCode output, got ${candidates.length}`);
             }
             const candidate = candidates[0] || null;
+            const previousRecords = before.map(parseRecord).filter(Boolean);
+            if (previousRecords.some((record) => record.comment.id === candidate.id)) {
+              throw new Error('OpenCode candidate reused a prior canonical comment ID');
+            }
+            // The raw candidate is model-authored/untrusted even if it imitates a v2
+            // envelope. All other POST-run comments are current state, including a newer
+            // generation whose timestamp did not change.
+            const records = after.filter((comment) => comment.id !== candidate.id).map(parseRecord).filter(Boolean)
+              .sort((a, b) => a.state.run_id - b.state.run_id || a.state.run_attempt - b.state.run_attempt);
+            const existing = records.at(-1) || null;
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner, repo: context.repo.repo, pull_number: issueNumber,
             });
