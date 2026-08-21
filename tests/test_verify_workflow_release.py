@@ -128,7 +128,7 @@ def release_repo(tmp_path: Path) -> tuple[Path, Path, str]:
     restore_historical_v140_manual_outputs(repo)
     # This synthetic v1.40 fixture uses genuine committed v1.44 central review bytes,
     # the last release before prepare-review-diff became a release dependency.
-    restore_historical_review_workflows(repo, ROOT)
+    restore_historical_review_workflows(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -163,6 +163,14 @@ def replace(path: Path, old: str, new: str, *, count: int = -1) -> None:
     text = path.read_text(encoding="utf-8")
     assert old in text
     path.write_text(text.replace(old, new, count), encoding="utf-8")
+
+
+def append_action_reference(path: Path, reference: str) -> None:
+    def append(document: dict) -> None:
+        job = next(job for job in document["jobs"].values() if "steps" in job)
+        job["steps"].append({"uses": reference})
+
+    mutate_yaml(path, append)
 
 
 def retag_bad_release(repo: Path, message: str) -> str:
@@ -617,6 +625,26 @@ def test_prepare_diff_capability_boundary_is_shared_with_release_inventory() -> 
     )
 
 
+def test_historical_review_workflows_restore_without_invoking_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "historical-fixture"
+    workflow_root = repo / ".github/workflows"
+    workflow_root.mkdir(parents=True)
+
+    def reject_git(*args, **kwargs):
+        raise AssertionError("historical fixture restoration invoked subprocess")
+
+    monkeypatch.setattr(subprocess, "run", reject_git)
+    restore_historical_review_workflows(repo)
+
+    fixture_root = Path(__file__).parent / "fixtures/review-workflows-v1.44"
+    for filename in ("claude-code-review.yml", "gemini-auto-review.yml"):
+        assert (workflow_root / filename).read_bytes() == (
+            fixture_root / filename
+        ).read_bytes()
+
+
 @pytest.mark.parametrize(
     ("old", "new"),
     (
@@ -755,7 +783,7 @@ def test_release_verifier_preserves_pre_inventory_v139_contract(
 ) -> None:
     repo = tmp_path / "historical-automation"
     shutil.copytree(ROOT / ".github/workflows", repo / ".github/workflows")
-    restore_historical_review_workflows(repo, ROOT)
+    restore_historical_review_workflows(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -770,7 +798,7 @@ def test_v144_release_keeps_the_historical_inventory_without_prepare_diff_action
 ) -> None:
     """Adding a v1.45 action must not retroactively invalidate immutable v1.44 tags."""
     repo, _ = current_release_repo
-    restore_historical_review_workflows(repo, ROOT)
+    restore_historical_review_workflows(repo)
     for relative in (
         ".github/actions/prepare-review-diff/action.yml",
         ".github/actions/prepare-review-diff/prepare_review_diff.py",
@@ -812,7 +840,7 @@ def test_pre_v145_rejects_prepare_dependency_regardless_of_future_action_files(
         if workflow == "claude-code-review.yml"
         else "claude-code-review.yml"
     )
-    restore_historical_review_workflows(repo, ROOT, (other,))
+    restore_historical_review_workflows(repo, (other,))
     if not action_files_present:
         for relative in (
             ".github/actions/prepare-review-diff/action.yml",
@@ -848,6 +876,42 @@ def test_v145_rejects_nonexact_local_review_action_dependencies(
 
     with pytest.raises(ReleaseVerificationError, match="prepare-review-diff dependency"):
         release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+@pytest.mark.parametrize("workflow", ("claude-code-review.yml", "gemini-auto-review.yml"))
+@pytest.mark.parametrize(
+    "reference",
+    (
+        "./.github/actions/unowned",
+        "$/.github/actions/prepare-review-diff",
+    ),
+    ids=("dot-local-action", "duplicate-exact-action"),
+)
+def test_v145_rejects_appended_local_review_action_dependencies(
+    current_release_repo: tuple[Path, str], workflow: str, reference: str
+) -> None:
+    repo, _ = current_release_repo
+    append_action_reference(repo / ".github/workflows" / workflow, reference)
+    bad_commit = commit(repo, f"append invalid {workflow} local action")
+
+    with pytest.raises(ReleaseVerificationError, match="prepare-review-diff dependency"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+@pytest.mark.parametrize("workflow", ("claude-code-review.yml", "gemini-auto-review.yml"))
+def test_pre_v145_rejects_appended_dot_local_review_action_dependency(
+    current_release_repo: tuple[Path, str], workflow: str
+) -> None:
+    repo, _ = current_release_repo
+    restore_historical_review_workflows(repo)
+    append_action_reference(
+        repo / ".github/workflows" / workflow,
+        "./.github/actions/unowned",
+    )
+    bad_commit = commit(repo, f"append pre-v1.45 {workflow} local action")
+
+    with pytest.raises(ReleaseVerificationError, match="prepare-review-diff dependency"):
+        release_verifier.verify_commit_content(repo, "v1.44", bad_commit)
 
 
 @pytest.mark.parametrize("unsupported", ("alternates", "promisor"))
@@ -2041,7 +2105,7 @@ def test_rejects_opencode_command_oidc_app_token_path(
         ),
         (comment_only_setup_pin, "resolver"),
         (unconditional_setup_input, "mode-controlled inputs"),
-        (extra_local_setup_resolver, "resolver"),
+        (extra_local_setup_resolver, "prepare-review-diff dependency"),
         (extra_direct_app_resolver, "App token"),
         (downstream_github_token, "write token"),
         (validation_not_immediately_before_resolver, "immediately preceded"),
@@ -2076,7 +2140,7 @@ def test_rejects_insecure_tagged_gemini_contracts(
         (inherited_write_without_resolver, "workflow-level write permissions"),
         (explicit_write_without_resolver, "exactly one.*resolver"),
         (github_token_in_write_job_env, "github.token"),
-        (alternate_local_token_mint_action, "approved action"),
+        (alternate_local_token_mint_action, "prepare-review-diff dependency"),
         (github_token_in_workflow_env, "workflow.*github.token"),
         (ambient_caller_write_without_permissions, "explicit permissions"),
     ],

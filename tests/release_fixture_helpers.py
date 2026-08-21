@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import subprocess
 
 
-HISTORICAL_REVIEW_WORKFLOW_COMMIT = "5ec427c540619d6fbd80ea758de8d8e0bf00d987"
+HISTORICAL_REVIEW_FIXTURE_ROOT = (
+    Path(__file__).parent / "fixtures/review-workflows-v1.44"
+)
 HISTORICAL_REVIEW_WORKFLOWS = (
     "claude-code-review.yml",
     "gemini-auto-review.yml",
@@ -37,26 +38,16 @@ def restore_historical_automation_ref(repo: Path, historical_ref: str) -> None:
 
 def restore_historical_review_workflows(
     repo: Path,
-    source_repo: Path,
     filenames: tuple[str, ...] = HISTORICAL_REVIEW_WORKFLOWS,
 ) -> None:
     """Restore genuine v1.44 central review bytes into a historical fixture.
 
-    The immutable commit is the target of tag v1.44. Using its committed bytes keeps
-    pre-v1.45 fixtures honest when the live workflows gain release-owned dependencies.
+    The snapshots come from immutable v1.44 commit 5ec427c540619d6fbd80ea758de8d8e0bf00d987.
+    Keeping them in the test tree makes historical fixtures independent of Git history.
     """
 
     for filename in filenames:
         relative = f".github/workflows/{filename}"
-        payload = subprocess.run(
-            [
-                "/usr/bin/git",
-                "-C",
-                str(source_repo),
-                "show",
-                f"{HISTORICAL_REVIEW_WORKFLOW_COMMIT}:{relative}",
-            ],
-            check=True,
-            stdout=subprocess.PIPE,
-        ).stdout
-        (repo / relative).write_bytes(payload)
+        (repo / relative).write_bytes(
+            (HISTORICAL_REVIEW_FIXTURE_ROOT / filename).read_bytes()
+        )

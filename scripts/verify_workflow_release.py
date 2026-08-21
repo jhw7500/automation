@@ -1713,7 +1713,9 @@ def _verify_prepare_review_diff_dependencies(
             continue
         references = _action_references(document)
         local_references = [
-            reference for reference in references if reference.startswith("$/")
+            reference
+            for reference in references
+            if reference.startswith(("$/", "./"))
         ]
         if supported:
             valid = (

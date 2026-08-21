@@ -258,7 +258,7 @@ def release_repo(tmp_path: Path) -> tuple[Path, str]:
     restore_historical_automation_ref(repo, "v1.40")
     # v1.40.2 predates the shared review action; use genuine committed v1.44
     # central workflow bytes rather than deleting dependencies from live workflows.
-    restore_historical_review_workflows(repo, ROOT)
+    restore_historical_review_workflows(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
