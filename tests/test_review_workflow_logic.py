@@ -25,6 +25,7 @@ run it against fixtures, so the review-round rules stay locked:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -921,6 +922,33 @@ def test_gemini_preparation_rejects_changed_or_malformed_head_before_model(tmp_p
     gate = model[:model.index("# Install dependencies")]
     result = subprocess.run(["bash", "-c", gate], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode != 0
+    assert not (tmp_path / "gemini_review.py").exists()
+
+
+def test_gemini_preparation_keeps_stable_head_bound_full_diff_ready_for_model(tmp_path):
+    head = "ab" * 20
+    workflow = _load("gemini-auto-review.yml")
+    preparation = _step(workflow, "gemini-review", "Get PR details")["run"]
+    output = tmp_path / "github-output"
+    env = _gh_stub(tmp_path, [], head_shas=[head, head])
+    env["GITHUB_OUTPUT"] = str(output)
+
+    subprocess.run(["bash", "-c", preparation], cwd=tmp_path, env=env, check=True, capture_output=True)
+
+    expected_sha256 = hashlib.sha256(b"FULL-DIFF-FIXTURE\n").hexdigest()
+    assert output.read_text(encoding="utf-8") == (
+        "diff_ready=true\n"
+        f"attempt_head={head}\n"
+        f"full_diff_sha256={expected_sha256}\n"
+        "diff_mode=full\n"
+    )
+    assert (tmp_path / "head_count.txt").read_text(encoding="utf-8") == "2"
+    assert (tmp_path / "pr_diff.txt").read_text(encoding="utf-8") == "FULL-DIFF-FIXTURE\n"
+
+    model = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
+    gate = model[:model.index("# Install dependencies")]
+    result = subprocess.run(["bash", "-c", gate], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0
     assert not (tmp_path / "gemini_review.py").exists()
 
 
