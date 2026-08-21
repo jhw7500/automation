@@ -444,6 +444,48 @@ def test_invalid_invocation_is_nonzero_and_does_not_call_gh(
     assert not gh_fixture.log.exists()
 
 
+def test_github_output_bridge_appends_action_safe_scalars_without_changing_stdout(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """The composite bridge must not add diagnostics or unsafe values to stdout."""
+    configure_gh(gh_fixture, base=history.base, head=history.head)
+    full, delta, manifest = outputs(tmp_path)
+    github_output = tmp_path / "github-output"
+    github_output.write_text("existing=value\n", encoding="utf-8")
+
+    result = run_prepare(
+        history.repo,
+        gh_fixture,
+        *prepare_args(full, delta, manifest, "--github-output", str(github_output)),
+    )
+
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert result.stdout == json.dumps(state, sort_keys=True) + "\n"
+    assert github_output.read_text(encoding="utf-8") == (
+        "existing=value\n"
+        "diff_ready=true\n"
+        "diff_mode=full\n"
+        f"head_sha={history.head}\n"
+        f"full_diff_sha256={state['full_diff_sha256']}\n"
+        "unchanged_since_previous=false\n"
+    )
+
+
+def test_omitted_github_output_bridge_does_not_create_an_output_file(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """Standalone use must leave an unrequested Actions output file untouched."""
+    configure_gh(gh_fixture, base=history.base, head=history.head)
+    full, delta, manifest = outputs(tmp_path)
+    github_output = tmp_path / "github-output"
+
+    result = run_prepare(history.repo, gh_fixture, *prepare_args(full, delta, manifest))
+
+    assert result.returncode == 0, result.stderr
+    assert not github_output.exists()
+
+
 def test_unicode_and_newline_paths_stay_scoped_in_incremental_diff(
     history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
 ) -> None:

@@ -742,6 +742,22 @@ def test_release_verifier_preserves_pre_inventory_v139_contract(
     assert verify_release(repo, "v1.39", commit_oid) == commit_oid
 
 
+def test_v144_release_keeps_the_historical_inventory_without_prepare_diff_action(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    """Adding a v1.45 action must not retroactively invalidate immutable v1.44 tags."""
+    repo, _ = current_release_repo
+    for relative in (
+        ".github/actions/prepare-review-diff/action.yml",
+        ".github/actions/prepare-review-diff/prepare_review_diff.py",
+    ):
+        (repo / relative).unlink()
+    historical_commit = commit(repo, "v1.44 historical inventory")
+    git(repo, "tag", "-a", "v1.44", "-m", "v1.44")
+
+    assert verify_release(repo, "v1.44", historical_commit) == historical_commit
+
+
 @pytest.mark.parametrize("unsupported", ("alternates", "promisor"))
 def test_release_verification_fails_closed_on_unsupported_object_storage(
     release_repo: tuple[Path, Path, str],
@@ -1042,6 +1058,43 @@ def test_commit_gate_rejects_action_file_replaced_by_directory_and_dummy_blob(
 
     with pytest.raises(ReleaseVerificationError, match="release inventory"):
         release_verifier.verify_commit_content(repo, "v1.41", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        ".github/actions/prepare-review-diff/action.yml",
+        ".github/actions/prepare-review-diff/prepare_review_diff.py",
+    ),
+)
+@pytest.mark.parametrize("mutation", ("missing", "executable-mode"))
+def test_v145_commit_gate_requires_each_prepare_diff_action_file_as_0644_blob(
+    release_repo: tuple[Path, Path, str], relative: str, mutation: str
+) -> None:
+    """The next release line fails closed on absent or non-regular action artifacts."""
+    repo, _, _ = release_repo
+    target = repo / relative
+    if mutation == "missing":
+        target.unlink()
+    else:
+        target.chmod(0o755)
+    bad_commit = commit(repo, f"mutate {relative}")
+
+    with pytest.raises(ReleaseVerificationError, match="release inventory"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+def test_v145_commit_gate_rejects_an_unsafe_prepare_diff_action_contract(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    """Release verification must reject a shell that interpolates a PR-controlled input."""
+    repo, _, _ = release_repo
+    action = repo / ".github/actions/prepare-review-diff/action.yml"
+    replace(action, '"$PR_NUMBER"', '"${{ inputs.pr-number }}"')
+    bad_commit = commit(repo, "weaken prepare diff action boundary")
+
+    with pytest.raises(ReleaseVerificationError, match="prepare-review-diff action contract"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 def test_commit_gate_verifies_setup_gemini_auth_action_contract(

@@ -12,6 +12,7 @@ import traceback
 import zlib
 
 import pytest
+import yaml
 
 from scripts.verify_workflow_release import ReleaseVerificationError
 import scripts.verify_workflow_release as release_verifier
@@ -27,6 +28,71 @@ RELEASE_REF = "v1.40.2"
 EXACT_RELEASE_FILES = tuple(
     root.path.as_posix() for root in EXACT_RELEASE_ROOTS
 )
+PREPARE_REVIEW_DIFF_ACTION = (
+    ROOT / ".github/actions/prepare-review-diff/action.yml"
+)
+
+
+def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() -> None:
+    """Action inputs must cross into bash only through quoted environment values."""
+    document = yaml.load(PREPARE_REVIEW_DIFF_ACTION.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+    assert document == {
+        "name": "Prepare review diff",
+        "description": "Prepare a fail-closed full or incremental PR diff",
+        "inputs": {
+            "github-token": {"required": "true"},
+            "pr-number": {"required": "true"},
+            "previous-sha": {"required": "false", "default": ""},
+            "previous-full-hash": {"required": "false", "default": ""},
+            "context-lines": {"required": "false", "default": "3"},
+        },
+        "outputs": {
+            "diff-ready": {"value": "${{ steps.prepare.outputs.diff_ready }}"},
+            "diff-mode": {"value": "${{ steps.prepare.outputs.diff_mode }}"},
+            "head-sha": {"value": "${{ steps.prepare.outputs.head_sha }}"},
+            "full-diff-sha256": {
+                "value": "${{ steps.prepare.outputs.full_diff_sha256 }}"
+            },
+            "unchanged-since-previous": {
+                "value": "${{ steps.prepare.outputs.unchanged_since_previous }}"
+            },
+        },
+        "runs": {
+            "using": "composite",
+            "steps": [
+                {
+                    "id": "prepare",
+                    "shell": "bash",
+                    "env": {
+                        "GH_TOKEN": "${{ inputs.github-token }}",
+                        "PR_NUMBER": "${{ inputs.pr-number }}",
+                        "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
+                        "PREVIOUS_FULL_HASH": "${{ inputs.previous-full-hash }}",
+                        "CONTEXT_LINES": "${{ inputs.context-lines }}",
+                    },
+                    "run": (
+                        'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py"\n'
+                        '  --repository "$GITHUB_REPOSITORY"\n'
+                        '  --pr-number "$PR_NUMBER"\n'
+                        '  --previous-sha "$PREVIOUS_SHA"\n'
+                        '  --previous-full-hash "$PREVIOUS_FULL_HASH"\n'
+                        '  --context-lines "$CONTEXT_LINES"\n'
+                        '  --full-output "$GITHUB_WORKSPACE/review-full.diff"\n'
+                        '  --delta-output "$GITHUB_WORKSPACE/review-delta.diff"\n'
+                        '  --manifest-output "$GITHUB_WORKSPACE/review-scope.json"\n'
+                        '  --github-output "$GITHUB_OUTPUT"\n'
+                    ),
+                }
+            ],
+        },
+    }
+
+
+def test_prepare_review_diff_action_is_bundled_as_regular_release_files() -> None:
+    """The helper and metadata travel at the same immutable automation commit."""
+    assert ".github/actions/prepare-review-diff/action.yml" in EXACT_RELEASE_FILES
+    assert ".github/actions/prepare-review-diff/prepare_review_diff.py" in EXACT_RELEASE_FILES
 
 
 def git(repo: Path, *args: str) -> str:
@@ -280,6 +346,23 @@ def test_bundle_rejects_action_file_replaced_by_directory_and_dummy_blob(
             pass
 
 
+def test_v144_bundle_materializes_without_future_prepare_diff_action(
+    release_repo: tuple[Path, str],
+) -> None:
+    """Version-aware extraction preserves an historical action inventory."""
+    repo, _ = release_repo
+    for relative in (
+        ".github/actions/prepare-review-diff/action.yml",
+        ".github/actions/prepare-review-diff/prepare_review_diff.py",
+    ):
+        (repo / relative).unlink()
+    historical_commit = retag(repo, "v1.44")
+
+    with materialize_release_bundle(repo, "v1.44", remote=None) as bundle:
+        assert bundle.commit == historical_commit
+        assert not (bundle.root / ".github/actions/prepare-review-diff").exists()
+
+
 def test_release_archive_ignores_host_user_and_xdg_git_includes(
     release_repo: tuple[Path, str],
     tmp_path: Path,
@@ -524,11 +607,12 @@ def test_bundle_binds_content_and_archive_across_aba_tag_movement(
         automation: Path,
         revision: str,
         *,
+        ref: str = "v1.45",
         tree: release_verifier.VerifiedCommitTree | None = None,
     ) -> bytes:
         archive_revisions.append(revision)
         assert tree is not None
-        return original_archive(automation, revision, tree=tree)
+        return original_archive(automation, revision, ref=ref, tree=tree)
 
     monkeypatch.setattr(release_verifier, "read_git_object", racing_read)
     monkeypatch.setattr(
@@ -617,7 +701,7 @@ def test_bundle_rejects_unsafe_archive_members(
     malicious = archive_with(member)
     monkeypatch.setattr(
         "scripts.workflow_release_bundle._git_archive",
-        lambda automation, ref, **_kwargs: malicious,
+        lambda automation, revision, **_kwargs: malicious,
     )
 
     with pytest.raises(ReleaseVerificationError, match="unsafe archive member"):

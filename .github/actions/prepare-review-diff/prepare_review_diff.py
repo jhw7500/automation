@@ -52,6 +52,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--full-output", required=True)
     parser.add_argument("--delta-output", required=True)
     parser.add_argument("--manifest-output", required=True)
+    parser.add_argument("--github-output")
     args = parser.parse_args(argv)
     if not REPOSITORY_RE.fullmatch(args.repository):
         parser.error("--repository must be OWNER/REPO")
@@ -251,6 +252,20 @@ def unavailable(
     return PreparedReviewDiff(False, "unavailable", head_sha, base_sha, "", False, warning)
 
 
+def write_github_output(path: str, result: PreparedReviewDiff) -> None:
+    """Append the scalar subset GitHub Actions may expose as composite outputs."""
+    values = (
+        ("diff_ready", str(result.diff_ready).lower()),
+        ("diff_mode", result.diff_mode),
+        ("head_sha", result.head_sha),
+        ("full_diff_sha256", result.full_diff_sha256),
+        ("unchanged_since_previous", str(result.unchanged_since_previous).lower()),
+    )
+    with Path(path).open("a", encoding="utf-8") as output:
+        for name, value in values:
+            output.write(f"{name}={value}\n")
+
+
 def prepare(args: argparse.Namespace, cwd: Path) -> PreparedReviewDiff:
     base_sha = ""
     head_sha = ""
@@ -338,6 +353,8 @@ def prepare(args: argparse.Namespace, cwd: Path) -> PreparedReviewDiff:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     result = prepare(args, Path.cwd())
+    if args.github_output is not None:
+        write_github_output(args.github_output, result)
     print(json.dumps(asdict(result), sort_keys=True))
     return 0
 

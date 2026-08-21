@@ -29,8 +29,10 @@ from scripts.workflow_catalog import (
     load_fleet_config,
 )
 from scripts.workflow_release_inventory import (
-    RELEASE_PATHS,
+    PREPARE_REVIEW_DIFF_ACTION_ROOT,
     SETUP_GEMINI_AUTH_ROOT,
+    release_paths_for,
+    release_roots_for,
     validate_release_listing,
 )
 
@@ -185,6 +187,56 @@ EXPECTED_SETUP_GEMINI_AUTH = {
                     "fi\n"
                 ),
             },
+        ],
+    },
+}
+EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
+    "name": "Prepare review diff",
+    "description": "Prepare a fail-closed full or incremental PR diff",
+    "inputs": {
+        "github-token": {"required": "true"},
+        "pr-number": {"required": "true"},
+        "previous-sha": {"required": "false", "default": ""},
+        "previous-full-hash": {"required": "false", "default": ""},
+        "context-lines": {"required": "false", "default": "3"},
+    },
+    "outputs": {
+        "diff-ready": {"value": "${{ steps.prepare.outputs.diff_ready }}"},
+        "diff-mode": {"value": "${{ steps.prepare.outputs.diff_mode }}"},
+        "head-sha": {"value": "${{ steps.prepare.outputs.head_sha }}"},
+        "full-diff-sha256": {
+            "value": "${{ steps.prepare.outputs.full_diff_sha256 }}"
+        },
+        "unchanged-since-previous": {
+            "value": "${{ steps.prepare.outputs.unchanged_since_previous }}"
+        },
+    },
+    "runs": {
+        "using": "composite",
+        "steps": [
+            {
+                "id": "prepare",
+                "shell": "bash",
+                "env": {
+                    "GH_TOKEN": "${{ inputs.github-token }}",
+                    "PR_NUMBER": "${{ inputs.pr-number }}",
+                    "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
+                    "PREVIOUS_FULL_HASH": "${{ inputs.previous-full-hash }}",
+                    "CONTEXT_LINES": "${{ inputs.context-lines }}",
+                },
+                "run": (
+                    'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py"\n'
+                    '  --repository "$GITHUB_REPOSITORY"\n'
+                    '  --pr-number "$PR_NUMBER"\n'
+                    '  --previous-sha "$PREVIOUS_SHA"\n'
+                    '  --previous-full-hash "$PREVIOUS_FULL_HASH"\n'
+                    '  --context-lines "$CONTEXT_LINES"\n'
+                    '  --full-output "$GITHUB_WORKSPACE/review-full.diff"\n'
+                    '  --delta-output "$GITHUB_WORKSPACE/review-delta.diff"\n'
+                    '  --manifest-output "$GITHUB_WORKSPACE/review-scope.json"\n'
+                    '  --github-output "$GITHUB_OUTPUT"\n'
+                ),
+            }
         ],
     },
 }
@@ -1286,9 +1338,10 @@ def _verify_approved_v140_policy(tree: VerifiedCommitTree, ref: str) -> None:
         )
 
 
-def _release_inventory(tree: VerifiedCommitTree) -> None:
+def _release_inventory(tree: VerifiedCommitTree, ref: str) -> None:
     try:
-        entries = validate_release_listing(tree.listing(RELEASE_PATHS))
+        roots = release_roots_for(ref)
+        entries = validate_release_listing(tree.listing(release_paths_for(ref)), roots)
         for entry in entries:
             tree.reader.read(entry.oid, "blob")
     except (ReleaseVerificationError, ValueError):
@@ -1316,6 +1369,20 @@ def _verify_setup_gemini_auth(tree: VerifiedCommitTree) -> None:
     if document != EXPECTED_SETUP_GEMINI_AUTH:
         raise ReleaseVerificationError(
             "setup-gemini-auth action contract is invalid"
+        )
+
+
+def _verify_prepare_review_diff_action(tree: VerifiedCommitTree) -> None:
+    path = PREPARE_REVIEW_DIFF_ACTION_ROOT.path.as_posix()
+    try:
+        document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
+    except (ReleaseVerificationError, yaml.YAMLError):
+        raise ReleaseVerificationError(
+            "prepare-review-diff action contract is invalid"
+        ) from None
+    if document != EXPECTED_PREPARE_REVIEW_DIFF_ACTION:
+        raise ReleaseVerificationError(
+            "prepare-review-diff action contract is invalid"
         )
 
 
@@ -1800,8 +1867,10 @@ def _verify_commit_content(
 ) -> VerifiedCommitTree:
     tree = VerifiedCommitTree.open(repo, revision)
     if _release_version(ref) >= (1, 40):
-        _release_inventory(tree)
+        _release_inventory(tree, ref)
         _verify_setup_gemini_auth(tree)
+    if _release_version(ref) >= (1, 45):
+        _verify_prepare_review_diff_action(tree)
     _verify_approved_v140_policy(tree, ref)
     _verify_manual_gemini_output_contract(tree, ref)
     catalog = _verify_tag_catalog(tree, ref)

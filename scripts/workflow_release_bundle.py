@@ -28,9 +28,11 @@ from scripts.workflow_catalog import (
     load_fleet_config,
 )
 from scripts.workflow_release_inventory import (
-    RELEASE_PATHS,
+    ReleaseRoot,
     release_directory,
     release_file_modes,
+    release_paths_for,
+    release_roots_for,
     validate_release_listing,
 )
 
@@ -45,20 +47,30 @@ class ReleaseBundle:
     canonical: Path
 
 
-def _release_owned(path: PurePosixPath, *, directory: bool) -> bool:
-    return release_directory(path) if directory else bool(release_file_modes(path))
+def _release_owned(
+    path: PurePosixPath, *, directory: bool, roots: tuple[ReleaseRoot, ...]
+) -> bool:
+    return (
+        release_directory(path, roots)
+        if directory
+        else bool(release_file_modes(path, roots))
+    )
 
 
 def _build_git_archive(
     automation: Path,
     revision: str,
     *,
+    ref: str = "v1.45",
     tree: VerifiedCommitTree | None = None,
 ) -> bytes:
     verified = tree if tree is not None else VerifiedCommitTree.open(automation, revision)
     if verified.commit != revision:
         raise ReleaseVerificationError("unable to archive verified release")
-    entries = validate_release_listing(verified.listing(RELEASE_PATHS))
+    roots = release_roots_for(ref)
+    entries = validate_release_listing(
+        verified.listing(release_paths_for(ref)), roots
+    )
 
     output = BytesIO()
     with tarfile.open(
@@ -82,11 +94,12 @@ def _git_archive(
     automation: Path,
     revision: str,
     *,
+    ref: str = "v1.45",
     tree: VerifiedCommitTree | None = None,
 ) -> bytes:
     archive: bytes | None = None
     try:
-        archive = _build_git_archive(automation, revision, tree=tree)
+        archive = _build_git_archive(automation, revision, ref=ref, tree=tree)
     except (OSError, UnicodeDecodeError, ValueError, ReleaseVerificationError):
         pass
     if archive is None:
@@ -94,14 +107,16 @@ def _git_archive(
     return archive
 
 
-def _safe_member(member: tarfile.TarInfo) -> PurePosixPath:
+def _safe_member(
+    member: tarfile.TarInfo, roots: tuple[ReleaseRoot, ...] = release_roots_for("v1.45")
+) -> PurePosixPath:
     path = PurePosixPath(member.name)
-    allowed_modes = release_file_modes(path)
+    allowed_modes = release_file_modes(path, roots)
     safe = (
         bool(path.parts)
         and not path.is_absolute()
         and ".." not in path.parts
-        and _release_owned(path, directory=member.isdir())
+        and _release_owned(path, directory=member.isdir(), roots=roots)
         and (member.isdir() or member.isreg())
         and (member.isdir() or member.mode in allowed_modes)
         and not member.issym()
@@ -112,11 +127,16 @@ def _safe_member(member: tarfile.TarInfo) -> PurePosixPath:
     return path
 
 
-def _extract_archive(archive_bytes: bytes, destination: Path) -> None:
+def _extract_archive(
+    archive_bytes: bytes,
+    destination: Path,
+    *,
+    roots: tuple[ReleaseRoot, ...] = release_roots_for("v1.45"),
+) -> None:
     try:
         with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:") as archive:
             members = tuple(archive.getmembers())
-            paths = tuple(_safe_member(member) for member in members)
+            paths = tuple(_safe_member(member, roots) for member in members)
             for member, relative in zip(members, paths):
                 target = destination.joinpath(*relative.parts)
                 if member.isdir():
@@ -142,11 +162,14 @@ def _materialize(
     if remote is not None:
         verify_remote_tag(automation, remote, tag)
     verified_tree = verify_tag_content(automation, ref, tag=tag)
+    roots = release_roots_for(ref)
 
     with tempfile.TemporaryDirectory(prefix="workflow-release-") as temporary:
         root = Path(temporary)
         _extract_archive(
-            _git_archive(automation, tag.commit, tree=verified_tree), root
+            _git_archive(automation, tag.commit, ref=ref, tree=verified_tree),
+            root,
+            roots=roots,
         )
         try:
             catalog = load_catalog(root)

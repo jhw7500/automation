@@ -55,40 +55,82 @@ WORKFLOW_CATALOG_ROOT = ReleaseRoot(
 WORKFLOW_CONFIG_ROOT = ReleaseRoot(
     PurePosixPath("scripts/workflow-config.json"), "file", "100644"
 )
+PREPARE_REVIEW_DIFF_ACTION_ROOT = ReleaseRoot(
+    PurePosixPath(".github/actions/prepare-review-diff/action.yml"),
+    "file",
+    "100644",
+)
+PREPARE_REVIEW_DIFF_HELPER_ROOT = ReleaseRoot(
+    PurePosixPath(".github/actions/prepare-review-diff/prepare_review_diff.py"),
+    "file",
+    "100644",
+)
 
-RELEASE_ROOTS = (
+HISTORICAL_RELEASE_ROOTS = (
     CENTRAL_WORKFLOW_ROOT,
     SETUP_GEMINI_AUTH_ROOT,
     CANONICAL_WORKFLOW_ROOT,
     WORKFLOW_CATALOG_ROOT,
     WORKFLOW_CONFIG_ROOT,
 )
+PREPARE_REVIEW_DIFF_ROOTS = (
+    PREPARE_REVIEW_DIFF_ACTION_ROOT,
+    PREPARE_REVIEW_DIFF_HELPER_ROOT,
+)
+RELEASE_ROOTS = HISTORICAL_RELEASE_ROOTS + PREPARE_REVIEW_DIFF_ROOTS
 RELEASE_PATHS = tuple(root.path.as_posix() for root in RELEASE_ROOTS)
 EXACT_RELEASE_ROOTS = tuple(root for root in RELEASE_ROOTS if root.kind == "file")
 TREE_RELEASE_ROOTS = tuple(root for root in RELEASE_ROOTS if root.kind == "tree")
 
-_EXACT_BY_PATH = {root.path: root for root in EXACT_RELEASE_ROOTS}
 _OID = re.compile(r"[0-9a-f]{40}")
 _TREE_FILE_MODES = frozenset({"100644", "100755"})
+_RELEASE_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
+_PREPARE_REVIEW_DIFF_RELEASE = (1, 45)
 
 
-def _tree_owner(path: PurePosixPath) -> ReleaseRoot | None:
+def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:
+    """Select the authenticated inventory that existed at ``ref``'s release line."""
+    if _RELEASE_REF.fullmatch(ref) is None:
+        raise ValueError("invalid release ref")
+    version = tuple(int(part) for part in ref.removeprefix("v").split("."))
+    if version >= _PREPARE_REVIEW_DIFF_RELEASE:
+        return RELEASE_ROOTS
+    return HISTORICAL_RELEASE_ROOTS
+
+
+def release_paths_for(ref: str) -> tuple[str, ...]:
+    return tuple(root.path.as_posix() for root in release_roots_for(ref))
+
+
+def _exact_by_path(roots: tuple[ReleaseRoot, ...]) -> dict[PurePosixPath, ReleaseRoot]:
+    return {root.path: root for root in roots if root.kind == "file"}
+
+
+def _tree_roots(roots: tuple[ReleaseRoot, ...]) -> tuple[ReleaseRoot, ...]:
+    return tuple(root for root in roots if root.kind == "tree")
+
+
+def _tree_owner(path: PurePosixPath, roots: tuple[ReleaseRoot, ...]) -> ReleaseRoot | None:
     return next(
         (
             root
-            for root in TREE_RELEASE_ROOTS
+            for root in _tree_roots(roots)
             if path != root.path and path.is_relative_to(root.path)
         ),
         None,
     )
 
 
-def validate_release_listing(listing: bytes) -> tuple[ReleaseBlob, ...]:
+def validate_release_listing(
+    listing: bytes, roots: tuple[ReleaseRoot, ...] = RELEASE_ROOTS
+) -> tuple[ReleaseBlob, ...]:
     """Validate raw ``git ls-tree -r -z`` output against the closed inventory."""
 
     blobs: list[ReleaseBlob] = []
     seen: set[PurePosixPath] = set()
     populated_trees: set[PurePosixPath] = set()
+    exact_by_path = _exact_by_path(roots)
+    tree_roots = _tree_roots(roots)
     try:
         records = listing.split(b"\0")
         for record in records:
@@ -100,8 +142,8 @@ def validate_release_listing(listing: bytes) -> tuple[ReleaseBlob, ...]:
             path = PurePosixPath(rendered)
             mode = raw_mode.decode("ascii")
             oid = raw_oid.decode("ascii")
-            exact = _EXACT_BY_PATH.get(path)
-            tree = _tree_owner(path)
+            exact = exact_by_path.get(path)
+            tree = _tree_owner(path, roots)
             if (
                 not path.parts
                 or path.is_absolute()
@@ -128,34 +170,44 @@ def validate_release_listing(listing: bytes) -> tuple[ReleaseBlob, ...]:
         raise ValueError("invalid release tree listing") from None
 
     if (
-        not {root.path for root in EXACT_RELEASE_ROOTS} <= seen
-        or populated_trees != {root.path for root in TREE_RELEASE_ROOTS}
+        not {root.path for root in exact_by_path.values()} <= seen
+        or populated_trees != {root.path for root in tree_roots}
     ):
         raise ValueError("incomplete release tree listing")
     return tuple(blobs)
 
 
-def release_file_modes(path: PurePosixPath) -> frozenset[int]:
+def release_file_modes(
+    path: PurePosixPath, roots: tuple[ReleaseRoot, ...] = RELEASE_ROOTS
+) -> frozenset[int]:
     """Return the allowed archive modes for an owned file."""
 
-    exact = _EXACT_BY_PATH.get(path)
+    exact = _exact_by_path(roots).get(path)
     if exact is not None:
         assert exact.mode is not None
         return frozenset({0o755 if exact.mode == "100755" else 0o644})
-    return frozenset({0o644, 0o755}) if _tree_owner(path) is not None else frozenset()
+    return (
+        frozenset({0o644, 0o755})
+        if _tree_owner(path, roots) is not None
+        else frozenset()
+    )
 
 
-def release_directory(path: PurePosixPath) -> bool:
+def release_directory(
+    path: PurePosixPath, roots: tuple[ReleaseRoot, ...] = RELEASE_ROOTS
+) -> bool:
     """Return whether an archive directory is owned or an owned-path ancestor."""
 
-    if path in _EXACT_BY_PATH:
+    exact_by_path = _exact_by_path(roots)
+    tree_roots = _tree_roots(roots)
+    if path in exact_by_path:
         return False
     return any(
         path == root.path
         or path.is_relative_to(root.path)
         or root.path.is_relative_to(path)
-        for root in TREE_RELEASE_ROOTS
+        for root in tree_roots
     ) or any(
         path != root.path and root.path.is_relative_to(path)
-        for root in EXACT_RELEASE_ROOTS
+        for root in exact_by_path.values()
     )
