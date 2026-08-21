@@ -296,7 +296,36 @@ def test_pr_files_failure_uses_numbered_full_diff_not_commit_range(
     assert "server-only" in full.read_text(encoding="utf-8")
     calls = [json.loads(line) for line in gh_fixture.log.read_text(encoding="utf-8").splitlines()]
     assert ["pr", "diff", "7"] in calls
-    assert json.loads(manifest.read_text(encoding="utf-8"))["files"] == []
+    scope = json.loads(manifest.read_text(encoding="utf-8"))
+    assert scope["files"] == []
+    assert scope["merge_base_sha"] == history.base
+
+
+def test_renamed_file_without_previous_name_uses_numbered_full_diff(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """Accepting a partial rename record can silently omit the old path from review."""
+    configure_gh(
+        gh_fixture,
+        base=history.base,
+        head=history.head,
+        files=[{"status": "renamed", "filename": "moved.txt"}],
+        pr_diff="diff --git a/inside.txt b/moved.txt\n+server rename\n",
+    )
+    full, delta, manifest = outputs(tmp_path)
+
+    result = run_prepare(history.repo, gh_fixture, *prepare_args(full, delta, manifest))
+
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert state["diff_ready"] is True
+    assert state["diff_mode"] == "full"
+    assert full.read_text(encoding="utf-8").endswith("+server rename\n")
+    scope = json.loads(manifest.read_text(encoding="utf-8"))
+    assert scope["merge_base_sha"] == history.base
+    assert scope["files"] == []
+    calls = [json.loads(line) for line in gh_fixture.log.read_text(encoding="utf-8").splitlines()]
+    assert ["pr", "diff", "7"] in calls
 
 
 def test_total_preparation_failure_removes_stale_outputs(

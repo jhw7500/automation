@@ -139,6 +139,8 @@ def pr_files(repository: str, pr_number: int, cwd: Path) -> list[dict[str, str]]
                 raise PreparationUnavailable("malformed PR file record")
             if previous_filename is not None and not isinstance(previous_filename, str):
                 raise PreparationUnavailable("malformed PR file record")
+            if status == "renamed" and not previous_filename:
+                raise PreparationUnavailable("malformed PR file record")
             key = (status, filename, previous_filename)
             if key in seen:
                 continue
@@ -248,20 +250,18 @@ def prepare(args: argparse.Namespace, cwd: Path) -> PreparedReviewDiff:
     output_paths = (args.full_output, args.delta_output, args.manifest_output)
     try:
         base_sha, head_sha = metadata(args.repository, args.pr_number, cwd)
-        records: list[dict[str, str]]
-        merge_base_sha = ""
+        ensure_commit(base_sha, cwd)
+        ensure_commit(head_sha, cwd)
+        merge_base_sha = merge_base(base_sha, head_sha, cwd)
+        records: list[dict[str, str]] = []
         warnings: list[str] = []
         local_full_ready = False
         try:
             records = pr_files(args.repository, args.pr_number, cwd)
             paths = scope_paths(records)
-            ensure_commit(base_sha, cwd)
-            ensure_commit(head_sha, cwd)
-            merge_base_sha = merge_base(base_sha, head_sha, cwd)
             full_diff = git_diff(merge_base_sha, head_sha, args.context_lines, paths, cwd)
             local_full_ready = True
         except PreparationUnavailable as error:
-            records = [] if "file list" in str(error) else records if "records" in locals() else []
             full_diff = numbered_pr_diff(args.pr_number, cwd)
             warnings.append(f"{error}; used numbered PR diff")
 
