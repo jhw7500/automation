@@ -691,6 +691,16 @@ def test_current_release_commit_only_uses_authenticated_objects(
         ),
         (
             ".github/workflows/opencode-auto-review.yml",
+            "const authenticateLive = async (comments) => {",
+            "const authenticateLive = async (comments) => { unresolvedAttemptEvidence.clear();",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "unresolvedAttemptEvidence.set(cacheKey, candidate);",
+            "unresolvedAttemptEvidence.delete(cacheKey);",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
             "name: 'automation/opencode-canonical-review', head_sha: workflowHead",
             "name: 'automation/opencode-canonical-review', head_sha: attemptHead",
         ),
@@ -730,6 +740,8 @@ def test_current_release_commit_only_uses_authenticated_objects(
         "historical-overflow",
         "all-strict-live-records",
         "incomplete-attempt-cache",
+        "pending-reset",
+        "pending-forgetting",
         "workflow-head-binding",
         "prepared-attempt-binding",
         "bounded-marker-cleanup",

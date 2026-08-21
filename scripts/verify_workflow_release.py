@@ -2065,7 +2065,13 @@ def _verify_commit_content(
             and "for (const candidate of bounded)" in canonical_script
             and "bounded.slice(0, 40)" not in canonical_script
             and "if (run?.status !== 'completed')" in canonical_script
-            and "liveEvidencePending = true" in canonical_script
+            and "const unresolvedAttemptEvidence = new Map();" in canonical_script
+            and canonical_script.count("unresolvedAttemptEvidence.set(cacheKey, candidate);") == 2
+            and canonical_script.count("unresolvedAttemptEvidence.delete(cacheKey);") == 2
+            and "unresolvedAttemptEvidence.clear()" not in canonical_script
+            and "const seenAttemptEvidence = new Set();" in canonical_script
+            and "if (seenAttemptEvidence.size > 40)" in canonical_script
+            and "unresolvedAttemptEvidence.size > 0" in canonical_script
             and "Deferring OpenCode repair while exact attempt provenance is pending" in canonical_script
             and "handoff.run_attempt > runAttempt" in canonical_script
             and "const maxUntrustedCleanupComments = 20;" in canonical_script

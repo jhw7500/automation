@@ -1278,6 +1278,8 @@ let comments = JSON.parse(JSON.stringify(fx.comments));
 let checkRuns = JSON.parse(JSON.stringify(fx.checkRuns || []));
 const workflowRunAttemptOffsets = new Map();
 let listCommentCalls = 0;
+let listWorkflowRunCalls = 0;
+let listCheckRunCalls = 0;
 let nextCommentId = Math.max(100, ...comments.map((item) => Number(item.id) || 0)) + 1;
 let nextCheckId = Math.max(1000, ...checkRuns.map((item) => Number(item.id) || 0)) + 1;
 const failUpdateCommentIds = new Set(fx.failUpdateCommentIds || []);
@@ -1322,7 +1324,11 @@ const github = {
     checks: {
       listForRef: async (a) => {
         calls.push(['list-checks', a]);
-        const matches = checkRuns.filter((item) => item.head_sha === a.ref && item.name === a.check_name);
+        const responses = fx.checkRunListResponses;
+        const source = Array.isArray(responses) && responses.length
+          ? responses[Math.min(listCheckRunCalls++, responses.length - 1)]
+          : checkRuns;
+        const matches = source.filter((item) => item.head_sha === a.ref && item.name === a.check_name);
         return { data: { total_count: matches.length, check_runs: matches.slice(0, a.per_page || 30) } };
       },
       create: async (a) => {
@@ -1347,7 +1353,11 @@ const github = {
       getArtifact: async (a) => ({ data: { id: a.artifact_id, expired: false, digest: `sha256:${process.env.HANDOFF_ARTIFACT_DIGEST}`, workflow_run: { id: Number(process.env.RUN_ID) } } }),
       listWorkflowRunsForRepo: async (a) => {
         calls.push(['list-runs', a]);
-        const matches = (fx.workflowRuns || []).filter((item) => item.event === a.event
+        const responses = fx.workflowRunListResponses;
+        const source = Array.isArray(responses) && responses.length
+          ? responses[Math.min(listWorkflowRunCalls++, responses.length - 1)]
+          : (fx.workflowRuns || []);
+        const matches = source.filter((item) => item.event === a.event
           && (a.status === undefined || item.conclusion === a.status));
         return { data: { total_count: matches.length, workflow_runs: matches.slice(0, a.per_page || 30) } };
       },
@@ -1358,7 +1368,13 @@ const github = {
         if (Array.isArray(sequence) && sequence.length) {
           const offset = workflowRunAttemptOffsets.get(sequenceKey) || 0;
           workflowRunAttemptOffsets.set(sequenceKey, offset + 1);
-          return { data: sequence[Math.min(offset, sequence.length - 1)] };
+          const response = sequence[Math.min(offset, sequence.length - 1)];
+          if (response && Object.hasOwn(response, '__error_status')) {
+            const error = new Error(`attempt fixture error ${response.__error_status}`);
+            if (response.__error_status !== null) error.status = response.__error_status;
+            throw error;
+          }
+          return { data: response };
         }
         return { data:
         (fx.workflowRunAttempts || []).find((item) => item.id === a.run_id && item.run_attempt === a.attempt_number)
@@ -1419,6 +1435,8 @@ def _run_upsert(
     workflow_runs: list[dict] | None = None,
     workflow_run_attempts: list[dict] | None = None,
     workflow_run_attempt_sequences: dict[str, list[dict]] | None = None,
+    workflow_run_list_responses: list[list[dict]] | None = None,
+    check_run_list_responses: list[list[dict]] | None = None,
     run_jobs_by_attempt: dict[str, list[dict]] | None = None,
     current_workflow_run: dict | None = None,
     inject_comments_at_list_call: dict[int, list[dict]] | None = None,
@@ -1452,6 +1470,8 @@ def _run_upsert(
         ],
         "workflowRunAttempts": workflow_run_attempts,
         "workflowRunAttemptSequences": workflow_run_attempt_sequences or {},
+        "workflowRunListResponses": workflow_run_list_responses,
+        "checkRunListResponses": check_run_list_responses,
         "currentWorkflowRun": current_workflow_run,
         "runJobs": [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "success"}],
         "runJobsByAttempt": run_jobs_by_attempt or {},
@@ -3574,6 +3594,173 @@ def test_opencode_live_refetches_in_progress_attempt_before_any_repair(tmp_path)
         for call in calls
     ) == 1
     assert not any(call[0] in {"create", "create-check", "update", "delete"} for call in calls)
+    assert any(
+        call[0] == "notice" and "Discarding stale OpenCode run before comment repair" in call[1]
+        for call in calls
+    )
+    assert not any(
+        call[0] == "notice" and "exact attempt provenance is pending" in call[1]
+        for call in calls
+    )
+
+
+@node_required
+@pytest.mark.parametrize("disappears", ("run", "check"))
+@pytest.mark.parametrize(
+    ("pending_run", "pending_attempt", "current_run", "current_attempt"),
+    ((79, 1, 78, 1), (78, 1, 78, 2)),
+    ids=("newer-generation", "same-run-prior-attempt"),
+)
+def test_opencode_live_retains_pending_identity_when_discovery_disappears(
+    tmp_path, disappears, pending_run, pending_attempt, current_run, current_attempt
+):
+    genuine = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, pending_run, "ab" * 20, pending_attempt),
+            "PENDING RECEIPT MUST SURVIVE DISCOVERY RACE",
+        ),
+        9,
+        updated="u1",
+    )
+    receipt = _opencode_attestation(genuine, workflow_head="de" * 20)
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    selected = {
+        "id": pending_run,
+        "run_attempt": max(pending_attempt, current_attempt if pending_run == current_run else pending_attempt),
+        "status": "in_progress", "conclusion": None, "head_sha": "de" * 20,
+        "event": "pull_request", "path": ".github/workflows/pr-review.yml",
+        "pull_requests": [], "referenced_workflows": referenced,
+    }
+    exact_pending = {**selected, "run_attempt": pending_attempt}
+    current = {
+        "id": current_run, "run_attempt": current_attempt, "status": "in_progress",
+        "conclusion": None, "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [genuine], [genuine], run_id=str(current_run),
+        run_attempt=str(current_attempt), sealed_check_runs=[], check_runs=[receipt],
+        workflow_runs=[selected], current_workflow_run=current,
+        workflow_run_attempt_sequences={
+            f"{pending_run}:{pending_attempt}": [exact_pending],
+        },
+        workflow_run_list_responses=[
+            [selected], [] if disappears == "run" else [selected],
+        ],
+        check_run_list_responses=[
+            [receipt], [] if disappears == "check" else [receipt],
+        ],
+    )
+
+    exact_calls = [
+        call for call in calls
+        if call[0] == "get-run-attempt" and call[1]["run_id"] == pending_run
+        and call[1]["attempt_number"] == pending_attempt
+    ]
+    assert len(exact_calls) == 1
+    assert not any(call[0] == "list-jobs" and call[1]["run_id"] == pending_run for call in calls)
+    assert not any(call[0] in {"create", "create-check", "update", "delete"} for call in calls)
+    assert any(
+        call[0] == "notice" and "exact attempt provenance is pending" in call[1]
+        for call in calls
+    )
+
+
+@node_required
+@pytest.mark.parametrize("error_status", (404, 503))
+def test_opencode_live_retains_pending_identity_on_retry_api_uncertainty(tmp_path, error_status):
+    genuine = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 79, "ab" * 20, 1),
+            "PENDING RECEIPT API UNCERTAINTY",
+        ),
+        9,
+        updated="u1",
+    )
+    receipt = _opencode_attestation(genuine, workflow_head="de" * 20)
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    selected = {
+        "id": 79, "run_attempt": 1, "status": "in_progress", "conclusion": None,
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+    current = {**selected, "id": 78}
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [genuine], [genuine], run_id="78", sealed_check_runs=[],
+        check_runs=[receipt], workflow_runs=[selected], current_workflow_run=current,
+        workflow_run_attempt_sequences={
+            "79:1": [selected, {"__error_status": error_status}],
+        },
+    )
+
+    assert sum(
+        call[0] == "get-run-attempt" and call[1]["run_id"] == 79
+        for call in calls
+    ) == 2
+    assert not any(call[0] == "list-jobs" and call[1]["run_id"] == 79 for call in calls)
+    assert not any(call[0] in {"create", "create-check", "update", "delete"} for call in calls)
+    assert any(call[0] == "notice" and "exact attempt provenance is pending" in call[1] for call in calls)
+
+
+@node_required
+@pytest.mark.parametrize("resolution", ("non-success", "invalid-job"))
+def test_opencode_live_resolves_completed_invalid_pending_receipt_as_untrusted(tmp_path, resolution):
+    genuine = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 77, "ab" * 20, 1),
+            "COMPLETED INVALID RECEIPT",
+        ),
+        9,
+        updated="u1",
+    )
+    receipt = _opencode_attestation(genuine, workflow_head="de" * 20)
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    selected = {
+        "id": 77, "run_attempt": 1, "status": "in_progress", "conclusion": None,
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+    completed = {
+        **selected, "status": "completed",
+        "conclusion": "failure" if resolution == "non-success" else "success",
+    }
+    jobs = [{
+        "name": "OpenCode Auto PR Review / opencode-canonicalize",
+        "conclusion": "failure" if resolution == "invalid-job" else "success",
+    }]
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [genuine], [genuine], run_id="78", sealed_check_runs=[],
+        check_runs=[receipt], workflow_runs=[selected],
+        workflow_run_attempt_sequences={"77:1": [selected, completed]},
+        run_jobs_by_attempt={"77:1": jobs},
+    )
+
+    assert sum(call[0] == "get-run-attempt" and call[1]["run_id"] == 77 for call in calls) == 2
+    expected_jobs = 0 if resolution == "non-success" else 1
+    assert sum(call[0] == "list-jobs" and call[1]["run_id"] == 77 for call in calls) == expected_jobs
+    assert not any(call[0] == "notice" and "exact attempt provenance is pending" in call[1] for call in calls)
+    assert any(call[0] in {"update", "delete"} and call[1]["comment_id"] == genuine["id"] for call in calls)
+    created_body = next(call[1]["body"] for call in calls if call[0] == "create")
+    created_state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", created_body).group(1))
+    assert created_state["successful_head"] is None
 
 
 @pytest.mark.parametrize("mismatch", ("caller_path", "event", "missing_reference", "reference_sha"))
@@ -3817,6 +4004,8 @@ def _run_opencode_canonicalize(
     workflow_runs: list[dict] | None = None,
     workflow_run_attempts: list[dict] | None = None,
     workflow_run_attempt_sequences: dict[str, list[dict]] | None = None,
+    workflow_run_list_responses: list[list[dict]] | None = None,
+    check_run_list_responses: list[list[dict]] | None = None,
     run_jobs_by_attempt: dict[str, list[dict]] | None = None,
     current_workflow_run: dict | None = None,
     trusted_workspace: Path | None = None,
@@ -4013,6 +4202,8 @@ def _run_opencode_canonicalize(
         workflow_runs=workflow_runs,
         workflow_run_attempts=workflow_run_attempts,
         workflow_run_attempt_sequences=workflow_run_attempt_sequences,
+        workflow_run_list_responses=workflow_run_list_responses,
+        check_run_list_responses=check_run_list_responses,
         run_jobs_by_attempt=run_jobs_by_attempt,
         current_workflow_run=current_workflow_run,
         inject_comments_at_list_call=inject_comments_at_list_call,

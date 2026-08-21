@@ -209,8 +209,13 @@ historical candidates fails closed before exact-attempt calls or comment repair;
 silently dropped before cleanup or publication. Live CAS applies this discovery to every strict
 canonical record, including unchanged records absent from the prepared evidence snapshot.
 Completed exact-attempt evidence is cached across repeated CAS checks; queued or in-progress
-evidence is never cached, is refreshed once before repair, and defers all mutation if still
-unsettled.
+evidence is never cached. Once a strict server Check/comment intersection yields unresolved
+exact-attempt evidence, that bounded `(run_id, run_attempt)` identity remains fail-closed for the
+whole canonicalization transaction. A later run/Check discovery omission, exact-attempt 404,
+API uncertainty, or another non-completed response cannot clear it or permit a write. Only a
+rediscovered exact completed attempt plus bounded jobs evidence resolves it: matching successful
+canonicalizer provenance is authenticated, while completed non-success or a valid jobs response
+without the successful canonicalizer resolves the receipt as untrusted.
 
 A partial GitHub rerun may reuse the immutable handoff produced by an earlier attempt of the
 same run. The handoff's producer attempt is retained as `prepared_run_attempt`; the clean job

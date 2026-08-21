@@ -986,7 +986,8 @@ jobs:
             const authenticatedLiveRecords = new Map();
 
             const attemptEvidenceCache = new Map();
-            let liveEvidencePending = false;
+            const unresolvedAttemptEvidence = new Map();
+            const seenAttemptEvidence = new Set();
             // Discover receipts from a bounded server-authored run-ID/head horizon. The latest
             // attempt may be running or failed; exact historical attempt/job evidence is fetched
             // only after a strict server Check + comment digest intersection.
@@ -1028,7 +1029,6 @@ jobs:
               return { checks, runs };
             };
             const authenticateLive = async (comments) => {
-              liveEvidencePending = false;
               const records = [];
               const claimed = comments.map(parseRecord).filter(Boolean);
               const evidence = await discoverLiveEvidence();
@@ -1055,6 +1055,12 @@ jobs:
                 throw new Error('historical OpenCode receipt candidate limit exceeded');
               }
               for (const candidate of bounded) {
+                seenAttemptEvidence.add(`${candidate.a.run_id}:${candidate.a.run_attempt}`);
+              }
+              if (seenAttemptEvidence.size > 40) {
+                throw new Error('transactional OpenCode receipt candidate limit exceeded');
+              }
+              for (const candidate of bounded) {
                 const { record, check, selectedRun, a } = candidate;
                 const cacheKey = `${a.run_id}:${a.run_attempt}`;
                 let runEntry = attemptEvidenceCache.get(cacheKey);
@@ -1065,13 +1071,15 @@ jobs:
                       run_id: a.run_id, attempt_number: a.run_attempt,
                     });
                     if (run?.status !== 'completed') {
-                      liveEvidencePending = true;
+                      unresolvedAttemptEvidence.set(cacheKey, candidate);
                       continue;
                     }
+                    let jobs = [];
                     if (run.conclusion !== 'success') {
                       runEntry = { run_id: a.run_id, run_attempt: a.run_attempt,
-                        run, selected_run: selectedRun, jobs: [] };
+                        run, selected_run: selectedRun, jobs };
                       attemptEvidenceCache.set(cacheKey, runEntry);
+                      unresolvedAttemptEvidence.delete(cacheKey);
                       continue;
                     }
                     const { data } = await github.rest.actions.listJobsForWorkflowRunAttempt({
@@ -1082,12 +1090,15 @@ jobs:
                       || data.total_count < 0 || data.total_count > 100) {
                       throw new Error('unbounded or invalid OpenCode workflow jobs page');
                     }
+                    jobs = data.jobs;
                     runEntry = { run_id: a.run_id, run_attempt: a.run_attempt,
-                      run, selected_run: selectedRun, jobs: data.jobs };
+                      run, selected_run: selectedRun, jobs };
                     attemptEvidenceCache.set(cacheKey, runEntry);
+                    unresolvedAttemptEvidence.delete(cacheKey);
                   } catch (error) {
-                    if (error.status === 404) continue;
-                    throw new Error(`cannot verify historical OpenCode attempt: ${error.message}`);
+                    unresolvedAttemptEvidence.set(cacheKey, candidate);
+                    core.warning(`Cannot yet resolve historical OpenCode attempt: ${error.message}`);
+                    continue;
                   }
                 }
                 if (attestationMatches(record, check, runEntry)) {
@@ -1100,9 +1111,9 @@ jobs:
                 || a.state.run_attempt - b.state.run_attempt).at(-1) || null;
             };
             let liveExisting = await authenticateLive(after);
-            if (liveEvidencePending) {
+            if (unresolvedAttemptEvidence.size > 0) {
               liveExisting = await authenticateLive(after);
-              if (liveEvidencePending) {
+              if (unresolvedAttemptEvidence.size > 0) {
                 core.notice('Deferring OpenCode repair while exact attempt provenance is pending');
                 return;
               }
@@ -1252,7 +1263,7 @@ jobs:
             }
             if (cleanupFailed) throw new Error('OpenCode repair failed; refusing canonical publication');
             const postRepairExisting = await authenticateLive(repaired);
-            if (liveEvidencePending) {
+            if (unresolvedAttemptEvidence.size > 0) {
               core.notice('Deferring OpenCode publication while exact attempt provenance is pending');
               return;
             }
@@ -1454,7 +1465,7 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo, pull_number: issueNumber,
             });
             const preCreateExisting = await authenticateLive(preCreateComments);
-            if (liveEvidencePending || preCreatePr.head?.sha !== attemptHead || (preCreateExisting
+            if (unresolvedAttemptEvidence.size > 0 || preCreatePr.head?.sha !== attemptHead || (preCreateExisting
               && (preCreateExisting.state.run_id > runId
                 || (preCreateExisting.state.run_id === runId
                   && preCreateExisting.state.run_attempt >= runAttempt)))
@@ -1525,7 +1536,7 @@ jobs:
             });
             const preSuccessExact = preSuccessComments.find((comment) => comment.id === created.id);
             const preAttestationExisting = await authenticateLive(preSuccessComments);
-            if (liveEvidencePending || finalPr.head?.sha !== attemptHead || (preAttestationExisting
+            if (unresolvedAttemptEvidence.size > 0 || finalPr.head?.sha !== attemptHead || (preAttestationExisting
               && (preAttestationExisting.state.run_id > runId
                 || (preAttestationExisting.state.run_id === runId
                   && preAttestationExisting.state.run_attempt >= runAttempt)))
