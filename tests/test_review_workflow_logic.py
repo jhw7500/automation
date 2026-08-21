@@ -5954,6 +5954,9 @@ def test_opencode_gitlink_anchor_ignores_hostile_submodule_ignore_configuration(
         updated_submodule,
     )
     _git(repo, "-C", "vendor/module", "checkout", "-q", updated_submodule)
+    # The fixture intentionally configures submodule.ignore=all. Force-stage
+    # the parent gitlink so the test remains deterministic across Git runners.
+    _git(repo, "add", "--force", "vendor/module")
     head = _commit_anchor_repo(repo, "parent pointer update")
     _git(repo, "config", "diff.ignoreSubmodules", "all")
     _git(repo, "config", "submodule.vendor/module.ignore", "all")

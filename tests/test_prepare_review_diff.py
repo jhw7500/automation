@@ -770,13 +770,14 @@ def test_cli_ignores_oversized_mutable_file_response(
 ) -> None:
     """A hostile oversized server file response cannot select local Git argv."""
     component = "x" * 240
-    filename = f"overflow/00000000/{component}/{component}/{component}/{component}"
+    components = "/".join(component for _ in range(6))
+    filename = f"overflow/00000000/{components}"
     available = max(os.sysconf("SC_ARG_MAX") - 128 * 1024, 0)
     record_count = min(3000, max(1, available // (len(os.fsencode(filename)) + 1) + 2))
     records = [
         {
             "status": "modified",
-            "filename": f"overflow/{index:08d}/{component}/{component}/{component}/{component}",
+            "filename": f"overflow/{index:08d}/{components}",
         }
         for index in range(record_count)
     ]
