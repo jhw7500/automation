@@ -194,14 +194,23 @@ comments may be marker-free tombstoned, but the newest prior fallback is retaine
 future completed run can authenticate the successor.
 
 Receipt discovery never starts from a comment-provided Check ID. Both prepare and live
-canonicalization first query a bounded horizon of recent successful `pull_request` Actions
-runs, retain only runs with the exact central reusable-workflow path and SHA, then list the
-exact named Check Runs on each server-authored workflow-run head. Comment receipt IDs are used
-only for equality after that discovery. An authentic receipt outside the horizon safely causes
-one full review; its next completed canonicalizer receipt returns the state to the horizon.
-The API page is bounded at 100 recent successful PR runs, central reusable-workflow identity is
-filtered before the newest 20 central runs are selected, and each selected head/job query is
-single-page bounded.
+canonicalization first query a bounded horizon of recent `pull_request` Actions run IDs and
+server-authored heads without filtering on the latest attempt status. They retain only runs with
+the exact central reusable-workflow path and SHA, then list the exact named Check Runs on each
+selected head. A strict receipt/comment digest intersection identifies historical attempts, and
+the exact attempt and its jobs must independently report a successful completed canonicalizer.
+This preserves an older successful attempt while a rerun of the same run ID is in progress,
+failed, or cancelled. Comment receipt IDs are used only for equality after server discovery.
+An authentic receipt outside the horizon safely causes one full review; its next completed
+canonicalizer receipt returns the state to the horizon. The API page is bounded at 100 recent PR
+runs, central reusable-workflow identity is filtered before the newest 20 central runs are
+selected, and each selected head/job query is single-page bounded. More than 40 strict matched
+historical candidates fails closed before exact-attempt calls or comment repair; no candidate is
+silently dropped before cleanup or publication. Live CAS applies this discovery to every strict
+canonical record, including unchanged records absent from the prepared evidence snapshot.
+Completed exact-attempt evidence is cached across repeated CAS checks; queued or in-progress
+evidence is never cached, is refreshed once before repair, and defers all mutation if still
+unsettled.
 
 A partial GitHub rerun may reuse the immutable handoff produced by an earlier attempt of the
 same run. The handoff's producer attempt is retained as `prepared_run_attempt`; the clean job

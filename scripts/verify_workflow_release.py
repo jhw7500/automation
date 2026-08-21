@@ -2051,17 +2051,33 @@ def _verify_commit_content(
             and "response.data.workflow_runs.filter((run) =>" in canonical_script
             and ").length === 1).slice(0, 20)" in canonical_script
             and "check_run_id: record.attestationId" not in canonical_script
-            and "event: 'pull_request', status: 'success', per_page: 100, page: 1" in canonical_script
+            and "event: 'pull_request', per_page: 100, page: 1" in canonical_script
+            and "event: 'pull_request', status: 'success'" not in canonical_script
             and "check_name: 'automation/opencode-canonical-review'" in canonical_script
             and "name: 'automation/opencode-canonical-review', head_sha: workflowHead" in canonical_script
             and "workflow_head: workflowHead" in canonical_script
             and "prepared_run_attempt: handoff.run_attempt" in canonical_script
             and "github.rest.actions.getWorkflowRunAttempt" in canonical_script
+            and canonical_script.count("run_id: a.run_id, attempt_number: a.run_attempt") == 2
+            and "a.run_attempt <= selectedRun.run_attempt" in canonical_script
+            and "const claimed = comments.map(parseRecord).filter(Boolean);" in canonical_script
+            and "if (bounded.length > 40)" in canonical_script
+            and "for (const candidate of bounded)" in canonical_script
+            and "bounded.slice(0, 40)" not in canonical_script
+            and "if (run?.status !== 'completed')" in canonical_script
+            and "liveEvidencePending = true" in canonical_script
+            and "Deferring OpenCode repair while exact attempt provenance is pending" in canonical_script
             and "handoff.run_attempt > runAttempt" in canonical_script
             and "const maxUntrustedCleanupComments = 20;" in canonical_script
             and 'gh api "repos/${GITHUB_REPOSITORY}/actions/runs" --method GET' in prepare_script
+            and '-f event=pull_request -F per_page=100 -F page=1' in prepare_script
+            and '-f status=success' not in prepare_script
             and 'commits/${workflow_head}/check-runs' in prepare_script
             and 'check-runs/${check_id}' not in prepare_script
+            and 'a.run_attempt <= run.run_attempt' in prepare_script
+            and "if (unique.length > 40)" in prepare_script
+            and "JSON.stringify(unique)" in prepare_script
+            and "unique.slice(0, 40)" not in prepare_script
             and prepare.get("outputs", {}).get("workflow_head_sha") == "${{ steps.build-handoff.outputs.workflow_head_sha }}"
             and canonical_step.get("env", {}).get("WORKFLOW_HEAD") == "${{ needs.opencode-prepare.outputs.workflow_head_sha }}"
             and "automation-attestation" in canonical_script

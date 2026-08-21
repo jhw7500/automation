@@ -239,6 +239,8 @@ def _gh_stub(
     check_runs: list[dict] | None = None,
     run_jobs: list[dict] | None = None,
     workflow_runs: list[dict] | None = None,
+    workflow_run_attempts: list[dict] | None = None,
+    run_jobs_by_attempt: dict[str, list[dict]] | None = None,
 ) -> dict:
     """PATH-shimmed gh that serves the REST comments and GraphQL reviews fixtures."""
     bin_dir = tmp_path / "bin"
@@ -269,6 +271,13 @@ def _gh_stub(
                 "referenced_workflows": [{"path": payload["referenced_workflow_path"], "sha": payload["referenced_workflow_sha"], "ref": "refs/tags/v1.45"}],
             })
     (tmp_path / "runs.json").write_text(json.dumps(runs), encoding="utf-8")
+    (tmp_path / "run-attempts.json").write_text(
+        json.dumps(workflow_run_attempts if workflow_run_attempts is not None else runs),
+        encoding="utf-8",
+    )
+    (tmp_path / "run-jobs-by-attempt.json").write_text(
+        json.dumps(run_jobs_by_attempt or {}), encoding="utf-8"
+    )
     (tmp_path / "reviews.json").write_text(
         json.dumps({"reviews": reviews or []}), encoding="utf-8"
     )
@@ -290,8 +299,8 @@ def _gh_stub(
         "case \"$*\" in\n"
         f"  *'/actions/runs --method GET'*) jq '{{total_count:length,workflow_runs:.}}' '{tmp_path}/runs.json' ;;\n"
         f"  *'/commits/'*'/check-runs --method GET'*) ref=$(printf '%s' \"$*\" | sed -n 's#.*commits/\\([^/ ]*\\)/check-runs.*#\\1#p'); jq --arg ref \"$ref\" '{{total_count:([.check_runs[] | select(.head_sha == $ref)] | length),check_runs:[.check_runs[] | select(.head_sha == $ref)]}}' '{tmp_path}/check-runs.json' ;;\n"
-        f"  *'/attempts/'*'/jobs'*) cat '{tmp_path}/run-jobs.json' ;;\n"
-        f"  *'/actions/runs/'*'/attempts/'*) run=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\).*#\\1#p'); jq --argjson run \"$run\" '.[] | select(.id == $run)' '{tmp_path}/runs.json' ;;\n"
+        f"  *'/attempts/'*'/jobs'*) run=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\)/jobs.*#\\1#p'); attempt=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\)/jobs.*#\\2#p'); key=\"${{run}}:${{attempt}}\"; jq -e --arg key \"$key\" 'has($key)' '{tmp_path}/run-jobs-by-attempt.json' >/dev/null && jq --arg key \"$key\" '{{total_count:(.[$key]|length),jobs:.[$key]}}' '{tmp_path}/run-jobs-by-attempt.json' || cat '{tmp_path}/run-jobs.json' ;;\n"
+        f"  *'/actions/runs/'*'/attempts/'*) run=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\).*#\\1#p'); attempt=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\).*#\\2#p'); jq --argjson run \"$run\" --argjson attempt \"$attempt\" '.[] | select(.id == $run and .run_attempt == $attempt)' '{tmp_path}/run-attempts.json' ;;\n"
         f"  *'/check-runs/'*) id=$(printf '%s' \"$*\" | sed -n 's#.*check-runs/\\([0-9]*\\).*#\\1#p'); jq --argjson id \"$id\" '.check_runs[] | select(.id == $id)' '{tmp_path}/check-runs.json' ;;\n"
         f"  *'/comments --paginate'*) [ \"${{GH_STUB_COMMENTS_FAIL:-false}}\" = true ] && exit 1; cat '{tmp_path}/comments.json' ;;\n"
         "  *'--json headRefOid'*)\n"
@@ -1267,6 +1276,7 @@ if (fx.cwd) process.chdir(fx.cwd);
 const calls = [];
 let comments = JSON.parse(JSON.stringify(fx.comments));
 let checkRuns = JSON.parse(JSON.stringify(fx.checkRuns || []));
+const workflowRunAttemptOffsets = new Map();
 let listCommentCalls = 0;
 let nextCommentId = Math.max(100, ...comments.map((item) => Number(item.id) || 0)) + 1;
 let nextCheckId = Math.max(1000, ...checkRuns.map((item) => Number(item.id) || 0)) + 1;
@@ -1337,11 +1347,22 @@ const github = {
       getArtifact: async (a) => ({ data: { id: a.artifact_id, expired: false, digest: `sha256:${process.env.HANDOFF_ARTIFACT_DIGEST}`, workflow_run: { id: Number(process.env.RUN_ID) } } }),
       listWorkflowRunsForRepo: async (a) => {
         calls.push(['list-runs', a]);
-        const matches = (fx.workflowRuns || []).filter((item) => item.event === a.event && item.conclusion === a.status);
+        const matches = (fx.workflowRuns || []).filter((item) => item.event === a.event
+          && (a.status === undefined || item.conclusion === a.status));
         return { data: { total_count: matches.length, workflow_runs: matches.slice(0, a.per_page || 30) } };
       },
-      getWorkflowRunAttempt: async (a) => ({ data:
-        (fx.workflowRuns || []).find((item) => item.id === a.run_id && item.run_attempt === a.attempt_number)
+      getWorkflowRunAttempt: async (a) => {
+        calls.push(['get-run-attempt', a]);
+        const sequenceKey = `${a.run_id}:${a.attempt_number}`;
+        const sequence = (fx.workflowRunAttemptSequences || {})[sequenceKey];
+        if (Array.isArray(sequence) && sequence.length) {
+          const offset = workflowRunAttemptOffsets.get(sequenceKey) || 0;
+          workflowRunAttemptOffsets.set(sequenceKey, offset + 1);
+          return { data: sequence[Math.min(offset, sequence.length - 1)] };
+        }
+        return { data:
+        (fx.workflowRunAttempts || []).find((item) => item.id === a.run_id && item.run_attempt === a.attempt_number)
+        || (fx.workflowRuns || []).find((item) => item.id === a.run_id && item.run_attempt === a.attempt_number)
         || fx.currentWorkflowRun || {
           id: Number(process.env.RUN_ID), run_attempt: Number(process.env.RUN_ATTEMPT),
           head_sha: process.env.WORKFLOW_HEAD, event: 'pull_request',
@@ -1351,10 +1372,11 @@ const github = {
             sha: '4545454545454545454545454545454545454545', ref: 'refs/tags/v1.45',
           }],
         }
-      }),
+      }},
       listJobsForWorkflowRunAttempt: async (a) => {
         calls.push(['list-jobs', a]);
-        const jobs = fx.runJobs || [];
+        const jobs = (fx.runJobsByAttempt || {})[`${a.run_id}:${a.attempt_number}`]
+          || fx.runJobs || [];
         return { data: { total_count: jobs.length, jobs: jobs.slice(0, a.per_page || 30) } };
       },
     },
@@ -1395,6 +1417,9 @@ def _run_upsert(
     fail_delete_comment_ids: list[int] | None = None,
     check_runs: list[dict] | None = None,
     workflow_runs: list[dict] | None = None,
+    workflow_run_attempts: list[dict] | None = None,
+    workflow_run_attempt_sequences: dict[str, list[dict]] | None = None,
+    run_jobs_by_attempt: dict[str, list[dict]] | None = None,
     current_workflow_run: dict | None = None,
     inject_comments_at_list_call: dict[int, list[dict]] | None = None,
 ) -> list:
@@ -1425,8 +1450,11 @@ def _run_upsert(
             for check in (check_runs or [])
             if re.match(r"<!-- automation-attestation:(\{.*\}) -->", check.get("output", {}).get("text", ""))
         ],
+        "workflowRunAttempts": workflow_run_attempts,
+        "workflowRunAttemptSequences": workflow_run_attempt_sequences or {},
         "currentWorkflowRun": current_workflow_run,
         "runJobs": [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "success"}],
+        "runJobsByAttempt": run_jobs_by_attempt or {},
     }
     (tmp_path / "fixture.json").write_text(json.dumps(fixture), encoding="utf-8")
     result = subprocess.run(
@@ -2971,6 +2999,8 @@ def _run_opencode_ctx(
     comments_fail: bool = False,
     check_runs: list[dict] | None = None,
     workflow_runs: list[dict] | None = None,
+    workflow_run_attempts: list[dict] | None = None,
+    run_jobs_by_attempt: dict[str, list[dict]] | None = None,
 ) -> str:
     if shutil.which("openssl") is None:
         pytest.skip("openssl required")
@@ -2987,6 +3017,8 @@ def _run_opencode_ctx(
     env = _gh_stub(
         tmp_path, comments, head_shas=head_shas, comments_fail=comments_fail,
         check_runs=check_runs, workflow_runs=workflow_runs,
+        workflow_run_attempts=workflow_run_attempts,
+        run_jobs_by_attempt=run_jobs_by_attempt,
     )
     env.update({
         "HEADER": OPENCODE_HEADER,
@@ -3140,6 +3172,10 @@ def test_opencode_collector_server_discovery_ignores_many_forged_receipt_ids(tmp
     assert sum("/actions/runs --method GET" in call for call in calls) == 1
     assert sum("/commits/" in call and "/check-runs --method GET" in call for call in calls) <= 20
     assert not any(re.search(r"/check-runs/[1-9][0-9]*", call) for call in calls)
+    exact_attempts = [call for call in calls if re.search(r"/actions/runs/[1-9][0-9]*/attempts/[1-9][0-9]* --method GET", call)]
+    assert len(exact_attempts) == 1
+    assert "/actions/runs/77/attempts/2 --method GET" in exact_attempts[0]
+    assert not any("/actions/runs/100" in call for call in exact_attempts)
 
 
 def test_opencode_collector_horizon_fallback_never_fetches_comment_receipt_id(tmp_path):
@@ -3159,6 +3195,200 @@ def test_opencode_collector_horizon_fallback_never_fetches_comment_receipt_id(tm
     assert "previous_sha=\n" in text
     calls = (tmp_path / "gh-calls.log").read_text(encoding="utf-8").splitlines()
     assert not any(re.search(r"/check-runs/[1-9][0-9]*", call) for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("latest_status", "latest_conclusion"),
+    (("in_progress", None), ("completed", "failure"), ("completed", "cancelled")),
+)
+def test_opencode_collector_authenticates_historical_success_when_latest_attempt_is_not_success(
+    tmp_path, latest_status, latest_conclusion
+):
+    head = "ab" * 20
+    full_hash = "12" * 32
+    genuine = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 77, head, 1, full_diff_sha256=full_hash),
+            "HISTORICAL ATTEMPT ONE",
+        ),
+        9,
+    )
+    receipt = _opencode_attestation(genuine, workflow_head="de" * 20)
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    latest = {
+        "id": 77, "run_attempt": 2, "status": latest_status,
+        "conclusion": latest_conclusion, "head_sha": "de" * 20,
+        "event": "pull_request", "path": ".github/workflows/pr-review.yml",
+        "pull_requests": [], "referenced_workflows": referenced,
+    }
+    historical = {
+        **latest, "run_attempt": 1, "status": "completed", "conclusion": "success",
+    }
+
+    text = _run_opencode_ctx(
+        tmp_path, [genuine], check_runs=[receipt], workflow_runs=[latest],
+        workflow_run_attempts=[historical],
+    )
+
+    assert "HISTORICAL ATTEMPT ONE" in text
+    assert f"previous_sha={head}" in text
+    assert f"previous_full_hash={full_hash}" in text
+    calls = (tmp_path / "gh-calls.log").read_text(encoding="utf-8").splitlines()
+    assert sum("/actions/runs/77/attempts/1 --method GET" in call for call in calls) == 1
+    assert not any("/actions/runs/77/attempts/2" in call for call in calls)
+
+
+def test_opencode_collector_full_rerun_keeps_older_run_historical_success(tmp_path):
+    head = "ab" * 20
+    full_hash = "12" * 32
+    genuine = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 77, head, 1, full_diff_sha256=full_hash),
+            "OLDER RUN ATTEMPT ONE",
+        ),
+        9,
+    )
+    receipt = _opencode_attestation(genuine, workflow_head="de" * 20)
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    current_run = {
+        "id": 78, "run_attempt": 1, "status": "in_progress", "conclusion": None,
+        "head_sha": "ef" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+    prior_latest = {
+        "id": 77, "run_attempt": 2, "status": "completed", "conclusion": "failure",
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+    historical = {**prior_latest, "run_attempt": 1, "conclusion": "success"}
+
+    text = _run_opencode_ctx(
+        tmp_path, [genuine], check_runs=[receipt],
+        workflow_runs=[current_run, prior_latest], workflow_run_attempts=[historical],
+    )
+
+    assert "OLDER RUN ATTEMPT ONE" in text
+    assert f"previous_sha={head}" in text
+    assert f"previous_full_hash={full_hash}" in text
+
+
+def test_opencode_collector_rejects_future_receipt_without_exact_attempt_call(tmp_path):
+    head = "ab" * 20
+    future = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 77, head, 3),
+            "FUTURE ATTEMPT MUST NOT SELECT API WORK",
+        ),
+        9,
+    )
+    receipt = _opencode_attestation(future, workflow_head="de" * 20)
+    latest = {
+        "id": 77, "run_attempt": 2, "status": "in_progress", "conclusion": None,
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": [{
+            "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+            "sha": "45" * 20, "ref": "refs/tags/v1.45",
+        }],
+    }
+
+    text = _run_opencode_ctx(
+        tmp_path, [future], check_runs=[receipt], workflow_runs=[latest],
+        workflow_run_attempts=[],
+    )
+
+    assert "FUTURE ATTEMPT" not in text
+    calls = (tmp_path / "gh-calls.log").read_text(encoding="utf-8").splitlines()
+    assert not any("/actions/runs/77/attempts/3" in call for call in calls)
+
+
+def test_opencode_collector_receipt_overflow_fails_before_exact_attempt_calls(tmp_path):
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    comments = []
+    checks = []
+    attempts = []
+    for attempt in range(1, 42):
+        comment = _bot(
+            "github-actions[bot]",
+            _opencode_v2_body(
+                _state_line("opencode", 7, 77, "ab" * 20, attempt),
+                f"OVERFLOW RECEIPT {attempt}",
+            ),
+            1000 + attempt,
+        )
+        comments.append(comment)
+        checks.append(_opencode_attestation(comment, workflow_head="de" * 20))
+        attempts.append({
+            "id": 77, "run_attempt": attempt, "status": "completed",
+            "conclusion": "success", "head_sha": "de" * 20,
+            "event": "pull_request", "path": ".github/workflows/pr-review.yml",
+            "pull_requests": [], "referenced_workflows": referenced,
+        })
+    selected = {
+        "id": 77, "run_attempt": 42, "status": "in_progress", "conclusion": None,
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_opencode_ctx(
+            tmp_path, comments, check_runs=checks, workflow_runs=[selected],
+            workflow_run_attempts=attempts,
+        )
+
+    calls = (tmp_path / "gh-calls.log").read_text(encoding="utf-8").splitlines()
+    assert not any(re.search(r"/actions/runs/77/attempts/[1-9][0-9]* --method GET", call) for call in calls)
+
+
+@pytest.mark.parametrize("mismatch", ("head", "caller", "reference", "job"))
+def test_opencode_collector_rejects_mismatched_historical_attempt_provenance(tmp_path, mismatch):
+    genuine = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 77, "ab" * 20, 1), "REJECT HISTORY"),
+        9,
+    )
+    receipt = _opencode_attestation(genuine, workflow_head="de" * 20)
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    latest = {
+        "id": 77, "run_attempt": 2, "status": "in_progress", "conclusion": None,
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+    historical = {**latest, "run_attempt": 1, "status": "completed", "conclusion": "success"}
+    jobs = [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "success"}]
+    if mismatch == "head": historical["head_sha"] = "ff" * 20
+    elif mismatch == "caller": historical["path"] = ".github/workflows/other.yml"
+    elif mismatch == "reference": historical["referenced_workflows"] = [{
+        "path": referenced[0]["path"], "sha": "99" * 20,
+    }]
+    else: jobs = [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "failure"}]
+
+    text = _run_opencode_ctx(
+        tmp_path, [genuine], check_runs=[receipt], workflow_runs=[latest],
+        workflow_run_attempts=[historical], run_jobs_by_attempt={"77:1": jobs},
+    )
+
+    assert "REJECT HISTORY" not in text
+    assert "previous_sha=\n" in text
 
 
 def test_opencode_collector_filters_unrelated_runs_before_central_horizon(tmp_path):
@@ -3204,6 +3434,146 @@ def test_opencode_collector_filters_unrelated_runs_before_central_horizon(tmp_pa
     assert sum("/actions/runs --method GET" in call for call in calls) == 1
     assert sum("/commits/" in call and "/check-runs --method GET" in call for call in calls) == 1
     assert any("per_page=100" in call for call in calls)
+
+
+@node_required
+def test_opencode_live_historical_attempt_calls_are_globally_bounded_and_cached(tmp_path):
+    comments = []
+    checks = []
+    attempts = []
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    for attempt in range(1, 42):
+        comment = _bot(
+            "github-actions[bot]",
+            _opencode_v2_body(
+                _state_line("opencode", 7, 77, "ab" * 20, attempt),
+                f"SERVER RECEIPT {attempt}",
+            ),
+            1000 + attempt,
+            updated="u2",
+        )
+        comments.append(comment)
+        checks.append(_opencode_attestation(comment, workflow_head="de" * 20))
+        attempts.append({
+            "id": 77, "run_attempt": attempt, "status": "completed",
+            "conclusion": "success", "head_sha": "de" * 20,
+            "event": "pull_request", "path": ".github/workflows/pr-review.yml",
+            "pull_requests": [], "referenced_workflows": referenced,
+        })
+    selected = {
+        "id": 77, "run_attempt": 42, "status": "in_progress", "conclusion": None,
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], comments, check_runs=checks, workflow_runs=[selected],
+        workflow_run_attempts=attempts, run_id="78", expect_error=True,
+    )
+
+    historical_gets = [
+        call for call in calls
+        if call[0] == "get-run-attempt" and call[1]["run_id"] == 77
+    ]
+    historical_jobs = [
+        call for call in calls
+        if call[0] == "list-jobs" and call[1]["run_id"] == 77
+    ]
+    assert historical_gets == []
+    assert historical_jobs == []
+    assert not any(call[0] in {"create", "create-check", "update", "delete"} for call in calls)
+
+
+@node_required
+def test_opencode_live_authenticates_unchanged_receipt_missing_from_sealed_evidence(tmp_path):
+    head = "ab" * 20
+    genuine = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 77, head, 1),
+            "UNCHANGED RECEIPT BECAME AUTHENTIC",
+        ),
+        9,
+        updated="u1",
+    )
+    receipt = _opencode_attestation(genuine, workflow_head="de" * 20)
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    selected = {
+        "id": 77, "run_attempt": 2, "status": "in_progress", "conclusion": None,
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+    historical = {
+        **selected, "run_attempt": 1, "status": "completed", "conclusion": "success",
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [genuine], [genuine], sealed_check_runs=[], check_runs=[receipt],
+        workflow_runs=[selected], workflow_run_attempts=[historical],
+    )
+
+    assert any(
+        call[0] == "get-run-attempt"
+        and call[1]["run_id"] == 77
+        and call[1]["attempt_number"] == 1
+        for call in calls
+    )
+    assert not any(call[0] in {"create", "create-check", "update", "delete"} for call in calls)
+
+
+@node_required
+def test_opencode_live_refetches_in_progress_attempt_before_any_repair(tmp_path):
+    genuine = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 77, "ab" * 20, 1),
+            "ATTEMPT COMPLETED DURING LIVE CAS",
+        ),
+        9,
+        updated="u1",
+    )
+    receipt = _opencode_attestation(genuine, workflow_head="de" * 20)
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    selected = {
+        "id": 77, "run_attempt": 2, "status": "in_progress", "conclusion": None,
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+    exact_in_progress = {**selected, "run_attempt": 1}
+    exact_success = {
+        **exact_in_progress, "status": "completed", "conclusion": "success",
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [genuine], [genuine], sealed_check_runs=[], check_runs=[receipt],
+        workflow_runs=[selected],
+        workflow_run_attempt_sequences={"77:1": [exact_in_progress, exact_success]},
+    )
+
+    exact_calls = [
+        call for call in calls
+        if call[0] == "get-run-attempt" and call[1]["run_id"] == 77
+        and call[1]["attempt_number"] == 1
+    ]
+    assert len(exact_calls) == 2
+    assert sum(
+        call[0] == "list-jobs" and call[1]["run_id"] == 77
+        and call[1]["attempt_number"] == 1
+        for call in calls
+    ) == 1
+    assert not any(call[0] in {"create", "create-check", "update", "delete"} for call in calls)
 
 
 @pytest.mark.parametrize("mismatch", ("caller_path", "event", "missing_reference", "reference_sha"))
@@ -3443,7 +3813,11 @@ def _run_opencode_canonicalize(
     fail_update_comment_ids: list[int] | None = None,
     fail_delete_comment_ids: list[int] | None = None,
     check_runs: list[dict] | None = None,
+    sealed_check_runs: list[dict] | None = None,
     workflow_runs: list[dict] | None = None,
+    workflow_run_attempts: list[dict] | None = None,
+    workflow_run_attempt_sequences: dict[str, list[dict]] | None = None,
+    run_jobs_by_attempt: dict[str, list[dict]] | None = None,
     current_workflow_run: dict | None = None,
     trusted_workspace: Path | None = None,
     inject_candidate_nonce: bool = True,
@@ -3512,7 +3886,7 @@ def _run_opencode_canonicalize(
         full_diff.unlink()
         scope.unlink()
     effective_checks = (
-        check_runs
+        sealed_check_runs if sealed_check_runs is not None else check_runs
         if check_runs is not None
         else [
             attestation
@@ -3538,6 +3912,13 @@ def _run_opencode_canonicalize(
                 "status": "completed", "conclusion": "success", "head_sha": payload["workflow_head"],
                 "event": "pull_request", "path": ".github/workflows/pr-review.yml",
                 "pull_requests": [],
+                "referenced_workflows": [{"path": payload["referenced_workflow_path"], "sha": payload["referenced_workflow_sha"], "ref": "refs/tags/v1.45"}],
+            },
+            "selected_run": {
+                "id": payload["run_id"], "run_attempt": payload["run_attempt"],
+                "status": "completed", "conclusion": "success",
+                "head_sha": payload["workflow_head"], "event": "pull_request",
+                "path": ".github/workflows/pr-review.yml", "pull_requests": [],
                 "referenced_workflows": [{"path": payload["referenced_workflow_path"], "sha": payload["referenced_workflow_sha"], "ref": "refs/tags/v1.45"}],
             },
             "jobs": [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "success"}],
@@ -3628,8 +4009,11 @@ def _run_opencode_canonicalize(
         env, after_with_nonce, cwd=workdir, current_head=current_head or attempt_head, expect_error=expect_error,
         fail_update_comment_ids=fail_update_comment_ids,
         fail_delete_comment_ids=fail_delete_comment_ids,
-        check_runs=effective_checks,
+        check_runs=check_runs if check_runs is not None else effective_checks,
         workflow_runs=workflow_runs,
+        workflow_run_attempts=workflow_run_attempts,
+        workflow_run_attempt_sequences=workflow_run_attempt_sequences,
+        run_jobs_by_attempt=run_jobs_by_attempt,
         current_workflow_run=current_workflow_run,
         inject_comments_at_list_call=inject_comments_at_list_call,
     )
@@ -3950,6 +4334,64 @@ def test_opencode_partial_rerun_uses_verified_sealed_prepare_attempt(tmp_path):
     assert receipt["run_attempt"] == 2
     assert receipt["prepared_run_attempt"] == 1
     assert any(call[0] in {"update", "delete"} and call[1]["comment_id"] == raw["id"] for call in calls)
+
+
+@node_required
+def test_opencode_canonicalizer_only_rerun_preserves_historical_attempt_success(tmp_path):
+    old_head = "ab" * 20
+    old_hash = "12" * 32
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 77, old_head, 1, full_diff_sha256=old_hash),
+            "ATTEMPT ONE TRUSTED BODY",
+        ),
+        900,
+        updated="u2",
+    )
+    prior_receipt = _opencode_attestation(prior, workflow_head="de" * 20)
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    current = {
+        "id": 77, "run_attempt": 2, "status": "in_progress", "conclusion": None,
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+    historical = {**current, "run_attempt": 1, "status": "completed", "conclusion": "success"}
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [prior], run_id="77", run_attempt="2", sealed_run_attempt="1",
+        outcome="failure", check_runs=[prior_receipt], workflow_runs=[current],
+        workflow_run_attempts=[historical, current],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert "ATTEMPT ONE TRUSTED BODY" in body
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] == old_head
+    assert state["full_diff_sha256"] == old_hash
+    assert not any(
+        call[0] in {"update", "delete"} and call[1]["comment_id"] == prior["id"]
+        for call in calls
+    )
+    assert sum(call[0] == "get-run-attempt" and call[1]["attempt_number"] == 1 for call in calls) == 1
+
+    canonical, receipt = _opencode_published_from_calls(calls)
+    next_dir = tmp_path / "next-collector"
+    next_dir.mkdir()
+    completed_current = {**current, "status": "completed", "conclusion": "success"}
+    text = _run_opencode_ctx(
+        next_dir, [prior, canonical], check_runs=[prior_receipt, receipt],
+        workflow_runs=[completed_current],
+        workflow_run_attempts=[historical, completed_current],
+    )
+    assert "ATTEMPT ONE TRUSTED BODY" in text
+    assert f"previous_sha={old_head}" in text
+    assert f"previous_full_hash={old_hash}" in text
 
 
 @node_required

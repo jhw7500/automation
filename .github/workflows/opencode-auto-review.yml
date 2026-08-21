@@ -147,15 +147,14 @@ jobs:
           RUN_JOBS="$RUNNER_TEMP/opencode-run-jobs-before.json"
           printf '[]' > "$CHECKS"
           printf '[]' > "$RUN_JOBS"
-          # Comment bytes never choose provenance lookups. Start from the newest bounded
-          # successful PR runs authored by Actions, then discover the exact named Checks on
-          # each server-authored run head. A comment's receipt ID is only an equality check.
+          # Comment bytes never choose provenance lookups. Start from recent server-authored
+          # PR run IDs/heads without trusting the latest attempt's status, then discover the
+          # exact named Checks on those heads. Comments can only reduce this server-selected set.
           RUNS_RAW="$RUNNER_TEMP/opencode-recent-runs.json"
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs" --method GET \
-            -f event=pull_request -f status=success -F per_page=100 -F page=1 > "$RUNS_RAW"
+            -f event=pull_request -F per_page=100 -F page=1 > "$RUNS_RAW"
           jq -ce '[.workflow_runs[]? | select(
               .id > 0 and .run_attempt > 0 and .event == "pull_request"
-              and .status == "completed" and .conclusion == "success"
               and (.head_sha | test("^[0-9a-f]{40}$"))
               and ([.referenced_workflows[]? | select(
                 (.path | startswith("jhw7500/automation/.github/workflows/opencode-auto-review.yml@"))
@@ -172,26 +171,107 @@ jobs:
             jq -nc --argjson old "$(cat "$CHECKS")" --argjson page "$checks_page" \
               '$old + $page.check_runs | unique_by(.id)' > "${CHECKS}.new"
             mv "${CHECKS}.new" "$CHECKS"
-            run_id="$(jq -er '.id' <<< "$run_record")"
-            run_attempt="$(jq -er '.run_attempt' <<< "$run_record")"
-            if ! jq -e --argjson run "$run_id" --argjson attempt "$run_attempt" '
-              any(.[]; ((.output.text // "")
-                | (try capture("^<!-- automation-attestation:(?<json>\\{.*\\}) -->$").json catch "")
-                | (try fromjson catch null)) as $a
-                | $a != null and $a.run_id == $run and $a.run_attempt == $attempt)' \
-                "$CHECKS" >/dev/null; then
-              continue
-            fi
+          done < <(jq -c '.[]' "${RUNS_RAW}.selected")
+          CANDIDATES="$RUNNER_TEMP/opencode-historical-candidates.json"
+          node - "$COMMENTS" "$CHECKS" "${RUNS_RAW}.selected" "$CANDIDATES" \
+            "$GITHUB_REPOSITORY" "$PR_NUMBER" "$SERVER_URL" <<'NODE'
+          const fs = require('fs');
+          const crypto = require('crypto');
+          const [commentsPath, checksPath, runsPath, outputPath, repository, prRaw, serverUrl] = process.argv.slice(2);
+          const comments = JSON.parse(fs.readFileSync(commentsPath, 'utf8'));
+          const checks = JSON.parse(fs.readFileSync(checksPath, 'utf8'));
+          const selectedRuns = JSON.parse(fs.readFileSync(runsPath, 'utf8'));
+          const sha = (text) => crypto.createHash('sha256').update(text).digest('hex');
+          const attestationKeys = ['attempt_head','body_sha256','caller_event','caller_workflow_path',
+            'comment_id','pr','prepared_run_attempt','referenced_workflow_path','referenced_workflow_sha','repository',
+            'run_attempt','run_id','schema','state_sha256','successful_head','workflow','workflow_head'];
+          const stateKeys = ['attempt_head','attempt_status','diff_mode','full_diff_sha256','pr','reviewer',
+            'run_attempt','run_id','schema','successful_head'];
+          const candidates = [];
+          for (const check of checks) {
+            const attMatch = (check.output?.text || '').match(/^<!-- automation-attestation:(\{.*\}) -->$/);
+            if (!attMatch || check.name !== 'automation/opencode-canonical-review'
+              || check.status !== 'completed' || check.conclusion !== 'success'
+              || check.app?.slug !== 'github-actions') continue;
+            let a;
+            try { a = JSON.parse(attMatch[1]); } catch { continue; }
+            if (JSON.stringify(Object.keys(a).sort()) !== JSON.stringify(attestationKeys)
+              || a.schema !== 1 || a.repository !== repository
+              || a.workflow !== '.github/workflows/opencode-auto-review.yml'
+              || a.caller_event !== 'pull_request'
+              || !Number.isSafeInteger(a.run_id) || a.run_id < 1
+              || !Number.isSafeInteger(a.run_attempt) || a.run_attempt < 1
+              || !Number.isSafeInteger(a.prepared_run_attempt) || a.prepared_run_attempt < 1
+              || a.prepared_run_attempt > a.run_attempt
+              || !Number.isSafeInteger(a.comment_id) || a.comment_id < 1
+              || !/^[0-9a-f]{40}$/.test(a.workflow_head || '')
+              || !/^[0-9a-f]{40}$/.test(a.referenced_workflow_sha || '')
+              || !/^jhw7500\/automation\/\.github\/workflows\/opencode-auto-review\.yml@/.test(a.referenced_workflow_path || '')
+              || check.id < 1 || check.head_sha !== a.workflow_head
+              || check.external_id !== `automation-opencode-canonical:${repository}:pr:${prRaw}:run:${a.run_id}:${a.run_attempt}:comment:${a.comment_id}`) continue;
+            const selected = selectedRuns.find((run) => run.id === a.run_id
+              && Number.isSafeInteger(run.run_attempt) && run.run_attempt > 0
+              && a.run_attempt <= run.run_attempt
+              && run.head_sha === a.workflow_head && run.event === 'pull_request'
+              && run.path === a.caller_workflow_path
+              && (run.referenced_workflows || []).some((item) =>
+                item.path === a.referenced_workflow_path && item.sha === a.referenced_workflow_sha));
+            if (!selected) continue;
+            const comment = comments.find((item) => item.id === a.comment_id);
+            const lines = (comment?.body || '').split('\n');
+            const stateMatch = (lines[2] || '').match(/^<!-- automation-state:(\{.*\}) -->$/);
+            const ids = lines.map((line) => line.match(/^- Attestation: ([1-9][0-9]*)$/)).filter(Boolean);
+            if (comment?.user?.type !== 'Bot' || lines[0] !== '## OpenCode Review (latest)'
+              || lines[1] !== '<!-- automation:opencode-auto-review:v2 -->'
+              || !stateMatch || ids.length !== 1 || Number(ids[0][1]) !== check.id
+              || a.body_sha256 !== sha(comment.body || '') || a.state_sha256 !== sha(stateMatch[1])) continue;
+            let state;
+            try { state = JSON.parse(stateMatch[1]); } catch { continue; }
+            const validPair = (state.successful_head === null && state.full_diff_sha256 === null)
+              || (/^[0-9a-f]{40}$/.test(state.successful_head || '')
+                && /^[0-9a-f]{64}$/.test(state.full_diff_sha256 || ''));
+            const validSemantics = state.attempt_status === 'success'
+              ? state.successful_head === state.attempt_head && state.successful_head !== null
+                && validPair && ['full','delta','unchanged'].includes(state.diff_mode)
+              : state.attempt_status === 'failure' && validPair;
+            if (!state || JSON.stringify(Object.keys(state).sort()) !== JSON.stringify(stateKeys)
+              || state.schema !== 2 || state.reviewer !== 'opencode' || state.pr !== Number(prRaw)
+              || state.run_id !== a.run_id || state.run_attempt !== a.run_attempt
+              || state.attempt_head !== a.attempt_head || state.successful_head !== a.successful_head
+              || !/^[0-9a-f]{40}$/.test(state.attempt_head || '') || !validSemantics
+              || !['full','delta','unchanged','unavailable'].includes(state.diff_mode)
+              || !lines.includes(`- Run: ${serverUrl}/${repository}/actions/runs/${state.run_id}`)) continue;
+            candidates.push({ check_id: check.id, run_id: a.run_id, run_attempt: a.run_attempt,
+              workflow_head: a.workflow_head, selected_run: selected });
+          }
+          candidates.sort((x, y) => y.run_id - x.run_id || y.run_attempt - x.run_attempt
+            || y.check_id - x.check_id);
+          const unique = [];
+          for (const candidate of candidates) {
+            if (!unique.some((item) => item.run_id === candidate.run_id
+              && item.run_attempt === candidate.run_attempt)) unique.push(candidate);
+          }
+          if (unique.length > 40) {
+            throw new Error('historical OpenCode receipt candidate limit exceeded');
+          }
+          fs.writeFileSync(outputPath, JSON.stringify(unique));
+          NODE
+          while IFS= read -r candidate; do
+            run_id="$(jq -er '.run_id' <<< "$candidate")"
+            run_attempt="$(jq -er '.run_attempt' <<< "$candidate")"
+            run_record="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}" \
+              --method GET)"
             jobs_page="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}/jobs" \
               --method GET -F per_page=100 -F page=1)"
             jq -e '(.total_count | type == "number") and .total_count >= 0
               and .total_count <= 100 and (.jobs | type == "array")' \
               >/dev/null <<< "$jobs_page" || { echo '::error::Unbounded workflow jobs page'; exit 1; }
             jq -nc --argjson old "$(cat "$RUN_JOBS")" --argjson jobs "$jobs_page" \
-              --argjson run_record "$run_record" --argjson run "$run_id" --argjson attempt "$run_attempt" \
-              '$old + [{run_id:$run,run_attempt:$attempt,run:$run_record,jobs:$jobs.jobs}]' > "${RUN_JOBS}.new"
+              --argjson run_record "$run_record" --argjson selected "$(jq '.selected_run' <<< "$candidate")" \
+              --argjson run "$run_id" --argjson attempt "$run_attempt" \
+              '$old + [{run_id:$run,run_attempt:$attempt,run:$run_record,selected_run:$selected,jobs:$jobs.jobs}]' > "${RUN_JOBS}.new"
             mv "${RUN_JOBS}.new" "$RUN_JOBS"
-          done < <(jq -c '.[]' "${RUNS_RAW}.selected")
+          done < <(jq -c '.[]' "$CANDIDATES")
           jq -n --slurpfile checks "$CHECKS" --slurpfile runs "$RUN_JOBS" \
             '{check_runs:$checks[0],workflow_runs:$runs[0]}' > "$ATTESTATIONS"
           chmod 0444 "$ATTESTATIONS"
@@ -245,8 +325,15 @@ jobs:
                 && run && run.run?.id === a.run_id && run.run?.run_attempt === a.run_attempt
                 && run.run?.head_sha === a.workflow_head
                 && run.run?.status === 'completed' && run.run?.conclusion === 'success'
-              && (run.run?.referenced_workflows || []).some((item) =>
-                item.path === a.referenced_workflow_path && item.sha === a.referenced_workflow_sha)
+                && run.run?.path === a.caller_workflow_path && run.run?.event === 'pull_request'
+                && (run.run?.referenced_workflows || []).some((item) =>
+                  item.path === a.referenced_workflow_path && item.sha === a.referenced_workflow_sha)
+                && run.selected_run?.id === a.run_id
+                && run.selected_run?.head_sha === a.workflow_head
+                && run.selected_run?.path === a.caller_workflow_path
+                && run.selected_run?.event === 'pull_request'
+                && (run.selected_run?.referenced_workflows || []).some((item) =>
+                  item.path === a.referenced_workflow_path && item.sha === a.referenced_workflow_sha)
                 && run.jobs.some((job) => /(?:^|\s\/\s)opencode-canonicalize$/.test(job.name || '')
                   && job.conclusion === 'success');
             });
@@ -834,16 +921,23 @@ jobs:
             const attestationKeys = ['attempt_head','body_sha256','caller_event','caller_workflow_path',
               'comment_id','pr','prepared_run_attempt','referenced_workflow_path','referenced_workflow_sha','repository',
               'run_attempt','run_id','schema','state_sha256','successful_head','workflow','workflow_head'];
-            const attestationMatches = (record, check, runEntry) => {
+            const parseAttestation = (check) => {
               const match = (check?.output?.text || '').match(/^<!-- automation-attestation:(\{.*\}) -->$/);
-              if (!match || check.id !== record.attestationId) return false;
-              let a;
-              try { a = JSON.parse(match[1]); } catch { return false; }
-              return JSON.stringify(Object.keys(a).sort()) === JSON.stringify(attestationKeys)
+              if (!match) return null;
+              try {
+                const value = JSON.parse(match[1]);
+                return JSON.stringify(Object.keys(value).sort()) === JSON.stringify(attestationKeys)
+                  ? value : null;
+              } catch { return null; }
+            };
+            const receiptMatchesRecord = (record, check, selectedRun) => {
+              const a = parseAttestation(check);
+              return Boolean(a) && check.id === record.attestationId
                 && a.schema === 1 && a.repository === repository && a.workflow === workflowName
-                && a.caller_workflow_path === runEntry?.run?.path
-                && a.caller_event === 'pull_request'
-                && runEntry?.run?.event === 'pull_request'
+                && Number.isSafeInteger(a.run_id) && a.run_id > 0
+                && Number.isSafeInteger(a.run_attempt) && a.run_attempt > 0
+                && a.caller_workflow_path === selectedRun?.path
+                && a.caller_event === 'pull_request' && selectedRun?.event === 'pull_request'
                 && /^jhw7500\/automation\/\.github\/workflows\/opencode-auto-review\.yml@/.test(a.referenced_workflow_path || '')
                 && /^[0-9a-f]{40}$/.test(a.referenced_workflow_sha || '')
                 && a.pr === issueNumber && a.comment_id === record.comment.id
@@ -859,9 +953,21 @@ jobs:
                 && check.head_sha === a.workflow_head && check.status === 'completed'
                 && check.conclusion === 'success' && check.app?.slug === 'github-actions'
                 && check.external_id === `automation-opencode-canonical:${repository}:pr:${issueNumber}:run:${a.run_id}:${a.run_attempt}:comment:${a.comment_id}`
+                && selectedRun?.id === a.run_id
+                && Number.isSafeInteger(selectedRun.run_attempt) && selectedRun.run_attempt > 0
+                && a.run_attempt <= selectedRun.run_attempt
+                && selectedRun.head_sha === a.workflow_head
+                && (selectedRun.referenced_workflows || []).some((item) =>
+                  item.path === a.referenced_workflow_path && item.sha === a.referenced_workflow_sha);
+            };
+            const attestationMatches = (record, check, runEntry) => {
+              const a = parseAttestation(check);
+              return receiptMatchesRecord(record, check, runEntry?.selected_run)
                 && runEntry?.run?.id === a.run_id && runEntry.run.run_attempt === a.run_attempt
                 && runEntry.run.head_sha === a.workflow_head
                 && runEntry.run.status === 'completed' && runEntry.run.conclusion === 'success'
+                && runEntry.run.path === a.caller_workflow_path
+                && runEntry.run.event === 'pull_request'
                 && (runEntry.run.referenced_workflows || []).some((item) =>
                   item.path === a.referenced_workflow_path
                   && item.sha === a.referenced_workflow_sha)
@@ -879,14 +985,17 @@ jobs:
             const authenticatedLiveIds = new Set();
             const authenticatedLiveRecords = new Map();
 
-            // Discover receipts from a bounded server-authored run horizon. Comment text is
-            // considered only after the server has selected runs and named Checks.
+            const attemptEvidenceCache = new Map();
+            let liveEvidencePending = false;
+            // Discover receipts from a bounded server-authored run-ID/head horizon. The latest
+            // attempt may be running or failed; exact historical attempt/job evidence is fetched
+            // only after a strict server Check + comment digest intersection.
             const discoverLiveEvidence = async () => {
               let response;
               try {
                 response = await github.rest.actions.listWorkflowRunsForRepo({
                   owner: context.repo.owner, repo: context.repo.repo,
-                  event: 'pull_request', status: 'success', per_page: 100, page: 1,
+                  event: 'pull_request', per_page: 100, page: 1,
                 });
               } catch (error) {
                 throw new Error(`cannot list recent OpenCode workflow runs: ${error.message}`);
@@ -897,8 +1006,7 @@ jobs:
               const runs = response.data.workflow_runs.filter((run) =>
                 Number.isSafeInteger(run.id) && run.id > 0
                 && Number.isSafeInteger(run.run_attempt) && run.run_attempt > 0
-                && run.event === 'pull_request' && run.status === 'completed'
-                && run.conclusion === 'success' && /^[0-9a-f]{40}$/.test(run.head_sha || '')
+                && run.event === 'pull_request' && /^[0-9a-f]{40}$/.test(run.head_sha || '')
                 && (run.referenced_workflows || []).filter((item) =>
                   /^jhw7500\/automation\/\.github\/workflows\/opencode-auto-review\.yml@/.test(item.path || '')
                   && /^[0-9a-f]{40}$/.test(item.sha || '')).length === 1).slice(0, 20);
@@ -917,45 +1025,71 @@ jobs:
                   if (!checks.some((item) => item.id === check.id)) checks.push(check);
                 }
               }
-              const runEntries = [];
-              for (const run of runs) {
-                const hasReceipt = checks.some((check) => {
-                  const match = (check.output?.text || '').match(/^<!-- automation-attestation:(\{.*\}) -->$/);
-                  if (!match) return false;
-                  try {
-                    const a = JSON.parse(match[1]);
-                    return a.run_id === run.id && a.run_attempt === run.run_attempt;
-                  } catch { return false; }
-                });
-                if (!hasReceipt) continue;
-                const { data } = await github.rest.actions.listJobsForWorkflowRunAttempt({
-                  owner: context.repo.owner, repo: context.repo.repo,
-                  run_id: run.id, attempt_number: run.run_attempt, per_page: 100, page: 1,
-                });
-                if (!Array.isArray(data?.jobs) || !Number.isSafeInteger(data.total_count)
-                  || data.total_count < 0 || data.total_count > 100) {
-                  throw new Error('unbounded or invalid OpenCode workflow jobs page');
-                }
-                runEntries.push({ run_id: run.id, run_attempt: run.run_attempt,
-                  run, jobs: data.jobs });
-              }
-              return { checks, runEntries };
+              return { checks, runs };
             };
             const authenticateLive = async (comments) => {
+              liveEvidencePending = false;
               const records = [];
-              const claimed = comments.map(parseRecord).filter(Boolean).filter((record) => {
-                const prior = beforeById.get(record.comment.id);
-                return !prior || prior.body !== record.comment.body
-                  || prior.updated_at !== record.comment.updated_at;
-              });
+              const claimed = comments.map(parseRecord).filter(Boolean);
               const evidence = await discoverLiveEvidence();
-              for (const record of claimed) {
-                if (!record.attestationId) continue;
-                const check = evidence.checks.find((item) => item.id === record.attestationId);
-                if (!check) continue;
-                const runEntry = evidence.runEntries.find((item) =>
-                  item.run_id === record.state.run_id
-                  && item.run_attempt === record.state.run_attempt);
+              const candidates = [];
+              for (const check of evidence.checks) {
+                const a = parseAttestation(check);
+                if (!a) continue;
+                const selectedRun = evidence.runs.find((run) => run.id === a.run_id
+                  && run.head_sha === a.workflow_head);
+                const record = claimed.find((item) => item.comment.id === a.comment_id
+                  && item.attestationId === check.id);
+                if (record && receiptMatchesRecord(record, check, selectedRun)) {
+                  candidates.push({ record, check, selectedRun, a });
+                }
+              }
+              candidates.sort((x, y) => y.a.run_id - x.a.run_id
+                || y.a.run_attempt - x.a.run_attempt || y.check.id - x.check.id);
+              const bounded = [];
+              for (const candidate of candidates) {
+                if (!bounded.some((item) => item.a.run_id === candidate.a.run_id
+                  && item.a.run_attempt === candidate.a.run_attempt)) bounded.push(candidate);
+              }
+              if (bounded.length > 40) {
+                throw new Error('historical OpenCode receipt candidate limit exceeded');
+              }
+              for (const candidate of bounded) {
+                const { record, check, selectedRun, a } = candidate;
+                const cacheKey = `${a.run_id}:${a.run_attempt}`;
+                let runEntry = attemptEvidenceCache.get(cacheKey);
+                if (!runEntry) {
+                  try {
+                    const { data: run } = await github.rest.actions.getWorkflowRunAttempt({
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      run_id: a.run_id, attempt_number: a.run_attempt,
+                    });
+                    if (run?.status !== 'completed') {
+                      liveEvidencePending = true;
+                      continue;
+                    }
+                    if (run.conclusion !== 'success') {
+                      runEntry = { run_id: a.run_id, run_attempt: a.run_attempt,
+                        run, selected_run: selectedRun, jobs: [] };
+                      attemptEvidenceCache.set(cacheKey, runEntry);
+                      continue;
+                    }
+                    const { data } = await github.rest.actions.listJobsForWorkflowRunAttempt({
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      run_id: a.run_id, attempt_number: a.run_attempt, per_page: 100, page: 1,
+                    });
+                    if (!Array.isArray(data?.jobs) || !Number.isSafeInteger(data.total_count)
+                      || data.total_count < 0 || data.total_count > 100) {
+                      throw new Error('unbounded or invalid OpenCode workflow jobs page');
+                    }
+                    runEntry = { run_id: a.run_id, run_attempt: a.run_attempt,
+                      run, selected_run: selectedRun, jobs: data.jobs };
+                    attemptEvidenceCache.set(cacheKey, runEntry);
+                  } catch (error) {
+                    if (error.status === 404) continue;
+                    throw new Error(`cannot verify historical OpenCode attempt: ${error.message}`);
+                  }
+                }
                 if (attestationMatches(record, check, runEntry)) {
                   authenticatedLiveIds.add(record.comment.id);
                   authenticatedLiveRecords.set(record.comment.id, record);
@@ -965,7 +1099,14 @@ jobs:
               return records.sort((a, b) => a.state.run_id - b.state.run_id
                 || a.state.run_attempt - b.state.run_attempt).at(-1) || null;
             };
-            const liveExisting = await authenticateLive(after);
+            let liveExisting = await authenticateLive(after);
+            if (liveEvidencePending) {
+              liveExisting = await authenticateLive(after);
+              if (liveEvidencePending) {
+                core.notice('Deferring OpenCode repair while exact attempt provenance is pending');
+                return;
+              }
+            }
             if (liveExisting && (!existing || liveExisting.state.run_id > existing.state.run_id
               || (liveExisting.state.run_id === existing.state.run_id
                 && liveExisting.state.run_attempt > existing.state.run_attempt))) {
@@ -1111,6 +1252,10 @@ jobs:
             }
             if (cleanupFailed) throw new Error('OpenCode repair failed; refusing canonical publication');
             const postRepairExisting = await authenticateLive(repaired);
+            if (liveEvidencePending) {
+              core.notice('Deferring OpenCode publication while exact attempt provenance is pending');
+              return;
+            }
             if (postRepairExisting && (postRepairExisting.state.run_id > runId
               || (postRepairExisting.state.run_id === runId
                 && postRepairExisting.state.run_attempt >= runAttempt))) {
@@ -1309,7 +1454,7 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo, pull_number: issueNumber,
             });
             const preCreateExisting = await authenticateLive(preCreateComments);
-            if (preCreatePr.head?.sha !== attemptHead || (preCreateExisting
+            if (liveEvidencePending || preCreatePr.head?.sha !== attemptHead || (preCreateExisting
               && (preCreateExisting.state.run_id > runId
                 || (preCreateExisting.state.run_id === runId
                   && preCreateExisting.state.run_attempt >= runAttempt)))
@@ -1380,7 +1525,7 @@ jobs:
             });
             const preSuccessExact = preSuccessComments.find((comment) => comment.id === created.id);
             const preAttestationExisting = await authenticateLive(preSuccessComments);
-            if (finalPr.head?.sha !== attemptHead || (preAttestationExisting
+            if (liveEvidencePending || finalPr.head?.sha !== attemptHead || (preAttestationExisting
               && (preAttestationExisting.state.run_id > runId
                 || (preAttestationExisting.state.run_id === runId
                   && preAttestationExisting.state.run_attempt >= runAttempt)))
@@ -1417,6 +1562,11 @@ jobs:
                   conclusion: 'success', event: handoff.caller_event,
                   path: handoff.caller_workflow_path,
                   pull_requests: [], referenced_workflows: [{ path: handoff.referenced_workflow_path,
+                    sha: handoff.referenced_workflow_sha }] },
+                selected_run: { id: runId, run_attempt: runAttempt, head_sha: workflowHead,
+                  status: 'completed', conclusion: 'success', event: handoff.caller_event,
+                  path: handoff.caller_workflow_path, pull_requests: [],
+                  referenced_workflows: [{ path: handoff.referenced_workflow_path,
                     sha: handoff.referenced_workflow_sha }] },
                 jobs: [{ name: 'opencode-canonicalize', conclusion: 'success' }],
               })) throw new Error('canonical attestation exact-byte refetch failed');
