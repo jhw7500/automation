@@ -14,7 +14,7 @@ run it against fixtures, so the review-round rules stay locked:
 - sticky meta (Status / Reviewed SHA) is parsed from the workflow-built header
   region only, so meta lines echoed or quoted inside a review body cannot
   disable re-review context or poison the incremental base;
-- delta pathspecs are literal, so glob-special file names stay in the delta;
+- Claude and Gemini delegate exact full/delta preparation to one shared action;
 - re-review mode requires the reviewer's own previous review;
 - opencode receives its previous review server-side (author-verified) instead
   of self-identifying it from PR comments by marker;
@@ -133,6 +133,18 @@ def _load(name: str) -> dict:
 
 def _step(workflow: dict, job: str, name: str) -> dict:
     return next(s for s in workflow["jobs"][job]["steps"] if s.get("name") == name)
+
+
+def _step_id(job: dict, name: str) -> str:
+    return next(step["id"] for step in job["steps"] if step.get("name") == name)
+
+
+def _github_outputs(path: Path) -> dict[str, str]:
+    return dict(
+        line.split("=", 1)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
 
 
 def _bot(
@@ -515,7 +527,7 @@ def test_claude_collect_rejects_extra_key_and_impossible_success_without_displac
     assert "NULL SUCCESS" not in context
 
 
-@pytest.mark.parametrize("diff_mode", ("unavailable", "unchanged"))
+@pytest.mark.parametrize("diff_mode", ("unavailable",))
 def test_claude_collect_rejects_success_without_covered_diff_mode(tmp_path, diff_mode):
     head = "ab" * 20
     valid = _v2_body(CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 1, head), "VALID")
@@ -529,6 +541,25 @@ def test_claude_collect_rejects_success_without_covered_diff_mode(tmp_path, diff
     assert context is not None
     assert "VALID" in context
     assert f"UNCOVERED {diff_mode}" not in context
+
+
+def test_shared_diff_claude_reader_accepts_unchanged_and_exports_validated_pair(tmp_path):
+    head = "ab" * 20
+    full_hash = "34" * 32
+    body = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 9, head, diff_mode="unchanged", full_diff_sha256=full_hash),
+        "UNCHANGED REVIEW BODY",
+    )
+
+    context = _run_collect(tmp_path, [_bot("github-actions[bot]", body)])
+    outputs = _github_outputs(tmp_path / "github-output")
+
+    assert context is not None
+    assert "UNCHANGED REVIEW BODY" in context
+    assert outputs["previous_sha"] == head
+    assert outputs["previous_full_hash"] == full_hash
 
 
 def test_claude_collect_excludes_generated_first_failure_from_context(tmp_path):
@@ -616,23 +647,23 @@ def test_collect_handles_deleted_user_comments(tmp_path):
     assert "ghost user comment" in context
 
 
-def test_collect_prepares_full_diff_file(tmp_path):
-    """전체 PR diff는 서버측에서 준비된다 — detached HEAD에서 모델의 번호 없는
-    `gh pr diff`가 실패해 저장소 전체를 리뷰하던 후퇴(redmine 2/2 재현)의 방지."""
+def test_collect_leaves_diff_preparation_to_shared_action(tmp_path):
     _run_collect(tmp_path, [])
-    full = (tmp_path / "claude-review-full.diff").read_text(encoding="utf-8")
-    assert "FULL-DIFF-FIXTURE" in full
+    assert not list(tmp_path.glob("*.diff"))
+    assert _github_outputs(tmp_path / "github-output") == {
+        "previous_sha": "",
+        "previous_full_hash": "",
+    }
 
 
 def test_claude_prompt_pins_diff_source():
     workflow = _load("claude-code-review.yml")
     step = _step(workflow, "claude-review", "Run Claude Code Review")
     prompt = step["with"]["prompt"]
-    assert "claude-review-full.diff" in prompt
-    # detached HEAD 대비: PR 번호를 프롬프트에 명시하고, diff 부재 시 저장소 파일
-    # 리뷰로 후퇴하는 것을 금지한다.
-    assert "${{ inputs.pr_number || github.event.pull_request.number }}" in prompt
-    assert "do not review repository files outside the PR diff" in prompt
+    assert "review-delta.diff" in prompt
+    assert "review-full.diff" in prompt
+    assert "exclusive change set" in prompt
+    assert "never broaden the reviewed change set or prepare another diff" in prompt
 
 
 def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure():
@@ -640,8 +671,99 @@ def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure()
     model = _step(workflow, "claude-review", "Run Claude Code Review")
     upsert = _step(workflow, "claude-review", "Upsert review comment")
 
-    assert model["if"] == "${{ steps.prepare-review-input.outputs.diff_ready == 'true' }}"
+    assert model["if"] == (
+        "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+    )
     assert upsert["if"] == "${{ !cancelled() }}"
+
+
+def test_shared_diff_wiring_is_exact_and_scope_safe():
+    cases = (
+        (
+            "claude-code-review.yml",
+            "claude-review",
+            "Collect previous review context",
+            "${{ github.token }}",
+            "${{ inputs.pr_number || github.event.pull_request.number }}",
+            "3",
+        ),
+        (
+            "gemini-auto-review.yml",
+            "gemini-review",
+            "Get PR details",
+            "${{ steps.auth.outputs.token }}",
+            "${{ inputs.pr_number || github.event.pull_request.number }}",
+            "20",
+        ),
+    )
+    for filename, job_name, collector_name, token, pr_number, context_lines in cases:
+        workflow = _load(filename)
+        job = workflow["jobs"][job_name]
+        action_steps = [
+            step for step in job["steps"]
+            if step.get("uses") == "$/.github/actions/prepare-review-diff"
+        ]
+        assert len(action_steps) == 1
+        action = action_steps[0]
+        assert action["name"] == "Prepare review diff"
+        assert action["id"] == "prepare-diff"
+        assert action["with"] == {
+            "github-token": token,
+            "pr-number": pr_number,
+            "previous-sha": f"${{{{ steps.{_step_id(job, collector_name)}.outputs.previous_sha }}}}",
+            "previous-full-hash": f"${{{{ steps.{_step_id(job, collector_name)}.outputs.previous_full_hash }}}}",
+            "context-lines": context_lines,
+        }
+
+        workflow_text = (WORKFLOWS / filename).read_text(encoding="utf-8")
+        assert "gh pr diff" not in workflow_text
+        assert "--name-only" not in workflow_text
+        assert "xargs -d" not in workflow_text
+        assert "git diff \"$PREV_SHA\"..\"$HEAD_SHA\"" not in workflow_text
+
+
+def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
+    claude = _load("claude-code-review.yml")
+    checkout = _step(claude, "claude-review", "Checkout repository")
+    claude_model = _step(claude, "claude-review", "Run Claude Code Review")
+    assert checkout["with"]["fetch-depth"] == "0"
+    assert claude_model["if"] == (
+        "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+    )
+    assert claude_model["env"]["REVIEW_DIFF_FILE"] == (
+        "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
+        "&& 'review-delta.diff' || 'review-full.diff' }}"
+    )
+    assert "exclusive change set" in claude_model["with"]["prompt"]
+    assert "Changed anchor" in claude_model["with"]["prompt"]
+    assert "concrete causal explanation" in claude_model["with"]["prompt"]
+    assert "Retracted" in claude_model["with"]["prompt"]
+    assert "Bash(gh pr" not in claude_model["with"]["claude_args"]
+
+    gemini = _load("gemini-auto-review.yml")
+    gemini_model = _step(gemini, "gemini-review", "Run Gemini Code Review")
+    assert gemini_model["if"] == (
+        "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+    )
+    assert gemini_model["env"]["REVIEW_DIFF_FILE"] == (
+        "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
+        "&& 'review-delta.diff' || 'review-full.diff' }}"
+    )
+    python = _extract_gemini_python()
+    assert "open(os.environ['REVIEW_DIFF_FILE'], 'r')" in python
+    assert "exclusive change set" in python
+    assert "Changed anchor" in python
+    assert "concrete causal explanation" in python
+    assert "Retracted" in python
+    assert "DIFF_LIMIT = 50000" in python
+    assert "for attempt in range(3)" in python
+
+    assert _step(gemini, "gemini-review", "Get PR details")["env"]["PR_NUMBER"] == (
+        "${{ inputs.pr_number || github.event.pull_request.number }}"
+    )
 
 
 def test_collect_strips_sticky_meta_from_injected_context(tmp_path):
@@ -723,7 +845,7 @@ def _sticky_with_reviewed(sha: str) -> dict:
     return _bot("github-actions[bot]", body, 1)
 
 
-def test_collect_generates_delta_for_incremental_round(tmp_path):
+def test_collect_exports_validated_pair_for_incremental_round(tmp_path):
     sha1, sha2 = _two_commit_repo(tmp_path)
     _run_collect(
         tmp_path,
@@ -731,14 +853,12 @@ def test_collect_generates_delta_for_incremental_round(tmp_path):
         head_sha=sha2,
         pr_files=["a.py", "b.py"],
     )
-    assert (tmp_path / "pr_head_sha.txt").read_text(encoding="utf-8") == sha2
-    delta = (tmp_path / "claude-review-delta.diff").read_text(encoding="utf-8")
-    assert "+print('v2')" in delta
-    assert "+print('bee')" in delta
-    assert "+print('v1')" not in delta
+    outputs = _github_outputs(tmp_path / "github-output")
+    assert outputs == {"previous_sha": sha1, "previous_full_hash": "12" * 32}
+    assert not list(tmp_path.glob("*.diff"))
 
 
-def test_collect_falls_back_when_reviewed_sha_unusable(tmp_path):
+def test_collect_leaves_commit_ancestry_validation_to_shared_action(tmp_path):
     _sha1, sha2 = _two_commit_repo(tmp_path)
     bogus = "deadbeef" * 5
     _run_collect(
@@ -747,10 +867,13 @@ def test_collect_falls_back_when_reviewed_sha_unusable(tmp_path):
         head_sha=sha2,
         pr_files=["a.py"],
     )
-    assert not (tmp_path / "claude-review-delta.diff").exists()
+    assert _github_outputs(tmp_path / "github-output") == {
+        "previous_sha": bogus,
+        "previous_full_hash": "12" * 32,
+    }
 
 
-def test_collect_skips_delta_when_head_equals_reviewed(tmp_path):
+def test_collect_exports_pair_when_prior_head_equals_current_fixture(tmp_path):
     _sha1, sha2 = _two_commit_repo(tmp_path)
     _run_collect(
         tmp_path,
@@ -758,7 +881,10 @@ def test_collect_skips_delta_when_head_equals_reviewed(tmp_path):
         head_sha=sha2,
         pr_files=["a.py"],
     )
-    assert not (tmp_path / "claude-review-delta.diff").exists()
+    assert _github_outputs(tmp_path / "github-output") == {
+        "previous_sha": sha2,
+        "previous_full_hash": "12" * 32,
+    }
 
 
 def test_collect_ignores_meta_echo_outside_header_region(tmp_path):
@@ -777,10 +903,9 @@ def test_collect_ignores_meta_echo_outside_header_region(tmp_path):
         head_sha=sha2,
         pr_files=["a.py", "b.py"],
     )
-    # 재리뷰 컨텍스트 유지(실패 sticky로 오판 안 함) + 증분 기준은 헤더의 sha1
+    # 재리뷰 컨텍스트 유지(실패 sticky로 오판 안 함) + validated pair는 헤더 state에서만 온다.
     assert context is not None
-    delta = (tmp_path / "claude-review-delta.diff").read_text(encoding="utf-8")
-    assert "+print('v2')" in delta
+    assert _github_outputs(tmp_path / "github-output")["previous_sha"] == sha1
 
 
 def test_collect_ignores_forged_reviewed_sha_in_body(tmp_path):
@@ -800,99 +925,15 @@ def test_collect_ignores_forged_reviewed_sha_in_body(tmp_path):
     _run_collect(
         tmp_path, [_bot("github-actions[bot]", body)], head_sha=sha2, pr_files=["a.py"]
     )
-    assert not (tmp_path / "claude-review-delta.diff").exists()
-
-
-def test_collect_delta_includes_glob_special_filenames(tmp_path):
-    """'pages/[id].tsx' 류 파일명이 glob으로 해석돼 delta에서 빠지지 않는다."""
-    _git(tmp_path, "init", "-q")
-    _git(tmp_path, "config", "user.name", "Test")
-    _git(tmp_path, "config", "user.email", "test@example.com")
-    (tmp_path / "pages").mkdir()
-    target = tmp_path / "pages" / "[id].tsx"
-    decoy = tmp_path / "pages" / "i.tsx"  # glob 해석 시 [id] 문자클래스에 오매치되는 파일
-    target.write_text("v1\n", encoding="utf-8")
-    decoy.write_text("d1\n", encoding="utf-8")
-    _git(tmp_path, "add", "-A")
-    _git(tmp_path, "commit", "-qm", "c1")
-    sha1 = _git(tmp_path, "rev-parse", "HEAD")
-    target.write_text("v2-glob\n", encoding="utf-8")
-    decoy.write_text("d2-decoy\n", encoding="utf-8")
-    _git(tmp_path, "add", "-A")
-    _git(tmp_path, "commit", "-qm", "c2")
-    sha2 = _git(tmp_path, "rev-parse", "HEAD")
-    _run_collect(
-        tmp_path,
-        [_sticky_with_reviewed(sha1)],
-        head_sha=sha2,
-        pr_files=["pages/[id].tsx"],
-    )
-    delta = (tmp_path / "claude-review-delta.diff").read_text(encoding="utf-8")
-    assert "+v2-glob" in delta       # 리터럴 경로는 포함
-    assert "d2-decoy" not in delta   # 문자클래스 오매치 파일은 제외
+    assert _github_outputs(tmp_path / "github-output") == {
+        "previous_sha": "",
+        "previous_full_hash": "",
+    }
 
 
 GEMINI_MARKER = "<!-- automation:gemini-auto-review -->"
 GEMINI_HEADER = "## 🔎 Gemini Code Review"
 GEMINI_V2_MARKER = "<!-- automation:gemini-auto-review:v2 -->"
-
-
-def test_gemini_incremental_delta_carries_wide_context(tmp_path):
-    """Gemini는 도구가 없어 diff 밖 코드를 못 보므로 delta에 -U20 컨텍스트를 싣는다."""
-    _git(tmp_path, "init", "-q")
-    _git(tmp_path, "config", "user.name", "Test")
-    _git(tmp_path, "config", "user.email", "test@example.com")
-    lines = [f"line{i:02d}\n" for i in range(1, 31)]
-    (tmp_path / "ctx.txt").write_text("".join(lines), encoding="utf-8")
-    _git(tmp_path, "add", "ctx.txt")
-    _git(tmp_path, "commit", "-qm", "c1")
-    sha1 = _git(tmp_path, "rev-parse", "HEAD")
-    lines[14] = "line15-changed\n"
-    (tmp_path / "ctx.txt").write_text("".join(lines), encoding="utf-8")
-    _git(tmp_path, "add", "ctx.txt")
-    _git(tmp_path, "commit", "-qm", "c2")
-    sha2 = _git(tmp_path, "rev-parse", "HEAD")
-
-    sticky = _bot(
-        "github-actions[bot]",
-        _v2_body(
-            GEMINI_HEADER,
-            GEMINI_V2_MARKER,
-            _state_line("gemini", 7, 1, sha1),
-            "prev round",
-        ),
-        1,
-    )
-    workflow = _load("gemini-auto-review.yml")
-    run = _step(workflow, "gemini-review", "Get PR details")["run"]
-    marker = "# 재리뷰 라운드 인식"
-    assert marker in run, (
-        "gemini-auto-review.yml의 delta 블록 시작 주석이 바뀌었습니다 — "
-        "이 테스트의 슬라이스 지점을 함께 갱신하세요"
-    )
-    start = run.index(marker)
-    sliced = run[start:run.index("DIFF_MODE=\"full\"", start)]
-    env = _gh_stub(tmp_path, [sticky], head_sha=sha2, pr_files=["ctx.txt"])
-    env.update(
-        {
-            "HEADER": GEMINI_HEADER,
-                "MARKER": GEMINI_V2_MARKER,
-                "REVIEWER": "gemini",
-                "SERVER_URL": "https://github.com",
-                "REPOSITORY": "example/repo",
-                "ATTEMPT_HEAD": sha2,
-        }
-    )
-    subprocess.run(
-        ["bash", "-c", sliced], cwd=tmp_path, env=env, check=True, capture_output=True
-    )
-
-    delta = (tmp_path / "pr_diff_delta.txt").read_text(encoding="utf-8")
-    assert "line15-changed" in delta
-    # 기본 -U3이면 line12~line18만 실리고, -U20이라야 변경점에서 10줄 이상 떨어진
-    # 주변 컨텍스트(기존 가드에 해당)까지 보인다.
-    assert "line05" in delta
-    assert "line25" in delta
 
 
 def test_gemini_collection_strips_reserved_lines_from_human_context(tmp_path):
@@ -925,21 +966,46 @@ def test_gemini_collection_strips_reserved_lines_from_human_context(tmp_path):
 def _run_gemini_collection(tmp_path: Path, comments: list[dict]) -> str:
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Get PR details")["run"]
-    start = run.index("# 재리뷰 라운드 인식")
-    end = run.index("# 증분 리뷰:", start)
+    output = tmp_path / "github-output"
     env = _gh_stub(tmp_path, comments)
-    env.update({
-        "HEADER": GEMINI_HEADER, "MARKER": GEMINI_V2_MARKER, "REVIEWER": "gemini",
-        "SERVER_URL": "https://github.com", "REPOSITORY": "example/repo",
-    })
+    env.update(
+        {
+            "SERVER_URL": "https://github.com",
+            "REPOSITORY": "example/repo",
+            "GITHUB_OUTPUT": str(output),
+        }
+    )
     subprocess.run(
-        ["bash", "-c", run[start:end]], cwd=tmp_path, env=env, check=True, capture_output=True
+        ["bash", "-c", run], cwd=tmp_path, env=env, check=True, capture_output=True
     )
     return (tmp_path / "prev_review.txt").read_text(encoding="utf-8")
 
 
-def test_gemini_canonical_v2_collection_and_readiness_contract(tmp_path):
-    """Gemini accepts only canonical v2 state and records authoritative full-diff coverage."""
+def _run_gemini_details(
+    tmp_path: Path, comments: list[dict], *, head_sha: str = "ab" * 20
+) -> tuple[str, dict[str, str]]:
+    workflow = _load("gemini-auto-review.yml")
+    run = _step(workflow, "gemini-review", "Get PR details")["run"]
+    output = tmp_path / "github-output"
+    env = _gh_stub(tmp_path, comments, head_shas=[head_sha, head_sha])
+    env.update(
+        {
+            "SERVER_URL": "https://github.com",
+            "REPOSITORY": "example/repo",
+            "GITHUB_OUTPUT": str(output),
+        }
+    )
+    subprocess.run(
+        ["bash", "-c", run], cwd=tmp_path, env=env, check=True, capture_output=True
+    )
+    return (
+        (tmp_path / "prev_review.txt").read_text(encoding="utf-8"),
+        _github_outputs(output),
+    )
+
+
+def test_gemini_canonical_v2_collection_and_shared_action_contract(tmp_path):
+    """Gemini exports only a canonical prior pair; the shared action owns diff coverage."""
     head = "ab" * 20
     comments = [
         _bot("foreign-bot[bot]", f"quote {GEMINI_V2_MARKER}\n{_state_line('gemini', 7, 99, head)}", 1),
@@ -984,7 +1050,7 @@ def test_gemini_canonical_v2_collection_and_readiness_contract(tmp_path):
             7,
         ),
     ]
-    previous = _run_gemini_collection(tmp_path, comments)
+    previous, outputs = _run_gemini_details(tmp_path, comments, head_sha=head)
 
     assert "SECOND ATTEMPT" in previous
     assert "FIRST ATTEMPT" not in previous
@@ -992,18 +1058,17 @@ def test_gemini_canonical_v2_collection_and_readiness_contract(tmp_path):
     assert "BAD" not in previous
     assert "FOREIGN REVIEWER" not in previous
     assert "MISMATCHED PR" not in previous
+    assert outputs == {"previous_sha": head, "previous_full_hash": "12" * 32}
     workflow = _load("gemini-auto-review.yml")
     job = workflow["jobs"]["gemini-review"]
     details = _step(workflow, "gemini-review", "Get PR details")["run"]
-    model = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
+    action = _step(workflow, "gemini-review", "Prepare review diff")
 
     assert "<!-- automation:gemini-auto-review:v2 -->" in details
     assert "sort_by(.state.run_id, .state.run_attempt)" in details
-    assert "review_diff_ready.txt" in details
-    assert "review_full_diff_sha256.txt" in details
-    assert "sha256sum pr_diff.txt" in details
-    assert 'echo "No diff available" > pr_diff.txt' not in details
-    assert model.index('cat review_diff_ready.txt') < model.index("pip install -q google-generativeai")
+    assert "gh pr diff" not in details
+    assert action["uses"] == "$/.github/actions/prepare-review-diff"
+    assert action["with"]["context-lines"] == "20"
     assert job["concurrency"] == {
         "group": "automation-gemini-auto-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}",
         "cancel-in-progress": "true",
@@ -1056,7 +1121,7 @@ def test_gemini_collect_rejects_extra_key_and_impossible_success_without_displac
     assert "NULL SUCCESS" not in previous
 
 
-@pytest.mark.parametrize("diff_mode", ("unavailable", "unchanged"))
+@pytest.mark.parametrize("diff_mode", ("unavailable",))
 def test_gemini_collect_rejects_success_without_covered_diff_mode(tmp_path, diff_mode):
     head = "ab" * 20
     valid = _v2_body(GEMINI_HEADER, GEMINI_V2_MARKER, _state_line("gemini", 7, 1, head), "VALID")
@@ -1071,75 +1136,23 @@ def test_gemini_collect_rejects_success_without_covered_diff_mode(tmp_path, diff
     assert f"UNCOVERED {diff_mode}" not in previous
 
 
-def test_gemini_model_step_fails_closed_without_prepared_diff(tmp_path):
-    workflow = _load("gemini-auto-review.yml")
-    run = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
-    gate = run[:run.index("# Install dependencies")]
-    (tmp_path / "review_diff_ready.txt").write_text("false", encoding="utf-8")
-
-    result = subprocess.run(["bash", "-c", gate], cwd=tmp_path, capture_output=True, text=True)
-
-    assert result.returncode != 0
-    assert "skipping model invocation" in result.stderr
-    assert not (tmp_path / "gemini_review.py").exists()
-
-
-@pytest.mark.parametrize(
-    "heads",
-    [
-        ("ab" * 20, "cd" * 20),
-        ("not-a-sha", "not-a-sha"),
-        ("ab" * 20, "not-a-sha"),
-    ],
-)
-def test_gemini_preparation_rejects_changed_or_malformed_head_before_model(tmp_path, heads):
-    workflow = _load("gemini-auto-review.yml")
-    preparation = _step(workflow, "gemini-review", "Get PR details")["run"]
-    output = tmp_path / "github-output"
-    env = _gh_stub(tmp_path, [], head_shas=list(heads))
-    env["GITHUB_OUTPUT"] = str(output)
-
-    subprocess.run(["bash", "-c", preparation], cwd=tmp_path, env=env, check=True, capture_output=True)
-
-    outputs = output.read_text(encoding="utf-8")
-    assert "diff_ready=false" in outputs
-    assert "attempt_head=\n" in outputs
-    assert "full_diff_sha256=\n" in outputs
-    assert "diff_mode=unavailable" in outputs
-    assert not (tmp_path / "pr_diff.txt").exists()
-
-    model = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
-    gate = model[:model.index("# Install dependencies")]
-    result = subprocess.run(["bash", "-c", gate], cwd=tmp_path, capture_output=True, text=True)
-    assert result.returncode != 0
-    assert not (tmp_path / "gemini_review.py").exists()
-
-
-def test_gemini_preparation_keeps_stable_head_bound_full_diff_ready_for_model(tmp_path):
+def test_shared_diff_gemini_reader_accepts_unchanged_and_exports_validated_pair(tmp_path):
     head = "ab" * 20
-    workflow = _load("gemini-auto-review.yml")
-    preparation = _step(workflow, "gemini-review", "Get PR details")["run"]
-    output = tmp_path / "github-output"
-    env = _gh_stub(tmp_path, [], head_shas=[head, head])
-    env["GITHUB_OUTPUT"] = str(output)
-
-    subprocess.run(["bash", "-c", preparation], cwd=tmp_path, env=env, check=True, capture_output=True)
-
-    expected_sha256 = hashlib.sha256(b"FULL-DIFF-FIXTURE\n").hexdigest()
-    assert output.read_text(encoding="utf-8") == (
-        "diff_ready=true\n"
-        f"attempt_head={head}\n"
-        f"full_diff_sha256={expected_sha256}\n"
-        "diff_mode=full\n"
+    full_hash = "34" * 32
+    body = _v2_body(
+        GEMINI_HEADER,
+        GEMINI_V2_MARKER,
+        _state_line("gemini", 7, 9, head, diff_mode="unchanged", full_diff_sha256=full_hash),
+        "UNCHANGED GEMINI REVIEW BODY",
     )
-    assert (tmp_path / "head_count.txt").read_text(encoding="utf-8") == "2"
-    assert (tmp_path / "pr_diff.txt").read_text(encoding="utf-8") == "FULL-DIFF-FIXTURE\n"
 
-    model = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
-    gate = model[:model.index("# Install dependencies")]
-    result = subprocess.run(["bash", "-c", gate], cwd=tmp_path, capture_output=True, text=True)
-    assert result.returncode == 0
-    assert not (tmp_path / "gemini_review.py").exists()
+    previous, outputs = _run_gemini_details(
+        tmp_path, [_bot("github-actions[bot]", body)], head_sha=head
+    )
+
+    assert "UNCHANGED GEMINI REVIEW BODY" in previous
+    assert outputs["previous_sha"] == head
+    assert outputs["previous_full_hash"] == full_hash
 
 
 # ---------------------------------------------------------------------------
@@ -1249,6 +1262,7 @@ def _claude_upsert(
     attempt_head: str = "cd" * 20,
     full_diff_sha256: str = "34" * 32,
     diff_mode: str = "full",
+    unchanged_since_previous: str = "false",
     current_head: str | None = None,
 ) -> list:
     workdir = tmp_path / ("with-review" if with_review else "without-review")
@@ -1267,6 +1281,7 @@ def _claude_upsert(
         "ATTEMPT_HEAD": attempt_head,
         "FULL_DIFF_SHA256": full_diff_sha256,
         "DIFF_MODE": diff_mode,
+        "UNCHANGED_SINCE_PREVIOUS": unchanged_since_previous,
     }
     return _run_upsert(
         tmp_path, "claude-code-review.yml", "claude-review", "Upsert review comment",
@@ -1288,6 +1303,7 @@ def _gemini_upsert(
     attempt_head: str = "cd" * 20,
     full_diff_sha256: str = "34" * 32,
     diff_mode: str = "full",
+    unchanged_since_previous: str = "false",
     current_head: str | None = None,
 ) -> list:
     workdir = tmp_path / ("gemini-with-review" if with_review else "gemini-without-review")
@@ -1307,6 +1323,7 @@ def _gemini_upsert(
         "ATTEMPT_HEAD": attempt_head,
         "FULL_DIFF_SHA256": full_diff_sha256,
         "DIFF_MODE": diff_mode,
+        "UNCHANGED_SINCE_PREVIOUS": unchanged_since_previous,
     }
     return _run_upsert(
         tmp_path, "gemini-auto-review.yml", "gemini-review", "Upsert review comment",
@@ -1405,7 +1422,7 @@ def test_claude_and_gemini_current_state_parsers_reject_invalid_schema_or_semant
         ("gemini", GEMINI_HEADER, GEMINI_V2_MARKER, _gemini_upsert),
     ],
 )
-@pytest.mark.parametrize("diff_mode", ("unavailable", "unchanged"))
+@pytest.mark.parametrize("diff_mode", ("unavailable",))
 def test_claude_and_gemini_current_state_parsers_ignore_success_without_covered_diff_mode(
     tmp_path, reviewer, header, marker, upsert, diff_mode
 ):
@@ -1424,6 +1441,239 @@ def test_claude_and_gemini_current_state_parsers_ignore_success_without_covered_
         attempt_head=head, current_head=head,
     )
     assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["create"]
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V2_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V2_MARKER, _gemini_upsert),
+    ],
+)
+def test_shared_diff_node_reader_accepts_canonical_success_unchanged(
+    tmp_path, reviewer, header, marker, upsert
+):
+    head = "cd" * 20
+    existing = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            header,
+            marker,
+            _state_line(reviewer, 7, 1, head, diff_mode="unchanged"),
+            "PRIOR UNCHANGED REVIEW",
+        ),
+        11,
+    )
+
+    calls = upsert(
+        tmp_path,
+        "success",
+        [existing],
+        with_review=True,
+        attempt_head=head,
+        current_head=head,
+    )
+
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11]
+    assert not any(call[0] == "create" for call in calls)
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V2_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V2_MARKER, _gemini_upsert),
+    ],
+)
+def test_shared_diff_unchanged_advances_only_matching_success_and_preserves_body(
+    tmp_path, reviewer, header, marker, upsert
+):
+    old_head = "ab" * 20
+    new_head = "cd" * 20
+    full_hash = "12" * 32
+    existing = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            header,
+            marker,
+            _state_line(reviewer, 7, 1, old_head, full_diff_sha256=full_hash),
+            "LAST COVERED REVIEW",
+        ),
+        11,
+    )
+
+    calls = upsert(
+        tmp_path,
+        "skipped",
+        [existing],
+        with_review=False,
+        diff_ready="true",
+        diff_mode="unchanged",
+        unchanged_since_previous="true",
+        attempt_head=new_head,
+        current_head=new_head,
+        full_diff_sha256=full_hash,
+    )
+    body = _updated_comment_body(calls, 11)
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+
+    assert "LAST COVERED REVIEW" in body
+    assert "- Status: success" in body
+    assert "- Last attempt:" not in body
+    assert state["attempt_status"] == "success"
+    assert state["diff_mode"] == "unchanged"
+    assert state["successful_head"] == new_head
+    assert state["full_diff_sha256"] == full_hash
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V2_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V2_MARKER, _gemini_upsert),
+    ],
+)
+@pytest.mark.parametrize("invalid_prior", ("hash-mismatch", "empty-body", "missing"))
+def test_shared_diff_invalid_unchanged_uses_failure_preservation_without_advancing(
+    tmp_path, reviewer, header, marker, upsert, invalid_prior
+):
+    old_head = "ab" * 20
+    new_head = "cd" * 20
+    action_hash = "34" * 32
+    prior_hash = "12" * 32 if invalid_prior == "hash-mismatch" else action_hash
+    changes = {"full_diff_sha256": prior_hash}
+    body = "" if invalid_prior == "empty-body" else "LAST COVERED REVIEW"
+    comments = [] if invalid_prior == "missing" else [
+        _bot(
+            "github-actions[bot]",
+            _v2_body(header, marker, _state_line(reviewer, 7, 1, old_head, **changes), body),
+            11,
+        )
+    ]
+
+    calls = upsert(
+        tmp_path,
+        "skipped",
+        comments,
+        with_review=False,
+        diff_ready="true",
+        diff_mode="unchanged",
+        unchanged_since_previous="true",
+        attempt_head=new_head,
+        current_head=new_head,
+        full_diff_sha256=action_hash,
+    )
+    body = _single_mutation_body(calls)
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] != new_head
+    if invalid_prior == "hash-mismatch":
+        assert state["successful_head"] == old_head
+        assert "LAST COVERED REVIEW" in body
+        assert "- Status: stale" in body
+    else:
+        assert state["successful_head"] is None
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V2_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V2_MARKER, _gemini_upsert),
+    ],
+)
+def test_shared_diff_unchanged_accepts_preserved_successful_pair_after_failure(
+    tmp_path, reviewer, header, marker, upsert
+):
+    old_head = "ab" * 20
+    failed_head = "ef" * 20
+    new_head = "cd" * 20
+    full_hash = "12" * 32
+    existing = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            header,
+            marker,
+            _state_line(
+                reviewer,
+                7,
+                1,
+                failed_head,
+                attempt_status="failure",
+                successful_head=old_head,
+                diff_mode="unavailable",
+                full_diff_sha256=full_hash,
+            ),
+            "LAST COVERED REVIEW",
+        ),
+        11,
+    )
+
+    calls = upsert(
+        tmp_path,
+        "skipped",
+        [existing],
+        with_review=False,
+        diff_ready="true",
+        diff_mode="unchanged",
+        unchanged_since_previous="true",
+        attempt_head=new_head,
+        current_head=new_head,
+        full_diff_sha256=full_hash,
+    )
+    state = json.loads(
+        re.search(
+            r"<!-- automation-state:(\{.*\}) -->", _updated_comment_body(calls, 11)
+        ).group(1)
+    )
+
+    assert state["attempt_status"] == "success"
+    assert state["successful_head"] == new_head
+    assert state["diff_mode"] == "unchanged"
+
+
+@node_required
+@pytest.mark.parametrize("upsert", (_claude_upsert, _gemini_upsert))
+@pytest.mark.parametrize("gate", ("stale-head", "newer-generation"))
+def test_shared_diff_unchanged_still_obeys_head_and_generation_gates(tmp_path, upsert, gate):
+    old_head = "ab" * 20
+    new_head = "cd" * 20
+    full_hash = "12" * 32
+    reviewer = "claude" if upsert is _claude_upsert else "gemini"
+    header = CLAUDE_HEADER if reviewer == "claude" else GEMINI_HEADER
+    marker = CLAUDE_V2_MARKER if reviewer == "claude" else GEMINI_V2_MARKER
+    existing_run = 43 if gate == "newer-generation" else 1
+    existing = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            header,
+            marker,
+            _state_line(reviewer, 7, existing_run, old_head, full_diff_sha256=full_hash),
+            "LAST COVERED REVIEW",
+        ),
+        11,
+    )
+
+    calls = upsert(
+        tmp_path,
+        "skipped",
+        [existing],
+        with_review=False,
+        diff_ready="true",
+        diff_mode="unchanged",
+        unchanged_since_previous="true",
+        attempt_head=new_head,
+        current_head=old_head if gate == "stale-head" else new_head,
+        full_diff_sha256=full_hash,
+        run_id="42",
+    )
+
+    assert not any(call[0] in {"create", "update", "delete"} for call in calls)
 
 
 @node_required
@@ -2145,7 +2395,7 @@ def test_gemini_infra_lines_sanitized_from_output_and_context(tmp_path):
         "pr_title.txt": "T",
         "pr_body.txt": "B",
         "pr_number.txt": "7",
-        "pr_diff.txt": "+x\n",
+        "review-full.diff": "+x\n",
         "prev_review.txt": (
             f"REPO: x\n{GEMINI_MARKER}\n- Status: success\n"
             f"- Reviewed: {fabricated_sha}\n\nPREV FINDINGS BODY"
@@ -2155,7 +2405,12 @@ def test_gemini_infra_lines_sanitized_from_output_and_context(tmp_path):
     for name, content in fixtures.items():
         (tmp_path / name).write_text(content, encoding="utf-8")
     env = dict(os.environ)
-    env.update({"GEMINI_API_KEY": "stub", "PYTHONPATH": str(tmp_path / "stub")})
+    env.update({
+        "GEMINI_API_KEY": "stub",
+        "PYTHONPATH": str(tmp_path / "stub"),
+        "REVIEW_DIFF_FILE": "review-full.diff",
+        "REVIEW_DIFF_MODE": "full",
+    })
     subprocess.run(
         ["python3", "gemini_review.py"],
         cwd=tmp_path, env=env, check=True, capture_output=True,
@@ -2204,7 +2459,7 @@ def test_gemini_retries_on_429_then_succeeds(tmp_path):
     )
     fixtures = {
         "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
-        "pr_diff.txt": "+x\n", "prev_review.txt": "", "human_comments.txt": "",
+        "review-full.diff": "+x\n", "prev_review.txt": "", "human_comments.txt": "",
     }
     for name, content in fixtures.items():
         (tmp_path / name).write_text(content, encoding="utf-8")
@@ -2213,6 +2468,8 @@ def test_gemini_retries_on_429_then_succeeds(tmp_path):
         "GEMINI_API_KEY": "stub",
         "PYTHONPATH": str(tmp_path / "stub"),
         "GEMINI_429_RETRY_SLEEP": "0",
+        "REVIEW_DIFF_FILE": "review-full.diff",
+        "REVIEW_DIFF_MODE": "full",
     })
     subprocess.run(
         ["python3", "gemini_review.py"],

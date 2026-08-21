@@ -133,10 +133,10 @@ jobs:
         id: pr-details
         env:
           GH_TOKEN: ${{ steps.auth.outputs.token }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           SERVER_URL: ${{ github.server_url }}
           REPOSITORY: ${{ github.repository }}
         run: |
-          PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
           HEADER='## 🔎 Gemini Code Review'
           MARKER='<!-- automation:gemini-auto-review:v2 -->'
           REVIEWER='gemini'
@@ -145,33 +145,6 @@ jobs:
           # SECURITY: never interpolate github.event.* expression values into this run: body —
           # GitHub renders them before bash runs, so a crafted PR title/body would execute as
           # shell (script injection / RCE). Fetch via gh so the values are handled as data.
-          rm -f pr_diff.txt pr_diff_delta.txt pr_head_sha.txt review_diff_ready.txt review_full_diff_sha256.txt
-          printf 'false' > review_diff_ready.txt
-          : > review_full_diff_sha256.txt
-          ATTEMPT_HEAD=""
-          is_sha() {
-            [[ "$1" =~ ^[0-9a-f]{40}$ ]]
-          }
-          # Bind the server-generated full diff to one immutable PR head. A push during
-          # retrieval would otherwise let an old diff and its hash be published as coverage
-          # for a newer head. Delta preparation below continues to use this validated head.
-          HEAD_BEFORE="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid // ""' 2>/dev/null || printf '')"
-          if ! is_sha "$HEAD_BEFORE"; then
-            echo '::warning::PR head before full-diff preparation is missing or malformed; Gemini will not run'
-          elif gh pr diff "$PR_NUMBER" > pr_diff.txt 2>/dev/null && [ -s pr_diff.txt ]; then
-            HEAD_AFTER="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid // ""' 2>/dev/null || printf '')"
-            if is_sha "$HEAD_AFTER" && [ "$HEAD_BEFORE" = "$HEAD_AFTER" ]; then
-              ATTEMPT_HEAD="$HEAD_AFTER"
-              printf 'true' > review_diff_ready.txt
-              sha256sum pr_diff.txt | cut -d' ' -f1 > review_full_diff_sha256.txt
-            else
-              echo '::warning::PR head changed or became malformed during full-diff preparation; Gemini will not run'
-              rm -f pr_diff.txt
-            fi
-          else
-            echo '::warning::Failed to fetch a non-empty full PR diff; Gemini will not run'
-            rm -f pr_diff.txt
-          fi
           gh pr view "$PR_NUMBER" --json title --jq '.title // ""' > pr_title.txt
           gh pr view "$PR_NUMBER" --json body  --jq '.body  // ""' > pr_body.txt
           echo "$PR_NUMBER" > pr_number.txt
@@ -212,7 +185,7 @@ jobs:
               def state_semantics:
                 if .attempt_status == "success" then
                   .successful_head != null and .successful_head == .attempt_head and successful_pair
-                  and (.diff_mode == "full" or .diff_mode == "delta")
+                  and (.diff_mode == "full" or .diff_mode == "delta" or .diff_mode == "unchanged")
                 elif .attempt_status == "failure" then successful_pair
                 else false end;
               def parsed_state($header; $marker; $reviewer; $pr; $server; $repo):
@@ -242,14 +215,17 @@ jobs:
           PREV_REVIEW="$(printf '%s\n' "$PREV_RECORD" | jq -r '.comment.body // ""')"
           PREV_STATE="$(printf '%s\n' "$PREV_RECORD" | jq -c '.state // {}')"
           PREV_SHA="$(printf '%s\n' "$PREV_STATE" | jq -r '(.successful_head // "") | if test("^[0-9a-f]{40}$") then . else "" end')"
+          PREV_FULL_HASH="$(printf '%s\n' "$PREV_STATE" | jq -r '(.full_diff_sha256 // "") | if test("^[0-9a-f]{64}$") then . else "" end')"
           strip_reserved() {
             grep -vE '^(- Status: |- Run: |- Reviewed: |- Last attempt: |<!-- automation:|<!-- automation-state:|## 🔎 Gemini Code Review$|REPO: |PR NUMBER: |Reviewer: Gemini|\*Reviewed by Gemini\*)'
           }
           PREV_REVIEW_CLEAN="$(printf '%s\n' "$PREV_REVIEW" | strip_reserved || true)"
           # A first failure has no successful pair and cannot provide incremental context.
-          if [ -z "$PREV_SHA" ] || [ -z "$PREV_REVIEW_CLEAN" ]; then
+          if [ -z "$PREV_SHA" ] || [ -z "$PREV_FULL_HASH" ] || [ -z "$PREV_REVIEW_CLEAN" ]; then
             PREV_REVIEW=""
+            PREV_STATE="{}"
             PREV_SHA=""
+            PREV_FULL_HASH=""
           else
             PREV_REVIEW="$PREV_REVIEW_CLEAN"
           fi
@@ -260,74 +236,30 @@ jobs:
                  | map("@" + (.user.login // "ghost") + " (" + (.created_at // "") + "):\n" + ((.body // "") | .[0:2000]))
                  | join("\n\n---\n\n")' pr_comments.json | strip_reserved || true)"
           printf '%s\n' "$HUMAN_COMMENTS" > human_comments.txt
-
-          # 증분 리뷰: 직전 성공 리뷰가 sticky에 남긴 "- Reviewed: <sha>"를 회수해, 그 이후
-          # push된 delta만 담은 diff 파일을 준비한다. SHA가 없거나(라운드 1/실패 라운드)
-          # HEAD의 조상이 아니면(rebase/force-push) 전체 리뷰로 폴백한다. delta는 PR 변경
-          # 파일 경로로 한정해, 브랜치에 main을 merge해 들어온 upstream 변경이 리뷰 대상에
-          # 섞이는 것을 줄인다.
-          # NOTE: claude-code-review.yml의 'Collect previous review context' 스텝에 같은
-          # delta 블록이 있다(파일명만 다름). 로직을 고치면 양쪽을 함께 고칠 것 — composite
-          # action 추출은 액션이 참조 시점에 태그로 선발행돼야 하는 플릿 릴리즈 제약 때문에 보류.
-          # (이 워크플로우는 기존부터 fetch-depth 0이라 unshallow 분기가 필요 없다.)
-          HEAD_SHA="$ATTEMPT_HEAD"
-          printf '%s' "$HEAD_SHA" > pr_head_sha.txt
-          if [ -n "$PREV_SHA" ] && [ -n "$HEAD_SHA" ] && [ "$PREV_SHA" != "$HEAD_SHA" ]; then
-            git cat-file -e "$PREV_SHA^{commit}" 2>/dev/null || git fetch -q origin "$PREV_SHA" 2>/dev/null || true
-            git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null || git fetch -q origin "$HEAD_SHA" 2>/dev/null || true
-            if git cat-file -e "$PREV_SHA^{commit}" 2>/dev/null \
-               && git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null \
-               && git merge-base --is-ancestor "$PREV_SHA" "$HEAD_SHA" 2>/dev/null; then
-              gh pr diff "$PR_NUMBER" --name-only > pr_files.txt 2>/dev/null || : > pr_files.txt
-              # -U20: 이 리뷰어는 단발 API 호출이라 diff 밖 코드를 열어볼 수 없다. 컨텍스트를
-              # 넓혀 hunk 주변의 기존 가드/초기화가 delta 안에 보이게 해, "주변 코드를 못 봐서"
-              # 생기는 오탐(예: 이미 있는 가드를 없다고 지적)을 줄인다. claude 쪽 블록은
-              # 에이전트형(주변 코드를 직접 조회 가능)이라 기본 컨텍스트를 유지한다 — 의도된 차이.
-              if [ -s pr_files.txt ]; then
-                # --literal-pathspecs: 파일명을 glob 패턴이 아닌 리터럴 경로로 다룬다 —
-                # 'pages/[id].tsx' 류 이름이 문자클래스로 해석돼 delta가 엉뚱한 파일을
-                # 매치하는 것을 막는다. 주의: git diff는 --pathspec-from-file을 지원하지
-                # 않는다(add/commit 계열 전용 — usage 오류 129로 죽어 매 라운드 전체
-                # 리뷰로 폴백된다, PR #34 라운드 2에서 실증). xargs 분할(ARG_MAX)은 PR
-                # 변경 파일 목록 규모에선 도달하지 않는 알려진 한계로 수용한다.
-                xargs -d '\n' -a pr_files.txt git --literal-pathspecs diff -U20 "$PREV_SHA".."$HEAD_SHA" -- > pr_diff_delta.txt \
-                  || rm -f pr_diff_delta.txt
-              else
-                git diff -U20 "$PREV_SHA".."$HEAD_SHA" > pr_diff_delta.txt || rm -f pr_diff_delta.txt
-              fi
-              if [ -s pr_diff_delta.txt ]; then
-                echo "Incremental round: delta ${PREV_SHA:0:7}..${HEAD_SHA:0:7} ($(wc -c < pr_diff_delta.txt) bytes)"
-              else
-                rm -f pr_diff_delta.txt
-                echo "Delta is empty; falling back to a full review"
-              fi
-            else
-              echo "Previous reviewed SHA unusable (missing or not an ancestor); falling back to a full review"
-            fi
-          fi
-          DIFF_MODE="full"
-          if [ -s pr_diff_delta.txt ]; then
-            DIFF_MODE="delta"
-          elif [ "$(cat review_diff_ready.txt)" != "true" ]; then
-            DIFF_MODE="unavailable"
-          fi
           {
-            printf 'diff_ready=%s\n' "$(cat review_diff_ready.txt)"
-            printf 'attempt_head=%s\n' "$ATTEMPT_HEAD"
-            printf 'full_diff_sha256=%s\n' "$(cat review_full_diff_sha256.txt)"
-            printf 'diff_mode=%s\n' "$DIFF_MODE"
+            printf 'previous_sha=%s\n' "$PREV_SHA"
+            printf 'previous_full_hash=%s\n' "$PREV_FULL_HASH"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare review diff
+        id: prepare-diff
+        uses: $/.github/actions/prepare-review-diff
+        with:
+          github-token: ${{ steps.auth.outputs.token }}
+          pr-number: ${{ inputs.pr_number || github.event.pull_request.number }}
+          previous-sha: ${{ steps.pr-details.outputs.previous_sha }}
+          previous-full-hash: ${{ steps.pr-details.outputs.previous_full_hash }}
+          context-lines: '20'
 
       - name: Run Gemini Code Review
         id: gemini-review
+        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3-flash-preview' }}
+          REVIEW_DIFF_FILE: ${{ steps.prepare-diff.outputs.diff-mode == 'delta' && 'review-delta.diff' || 'review-full.diff' }}
+          REVIEW_DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode }}
         run: |
-          if [ "$(cat review_diff_ready.txt 2>/dev/null || printf 'false')" != 'true' ]; then
-            echo 'Gemini review input is unavailable; skipping model invocation.' >&2
-            exit 1
-          fi
           # Install dependencies
           pip install -q google-generativeai
 
@@ -357,7 +289,7 @@ jobs:
               pr_body = f.read().strip()
           with open('pr_number.txt', 'r') as f:
               pr_number = f.read().strip()
-          with open('pr_diff.txt', 'r') as f:
+          with open(os.environ['REVIEW_DIFF_FILE'], 'r') as f:
               pr_diff = f.read()
 
           def read_optional(path):
@@ -395,12 +327,8 @@ jobs:
           prev_review = strip_infra_lines(read_optional('prev_review.txt'))
           human_comments = read_optional('human_comments.txt')
 
-          # 증분 리뷰: delta가 준비된 라운드는 전체 diff 대신 delta만 검토한다 — 변경 없는
-          # 코드에 대한 재지적을 기계적으로 차단하고 라운드 2+의 diff 토큰을 줄인다.
-          delta_diff = read_optional('pr_diff_delta.txt')
           incremental_note = ""
-          if prev_review and delta_diff:
-              pr_diff = delta_diff
+          if os.environ.get('REVIEW_DIFF_MODE') == 'delta':
               incremental_note = (
                   "\n\nINCREMENTAL ROUND: the diff below contains ONLY the changes pushed "
                   "since your last reviewed commit. Base NEW findings on this delta; handle "
@@ -488,7 +416,8 @@ jobs:
           prompt = f"""REPO: {os.environ.get('GITHUB_REPOSITORY', '')}
           PR NUMBER: {pr_number}
 
-          You are reviewing a pull request. Focus ONLY on the changes in the diff.
+          You are reviewing a pull request. The selected prepared diff below is the exclusive change set.
+          Focus ONLY on those changes. Surrounding code may explain impact but cannot broaden scope.
           IMPORTANT: Do NOT wrap your response in triple backticks. Write plain GitHub-flavored Markdown.
 
 
@@ -519,8 +448,10 @@ jobs:
           Output rules:
           - Tag every finding with a severity: [CRITICAL] / [HIGH] / [MEDIUM] / [LOW]; list higher
             severities first and omit [LOW] noise unless there is nothing more serious to report.
-          - For each concrete finding, cite the path/to/file:line from the diff hunk headers and
-            quote the offending line; if you cannot tie it to a line, label it a general observation.
+          - Every New finding must identify a `Changed anchor: path/to/file:line` from the selected
+            prepared diff. An unchanged line is supporting evidence only with a concrete causal explanation
+            from that changed anchor. Omit a finding without a changed anchor.
+          - A disproven previous claim is Retracted, not Resolved. Resolved requires a code change.
           - If you find nothing at MEDIUM or above, say so plainly — "No blocking issues found" is a
             complete, valid review. Do not invent findings to appear thorough.
           - Write the review in the same language as the PR description and commit history (e.g.
@@ -599,13 +530,14 @@ jobs:
           REVIEW_OUTCOME: ${{ steps.gemini-review.outcome }}
           SERVER_URL: ${{ github.server_url }}
           REPOSITORY: ${{ github.repository }}
-          DIFF_READY: ${{ steps.pr-details.outputs.diff_ready }}
+          DIFF_READY: ${{ steps.prepare-diff.outputs.diff-ready }}
           DIFF_TRUNCATED: ${{ steps.gemini-review.outputs.diff_truncated }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
-          ATTEMPT_HEAD: ${{ steps.pr-details.outputs.attempt_head }}
-          FULL_DIFF_SHA256: ${{ steps.pr-details.outputs.full_diff_sha256 }}
-          DIFF_MODE: ${{ steps.pr-details.outputs.diff_mode }}
+          ATTEMPT_HEAD: ${{ steps.prepare-diff.outputs.head-sha }}
+          FULL_DIFF_SHA256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
+          DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode }}
+          UNCHANGED_SINCE_PREVIOUS: ${{ steps.prepare-diff.outputs.unchanged-since-previous }}
         with:
           github-token: ${{ steps.auth.outputs.token }}
           script: |
@@ -632,6 +564,7 @@ jobs:
             const attemptHead = process.env.ATTEMPT_HEAD || '';
             const fullDiffSha256 = process.env.FULL_DIFF_SHA256 || '';
             const diffMode = process.env.DIFF_MODE || (diffReady ? 'full' : 'unavailable');
+            const unchangedSincePrevious = process.env.UNCHANGED_SINCE_PREVIOUS === 'true';
 
             const maxLen = 60000;
             const trim = (s) => {
@@ -650,7 +583,7 @@ jobs:
             // turn an infrastructure-only response into a successful checkpoint.
             const infraLine = /^(REPO: \S+$|PR NUMBER: [0-9]+$|Reviewer: Gemini Auto \(Diff Focus\)$|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Reviewed: [0-9a-f]{40}$|- Last attempt: |<!-- automation:[A-Za-z0-9_-]+|<!-- automation-state:|## 🔎 Gemini Code Review$|\*Reviewed by Gemini\*$)/;
             review = review.split('\n').filter((line) => !infraLine.test(line)).join('\n').trim();
-            const failed = !ok || !diffReady || diffTruncated || !review;
+            const modelFailed = !ok || !diffReady || diffTruncated || !review;
 
             const { owner, repo } = context.repo;
             const comments = await github.paginate(github.rest.issues.listComments, {
@@ -672,7 +605,7 @@ jobs:
               && (state.attempt_status === 'success'
                 ? state.successful_head === state.attempt_head && state.successful_head !== null
                   && sha1(state.successful_head) && sha256(state.full_diff_sha256)
-                  && ['full', 'delta'].includes(state.diff_mode)
+                  && ['full', 'delta', 'unchanged'].includes(state.diff_mode)
                 : state.attempt_status === 'failure' && (state.successful_head === null
                 ? state.full_diff_sha256 === null
                 : sha1(state.successful_head) && sha256(state.full_diff_sha256)))
@@ -720,14 +653,23 @@ jobs:
               return;
             }
 
-            const reviewedInputIsValid = ['full', 'delta'].includes(diffMode) && sha256(fullDiffSha256);
-            const checkpointFailed = failed || !reviewedInputIsValid;
-            const stateDiffMode = ['full', 'delta', 'unchanged', 'unavailable'].includes(diffMode)
-              ? diffMode
-              : 'unavailable';
             const preservedProse = existing
               ? (existing.comment.body || '').split('\n').filter((line) => !infraLine.test(line)).join('\n').trim()
               : '';
+            const reviewedInputIsValid = ['full', 'delta'].includes(diffMode) && sha256(fullDiffSha256);
+            const unchangedInputIsValid = diffReady
+              && diffMode === 'unchanged'
+              && unchangedSincePrevious
+              && sha256(fullDiffSha256)
+              && existing
+              && sha1(existing.state.successful_head)
+              && sha256(existing.state.full_diff_sha256)
+              && existing.state.full_diff_sha256 === fullDiffSha256
+              && preservedProse.length > 0;
+            const checkpointFailed = !((!modelFailed && reviewedInputIsValid) || unchangedInputIsValid);
+            const stateDiffMode = ['full', 'delta', 'unchanged', 'unavailable'].includes(diffMode)
+              ? diffMode
+              : 'unavailable';
             const preserveSuccess = checkpointFailed && existing && sha1(existing.state.successful_head) && preservedProse;
             const successfulHead = checkpointFailed
               ? (preserveSuccess ? existing.state.successful_head : null)
@@ -756,7 +698,7 @@ jobs:
               ? `\n\n${trim(preservedProse)}`
               : checkpointFailed
                 ? `\n\n### Error\n\nGemini review did not produce a valid covered review. (See run logs: ${runUrl})`
-                : `\n\n${trim(review)}`;
+                : `\n\n${trim(unchangedInputIsValid ? preservedProse : review)}`;
             const body = `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n\n${meta}${content}`;
             const target = existing?.comment || legacyTarget;
 
