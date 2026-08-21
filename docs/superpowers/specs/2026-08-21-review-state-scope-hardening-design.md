@@ -49,7 +49,9 @@ The final audit tightened four boundaries and supersedes conflicting details lat
    records use both old and current paths, and every query disables replace objects, external
    diff/text conversion, and submodule-ignore configuration. The hunk query also disables color and
    inter-hunk merging. A strict old/new-counter parser accepts only actual `+` body records—not a
-   header span, context, deletion, or no-newline control—and rejects malformed/truncated patches.
+   header span, context, deletion, or no-newline control. It rejects empty or overlapping hunks and
+   malformed/truncated hunk bodies, counters, coordinates, or controls; a side marked as EOF cannot
+   be reopened by a later hunk.
    Exact decoded comparison and literal Git argv preserve newlines, backticks, colons, Unicode, and
    leading dashes without normalization.
 5. Before any cleanup or GitHub comment/Check mutation, canonicalization computes the complete
@@ -318,8 +320,9 @@ recorded merge-base/head graph, including both endpoints for a rename/copy, then
 consumed by an actual `+` record in that record's added-side hunk. Both queries disable replace
 objects, external diff/text conversion, and submodule-ignore configuration; the hunk query also
 forces no color and zero inter-hunk context. Header spans, context, deletions, no-newline controls,
-and count-incomplete patches cannot satisfy an anchor. Claude and Gemini remain bounded by their
-prepared diff input and receive the same semantic instruction.
+empty or overlapping hunks, count-incomplete hunk bodies, premature controls, and later hunks after
+a side's EOF control cannot satisfy an anchor. Claude and Gemini remain bounded by their prepared
+diff input and receive the same semantic instruction.
 
 ## 10. Failure Behavior
 

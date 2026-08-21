@@ -5546,6 +5546,52 @@ def _run_opencode_added_range_parser(patch: str):
             "+after three\n\\ No newline at end of file\n",
             [[1, 1], [3, 3]],
         ),
+        ("@@ -0,0 +1 @@\n+added\n", [[1, 1]]),
+        ("@@ -1 +0,0 @@\n-deleted\n", []),
+        (
+            "@@ -1,0 +2 @@\n+inserted\n"
+            "@@ -3 +4 @@\n-before\n+after\n",
+            [[2, 2], [4, 4]],
+        ),
+        (
+            "@@ -1 +1 @@\n-before\n+after\n"
+            "@@ -2 +2 @@\n-before two\n+after two\n",
+            [[1, 2]],
+        ),
+        (
+            "@@ -1 +0,0 @@\n-old eof\n\\ No newline at end of file\n",
+            [],
+        ),
+        (
+            "@@ -0,0 +1 @@\n+new eof\n\\ No newline at end of file\n",
+            [[1, 1]],
+        ),
+        (
+            "@@ -1 +1 @@\n context eof\n\\ No newline at end of file\n",
+            [],
+        ),
+        ("similarity index 100%\nrename from old\nrename to new\n", []),
+    ),
+    ids=(
+        "actual-plus-lines",
+        "zero-count-insertion",
+        "zero-count-deletion",
+        "valid-multi-hunk-gap",
+        "valid-adjacent-non-overlap",
+        "valid-old-no-newline-control",
+        "valid-new-no-newline-control",
+        "valid-context-no-newline-control",
+        "metadata-only",
+    ),
+)
+def test_opencode_added_range_parser_accepts_valid_patch_grammar(patch, expected):
+    assert _run_opencode_added_range_parser(patch) == expected
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("patch", "expected"),
+    (
         ("@@ -1 +1 @@\n-before\n", None),
         ("@@ -1 +1 @@\n-before\n+after\n unexpected\n", None),
         (
@@ -5554,18 +5600,221 @@ def _run_opencode_added_range_parser(patch: str):
             None,
         ),
         ("@@ -1 +1 @@\n-before\n+after", None),
-        ("similarity index 100%\nrename from old\nrename to new\n", []),
+        ("\\ No newline at end of file\n", None),
+        (
+            "\\ No newline at end of file\n"
+            "@@ -0,0 +1 @@\n+after marker\n",
+            None,
+        ),
+        (
+            "@@ -0,0 +1 @@\n"
+            "\\ No newline at end of file\n+after marker\n",
+            None,
+        ),
+        (
+            "@@ -0,0 +1,2 @@\n+first\n"
+            "\\ No newline at end of file\n+second\n",
+            None,
+        ),
+        (
+            "@@ -1,2 +0,0 @@\n-first\n"
+            "\\ No newline at end of file\n-second\n",
+            None,
+        ),
+        (
+            "@@ -1,2 +1,2 @@\n first\n"
+            "\\ No newline at end of file\n second\n",
+            None,
+        ),
+        ("@@ -0 +1 @@\n-old\n+new\n", None),
+        ("@@ -1 +0 @@\n-old\n+new\n", None),
+        ("@@ -9007199254740991 +1 @@\n-old\n+new\n", None),
+        ("@@ -1 +9007199254740991 @@\n-old\n+new\n", None),
+        ("@@ -0,0 +0,0 @@\n", None),
+        (
+            "@@ -1 +1 @@\n-old eof\n\\ No newline at end of file\n+new one\n"
+            "@@ -3 +3 @@\n-old later\n+new later\n",
+            None,
+        ),
+        (
+            "@@ -1 +1 @@\n-old eof\n\\ No newline at end of file\n+new one\n"
+            "@@ -3,0 +3 @@\n+later insertion\n",
+            None,
+        ),
+        (
+            "@@ -1 +1 @@\n-old one\n+new eof\n\\ No newline at end of file\n"
+            "@@ -3 +3 @@\n-old later\n+new later\n",
+            None,
+        ),
+        (
+            "@@ -1 +1 @@\n-old one\n+new eof\n\\ No newline at end of file\n"
+            "@@ -3 +3,0 @@\n-old later\n",
+            None,
+        ),
+        (
+            "@@ -1 +1 @@\n context eof\n\\ No newline at end of file\n"
+            "@@ -3 +3 @@\n-old later\n+new later\n",
+            None,
+        ),
+        (
+            "@@ -1 +1 @@\n-before\n+after\n"
+            "@@ -1 +1 @@\n-before duplicate\n+after duplicate\n",
+            None,
+        ),
+        (
+            "@@ -1,2 +1 @@\n-old one\n-old two\n+new one\n"
+            "@@ -2 +3 @@\n-old overlap\n+new three\n",
+            None,
+        ),
+        (
+            "@@ -1 +1,2 @@\n-old one\n+new one\n+new two\n"
+            "@@ -3 +2 @@\n-old three\n+new overlap\n",
+            None,
+        ),
+        (
+            "@@ -5,0 +6 @@\n+new six\n"
+            "@@ -3,0 +8 @@\n+new eight\n",
+            None,
+        ),
+        (
+            "@@ -5 +5,0 @@\n-old five\n"
+            "@@ -7 +3,0 @@\n-old seven\n",
+            None,
+        ),
+        (
+            "@@ -1,0 +2 @@\n+new two\n"
+            "@@ -1,0 +4 @@\n+new four\n",
+            None,
+        ),
+        (
+            "@@ -1 +0,0 @@\n-old one\n"
+            "@@ -3 +0,0 @@\n-old three\n",
+            None,
+        ),
     ),
     ids=(
-        "actual-plus-lines",
         "truncated-count",
         "extra-body",
         "duplicate-no-newline-control",
         "missing-terminal-newline",
-        "metadata-only",
+        "no-newline-control-outside-hunk",
+        "no-newline-control-before-first-hunk",
+        "no-newline-control-after-header",
+        "premature-new-side-no-newline-control",
+        "premature-old-side-no-newline-control",
+        "premature-context-no-newline-control",
+        "positive-old-count-at-zero",
+        "positive-new-count-at-zero",
+        "unsafe-old-exclusive-end",
+        "unsafe-new-exclusive-end",
+        "empty-zero-count-hunk",
+        "old-eof-marker-before-later-consuming-hunk",
+        "old-eof-marker-before-later-zero-count-hunk",
+        "new-eof-marker-before-later-consuming-hunk",
+        "new-eof-marker-before-later-zero-count-hunk",
+        "context-eof-marker-before-later-hunk",
+        "duplicate-hunk-coordinates",
+        "overlapping-old-hunk-coordinates",
+        "overlapping-new-hunk-coordinates",
+        "descending-old-hunk-coordinates",
+        "descending-new-hunk-coordinates",
+        "duplicate-zero-count-old-coordinate",
+        "duplicate-zero-count-new-coordinate",
     ),
 )
-def test_opencode_added_range_parser_fails_closed(patch, expected):
+def test_opencode_added_range_parser_rejects_invalid_patch_grammar(patch, expected):
+    assert _run_opencode_added_range_parser(patch) == expected
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("old_content", "new_content", "expected"),
+    (
+        ("two\nthree\n", "one\ntwo\nthree\n", [[1, 1]]),
+        ("one\nthree\n", "one\ntwo\nthree\n", [[2, 2]]),
+        ("one\ntwo\n", "one\ntwo\nthree\n", [[3, 3]]),
+        ("one\ntwo\nthree\n", "two\nthree\n", []),
+        ("one\ntwo\nthree\n", "one\nthree\n", []),
+        ("one\ntwo\nthree\n", "one\ntwo\n", []),
+        ("one\ntwo\n", "ONE\ntwo\n", [[1, 1]]),
+        ("one\ntwo\nthree\n", "one\nTWO\nthree\n", [[2, 2]]),
+        ("one\ntwo\nthree\n", "one\ntwo\nTHREE\n", [[3, 3]]),
+        (
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n",
+            "1\nTWO\n3\n4\n5\n6\n7\nEIGHT\n9\n",
+            [[2, 2], [8, 8]],
+        ),
+        (
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+            "1\nA\n2\n3\n4\n5\n6\n7\n8\nB\n9\n10\n",
+            [[2, 2], [10, 10]],
+        ),
+        (
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+            "1\n3\n4\n5\n6\n7\n8\n10\n",
+            [],
+        ),
+        ("old eof", "new eof\n", [[1, 1]]),
+        ("old eof\n", "new eof", [[1, 1]]),
+        ("old eof", "new eof", [[1, 1]]),
+        ("", "one\n", [[1, 1]]),
+        ("one\n", "", []),
+    ),
+    ids=(
+        "insert-start",
+        "insert-middle",
+        "insert-eof",
+        "delete-start",
+        "delete-middle",
+        "delete-eof",
+        "replace-start",
+        "replace-middle",
+        "replace-eof",
+        "scattered-replacements",
+        "scattered-insertions",
+        "scattered-deletions",
+        "old-no-newline",
+        "new-no-newline",
+        "old-and-new-no-newline",
+        "empty-to-nonempty",
+        "nonempty-to-empty",
+    ),
+)
+def test_opencode_added_range_parser_accepts_real_git_corpus(
+    tmp_path, old_content, new_content, expected
+):
+    repo = tmp_path / "repo"
+    _init_anchor_repo(repo)
+    target = repo / "corpus.txt"
+    target.write_text(old_content, encoding="utf-8")
+    base = _commit_anchor_repo(repo, "base")
+    target.write_text(new_content, encoding="utf-8")
+    head = _commit_anchor_repo(repo, "head")
+    patch = subprocess.run(
+        [
+            "/usr/bin/git",
+            "--no-replace-objects",
+            "--literal-pathspecs",
+            "-c",
+            "diff.external=",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--find-renames=50%",
+            "--ignore-submodules=none",
+            "--inter-hunk-context=0",
+            "--no-color",
+            "-U0",
+            f"{base}..{head}",
+            "--",
+            "corpus.txt",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
     assert _run_opencode_added_range_parser(patch) == expected
 
 

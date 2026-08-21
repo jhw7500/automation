@@ -2130,6 +2130,47 @@ def _verify_commit_content(
                 "return null;"
             )
             == 2
+            and "if (!inHunk || lastBodyPrefix === null" in canonical_script
+            and "(lastBodyPrefix === '+' && newRemaining !== 0)"
+            in canonical_script
+            and "(lastBodyPrefix === '-' && oldRemaining !== 0)"
+            in canonical_script
+            and (
+                "lastBodyPrefix === ' '\n            "
+                "&& (oldRemaining !== 0 || newRemaining !== 0)"
+            )
+            in canonical_script
+            and "const oldEnd = oldStart + oldCount;" in canonical_script
+            and "const newEnd = newStart + newCount;" in canonical_script
+            and (
+                "[oldStart, oldCount, newStart, newCount, oldEnd, newEnd]\n"
+                "          .every(Number.isSafeInteger)"
+            )
+            in canonical_script
+            and (
+                "previousOldEnd !== null && (oldStart < previousOldEnd\n"
+                "            || newStart < previousNewEnd || "
+                "oldStart === previousOldStart\n"
+                "            || newStart === previousNewStart)"
+            )
+            in canonical_script
+            and "(oldCount === 0 && newCount === 0)" in canonical_script
+            and "let oldEofMarked = false;" in canonical_script
+            and "let newEofMarked = false;" in canonical_script
+            and (
+                "if (inHunk && (oldEofMarked || newEofMarked)) return null;"
+            )
+            in canonical_script
+            and (
+                "if (lastBodyPrefix === '+' || lastBodyPrefix === ' ') "
+                "newEofMarked = true;"
+            )
+            in canonical_script
+            and (
+                "if (lastBodyPrefix === '-' || lastBodyPrefix === ' ') "
+                "oldEofMarked = true;"
+            )
+            in canonical_script
             and "const ranges = parseAddedRanges(result.stdout);" in canonical_script
             and "const start = Number(match[1]);" not in canonical_script
         )

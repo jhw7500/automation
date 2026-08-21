@@ -44,8 +44,10 @@ This amendment supersedes any conflicting implementation detail in the task tran
   `--ignore-submodules=none`; the hunk query additionally forces zero inter-hunk context and no
   color. Canonicalization validates old/new counters through each complete unified hunk and records
   only actual `+` lines, never the hunk header's full span, context, deletion, or no-newline control
-  records. A pure rename therefore contributes no reportable added line, and malformed/truncated
-  patch output fails closed.
+  records. Successive coordinates must be monotonic and non-overlapping, empty hunks are invalid,
+  and a no-newline control must immediately follow the final body record for its marked side; no
+  later hunk may reopen that EOF-marked side. A pure rename therefore contributes no reportable
+  added line, while malformed/truncated hunk bodies, counters, coordinates, or controls fail closed.
 - The complete canonical state and worst-case fully wrapped 65,536-byte body are computed and
   checked before any cleanup or GitHub comment/Check mutation. An oversize prior body leaves even
   hostile marker comments untouched and fails closed.

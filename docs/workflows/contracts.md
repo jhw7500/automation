@@ -226,7 +226,11 @@ and non-positive or unsafe line integers fail closed. The parser then:
    `--ignore-submodules=none`. It also forces `--inter-hunk-context=0` and `--no-color`, then
    validates every hunk's old/new counters through the complete patch body and accepts only line
    numbers consumed by actual `+` records. Context, deletions, and the no-newline control record
-   never become anchors; malformed, truncated, or count-mismatched output fails closed.
+   never become anchors. Hunk coordinates must advance without overlap on both sides, and an empty
+   old/new hunk is invalid. A no-newline control must immediately follow a body record that exhausts
+   its relevant side; once that side is EOF-marked, a later hunk cannot reopen it. Malformed or
+   truncated hunk bodies, counters, coordinates, and controls fail closed; diff prelude metadata is
+   not treated as hunk-body evidence.
 
 Rename preparation consequently transports both old and current identities, but a reportable
 anchor names a changed added-side line in the current filename. A pure 100% rename has no such

@@ -1575,7 +1575,13 @@ jobs:
                 let newLine = 0;
                 let oldRemaining = 0;
                 let newRemaining = 0;
-                let canHaveNoNewlineMarker = false;
+                let previousOldStart = null;
+                let previousNewStart = null;
+                let previousOldEnd = null;
+                let previousNewEnd = null;
+                let lastBodyPrefix = null;
+                let oldEofMarked = false;
+                let newEofMarked = false;
                 const addLine = (line) => {
                   const previous = ranges.at(-1);
                   if (previous && previous[1] + 1 === line) previous[1] = line;
@@ -1584,32 +1590,47 @@ jobs:
                 for (const line of lines) {
                   if (line.startsWith('@@')) {
                     if (inHunk && (oldRemaining !== 0 || newRemaining !== 0)) return null;
+                    if (inHunk && (oldEofMarked || newEofMarked)) return null;
                     const match = line.match(/^@@ -([0-9]+)(?:,([0-9]+))? \+([0-9]+)(?:,([0-9]+))? @@(?: .*)?$/);
                     if (!match) return null;
                     const oldStart = Number(match[1]);
                     const oldCount = match[2] === undefined ? 1 : Number(match[2]);
                     const newStart = Number(match[3]);
                     const newCount = match[4] === undefined ? 1 : Number(match[4]);
-                    if (![oldStart, oldCount, newStart, newCount].every(Number.isSafeInteger)
+                    const oldEnd = oldStart + oldCount;
+                    const newEnd = newStart + newCount;
+                    if (![oldStart, oldCount, newStart, newCount, oldEnd, newEnd]
+                      .every(Number.isSafeInteger)
                       || (oldCount > 0 && oldStart < 1) || (newCount > 0 && newStart < 1)
-                      || !Number.isSafeInteger(oldStart + Math.max(0, oldCount - 1))
-                      || !Number.isSafeInteger(newStart + Math.max(0, newCount - 1))) return null;
+                      || (oldCount === 0 && newCount === 0)
+                      || (previousOldEnd !== null && (oldStart < previousOldEnd
+                        || newStart < previousNewEnd || oldStart === previousOldStart
+                        || newStart === previousNewStart))) return null;
                     inHunk = true;
                     oldLine = oldStart;
                     newLine = newStart;
                     oldRemaining = oldCount;
                     newRemaining = newCount;
-                    canHaveNoNewlineMarker = false;
+                    previousOldStart = oldStart;
+                    previousNewStart = newStart;
+                    previousOldEnd = oldEnd;
+                    previousNewEnd = newEnd;
+                    lastBodyPrefix = null;
+                    continue;
+                  }
+                  if (line === '\\ No newline at end of file') {
+                    if (!inHunk || lastBodyPrefix === null
+                      || (lastBodyPrefix === '+' && newRemaining !== 0)
+                      || (lastBodyPrefix === '-' && oldRemaining !== 0)
+                      || (lastBodyPrefix === ' '
+                        && (oldRemaining !== 0 || newRemaining !== 0))) return null;
+                    if (lastBodyPrefix === '+' || lastBodyPrefix === ' ') newEofMarked = true;
+                    if (lastBodyPrefix === '-' || lastBodyPrefix === ' ') oldEofMarked = true;
+                    lastBodyPrefix = null;
                     continue;
                   }
                   if (!inHunk) continue;
-                  if (line === '\\ No newline at end of file') {
-                    if (!canHaveNoNewlineMarker) return null;
-                    canHaveNoNewlineMarker = false;
-                    continue;
-                  }
                   if (oldRemaining === 0 && newRemaining === 0) return null;
-                  canHaveNoNewlineMarker = true;
                   if (line.startsWith(' ')) {
                     if (oldRemaining < 1 || newRemaining < 1) return null;
                     oldLine += 1;
@@ -1628,6 +1649,7 @@ jobs:
                   } else {
                     return null;
                   }
+                  lastBodyPrefix = line[0];
                   if (!Number.isSafeInteger(oldLine) || !Number.isSafeInteger(newLine)) return null;
                 }
                 if (inHunk && (oldRemaining !== 0 || newRemaining !== 0)) return null;
