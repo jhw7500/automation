@@ -2084,6 +2084,53 @@ def _verify_commit_content(
         canonical_script = canonical_step.get("with", {}).get("script", "")
         prepare_script = prepare_collect.get("run", "")
         model_validation = model_validate.get("run", "")
+        anchor_range = (
+            "`${manifest.merge_base_sha}..${manifest.head_sha}`, '--', "
+            "...pathspecs,"
+        )
+        canonical_anchor_contract = (
+            "const parseNameStatus = (bytes) => {" in canonical_script
+            and "new TextDecoder('utf-8', { fatal: true })" in canonical_script
+            and "bytes.at(-1) !== 0" in canonical_script
+            and "? [file.previous_filename, file.filename] : [file.filename]"
+            in canonical_script
+            and canonical_script.count(
+                "'--no-replace-objects', '--literal-pathspecs', '-c', "
+                "'diff.external=',"
+            )
+            == 2
+            and (
+                "'diff', '--no-ext-diff', '--no-textconv', '--name-status', "
+                "'-z',\n      '--find-renames=50%', "
+                "'--ignore-submodules=none',"
+            )
+            in canonical_script
+            and (
+                "'diff', '--no-ext-diff', '--no-textconv', "
+                "'--find-renames=50%',\n      "
+                "'--ignore-submodules=none', '-U0',"
+            )
+            in canonical_script
+            and canonical_script.count(anchor_range) == 2
+            and "records.length !== 1 || records[0].status !== file.status"
+            in canonical_script
+            and "records[0].filename !== file.filename" in canonical_script
+            and (
+                "(records[0].previous_filename || null) !== "
+                "(file.previous_filename || null)"
+            )
+            in canonical_script
+        )
+        body_limit_gate = canonical_script.find(
+            "if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') "
+            "> 65536)"
+        )
+        repair_call = canonical_script.find("if (!(await repairComments())) return;")
+        canonical_pre_mutation_size_contract = (
+            body_limit_gate >= 0
+            and repair_call > body_limit_gate
+            and canonical_script.count("if (!(await repairComments())) return;") == 1
+        )
         artifact_contract = (
             prepare.get("permissions") == expected_prepare
             and canonical.get("permissions") == expected_canonical
@@ -2115,7 +2162,9 @@ def _verify_commit_content(
             and "entries.length !== 1 || entries[0].name !== 'review.md'" in canonical_script
             and "candidateStat.size > 60000" in canonical_script
             and "Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536" in canonical_script
-            and "JSON.stringify(anchor) !== match[1]" in canonical_script
+            and "match[1] !== JSON.stringify({ path: anchor.path, line: anchor.line })" in canonical_script
+            and canonical_anchor_contract
+            and canonical_pre_mutation_size_contract
             and "github.rest.checks.create" in canonical_script
             and "github.rest.checks.update" in canonical_script
             and "github.rest.actions.listWorkflowRunsForRepo" in canonical_script

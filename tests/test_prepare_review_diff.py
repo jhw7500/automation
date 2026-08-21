@@ -381,6 +381,56 @@ def test_unavailable_local_head_object_removes_stale_outputs(
     assert all(not output.exists() for output in (full, delta, manifest))
 
 
+def test_missing_head_is_fetched_by_exact_literal_sha_from_origin(
+    gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    """A commit advertised only by origin must remain available through literal-SHA fetch."""
+    source = tmp_path / "source"
+    source.mkdir()
+    git(source, "init", "-b", "main")
+    git(source, "config", "user.name", "Test User")
+    git(source, "config", "user.email", "test@example.invalid")
+    (source / "base.txt").write_text("base\n", encoding="utf-8")
+    base = commit(source, "base")
+
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    git(origin, "init", "--bare")
+    git(source, "remote", "add", "origin", str(origin))
+    git(source, "push", "-u", "origin", "main")
+    git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+
+    consumer = tmp_path / "consumer"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(consumer)],
+        check=True,
+        capture_output=True,
+    )
+    (source / "fetched-only.txt").write_text("literal SHA fetch\n", encoding="utf-8")
+    head = commit(source, "remote head")
+    git(source, "push", "origin", "main")
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{head}^{{commit}}"],
+        cwd=consumer,
+        capture_output=True,
+    ).returncode != 0
+
+    configure_gh(gh_fixture, base=base, head=head)
+    git_log = install_git_log_shim(gh_fixture, tmp_path)
+    full, delta, manifest = outputs(tmp_path)
+
+    result = run_prepare(consumer, gh_fixture, *prepare_args(full, delta, manifest))
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["diff_ready"] is True
+    assert "literal SHA fetch" in full.read_text(encoding="utf-8")
+    calls = [
+        json.loads(line)
+        for line in git_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert ["--no-replace-objects", "fetch", "--no-tags", "origin", head] in calls
+
+
 @pytest.mark.parametrize("changed", ["head", "base"])
 def test_changed_metadata_snapshot_fails_closed(
     history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path, changed: str

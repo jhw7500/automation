@@ -37,7 +37,14 @@ This amendment supersedes any conflicting implementation detail in the task tran
 - OpenCode anchors use the exact canonical one-line JSON form
   `- Changed anchor: {"path":"path/to/file","line":1}`. Strict canonical serialization, exact
   keys/types, manifest identity, and literal Git argv make all UTF-8 paths reversible while
-  duplicate keys and malformed/noncanonical encodings fail closed.
+  duplicate keys, reversed key order, and malformed/noncanonical encodings fail closed. The clean
+  canonicalizer re-derives one exact NUL-delimited name-status record and its added hunks from the
+  same immutable merge-base/head graph. Rename/copy checks use both old and current paths, and both
+  queries force no replace objects, external diff/text conversion, 50% rename detection, and
+  `--ignore-submodules=none`; a pure rename therefore contributes no reportable added line.
+- The complete canonical state and worst-case fully wrapped 65,536-byte body are computed and
+  checked before any cleanup or GitHub comment/Check mutation. An oversize prior body leaves even
+  hostile marker comments untouched and fails closed.
 
 The remaining checkbox steps document the original execution sequence. Where their Pulls Files,
 numbered-diff, model-comment, or `path:line` instructions conflict with this amendment, they are

@@ -44,8 +44,14 @@ The final audit tightened four boundaries and supersedes conflicting details lat
    heading cannot appear as a new finding.
 4. An OpenCode changed anchor is one exact canonical JSON line containing only a non-empty UTF-8
    `path` and positive safe-integer `line`. Canonical serialization rejects duplicate keys and
-   ambiguous encodings; exact decoded manifest comparison and literal Git argv preserve newlines,
-   backticks, colons, Unicode, and leading dashes without normalization.
+   ambiguous encodings, including reversed key order. The canonicalizer re-derives one exact
+   NUL-delimited status/path record and its added hunks from the same immutable graph; rename/copy
+   records use both old and current paths, and every query disables replace objects, external
+   diff/text conversion, and submodule-ignore configuration. Exact decoded comparison and literal
+   Git argv preserve newlines, backticks, colons, Unicode, and leading dashes without normalization.
+5. Before any cleanup or GitHub comment/Check mutation, canonicalization computes the complete
+   output state and worst-case fully wrapped body and enforces the 65,536-byte limit. Oversize input
+   fails without modifying even untrusted marker comments.
 
 Any later reference to REST file selection, numbered-diff fallback, model-authored comments as
 candidate transport, or final-colon `path:line` parsing is historical and non-normative.
@@ -278,7 +284,8 @@ full review rather than claiming no change.
   separately uploaded untrusted artifact.
 - Admit only a strict UTF-8, 1..60,000-byte `review.md` from the exact artifact
   ID/digest/run/name and exact one-regular-file inventory. Only the clean privileged canonicalizer
-  may publish it, and only after a 65,536-byte final-body preflight.
+  may publish it. It computes the complete state and worst-case fully wrapped body before any
+  cleanup or comment/Check mutation, then enforces the 65,536-byte preflight.
 - Previous context is drawn only from that canonical envelope; arbitrary marker-containing
   comments are ignored.
 - Carryover blocks bind exact headings one-to-one to unique authenticated prior active findings;
@@ -303,8 +310,11 @@ finding section that lacks the exact
 `- Changed anchor: {"path":"path/to/file","line":1}` form. Canonical JSON serialization and exact
 keys/types reject duplicate or ambiguous encodings while reversibly representing every UTF-8 path.
 The decoded path is matched exactly against the scope manifest and passed as one literal Git argv
-element; the line must belong to an added-side hunk from the recorded merge-base and head. Claude
-and Gemini remain bounded by their prepared diff input and receive the same semantic instruction.
+element. The canonicalizer first requires one exact NUL-delimited status/path record from the same
+recorded merge-base/head graph, including both endpoints for a rename/copy, then accepts only a line
+in that record's added-side hunk. Both queries disable replace objects, external diff/text
+conversion, and submodule-ignore configuration. Claude and Gemini remain bounded by their prepared
+diff input and receive the same semantic instruction.
 
 ## 10. Failure Behavior
 

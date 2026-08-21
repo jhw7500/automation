@@ -714,8 +714,48 @@ def test_current_release_commit_only_uses_authenticated_objects(
         ),
         (
             ".github/workflows/opencode-auto-review.yml",
-            "JSON.stringify(anchor) !== match[1]",
+            "match[1] !== JSON.stringify({ path: anchor.path, line: anchor.line })",
             "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "? [file.previous_filename, file.filename] : [file.filename]",
+            "? [file.filename] : [file.filename]",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'diff', '--no-ext-diff', '--no-textconv', '--name-status', '-z',\n"
+            "                  '--find-renames=50%', '--ignore-submodules=none',",
+            "'diff', '--no-ext-diff', '--no-textconv', '--name-status', '-z',\n"
+            "                  '--find-renames=50%',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'diff', '--no-ext-diff', '--no-textconv', '--find-renames=50%',\n"
+            "                  '--ignore-submodules=none', '-U0',",
+            "'diff', '--no-ext-diff', '--find-renames=50%',\n"
+            "                  '--ignore-submodules=none', '-U0',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "`${manifest.merge_base_sha}..${manifest.head_sha}`, '--', ...pathspecs,",
+            "`${manifest.merge_base_sha}..${attemptHead}`, '--', ...pathspecs,",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "records.length !== 1 || records[0].status !== file.status",
+            "records.length < 1 || records[0].status !== file.status",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "            if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536) {\n"
+            "              throw new Error('canonical OpenCode comment exceeds 65,536-byte publication limit');\n"
+            "            }\n"
+            "            if (!(await repairComments())) return;",
+            "            if (!(await repairComments())) return;\n"
+            "            if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536) {\n"
+            "              throw new Error('canonical OpenCode comment exceeds 65,536-byte publication limit');\n"
+            "            }",
         ),
         (
             ".github/workflows/opencode-auto-review.yml",
@@ -755,6 +795,12 @@ def test_current_release_commit_only_uses_authenticated_objects(
         "prepared-attempt-binding",
         "bounded-marker-cleanup",
         "canonical-json-anchor",
+        "canonical-rename-endpoints",
+        "canonical-name-status-flags",
+        "canonical-hunk-flags",
+        "canonical-same-graph-range",
+        "canonical-exact-scope-record",
+        "canonical-size-before-repair",
         "unbounded-candidate-cleanup",
         "baseline-caller-ceiling",
         "self-caller-ceiling",

@@ -106,8 +106,8 @@ OpenCode callers accept only same-repository pull request content and fail close
 fork/external heads. Their caller ceiling is exactly `actions: read`, `checks: write`,
 `contents: read`, `pull-requests: write`, and `issues: write`; they force the job-scoped
 GitHub token and do not grant OIDC. The reusable workflow narrows each job below that ceiling:
-the prepare job has read-only API access, the model job has only the comment-write authority
-required by the pinned CLI, and only the clean canonicalizer can write the durable Check receipt.
+the prepare job has read-only API access, the model job has empty permissions and produces only an
+untrusted artifact, and only the clean canonicalizer can write a comment or durable Check receipt.
 Central workflows own the pinned OpenCode CLI archive and action versions; consumers do not add
 an installer.
 
@@ -217,14 +217,21 @@ and non-positive or unsafe line integers fail closed. The parser then:
 1. verifies the sealed full diff and manifest hashes and their repository, PR, merge-base, and head
    identity;
 2. matches the anchor against the current `filename` in the manifest (not
-   `previous_filename`) and rejects removed files; and
-3. derives zero-context `merge-base..head` hunks for that literal path with `/usr/bin/git` in a
-   closed provider-free environment, accepting only added-side line ranges.
+   `previous_filename`) and rejects removed files;
+3. re-derives exactly one NUL-delimited local name-status record from the manifest's immutable
+   `merge-base..head` graph, using both old and current literal path arguments for rename/copy
+   records, and requires its status and path identities to equal the sealed record; and
+4. derives zero-context hunks for that same record and graph with `/usr/bin/git`,
+   `--no-replace-objects`, `--no-ext-diff`, `--no-textconv`, `--find-renames=50%`, and
+   `--ignore-submodules=none`, accepting only added-side line ranges.
 
 Rename preparation consequently transports both old and current identities, but a reportable
-anchor names a changed added-side line in the current filename. The workflow machine-checks anchor
-form and changed-line membership; the causal explanation for supporting unchanged evidence remains
-a semantic review requirement.
+anchor names a changed added-side line in the current filename. A pure 100% rename has no such
+line, while a renamed file with a real addition can cite that addition. The explicit submodule
+override keeps a changed gitlink reportable even when tracked or local configuration says to ignore
+submodules. Exact-record matching prevents another path's hunk from satisfying the anchor. The
+workflow machine-checks anchor form and changed-line membership; the causal explanation for
+supporting unchanged evidence remains a semantic review requirement.
 
 ## Canonical automated-review state (v2)
 
@@ -290,8 +297,10 @@ reported and REST digest, repository/run identity, exact run-scoped name, one-fi
 regular-file/no-symlink type, 1..60,000-byte size, and strict UTF-8 decoding before parsing it.
 It separately re-downloads the sealed handoff, checks out the sealed PR head, and uses
 `/usr/bin/git` with a closed provider-free environment for changed-anchor validation. Before any
-comment mutation it also constructs the final canonical body and requires at most 65,536 UTF-8
-bytes, matching the repository's GitHub comment-publication contract.
+comment or Check mutation it computes the complete canonical state and worst-case fully wrapped
+body, then requires at most 65,536 UTF-8 bytes. Oversize failure therefore performs no cleanup,
+comment creation/update/deletion, or Check creation, matching the repository's GitHub
+comment-publication contract.
 
 The canonicalizer treats every model-window marker-bearing new or changed comment as untrusted
 cleanup material; none can supply the model result. It restores the newest previously attested

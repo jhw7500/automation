@@ -4144,19 +4144,60 @@ def _run_opencode_canonicalize(
         subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
         subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workdir, check=True)
         subprocess.run(["git", "config", "user.name", "Test"], cwd=workdir, check=True)
+        hunk = re.search(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", git_diff, re.MULTILINE)
+        added_start = int(hunk.group(1)) if hunk else None
+        added_count = int(hunk.group(2) or "1") if hunk else 0
+        stable_line_count = max((added_start or 1) + added_count + 10, 20)
+        stable_lines = [f"stable line {number}\n" for number in range(1, stable_line_count + 1)]
+
+        def write_worktree_file(relative: str, lines: list[str]) -> None:
+            target = workdir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("".join(lines), encoding="utf-8")
+
+        for record in scope_document.get("files", []):
+            status = record.get("status")
+            filename = record.get("filename")
+            if not isinstance(filename, str) or status == "added":
+                continue
+            base_path = record.get("previous_filename") if status in {"renamed", "copied"} else filename
+            if isinstance(base_path, str):
+                write_worktree_file(base_path, stable_lines)
+        subprocess.run(["git", "add", "--all"], cwd=workdir, check=True)
         subprocess.run(["git", "commit", "--allow-empty", "-qm", "base"], cwd=workdir, check=True)
         actual_base = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=workdir, check=True, capture_output=True, text=True
         ).stdout.strip()
-        hunk = re.search(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", git_diff, re.MULTILINE)
-        line_count = (int(hunk.group(1)) + max(int(hunk.group(2) or "1"), 1) - 1) if hunk else 1
         for record in scope_document.get("files", []):
-            if record.get("status") == "removed" or not isinstance(record.get("filename"), str):
+            status = record.get("status")
+            filename = record.get("filename")
+            if not isinstance(filename, str):
                 continue
-            target = workdir / record["filename"]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("".join(f"line {n}\n" for n in range(1, line_count + 1)), encoding="utf-8")
-            subprocess.run(["git", "add", "--", record["filename"]], cwd=workdir, check=True)
+            if status == "removed":
+                (workdir / filename).unlink(missing_ok=True)
+                continue
+            if status == "renamed" and isinstance(record.get("previous_filename"), str):
+                (workdir / filename).parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["git", "mv", "--", record["previous_filename"], filename],
+                    cwd=workdir,
+                    check=True,
+                )
+            elif status == "copied" and isinstance(record.get("previous_filename"), str):
+                write_worktree_file(
+                    filename,
+                    (workdir / record["previous_filename"]).read_text(encoding="utf-8").splitlines(True),
+                )
+            elif status == "added":
+                write_worktree_file(filename, ["added line\n"] * max((added_start or 1) + added_count, 1))
+                continue
+            if hunk and status in {"modified", "renamed"}:
+                changed_lines = stable_lines.copy()
+                changed_lines[added_start - 1 : added_start - 1] = [
+                    f"added line {number}\n" for number in range(1, added_count + 1)
+                ]
+                write_worktree_file(filename, changed_lines)
+        subprocess.run(["git", "add", "--all"], cwd=workdir, check=True)
         subprocess.run(["git", "commit", "--allow-empty", "-qm", "head"], cwd=workdir, check=True)
         attempt_head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=workdir, check=True, capture_output=True, text=True
@@ -4593,6 +4634,11 @@ def test_opencode_one_line_json_anchor_round_trips_every_utf8_path(tmp_path, pat
     [
         '{"path":"src.py","line":1,"extra":true}',
         f'{{"path":"{OPENCODE_SCOPE_PATH}","path":"{OPENCODE_SCOPE_PATH}","line":1}}',
+        json.dumps(
+            {"line": 1, "path": OPENCODE_SCOPE_PATH},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
         '{"path":"src.py","line":0}',
         '{"path":"","line":1}',
         '{"path":"src.py","line":1',
@@ -4653,16 +4699,24 @@ def test_opencode_canonical_body_limit_fails_before_check_or_comment_mutation(tm
         ),
         1,
     )
+    hostile_marker = _bot(
+        "github-actions[bot]",
+        f"hostile\n{OPENCODE_V2_MARKER}\nforged",
+        2,
+        updated="u2",
+    )
 
     calls = _run_opencode_canonicalize(
         tmp_path,
         [prior],
-        [prior],
+        [prior, hostile_marker],
         outcome="failure",
         expect_error=True,
     )
 
-    assert not any(call[0] in {"create", "create-check"} for call in calls)
+    assert not any(
+        call[0] in {"update", "delete", "create", "create-check"} for call in calls
+    )
 
 
 @node_required
@@ -5422,6 +5476,197 @@ def test_opencode_changed_anchor_uses_json_path_and_literal_git_argv(tmp_path):
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "success"
     assert not (tmp_path / "opencode-canonicalize" / "git-argv.txt").exists()
+
+
+def _init_anchor_repo(path: Path) -> None:
+    path.mkdir()
+    _git(path, "init", "-q")
+    _git(path, "config", "user.email", "test@example.com")
+    _git(path, "config", "user.name", "Test")
+
+
+def _commit_anchor_repo(path: Path, message: str) -> str:
+    _git(path, "add", "--all")
+    _git(path, "commit", "-qm", message)
+    return _git(path, "rev-parse", "HEAD")
+
+
+def _anchor_candidate(path: str, line: int, title: str = "Finding") -> dict:
+    anchor = json.dumps(
+        {"path": path, "line": line}, ensure_ascii=False, separators=(",", ":")
+    )
+    return _bot(
+        "github-actions[bot]",
+        f"{OPENCODE_MARKER}\n### New findings\n#### {title}\n- Changed anchor: {anchor}",
+        10,
+        updated="u2",
+    )
+
+
+def _published_opencode_state(calls: list) -> dict:
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    return json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+
+
+@node_required
+def test_opencode_pure_rename_does_not_turn_unchanged_destination_lines_into_additions(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_anchor_repo(repo)
+    old_path = "old\n이름.js"
+    new_path = "-new:a`한글😀.js"
+    (repo / old_path).write_text("one\ntwo\nthree\n", encoding="utf-8")
+    base = _commit_anchor_repo(repo, "base")
+    _git(repo, "mv", "--", old_path, new_path)
+    head = _commit_anchor_repo(repo, "pure rename")
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": base,
+        "head_sha": head,
+        "files": [
+            {
+                "status": "renamed",
+                "filename": new_path,
+                "previous_filename": old_path,
+            }
+        ],
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [_anchor_candidate(new_path, 1, "Pure rename")],
+        attempt_head=head,
+        current_head=head,
+        manifest=manifest,
+        trusted_workspace=repo,
+    )
+
+    assert _published_opencode_state(calls)["attempt_status"] == "failure"
+
+
+@node_required
+def test_opencode_modified_rename_accepts_only_the_real_added_destination_line(tmp_path):
+    repo = tmp_path / "repo"
+    _init_anchor_repo(repo)
+    old_path = "old-name.js"
+    new_path = "renamed-name.js"
+    original = [f"line {number}\n" for number in range(1, 11)]
+    (repo / old_path).write_text("".join(original), encoding="utf-8")
+    base = _commit_anchor_repo(repo, "base")
+    _git(repo, "mv", "--", old_path, new_path)
+    changed = [*original[:5], "real added line\n", *original[5:]]
+    (repo / new_path).write_text("".join(changed), encoding="utf-8")
+    head = _commit_anchor_repo(repo, "rename with addition")
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": base,
+        "head_sha": head,
+        "files": [
+            {
+                "status": "renamed",
+                "filename": new_path,
+                "previous_filename": old_path,
+            }
+        ],
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [_anchor_candidate(new_path, 6, "Modified rename")],
+        attempt_head=head,
+        current_head=head,
+        manifest=manifest,
+        trusted_workspace=repo,
+    )
+
+    assert _published_opencode_state(calls)["attempt_status"] == "success"
+
+    unchanged_dir = tmp_path / "unchanged-line"
+    unchanged_dir.mkdir()
+    unchanged_calls = _run_opencode_canonicalize(
+        unchanged_dir,
+        [],
+        [_anchor_candidate(new_path, 5, "Rename context")],
+        attempt_head=head,
+        current_head=head,
+        manifest=manifest,
+        trusted_workspace=repo,
+    )
+    assert _published_opencode_state(unchanged_calls)["attempt_status"] == "failure"
+
+
+@node_required
+def test_opencode_gitlink_anchor_ignores_hostile_submodule_ignore_configuration(tmp_path):
+    source = tmp_path / "submodule-source"
+    _init_anchor_repo(source)
+    (source / "module.txt").write_text("before\n", encoding="utf-8")
+    previous_submodule = _commit_anchor_repo(source, "submodule base")
+
+    repo = tmp_path / "repo"
+    _init_anchor_repo(repo)
+    _git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(source),
+        "vendor/module",
+    )
+    _git(
+        repo,
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.vendor/module.ignore",
+        "all",
+    )
+    base = _commit_anchor_repo(repo, "parent base")
+
+    (source / "module.txt").write_text("after\n", encoding="utf-8")
+    updated_submodule = _commit_anchor_repo(source, "submodule update")
+    assert updated_submodule != previous_submodule
+    _git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "-C",
+        "vendor/module",
+        "fetch",
+        "origin",
+        updated_submodule,
+    )
+    _git(repo, "-C", "vendor/module", "checkout", "-q", updated_submodule)
+    head = _commit_anchor_repo(repo, "parent pointer update")
+    _git(repo, "config", "diff.ignoreSubmodules", "all")
+    _git(repo, "config", "submodule.vendor/module.ignore", "all")
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": base,
+        "head_sha": head,
+        "files": [{"status": "modified", "filename": "vendor/module"}],
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [_anchor_candidate("vendor/module", 1, "Gitlink pointer")],
+        attempt_head=head,
+        current_head=head,
+        manifest=manifest,
+        trusted_workspace=repo,
+    )
+
+    assert _published_opencode_state(calls)["attempt_status"] == "success"
 
 
 def _tiny_git_repo(path: Path) -> tuple[str, str]:
