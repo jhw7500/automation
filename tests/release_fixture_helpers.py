@@ -52,3 +52,30 @@ def restore_historical_review_workflows(
         (repo / relative).write_bytes(
             (HISTORICAL_REVIEW_FIXTURE_ROOT / filename).read_bytes()
         )
+
+    # v1.44 callers predate the Task 5 Actions/Checks ceiling. Restore those two
+    # release-policy files without altering the immutable central workflow fixtures.
+    baseline = repo / "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml"
+    if baseline.exists():
+        text = baseline.read_text(encoding="utf-8")
+        text = text.replace("      actions: read\n      checks: write\n", "", 1)
+        baseline.write_text(text, encoding="utf-8")
+    catalog = repo / "scripts/workflow-catalog.json"
+    if catalog.exists():
+        text = catalog.read_text(encoding="utf-8")
+        text = text.replace(
+            '          "permissions": {\n'
+            '            "actions": "read",\n'
+            '            "checks": "write",\n'
+            '            "contents": "read",\n'
+            '            "issues": "write",\n'
+            '            "pull-requests": "write"\n'
+            "          },",
+            '          "permissions": {\n'
+            '            "contents": "read",\n'
+            '            "issues": "write",\n'
+            '            "pull-requests": "write"\n'
+            "          },",
+            1,
+        )
+        catalog.write_text(text, encoding="utf-8")

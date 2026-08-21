@@ -40,6 +40,8 @@ from scripts.workflow_release_inventory import (
 
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 CACHE_ACTION = "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+DOWNLOAD_ARTIFACT_ACTION = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
 OPENCODE_VERSION = "1.18.17"
 OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
@@ -1991,7 +1993,6 @@ def _verify_commit_content(
     try:
         check_job = auto["jobs"]["check-enabled"]
         job = auto["jobs"]["opencode-review"]
-        permissions = job["permissions"]
         checkout = next(
             item for item in job["steps"] if item.get("name") == "Checkout repository"
         )
@@ -2005,10 +2006,70 @@ def _verify_commit_content(
         "pull-requests": "write",
         "issues": "write",
     }
-    if permissions != expected_permissions:
+    if job.get("permissions") != expected_permissions:
         raise ReleaseVerificationError(
             f"OpenCode auto review permissions differ from {expected_permissions}"
         )
+    if release_supports_prepare_review_diff(ref):
+        try:
+            prepare = auto["jobs"]["opencode-prepare"]
+            canonical = auto["jobs"]["opencode-canonicalize"]
+            upload = next(item for item in prepare["steps"] if item.get("name") == "Upload sealed canonicalization handoff")
+            model_download = next(item for item in job["steps"] if item.get("name") == "Download sealed review handoff")
+            model_validate = next(item for item in job["steps"] if item.get("name") == "Validate sealed review handoff")
+            canonical_download = next(item for item in canonical["steps"] if item.get("name") == "Download sealed canonicalization handoff")
+            canonical_step = next(item for item in canonical["steps"] if item.get("name") == "Canonicalize OpenCode review")
+            canonical_checkout = next(item for item in canonical["steps"] if item.get("name") == "Checkout trusted repository")
+        except (KeyError, TypeError, StopIteration) as exc:
+            raise ReleaseVerificationError("OpenCode three-job attestation boundary is missing") from exc
+        expected_prepare = {"actions": "read", "checks": "read", "contents": "read", "pull-requests": "read", "issues": "read"}
+        expected_canonical = {"actions": "read", "checks": "write", "contents": "read", "pull-requests": "write", "issues": "write"}
+        canonical_script = canonical_step.get("with", {}).get("script", "")
+        model_validation = model_validate.get("run", "")
+        artifact_contract = (
+            prepare.get("permissions") == expected_prepare
+            and canonical.get("permissions") == expected_canonical
+            and "checks" not in job.get("permissions", {}) and "actions" not in job.get("permissions", {})
+            and prepare.get("needs") == "check-enabled"
+            and job.get("needs") == ["check-enabled", "opencode-prepare"]
+            and canonical.get("needs") == ["check-enabled", "opencode-prepare", "opencode-review"]
+            and upload.get("uses") == UPLOAD_ARTIFACT_ACTION
+            and upload.get("with", {}).get("overwrite") == "false"
+            and all(item.get("uses") == DOWNLOAD_ARTIFACT_ACTION for item in (model_download, canonical_download))
+            and all(item.get("with", {}).get("artifact-ids") == "${{ needs.opencode-prepare.outputs.handoff_artifact_id }}" for item in (model_download, canonical_download))
+            and all(item.get("with", {}).get("merge-multiple") == "true" for item in (model_download, canonical_download))
+            and model_validate.get("env", {}).get("HANDOFF_ARTIFACT_DIGEST") == "${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}"
+            and '[[ "$HANDOFF_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]' in model_validation
+            and canonical_step.get("env", {}).get("HANDOFF_ARTIFACT_DIGEST") == "${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}"
+            and 'artifact.digest !== `sha256:${process.env.HANDOFF_ARTIFACT_DIGEST}`' in canonical_script
+            and "github.rest.checks.create" in canonical_script
+            and "github.rest.checks.update" in canonical_script
+            and "automation-attestation" in canonical_script
+            and canonical_checkout.get("with", {}).get("persist-credentials") == "false"
+            and canonical_checkout.get("with", {}).get("ref") == "${{ needs.opencode-prepare.outputs.head_sha }}"
+            and "always()" in canonical.get("if", "")
+        )
+        if not artifact_contract:
+            raise ReleaseVerificationError("OpenCode sealed handoff/attestation contract is invalid")
+        expected_caller_permissions = {
+            "actions": "read", "checks": "write", "contents": "read",
+            "issues": "write", "pull-requests": "write",
+        }
+        opencode_entry = next(
+            (entry for entry in catalog.callers
+             if entry.path.as_posix() == ".github/workflows/opencode-auto-review.yml"),
+            None,
+        ) if catalog is not None else None
+        self_document = documents.get("_self-opencode-auto-review.yml", {})
+        self_job = self_document.get("jobs", {}).get("opencode-review", {})
+        if (
+            opencode_entry is None
+            or len(opencode_entry.caller_jobs) != 1
+            or dict(opencode_entry.caller_jobs[0].permissions) != expected_caller_permissions
+            or self_job.get("permissions") != expected_caller_permissions
+            or self_job.get("uses") != "./.github/workflows/opencode-auto-review.yml"
+        ):
+            raise ReleaseVerificationError("OpenCode caller permission ceiling is invalid")
     safe_output = check_job.get("outputs", {}).get("safe_pr")
     scope_step = next(
         (item for item in check_job.get("steps", []) if item.get("id") == "pr_scope"),

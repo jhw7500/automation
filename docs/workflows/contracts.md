@@ -167,17 +167,36 @@ invalid prior state cannot advance coverage (invalid prior state falls back to a
 
 Immediately before comment mutation, each reviewer refetches the PR head and requires it to
 equal `attempt_head`; it also refuses to write unless stored `(run_id, run_attempt)` is
-strictly older. Per-reviewer/per-PR concurrency with cancellation reduces overlap, but these
-are the correctness gates. The final head read and comment mutation are separate API calls,
-so this is an optimistic guard rather than atomic compare-and-swap; a push in that final API
-window needs a conditional comment API or different persistence design to eliminate entirely.
+strictly older. Per-reviewer/per-PR concurrency with cancellation reduces overlap. OpenCode
+adds fresh generation and head checks before repair, before comment creation, and immediately
+before its receipt becomes successful.
 
-OpenCode compares pre- and post-run comment sets to identify current-run marker-bearing bot
-output, then requires exactly one candidate whose ID was absent from the snapshot. Zero,
-multiple, reused, or unverified candidates fail closed. The workflow strips its reserved
-lines, wraps only that candidate in canonical v2 state, updates the prior canonical record
-when one exists, and deletes the transient raw candidate. Thus raw OpenCode model comments,
-like all other review prose, never become trusted state by themselves.
+OpenCode uses three jobs. A read-only prepare job captures prior comments and provenance,
+prepares the diff, and uploads one immutable handoff. The handoff is selected by server-issued
+artifact ID, with the upload's raw SHA-256 output, the REST `sha256:` digest, repository/run
+identity, an exact conditional file inventory, and per-file hashes all checked. The model job
+has no Actions, Checks, OIDC, or contents-write permission. The pinned CLI is expected to emit
+one legacy raw comment containing the sealed per-attempt candidate nonce exactly once; every
+marker-bearing model-window mutation remains untrusted and subject to quarantine. A clean
+privileged job re-downloads the exact artifact ID, validates it, checks out the sealed PR head, and uses
+`/usr/bin/git` with a closed provider-free environment for changed-anchor validation.
+
+The canonicalizer treats every model-window marker-bearing new or changed comment as
+untrusted. It restores the newest previously attested fallback, quarantines forgeries, admits
+exactly one new-ID nonce-bound raw candidate, and creates a new canonical comment. It then
+completes a dedicated Check Run only after exact-byte refetch. The receipt binds repository,
+workflow, PR, attempt head, successful head, run ID/attempt, comment ID, body/state digests,
+the actual caller workflow path/event, and the referenced central workflow path/SHA. A later
+collector also requires that bound run attempt and its reusable canonicalizer job to have
+completed successfully; cancelled runs therefore leave no trusted state. Older attested
+comments may be marker-free tombstoned, but the newest prior fallback is retained until a
+future completed run can authenticate the successor.
+
+Checks are a canonicalizer-only receipt under this workflow's fixed least-privilege caller
+ceiling, not a universal signature against an unrelated workflow independently granted
+`checks: write`. This OpenCode path targets GitHub-hosted Actions: the pinned artifact v4
+actions are not GHES-compatible, and the pinned upstream OpenCode command is itself tied to
+github.com.
 
 ## Adoption and recovery
 

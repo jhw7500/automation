@@ -611,6 +611,83 @@ def test_current_release_commit_only_uses_authenticated_objects(
     )
 
 
+@pytest.mark.parametrize(
+    ("relative", "old", "new"),
+    (
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            "actions/upload-artifact@" + "0" * 40,
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "          merge-multiple: true",
+            "          merge-multiple: false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "          HANDOFF_ARTIFACT_ID: ${{ needs.opencode-prepare.outputs.handoff_artifact_id }}\n"
+            "          HANDOFF_ARTIFACT_DIGEST: ${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}",
+            "          HANDOFF_ARTIFACT_ID: ${{ needs.opencode-prepare.outputs.handoff_artifact_id }}\n"
+            "          HANDOFF_ARTIFACT_DIGEST: unsealed",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "      actions: read\n      checks: read\n      contents: read",
+            "      actions: write\n      checks: read\n      contents: read",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "      # Deliberately no actions/checks/id-token permission. The pinned same-run download\n"
+            "      # uses the runner artifact service; the model cannot publish canonical attestations.\n"
+            "      contents: read",
+            "      actions: read\n      checks: read\n"
+            "      contents: read",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "      actions: read\n      checks: write\n      contents: read",
+            "      actions: read\n      checks: read\n      contents: read",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "github.rest.checks.create",
+            "github.rest.checks.listForRef",
+        ),
+        (
+            "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml",
+            "      actions: read\n      checks: write\n",
+            "",
+        ),
+        (
+            ".github/workflows/_self-opencode-auto-review.yml",
+            "      actions: read\n      checks: write\n",
+            "",
+        ),
+    ),
+    ids=(
+        "upload-pin",
+        "download-layout",
+        "artifact-digest",
+        "prepare-write",
+        "model-checks-actions",
+        "canonical-checks",
+        "check-protocol",
+        "baseline-caller-ceiling",
+        "self-caller-ceiling",
+    ),
+)
+def test_current_release_rejects_opencode_attestation_boundary_drift(
+    current_release_repo: tuple[Path, str], relative: str, old: str, new: str
+) -> None:
+    repo, _ = current_release_repo
+    replace(repo / relative, old, new, count=1)
+    bad_commit = commit(repo, "weaken OpenCode attestation boundary")
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
 def test_prepare_diff_capability_boundary_is_shared_with_release_inventory() -> None:
     capability = getattr(
         release_inventory, "release_supports_prepare_review_diff", None

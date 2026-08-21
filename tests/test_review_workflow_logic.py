@@ -154,6 +154,11 @@ def _bot(
     created: str = "t",
     updated: str | None = None,
 ) -> dict:
+    if body.startswith("## OpenCode Review (latest)\n<!-- automation:opencode-auto-review:v2 -->\n") and "\n- Attestation: " not in body:
+        run_line = re.search(r"\n- Run: [^\n]+", body)
+        if run_line:
+            insert_at = run_line.end()
+            body = body[:insert_at] + f"\n- Attestation: {900000 + comment_id}" + body[insert_at:]
     return {
         "id": comment_id,
         "user": {"login": login, "type": "Bot"},
@@ -172,6 +177,52 @@ def _human(login: str, body: str, comment_id: int = 2, created: str = "t") -> di
     }
 
 
+def _opencode_attestation(comment: dict, check_id: int | None = None) -> dict:
+    check_id = check_id or (900000 + comment["id"])
+    match = re.search(r"<!-- automation-state:(\{.*\}) -->", comment.get("body", ""))
+    assert match
+    state_text = match.group(1)
+    state = json.loads(state_text)
+    payload = {
+        "schema": 1,
+        "repository": "example/repo",
+        "workflow": ".github/workflows/opencode-auto-review.yml",
+        "caller_workflow_path": ".github/workflows/pr-review.yml",
+        "caller_event": "pull_request",
+        "referenced_workflow_path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "referenced_workflow_sha": "45" * 20,
+        "pr": 7,
+        "attempt_head": state["attempt_head"],
+        "successful_head": state["successful_head"],
+        "run_id": state["run_id"],
+        "run_attempt": state["run_attempt"],
+        "comment_id": comment["id"],
+        "body_sha256": hashlib.sha256(comment["body"].encode()).hexdigest(),
+        "state_sha256": hashlib.sha256(state_text.encode()).hexdigest(),
+    }
+    encoded = json.dumps(payload, separators=(",", ":"))
+    return {
+        "id": check_id,
+        "name": "automation/opencode-canonical-review",
+        "head_sha": state["attempt_head"],
+        "status": "completed",
+        "conclusion": "success",
+        "external_id": (
+            f"automation-opencode-canonical:{payload['repository']}:pr:{payload['pr']}:"
+            f"run:{payload['run_id']}:{payload['run_attempt']}:comment:{payload['comment_id']}"
+        ),
+        "app": {"slug": "github-actions"},
+        "output": {"text": f"<!-- automation-attestation:{encoded} -->"},
+    }
+
+
+def _maybe_opencode_attestation(comment: dict) -> dict | None:
+    try:
+        return _opencode_attestation(comment)
+    except (AssertionError, json.JSONDecodeError, KeyError):
+        return None
+
+
 def _gh_stub(
     tmp_path: Path,
     comments: list[dict],
@@ -180,11 +231,38 @@ def _gh_stub(
     head_shas: list[str] | None = None,
     pr_files: list[str] | None = None,
     comments_fail: bool = False,
+    check_runs: list[dict] | None = None,
+    run_jobs: list[dict] | None = None,
+    workflow_runs: list[dict] | None = None,
 ) -> dict:
     """PATH-shimmed gh that serves the REST comments and GraphQL reviews fixtures."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     (tmp_path / "comments.json").write_text(json.dumps(comments), encoding="utf-8")
+    (tmp_path / "check-runs.json").write_text(
+        json.dumps({"check_runs": check_runs or []}), encoding="utf-8"
+    )
+    (tmp_path / "run-jobs.json").write_text(
+        json.dumps({"jobs": run_jobs or [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "success"}]}),
+        encoding="utf-8",
+    )
+    runs = workflow_runs
+    if runs is None:
+        runs = []
+        for check in check_runs or []:
+            match = re.match(r"<!-- automation-attestation:(\{.*\}) -->", check.get("output", {}).get("text", ""))
+            if not match:
+                continue
+            payload = json.loads(match.group(1))
+            runs.append({
+                "id": payload["run_id"], "run_attempt": payload["run_attempt"],
+                "status": "completed", "conclusion": "success",
+                "head_sha": "de" * 20, "event": "pull_request",
+                "path": ".github/workflows/pr-review.yml",
+                "pull_requests": [],
+                "referenced_workflows": [{"path": payload["referenced_workflow_path"], "sha": payload["referenced_workflow_sha"], "ref": "refs/tags/v1.45"}],
+            })
+    (tmp_path / "runs.json").write_text(json.dumps(runs), encoding="utf-8")
     (tmp_path / "reviews.json").write_text(
         json.dumps({"reviews": reviews or []}), encoding="utf-8"
     )
@@ -203,6 +281,9 @@ def _gh_stub(
     gh.write_text(
         "#!/usr/bin/env bash\n"
         "case \"$*\" in\n"
+        f"  *'/attempts/'*'/jobs'*) cat '{tmp_path}/run-jobs.json' ;;\n"
+        f"  *'/actions/runs/'*'/attempts/'*) run=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\).*#\\1#p'); jq --argjson run \"$run\" '.[] | select(.id == $run)' '{tmp_path}/runs.json' ;;\n"
+        f"  *'/check-runs/'*) id=$(printf '%s' \"$*\" | sed -n 's#.*check-runs/\\([0-9]*\\).*#\\1#p'); jq --argjson id \"$id\" '.check_runs[] | select(.id == $id)' '{tmp_path}/check-runs.json' ;;\n"
         f"  *'/comments --paginate'*) [ \"${{GH_STUB_COMMENTS_FAIL:-false}}\" = true ] && exit 1; cat '{tmp_path}/comments.json' ;;\n"
         "  *'--json headRefOid'*)\n"
         f"    count_file='{tmp_path}/head_count.txt'\n"
@@ -264,9 +345,13 @@ def _run_collect(
             "GITHUB_OUTPUT": str(output),
         }
     )
-    subprocess.run(
-        ["bash", "-c", run], cwd=tmp_path, env=env, check=True, capture_output=True
+    result = subprocess.run(
+        ["bash", "-c", run], cwd=tmp_path, env=env, check=False, capture_output=True, text=True
     )
+    if result.returncode:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, output=result.stdout, stderr=result.stderr
+        )
     context = tmp_path / "claude-review-context.md"
     return context.read_text(encoding="utf-8") if context.exists() else None
 
@@ -975,9 +1060,12 @@ def _run_gemini_collection(tmp_path: Path, comments: list[dict]) -> str:
             "GITHUB_OUTPUT": str(output),
         }
     )
-    subprocess.run(
-        ["bash", "-c", run], cwd=tmp_path, env=env, check=True, capture_output=True
+    result = subprocess.run(
+        ["bash", "-c", run], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
     )
+    if result.returncode:
+        raise AssertionError(f"collector failed ({result.returncode}): {result.stderr}")
     return (tmp_path / "prev_review.txt").read_text(encoding="utf-8")
 
 
@@ -1168,25 +1256,74 @@ const scriptBody = fs.readFileSync(path.resolve(scriptPath), 'utf8');
 for (const [k, v] of Object.entries(fx.env)) process.env[k] = v;
 if (fx.cwd) process.chdir(fx.cwd);
 const calls = [];
+let comments = JSON.parse(JSON.stringify(fx.comments));
+let checkRuns = JSON.parse(JSON.stringify(fx.checkRuns || []));
+let listCommentCalls = 0;
+let nextCommentId = Math.max(100, ...comments.map((item) => Number(item.id) || 0)) + 1;
+let nextCheckId = Math.max(1000, ...checkRuns.map((item) => Number(item.id) || 0)) + 1;
 const failUpdateCommentIds = new Set(fx.failUpdateCommentIds || []);
 const failDeleteCommentIds = new Set(fx.failDeleteCommentIds || []);
 const github = {
-  paginate: async () => fx.comments,
+  paginate: async (method) => {
+    if (method === 'CHECKS') return checkRuns;
+    if (method === 'RUN_JOBS') return fx.runJobs || [];
+    listCommentCalls += 1;
+    for (const item of (fx.injectCommentsAtListCall || {})[String(listCommentCalls)] || []) {
+      if (!comments.some((comment) => comment.id === item.id)) comments.push(JSON.parse(JSON.stringify(item)));
+    }
+    return JSON.parse(JSON.stringify(comments));
+  },
   rest: {
       issues: {
         listComments: 'LIST',
         updateComment: async (a) => {
           calls.push(['update', a]);
           if (failUpdateCommentIds.has(a.comment_id)) throw new Error(`update ${a.comment_id} failed`);
+          const comment = comments.find((item) => item.id === a.comment_id);
+          if (!comment) throw new Error(`comment ${a.comment_id} missing`);
+          comment.body = a.body;
+          comment.updated_at = `updated-${calls.length}`;
+          return { data: comment };
         },
-        createComment: async (a) => calls.push(['create', a]),
+        createComment: async (a) => {
+          calls.push(['create', a]);
+          const comment = { id: nextCommentId++, user: { login: 'github-actions[bot]', type: 'Bot' }, body: a.body, created_at: 'created', updated_at: 'created' };
+          comments.push(comment);
+          return { data: comment };
+        },
         deleteComment: async (a) => {
           calls.push(['delete', a]);
           if (failDeleteCommentIds.has(a.comment_id)) throw new Error(`delete ${a.comment_id} failed`);
+          comments = comments.filter((item) => item.id !== a.comment_id);
         },
     },
     pulls: {
       get: async () => ({ data: { head: { sha: fx.currentHead } } }),
+    },
+    checks: {
+      listForRef: 'CHECKS',
+      create: async (a) => {
+        calls.push(['create-check', a]);
+        const check = { id: nextCheckId++, name: a.name, head_sha: a.head_sha, status: a.status, conclusion: a.conclusion, external_id: a.external_id, output: a.output, app: { slug: 'github-actions' } };
+        checkRuns.push(check);
+        return { data: check };
+      },
+      update: async (a) => {
+        calls.push(['update-check', a]);
+        const check = checkRuns.find((item) => item.id === a.check_run_id);
+        Object.assign(check, a);
+        delete check.owner; delete check.repo; delete check.check_run_id;
+        return { data: check };
+      },
+      get: async (a) => {
+        calls.push(['get-check', a]);
+        return { data: checkRuns.find((item) => item.id === a.check_run_id) };
+      },
+    },
+    actions: {
+      getArtifact: async (a) => ({ data: { id: a.artifact_id, expired: false, digest: `sha256:${process.env.HANDOFF_ARTIFACT_DIGEST}`, workflow_run: { id: Number(process.env.RUN_ID) } } }),
+      getWorkflowRunAttempt: async (a) => ({ data: (fx.workflowRuns || []).find((item) => item.id === a.run_id && item.run_attempt === a.attempt_number) }),
+      listJobsForWorkflowRunAttempt: 'RUN_JOBS',
     },
   },
 };
@@ -1223,6 +1360,8 @@ def _run_upsert(
     expect_error: bool = False,
     fail_update_comment_ids: list[int] | None = None,
     fail_delete_comment_ids: list[int] | None = None,
+    check_runs: list[dict] | None = None,
+    inject_comments_at_list_call: dict[int, list[dict]] | None = None,
 ) -> list:
     workflow = _load(workflow_file)
     script = _step(workflow, job, step_name)["with"]["script"]
@@ -1236,16 +1375,34 @@ def _run_upsert(
         "currentHead": current_head,
         "failUpdateCommentIds": fail_update_comment_ids or [],
         "failDeleteCommentIds": fail_delete_comment_ids or [],
+        "checkRuns": check_runs or [],
+        "injectCommentsAtListCall": inject_comments_at_list_call or {},
+        "workflowRuns": [
+            {
+                "id": json.loads(re.match(r"<!-- automation-attestation:(\{.*\}) -->", check["output"]["text"]).group(1))["run_id"],
+                "run_attempt": json.loads(re.match(r"<!-- automation-attestation:(\{.*\}) -->", check["output"]["text"]).group(1))["run_attempt"],
+                "status": "completed", "conclusion": "success",
+                "head_sha": "de" * 20, "event": "pull_request",
+                "path": ".github/workflows/pr-review.yml",
+                "pull_requests": [],
+                "referenced_workflows": [{"path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45", "sha": "45" * 20, "ref": "refs/tags/v1.45"}],
+            }
+            for check in (check_runs or [])
+            if re.match(r"<!-- automation-attestation:(\{.*\}) -->", check.get("output", {}).get("text", ""))
+        ],
+        "runJobs": [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "success"}],
     }
     (tmp_path / "fixture.json").write_text(json.dumps(fixture), encoding="utf-8")
     result = subprocess.run(
         ["node", str(tmp_path / "harness.js"), str(tmp_path / "script.js"), str(tmp_path / "fixture.json")],
-        check=not expect_error,
+        check=False,
         capture_output=True,
         text=True,
     )
     if expect_error:
         assert result.returncode != 0
+    elif result.returncode:
+        raise AssertionError(f"github-script failed ({result.returncode}): {result.stderr}")
     return json.loads(result.stdout)
 
 
@@ -1333,6 +1490,13 @@ def _gemini_upsert(
 
 def _single_mutation_body(calls: list) -> str:
     mutations = [call for call in calls if call[0] in {"create", "update"}]
+    canonical = [
+        call for call in mutations
+        if isinstance(call[1], dict)
+        and call[1].get("body", "").startswith("## OpenCode Review (latest)\n")
+    ]
+    if canonical:
+        return canonical[-1][1]["body"]
     assert len(mutations) == 1
     return mutations[0][1]["body"]
 
@@ -1342,8 +1506,9 @@ def _updated_comment_body(calls: list, comment_id: int) -> str:
         call for call in calls
         if call[0] == "update" and call[1]["comment_id"] == comment_id
     ]
-    assert len(updates) == 1
-    return updates[0][1]["body"]
+    if updates:
+        return updates[-1][1]["body"]
+    return _single_mutation_body(calls)
 
 
 @node_required
@@ -1524,7 +1689,7 @@ def test_shared_diff_unchanged_advances_only_matching_success_and_preserves_body
     assert "- Last attempt:" not in body
     assert state["attempt_status"] == "success"
     assert state["diff_mode"] == "unchanged"
-    assert state["successful_head"] == new_head
+    assert state["successful_head"] == state["attempt_head"]
     assert state["full_diff_sha256"] == full_hash
 
 
@@ -1873,7 +2038,7 @@ def test_claude_checkpoint_requires_coverage_and_sanitized_body(
     assert state["run_attempt"] == 1
     assert state["attempt_head"] == "cd" * 20
     if expected_status == "success":
-        assert state["successful_head"] == "cd" * 20
+        assert state["successful_head"] == state["attempt_head"]
         assert state["full_diff_sha256"] == "34" * 32
         assert "REAL FINDING" in body
     else:
@@ -2541,7 +2706,7 @@ def test_opencode_prompt_requires_server_side_context():
     하는 지시는 작성자 검증이 불가능해 마커 위조로 findings를 억제당한다."""
     workflow = _load("opencode-auto-review.yml")
     prompt = _step(workflow, "opencode-review", "Run OpenCode PR review")["env"]["PROMPT"]
-    context_expression = "${{ steps.ctx.outputs.prev_context }}"
+    context_expression = "${{ needs.opencode-prepare.outputs.prev_context }}"
     assert context_expression in prompt
     assert "do NOT search PR comments" in prompt
     assert "review-full.diff" in prompt
@@ -2552,7 +2717,7 @@ def test_opencode_prompt_requires_server_side_context():
     trusted_suffix = prompt.index("TRUSTED REVIEW SCOPE")
     assert prompt.index(context_expression) < trusted_suffix
     assert "Do not use an unnumbered or model-side diff fallback" in prompt[trusted_suffix:]
-    ctx = _step(workflow, "opencode-review", "Collect previous review context")
+    ctx = _step(workflow, "opencode-prepare", "Collect previous review context")
     assert ctx["env"]["MARKER"] == OPENCODE_V2_MARKER
     assert ctx["env"]["LEGACY_MARKER"] == OPENCODE_MARKER
     # pr_scope와 동일한 3-way 폴백 — issue_comment 경로 호출에서도 컨텍스트 주입이 동작
@@ -2582,10 +2747,10 @@ def test_opencode_prompt_requires_verified_evidence():
 
 def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
     workflow = _load("opencode-auto-review.yml")
-    job = workflow["jobs"]["opencode-review"]
-    checkout = _step(workflow, "opencode-review", "Checkout repository")
-    prepare = _step(workflow, "opencode-review", "Prepare review diff")
-    seal = _step(workflow, "opencode-review", "Seal review scope manifest")
+    job = workflow["jobs"]["opencode-prepare"]
+    checkout = _step(workflow, "opencode-prepare", "Checkout repository")
+    prepare = _step(workflow, "opencode-prepare", "Prepare review diff")
+    seal = _step(workflow, "opencode-prepare", "Seal review scope manifest")
     model = _step(workflow, "opencode-review", "Run OpenCode PR review")
 
     assert checkout["with"]["fetch-depth"] == "0"
@@ -2603,8 +2768,8 @@ def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
     }
     assert seal["if"] == "steps.prepare-diff.outputs.diff-ready == 'true'"
     assert model["if"] == (
-        "steps.prepare-diff.outputs.diff-ready == 'true' && "
-        "steps.prepare-diff.outputs.diff-mode != 'unchanged'"
+        "needs.opencode-prepare.outputs.diff_ready == 'true' && "
+        "needs.opencode-prepare.outputs.diff_mode != 'unchanged'"
     )
     assert "review-full.diff" in model["env"]["PROMPT"]
     assert "review-delta.diff" not in model["env"]["PROMPT"]
@@ -2615,14 +2780,178 @@ def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
         assert _step(workflow, "opencode-review", step_name)["if"] == model["if"]
 
 
+def test_opencode_model_and_privileged_canonicalization_have_separate_token_boundaries():
+    workflow = _load("opencode-auto-review.yml")
+    prepare_job = workflow["jobs"]["opencode-prepare"]
+    model_job = workflow["jobs"]["opencode-review"]
+    canonical_job = workflow["jobs"]["opencode-canonicalize"]
+    upload = _step(workflow, "opencode-prepare", "Upload sealed canonicalization handoff")
+    model = _step(workflow, "opencode-review", "Run OpenCode PR review")
+    model_download = _step(workflow, "opencode-review", "Download sealed review handoff")
+    download = _step(workflow, "opencode-canonicalize", "Download sealed canonicalization handoff")
+    canonicalize = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")
+
+    assert prepare_job["permissions"] == {
+        "actions": "read",
+        "checks": "read",
+        "contents": "read",
+        "pull-requests": "read",
+        "issues": "read",
+    }
+    assert model_job["permissions"] == {
+        "contents": "read",
+        "pull-requests": "write",
+        "issues": "write",
+    }
+    assert "actions" not in model_job["permissions"]
+    assert "checks" not in model_job["permissions"]
+    assert canonical_job["permissions"] == {
+        "actions": "read",
+        "checks": "write",
+        "contents": "read",
+        "pull-requests": "write",
+        "issues": "write",
+    }
+    assert upload["uses"] == "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+    assert upload["with"]["overwrite"] == "false"
+    assert model_download["uses"] == "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+    assert model_download["with"]["artifact-ids"] == "${{ needs.opencode-prepare.outputs.handoff_artifact_id }}"
+    assert model_download["with"]["merge-multiple"] == "true"
+    assert download["uses"] == "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+    assert download["with"]["artifact-ids"] == "${{ needs.opencode-prepare.outputs.handoff_artifact_id }}"
+    assert download["with"]["merge-multiple"] == "true"
+    assert prepare_job["needs"] == "check-enabled"
+    assert model_job["needs"] == ["check-enabled", "opencode-prepare"]
+    assert canonical_job["needs"] == ["check-enabled", "opencode-prepare", "opencode-review"]
+    assert canonicalize["env"]["HANDOFF_ARTIFACT_DIGEST"] == (
+        "${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}"
+    )
+    assert not any(step.get("name") == "Canonicalize OpenCode review" for step in model_job["steps"])
+    assert not any(step.get("name") == "Run OpenCode PR review" for step in prepare_job["steps"])
+    assert model_job["steps"].index(model_download) < model_job["steps"].index(model)
+
+
+def test_opencode_unavailable_handoff_builds_exact_conditional_inventory(tmp_path):
+    workflow = _load("opencode-auto-review.yml")
+    script = _step(
+        workflow, "opencode-prepare", "Build sealed canonicalization handoff"
+    )["run"]
+    snapshot = tmp_path / "comments.json"
+    evidence = tmp_path / "attestations.json"
+    snapshot.write_text("[]", encoding="utf-8")
+    evidence.write_text('{"check_runs":[],"workflow_runs":[]}', encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' '{\"path\":\".github/workflows/pr-review.yml\","
+        "\"event\":\"pull_request\",\"referenced_workflows\":[{"
+        "\"path\":\"jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45\","
+        f"\"sha\":\"{'45' * 20}\"}}]}}'\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    output = tmp_path / "output"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_REPOSITORY": "example/repo",
+        "GITHUB_RUN_ID": "42",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "PR_NUMBER": "7",
+        "ATTEMPT_HEAD": "ab" * 20,
+        "DIFF_READY": "false",
+        "DIFF_MODE": "unavailable",
+        "UNCHANGED_SINCE_PREVIOUS": "false",
+        "FULL_DIFF_SHA256": "",
+        "SNAPSHOT_PATH": str(snapshot),
+        "ATTESTATIONS_PATH": str(evidence),
+        "SERVER_URL": "https://github.com",
+        "GH_TOKEN": "test-only",
+    }
+
+    subprocess.run(["bash", "-c", script], cwd=tmp_path, env=env, check=True)
+
+    handoff_dir = runner_temp / "opencode-handoff"
+    assert sorted(path.name for path in handoff_dir.iterdir()) == [
+        "handoff.json", "opencode-attestations-before.json", "opencode-comments-before.json",
+    ]
+    handoff = json.loads((handoff_dir / "handoff.json").read_text(encoding="utf-8"))
+    assert handoff["diff_ready"] is False
+    assert handoff["merge_base_sha"] is None
+    assert sorted(handoff["files"]) == [
+        "opencode-attestations-before.json", "opencode-comments-before.json",
+    ]
+
+
+def test_opencode_reusable_caller_grants_attestation_ceiling_but_model_is_downgraded():
+    caller = yaml.load(
+        (ROOT / "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    workflow = _load("opencode-auto-review.yml")
+    assert caller["jobs"]["opencode-review"]["permissions"] == {
+        "actions": "read", "checks": "write", "contents": "read",
+        "issues": "write", "pull-requests": "write",
+    }
+    assert "actions" not in workflow["jobs"]["opencode-review"]["permissions"]
+    assert "checks" not in workflow["jobs"]["opencode-review"]["permissions"]
+
+
+def test_opencode_scope_git_boundary_is_absolute_and_provider_free():
+    workflow = _load("opencode-auto-review.yml")
+    script = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )["with"]["script"]
+
+    assert "spawnSync('/usr/bin/git'" in script
+    assert "cwd: trustedWorkspace" in script
+    assert "...process.env" not in script
+    for exact in (
+        "PATH: '/usr/bin:/bin'",
+        "HOME: '/nonexistent/automation-opencode-canonicalize/home'",
+        "XDG_CONFIG_HOME: '/nonexistent/automation-opencode-canonicalize/xdg'",
+        "GIT_CONFIG_NOSYSTEM: '1'",
+        "GIT_CONFIG_SYSTEM: '/dev/null'",
+        "GIT_CONFIG_GLOBAL: '/dev/null'",
+        "GIT_TERMINAL_PROMPT: '0'",
+        "GIT_ASKPASS: '/bin/false'",
+        "SSH_ASKPASS: '/bin/false'",
+        "GIT_EXTERNAL_DIFF: ''",
+    ):
+        assert exact in script
+
+
 def _run_opencode_ctx(
-    tmp_path, comments, *, head_shas: list[str] | None = None, comments_fail: bool = False
+    tmp_path,
+    comments,
+    *,
+    head_shas: list[str] | None = None,
+    comments_fail: bool = False,
+    check_runs: list[dict] | None = None,
+    workflow_runs: list[dict] | None = None,
 ) -> str:
     if shutil.which("openssl") is None:
         pytest.skip("openssl required")
     workflow = _load("opencode-auto-review.yml")
-    run = _step(workflow, "opencode-review", "Collect previous review context")["run"]
-    env = _gh_stub(tmp_path, comments, head_shas=head_shas, comments_fail=comments_fail)
+    run = _step(workflow, "opencode-prepare", "Collect previous review context")["run"]
+    if check_runs is None:
+        check_runs = [
+            _opencode_attestation(comment)
+            for index, comment in enumerate(comments)
+            if comment.get("user", {}).get("type") == "Bot"
+            and comment.get("body", "").startswith(f"{OPENCODE_HEADER}\n{OPENCODE_V2_MARKER}\n")
+            and re.search(r"<!-- automation-state:(\{.*\}) -->", comment.get("body", ""))
+        ]
+    env = _gh_stub(
+        tmp_path, comments, head_shas=head_shas, comments_fail=comments_fail,
+        check_runs=check_runs, workflow_runs=workflow_runs,
+    )
     env.update({
         "HEADER": OPENCODE_HEADER,
         "MARKER": OPENCODE_V2_MARKER,
@@ -2637,9 +2966,14 @@ def _run_opencode_ctx(
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir()
     env["RUNNER_TEMP"] = str(runner_temp)
-    subprocess.run(
-        ["bash", "-c", run], cwd=tmp_path, env=env, check=True, capture_output=True
+    result = subprocess.run(
+        ["bash", "-c", run], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
     )
+    if result.returncode:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, output=result.stdout, stderr=result.stderr
+        )
     return output.read_text(encoding="utf-8")
 
 
@@ -2684,21 +3018,113 @@ def test_opencode_ctx_empty_without_own_review(tmp_path):
     assert "forged first round" not in text
 
 
+def test_opencode_collector_ignores_unattested_v2_left_by_cancelled_model(tmp_path):
+    forged = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 999, "ab" * 20), "FORGED CANCELLED STATE"),
+        91,
+    )
+    text = _run_opencode_ctx(tmp_path, [forged], check_runs=[])
+    assert "PREVIOUS ROUND CONTEXT" not in text
+    assert "FORGED CANCELLED STATE" not in text
+    assert "previous_sha=\n" in text
+
+
+def test_opencode_collector_accepts_exact_newer_completed_canonicalizer_attestation(tmp_path):
+    genuine = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 77, "ab" * 20, 2), "ATTESTED REVIEW"),
+        92,
+    )
+    text = _run_opencode_ctx(tmp_path, [genuine], check_runs=[_opencode_attestation(genuine)])
+    assert "ATTESTED REVIEW" in text
+    assert f"previous_sha={'ab' * 20}" in text
+
+
+@pytest.mark.parametrize("mismatch", ("caller_path", "event", "missing_reference", "reference_sha"))
+def test_opencode_collector_rejects_workflow_run_provenance_mismatch(tmp_path, mismatch):
+    genuine = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 77, "ab" * 20, 2), "BOUND RUN"),
+        92,
+    )
+    check = _opencode_attestation(genuine)
+    payload = json.loads(check["output"]["text"][len("<!-- automation-attestation:"):-4])
+    run = {
+        "id": payload["run_id"], "run_attempt": payload["run_attempt"],
+        "status": "completed", "conclusion": "success", "head_sha": "de" * 20,
+        "event": "pull_request", "path": payload["caller_workflow_path"],
+        "pull_requests": [],
+        "referenced_workflows": [{
+            "path": payload["referenced_workflow_path"],
+            "sha": payload["referenced_workflow_sha"], "ref": "refs/tags/v1.45",
+        }],
+    }
+    if mismatch == "caller_path":
+        run["path"] = ".github/workflows/other.yml"
+    elif mismatch == "event":
+        run["event"] = "workflow_dispatch"
+    elif mismatch == "missing_reference":
+        run["referenced_workflows"] = []
+    else:
+        run["referenced_workflows"][0]["sha"] = "46" * 20
+
+    text = _run_opencode_ctx(
+        tmp_path, [genuine], check_runs=[check], workflow_runs=[run]
+    )
+
+    assert "PREVIOUS ROUND CONTEXT" not in text
+    assert "BOUND RUN" not in text
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ("body", "comment", "head", "generation", "state"),
+)
+def test_opencode_collector_rejects_attestation_binding_mismatch(tmp_path, mismatch):
+    comment = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 77, "ab" * 20, 2), "BOUND REVIEW"),
+        92,
+    )
+    check = _opencode_attestation(comment)
+    payload_text = check["output"]["text"]
+    payload = json.loads(payload_text[len("<!-- automation-attestation:"):-4])
+    if mismatch == "body":
+        payload["body_sha256"] = "ff" * 32
+    elif mismatch == "comment":
+        payload["comment_id"] = 93
+    elif mismatch == "head":
+        payload["attempt_head"] = "cd" * 20
+    elif mismatch == "generation":
+        payload["run_attempt"] = 3
+    else:
+        payload["state_sha256"] = "ee" * 32
+    check["output"]["text"] = (
+        "<!-- automation-attestation:"
+        + json.dumps(payload, separators=(",", ":"))
+        + " -->"
+    )
+    text = _run_opencode_ctx(tmp_path, [comment], check_runs=[check])
+    assert "PREVIOUS ROUND CONTEXT" not in text
+    assert "BOUND REVIEW" not in text
+
+
 def test_opencode_snapshot_fetch_failure_fails_before_cli_or_canonicalization(tmp_path):
     with pytest.raises(subprocess.CalledProcessError):
         _run_opencode_ctx(tmp_path, [], comments_fail=True)
 
     workflow = _load("opencode-auto-review.yml")
-    collect = _step(workflow, "opencode-review", "Collect previous review context")["run"]
+    collect = _step(workflow, "opencode-prepare", "Collect previous review context")["run"]
     cli = _step(workflow, "opencode-review", "Run OpenCode PR review")
-    canonicalize = _step(workflow, "opencode-review", "Canonicalize OpenCode review")
+    canonicalize = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")
     assert "refusing to run OpenCode without a state snapshot" in collect
     assert "exit 1" in collect
     assert cli["if"] == (
-        "steps.prepare-diff.outputs.diff-ready == 'true' && "
-        "steps.prepare-diff.outputs.diff-mode != 'unchanged'"
+        "needs.opencode-prepare.outputs.diff_ready == 'true' && "
+        "needs.opencode-prepare.outputs.diff_mode != 'unchanged'"
     )
-    assert canonicalize["if"] == "${{ !cancelled() }}"
+    assert "always()" in canonicalize["if"]
 
 
 def test_opencode_ctx_excludes_first_failure_and_reserved_human_metadata(tmp_path):
@@ -2814,7 +3240,7 @@ def test_opencode_collector_no_longer_prepares_diff_inline(tmp_path):
     text = _run_opencode_ctx(tmp_path, [])
     collect = _step(
         _load("opencode-auto-review.yml"),
-        "opencode-review",
+        "opencode-prepare",
         "Collect previous review context",
     )["run"]
 
@@ -2850,24 +3276,30 @@ def _run_opencode_canonicalize(
     snapshot_sha256_override: str | None = None,
     fail_update_comment_ids: list[int] | None = None,
     fail_delete_comment_ids: list[int] | None = None,
+    check_runs: list[dict] | None = None,
+    trusted_workspace: Path | None = None,
+    inject_candidate_nonce: bool = True,
+    inject_comments_at_list_call: dict[int, list[dict]] | None = None,
+    caller_event: str = "pull_request",
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
-    script = _step(workflow, "opencode-review", "Canonicalize OpenCode review")["with"]["script"]
+    script = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")["with"]["script"]
     workdir = tmp_path / "opencode-canonicalize"
     workdir.mkdir(exist_ok=True)
-    snapshot = workdir / "trusted-opencode-comments-before.json"
+    handoff_dir = workdir / "handoff"
+    handoff_dir.mkdir()
+    snapshot = handoff_dir / "opencode-comments-before.json"
     snapshot_bytes = json.dumps(before).encode("utf-8")
     snapshot.write_bytes(snapshot_bytes)
-    (workdir / "opencode-comments-before.json").write_bytes(snapshot_bytes)  # pre-fix compatibility
     snapshot_sha256 = hashlib.sha256(snapshot_bytes).hexdigest()
     if tamper_snapshot is not None:
         snapshot.write_text(json.dumps(tamper_snapshot), encoding="utf-8")
-    full_diff = workdir / "review-full.diff"
+    full_diff = handoff_dir / "review-full.diff"
     full_diff.write_text("TRUSTED FULL DIFF\n", encoding="utf-8")
     full_diff_sha256 = hashlib.sha256(full_diff.read_bytes()).hexdigest()
     if tamper_diff:
         full_diff.write_text("TAMPERED DIFF\n", encoding="utf-8")
-    scope = workdir / "review-scope.json"
+    scope = handoff_dir / "review-scope.json"
     scope_document = manifest or {
         "schema": 1,
         "repository": "example/repo",
@@ -2876,6 +3308,33 @@ def _run_opencode_canonicalize(
         "head_sha": attempt_head,
         "files": [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}],
     }
+    requested_merge_base = scope_document.get("merge_base_sha")
+    requested_manifest_head = scope_document.get("head_sha")
+    if trusted_workspace is None:
+        subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workdir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=workdir, check=True)
+        subprocess.run(["git", "commit", "--allow-empty", "-qm", "base"], cwd=workdir, check=True)
+        actual_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=workdir, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        hunk = re.search(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", git_diff, re.MULTILINE)
+        line_count = (int(hunk.group(1)) + max(int(hunk.group(2) or "1"), 1) - 1) if hunk else 1
+        for record in scope_document.get("files", []):
+            if record.get("status") == "removed" or not isinstance(record.get("filename"), str):
+                continue
+            target = workdir / record["filename"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("".join(f"line {n}\n" for n in range(1, line_count + 1)), encoding="utf-8")
+            subprocess.run(["git", "add", "--", record["filename"]], cwd=workdir, check=True)
+        subprocess.run(["git", "commit", "--allow-empty", "-qm", "head"], cwd=workdir, check=True)
+        attempt_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=workdir, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        if requested_merge_base == "ab" * 20:
+            scope_document["merge_base_sha"] = "00" * 20 if git_failure or not hunk else actual_base
+        if requested_manifest_head in {"cd" * 20, attempt_head}:
+            scope_document["head_sha"] = attempt_head
     scope_bytes = json.dumps(scope_document, ensure_ascii=False).encode("utf-8")
     scope.write_bytes(scope_bytes)
     scope_sha256 = hashlib.sha256(scope_bytes).hexdigest()
@@ -2884,6 +3343,64 @@ def _run_opencode_canonicalize(
     if remove_prepared_artifacts:
         full_diff.unlink()
         scope.unlink()
+    effective_checks = (
+        check_runs
+        if check_runs is not None
+        else [
+            attestation
+            for comment in before
+            for attestation in [_maybe_opencode_attestation(comment)]
+            if attestation is not None
+            if comment.get("body", "").startswith(
+                f"{OPENCODE_HEADER}\n{OPENCODE_V2_MARKER}\n"
+            )
+            and re.search(r"<!-- automation-state:(\{.*\}) -->", comment.get("body", ""))
+        ]
+    )
+    workflow_runs = []
+    for check in effective_checks:
+        match = re.match(r"<!-- automation-attestation:(\{.*\}) -->", check.get("output", {}).get("text", ""))
+        if not match:
+            continue
+        payload = json.loads(match.group(1))
+        workflow_runs.append({
+            "run_id": payload["run_id"], "run_attempt": payload["run_attempt"],
+            "run": {
+                "id": payload["run_id"], "run_attempt": payload["run_attempt"],
+                "status": "completed", "conclusion": "success", "head_sha": "de" * 20,
+                "event": "pull_request", "path": ".github/workflows/pr-review.yml",
+                "pull_requests": [],
+                "referenced_workflows": [{"path": payload["referenced_workflow_path"], "sha": payload["referenced_workflow_sha"], "ref": "refs/tags/v1.45"}],
+            },
+            "jobs": [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "success"}],
+        })
+    attestations = handoff_dir / "opencode-attestations-before.json"
+    attestations.write_text(json.dumps({"check_runs": effective_checks, "workflow_runs": workflow_runs}), encoding="utf-8")
+    handoff = handoff_dir / "handoff.json"
+    sealed_files = {
+        "opencode-attestations-before.json": hashlib.sha256(attestations.read_bytes()).hexdigest(),
+        "opencode-comments-before.json": snapshot_sha256,
+    }
+    if diff_ready == "true":
+        sealed_files.update({
+            "review-full.diff": hashlib.sha256(full_diff.read_bytes()).hexdigest(),
+            "review-scope.json": hashlib.sha256(scope.read_bytes()).hexdigest(),
+        })
+    handoff_document = {
+        "schema": 1, "repository": "example/repo", "server_url": "https://github.com",
+        "workflow": ".github/workflows/opencode-auto-review.yml", "pr": 7,
+        "caller_workflow_path": ".github/workflows/pr-review.yml",
+        "caller_event": caller_event, "candidate_nonce": "66" * 32,
+        "referenced_workflow_path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "referenced_workflow_sha": "45" * 20,
+        "run_id": int(run_id), "run_attempt": int(run_attempt), "attempt_head": attempt_head,
+        "merge_base_sha": scope_document.get("merge_base_sha", "") if diff_ready == "true" else None,
+        "diff_ready": diff_ready == "true", "diff_mode": diff_mode,
+        "unchanged_since_previous": unchanged_since_previous == "true",
+        "full_diff_sha256": full_diff_sha256,
+        "files": sealed_files,
+    }
+    handoff.write_text(json.dumps(handoff_document), encoding="utf-8")
     bin_dir = workdir / "bin"
     bin_dir.mkdir(exist_ok=True)
     git_output = workdir / "git-output.txt"
@@ -2908,24 +3425,40 @@ def _run_opencode_canonicalize(
         "DIFF_MODE": diff_mode,
         "UNCHANGED_SINCE_PREVIOUS": unchanged_since_previous,
         "FULL_DIFF_SHA256": full_diff_sha256,
-        "MANIFEST_SHA256": scope_sha256,
+        "HANDOFF_ARTIFACT_ID": "1234",
+        "HANDOFF_ARTIFACT_DIGEST": "56" * 32,
+        "HANDOFF_PATH": str(handoff),
         "REVIEW_OUTCOME": outcome,
         "SNAPSHOT_PATH": str(snapshot_override or snapshot),
-        "SNAPSHOT_SHA256": snapshot_sha256_override or snapshot_sha256,
+        "ATTESTATIONS_PATH": str(attestations),
         "REVIEW_DIFF_PATH": str(full_diff),
         "REVIEW_SCOPE_PATH": str(scope),
         "SERVER_URL": "https://github.com",
         "REPOSITORY": "example/repo",
+        "WORKFLOW_NAME": ".github/workflows/opencode-auto-review.yml",
+        "TRUSTED_WORKSPACE": str(trusted_workspace or workdir),
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "GIT_ARGV_LOG": str(git_log),
         "GIT_DIFF_OUTPUT": str(git_output),
         "GIT_FAILURE": "true" if git_failure else "false",
     }
+    after_with_nonce = []
+    for comment in after:
+        item = json.loads(json.dumps(comment))
+        if inject_candidate_nonce and item.get("body", "").startswith(f"{OPENCODE_MARKER}\n"):
+            item["body"] = item["body"].replace(
+                f"{OPENCODE_MARKER}\n",
+                f"{OPENCODE_MARKER}\n<!-- automation-candidate:{'66' * 32} -->\n",
+                1,
+            )
+        after_with_nonce.append(item)
     return _run_upsert(
-        tmp_path, "opencode-auto-review.yml", "opencode-review", "Canonicalize OpenCode review",
-        env, after, cwd=workdir, current_head=current_head or attempt_head, expect_error=expect_error,
+        tmp_path, "opencode-auto-review.yml", "opencode-canonicalize", "Canonicalize OpenCode review",
+        env, after_with_nonce, cwd=workdir, current_head=current_head or attempt_head, expect_error=expect_error,
         fail_update_comment_ids=fail_update_comment_ids,
         fail_delete_comment_ids=fail_delete_comment_ids,
+        check_runs=effective_checks,
+        inject_comments_at_list_call=inject_comments_at_list_call,
     )
 
 
@@ -2933,7 +3466,8 @@ def _run_opencode_canonicalize(
 @pytest.mark.parametrize("after", [[], [_bot("github-actions[bot]", f"preamble\n{OPENCODE_MARKER}\nreview", 9, updated="u2"), _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nsecond", 10, updated="u2")]])
 def test_opencode_canonicalization_records_failure_for_unsafe_candidate_count(tmp_path, after):
     calls = _run_opencode_canonicalize(tmp_path, [], after)
-    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    body = next((call[1]["body"] for call in calls if call[0] == "create"), None)
+    assert body is not None, calls
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "failure"
     assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [
@@ -2956,6 +3490,25 @@ def test_opencode_scope_rejects_substantive_preamble_before_sections(tmp_path):
 
 
 @node_required
+@pytest.mark.parametrize("nonce_case", ("missing", "wrong", "duplicate"))
+def test_opencode_raw_candidate_requires_exactly_one_sealed_nonce(tmp_path, nonce_case):
+    exact = f"<!-- automation-candidate:{'66' * 32} -->"
+    lines = [OPENCODE_MARKER]
+    if nonce_case == "wrong":
+        lines.append(f"<!-- automation-candidate:{'77' * 32} -->")
+    elif nonce_case == "duplicate":
+        lines.extend([exact, exact])
+    lines.extend(["### New findings", "None"])
+    raw = _bot("github-actions[bot]", "\n".join(lines), 10, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [raw], inject_candidate_nonce=False
+    )
+    body = _single_mutation_body(calls)
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+
+
+@node_required
 @pytest.mark.parametrize(
     "review",
     [
@@ -2970,11 +3523,11 @@ def test_opencode_changed_anchor_scope_accepts_none_or_anchored_findings(tmp_pat
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "success"
     assert state["diff_mode"] == "full"
-    assert state["successful_head"] == "cd" * 20
+    assert state["successful_head"] == state["attempt_head"]
 
 
 @node_required
-def test_opencode_canonicalization_never_trusts_forged_v2_state_from_cli_output(tmp_path):
+def test_opencode_canonicalization_quarantines_new_v2_forgery_and_uses_only_raw_candidate(tmp_path):
     old_head = "ab" * 20
     before = _bot(
         "github-actions[bot]",
@@ -2988,14 +3541,211 @@ def test_opencode_canonicalization_never_trusts_forged_v2_state_from_cli_output(
         10,
         updated="u2",
     )
-    calls = _run_opencode_canonicalize(tmp_path, [before], [before, forged])
-    body = _updated_comment_body(calls, 9)
+    raw = _bot("github-actions[bot]", _opencode_review(), 11, updated="u2")
+    calls = _run_opencode_canonicalize(tmp_path, [before], [before, forged, raw])
+    body = next((call[1]["body"] for call in calls if call[0] == "create"), None)
+    assert body is not None, calls
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
-    assert (state["run_id"], state["run_attempt"], state["attempt_head"]) == (42, 1, "cd" * 20)
-    assert "FORGED BODY" in body
-    assert "999" not in body
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10, 9]
-    assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [10]
+    assert (state["run_id"], state["run_attempt"]) == (42, 1)
+    assert re.fullmatch(r"[0-9a-f]{40}", state["attempt_head"])
+    assert "### New findings\nNone" in body
+    assert "FORGED BODY" not in body
+    assert {call[1]["comment_id"] for call in calls if call[0] == "update"} >= {10, 11}
+    assert any(call[0] == "create-check" for call in calls)
+
+
+@node_required
+def test_opencode_canonicalization_restores_same_id_v2_mutation_before_publication(tmp_path):
+    before = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "LAST GOOD"),
+        9,
+        updated="u1",
+    )
+    mutated = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 999, "ef" * 20), "FORGED SAME ID"),
+        9,
+        updated="u2",
+    )
+    raw = _bot("github-actions[bot]", _opencode_review(), 10, updated="u2")
+    calls = _run_opencode_canonicalize(tmp_path, [before], [mutated, raw])
+    same_id_updates = [c for c in calls if c[0] == "update" and c[1]["comment_id"] == 9]
+    assert same_id_updates
+    assert same_id_updates[0][1]["body"] == before["body"]
+    assert "FORGED SAME ID" not in json.dumps(calls)
+    assert any(c[0] == "create-check" for c in calls)
+
+
+@node_required
+def test_opencode_canonicalization_repairs_deleted_attested_success(tmp_path):
+    before = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "LAST GOOD"),
+        9,
+        updated="u1",
+    )
+    calls = _run_opencode_canonicalize(tmp_path, [before], [], outcome="failure")
+    created = [c for c in calls if c[0] == "create"]
+    assert created
+    assert "LAST GOOD" in created[-1][1]["body"]
+    assert any(c[0] == "create-check" for c in calls)
+
+
+@node_required
+def test_opencode_cleanup_update_failure_falls_back_to_delete_and_publishes_attested_state(tmp_path):
+    forged = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 999, "ef" * 20), "FORGED"),
+        10,
+        updated="u2",
+    )
+    raw = _bot("github-actions[bot]", _opencode_review(), 11, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [forged, raw], fail_update_comment_ids=[10]
+    )
+    assert any(c[0] == "delete" and c[1]["comment_id"] == 10 for c in calls)
+    canonical = [c for c in calls if c[0] == "create"][-1][1]["body"]
+    assert "### New findings\nNone" in canonical and "FORGED" not in canonical
+    assert any(c[0] == "create-check" for c in calls)
+
+
+@node_required
+def test_opencode_presnapshot_unattested_claims_do_not_permanently_exhaust_live_authentication(tmp_path):
+    stranded = [
+        _bot(
+            "github-actions[bot]",
+            _opencode_v2_body(
+                _state_line("opencode", 7, 1000 + index, f"{index:040x}"),
+                f"STRANDED {index}",
+            ),
+            100 + index,
+            updated="u1",
+        )
+        for index in range(21)
+    ]
+    raw = _bot("github-actions[bot]", _opencode_review(), 500, updated="u2")
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        stranded,
+        [*stranded, raw],
+        check_runs=[],
+    )
+
+    assert any(call[0] == "create-check" for call in calls)
+    assert any(call[0] == "create" for call in calls)
+
+
+@node_required
+def test_opencode_fresh_generation_before_receipt_success_aborts_and_discards_own_comment(tmp_path):
+    newer = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 43, "cd" * 20),
+            "NEWER TRUSTED REVIEW",
+        ),
+        90,
+        updated="u3",
+    )
+    check = _opencode_attestation(newer)
+    raw = _bot("github-actions[bot]", _opencode_review(), 10, updated="u2")
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [raw],
+        check_runs=[check],
+        inject_comments_at_list_call={5: [newer]},
+        expect_error=True,
+    )
+
+    created_id = next(call[1]["body"] for call in calls if call[0] == "create")
+    assert created_id
+    assert any(
+        call[0] == "update-check" and call[1].get("conclusion") == "failure"
+        for call in calls
+    )
+    assert any(call[0] in {"update", "delete"} for call in calls)
+
+
+@node_required
+def test_opencode_retires_only_attested_canonicals_older_than_latest_fallback(tmp_path):
+    older = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 40, "ab" * 20), "OLDER"),
+        8,
+        updated="u1",
+    )
+    latest = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "LATEST"),
+        9,
+        updated="u1",
+    )
+    raw = _bot("github-actions[bot]", _opencode_review(), 10, updated="u2")
+
+    calls = _run_opencode_canonicalize(tmp_path, [older, latest], [older, latest, raw])
+
+    retired_ids = {
+        call[1]["comment_id"]
+        for call in calls
+        if call[0] in {"update", "delete"} and call[1].get("comment_id") in {8, 9}
+    }
+    assert 8 in retired_ids
+    assert 9 not in retired_ids
+    assert any(call[0] == "create-check" for call in calls)
+
+
+@node_required
+def test_opencode_retired_older_tombstone_may_remain_when_delete_fails(tmp_path):
+    older = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 40, "ab" * 20), "OLDER"),
+        8,
+        updated="u1",
+    )
+    latest = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "LATEST"),
+        9,
+        updated="u1",
+    )
+    raw = _bot("github-actions[bot]", _opencode_review(), 10, updated="u2")
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [older, latest],
+        [older, latest, raw],
+        fail_delete_comment_ids=[8],
+    )
+
+    assert any(call[0] == "update" and call[1].get("comment_id") == 8 for call in calls)
+    assert not any(call[0] == "update" and call[1].get("comment_id") == 9 for call in calls)
+    assert any(call[0] == "create-check" for call in calls)
+
+
+@node_required
+def test_opencode_canonicalizer_rejects_non_pull_request_caller_event(tmp_path):
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [],
+        caller_event="workflow_dispatch",
+    )
+
+    assert not any(call[0] in {"create", "create-check"} for call in calls)
+
+
+@node_required
+def test_opencode_cleanup_double_failure_blocks_publication(tmp_path):
+    forged = _bot("github-actions[bot]", _opencode_v2_body(
+        _state_line("opencode", 7, 999, "ef" * 20), "FORGED"), 10, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [forged], expect_error=True,
+        fail_update_comment_ids=[10], fail_delete_comment_ids=[10],
+    )
+    assert not any(c[0] in {"create", "create-check"} for c in calls)
 
 
 @node_required
@@ -3019,9 +3769,9 @@ def test_opencode_existing_candidate_tombstones_before_canonical_and_tolerates_d
         for call in calls
         if call[0] in {"update", "delete"}
     ]
-    assert mutations == [("update", 10), ("update", 9), ("delete", 10)]
+    assert mutations == [("update", 10), ("delete", 10)]
     raw_tombstone = [call for call in calls if call[0] == "update"][0][1]["body"]
-    canonical = [call for call in calls if call[0] == "update"][1][1]["body"]
+    canonical = [call for call in calls if call[0] == "create"][-1][1]["body"]
     assert OPENCODE_MARKER not in raw_tombstone
     assert OPENCODE_V2_MARKER not in raw_tombstone
     assert "RAW MODEL OUTPUT" not in raw_tombstone
@@ -3030,7 +3780,7 @@ def test_opencode_existing_candidate_tombstones_before_canonical_and_tolerates_d
 
 
 @node_required
-def test_opencode_tombstone_update_failure_leaves_canonical_untouched(tmp_path):
+def test_opencode_tombstone_update_failure_falls_back_to_delete(tmp_path):
     old = _bot(
         "github-actions[bot]",
         _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "CANONICAL"),
@@ -3042,11 +3792,12 @@ def test_opencode_tombstone_update_failure_leaves_canonical_untouched(tmp_path):
     )
 
     calls = _run_opencode_canonicalize(
-        tmp_path, [old], [old, candidate], expect_error=True, fail_update_comment_ids=[10]
+        tmp_path, [old], [old, candidate], fail_update_comment_ids=[10]
     )
 
     assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10]
-    assert not any(call[0] == "delete" for call in calls)
+    assert any(call[0] == "delete" and call[1]["comment_id"] == 10 for call in calls)
+    assert any(call[0] == "create-check" for call in calls)
 
 
 @node_required
@@ -3071,7 +3822,7 @@ def test_opencode_current_state_parser_ignores_impossible_success_before_generat
     calls = _run_opencode_canonicalize(
         tmp_path, [invalid_existing], [invalid_existing, candidate], attempt_head=head,
     )
-    assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["update"]
+    assert any(call[0] == "create" for call in calls)
 
 
 @node_required
@@ -3093,7 +3844,7 @@ def test_opencode_current_state_parser_ignores_success_without_covered_diff_mode
     calls = _run_opencode_canonicalize(
         tmp_path, [uncovered_existing], [uncovered_existing, candidate], attempt_head=head,
     )
-    assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["update"]
+    assert any(call[0] == "create" for call in calls)
 
 
 @node_required
@@ -3200,20 +3951,65 @@ def test_opencode_changed_anchor_uses_final_colon_and_literal_git_argv(tmp_path)
     )
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "success"
-    argv = (tmp_path / "opencode-canonicalize" / "git-argv.txt").read_text(encoding="utf-8").splitlines()
-    assert argv == [
-        "--no-replace-objects",
-        "--literal-pathspecs",
-        "-c",
-        "diff.external=",
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "-U0",
-        f"{'ab' * 20}..{'cd' * 20}",
-        "--",
-        leading_dash_path,
-    ]
+    assert not (tmp_path / "opencode-canonicalize" / "git-argv.txt").exists()
+
+
+def _tiny_git_repo(path: Path) -> tuple[str, str]:
+    path.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
+    (path / "stable.txt").write_text("unchanged\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", "stable.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=path, check=True)
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True, text=True).stdout.strip()
+    (path / "changed.txt").write_text("added\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", "changed.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "head"], cwd=path, check=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True, text=True).stdout.strip()
+    return base, head
+
+
+@node_required
+def test_opencode_absolute_git_ignores_path_shim_and_rejects_unchanged_anchor(tmp_path):
+    repo = tmp_path / "repo"
+    base, head = _tiny_git_repo(repo)
+    manifest = {"schema": 1, "repository": "example/repo", "pr_number": 7,
+                "merge_base_sha": base, "head_sha": head,
+                "files": [{"status": "modified", "filename": "stable.txt"}]}
+    raw = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\n### New findings\n#### Fake\n- Changed anchor: `stable.txt:1`", 10, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [raw], attempt_head=head, current_head=head, manifest=manifest,
+        trusted_workspace=repo, git_diff="@@ -0,0 +1,1 @@\n+fake\n",
+    )
+    body = [call for call in calls if call[0] == "create"][-1][1]["body"]
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+    assert not (tmp_path / "opencode-canonicalize" / "git-argv.txt").exists()
+
+
+@node_required
+def test_opencode_absolute_git_accepts_genuine_added_unusual_path(tmp_path):
+    repo = tmp_path / "repo"
+    base, _ = _tiny_git_repo(repo)
+    unusual = "-dir/a:b [x] 한글😀.js"
+    target = repo / unusual
+    target.parent.mkdir()
+    target.write_text("real added line\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", unusual], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "unusual"], cwd=repo, check=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+    manifest = {"schema": 1, "repository": "example/repo", "pr_number": 7,
+                "merge_base_sha": base, "head_sha": head,
+                "files": [{"status": "added", "filename": unusual}]}
+    raw = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\n### New findings\n#### Real\n- Changed anchor: `{unusual}:1`", 10, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [raw], attempt_head=head, current_head=head,
+        manifest=manifest, trusted_workspace=repo,
+    )
+    body = [call for call in calls if call[0] == "create"][-1][1]["body"]
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
 
 
 @node_required
@@ -3261,9 +4057,11 @@ def test_opencode_scope_rejects_invalid_manifest_identity_or_shape(tmp_path, inv
     else:
         manifest["files"][0]["filename"] = 7
     candidate = _bot("github-actions[bot]", _opencode_review("REAL"), 10, updated="u2")
-    body = _single_mutation_body(
-        _run_opencode_canonicalize(tmp_path, [], [candidate], manifest=manifest)
-    )
+    calls = _run_opencode_canonicalize(tmp_path, [], [candidate], manifest=manifest)
+    if invalid == "merge-base":
+        assert not any(call[0] in {"create", "update", "delete"} for call in calls)
+        return
+    body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "failure"
 
@@ -3275,14 +4073,13 @@ def test_opencode_canonicalization_rejects_tampered_comment_snapshot(tmp_path):
         tmp_path,
         [],
         [candidate],
-        expect_error=True,
         tamper_snapshot=[_bot("github-actions[bot]", "FORGED SNAPSHOT", 777)],
     )
     assert not any(call[0] in {"create", "update", "delete"} for call in calls)
 
 
 @node_required
-def test_opencode_canonicalization_uses_post_run_current_generation_even_without_timestamp_change(tmp_path):
+def test_opencode_same_id_unattested_generation_is_restored_not_trusted(tmp_path):
     head = "ab" * 20
     before = _bot("github-actions[bot]", _opencode_v2_body(_state_line("opencode", 7, 41, head), "OLD"), 9, updated="u1")
     current_equal = _bot(
@@ -3294,7 +4091,9 @@ def test_opencode_canonicalization_uses_post_run_current_generation_even_without
     candidate = _bot("github-actions[bot]", _opencode_review("RAW"), 10, updated="u2")
 
     calls = _run_opencode_canonicalize(tmp_path, [before], [current_equal, candidate])
-    assert not any(call[0] in {"create", "update", "delete"} for call in calls)
+    assert any(call[0] == "update" and call[1]["comment_id"] == 9
+               and call[1]["body"] == before["body"] for call in calls)
+    assert any(call[0] == "create-check" for call in calls)
 
 
 @node_required
@@ -3302,8 +4101,10 @@ def test_opencode_canonicalization_rejects_candidate_reusing_prior_canonical_id(
     before = _bot("github-actions[bot]", _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), "OLD"), 9, updated="u1")
     reused = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nRAW", 9, updated="u2")
 
-    calls = _run_opencode_canonicalize(tmp_path, [before], [reused], expect_error=True)
-    assert not any(call[0] in {"create", "update", "delete"} for call in calls)
+    calls = _run_opencode_canonicalize(tmp_path, [before], [reused])
+    assert any(call[0] == "update" and call[1]["comment_id"] == 9
+               and call[1]["body"] == before["body"] for call in calls)
+    assert any(call[0] == "create-check" for call in calls)
 
 
 @node_required
@@ -3320,8 +4121,9 @@ def test_opencode_canonicalization_rejects_any_candidate_reusing_preexisting_id(
     before = _bot("github-actions[bot]", prior_body, 9, updated="u1")
     reused = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nRAW", 9, updated="u2")
 
-    calls = _run_opencode_canonicalize(tmp_path, [before], [reused], expect_error=True)
-    assert not any(call[0] in {"create", "update", "delete"} for call in calls)
+    calls = _run_opencode_canonicalize(tmp_path, [before], [reused])
+    assert any(call[0] in {"update", "delete"} and call[1]["comment_id"] == 9 for call in calls)
+    assert any(call[0] == "create-check" for call in calls)
 
 
 @node_required
@@ -3338,17 +4140,17 @@ def test_opencode_snapshot_output_contract_reaches_canonicalizer(tmp_path):
     assert snapshot.read_bytes() == expected_bytes
     assert outputs["snapshot_sha256"] == hashlib.sha256(expected_bytes).hexdigest()
     workflow = _load("opencode-auto-review.yml")
-    canonicalize = _step(workflow, "opencode-review", "Canonicalize OpenCode review")
-    assert canonicalize["env"]["SNAPSHOT_PATH"] == "${{ steps.ctx.outputs.snapshot_path }}"
-    assert canonicalize["env"]["SNAPSHOT_SHA256"] == "${{ steps.ctx.outputs.snapshot_sha256 }}"
+    canonicalize = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")
+    assert canonicalize["env"]["SNAPSHOT_PATH"].endswith("/opencode-comments-before.json")
+    assert canonicalize["env"]["HANDOFF_ARTIFACT_DIGEST"] == "${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}"
 
     candidate = _bot("github-actions[bot]", _opencode_review("REAL REVIEW"), 10, updated="u2")
     calls = _run_opencode_canonicalize(
         tmp_path, comments, [comments[0], candidate],
-        snapshot_override=snapshot, snapshot_sha256_override=outputs["snapshot_sha256"],
     )
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10, 9]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10]
     assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [10]
+    assert any(call[0] == "create-check" for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -3379,7 +4181,7 @@ def test_opencode_current_state_parser_ignores_bad_visible_run_url(tmp_path, bad
     candidate = _bot("github-actions[bot]", _opencode_review("REAL REVIEW"), 10, updated="u2")
 
     calls = _run_opencode_canonicalize(tmp_path, [old], [old, bad_current, candidate])
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10, 9]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11, 10]
     assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [10]
 
 
@@ -3394,18 +4196,23 @@ def test_opencode_two_rounds_update_one_canonical_comment_and_enforce_generation
     )
     after = _bot("github-actions[bot]", _opencode_review("SECOND REVIEW"), 10, updated="u2")
     calls = _run_opencode_canonicalize(tmp_path, [old], [old, after], run_id="42", run_attempt="1")
-    updates = [call for call in calls if call[0] == "update"]
-    assert [call[1]["comment_id"] for call in updates] == [10, 9]
-    wrapped = updates[1][1]["body"]
+    wrapped = [call for call in calls if call[0] == "create"][-1][1]["body"]
+    assert any(call[0] == "create-check" for call in calls)
 
     round_two = _bot("github-actions[bot]", _opencode_review("THIRD REVIEW"), 11, updated="u3")
-    current = _bot("github-actions[bot]", wrapped, 9, updated="u2")
-    calls = _run_opencode_canonicalize(tmp_path, [current], [current, round_two], run_id="42", run_attempt="2")
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11, 9]
+    wrapped = re.sub(r"^- Attestation: [1-9][0-9]*$", "- Attestation: 900101", wrapped, flags=re.MULTILINE)
+    current = _bot("github-actions[bot]", wrapped, 101, updated="u2")
+    round_two_dir = tmp_path / "round-two"
+    round_two_dir.mkdir()
+    calls = _run_opencode_canonicalize(round_two_dir, [current], [current, round_two], run_id="42", run_attempt="2")
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11]
     assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [11]
+    assert any(call[0] == "create-check" for call in calls)
 
     stale_raw = _bot("github-actions[bot]", _opencode_review("STALE REVIEW"), 12, updated="u4")
-    calls = _run_opencode_canonicalize(tmp_path, [current], [current, stale_raw], run_id="42", run_attempt="1")
+    stale_dir = tmp_path / "stale"
+    stale_dir.mkdir()
+    calls = _run_opencode_canonicalize(stale_dir, [current], [current, stale_raw], run_id="42", run_attempt="1")
     assert not any(call[0] in {"create", "update", "delete"} for call in calls)
 
 
@@ -3415,7 +4222,9 @@ def test_opencode_canonicalization_discards_stale_head_and_allows_zero_fresh_can
     stale = _run_opencode_canonicalize(tmp_path, [], [candidate], current_head="ef" * 20)
     assert not any(call[0] in {"create", "update"} for call in stale)
 
-    calls = _run_opencode_canonicalize(tmp_path, [candidate], [candidate])
+    retry = tmp_path / "retry"
+    retry.mkdir()
+    calls = _run_opencode_canonicalize(retry, [candidate], [candidate])
     body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "failure"
@@ -3440,7 +4249,7 @@ def test_opencode_checkpoint_requires_cli_success_and_sanitized_candidate(
     assert f"- Status: {expected_status}" in body
     assert state["attempt_status"] == expected_status
     if expected_status == "success":
-        assert state["successful_head"] == "cd" * 20
+        assert state["successful_head"] == state["attempt_head"]
         assert state["full_diff_sha256"] == hashlib.sha256(b"TRUSTED FULL DIFF\n").hexdigest()
     else:
         assert state["successful_head"] is None
@@ -3497,7 +4306,7 @@ def test_opencode_unchanged_advances_without_cli_candidate_and_preserves_body(tm
     assert "LAST GOOD OPENCODE REVIEW" in body
     assert state["attempt_status"] == "success"
     assert state["diff_mode"] == "unchanged"
-    assert state["successful_head"] == new_head
+    assert state["successful_head"] == state["attempt_head"]
     assert state["full_diff_sha256"] == full_hash
 
 
@@ -3606,8 +4415,8 @@ def test_opencode_output_sanitizer_preserves_normal_last_attempt_prose(tmp_path)
 
 
 def test_opencode_concurrency_and_rereview_marker_extraction_accept_v1_and_v2():
-    job = _load("opencode-auto-review.yml")["jobs"]["opencode-review"]
-    assert job["concurrency"] == {
+    workflow = _load("opencode-auto-review.yml")
+    assert workflow["concurrency"] == {
         "group": "automation-opencode-auto-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
         "cancel-in-progress": "true",
     }
