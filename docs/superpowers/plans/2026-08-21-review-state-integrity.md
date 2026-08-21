@@ -4,7 +4,7 @@
 
 **Goal:** Make Claude, Gemini, and OpenCode review checkpoints provenance-bound, coverage-aware, sanitized before success evaluation, and immune to stale-run overwrites.
 
-**Architecture:** Each workflow keeps its existing model integration but adopts the same v2 canonical comment envelope and state transition rules. The workflow—not the model—constructs reserved metadata, and every write is guarded by the captured PR head and monotonic run ID. This slice uses the existing diff preparation paths with explicit readiness flags; the second plan replaces those paths with the shared deterministic action.
+**Architecture:** Each workflow keeps its existing model integration but adopts the same v2 canonical comment envelope and state transition rules. The workflow—not the model—constructs reserved metadata, and every write is guarded by the captured PR head and monotonic `(run_id, run_attempt)` generation. This slice uses the existing diff preparation paths with explicit readiness flags; the second plan replaces those paths with the shared deterministic action.
 
 **Tech Stack:** GitHub Actions YAML, Bash, jq, JavaScript in `actions/github-script`, Python pytest harnesses, Node.js workflow-script harness.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- A successful checkpoint requires a prepared review input, successful model step, non-empty sanitized body, current captured head, and non-stale run ID.
+- A successful checkpoint requires a prepared review input, successful model step, non-empty sanitized body, current captured head, and a strictly newer `(run_id, run_attempt)` generation.
 - A validated previous successful checkpoint with an unchanged full-diff hash is the only model-free checkpoint path; that optimization belongs to the second plan.
 - Legacy comments may be display targets but never trusted input state.
 - Reserved header, marker, visible metadata, and JSON state lines are workflow-generated only.
@@ -30,7 +30,7 @@
 
 **Interfaces:**
 - Consumes: issue comments returned by `gh api repos/$GITHUB_REPOSITORY/issues/$PR_NUM/comments --paginate`.
-- Produces: a canonical v2 state line with fields `schema`, `reviewer`, `pr`, `run_id`, `attempt_head`, `successful_head`, `attempt_status`, `diff_mode`, and `full_diff_sha256`; validated previous body and successful SHA for later tasks.
+- Produces: a canonical v2 state line with fields `schema`, `reviewer`, `pr`, `run_id`, `run_attempt`, `attempt_head`, `successful_head`, `attempt_status`, `diff_mode`, and `full_diff_sha256`; validated previous body and successful SHA for later tasks.
 
 - [ ] **Step 1: Add failing canonical-selection fixtures**
 
@@ -40,12 +40,13 @@ Add helpers that build the exact prefix and state line, then add tests for a val
 CLAUDE_HEADER = "## Claude Code Review (latest)"
 CLAUDE_V2_MARKER = "<!-- automation:claude-code-review:v2 -->"
 
-def _state_line(reviewer: str, pr: int, run_id: int, head: str) -> str:
+def _state_line(reviewer: str, pr: int, run_id: int, head: str, run_attempt: int = 1) -> str:
     state = {
         "schema": 2,
         "reviewer": reviewer,
         "pr": pr,
         "run_id": run_id,
+        "run_attempt": run_attempt,
         "attempt_head": head,
         "successful_head": head,
         "attempt_status": "success",
@@ -66,7 +67,7 @@ Expected: new tests fail because collection still uses `Bot && contains(marker)`
 
 - [ ] **Step 3: Implement strict Claude collection parsing**
 
-Replace the broad jq selector with a jq program that requires exact first lines, parses the state JSON with `fromjson?`, validates all fields, and selects the largest numeric `run_id`. Export the validated state separately from sanitized review prose.
+Replace the broad jq selector with a jq program that requires exact first lines, parses the state JSON with `fromjson?`, validates all fields, and selects the largest lexicographic `(run_id, run_attempt)` generation. Export the validated state separately from sanitized review prose.
 
 ```jq
 def parsed_state($header; $marker; $reviewer; $pr):
@@ -77,11 +78,12 @@ def parsed_state($header; $marker; $reviewer; $pr):
   | ($lines[2] | capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$").json? | fromjson?) as $s
   | select($s.schema == 2 and $s.reviewer == $reviewer and $s.pr == ($pr | tonumber))
   | select(($s.run_id | type) == "number" and $s.run_id > 0)
+  | select(($s.run_attempt | type) == "number" and $s.run_attempt > 0)
   | select(($s.attempt_head | test("^[0-9a-f]{40}$")))
   | {comment: ., state: $s};
 
 [.[] | parsed_state($header; $marker; $reviewer; $pr)]
-| sort_by(.state.run_id)
+| sort_by(.state.run_id, .state.run_attempt)
 | last // null
 ```
 
@@ -186,8 +188,8 @@ git commit -m "fix(review): gate Claude checkpoints on reviewed input"
 - Modify: `.github/workflows/claude-code-review.yml:75-440`
 
 **Interfaces:**
-- Consumes: captured attempt head, `github.run_id`, current PR head from `pulls.get`, and stored v2 `run_id`.
-- Produces: comment update only when `currentHead == attemptHead` and `storedRunId <= currentRunId`.
+- Consumes: captured attempt head, `github.run_id`, `github.run_attempt`, current PR head from `pulls.get`, and the stored v2 generation tuple.
+- Produces: comment update only when `currentHead == attemptHead` and the stored `(run_id, run_attempt)` is strictly older than the current tuple.
 
 - [ ] **Step 1: Extend the Node harness with PR-head API behavior**
 
@@ -200,7 +202,10 @@ rest: {
 }
 ```
 
-Add tests where the current head differs and where the existing state has a larger run ID. Assert there are no `createComment` or `updateComment` calls.
+Add tests where the current head differs, where the existing state has a larger run ID, and
+where the same run ID has an equal or larger attempt. Assert there are no `createComment`
+or `updateComment` calls. Add the positive case where a larger `run_attempt` under the same
+run ID is allowed.
 
 - [ ] **Step 2: Run stale-write tests and verify they fail**
 
@@ -218,13 +223,14 @@ if (pr.head?.sha !== attemptHead) {
   core.notice(`Discarding stale review for ${attemptHead}; current head is ${pr.head?.sha || 'unknown'}`);
   return;
 }
-if (existingState && BigInt(existingState.run_id) > BigInt(runId)) {
-  core.notice(`Discarding older run ${runId}; state is already at run ${existingState.run_id}`);
+if (existingState && (existingState.run_id > runId
+  || (existingState.run_id === runId && existingState.run_attempt >= runAttempt))) {
+  core.notice(`Discarding stale generation (${runId}, ${runAttempt})`);
   return;
 }
 ```
 
-Reject a missing/malformed captured head rather than posting success.
+Reject a missing/malformed captured head, run ID, or run attempt rather than posting success.
 
 - [ ] **Step 4: Add per-reviewer/PR job concurrency**
 
@@ -255,11 +261,11 @@ git commit -m "fix(review): reject stale Claude review writes"
 
 **Interfaces:**
 - Consumes: the Task 1 envelope schema and Task 3 compare-before-write rules.
-- Produces: Gemini v2 state with identical field meanings; Gemini-specific header, marker, model, and `-U20` diff mode remain unchanged.
+- Produces: Gemini v2 state with identical field meanings, including `(run_id, run_attempt)` ordering; Gemini-specific header, marker, model, and `-U20` diff mode remain unchanged.
 
 - [ ] **Step 1: Add Gemini parity tests**
 
-Parameterize the canonical-state and transition assertions across Claude and Gemini wherever the workflow shape permits. Add explicit Gemini tests for foreign bot marker quotation, malformed v2 state, unavailable `pr_diff.txt`, sanitized-empty output, stale head, newer run, and an older rate-limited run finishing after a newer success.
+Parameterize the canonical-state and transition assertions across Claude and Gemini wherever the workflow shape permits. Add explicit Gemini tests for foreign bot marker quotation, malformed v2 state, unavailable `pr_diff.txt`, sanitized-empty output, stale head, newer run, higher manual-rerun attempt, equal/lower generation rejection, and an older rate-limited run finishing after a newer success.
 
 - [ ] **Step 2: Verify current Gemini behavior fails the new contract**
 
@@ -308,12 +314,12 @@ git commit -m "fix(review): make Gemini state head-bound and monotonic"
 - Modify: `.github/workflows/opencode-auto-review.yml:75-250`
 
 **Interfaces:**
-- Consumes: before/after issue-comment snapshots, current run ID, captured head, an explicitly numbered full PR diff, and OpenCode marker-bearing output.
+- Consumes: before/after issue-comment snapshots, current run ID and attempt, captured head, an explicitly numbered full PR diff, and OpenCode marker-bearing output.
 - Produces: exactly one canonical OpenCode v2 comment; previous context only from validated OpenCode v2 state.
 
 - [ ] **Step 1: Add failing OpenCode provenance and candidate tests**
 
-Add cases for a genuine canonical state followed by a newer Claude/Gemini bot quote, a legacy OpenCode marker, a model preamble before the marker, zero current-run candidates, and two current-run candidates. The collection test must select the canonical OpenCode record by `run_id`; the canonicalization test must fail closed unless exactly one comment changed during the run.
+Add cases for a genuine canonical state followed by a newer Claude/Gemini bot quote, a legacy OpenCode marker, a model preamble before the marker, zero current-run candidates, and two current-run candidates. The collection test must select the canonical OpenCode record by `(run_id, run_attempt)`; the canonicalization test must fail closed unless exactly one comment changed during the run.
 
 - [ ] **Step 2: Run the focused tests**
 

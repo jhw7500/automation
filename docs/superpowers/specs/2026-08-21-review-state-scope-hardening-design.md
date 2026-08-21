@@ -82,7 +82,7 @@ generated after model output sanitization. Example:
 ```markdown
 ## Claude Code Review (latest)
 <!-- automation:claude-code-review:v2 -->
-<!-- automation-state:{"schema":2,"reviewer":"claude-code-review","pr":34,"run_id":1234,"attempt_head":"<sha>","successful_head":"<sha>","attempt_status":"success","diff_mode":"delta","full_diff_sha256":"<sha256>"} -->
+<!-- automation-state:{"schema":2,"reviewer":"claude-code-review","pr":34,"run_id":1234,"run_attempt":2,"attempt_head":"<sha>","successful_head":"<sha>","attempt_status":"success","diff_mode":"delta","full_diff_sha256":"<sha256>"} -->
 ```
 
 The model never generates or edits these lines. Output sanitization removes every reserved
@@ -102,15 +102,17 @@ A previous-state candidate is accepted only if all of the following hold:
 - the JSON contains only the supported schema and field types;
 - `reviewer` and `pr` match the running workflow;
 - SHA and hash fields have exact hexadecimal lengths;
-- `run_id` is a positive integer and the visible run URL matches the current repository;
+- `run_id` and `run_attempt` are positive safe integers and the visible run URL matches the current repository;
 - the visible run URL contains the same `run_id`; and
 - the comment author is a bot.
 
-Candidates are ordered by `run_id`, not comment list order or `updated_at`. The exact-prefix
-requirement is paired with output sanitization in every reviewer, so another reviewer's
-model body cannot accidentally manufacture a candidate. If validation cannot be completed,
-the workflow ignores the candidate and performs a full review. A marker appearing anywhere
-else in a body has no state meaning.
+Candidates are ordered lexicographically by `(run_id, run_attempt)`, not comment list order
+or `updated_at`. GitHub manual reruns retain their `run_id` and increment `run_attempt`, so
+the pair is the review generation. The exact-prefix requirement is paired with output
+sanitization in every reviewer, so another reviewer's model body cannot accidentally
+manufacture a candidate. If validation cannot be completed, the workflow ignores the
+candidate and performs a full review. A marker appearing anywhere else in a body has no
+state meaning.
 
 This is a provenance boundary against accidental or model-induced cross-reviewer marker
 echoes. A dedicated App identity remains a possible later defense-in-depth improvement, not
@@ -136,10 +138,13 @@ comment mutation the workflow must:
 1. refetch the PR head SHA;
 2. compare it with the head captured during input preparation;
 3. parse the current canonical state; and
-4. refuse the update if the stored `run_id` is greater than the current run ID.
+4. refuse the update unless the stored `(run_id, run_attempt)` generation is strictly older
+   than the current generation.
 
 This compare-before-write rule handles cancellation races and jobs already beyond a
-non-cancellable external API call.
+non-cancellable external API call. The head read and comment mutation are separate GitHub
+resources, so this remains an optimistic guard; eliminating the final push race would
+require an atomic conditional comment API or a different persistence design.
 
 ## 7. Deterministic PR Diff Preparation
 
