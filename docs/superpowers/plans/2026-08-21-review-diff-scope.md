@@ -34,6 +34,7 @@
 - CLI inputs: `--repository OWNER/REPO`, `--pr-number INT`, `--previous-sha SHA|''`, `--previous-full-hash HASH|''`, `--context-lines INT`, `--full-output PATH`, `--delta-output PATH`, `--manifest-output PATH`.
 - Environment: `GH_TOKEN` for `gh`; current Git repository is the consumer checkout.
 - JSON result: `diff_ready`, `diff_mode`, `head_sha`, `base_sha`, `full_diff_sha256`, `unchanged_since_previous`, and `warning`.
+- Scope manifest: schema, repository, PR number, merge-base SHA, head SHA, and decoded file records with `status`, `filename`, and optional `previous_filename`.
 
 - [ ] **Step 1: Write subprocess-backed unit tests**
 
@@ -319,10 +320,15 @@ Use context width `3`. Skip `opencode github run` when input is unavailable. Inc
 Require each non-`None` item under `### New findings` to include a line matching:
 
 ```regex
-^\s*- Changed anchor: `?[^`:\n]+:\d+`?\s*$
+^\s*- Changed anchor: `?(?<location>.+:\d+)`?\s*$
 ```
 
-Canonicalization checks that the anchor path/line exists in `review-scope.json`. Supporting unchanged evidence remains allowed only when the finding also contains a valid changed anchor. Invalid new-finding output is recorded as a failed attempt and cannot advance state.
+Split `location` at its final `:<decimal line>` delimiter so colons remain legal inside the
+path. Canonicalization checks that the decoded path exists in `review-scope.json`, then
+derives zero-context added-side hunk ranges from the manifest's merge-base/head and verifies
+the cited line is changed. Supporting unchanged evidence remains allowed only when the
+finding also contains a valid changed anchor. Invalid new-finding output is recorded as a
+failed attempt and cannot advance state.
 
 - [ ] **Step 5: Run and commit**
 

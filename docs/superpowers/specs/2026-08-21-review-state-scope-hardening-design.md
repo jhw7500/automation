@@ -165,7 +165,8 @@ output filenames, and context-line count. It writes:
 
 - the full PR diff;
 - an incremental diff when safe and non-empty;
-- a JSON scope manifest;
+- a JSON scope manifest containing schema, repository, PR number, merge-base SHA, head SHA,
+  and decoded file records (`status`, `filename`, and optional `previous_filename`);
 - the captured head SHA; and
 - outputs for `diff_ready`, `diff_mode`, `head_sha`, `full_diff_sha256`, and
   `unchanged_since_previous`.
@@ -250,8 +251,11 @@ All three prompts use the same semantic rule:
 
 Prompt-contract tests assert these requirements. The project does not attempt to prove the
 semantic explanation automatically, but OpenCode's canonicalization step rejects a new
-finding section that lacks the required changed-anchor form. Claude and Gemini remain
-bounded by their prepared diff input and receive the same instruction.
+finding section that lacks the required changed-anchor form. It parses the final
+`:<decimal line>` delimiter so legal colons in Git paths remain supported, verifies the path
+against the scope manifest, and verifies the line against an added-side hunk derived from
+the recorded merge-base and head. Claude and Gemini remain bounded by their prepared diff
+input and receive the same instruction.
 
 ## 10. Failure Behavior
 
