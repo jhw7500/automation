@@ -154,6 +154,7 @@ jobs:
               def state_semantics:
                 if .attempt_status == "success" then
                   .successful_head != null and .successful_head == .attempt_head and successful_pair
+                  and (.diff_mode == "full" or .diff_mode == "delta")
                 elif .attempt_status == "failure" then successful_pair
                 else false end;
               def parsed_state:
@@ -424,6 +425,7 @@ jobs:
                 || (/^[0-9a-f]{40}$/.test(state.successful_head || '') && /^[0-9a-f]{64}$/.test(state.full_diff_sha256 || ''));
               const validSemantics = state.attempt_status === 'success'
                 ? state.successful_head !== null && state.successful_head === state.attempt_head && validPair
+                  && ['full', 'delta'].includes(state.diff_mode)
                 : state.attempt_status === 'failure' && validPair;
               if (state.schema !== 2 || state.reviewer !== reviewer || state.pr !== issueNumber
                 || !validInteger(state.run_id) || !validInteger(state.run_attempt)

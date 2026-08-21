@@ -515,6 +515,22 @@ def test_claude_collect_rejects_extra_key_and_impossible_success_without_displac
     assert "NULL SUCCESS" not in context
 
 
+@pytest.mark.parametrize("diff_mode", ("unavailable", "unchanged"))
+def test_claude_collect_rejects_success_without_covered_diff_mode(tmp_path, diff_mode):
+    head = "ab" * 20
+    valid = _v2_body(CLAUDE_HEADER, CLAUDE_V2_MARKER, _state_line("claude", 7, 1, head), "VALID")
+    uncovered = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 99, head, diff_mode=diff_mode),
+        f"UNCOVERED {diff_mode}",
+    )
+    context = _run_collect(tmp_path, [_bot("github-actions[bot]", uncovered), _bot("github-actions[bot]", valid)])
+    assert context is not None
+    assert "VALID" in context
+    assert f"UNCOVERED {diff_mode}" not in context
+
+
 def test_claude_collect_excludes_generated_first_failure_from_context(tmp_path):
     calls = _claude_upsert(
         tmp_path, "failure", [], with_review=False, attempt_head="ab" * 20,
@@ -1031,6 +1047,21 @@ def test_gemini_collect_rejects_extra_key_and_impossible_success_without_displac
     assert "NULL SUCCESS" not in previous
 
 
+@pytest.mark.parametrize("diff_mode", ("unavailable", "unchanged"))
+def test_gemini_collect_rejects_success_without_covered_diff_mode(tmp_path, diff_mode):
+    head = "ab" * 20
+    valid = _v2_body(GEMINI_HEADER, GEMINI_V2_MARKER, _state_line("gemini", 7, 1, head), "VALID")
+    uncovered = _v2_body(
+        GEMINI_HEADER,
+        GEMINI_V2_MARKER,
+        _state_line("gemini", 7, 99, head, diff_mode=diff_mode),
+        f"UNCOVERED {diff_mode}",
+    )
+    previous = _run_gemini_collection(tmp_path, [_bot("github-actions[bot]", uncovered), _bot("github-actions[bot]", valid)])
+    assert "VALID" in previous
+    assert f"UNCOVERED {diff_mode}" not in previous
+
+
 def test_gemini_model_step_fails_closed_without_prepared_diff(tmp_path):
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
@@ -1331,6 +1362,35 @@ def test_claude_and_gemini_current_state_parsers_reject_invalid_schema_or_semant
     )
     calls = upsert(
         tmp_path, "success", [invalid_existing], with_review=True,
+        attempt_head=head, current_head=head,
+    )
+    assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["create"]
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V2_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V2_MARKER, _gemini_upsert),
+    ],
+)
+@pytest.mark.parametrize("diff_mode", ("unavailable", "unchanged"))
+def test_claude_and_gemini_current_state_parsers_ignore_success_without_covered_diff_mode(
+    tmp_path, reviewer, header, marker, upsert, diff_mode
+):
+    head = "ab" * 20
+    uncovered_existing = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            header, marker,
+            _state_line(reviewer, 7, 99, head, diff_mode=diff_mode),
+            f"UNCOVERED {diff_mode}",
+        ),
+        11,
+    )
+    calls = upsert(
+        tmp_path, "success", [uncovered_existing], with_review=True,
         attempt_head=head, current_head=head,
     )
     assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["create"]
@@ -2287,6 +2347,27 @@ def test_opencode_ctx_ignores_impossible_success_without_displacing_valid_state(
     assert "IMPOSSIBLE" not in text
 
 
+@pytest.mark.parametrize("diff_mode", ("unavailable", "unchanged"))
+def test_opencode_ctx_ignores_success_without_covered_diff_mode(tmp_path, diff_mode):
+    head = "ab" * 20
+    valid = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), "VALID"),
+        1,
+    )
+    uncovered = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 99, head, diff_mode=diff_mode),
+            f"UNCOVERED {diff_mode}",
+        ),
+        2,
+    )
+    text = _run_opencode_ctx(tmp_path, [uncovered, valid])
+    assert "VALID" in text
+    assert f"UNCOVERED {diff_mode}" not in text
+
+
 def test_opencode_preparation_binds_full_diff_to_stable_validated_head(tmp_path):
     head = "ab" * 20
     text = _run_opencode_ctx(tmp_path, [], head_shas=[head, head])
@@ -2449,6 +2530,28 @@ def test_opencode_current_state_parser_ignores_impossible_success_before_generat
     candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL", 10, updated="u2")
     calls = _run_opencode_canonicalize(
         tmp_path, [invalid_existing], [invalid_existing, candidate], attempt_head=head,
+    )
+    assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["update"]
+
+
+@node_required
+@pytest.mark.parametrize("diff_mode", ("unavailable", "unchanged"))
+def test_opencode_current_state_parser_ignores_success_without_covered_diff_mode_before_generation_cas(
+    tmp_path, diff_mode
+):
+    head = "cd" * 20
+    uncovered_existing = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 99, head, diff_mode=diff_mode),
+            f"UNCOVERED {diff_mode}",
+        ),
+        9,
+        updated="u1",
+    )
+    candidate = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nREAL", 10, updated="u2")
+    calls = _run_opencode_canonicalize(
+        tmp_path, [uncovered_existing], [uncovered_existing, candidate], attempt_head=head,
     )
     assert [call[0] for call in calls if call[0] in {"create", "update"}] == ["update"]
 

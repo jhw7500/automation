@@ -172,6 +172,7 @@ jobs:
               def state_semantics:
                 if .attempt_status == "success" then
                   .successful_head != null and .successful_head == .attempt_head and successful_pair
+                  and (.diff_mode == "full" or .diff_mode == "delta")
                 elif .attempt_status == "failure" then successful_pair
                 else false end;
               def parsed_state($header; $marker; $reviewer; $pr; $server; $repo):
@@ -501,6 +502,7 @@ jobs:
               && (state.attempt_status === 'success'
                 ? state.successful_head === state.attempt_head && state.successful_head !== null
                   && sha1(state.successful_head) && sha256(state.full_diff_sha256)
+                  && ['full', 'delta'].includes(state.diff_mode)
                 : state.attempt_status === 'failure' && (state.successful_head === null
                 ? state.full_diff_sha256 === null
                 : sha1(state.successful_head) && sha256(state.full_diff_sha256)))
