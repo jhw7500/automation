@@ -2187,6 +2187,70 @@ def test_claude_checkpoint_requires_coverage_and_sanitized_body(
 
 
 @node_required
+def test_claude_upsert_drops_self_disqualified_findings_but_keeps_confirmed_ones(tmp_path):
+    review = """## New findings
+
+[MEDIUM] Confirmed null dereference
+Changed anchor: `src/live.py:10`
+The changed branch always dereferences `item` after assigning `None`.
+
+[MEDIUM] Speculative provider shape
+Changed anchor: `src/provider.py:20`
+This payload shape is plausible but unconfirmed without external evidence.
+
+## Still open
+
+[MEDIUM] Hypothetical mixed quota
+Changed anchor: `src/quota.py:30`
+If a transient response ever co-lists an unrelated daily quota, retry stops.
+
+[MEDIUM] Confirmed stale write
+Changed anchor: `src/state.py:40`
+The current branch always writes the superseded generation with `status = "unconfirmed"`.
+
+## Resolved
+
+[MEDIUM] Prior parser defect
+The changed parser now rejects the malformed record.
+"""
+    calls = _claude_upsert(tmp_path, "success", [], with_review=True, review=review)
+    body = _single_mutation_body(calls)
+
+    assert "Confirmed null dereference" in body
+    assert "Confirmed stale write" in body
+    assert "Prior parser defect" in body
+    assert "Speculative provider shape" not in body
+    assert "Hypothetical mixed quota" not in body
+    assert [call for call in calls if call[0] == "notice"] == [
+        ["notice", "Dropped 2 self-disqualified Claude finding(s)."]
+    ]
+
+
+@node_required
+def test_claude_upsert_collapses_only_unconfirmed_findings_to_none(tmp_path):
+    review = """## New findings
+
+[MEDIUM] Unverified API support
+Changed anchor: `src/config.py:10`
+The configured value is not confirmed to be accepted.
+
+## Still open
+
+[MEDIUM] Pending service behavior
+Changed anchor: `src/client.py:20`
+Carrying this forward pending confirmation from a live service.
+"""
+    calls = _claude_upsert(tmp_path, "success", [], with_review=True, review=review)
+    body = _single_mutation_body(calls)
+
+    assert "## New findings\n\nNone." in body
+    assert "## Still open" not in body
+    assert "Unverified API support" not in body
+    assert "Pending service behavior" not in body
+    assert "- Status: success" in body
+
+
+@node_required
 def test_claude_infra_only_output_preserves_prior_success_as_stale(tmp_path):
     old_head = "ab" * 20
     old_body = _v2_body(
