@@ -304,6 +304,8 @@ jobs:
               let a;
               try { a = JSON.parse(attMatch[1]); } catch { return false; }
               const run = (evidence.workflow_runs || []).find((item) => item.run_id === a.run_id && item.run_attempt === a.run_attempt);
+              const allowedConclusions = state.attempt_status === 'failure' ? ['success', 'failure']
+                : state.attempt_status === 'success' ? ['success'] : [];
               return JSON.stringify(Object.keys(a).sort()) === JSON.stringify(expectedKeys)
                 && a.schema === 1 && a.repository === repository
               && a.workflow === '.github/workflows/opencode-auto-review.yml'
@@ -324,7 +326,8 @@ jobs:
                 && check.external_id === `automation-opencode-canonical:${repository}:pr:${prRaw}:run:${a.run_id}:${a.run_attempt}:comment:${comment.id}`
                 && run && run.run?.id === a.run_id && run.run?.run_attempt === a.run_attempt
                 && run.run?.head_sha === a.workflow_head
-                && run.run?.status === 'completed' && run.run?.conclusion === 'success'
+                && allowedConclusions.includes(run.run?.conclusion)
+                && run.run?.status === 'completed'
                 && run.run?.path === a.caller_workflow_path && run.run?.event === 'pull_request'
                 && (run.run?.referenced_workflows || []).some((item) =>
                   item.path === a.referenced_workflow_path && item.sha === a.referenced_workflow_sha)
@@ -335,7 +338,7 @@ jobs:
                 && (run.selected_run?.referenced_workflows || []).some((item) =>
                   item.path === a.referenced_workflow_path && item.sha === a.referenced_workflow_sha)
                 && run.jobs.some((job) => /(?:^|\s\/\s)opencode-canonicalize$/.test(job.name || '')
-                  && job.conclusion === 'success');
+                  && job.conclusion === run.run.conclusion);
             });
             if (valid) ids.push(comment.id);
           }
@@ -624,6 +627,16 @@ jobs:
             An unchanged line is supporting evidence only and requires a concrete causal explanation.
             You must quote the exact current line for each cited location. If a real changed anchor and
             exact line cannot be verified, do not report it.
+
+            For `line`, use the destination-file line number from the unified-diff hunk header:
+            start at the `+NEW_START` value in `@@ -OLD +NEW_START @@`, increment it for context
+            and `+` lines, and do not increment it for `-` lines. Never use the attachment's display line number,
+            the line number of the diff text itself, or a guessed source-file line number.
+
+            Report only findings with a concrete changed-code causal path and a reproducible runtime,
+            security, data-integrity, or user-visible impact. Omit LOW, style-only, maintainability-only,
+            cleanup-after-process-termination, and speculative hardening suggestions. If no finding meets
+            MEDIUM severity, use `None`; do not manufacture a finding for completeness.
 
             Begin your review body with this exact line so later rounds can identify it:
             <!-- automation:opencode-auto-review -->
@@ -1052,17 +1065,20 @@ jobs:
             };
             const attestationMatches = (record, check, runEntry) => {
               const a = parseAttestation(check);
+              const allowedConclusions = record.state.attempt_status === 'failure' ? ['success', 'failure']
+                : record.state.attempt_status === 'success' ? ['success'] : [];
               return receiptMatchesRecord(record, check, runEntry?.selected_run)
                 && runEntry?.run?.id === a.run_id && runEntry.run.run_attempt === a.run_attempt
                 && runEntry.run.head_sha === a.workflow_head
-                && runEntry.run.status === 'completed' && runEntry.run.conclusion === 'success'
+                && allowedConclusions.includes(runEntry.run.conclusion)
+                && runEntry.run.status === 'completed'
                 && runEntry.run.path === a.caller_workflow_path
                 && runEntry.run.event === 'pull_request'
                 && (runEntry.run.referenced_workflows || []).some((item) =>
                   item.path === a.referenced_workflow_path
                   && item.sha === a.referenced_workflow_sha)
                 && runEntry.jobs.some((job) => /(?:^|\s\/\s)opencode-canonicalize$/.test(job.name || '')
-                  && job.conclusion === 'success');
+                  && job.conclusion === runEntry.run.conclusion);
             };
             const sealedRecords = before.map(parseRecord).filter(Boolean).filter((record) => {
               const check = sealedEvidence.check_runs.find((item) => item.id === record.attestationId);
@@ -1384,7 +1400,7 @@ jobs:
               }
               return true;
             };
-            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Last attempt: failure \(https?:\/\/\S+\)$)/;
+            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Last attempt: failure \(https?:\/\/\S+\)$|- Reason: [a-z_]+$)/;
             const clean = (body) => {
               const lines = (body || '').split('\n').filter((line) =>
                 line !== `<!-- automation-candidate:${handoff.candidate_nonce} -->`
@@ -1780,7 +1796,7 @@ jobs:
               : !anchorsCovered ? 'anchor_out_of_scope'
               : 'unknown';
             const failureBody = previousBody
-              || `Reason: ${failureReason}\n\nOpenCode review attempt failed validation; no review checkpoint was advanced.`;
+              || 'OpenCode review attempt failed validation; no review checkpoint was advanced.';
             const state = succeeded
               ? {
                   schema: 2, reviewer, pr: issueNumber, run_id: runId, run_attempt: runAttempt,
@@ -1796,7 +1812,7 @@ jobs:
                 };
             const status = succeeded ? 'success' : (priorSuccess ? 'stale' : 'failure');
             const displayBody = succeeded ? successBody : failureBody;
-            const bodyFor = (attestationId) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${attestationId}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})` : ''}\n\n${displayBody}`;
+            const bodyFor = (attestationId) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${attestationId}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})\n- Reason: ${failureReason}` : ''}\n\n${displayBody}`;
             if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536) {
               throw new Error('canonical OpenCode comment exceeds 65,536-byte publication limit');
             }
@@ -1913,7 +1929,7 @@ jobs:
                 // are checked here; the next prepare additionally requires completed run/job provenance.
                 run: { id: runId, run_attempt: runAttempt, head_sha: workflowHead,
                   status: 'completed',
-                  conclusion: 'success', event: handoff.caller_event,
+                  conclusion: succeeded ? 'success' : 'failure', event: handoff.caller_event,
                   path: handoff.caller_workflow_path,
                   pull_requests: [], referenced_workflows: [{ path: handoff.referenced_workflow_path,
                     sha: handoff.referenced_workflow_sha }] },
@@ -1922,7 +1938,7 @@ jobs:
                   path: handoff.caller_workflow_path, pull_requests: [],
                   referenced_workflows: [{ path: handoff.referenced_workflow_path,
                     sha: handoff.referenced_workflow_sha }] },
-                jobs: [{ name: 'opencode-canonicalize', conclusion: 'success' }],
+                jobs: [{ name: 'opencode-canonicalize', conclusion: succeeded ? 'success' : 'failure' }],
               })) throw new Error('canonical attestation exact-byte refetch failed');
             } catch (error) {
               try {

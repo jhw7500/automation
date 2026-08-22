@@ -1559,6 +1559,7 @@ def _gemini_upsert(
     full_diff_sha256: str = "34" * 32,
     diff_mode: str = "full",
     unchanged_since_previous: str = "false",
+    failure_reason: str = "",
     current_head: str | None = None,
 ) -> list:
     workdir = tmp_path / ("gemini-with-review" if with_review else "gemini-without-review")
@@ -1579,6 +1580,7 @@ def _gemini_upsert(
         "FULL_DIFF_SHA256": full_diff_sha256,
         "DIFF_MODE": diff_mode,
         "UNCHANGED_SINCE_PREVIOUS": unchanged_since_previous,
+        "FAILURE_REASON": failure_reason,
     }
     return _run_upsert(
         tmp_path, "gemini-auto-review.yml", "gemini-review", "Upsert review comment",
@@ -1995,6 +1997,22 @@ def test_gemini_failure_reports_machine_readable_coverage_reason(tmp_path):
     assert "Reason: coverage_truncated" in _single_mutation_body(calls)
     assert [call for call in calls if call[0] == "failed"] == [
         ["failed", "Gemini review checkpoint failed: coverage_truncated"]
+    ]
+
+
+@node_required
+def test_gemini_provider_quota_failure_keeps_specific_reason(tmp_path):
+    calls = _gemini_upsert(
+        tmp_path,
+        "failure",
+        [],
+        with_review=True,
+        review="⚠️ Failed to generate Gemini review",
+        failure_reason="quota_exhausted",
+    )
+    assert "Reason: quota_exhausted" in _single_mutation_body(calls)
+    assert [call for call in calls if call[0] == "failed"] == [
+        ["failed", "Gemini review checkpoint failed: quota_exhausted"]
     ]
 
 
@@ -2748,6 +2766,7 @@ def test_gemini_retries_on_429_then_succeeds(tmp_path):
         "GEMINI_API_KEY": "stub",
         "PYTHONPATH": str(tmp_path / "stub"),
         "GEMINI_429_RETRY_SLEEP": "0",
+        "GEMINI_429_RETRY_JITTER": "0",
         "REVIEW_DIFF_FILE": "review-full.diff",
         "REVIEW_DIFF_MODE": "full",
     })
@@ -2759,8 +2778,8 @@ def test_gemini_retries_on_429_then_succeeds(tmp_path):
     assert "RETRY SURVIVOR REVIEW" in (tmp_path / "gemini_review.md").read_text(encoding="utf-8")
 
 
-def test_gemini_reviews_every_deterministic_diff_chunk(tmp_path):
-    """A large diff is successful only after every bounded chunk reaches the model."""
+def test_gemini_uses_one_full_context_call_to_bound_request_count(tmp_path):
+    """A real-world 750 KB diff fits one call instead of consuming most daily requests."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
     stub = tmp_path / "stub" / "google"
     stub.mkdir(parents=True)
@@ -2782,7 +2801,7 @@ def test_gemini_reviews_every_deterministic_diff_chunk(tmp_path):
     )
     fixtures = {
         "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
-        "review-full.diff": ("+" + ("x" * 98) + "\n") * 1_200,
+        "review-full.diff": ("+" + ("x" * 98) + "\n") * 7_500,
         "prev_review.txt": "", "human_comments.txt": "",
     }
     for name, content in fixtures.items():
@@ -2799,14 +2818,135 @@ def test_gemini_reviews_every_deterministic_diff_chunk(tmp_path):
         ["python3", "gemini_review.py"],
         cwd=tmp_path, env=env, check=True, capture_output=True,
     )
-    assert (tmp_path / "chunk-attempts.txt").read_text() == "3"
+    assert (tmp_path / "chunk-attempts.txt").read_text() == "1"
     assert (tmp_path / "review_diff_truncated.txt").read_text() == "false"
     saved = (tmp_path / "gemini_review.md").read_text(encoding="utf-8")
-    assert all(f"CHUNK REVIEW {index}" in saved for index in range(1, 4))
-    assert all(
-        f"CHUNK {index}/3" in (tmp_path / f"chunk-prompt-{index}.txt").read_text()
-        for index in range(1, 4)
+    assert "CHUNK REVIEW 1" in saved
+    prompt = (tmp_path / "chunk-prompt-1.txt").read_text()
+    assert "complete,\nexclusive change set" in prompt
+    assert "CHUNK 1/1" not in prompt
+
+
+def test_gemini_fails_before_provider_when_full_diff_exceeds_single_call_budget(tmp_path):
+    """Oversized input must fail closed, never spend quota on a partial/multi-call review."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class _R:\n"
+        "    text = 'MUST NOT RUN'\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        pathlib.Path('provider-called.txt').write_text('yes')\n"
+        "        return _R()\n",
+        encoding="utf-8",
     )
+    fixtures = {
+        "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
+        "review-full.diff": "+0123456789\n", "prev_review.txt": "", "human_comments.txt": "",
+    }
+    for name, content in fixtures.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    env = dict(os.environ)
+    env.update({
+        "GEMINI_API_KEY": "stub",
+        "PYTHONPATH": str(tmp_path / "stub"),
+        "GEMINI_DIFF_INPUT_CHARS": "10",
+        "REVIEW_DIFF_FILE": "review-full.diff",
+        "REVIEW_DIFF_MODE": "full",
+    })
+    result = subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=env, check=False, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert not (tmp_path / "provider-called.txt").exists()
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "coverage_input_too_large"
+
+
+def test_gemini_uses_server_retry_delay_as_a_floor(tmp_path):
+    """429 retry jitter may delay a retry, but must never undercut RetryInfo."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class _R:\n"
+        "    text = 'RETRY DELAY REVIEW'\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        counter = pathlib.Path('attempts.txt')\n"
+        "        n = int(counter.read_text()) if counter.exists() else 0\n"
+        "        counter.write_text(str(n + 1))\n"
+        "        if n == 0:\n"
+        "            raise RuntimeError('429 quota; Please retry in 0.05s')\n"
+        "        return _R()\n",
+        encoding="utf-8",
+    )
+    fixtures = {
+        "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
+        "review-full.diff": "+x\n", "prev_review.txt": "", "human_comments.txt": "",
+    }
+    for name, content in fixtures.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    env = dict(os.environ)
+    env.update({
+        "GEMINI_API_KEY": "stub",
+        "PYTHONPATH": str(tmp_path / "stub"),
+        "GEMINI_429_RETRY_SLEEP": "0",
+        "GEMINI_429_RETRY_JITTER": "0",
+        "REVIEW_DIFF_FILE": "review-full.diff",
+        "REVIEW_DIFF_MODE": "full",
+    })
+    result = subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=env, check=True, capture_output=True, text=True,
+    )
+    assert "retrying in 0.05s" in result.stdout
+
+
+def test_gemini_records_quota_failure_reason(tmp_path):
+    """A quota failure remains distinguishable from auth and generic provider failures."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "def configure(api_key=None): pass\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        raise RuntimeError('429 Quota exceeded for metric: requests')\n",
+        encoding="utf-8",
+    )
+    fixtures = {
+        "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
+        "review-full.diff": "+x\n", "prev_review.txt": "", "human_comments.txt": "",
+    }
+    for name, content in fixtures.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    env = dict(os.environ)
+    env.update({
+        "GEMINI_API_KEY": "stub",
+        "PYTHONPATH": str(tmp_path / "stub"),
+        "GEMINI_429_RETRY_SLEEP": "0",
+        "GEMINI_429_RETRY_JITTER": "0",
+        "REVIEW_DIFF_FILE": "review-full.diff",
+        "REVIEW_DIFF_MODE": "full",
+    })
+    result = subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=env, check=False, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "quota_exhausted"
 
 
 # ---------------------------------------------------------------------------
@@ -2911,6 +3051,9 @@ def test_opencode_prompt_requires_verified_evidence():
     assert "unchanged line is supporting evidence only" in prompt
     assert "concrete causal explanation" in prompt
     assert "Retracted" in prompt
+    assert "destination-file line number from the unified-diff hunk header" in prompt
+    assert "Never use the attachment's display line number" in prompt
+    assert "Omit LOW, style-only, maintainability-only" in prompt
 
 
 def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
@@ -3575,6 +3718,48 @@ def test_opencode_collector_rejects_mismatched_historical_attempt_provenance(tmp
 
     assert "REJECT HISTORY" not in text
     assert "previous_sha=\n" in text
+
+
+def test_opencode_collector_authenticates_attested_failed_checkpoint_for_sticky_reuse(tmp_path):
+    """An intentional failed check remains authentic so the next run updates one sticky."""
+    head = "ab" * 20
+    failed = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line(
+                "opencode", 7, 77, head,
+                attempt_status="failure", successful_head=None, full_diff_sha256=None,
+            ),
+            "Reason: anchor_out_of_scope",
+        ),
+        9,
+    )
+    receipt = _opencode_attestation(failed, workflow_head="de" * 20)
+    referenced = [{
+        "path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45",
+        "sha": "45" * 20, "ref": "refs/tags/v1.45",
+    }]
+    run = {
+        "id": 77, "run_attempt": 1, "status": "completed", "conclusion": "failure",
+        "head_sha": "de" * 20, "event": "pull_request",
+        "path": ".github/workflows/pr-review.yml", "pull_requests": [],
+        "referenced_workflows": referenced,
+    }
+    _run_opencode_ctx(
+        tmp_path, [failed], check_runs=[receipt], workflow_runs=[run],
+        workflow_run_attempts=[run],
+        run_jobs_by_attempt={
+            "77:1": [{
+                "name": "OpenCode Auto PR Review / opencode-canonicalize",
+                "conclusion": "failure",
+            }],
+        },
+    )
+
+    trusted = json.loads(
+        (tmp_path / "runner-temp" / "opencode-trusted-comment-ids.json").read_text()
+    )
+    assert trusted == [9]
 
 
 def test_opencode_collector_filters_unrelated_runs_before_central_horizon(tmp_path):
@@ -6536,6 +6721,7 @@ def test_opencode_failure_preserves_prior_success_as_stale(tmp_path):
     body = _updated_comment_body(calls, 9)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert "LAST GOOD OPENCODE REVIEW" in body
+    assert "Reason: provider_failed" in body
     assert "- Status: stale" in body
     assert state["attempt_status"] == "failure"
     assert state["successful_head"] == old_head
