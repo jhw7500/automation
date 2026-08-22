@@ -294,6 +294,14 @@ remains a generic provider failure. An SDK timeout or subprocess deadline record
 without advancing `Reviewed`. The job timeout is the last-resort ceiling and remains below the
 12-minute `/jhw:ship` review-round deadline.
 
+Gemini 429 handling separates retry eligibility from the final failure classification. A positive
+provider `RetryInfo`/`Please retry in` delay remains authoritative even when the same response
+contains a requests-per-day quota ID: the reviewer follows the existing three-attempt bounded
+backoff and never waits less than the provider delay. A requests-per-day quota response without
+retry guidance is terminal for that job. If the bounded attempts are exhausted, a quota response
+is still published as `quota_exhausted`; retrying it does not weaken the sticky failure state or
+extend any of the nested deadlines above.
+
 Immediately before comment mutation, each reviewer refetches the PR head and requires it to
 equal `attempt_head`; it also refuses to write unless stored `(run_id, run_attempt)` is
 strictly older. Per-reviewer/per-PR concurrency with cancellation reduces overlap. OpenCode

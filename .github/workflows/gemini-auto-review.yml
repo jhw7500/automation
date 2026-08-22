@@ -620,8 +620,15 @@ jobs:
                   try:
                       response = generate_content(prompt)
                   except Exception as error:
-                      if is_rate_limited(error) and is_daily_request_quota_exhausted(error):
-                          print("Daily Gemini request quota exhausted; skipping unrecoverable retries")
+                      if (
+                          is_rate_limited(error)
+                          and is_daily_request_quota_exhausted(error)
+                          and server_retry_delay(error) <= 0
+                      ):
+                          print(
+                              "Daily Gemini request quota exhausted without retry guidance; "
+                              "skipping unrecoverable retries"
+                          )
                           raise
                       if not is_rate_limited(error) or attempt == 2:
                           raise
