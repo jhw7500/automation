@@ -3331,6 +3331,95 @@ def test_gemini_retries_daily_labeled_quota_with_server_retry_guidance(tmp_path)
     assert (tmp_path / "gemini_failure_reason.txt").read_text() == ""
 
 
+def test_gemini_retries_daily_labeled_quota_with_millisecond_guidance(tmp_path):
+    """The provider's sub-second RetryInfo text remains actionable."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class _R:\n"
+        "    text = 'RECOVERED REVIEW'\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        counter = pathlib.Path('attempts.txt')\n"
+        "        n = int(counter.read_text()) if counter.exists() else 0\n"
+        "        counter.write_text(str(n + 1))\n"
+        "        if n == 0:\n"
+        "            raise RuntimeError(\n"
+        "                '429 Quota exceeded for metric: generate_content_free_tier_requests; ' \n"
+        "                'quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier; ' \n"
+        "                'Please retry in 902.029958ms'\n"
+        "            )\n"
+        "        return _R()\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env.update({
+        "GEMINI_429_RETRY_SLEEP": "0",
+        "GEMINI_429_RETRY_JITTER": "0",
+    })
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=env, check=False, capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "attempts.txt").read_text() == "2"
+    assert "retrying in 0.90s" in result.stdout
+    assert (tmp_path / "gemini_review.md").read_text() == "RECOVERED REVIEW"
+
+
+def test_gemini_rejects_retry_guidance_beyond_process_budget(tmp_path):
+    """A retry sleep must not consume the watchdog and erase the quota reason."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class _R:\n"
+        "    text = 'SHOULD NOT RETRY'\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        counter = pathlib.Path('attempts.txt')\n"
+        "        n = int(counter.read_text()) if counter.exists() else 0\n"
+        "        counter.write_text(str(n + 1))\n"
+        "        if n == 0:\n"
+        "            raise RuntimeError(\n"
+        "                '429 Quota exceeded for metric: generate_content_free_tier_requests; ' \n"
+        "                'quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier; ' \n"
+        "                'Please retry in 0.02s'\n"
+        "            )\n"
+        "        return _R()\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env.update({
+        "GEMINI_429_RETRY_SLEEP": "0",
+        "GEMINI_429_RETRY_JITTER": "0",
+        "GEMINI_REVIEW_PROCESS_TIMEOUT": "5.01",
+    })
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=env, check=False, capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "attempts.txt").read_text() == "1"
+    assert "retrying in" not in result.stdout
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "quota_exhausted"
+
+
 def test_gemini_does_not_retry_daily_quota_without_server_retry_guidance(tmp_path):
     """A daily quota with no RetryInfo remains terminal inside the bounded job."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")

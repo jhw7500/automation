@@ -245,7 +245,7 @@ Edit the respective `gemini-*.yml` files to modify:
 ### Gemini workflows fail
 - Verify `GEMINI_API_KEY` is valid and not expired
 - Check API quota limits at https://aistudio.google.com
-- A quota response with provider retry guidance receives bounded backoff; a final `Reason: quota_exhausted` means all allowed attempts failed or the provider supplied no retry guidance
+- A quota response with positive provider retry guidance (seconds or milliseconds) receives bounded backoff only when the wait fits inside the remaining process watchdog; a final `Reason: quota_exhausted` means all allowed attempts failed, guidance was absent, or the guided wait could not fit
 - Ensure GCP credentials are correct (if using Vertex AI)
 - A sticky `Reason: provider_timeout` means the provider request exceeded its finite review deadline; inspect the linked run before rerunning
 
