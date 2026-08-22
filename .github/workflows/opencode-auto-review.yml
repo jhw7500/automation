@@ -1407,7 +1407,13 @@ jobs:
             };
             const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Last attempt: failure \(https?:\/\/\S+\)$|- Reason: [a-z_]+$)/;
             const clean = (body) => {
-              const lines = (body || '').split('\n').filter((line) =>
+              const rawLines = (body || '').split('\n');
+              // OpenCode can include tool/thinking traces in the final text event. Only an exact
+              // final-review marker starts a candidate suffix; the strict grammar and changed-line
+              // anchor checks below remain authoritative over every byte retained after it.
+              const finalMarker = rawLines.lastIndexOf(legacyMarker);
+              const selectedLines = finalMarker >= 0 ? rawLines.slice(finalMarker + 1) : rawLines;
+              const lines = selectedLines.filter((line) =>
                 line !== `<!-- automation-candidate:${handoff.candidate_nonce} -->`
                 && !reserved.test(line));
               // OpenCode may emit this exact harmless preamble before the required

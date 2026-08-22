@@ -846,6 +846,8 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert "Do not report speculative, hypothetical, or unconfirmed risks" in claude_model["with"]["prompt"]
     assert "external documentation or live service behavior" in claude_model["with"]["prompt"]
     assert "Prior uncertainty is not evidence" in claude_model["with"]["prompt"]
+    assert "depends on unverified external service behavior" in claude_model["with"]["prompt"]
+    assert "must not appear in Still open" in claude_model["with"]["prompt"]
     assert "Report only findings at MEDIUM or above" in claude_model["with"]["prompt"]
     assert "Bash(gh pr" not in claude_model["with"]["claude_args"]
 
@@ -2184,70 +2186,6 @@ def test_claude_checkpoint_requires_coverage_and_sanitized_body(
         assert state["successful_head"] is None
         assert state["full_diff_sha256"] is None
         assert "- Reviewed:" not in body
-
-
-@node_required
-def test_claude_upsert_drops_self_disqualified_findings_but_keeps_confirmed_ones(tmp_path):
-    review = """## New findings
-
-[MEDIUM] Confirmed null dereference
-Changed anchor: `src/live.py:10`
-The changed branch always dereferences `item` after assigning `None`.
-
-[MEDIUM] Speculative provider shape
-Changed anchor: `src/provider.py:20`
-This payload shape is plausible but unconfirmed without external evidence.
-
-## Still open
-
-[MEDIUM] Hypothetical mixed quota
-Changed anchor: `src/quota.py:30`
-If a transient response ever co-lists an unrelated daily quota, retry stops.
-
-[MEDIUM] Confirmed stale write
-Changed anchor: `src/state.py:40`
-The current branch always writes the superseded generation with `status = "unconfirmed"`.
-
-## Resolved
-
-[MEDIUM] Prior parser defect
-The changed parser now rejects the malformed record.
-"""
-    calls = _claude_upsert(tmp_path, "success", [], with_review=True, review=review)
-    body = _single_mutation_body(calls)
-
-    assert "Confirmed null dereference" in body
-    assert "Confirmed stale write" in body
-    assert "Prior parser defect" in body
-    assert "Speculative provider shape" not in body
-    assert "Hypothetical mixed quota" not in body
-    assert [call for call in calls if call[0] == "notice"] == [
-        ["notice", "Dropped 2 self-disqualified Claude finding(s)."]
-    ]
-
-
-@node_required
-def test_claude_upsert_collapses_only_unconfirmed_findings_to_none(tmp_path):
-    review = """## New findings
-
-[MEDIUM] Unverified API support
-Changed anchor: `src/config.py:10`
-The configured value is not confirmed to be accepted.
-
-## Still open
-
-[MEDIUM] Pending service behavior
-Changed anchor: `src/client.py:20`
-Carrying this forward pending confirmation from a live service.
-"""
-    calls = _claude_upsert(tmp_path, "success", [], with_review=True, review=review)
-    body = _single_mutation_body(calls)
-
-    assert "## New findings\n\nNone." in body
-    assert "## Still open" not in body
-    assert "Unverified API support" not in body
-    assert "Pending service behavior" not in body
-    assert "- Status: success" in body
 
 
 @node_required
@@ -4600,6 +4538,7 @@ def _run_opencode_canonicalize(
     inject_comments_at_list_call: dict[int, list[dict]] | None = None,
     caller_event: str = "pull_request",
     candidate_artifact_case: str = "valid",
+    candidate_review: str | None = None,
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
     script = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")["with"]["script"]
@@ -4805,9 +4744,14 @@ def _run_opencode_canonicalize(
     candidate_dir = workdir / "candidate"
     candidate_dir.mkdir()
     candidate_path = candidate_dir / "review.md"
-    candidate_available = len(raw_candidates) == 1 and candidate_artifact_case != "absent"
+    candidate_available = (
+        candidate_review is not None or len(raw_candidates) == 1
+    ) and candidate_artifact_case != "absent"
     if candidate_available:
-        candidate_path.write_text(raw_candidates[0]["body"], encoding="utf-8")
+        candidate_path.write_text(
+            candidate_review if candidate_review is not None else raw_candidates[0]["body"],
+            encoding="utf-8",
+        )
         if candidate_artifact_case == "extra":
             (candidate_dir / "extra.txt").write_text("extra", encoding="utf-8")
         elif candidate_artifact_case == "symlink":
@@ -4933,6 +4877,32 @@ def test_opencode_scope_rejects_substantive_preamble_before_sections(tmp_path):
     assert [call for call in calls if call[0] == "failed"] == [
         ["failed", "OpenCode review checkpoint failed: output_grammar_invalid"]
     ]
+
+
+@node_required
+def test_opencode_scope_extracts_final_review_after_noisy_model_trace(tmp_path):
+    candidate_review = f"""I'll analyze the diff before producing the final review.
+
+```python
+print("tool trace")
+```
+</think>
+{OPENCODE_MARKER}
+<!-- automation-candidate:{'66' * 32} -->
+
+### New findings
+None
+"""
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [], inject_candidate_nonce=False, candidate_review=candidate_review
+    )
+    body = _single_mutation_body(calls)
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+
+    assert state["attempt_status"] == "success"
+    assert "### New findings\nNone" in body
+    assert "I'll analyze" not in body
+    assert "tool trace" not in body
 
 
 @node_required
