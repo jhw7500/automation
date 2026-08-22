@@ -299,7 +299,9 @@ jobs:
 
           gemini_model = os.environ.get('GEMINI_MODEL', 'gemini-3-flash-preview')
           thinking_level = os.environ.get('GEMINI_THINKING_LEVEL', 'medium').lower()
-          if thinking_level not in {'minimal', 'low', 'medium', 'high'}:
+          # low/medium/high are shared by the supported Gemini 3 text models. Avoid
+          # model-specific values such as minimal when GEMINI_MODEL is overridden.
+          if thinking_level not in {'low', 'medium', 'high'}:
               print(f"ERROR: unsupported GEMINI_THINKING_LEVEL: {thinking_level}")
               record_failure_reason('invalid_thinking_level')
               exit(1)
@@ -308,7 +310,6 @@ jobs:
               client = google_genai.Client(api_key=api_key)
               generation_config = genai_types.GenerateContentConfig(
                   thinking_config=genai_types.ThinkingConfig(thinking_level=thinking_level),
-                  max_output_tokens=16384,
               )
 
               def generate_content(prompt):
@@ -503,6 +504,14 @@ jobs:
           - A disproven previous claim is Retracted, not Resolved. Resolved requires a code change.
           - If you find nothing at MEDIUM or above, say so plainly — "No blocking issues found" is a
             complete, valid review. Do not invent findings to appear thorough.
+          - Report only a concrete, reproducible runtime, security, data-integrity, or user-visible
+            regression caused by a changed line. Omit LOW, style, maintainability, hypothetical
+            portability, and cleanup-after-process-termination suggestions.
+          - Fail-closed behavior is not a finding unless it can falsely record success or corrupt
+            authenticated state. An extra untrusted comment that cannot pass attestation is cleanup;
+            unauthenticated UI clutter alone is not a security impact.
+          - A deletion concern must still cite an added-side changed anchor that causally introduces
+            the regression. Do not recommend weakening added-line scope validation just to cite a deletion.
           - Write the review in the same language as the PR description and commit history (e.g.
             respond in Korean if they are Korean); keep identifiers, file paths and log strings as-is.
 
@@ -542,11 +551,19 @@ jobs:
           class EmptyModelResponse(RuntimeError):
               pass
 
+          class TruncatedModelResponse(RuntimeError):
+              pass
+
+          def finish_reason_names(response):
+              reasons = []
+              for candidate in (getattr(response, 'candidates', None) or []):
+                  reason = getattr(candidate, 'finish_reason', None)
+                  name = getattr(reason, 'name', None) or str(reason or 'unknown')
+                  reasons.append(name.rsplit('.', 1)[-1].upper())
+              return reasons
+
           def response_diagnostics(response):
-              finish_reasons = [
-                  str(getattr(candidate, 'finish_reason', 'unknown'))
-                  for candidate in (getattr(response, 'candidates', None) or [])
-              ]
+              finish_reasons = finish_reason_names(response)
               return (
                   f"finish_reasons={finish_reasons or ['none']}; "
                   f"prompt_feedback={getattr(response, 'prompt_feedback', None)}; "
@@ -564,6 +581,8 @@ jobs:
               message = str(err).lower()
               if isinstance(err, EmptyModelResponse):
                   return 'empty_output'
+              if isinstance(err, TruncatedModelResponse):
+                  return 'output_truncated'
               if is_rate_limited(err):
                   if 'quota exceeded' in message or 'exceeded your current quota' in message:
                       return 'quota_exhausted'
@@ -590,6 +609,10 @@ jobs:
                   review_text = strip_infra_lines(
                       strip_outer_code_fence(response_text(response)), INFRA_LINE_OUTPUT
                   ).strip()
+                  if 'MAX_TOKENS' in finish_reason_names(response):
+                      raise TruncatedModelResponse(
+                          f"Gemini stopped at MAX_TOKENS: {response_diagnostics(response)}"
+                      )
                   if review_text:
                       break
                   print(
@@ -694,7 +717,7 @@ jobs:
             const allowedFailureReasons = new Set([
               'provider_failed', 'quota_exhausted', 'rate_limited', 'authentication_failed',
               'coverage_input_too_large', 'invalid_input_budget', 'invalid_thinking_level',
-              'empty_output',
+              'empty_output', 'output_truncated',
             ]);
             const providerFailureReason = allowedFailureReasons.has(reportedFailureReason)
               ? reportedFailureReason : 'provider_failed';
