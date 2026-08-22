@@ -257,7 +257,7 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3-flash-preview' }}
-          GEMINI_DIFF_INPUT_CHARS: ${{ vars.GEMINI_DIFF_INPUT_CHARS || '800000' }}
+          GEMINI_DIFF_INPUT_CHARS: ${{ vars.GEMINI_DIFF_INPUT_CHARS || '900000' }}
           REVIEW_DIFF_FILE: ${{ steps.prepare-diff.outputs.diff-mode == 'delta' && 'review-delta.diff' || 'review-full.diff' }}
           REVIEW_DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode }}
         run: |
@@ -368,12 +368,12 @@ jobs:
               return "\n".join(lines[1:-1]).strip()
 
           # Gemini 3 Flash has a 1M-token input window. Keep a conservative character cap so
-          # prepared diffs up to ~800 KB fit in exactly one request instead of consuming most
+          # prepared diffs up to ~900 KB fit in exactly one request instead of consuming most
           # of a free-tier request budget. Oversized reviews fail closed before contacting
           # the provider: splitting one review into independent calls loses global re-review
           # context and can overflow the single GitHub sticky comment on aggregation.
           try:
-              DIFF_INPUT_LIMIT = int(os.environ.get('GEMINI_DIFF_INPUT_CHARS', '800000'))
+              DIFF_INPUT_LIMIT = int(os.environ.get('GEMINI_DIFF_INPUT_CHARS', '900000'))
           except ValueError:
               DIFF_INPUT_LIMIT = 0
           if DIFF_INPUT_LIMIT <= 0:

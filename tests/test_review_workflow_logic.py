@@ -2779,7 +2779,7 @@ def test_gemini_retries_on_429_then_succeeds(tmp_path):
 
 
 def test_gemini_uses_one_full_context_call_to_bound_request_count(tmp_path):
-    """A real-world 750 KB diff fits one call instead of consuming most daily requests."""
+    """A real-world 840 KB diff fits one call instead of consuming most daily requests."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
     stub = tmp_path / "stub" / "google"
     stub.mkdir(parents=True)
@@ -2801,7 +2801,7 @@ def test_gemini_uses_one_full_context_call_to_bound_request_count(tmp_path):
     )
     fixtures = {
         "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
-        "review-full.diff": ("+" + ("x" * 98) + "\n") * 7_500,
+        "review-full.diff": ("+" + ("x" * 98) + "\n") * 8_400,
         "prev_review.txt": "", "human_comments.txt": "",
     }
     for name, content in fixtures.items():
@@ -5116,6 +5116,34 @@ def test_opencode_canonicalization_repairs_deleted_attested_success(tmp_path):
 
 
 @node_required
+def test_opencode_verified_publication_retires_previous_canonical_sticky(tmp_path):
+    old = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 41, "ab" * 20),
+            _opencode_review(),
+        ),
+        9,
+        updated="u1",
+    )
+    candidate = _bot(
+        "github-actions[bot]", _opencode_review("NEW REVIEW"), 10, updated="u2"
+    )
+
+    calls = _run_opencode_canonicalize(tmp_path, [old], [old, candidate])
+
+    assert any(
+        call[0] == "update" and call[1]["comment_id"] == 9
+        and call[1]["body"] == "This transient OpenCode review output was superseded by the canonical review."
+        for call in calls
+    )
+    assert any(
+        call[0] == "delete" and call[1]["comment_id"] == 9 for call in calls
+    )
+    assert "NEW REVIEW" in _single_mutation_body(calls)
+
+
+@node_required
 def test_opencode_cleanup_update_failure_falls_back_to_delete_and_publishes_attested_state(tmp_path):
     forged = _bot(
         "github-actions[bot]",
@@ -5300,7 +5328,7 @@ def test_opencode_canonicalizer_only_rerun_preserves_historical_attempt_success(
     assert state["attempt_status"] == "failure"
     assert state["successful_head"] == old_head
     assert state["full_diff_sha256"] == old_hash
-    assert not any(
+    assert any(
         call[0] in {"update", "delete"} and call[1]["comment_id"] == prior["id"]
         for call in calls
     )
@@ -5309,11 +5337,17 @@ def test_opencode_canonicalizer_only_rerun_preserves_historical_attempt_success(
     canonical, receipt = _opencode_published_from_calls(calls)
     next_dir = tmp_path / "next-collector"
     next_dir.mkdir()
-    completed_current = {**current, "status": "completed", "conclusion": "success"}
+    completed_current = {**current, "status": "completed", "conclusion": "failure"}
     text = _run_opencode_ctx(
-        next_dir, [prior, canonical], check_runs=[prior_receipt, receipt],
+        next_dir, [canonical], check_runs=[receipt],
         workflow_runs=[completed_current],
         workflow_run_attempts=[historical, completed_current],
+        run_jobs_by_attempt={
+            "77:2": [{
+                "name": "OpenCode Auto PR Review / opencode-canonicalize",
+                "conclusion": "failure",
+            }],
+        },
     )
     assert "ATTEMPT ONE TRUSTED BODY" in text
     assert f"previous_sha={old_head}" in text
@@ -5487,8 +5521,7 @@ def test_opencode_retires_only_attested_canonicals_older_than_latest_fallback(tm
         for call in calls
         if call[0] in {"update", "delete"} and call[1].get("comment_id") in {8, 9}
     }
-    assert 8 in retired_ids
-    assert 9 not in retired_ids
+    assert retired_ids == {8, 9}
     assert any(call[0] == "create-check" for call in calls)
 
 
@@ -5516,7 +5549,7 @@ def test_opencode_retired_older_tombstone_may_remain_when_delete_fails(tmp_path)
     )
 
     assert any(call[0] == "update" and call[1].get("comment_id") == 8 for call in calls)
-    assert not any(call[0] == "update" and call[1].get("comment_id") == 9 for call in calls)
+    assert any(call[0] == "update" and call[1].get("comment_id") == 9 for call in calls)
     assert any(call[0] == "create-check" for call in calls)
 
 
@@ -5576,7 +5609,9 @@ def test_opencode_existing_candidate_tombstones_before_canonical_and_tolerates_d
         for call in calls
         if call[0] in {"update", "delete"}
     ]
-    assert mutations == [("update", 10), ("delete", 10)]
+    assert mutations == [
+        ("update", 10), ("update", 9), ("delete", 9), ("delete", 10),
+    ]
     raw_tombstone = [call for call in calls if call[0] == "update"][0][1]["body"]
     canonical = [call for call in calls if call[0] == "create"][-1][1]["body"]
     assert OPENCODE_MARKER not in raw_tombstone
@@ -5602,8 +5637,9 @@ def test_opencode_tombstone_update_failure_falls_back_to_delete(tmp_path):
         tmp_path, [old], [old, candidate], fail_update_comment_ids=[10]
     )
 
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10, 9]
     assert any(call[0] == "delete" and call[1]["comment_id"] == 10 for call in calls)
+    assert any(call[0] == "delete" and call[1]["comment_id"] == 9 for call in calls)
     assert any(call[0] == "create-check" for call in calls)
 
 
@@ -6599,8 +6635,8 @@ def test_opencode_snapshot_output_contract_reaches_canonicalizer(tmp_path):
     calls = _run_opencode_canonicalize(
         tmp_path, comments, [comments[0], candidate],
     )
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10]
-    assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [10]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [10, 9]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [9, 10]
     assert any(call[0] == "create-check" for call in calls)
 
 
@@ -6632,8 +6668,8 @@ def test_opencode_current_state_parser_ignores_bad_visible_run_url(tmp_path, bad
     candidate = _bot("github-actions[bot]", _opencode_review("REAL REVIEW"), 10, updated="u2")
 
     calls = _run_opencode_canonicalize(tmp_path, [old], [old, bad_current, candidate])
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11, 10]
-    assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [10]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11, 10, 9]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [9, 10]
 
 
 @node_required
@@ -6656,8 +6692,8 @@ def test_opencode_two_rounds_update_one_canonical_comment_and_enforce_generation
     round_two_dir = tmp_path / "round-two"
     round_two_dir.mkdir()
     calls = _run_opencode_canonicalize(round_two_dir, [current], [current, round_two], run_id="42", run_attempt="2")
-    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11]
-    assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [11]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11, 101]
+    assert [call[1]["comment_id"] for call in calls if call[0] == "delete"] == [101, 11]
     assert any(call[0] == "create-check" for call in calls)
 
     stale_raw = _bot("github-actions[bot]", _opencode_review("STALE REVIEW"), 12, updated="u4")
@@ -6718,7 +6754,7 @@ def test_opencode_failure_preserves_prior_success_as_stale(tmp_path):
     )
     raw_failure = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\nRAW FAILURE OUTPUT", 10, updated="u2")
     calls = _run_opencode_canonicalize(tmp_path, [old], [old, raw_failure], outcome="failure")
-    body = _updated_comment_body(calls, 9)
+    body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert "LAST GOOD OPENCODE REVIEW" in body
     assert "Reason: provider_failed" in body
@@ -6753,7 +6789,7 @@ def test_opencode_unchanged_advances_without_cli_candidate_and_preserves_body(tm
         unchanged_since_previous="true",
         attempt_head=new_head,
     )
-    body = _updated_comment_body(calls, 9)
+    body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert "LAST GOOD OPENCODE REVIEW" in body
     assert state["attempt_status"] == "success"
@@ -6846,7 +6882,7 @@ def test_opencode_unavailable_preserves_prior_success_as_stale_without_artifacts
         attempt_head="cd" * 20,
         remove_prepared_artifacts=True,
     )
-    body = _updated_comment_body(calls, 9)
+    body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert "LAST GOOD OPENCODE REVIEW" in body
     assert state["attempt_status"] == "failure"

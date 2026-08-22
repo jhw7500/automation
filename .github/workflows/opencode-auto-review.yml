@@ -1968,6 +1968,34 @@ jobs:
               await discardCreated();
               throw new Error('canonical comment changed after attestation publication');
             }
+            // Publication uses a fresh comment so its immutable id can be bound into the
+            // attestation. Retire the previous canonical only after the replacement is fully
+            // attested; otherwise every successful round leaves two "latest" sticky comments.
+            if (existing && existing.comment.id !== created.id) {
+              try {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  comment_id: existing.comment.id, body: tombstone,
+                });
+                try {
+                  await github.rest.issues.deleteComment({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    comment_id: existing.comment.id,
+                  });
+                } catch (error) {
+                  core.warning(`Previous OpenCode canonical tombstone could not be deleted: ${error.message}`);
+                }
+              } catch (error) {
+                try {
+                  await github.rest.issues.deleteComment({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    comment_id: existing.comment.id,
+                  });
+                } catch (deleteError) {
+                  core.warning(`Previous OpenCode canonical could not be retired: ${deleteError.message}`);
+                }
+              }
+            }
             for (const raw of neutralizedCommentCandidates) {
               try {
                 await github.rest.issues.deleteComment({
