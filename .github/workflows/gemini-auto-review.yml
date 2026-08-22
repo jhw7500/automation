@@ -665,7 +665,7 @@ jobs:
 
           # Run the review script
           set +e
-          timeout --signal=TERM --kill-after=15s "${GEMINI_REVIEW_PROCESS_TIMEOUT}s" python gemini_review.py
+          timeout --foreground --signal=TERM --kill-after=15s "${GEMINI_REVIEW_PROCESS_TIMEOUT}s" python gemini_review.py
           review_exit=$?
           set -e
           if [ "$review_exit" -eq 124 ]; then

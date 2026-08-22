@@ -2797,6 +2797,43 @@ def test_gemini_process_watchdog_records_provider_timeout(tmp_path):
     assert _github_outputs(output)["failure_reason"] == "provider_timeout"
 
 
+def test_gemini_process_watchdog_records_timeout_after_hard_kill(tmp_path):
+    """The kill-after path must retain timeout identity instead of returning generic 137."""
+    workflow = _load("gemini-auto-review.yml")
+    original_run = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
+    run = original_run.replace("--kill-after=15s", "--kill-after=0.2s")
+    assert run != original_run
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in {
+        "pip": "#!/bin/sh\nexit 0\n",
+        "python": (
+            "#!/usr/bin/env python3\n"
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "time.sleep(3)\n"
+        ),
+    }.items():
+        executable = bin_dir / name
+        executable.write_text(body, encoding="utf-8")
+        executable.chmod(0o755)
+    output = tmp_path / "github-output"
+    env = dict(os.environ)
+    env.update({
+        "PATH": f"{bin_dir}:{env['PATH']}",
+        "GEMINI_REVIEW_PROCESS_TIMEOUT": "1",
+        "GITHUB_OUTPUT": str(output),
+    })
+
+    result = subprocess.run(
+        ["bash", "-c", run], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True, timeout=5,
+    )
+
+    assert result.returncode == 124
+    assert _github_outputs(output)["failure_reason"] == "provider_timeout"
+
+
 def test_gemini_infra_lines_sanitized_from_output_and_context(tmp_path):
     """모델이 sticky 헤더(marker, '- Reviewed:')를 에코해도 게시본·프롬프트에 남지 않는다."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
