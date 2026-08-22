@@ -29,14 +29,19 @@ from scripts.workflow_catalog import (
     load_fleet_config,
 )
 from scripts.workflow_release_inventory import (
-    RELEASE_PATHS,
+    PREPARE_REVIEW_DIFF_ACTION_ROOT,
     SETUP_GEMINI_AUTH_ROOT,
+    release_paths_for,
+    release_roots_for,
+    release_supports_prepare_review_diff,
     validate_release_listing,
 )
 
 
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 CACHE_ACTION = "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+DOWNLOAD_ARTIFACT_ACTION = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
 OPENCODE_VERSION = "1.18.17"
 OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
@@ -188,6 +193,56 @@ EXPECTED_SETUP_GEMINI_AUTH = {
         ],
     },
 }
+EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
+    "name": "Prepare review diff",
+    "description": "Prepare a fail-closed full or incremental PR diff",
+    "inputs": {
+        "github-token": {"required": "true"},
+        "pr-number": {"required": "true"},
+        "previous-sha": {"required": "false", "default": ""},
+        "previous-full-hash": {"required": "false", "default": ""},
+        "context-lines": {"required": "false", "default": "3"},
+    },
+    "outputs": {
+        "diff-ready": {"value": "${{ steps.prepare.outputs.diff_ready }}"},
+        "diff-mode": {"value": "${{ steps.prepare.outputs.diff_mode }}"},
+        "head-sha": {"value": "${{ steps.prepare.outputs.head_sha }}"},
+        "full-diff-sha256": {
+            "value": "${{ steps.prepare.outputs.full_diff_sha256 }}"
+        },
+        "unchanged-since-previous": {
+            "value": "${{ steps.prepare.outputs.unchanged_since_previous }}"
+        },
+    },
+    "runs": {
+        "using": "composite",
+        "steps": [
+            {
+                "id": "prepare",
+                "shell": "bash",
+                "env": {
+                    "GH_TOKEN": "${{ inputs.github-token }}",
+                    "PR_NUMBER": "${{ inputs.pr-number }}",
+                    "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
+                    "PREVIOUS_FULL_HASH": "${{ inputs.previous-full-hash }}",
+                    "CONTEXT_LINES": "${{ inputs.context-lines }}",
+                },
+                "run": (
+                    'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" '
+                    '--repository "$GITHUB_REPOSITORY" '
+                    '--pr-number "$PR_NUMBER" '
+                    '--previous-sha "$PREVIOUS_SHA" '
+                    '--previous-full-hash "$PREVIOUS_FULL_HASH" '
+                    '--context-lines "$CONTEXT_LINES" '
+                    '--full-output "$GITHUB_WORKSPACE/review-full.diff" '
+                    '--delta-output "$GITHUB_WORKSPACE/review-delta.diff" '
+                    '--manifest-output "$GITHUB_WORKSPACE/review-scope.json" '
+                    '--github-output "$GITHUB_OUTPUT"'
+                ),
+            }
+        ],
+    },
+}
 class ManualGeminiContract(NamedTuple):
     step_name: str
     step_id: str
@@ -230,6 +285,14 @@ APPROVED_GEMINI_ACTIONS = frozenset(
         "jhw7500/automation/.github/actions/check-workflow-enabled@v1.1",
         SETUP_GEMINI_AUTH,
     }
+)
+PREPARE_REVIEW_DIFF_ACTION = (
+    f"$/{PREPARE_REVIEW_DIFF_ACTION_ROOT.path.parent.as_posix()}"
+)
+REVIEW_DIFF_DEPENDENCY_WORKFLOWS = (
+    "claude-code-review.yml",
+    "gemini-auto-review.yml",
+    "opencode-auto-review.yml",
 )
 GIT_EXECUTABLE = "/usr/bin/git"
 CANONICAL_AUTOMATION_REMOTE = "https://github.com/jhw7500/automation.git"
@@ -1224,8 +1287,10 @@ def verify_remote_tag(repo: Path, remote: str, tag: AnnotatedTag) -> None:
         )
 
 
-def verify_opencode_runtime(job: dict, step_name: str, workflow_name: str) -> dict:
-    """Require a digest-verified CLI and the restricted repository token path."""
+def verify_opencode_runtime(
+    job: dict, step_name: str, workflow_name: str, *, generic_run: bool = False
+) -> dict:
+    """Require a digest-verified CLI and the workflow-specific command boundary."""
     try:
         cache = next(
             item
@@ -1248,6 +1313,24 @@ def verify_opencode_runtime(job: dict, step_name: str, workflow_name: str) -> di
     expected_url = (
         "releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
     )
+    run_script = run_step.get("run", "")
+    generic_contract = (
+        "opencode github run" not in run_script
+        and "opencode run --model zai-coding-plan/glm-4.7 --format json --file review-full.diff --file review-scope.json" in run_script
+        and "map(fromjson)" in run_script
+        and "fromjson?" not in run_script
+        and "else last end" in run_script
+        and run_step.get("env", {}).get("OPENCODE_PURE") == "true"
+        and run_step.get("env", {}).get("OPENCODE_DISABLE_PROJECT_CONFIG") == "true"
+        and run_step.get("env", {}).get("OPENCODE_CONFIG_CONTENT")
+        == '{"share":"disabled","snapshot":false,"permission":{"*":"deny"}}'
+        and not {"GITHUB_TOKEN", "GH_TOKEN", "USE_GITHUB_TOKEN"}
+        & set(run_step.get("env", {}))
+    )
+    github_contract = (
+        run_script == "opencode github run"
+        and run_step.get("env", {}).get("USE_GITHUB_TOKEN") == "true"
+    )
     runtime_is_pinned = (
         job_env.get("OPENCODE_VERSION") == OPENCODE_VERSION
         and job_env.get("OPENCODE_ARCHIVE_SHA256") == OPENCODE_ARCHIVE_SHA256
@@ -1255,9 +1338,8 @@ def verify_opencode_runtime(job: dict, step_name: str, workflow_name: str) -> di
         and expected_url in install_script
         and "sha256sum --check -" in install_script
         and '"$install_dir/opencode" --version' in install_script
-        and run_step.get("run") == "opencode github run"
-        and run_step.get("env", {}).get("USE_GITHUB_TOKEN") == "true"
-        and run_step.get("env", {}).get("MODEL") == "zai-coding-plan/glm-4.7"
+        and (generic_contract if generic_run else github_contract)
+        and (generic_run or run_step.get("env", {}).get("MODEL") == "zai-coding-plan/glm-4.7")
     )
     if not runtime_is_pinned:
         raise ReleaseVerificationError(
@@ -1286,9 +1368,10 @@ def _verify_approved_v140_policy(tree: VerifiedCommitTree, ref: str) -> None:
         )
 
 
-def _release_inventory(tree: VerifiedCommitTree) -> None:
+def _release_inventory(tree: VerifiedCommitTree, ref: str) -> None:
     try:
-        entries = validate_release_listing(tree.listing(RELEASE_PATHS))
+        roots = release_roots_for(ref)
+        entries = validate_release_listing(tree.listing(release_paths_for(ref)), roots)
         for entry in entries:
             tree.reader.read(entry.oid, "blob")
     except (ReleaseVerificationError, ValueError):
@@ -1316,6 +1399,54 @@ def _verify_setup_gemini_auth(tree: VerifiedCommitTree) -> None:
     if document != EXPECTED_SETUP_GEMINI_AUTH:
         raise ReleaseVerificationError(
             "setup-gemini-auth action contract is invalid"
+        )
+
+
+def _verify_prepare_review_diff_action(tree: VerifiedCommitTree) -> None:
+    path = PREPARE_REVIEW_DIFF_ACTION_ROOT.path.as_posix()
+    try:
+        document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
+    except (ReleaseVerificationError, yaml.YAMLError):
+        raise ReleaseVerificationError(
+            "prepare-review-diff action contract is invalid"
+        ) from None
+    if document != EXPECTED_PREPARE_REVIEW_DIFF_ACTION:
+        raise ReleaseVerificationError(
+            "prepare-review-diff action contract is invalid"
+        )
+    try:
+        helper = tree.read_text(
+            ".github/actions/prepare-review-diff/prepare_review_diff.py"
+        )
+    except ReleaseVerificationError:
+        raise ReleaseVerificationError(
+            "prepare-review-diff immutable local Git scope contract is invalid"
+        ) from None
+    required = (
+        "def parse_name_status(",
+        "def local_scope(",
+        "def git_full_diff(",
+        '"--name-status"',
+        '"-z"',
+        '"--find-renames=50%"',
+        '"--ignore-submodules=none"',
+        '"--no-replace-objects"',
+        "full_diff = git_full_diff(merge_base_sha, head_sha",
+        "records = local_scope(merge_base_sha, head_sha",
+    )
+    forbidden = (
+        "def pr_files(",
+        "def numbered_pr_diff(",
+        "/pulls/{pr_number}/files",
+        '["gh", "pr", "diff"',
+    )
+    if (
+        not all(item in helper for item in required)
+        or helper.count('"--ignore-submodules=none"') != 3
+        or any(item in helper for item in forbidden)
+    ):
+        raise ReleaseVerificationError(
+            "prepare-review-diff immutable local Git scope contract is invalid"
         )
 
 
@@ -1624,6 +1755,37 @@ def _action_references(value: object) -> list[str]:
     return result
 
 
+def _verify_prepare_review_diff_dependencies(
+    ref: str, documents: dict[str, dict]
+) -> None:
+    supported = release_supports_prepare_review_diff(ref)
+    for name in REVIEW_DIFF_DEPENDENCY_WORKFLOWS:
+        document = documents.get(name)
+        if document is None:
+            if supported:
+                raise ReleaseVerificationError(
+                    f"{name} prepare-review-diff dependency is missing"
+                )
+            continue
+        references = _action_references(document)
+        local_references = [
+            reference
+            for reference in references
+            if reference.startswith(("$/", "./"))
+        ]
+        if supported:
+            valid = (
+                references.count(PREPARE_REVIEW_DIFF_ACTION) == 1
+                and local_references == [PREPARE_REVIEW_DIFF_ACTION]
+            )
+        else:
+            valid = not local_references
+        if not valid:
+            raise ReleaseVerificationError(
+                f"{name} prepare-review-diff dependency contract is invalid"
+            )
+
+
 def _verify_token_mapping(
     name: str, location: str, mapping: object, *, allow_empty: bool = False
 ) -> int:
@@ -1647,7 +1809,7 @@ def _verify_token_mapping(
     return sinks
 
 
-def _verify_gemini_workflow(name: str, document: dict) -> None:
+def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
     try:
         call = document["on"]["workflow_call"]
         inputs = call["inputs"]
@@ -1695,9 +1857,10 @@ def _verify_gemini_workflow(name: str, document: dict) -> None:
         raise ReleaseVerificationError(
             f"{name} must not grant workflow-level write permissions"
         )
-    unapproved_actions = sorted(
-        set(_action_references(document)) - APPROVED_GEMINI_ACTIONS
-    )
+    approved_actions = APPROVED_GEMINI_ACTIONS
+    if release_supports_prepare_review_diff(ref):
+        approved_actions |= {PREPARE_REVIEW_DIFF_ACTION}
+    unapproved_actions = sorted(set(_action_references(document)) - approved_actions)
     if unapproved_actions:
         raise ReleaseVerificationError(
             f"{name} uses a resolver/action outside the approved action allowlist: "
@@ -1800,8 +1963,10 @@ def _verify_commit_content(
 ) -> VerifiedCommitTree:
     tree = VerifiedCommitTree.open(repo, revision)
     if _release_version(ref) >= (1, 40):
-        _release_inventory(tree)
+        _release_inventory(tree, ref)
         _verify_setup_gemini_auth(tree)
+    if release_supports_prepare_review_diff(ref):
+        _verify_prepare_review_diff_action(tree)
     _verify_approved_v140_policy(tree, ref)
     _verify_manual_gemini_output_contract(tree, ref)
     catalog = _verify_tag_catalog(tree, ref)
@@ -1824,6 +1989,8 @@ def _verify_commit_content(
         data = yaml.load(text, Loader=yaml.BaseLoader)
         documents[Path(name).name] = data if isinstance(data, dict) else {}
 
+    _verify_prepare_review_diff_dependencies(ref, documents)
+
     if catalog is not None:
         gemini_targets = sorted(
             {
@@ -1837,7 +2004,7 @@ def _verify_commit_content(
                 raise ReleaseVerificationError(
                     f"central Gemini workflow is missing: {target}"
                 )
-            _verify_gemini_workflow(target, documents[target])
+            _verify_gemini_workflow(target, documents[target], ref)
 
         for entry in catalog.callers:
             assert entry.central_workflow is not None
@@ -1879,24 +2046,252 @@ def _verify_commit_content(
     try:
         check_job = auto["jobs"]["check-enabled"]
         job = auto["jobs"]["opencode-review"]
-        permissions = job["permissions"]
-        checkout = next(
-            item for item in job["steps"] if item.get("name") == "Checkout repository"
-        )
-    except (KeyError, TypeError, StopIteration) as exc:
+    except (KeyError, TypeError) as exc:
         raise ReleaseVerificationError("OpenCode security structure is missing") from exc
+    modern_auto_review = release_supports_prepare_review_diff(ref)
     step = verify_opencode_runtime(
-        job, "Run OpenCode PR review", "opencode-auto-review.yml"
+        job,
+        "Run OpenCode PR review",
+        "opencode-auto-review.yml",
+        generic_run=modern_auto_review,
     )
-    expected_permissions = {
-        "contents": "read",
-        "pull-requests": "write",
-        "issues": "write",
-    }
-    if permissions != expected_permissions:
+    expected_permissions: dict[str, str] = (
+        {}
+        if modern_auto_review
+        else {"contents": "read", "pull-requests": "write", "issues": "write"}
+    )
+    if job.get("permissions") != expected_permissions:
         raise ReleaseVerificationError(
             f"OpenCode auto review permissions differ from {expected_permissions}"
         )
+    if modern_auto_review:
+        try:
+            prepare = auto["jobs"]["opencode-prepare"]
+            canonical = auto["jobs"]["opencode-canonicalize"]
+            prepare_collect = next(item for item in prepare["steps"] if item.get("name") == "Collect previous review context")
+            upload = next(item for item in prepare["steps"] if item.get("name") == "Upload sealed canonicalization handoff")
+            model_download = next(item for item in job["steps"] if item.get("name") == "Download sealed review handoff")
+            model_validate = next(item for item in job["steps"] if item.get("name") == "Validate sealed review handoff")
+            candidate_upload = next(item for item in job["steps"] if item.get("name") == "Upload untrusted OpenCode candidate")
+            canonical_download = next(item for item in canonical["steps"] if item.get("name") == "Download sealed canonicalization handoff")
+            candidate_download = next(item for item in canonical["steps"] if item.get("name") == "Download untrusted OpenCode candidate")
+            canonical_step = next(item for item in canonical["steps"] if item.get("name") == "Canonicalize OpenCode review")
+            canonical_checkout = next(item for item in canonical["steps"] if item.get("name") == "Checkout trusted repository")
+        except (KeyError, TypeError, StopIteration) as exc:
+            raise ReleaseVerificationError("OpenCode three-job attestation boundary is missing") from exc
+        expected_prepare = {"actions": "read", "checks": "read", "contents": "read", "pull-requests": "read", "issues": "read"}
+        expected_canonical = {"actions": "read", "checks": "write", "contents": "read", "pull-requests": "write", "issues": "write"}
+        canonical_script = canonical_step.get("with", {}).get("script", "")
+        prepare_script = prepare_collect.get("run", "")
+        model_validation = model_validate.get("run", "")
+        anchor_range = (
+            "`${manifest.merge_base_sha}..${manifest.head_sha}`, '--', "
+            "...pathspecs,"
+        )
+        canonical_anchor_contract = (
+            "const parseNameStatus = (bytes) => {" in canonical_script
+            and "new TextDecoder('utf-8', { fatal: true })" in canonical_script
+            and "bytes.at(-1) !== 0" in canonical_script
+            and "? [file.previous_filename, file.filename] : [file.filename]"
+            in canonical_script
+            and canonical_script.count(
+                "'--no-replace-objects', '--literal-pathspecs', '-c', "
+                "'diff.external=',"
+            )
+            == 2
+            and (
+                "'diff', '--no-ext-diff', '--no-textconv', '--name-status', "
+                "'-z',\n      '--find-renames=50%', "
+                "'--ignore-submodules=none',"
+            )
+            in canonical_script
+            and (
+                "'diff', '--no-ext-diff', '--no-textconv', "
+                "'--find-renames=50%',\n      "
+                "'--ignore-submodules=none', '--inter-hunk-context=0', "
+                "'--no-color', '-U0',"
+            )
+            in canonical_script
+            and canonical_script.count(anchor_range) == 2
+            and "records.length !== 1 || records[0].status !== file.status"
+            in canonical_script
+            and "records[0].filename !== file.filename" in canonical_script
+            and (
+                "(records[0].previous_filename || null) !== "
+                "(file.previous_filename || null)"
+            )
+            in canonical_script
+            and "const parseAddedRanges = (patch) => {" in canonical_script
+            and "if (!patch.endsWith('\\n')) return null;" in canonical_script
+            and "} else if (line.startsWith('+')) {" in canonical_script
+            and "addLine(newLine, line.slice(1));" in canonical_script
+            and "ranges.addedLines = addedLines;" in canonical_script
+            and "typeof location.currentLine !== 'string'" in canonical_script
+            and "ranges.addedLines.get(anchor.line) === anchor.currentLine"
+            in canonical_script
+            and canonical_script.count(
+                "if (inHunk && (oldRemaining !== 0 || newRemaining !== 0)) "
+                "return null;"
+            )
+            == 2
+            and "if (!inHunk || lastBodyPrefix === null" in canonical_script
+            and "(lastBodyPrefix === '+' && newRemaining !== 0)"
+            in canonical_script
+            and "(lastBodyPrefix === '-' && oldRemaining !== 0)"
+            in canonical_script
+            and (
+                "lastBodyPrefix === ' '\n            "
+                "&& (oldRemaining !== 0 || newRemaining !== 0)"
+            )
+            in canonical_script
+            and "const oldEnd = oldStart + oldCount;" in canonical_script
+            and "const newEnd = newStart + newCount;" in canonical_script
+            and (
+                "[oldStart, oldCount, newStart, newCount, oldEnd, newEnd]\n"
+                "          .every(Number.isSafeInteger)"
+            )
+            in canonical_script
+            and (
+                "previousOldEnd !== null && (oldStart < previousOldEnd\n"
+                "            || newStart < previousNewEnd || "
+                "oldStart === previousOldStart\n"
+                "            || newStart === previousNewStart)"
+            )
+            in canonical_script
+            and "(oldCount === 0 && newCount === 0)" in canonical_script
+            and "let oldEofMarked = false;" in canonical_script
+            and "let newEofMarked = false;" in canonical_script
+            and (
+                "if (inHunk && (oldEofMarked || newEofMarked)) return null;"
+            )
+            in canonical_script
+            and (
+                "if (lastBodyPrefix === '+' || lastBodyPrefix === ' ') "
+                "newEofMarked = true;"
+            )
+            in canonical_script
+            and (
+                "if (lastBodyPrefix === '-' || lastBodyPrefix === ' ') "
+                "oldEofMarked = true;"
+            )
+            in canonical_script
+            and "const ranges = parseAddedRanges(result.stdout);" in canonical_script
+            and "const start = Number(match[1]);" not in canonical_script
+        )
+        body_limit_gate = canonical_script.find(
+            "if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') "
+            "> 65536)"
+        )
+        repair_call = canonical_script.find("if (!(await repairComments())) return;")
+        canonical_pre_mutation_size_contract = (
+            body_limit_gate >= 0
+            and repair_call > body_limit_gate
+            and canonical_script.count("if (!(await repairComments())) return;") == 1
+        )
+        artifact_contract = (
+            prepare.get("permissions") == expected_prepare
+            and canonical.get("permissions") == expected_canonical
+            and job.get("permissions") == {}
+            and not any("actions/checkout@" in item.get("uses", "") for item in job.get("steps", []))
+            and prepare.get("needs") == "check-enabled"
+            and job.get("needs") == ["check-enabled", "opencode-prepare"]
+            and canonical.get("needs") == ["check-enabled", "opencode-prepare", "opencode-review"]
+            and upload.get("uses") == UPLOAD_ARTIFACT_ACTION
+            and upload.get("with", {}).get("overwrite") == "false"
+            and candidate_upload.get("uses") == UPLOAD_ARTIFACT_ACTION
+            and candidate_upload.get("with", {}).get("name") == "opencode-candidate-${{ github.run_id }}-${{ github.run_attempt }}"
+            and candidate_upload.get("with", {}).get("path") == "${{ runner.temp }}/opencode-candidate/review.md"
+            and candidate_upload.get("with", {}).get("overwrite") == "false"
+            and all(item.get("uses") == DOWNLOAD_ARTIFACT_ACTION for item in (model_download, canonical_download, candidate_download))
+            and all(item.get("with", {}).get("artifact-ids") == "${{ needs.opencode-prepare.outputs.handoff_artifact_id }}" for item in (model_download, canonical_download))
+            and all(item.get("with", {}).get("merge-multiple") == "true" for item in (model_download, canonical_download))
+            and candidate_download.get("with", {}).get("artifact-ids") == "${{ needs.opencode-review.outputs.candidate_artifact_id }}"
+            and candidate_download.get("with", {}).get("merge-multiple") == "true"
+            and job.get("outputs", {}).get("candidate_artifact_id") == "${{ steps.upload-candidate.outputs.artifact-id }}"
+            and job.get("outputs", {}).get("candidate_artifact_digest") == "${{ steps.upload-candidate.outputs.artifact-digest }}"
+            and model_validate.get("env", {}).get("HANDOFF_ARTIFACT_DIGEST") == "${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}"
+            and '[[ "$HANDOFF_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]' in model_validation
+            and canonical_step.get("env", {}).get("HANDOFF_ARTIFACT_DIGEST") == "${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}"
+            and 'artifact.digest !== `sha256:${process.env.HANDOFF_ARTIFACT_DIGEST}`' in canonical_script
+            and 'candidateArtifact.digest !== `sha256:${candidateDigest}`' in canonical_script
+            and 'candidateArtifact.name !== candidateName' in canonical_script
+            and 'candidateArtifact.workflow_run?.id !== runId' in canonical_script
+            and "entries.length !== 1 || entries[0].name !== 'review.md'" in canonical_script
+            and "candidateStat.size > 60000" in canonical_script
+            and "Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536" in canonical_script
+            and "match[1] !== JSON.stringify({ path: anchor.path, line: anchor.line })" in canonical_script
+            and canonical_anchor_contract
+            and canonical_pre_mutation_size_contract
+            and "github.rest.checks.create" in canonical_script
+            and "github.rest.checks.update" in canonical_script
+            and "github.rest.actions.listWorkflowRunsForRepo" in canonical_script
+            and "github.rest.checks.listForRef" in canonical_script
+            and "response.data.workflow_runs.filter((run) =>" in canonical_script
+            and ").length === 1).slice(0, 20)" in canonical_script
+            and "check_run_id: record.attestationId" not in canonical_script
+            and "event: 'pull_request', per_page: 100, page: 1" in canonical_script
+            and "event: 'pull_request', status: 'success'" not in canonical_script
+            and "check_name: 'automation/opencode-canonical-review'" in canonical_script
+            and "name: 'automation/opencode-canonical-review', head_sha: workflowHead" in canonical_script
+            and "workflow_head: workflowHead" in canonical_script
+            and "prepared_run_attempt: handoff.run_attempt" in canonical_script
+            and "github.rest.actions.getWorkflowRunAttempt" in canonical_script
+            and canonical_script.count("run_id: a.run_id, attempt_number: a.run_attempt") == 2
+            and "a.run_attempt <= selectedRun.run_attempt" in canonical_script
+            and "const claimed = comments.map(parseRecord).filter(Boolean);" in canonical_script
+            and "if (bounded.length > 40)" in canonical_script
+            and "for (const candidate of bounded)" in canonical_script
+            and "bounded.slice(0, 40)" not in canonical_script
+            and "if (run?.status !== 'completed')" in canonical_script
+            and "const unresolvedAttemptEvidence = new Map();" in canonical_script
+            and canonical_script.count("unresolvedAttemptEvidence.set(cacheKey, candidate);") == 2
+            and canonical_script.count("unresolvedAttemptEvidence.delete(cacheKey);") == 2
+            and "unresolvedAttemptEvidence.clear()" not in canonical_script
+            and "const seenAttemptEvidence = new Set();" in canonical_script
+            and "if (seenAttemptEvidence.size > 40)" in canonical_script
+            and "unresolvedAttemptEvidence.size > 0" in canonical_script
+            and "Deferring OpenCode repair while exact attempt provenance is pending" in canonical_script
+            and "handoff.run_attempt > runAttempt" in canonical_script
+            and "const maxUntrustedCleanupComments = 20;" in canonical_script
+            and "for (const raw of commentCandidates)" not in canonical_script
+            and "for (const raw of neutralizedCommentCandidates)" in canonical_script
+            and 'gh api "repos/${GITHUB_REPOSITORY}/actions/runs" --method GET' in prepare_script
+            and '-f event=pull_request -F per_page=100 -F page=1' in prepare_script
+            and '-f status=success' not in prepare_script
+            and 'commits/${workflow_head}/check-runs' in prepare_script
+            and 'check-runs/${check_id}' not in prepare_script
+            and 'a.run_attempt <= run.run_attempt' in prepare_script
+            and "if (unique.length > 40)" in prepare_script
+            and "JSON.stringify(unique)" in prepare_script
+            and "unique.slice(0, 40)" not in prepare_script
+            and prepare.get("outputs", {}).get("workflow_head_sha") == "${{ steps.build-handoff.outputs.workflow_head_sha }}"
+            and canonical_step.get("env", {}).get("WORKFLOW_HEAD") == "${{ needs.opencode-prepare.outputs.workflow_head_sha }}"
+            and "automation-attestation" in canonical_script
+            and canonical_checkout.get("with", {}).get("persist-credentials") == "false"
+            and canonical_checkout.get("with", {}).get("ref") == "${{ needs.opencode-prepare.outputs.head_sha }}"
+            and "always()" in canonical.get("if", "")
+        )
+        if not artifact_contract:
+            raise ReleaseVerificationError("OpenCode sealed handoff/attestation contract is invalid")
+        expected_caller_permissions = {
+            "actions": "read", "checks": "write", "contents": "read",
+            "issues": "write", "pull-requests": "write",
+        }
+        opencode_entry = next(
+            (entry for entry in catalog.callers
+             if entry.path.as_posix() == ".github/workflows/opencode-auto-review.yml"),
+            None,
+        ) if catalog is not None else None
+        self_document = documents.get("_self-opencode-auto-review.yml", {})
+        self_job = self_document.get("jobs", {}).get("opencode-review", {})
+        if (
+            opencode_entry is None
+            or len(opencode_entry.caller_jobs) != 1
+            or dict(opencode_entry.caller_jobs[0].permissions) != expected_caller_permissions
+            or self_job.get("permissions") != expected_caller_permissions
+            or self_job.get("uses") != "./.github/workflows/opencode-auto-review.yml"
+        ):
+            raise ReleaseVerificationError("OpenCode caller permission ceiling is invalid")
     safe_output = check_job.get("outputs", {}).get("safe_pr")
     scope_step = next(
         (item for item in check_job.get("steps", []) if item.get("id") == "pr_scope"),
@@ -1912,12 +2307,32 @@ def _verify_commit_content(
         raise ReleaseVerificationError(
             "OpenCode auto review lacks a central same-repository PR guard"
         )
-    if checkout.get("with", {}).get("persist-credentials") != "true":
-        raise ReleaseVerificationError(
-            "OpenCode auto review cannot authenticate private repository fetch"
-        )
-    if step.get("env", {}).get("GITHUB_TOKEN") != "${{ github.token }}":
-        raise ReleaseVerificationError("OpenCode auto review does not use github.token")
+    if modern_auto_review:
+        if {"GITHUB_TOKEN", "GH_TOKEN", "USE_GITHUB_TOKEN"} & set(step.get("env", {})):
+            raise ReleaseVerificationError("OpenCode auto review model receives a GitHub token")
+        if any(
+            "actions/checkout@" in item.get("uses", "")
+            for item in job.get("steps", [])
+        ):
+            raise ReleaseVerificationError("OpenCode auto review model receives a repository checkout")
+    else:
+        try:
+            checkout = next(
+                item
+                for item in job["steps"]
+                if item.get("name") == "Checkout repository"
+            )
+        except (KeyError, TypeError, StopIteration) as exc:
+            raise ReleaseVerificationError(
+                "OpenCode auto review checkout is missing"
+            ) from exc
+        if (
+            checkout.get("with", {}).get("persist-credentials") != "true"
+            or step.get("env", {}).get("GITHUB_TOKEN") != "${{ github.token }}"
+        ):
+            raise ReleaseVerificationError(
+                "OpenCode auto review cannot authenticate its historical private repository fetch"
+            )
 
     command = documents.get("opencode.yml")
     try:

@@ -1,6 +1,6 @@
 # GitHub Actions Configuration
 
-This directory contains GitHub Actions workflows for automated code review and quality assurance using Claude Code and Gemini.
+This directory contains GitHub Actions workflows for automated code review and quality assurance using Claude Code, Gemini, and OpenCode.
 
 ## Workflows
 
@@ -76,6 +76,22 @@ Runs periodic analysis of repository issues.
 **Required Variables:**
 - Additional configuration may be required in workflow files
 
+### Automatic Review Input
+
+Claude, Gemini, and OpenCode automatic reviews use the shared
+`$/.github/actions/prepare-review-diff` action. It prepares a PR-scoped full diff, a safe
+incremental diff when available, and a scope manifest from the same immutable automation commit
+as the reusable workflow. The authoritative full diff and manifest come only from the exact local
+`merge-base..captured-head` object graph—never Pulls Files or a numbered server diff—so ABA views
+and the 3,000-file API ceiling cannot narrow review scope. Missing authoritative input skips the
+model and cannot advance the review checkpoint. Claude and Gemini consume the selected
+full/incremental artifact. OpenCode consumes the sealed full diff through a tokenless generic run,
+returns an exact-ID/digest untrusted artifact to the clean canonicalizer, and machine-validates
+canonical one-line JSON changed anchors plus authenticated carryover identity.
+
+See [`docs/workflows/contracts.md`](../docs/workflows/contracts.md#deterministic-automated-review-input)
+for exact modes, state transitions, unusual-path handling, and fail-closed behavior.
+
 ## Setup Instructions
 
 ### 1. Claude Code Setup
@@ -128,12 +144,19 @@ After adding secrets, create a test PR or mention `@claude` in an issue to verif
 
 ## Workflow Permissions
 
-All workflows require these permissions:
-- `contents: read` - Read repository contents
-- `pull-requests: read` - Read PR information
-- `issues: read` - Read issue information
-- `id-token: write` - Generate OIDC tokens (for Claude)
-- `actions: read` - Read CI results (for Claude PR reviews)
+Permissions are catalogued per caller; there is no universal permission set. The automatic
+review caller ceilings are:
+
+- Claude: `contents: read`, `pull-requests: write`, `issues: read`, `id-token: write`.
+- Gemini: `contents: read`, `pull-requests: write`, `issues: write`.
+- OpenCode: `actions: read`, `checks: write`, `contents: read`, `pull-requests: write`,
+  `issues: write`; no OIDC. Its reusable workflow narrows permissions by job so only the clean
+  canonicalizer can write comments or the durable Check receipt; the model job has empty
+  permissions, no checkout, and no GitHub token.
+
+Interactive and triage workflows have their own catalogued permissions. See
+[`docs/workflows/contracts.md`](../docs/workflows/contracts.md#triggers-inputs-and-permissions)
+for the authoritative caller contract.
 
 ## Disabling Workflows
 

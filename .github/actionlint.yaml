@@ -1,0 +1,14 @@
+# GitHub Actions supports `$/path/to/dir` for a local action in the
+# self-repository context. actionlint 1.7.12 does not recognize this syntax,
+# although the hosted runner does; keep the narrowly scoped compatibility
+# exception and continue linting every other action reference.
+paths:
+  .github/workflows/claude-code-review.yml:
+    ignore:
+      - 'specifying action "\$/\.github/actions/prepare-review-diff" in invalid format because ref is missing'
+  .github/workflows/gemini-auto-review.yml:
+    ignore:
+      - 'specifying action "\$/\.github/actions/prepare-review-diff" in invalid format because ref is missing'
+  .github/workflows/opencode-auto-review.yml:
+    ignore:
+      - 'specifying action "\$/\.github/actions/prepare-review-diff" in invalid format because ref is missing'

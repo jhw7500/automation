@@ -228,6 +228,11 @@ STANDARD_WRITE_PERMISSIONS = {
     "issues": "write",
     "pull-requests": "write",
 }
+OPENCODE_ATTESTED_PERMISSIONS = {
+    "actions": "read",
+    "checks": "write",
+    **STANDARD_WRITE_PERMISSIONS,
+}
 
 EXPECTED_CALLER_PERMISSIONS = {
     "auto-rereview-request.yml": ("rereview", STANDARD_WRITE_PERMISSIONS),
@@ -243,7 +248,7 @@ EXPECTED_CALLER_PERMISSIONS = {
     "gemini-scheduled-triage.yml": ("triage", STANDARD_WRITE_PERMISSIONS),
     "gemini-triage.yml": ("triage", STANDARD_WRITE_PERMISSIONS),
     "opencode.yml": ("opencode", STANDARD_WRITE_PERMISSIONS),
-    "opencode-auto-review.yml": ("opencode-review", STANDARD_WRITE_PERMISSIONS),
+    "opencode-auto-review.yml": ("opencode-review", OPENCODE_ATTESTED_PERMISSIONS),
 }
 
 

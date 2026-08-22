@@ -11,6 +11,16 @@ import json
 from pathlib import Path
 
 
+HISTORICAL_REVIEW_FIXTURE_ROOT = (
+    Path(__file__).parent / "fixtures/review-workflows-v1.44"
+)
+HISTORICAL_REVIEW_WORKFLOWS = (
+    "claude-code-review.yml",
+    "gemini-auto-review.yml",
+    "opencode-auto-review.yml",
+)
+
+
 def restore_historical_automation_ref(repo: Path, historical_ref: str) -> None:
     """픽스처 트리의 automation_ref 를 라이브 값에서 역사적 값으로 되돌린다."""
     config_path = repo / "scripts/workflow-config.json"
@@ -25,3 +35,47 @@ def restore_historical_automation_ref(repo: Path, historical_ref: str) -> None:
         config_text.replace(needle, f'"automation_ref": "{historical_ref}"', 1),
         encoding="utf-8",
     )
+
+
+def restore_historical_review_workflows(
+    repo: Path,
+    filenames: tuple[str, ...] = HISTORICAL_REVIEW_WORKFLOWS,
+) -> None:
+    """Restore genuine v1.44 central review bytes into a historical fixture.
+
+    The snapshots come from immutable v1.44 commit 5ec427c540619d6fbd80ea758de8d8e0bf00d987.
+    Keeping them in the test tree makes historical fixtures independent of Git history.
+    """
+
+    for filename in filenames:
+        relative = f".github/workflows/{filename}"
+        (repo / relative).write_bytes(
+            (HISTORICAL_REVIEW_FIXTURE_ROOT / filename).read_bytes()
+        )
+
+    # v1.44 callers predate the Task 5 Actions/Checks ceiling. Restore those two
+    # release-policy files without altering the immutable central workflow fixtures.
+    baseline = repo / "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml"
+    if baseline.exists():
+        text = baseline.read_text(encoding="utf-8")
+        text = text.replace("      actions: read\n      checks: write\n", "", 1)
+        baseline.write_text(text, encoding="utf-8")
+    catalog = repo / "scripts/workflow-catalog.json"
+    if catalog.exists():
+        text = catalog.read_text(encoding="utf-8")
+        text = text.replace(
+            '          "permissions": {\n'
+            '            "actions": "read",\n'
+            '            "checks": "write",\n'
+            '            "contents": "read",\n'
+            '            "issues": "write",\n'
+            '            "pull-requests": "write"\n'
+            "          },",
+            '          "permissions": {\n'
+            '            "contents": "read",\n'
+            '            "issues": "write",\n'
+            '            "pull-requests": "write"\n'
+            "          },",
+            1,
+        )
+        catalog.write_text(text, encoding="utf-8")

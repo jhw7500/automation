@@ -99,8 +99,8 @@ jobs:
           fi
           STICKY_REVIEWERS=$(printf '%s' "$RAW_COMMENTS_JSON" \
             | jq -s 'add // [] | [.[] | select(((.user.type // "") == "Bot")
-                     and ((.body // "") | test("<!-- automation:[A-Za-z0-9_-]+")))
-                     | (.body | capture("<!-- automation:(?<name>[A-Za-z0-9_-]+)").name)]' \
+                     and ((.body // "") | test("<!-- automation:[A-Za-z0-9_-]+(?::v[0-9]+)? -->")))
+                     | (.body | capture("<!-- automation:(?<name>[A-Za-z0-9_-]+)(?::v[0-9]+)? -->").name)]' \
             || printf '[]')
           # sticky 리뷰어는 실제 계정이 아니라 멘션이 불가능하다 — push 시 자동으로
           # 재리뷰가 돌기 때문에 사람에게는 "누가 리뷰했는지"를 알리는 정보성 표기다.

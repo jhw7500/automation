@@ -1,0 +1,49 @@
+name: Prepare review diff
+description: Prepare a fail-closed full or incremental PR diff
+inputs:
+  github-token:
+    required: true
+  pr-number:
+    required: true
+  previous-sha:
+    required: false
+    default: ''
+  previous-full-hash:
+    required: false
+    default: ''
+  context-lines:
+    required: false
+    default: '3'
+outputs:
+  diff-ready:
+    value: ${{ steps.prepare.outputs.diff_ready }}
+  diff-mode:
+    value: ${{ steps.prepare.outputs.diff_mode }}
+  head-sha:
+    value: ${{ steps.prepare.outputs.head_sha }}
+  full-diff-sha256:
+    value: ${{ steps.prepare.outputs.full_diff_sha256 }}
+  unchanged-since-previous:
+    value: ${{ steps.prepare.outputs.unchanged_since_previous }}
+runs:
+  using: composite
+  steps:
+    - id: prepare
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PREVIOUS_SHA: ${{ inputs.previous-sha }}
+        PREVIOUS_FULL_HASH: ${{ inputs.previous-full-hash }}
+        CONTEXT_LINES: ${{ inputs.context-lines }}
+      run: >-
+        python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py"
+        --repository "$GITHUB_REPOSITORY"
+        --pr-number "$PR_NUMBER"
+        --previous-sha "$PREVIOUS_SHA"
+        --previous-full-hash "$PREVIOUS_FULL_HASH"
+        --context-lines "$CONTEXT_LINES"
+        --full-output "$GITHUB_WORKSPACE/review-full.diff"
+        --delta-output "$GITHUB_WORKSPACE/review-delta.diff"
+        --manifest-output "$GITHUB_WORKSPACE/review-scope.json"
+        --github-output "$GITHUB_OUTPUT"

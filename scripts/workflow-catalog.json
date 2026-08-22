@@ -580,6 +580,8 @@
         {
           "name": "opencode-review",
           "permissions": {
+            "actions": "read",
+            "checks": "write",
             "contents": "read",
             "issues": "write",
             "pull-requests": "write"

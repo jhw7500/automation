@@ -17,8 +17,13 @@ import pytest
 import yaml
 
 import scripts.verify_workflow_release as release_verifier
+import scripts.workflow_release_inventory as release_inventory
 from scripts.verify_workflow_release import ReleaseVerificationError, verify_release
 from scripts.workflow_release_inventory import RELEASE_PATHS
+from release_fixture_helpers import (
+    HISTORICAL_REVIEW_WORKFLOWS,
+    restore_historical_review_workflows,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -124,6 +129,9 @@ def release_repo(tmp_path: Path) -> tuple[Path, Path, str]:
         else:
             shutil.copy2(source, target)
     restore_historical_v140_manual_outputs(repo)
+    # This synthetic v1.40 fixture uses genuine committed v1.44 central review bytes,
+    # the last release before prepare-review-diff became a release dependency.
+    restore_historical_review_workflows(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -158,6 +166,14 @@ def replace(path: Path, old: str, new: str, *, count: int = -1) -> None:
     text = path.read_text(encoding="utf-8")
     assert old in text
     path.write_text(text.replace(old, new, count), encoding="utf-8")
+
+
+def append_action_reference(path: Path, reference: str) -> None:
+    def append(document: dict) -> None:
+        job = next(job for job in document["jobs"].values() if "steps" in job)
+        job["steps"].append({"uses": reference})
+
+    mutate_yaml(path, append)
 
 
 def retag_bad_release(repo: Path, message: str) -> str:
@@ -590,9 +606,336 @@ def test_current_release_commit_only_uses_authenticated_objects(
     repo, current = current_release_repo
 
     assert (
-        release_verifier.verify_commit_content(repo, "v1.40.2", current)
+        release_verifier.verify_commit_content(repo, "v1.45", current)
         == current
     )
+
+
+@pytest.mark.parametrize(
+    ("relative", "old", "new"),
+    (
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            "actions/upload-artifact@" + "0" * 40,
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "          merge-multiple: true",
+            "          merge-multiple: false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "          HANDOFF_ARTIFACT_ID: ${{ needs.opencode-prepare.outputs.handoff_artifact_id }}\n"
+            "          HANDOFF_ARTIFACT_DIGEST: ${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}",
+            "          HANDOFF_ARTIFACT_ID: ${{ needs.opencode-prepare.outputs.handoff_artifact_id }}\n"
+            "          HANDOFF_ARTIFACT_DIGEST: unsealed",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "      actions: read\n      checks: read\n      contents: read",
+            "      actions: write\n      checks: read\n      contents: read",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "    permissions: {}",
+            "    permissions:\n      actions: read\n      checks: read\n"
+            "      contents: read",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "      actions: read\n      checks: write\n      contents: read",
+            "      actions: read\n      checks: read\n      contents: read",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "github.rest.checks.create",
+            "github.rest.checks.listForRef",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "github.rest.actions.listWorkflowRunsForRepo",
+            "github.rest.actions.getWorkflowRunAttempt",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "event: 'pull_request', per_page: 100, page: 1",
+            "event: 'pull_request', status: 'success', per_page: 100, page: 1",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "-f event=pull_request -F per_page=100 -F page=1",
+            "-f event=pull_request -f status=success -F per_page=100 -F page=1",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "run_id: a.run_id, attempt_number: a.run_attempt,",
+            "run_id: a.run_id, attempt_number: selectedRun.run_attempt,",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "if (bounded.length > 40)",
+            "if (bounded.length > 400)",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "const claimed = comments.map(parseRecord).filter(Boolean);",
+            "const claimed = comments.map(parseRecord).filter(Boolean).filter(() => false);",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "if (run?.status !== 'completed')",
+            "if (false)",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "const authenticateLive = async (comments) => {",
+            "const authenticateLive = async (comments) => { unresolvedAttemptEvidence.clear();",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "unresolvedAttemptEvidence.set(cacheKey, candidate);",
+            "unresolvedAttemptEvidence.delete(cacheKey);",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "name: 'automation/opencode-canonical-review', head_sha: workflowHead",
+            "name: 'automation/opencode-canonical-review', head_sha: attemptHead",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "prepared_run_attempt: handoff.run_attempt",
+            "prepared_run_attempt: runAttempt",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "const maxUntrustedCleanupComments = 20;",
+            "const maxUntrustedCleanupComments = 200;",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "match[1] !== JSON.stringify({ path: anchor.path, line: anchor.line })",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "? [file.previous_filename, file.filename] : [file.filename]",
+            "? [file.filename] : [file.filename]",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'diff', '--no-ext-diff', '--no-textconv', '--name-status', '-z',\n"
+            "                  '--find-renames=50%', '--ignore-submodules=none',",
+            "'diff', '--no-ext-diff', '--no-textconv', '--name-status', '-z',\n"
+            "                  '--find-renames=50%',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'diff', '--no-ext-diff', '--no-textconv', '--find-renames=50%',\n"
+            "                  '--ignore-submodules=none', '--inter-hunk-context=0', "
+            "'--no-color', '-U0',",
+            "'diff', '--no-ext-diff', '--find-renames=50%',\n"
+            "                  '--ignore-submodules=none', '--inter-hunk-context=0', "
+            "'--no-color', '-U0',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'--ignore-submodules=none', '--inter-hunk-context=0', '--no-color', '-U0',",
+            "'--ignore-submodules=none', '--no-color', '-U0',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'--ignore-submodules=none', '--inter-hunk-context=0', '--no-color', '-U0',",
+            "'--ignore-submodules=none', '--inter-hunk-context=0', '-U0',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "} else if (line.startsWith('+')) {",
+            "} else if (line.startsWith(' ')) {",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "const ranges = parseAddedRanges(result.stdout);",
+            "const ranges = [[1, Number.MAX_SAFE_INTEGER]];",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "if (inHunk && (oldRemaining !== 0 || newRemaining !== 0)) return null;",
+            "if (false) return null;",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "if (!inHunk || lastBodyPrefix === null",
+            "if (lastBodyPrefix === null",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "|| (lastBodyPrefix === '+' && newRemaining !== 0)",
+            "|| (lastBodyPrefix === '+' && false)",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "const oldEnd = oldStart + oldCount;",
+            "const oldEnd = oldStart;",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "oldStart < previousOldEnd",
+            "oldStart > previousOldEnd",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "oldStart === previousOldStart",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "|| (oldCount === 0 && newCount === 0)",
+            "|| false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "if (inHunk && (oldEofMarked || newEofMarked)) return null;",
+            "if (false) return null;",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "if (lastBodyPrefix === '+' || lastBodyPrefix === ' ') newEofMarked = true;",
+            "if (false) newEofMarked = true;",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "`${manifest.merge_base_sha}..${manifest.head_sha}`, '--', ...pathspecs,",
+            "`${manifest.merge_base_sha}..${attemptHead}`, '--', ...pathspecs,",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "records.length !== 1 || records[0].status !== file.status",
+            "records.length < 1 || records[0].status !== file.status",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "            if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536) {\n"
+            "              throw new Error('canonical OpenCode comment exceeds 65,536-byte publication limit');\n"
+            "            }\n"
+            "            if (!(await repairComments())) return;",
+            "            if (!(await repairComments())) return;\n"
+            "            if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536) {\n"
+            "              throw new Error('canonical OpenCode comment exceeds 65,536-byte publication limit');\n"
+            "            }",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "const maxUntrustedCleanupComments = 20;",
+            "const maxUntrustedCleanupComments = 20;\n"
+            "            for (const raw of commentCandidates) {}",
+        ),
+        (
+            "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml",
+            "      actions: read\n      checks: write\n",
+            "",
+        ),
+        (
+            ".github/workflows/_self-opencode-auto-review.yml",
+            "      actions: read\n      checks: write\n",
+            "",
+        ),
+    ),
+    ids=(
+        "upload-pin",
+        "download-layout",
+        "artifact-digest",
+        "prepare-write",
+        "model-checks-actions",
+        "canonical-checks",
+        "check-protocol",
+        "server-run-discovery",
+        "live-latest-success-only",
+        "prepare-latest-success-only",
+        "exact-historical-attempt",
+        "historical-overflow",
+        "all-strict-live-records",
+        "incomplete-attempt-cache",
+        "pending-reset",
+        "pending-forgetting",
+        "workflow-head-binding",
+        "prepared-attempt-binding",
+        "bounded-marker-cleanup",
+        "canonical-json-anchor",
+        "canonical-rename-endpoints",
+        "canonical-name-status-flags",
+        "canonical-hunk-flags",
+        "canonical-inter-hunk-zero",
+        "canonical-no-color",
+        "canonical-plus-lines-only",
+        "canonical-body-parser-call",
+        "canonical-hunk-count-exhaustion",
+        "canonical-no-newline-marker-location",
+        "canonical-no-newline-marker-side-exhaustion",
+        "canonical-hunk-exclusive-end",
+        "canonical-hunk-monotonicity",
+        "canonical-zero-count-coordinate-duplicates",
+        "canonical-empty-hunk",
+        "canonical-no-later-hunk-after-eof",
+        "canonical-eof-side-tracking",
+        "canonical-same-graph-range",
+        "canonical-exact-scope-record",
+        "canonical-size-before-repair",
+        "unbounded-candidate-cleanup",
+        "baseline-caller-ceiling",
+        "self-caller-ceiling",
+    ),
+)
+def test_current_release_rejects_opencode_attestation_boundary_drift(
+    current_release_repo: tuple[Path, str], relative: str, old: str, new: str
+) -> None:
+    repo, _ = current_release_repo
+    replace(repo / relative, old, new, count=1)
+    bad_commit = commit(repo, "weaken OpenCode attestation boundary")
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+def test_prepare_diff_capability_boundary_is_shared_with_release_inventory() -> None:
+    capability = getattr(
+        release_inventory, "release_supports_prepare_review_diff", None
+    )
+    assert callable(capability)
+    assert capability("v1.44") is False
+    assert capability("v1.45") is True
+    assert (
+        release_inventory.PREPARE_REVIEW_DIFF_ACTION_ROOT
+        not in release_inventory.release_roots_for("v1.44")
+    )
+    assert (
+        release_inventory.PREPARE_REVIEW_DIFF_ACTION_ROOT
+        in release_inventory.release_roots_for("v1.45")
+    )
+
+
+def test_historical_review_workflows_restore_without_invoking_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "historical-fixture"
+    workflow_root = repo / ".github/workflows"
+    workflow_root.mkdir(parents=True)
+
+    def reject_git(*args, **kwargs):
+        raise AssertionError("historical fixture restoration invoked subprocess")
+
+    monkeypatch.setattr(subprocess, "run", reject_git)
+    restore_historical_review_workflows(repo)
+
+    fixture_root = Path(__file__).parent / "fixtures/review-workflows-v1.44"
+    for filename in (
+        "claude-code-review.yml",
+        "gemini-auto-review.yml",
+        "opencode-auto-review.yml",
+    ):
+        assert (workflow_root / filename).read_bytes() == (
+            fixture_root / filename
+        ).read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -629,7 +972,7 @@ def test_commit_gate_rejects_unsafe_manual_gemini_output_writer(
     bad_commit = commit(repo, "weaken manual Gemini output writer")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -670,7 +1013,7 @@ def test_commit_gate_rejects_manual_gemini_outputs_rewired_to_unsafe_step(
     bad_commit = commit(repo, "rewire manual Gemini outputs")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -699,7 +1042,7 @@ def test_commit_gate_rejects_manual_gemini_fetch_without_explicit_bash(
     bad_commit = commit(repo, "remove explicit Bash execution context")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -725,7 +1068,7 @@ def test_commit_gate_rejects_manual_gemini_downstream_output_rewiring(
     bad_commit = commit(repo, "rewire downstream manual Gemini title")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.40.2", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 def test_release_verifier_preserves_pre_inventory_v139_contract(
@@ -733,6 +1076,7 @@ def test_release_verifier_preserves_pre_inventory_v139_contract(
 ) -> None:
     repo = tmp_path / "historical-automation"
     shutil.copytree(ROOT / ".github/workflows", repo / ".github/workflows")
+    restore_historical_review_workflows(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -740,6 +1084,137 @@ def test_release_verifier_preserves_pre_inventory_v139_contract(
     git(repo, "tag", "-a", "v1.39", "-m", "v1.39")
 
     assert verify_release(repo, "v1.39", commit_oid) == commit_oid
+
+
+def test_v144_release_keeps_the_historical_inventory_without_prepare_diff_action(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    """Adding a v1.45 action must not retroactively invalidate immutable v1.44 tags."""
+    repo, _ = current_release_repo
+    restore_historical_review_workflows(repo)
+    for relative in (
+        ".github/actions/prepare-review-diff/action.yml",
+        ".github/actions/prepare-review-diff/prepare_review_diff.py",
+    ):
+        (repo / relative).unlink()
+    historical_commit = commit(repo, "v1.44 historical inventory")
+    git(repo, "tag", "-a", "v1.44", "-m", "v1.44")
+
+    assert verify_release(repo, "v1.44", historical_commit) == historical_commit
+
+
+def test_v140_release_without_prepare_dependency_or_action_files_passes(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    repo, _, _ = release_repo
+    for relative in (
+        ".github/actions/prepare-review-diff/action.yml",
+        ".github/actions/prepare-review-diff/prepare_review_diff.py",
+    ):
+        (repo / relative).unlink()
+    historical_commit = commit(repo, "v1.40 without future review action")
+
+    assert (
+        release_verifier.verify_commit_content(repo, "v1.40", historical_commit)
+        == historical_commit
+    )
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"),
+)
+@pytest.mark.parametrize("action_files_present", (True, False))
+def test_pre_v145_rejects_prepare_dependency_regardless_of_future_action_files(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    action_files_present: bool,
+) -> None:
+    repo, _ = current_release_repo
+    restore_historical_review_workflows(
+        repo,
+        tuple(name for name in HISTORICAL_REVIEW_WORKFLOWS if name != workflow),
+    )
+    if not action_files_present:
+        for relative in (
+            ".github/actions/prepare-review-diff/action.yml",
+            ".github/actions/prepare-review-diff/prepare_review_diff.py",
+        ):
+            (repo / relative).unlink()
+    bad_commit = commit(repo, f"pre-v1.45 {workflow} dependency")
+
+    with pytest.raises(ReleaseVerificationError, match="prepare-review-diff dependency"):
+        release_verifier.verify_commit_content(repo, "v1.44", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"),
+)
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "$/.github/actions/prepare-review-diff/action.yml",
+        "$/.github/actions/check-workflow-enabled",
+    ),
+    ids=("near-match", "other-local-action"),
+)
+def test_v145_rejects_nonexact_local_review_action_dependencies(
+    current_release_repo: tuple[Path, str], workflow: str, replacement: str
+) -> None:
+    repo, _ = current_release_repo
+    replace(
+        repo / ".github/workflows" / workflow,
+        "$/.github/actions/prepare-review-diff",
+        replacement,
+        count=1,
+    )
+    bad_commit = commit(repo, f"invalid {workflow} local action")
+
+    with pytest.raises(ReleaseVerificationError, match="prepare-review-diff dependency"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"),
+)
+@pytest.mark.parametrize(
+    "reference",
+    (
+        "./.github/actions/unowned",
+        "$/.github/actions/prepare-review-diff",
+    ),
+    ids=("dot-local-action", "duplicate-exact-action"),
+)
+def test_v145_rejects_appended_local_review_action_dependencies(
+    current_release_repo: tuple[Path, str], workflow: str, reference: str
+) -> None:
+    repo, _ = current_release_repo
+    append_action_reference(repo / ".github/workflows" / workflow, reference)
+    bad_commit = commit(repo, f"append invalid {workflow} local action")
+
+    with pytest.raises(ReleaseVerificationError, match="prepare-review-diff dependency"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"),
+)
+def test_pre_v145_rejects_appended_dot_local_review_action_dependency(
+    current_release_repo: tuple[Path, str], workflow: str
+) -> None:
+    repo, _ = current_release_repo
+    restore_historical_review_workflows(repo)
+    append_action_reference(
+        repo / ".github/workflows" / workflow,
+        "./.github/actions/unowned",
+    )
+    bad_commit = commit(repo, f"append pre-v1.45 {workflow} local action")
+
+    with pytest.raises(ReleaseVerificationError, match="prepare-review-diff dependency"):
+        release_verifier.verify_commit_content(repo, "v1.44", bad_commit)
 
 
 @pytest.mark.parametrize("unsupported", ("alternates", "promisor"))
@@ -1042,6 +1517,43 @@ def test_commit_gate_rejects_action_file_replaced_by_directory_and_dummy_blob(
 
     with pytest.raises(ReleaseVerificationError, match="release inventory"):
         release_verifier.verify_commit_content(repo, "v1.41", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        ".github/actions/prepare-review-diff/action.yml",
+        ".github/actions/prepare-review-diff/prepare_review_diff.py",
+    ),
+)
+@pytest.mark.parametrize("mutation", ("missing", "executable-mode"))
+def test_v145_commit_gate_requires_each_prepare_diff_action_file_as_0644_blob(
+    release_repo: tuple[Path, Path, str], relative: str, mutation: str
+) -> None:
+    """The next release line fails closed on absent or non-regular action artifacts."""
+    repo, _, _ = release_repo
+    target = repo / relative
+    if mutation == "missing":
+        target.unlink()
+    else:
+        target.chmod(0o755)
+    bad_commit = commit(repo, f"mutate {relative}")
+
+    with pytest.raises(ReleaseVerificationError, match="release inventory"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+def test_v145_commit_gate_rejects_an_unsafe_prepare_diff_action_contract(
+    release_repo: tuple[Path, Path, str],
+) -> None:
+    """Release verification must reject a shell that interpolates a PR-controlled input."""
+    repo, _, _ = release_repo
+    action = repo / ".github/actions/prepare-review-diff/action.yml"
+    replace(action, '"$PR_NUMBER"', '"${{ inputs.pr-number }}"')
+    bad_commit = commit(repo, "weaken prepare diff action boundary")
+
+    with pytest.raises(ReleaseVerificationError, match="prepare-review-diff action contract"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
 def test_commit_gate_verifies_setup_gemini_auth_action_contract(
@@ -1896,7 +2408,7 @@ def test_rejects_opencode_command_oidc_app_token_path(
         ),
         (comment_only_setup_pin, "resolver"),
         (unconditional_setup_input, "mode-controlled inputs"),
-        (extra_local_setup_resolver, "resolver"),
+        (extra_local_setup_resolver, "prepare-review-diff dependency"),
         (extra_direct_app_resolver, "App token"),
         (downstream_github_token, "write token"),
         (validation_not_immediately_before_resolver, "immediately preceded"),
@@ -1931,7 +2443,7 @@ def test_rejects_insecure_tagged_gemini_contracts(
         (inherited_write_without_resolver, "workflow-level write permissions"),
         (explicit_write_without_resolver, "exactly one.*resolver"),
         (github_token_in_write_job_env, "github.token"),
-        (alternate_local_token_mint_action, "approved action"),
+        (alternate_local_token_mint_action, "prepare-review-diff dependency"),
         (github_token_in_workflow_env, "workflow.*github.token"),
         (ambient_caller_write_without_permissions, "explicit permissions"),
     ],
