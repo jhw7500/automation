@@ -285,10 +285,11 @@ back to a full review).
 
 Gemini auto-review has nested finite deadlines so a provider or transport stall cannot occupy a
 review round indefinitely: the current SDK request timeout is 420,000 ms, the review subprocess
-watchdog is 540 seconds, and the job timeout is 10 minutes. An SDK timeout or subprocess deadline
-records `provider_timeout`; the non-cancelled upsert path publishes that reason as a failed/stale
-attempt without advancing `Reviewed`. The job timeout is the last-resort ceiling and remains below
-the 12-minute `/jhw:ship` review-round deadline.
+watchdog is 450 seconds (plus a 15-second hard-kill grace), and the job timeout is 10 minutes. This
+reserves 135 seconds of the job budget outside the watchdog window for setup overhead, cleanup, and
+sticky publication. An SDK timeout or subprocess deadline records `provider_timeout`; the non-cancelled
+upsert path publishes that reason as a failed/stale attempt without advancing `Reviewed`. The job
+timeout is the last-resort ceiling and remains below the 12-minute `/jhw:ship` review-round deadline.
 
 Immediately before comment mutation, each reviewer refetches the PR head and requires it to
 equal `attempt_head`; it also refuses to write unless stored `(run_id, run_attempt)` is

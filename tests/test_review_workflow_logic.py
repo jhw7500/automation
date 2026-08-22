@@ -1191,8 +1191,14 @@ def test_gemini_canonical_v2_collection_and_shared_action_contract(tmp_path):
 
 def test_gemini_review_job_terminates_before_ship_round_deadline():
     workflow = _load("gemini-auto-review.yml")
+    job = workflow["jobs"]["gemini-review"]
+    review_step = _step(workflow, "gemini-review", "Run Gemini Code Review")
+    job_timeout_seconds = int(job["timeout-minutes"]) * 60
+    process_timeout_seconds = int(review_step["env"]["GEMINI_REVIEW_PROCESS_TIMEOUT"])
 
-    assert workflow["jobs"]["gemini-review"]["timeout-minutes"] == "10"
+    assert job_timeout_seconds < 12 * 60
+    assert process_timeout_seconds >= 420 + 30
+    assert process_timeout_seconds + 15 <= job_timeout_seconds - 120
 
 
 @pytest.mark.parametrize(
@@ -3289,8 +3295,14 @@ def test_gemini_records_quota_failure_reason(tmp_path):
 def test_gemini_records_provider_timeout_failure_reason(tmp_path):
     """A transport timeout remains distinguishable from other provider failures."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
-    stub = tmp_path / "stub" / "google"
+    stub_root = tmp_path / "stub"
+    stub = stub_root / "google"
     stub.mkdir(parents=True)
+    (stub_root / "httpx.py").write_text(
+        "class TimeoutException(Exception): pass\n"
+        "class ReadTimeout(TimeoutException): pass\n",
+        encoding="utf-8",
+    )
     (stub / "__init__.py").write_text("", encoding="utf-8")
     (stub / "generativeai.py").write_text(
         "from httpx import ReadTimeout\n"

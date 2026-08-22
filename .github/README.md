@@ -50,7 +50,7 @@ Automatically reviews pull requests when opened or updated.
 - Code quality suggestions
 - Performance considerations
 - Uses the Gemini model set by the `GEMINI_MODEL` repo/org variable (default: `gemini-3-flash-preview`)
-- Bounds provider waits with a 7-minute SDK timeout, 9-minute process watchdog, and 10-minute job ceiling
+- Bounds provider waits with a 7-minute SDK timeout, 7.5-minute process watchdog, and 10-minute job ceiling
 
 **Triggers:** Automatically on PR opened or synchronized (new commits pushed)
 

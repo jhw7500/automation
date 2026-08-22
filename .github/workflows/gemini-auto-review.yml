@@ -260,7 +260,7 @@ jobs:
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3-flash-preview' }}
           GEMINI_THINKING_LEVEL: ${{ vars.GEMINI_THINKING_LEVEL || 'medium' }}
           GEMINI_DIFF_INPUT_CHARS: ${{ vars.GEMINI_DIFF_INPUT_CHARS || '900000' }}
-          GEMINI_REVIEW_PROCESS_TIMEOUT: '540'
+          GEMINI_REVIEW_PROCESS_TIMEOUT: '450'
           REVIEW_DIFF_FILE: ${{ steps.prepare-diff.outputs.diff-mode == 'delta' && 'review-delta.diff' || 'review-full.diff' }}
           REVIEW_DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode }}
         run: |
