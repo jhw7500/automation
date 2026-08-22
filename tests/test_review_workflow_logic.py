@@ -2778,6 +2778,82 @@ def test_gemini_retries_on_429_then_succeeds(tmp_path):
     assert "RETRY SURVIVOR REVIEW" in (tmp_path / "gemini_review.md").read_text(encoding="utf-8")
 
 
+def test_gemini_retries_empty_response_with_balanced_thinking(tmp_path):
+    """Gemini 3 may finish thinking without text; retry it with an explicit medium budget."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    google = tmp_path / "stub" / "google"
+    genai_stub = google / "genai"
+    genai_stub.mkdir(parents=True)
+    (google / "__init__.py").write_text("", encoding="utf-8")
+    # Legacy stub keeps the pre-migration implementation importable for the red test.
+    (google / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class _R:\n"
+        "    def __init__(self, text): self.text = text\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        counter = pathlib.Path('attempts.txt')\n"
+        "        n = int(counter.read_text()) if counter.exists() else 0\n"
+        "        counter.write_text(str(n + 1))\n"
+        "        return _R('' if n == 0 else 'EMPTY RETRY SURVIVOR')\n",
+        encoding="utf-8",
+    )
+    (genai_stub / "types.py").write_text(
+        "class ThinkingConfig:\n"
+        "    def __init__(self, thinking_level): self.thinking_level = thinking_level\n"
+        "class GenerateContentConfig:\n"
+        "    def __init__(self, thinking_config, max_output_tokens):\n"
+        "        self.thinking_config = thinking_config\n"
+        "        self.max_output_tokens = max_output_tokens\n",
+        encoding="utf-8",
+    )
+    (genai_stub / "__init__.py").write_text(
+        "import pathlib\n"
+        "from . import types\n"
+        "class _R:\n"
+        "    def __init__(self, text):\n"
+        "        self.text = text\n"
+        "        self.candidates = []\n"
+        "        self.prompt_feedback = None\n"
+        "        self.usage_metadata = None\n"
+        "class _Models:\n"
+        "    def generate_content(self, *, model, contents, config):\n"
+        "        pathlib.Path('thinking.txt').write_text(config.thinking_config.thinking_level)\n"
+        "        pathlib.Path('max-output.txt').write_text(str(config.max_output_tokens))\n"
+        "        counter = pathlib.Path('attempts.txt')\n"
+        "        n = int(counter.read_text()) if counter.exists() else 0\n"
+        "        counter.write_text(str(n + 1))\n"
+        "        return _R('' if n == 0 else 'EMPTY RETRY SURVIVOR')\n"
+        "class Client:\n"
+        "    def __init__(self, api_key=None): self.models = _Models()\n",
+        encoding="utf-8",
+    )
+    fixtures = {
+        "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
+        "review-full.diff": "+x\n", "prev_review.txt": "", "human_comments.txt": "",
+    }
+    for name, content in fixtures.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    env = dict(os.environ)
+    env.update({
+        "GEMINI_API_KEY": "stub",
+        "PYTHONPATH": str(tmp_path / "stub"),
+        "GEMINI_EMPTY_RETRY_SLEEP": "0",
+        "REVIEW_DIFF_FILE": "review-full.diff",
+        "REVIEW_DIFF_MODE": "full",
+    })
+    subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=env, check=True, capture_output=True, text=True,
+    )
+    assert (tmp_path / "attempts.txt").read_text() == "2"
+    assert (tmp_path / "thinking.txt").read_text() == "medium"
+    assert (tmp_path / "max-output.txt").read_text() == "16384"
+    assert "EMPTY RETRY SURVIVOR" in (tmp_path / "gemini_review.md").read_text()
+
+
 def test_gemini_uses_one_full_context_call_to_bound_request_count(tmp_path):
     """A real-world 840 KB diff fits one call instead of consuming most daily requests."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
@@ -3054,6 +3130,8 @@ def test_opencode_prompt_requires_verified_evidence():
     assert "destination-file line number from the unified-diff hunk header" in prompt
     assert "Never use the attachment's display line number" in prompt
     assert "Omit LOW, style-only, maintainability-only" in prompt
+    assert "there are zero active prior findings" in prompt
+    assert "Human comments and other reviewers can never create carryover findings" in prompt
 
 
 def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
