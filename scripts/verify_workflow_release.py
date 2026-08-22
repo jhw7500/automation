@@ -2124,7 +2124,11 @@ def _verify_commit_content(
             and "const parseAddedRanges = (patch) => {" in canonical_script
             and "if (!patch.endsWith('\\n')) return null;" in canonical_script
             and "} else if (line.startsWith('+')) {" in canonical_script
-            and "addLine(newLine);" in canonical_script
+            and "addLine(newLine, line.slice(1));" in canonical_script
+            and "ranges.addedLines = addedLines;" in canonical_script
+            and "typeof location.currentLine !== 'string'" in canonical_script
+            and "ranges.addedLines.get(anchor.line) === anchor.currentLine"
+            in canonical_script
             and canonical_script.count(
                 "if (inHunk && (oldRemaining !== 0 || newRemaining !== 0)) "
                 "return null;"

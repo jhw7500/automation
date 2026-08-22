@@ -619,6 +619,8 @@ jobs:
 
             Every new finding must identify a one-line JSON Changed anchor from the prepared diff,
             exactly `- Changed anchor: {"path":"path/to/file","line":1}`.
+            Immediately follow it with the exact added-side source line as one JSON string,
+            exactly `- Current line: "source text"` (without the diff's leading `+`).
             An unchanged line is supporting evidence only and requires a concrete causal explanation.
             You must quote the exact current line for each cited location. If a real changed anchor and
             exact line cannot be verified, do not report it.
@@ -662,6 +664,8 @@ jobs:
             - Every finding block has at least one exact one-line JSON anchor
               `- Changed anchor: {"path":"path/to/file","line":1}`. Escape the path as JSON;
               every anchor must name an added-side line.
+            - Every New finding and Still open block has exactly one Changed anchor and exactly
+              one `- Current line: "source text"` JSON string matching that added-side line.
             - The only other allowed top-level sections are `### Still open`, `### Resolved`,
               and `### Retracted`, each at most once, containing only `####` finding blocks.
               Omit all three on a first review. On a re-review, copy each carryover block's exact
@@ -1395,7 +1399,22 @@ jobs:
               const knownPreamble = 'Looking at the diff for security and correctness issues:';
               const normalized = firstSection >= 0 && prefix.length === 1
                 && prefix[0] === knownPreamble ? lines.slice(firstSection) : lines;
-              return normalized.join('\n').trim();
+              const compacted = [];
+              for (let index = 0; index < normalized.length;) {
+                const emptyCarryover = normalized[index]?.match(
+                  /^### (Still open|Resolved|Retracted)$/);
+                if (emptyCarryover) {
+                  let next = index + 1;
+                  while (next < normalized.length && !normalized[next].startsWith('### ')) next += 1;
+                  if (normalized.slice(index + 1, next).join('\n').trim() === 'None') {
+                    index = next;
+                    continue;
+                  }
+                }
+                compacted.push(normalized[index]);
+                index += 1;
+              }
+              return compacted.join('\n').trim();
             };
             const previousBody = existing ? clean(existing.comment.body) : '';
             const priorSuccess = existing && /^[0-9a-f]{40}$/.test(existing.state.successful_head || '')
@@ -1511,23 +1530,36 @@ jobs:
                   const priorMatches = priorActiveHeadings.get(block.heading) || 0;
                   if (section.name === 'New findings' && priorMatches !== 0) return null;
                   if (section.name !== 'New findings' && priorMatches !== 1) return null;
-                  let blockAnchors = 0;
+                  const blockAnchors = [];
+                  const blockCurrentLines = [];
                   for (const line of block.lines) {
-                    if (!/changed anchor/i.test(line)) continue;
-                    const match = line.match(/^- Changed anchor: (\{.*\})$/);
-                    if (!match) return null;
-                    let anchor;
-                    try { anchor = JSON.parse(match[1]); } catch { return null; }
-                    if (!anchor || typeof anchor !== 'object' || Array.isArray(anchor)
-                      || JSON.stringify(Object.keys(anchor).sort()) !== JSON.stringify(['line', 'path'])
-                      || typeof anchor.path !== 'string' || anchor.path.length === 0
-                      || !Number.isSafeInteger(anchor.line) || anchor.line <= 0
-                      || match[1] !== JSON.stringify({ path: anchor.path, line: anchor.line })) return null;
-                    anchors.push(anchor);
-                    blockAnchors += 1;
+                    if (/changed anchor/i.test(line)) {
+                      const match = line.match(/^- Changed anchor: (\{.*\})$/);
+                      if (!match) return null;
+                      let anchor;
+                      try { anchor = JSON.parse(match[1]); } catch { return null; }
+                      if (!anchor || typeof anchor !== 'object' || Array.isArray(anchor)
+                        || JSON.stringify(Object.keys(anchor).sort()) !== JSON.stringify(['line', 'path'])
+                        || typeof anchor.path !== 'string' || anchor.path.length === 0
+                        || !Number.isSafeInteger(anchor.line) || anchor.line <= 0
+                        || match[1] !== JSON.stringify({ path: anchor.path, line: anchor.line })) return null;
+                      blockAnchors.push(anchor);
+                    }
+                    if (/current line/i.test(line)) {
+                      const match = line.match(/^- Current line: (".*")$/);
+                      if (!match) return null;
+                      let currentLine;
+                      try { currentLine = JSON.parse(match[1]); } catch { return null; }
+                      if (typeof currentLine !== 'string' || match[1] !== JSON.stringify(currentLine)) return null;
+                      blockCurrentLines.push(currentLine);
+                    }
                   }
                   if ((section.name === 'New findings' || section.name === 'Still open')
-                    && blockAnchors === 0) return null;
+                    && (blockAnchors.length !== 1 || blockCurrentLines.length !== 1)) return null;
+                  if (blockAnchors.length || blockCurrentLines.length) {
+                    if (blockAnchors.length !== 1 || blockCurrentLines.length !== 1) return null;
+                    anchors.push({ ...blockAnchors[0], currentLine: blockCurrentLines[0] });
+                  }
                 }
               }
               return anchors;
@@ -1583,6 +1615,7 @@ jobs:
                 const lines = patch.split('\n');
                 lines.pop();
                 const ranges = [];
+                const addedLines = new Map();
                 let inHunk = false;
                 let oldLine = 0;
                 let newLine = 0;
@@ -1595,10 +1628,11 @@ jobs:
                 let lastBodyPrefix = null;
                 let oldEofMarked = false;
                 let newEofMarked = false;
-                const addLine = (line) => {
+                const addLine = (line, text) => {
                   const previous = ranges.at(-1);
                   if (previous && previous[1] + 1 === line) previous[1] = line;
                   else ranges.push([line, line]);
+                  addedLines.set(line, text);
                 };
                 for (const line of lines) {
                   if (line.startsWith('@@')) {
@@ -1656,7 +1690,7 @@ jobs:
                     oldRemaining -= 1;
                   } else if (line.startsWith('+')) {
                     if (newRemaining < 1) return null;
-                    addLine(newLine);
+                    addLine(newLine, line.slice(1));
                     newLine += 1;
                     newRemaining -= 1;
                   } else {
@@ -1666,15 +1700,18 @@ jobs:
                   if (!Number.isSafeInteger(oldLine) || !Number.isSafeInteger(newLine)) return null;
                 }
                 if (inHunk && (oldRemaining !== 0 || newRemaining !== 0)) return null;
+                ranges.addedLines = addedLines;
                 return ranges;
               };
               const anchors = [];
               for (const location of locations) {
                 if (!location || typeof location.path !== 'string'
-                  || !Number.isSafeInteger(location.line) || location.line <= 0) return false;
+                  || !Number.isSafeInteger(location.line) || location.line <= 0
+                  || typeof location.currentLine !== 'string') return false;
                 const file = files.get(location.path);
                 if (!file || file.status === 'removed') return false;
-                anchors.push({ path: location.path, line: location.line });
+                anchors.push({ path: location.path, line: location.line,
+                  currentLine: location.currentLine });
               }
               const rangesByPath = new Map();
               for (const path of new Set(anchors.map((anchor) => anchor.path))) {
@@ -1710,20 +1747,24 @@ jobs:
                 });
                 if (result.error || result.status !== 0 || typeof result.stdout !== 'string') return false;
                 const ranges = parseAddedRanges(result.stdout);
-                if (!ranges || !ranges.length) return false;
+                if (!ranges || !ranges.length || !(ranges.addedLines instanceof Map)) return false;
                 rangesByPath.set(path, ranges);
               }
-              return anchors.every((anchor) => rangesByPath.get(anchor.path)
-                .some(([start, end]) => anchor.line >= start && anchor.line <= end));
+              return anchors.every((anchor) => {
+                const ranges = rangesByPath.get(anchor.path);
+                return ranges.some(([start, end]) => anchor.line >= start && anchor.line <= end)
+                  && ranges.addedLines.get(anchor.line) === anchor.currentLine;
+              });
             };
 
             const candidate = candidateArtifactValid ? { body: candidateReview } : null;
             const review = candidate ? clean(candidate.body) : '';
             const parsedReview = review ? parseReview(review) : null;
+            const anchorsCovered = parsedReview !== null && anchorsAreChanged(parsedReview);
             const modelSucceeded = diffReady && ['full', 'delta'].includes(diffMode)
               && !unchangedSincePrevious && artifactsValid && modelOk
               && candidateArtifactValid && parsedReview !== null
-              && anchorsAreChanged(parsedReview);
+              && anchorsCovered;
             const unchangedSucceeded = diffReady && diffMode === 'unchanged'
               && unchangedSincePrevious && artifactsValid && !candidateArtifactValid
               && priorSuccess && existing.state.full_diff_sha256 === fullDiffSha256;
@@ -1731,8 +1772,15 @@ jobs:
             const recordedMode = ['full', 'delta', 'unchanged', 'unavailable'].includes(diffMode)
               ? diffMode : 'unavailable';
             const successBody = unchangedSucceeded ? previousBody : review;
+            const failureReason = !diffReady ? 'diff_unavailable'
+              : !artifactsValid ? 'prepared_artifact_invalid'
+              : !modelOk ? 'provider_failed'
+              : !candidateArtifactValid ? 'candidate_artifact_invalid'
+              : parsedReview === null ? 'output_grammar_invalid'
+              : !anchorsCovered ? 'anchor_out_of_scope'
+              : 'unknown';
             const failureBody = previousBody
-              || 'OpenCode review attempt failed validation; no review checkpoint was advanced.';
+              || `Reason: ${failureReason}\n\nOpenCode review attempt failed validation; no review checkpoint was advanced.`;
             const state = succeeded
               ? {
                   schema: 2, reviewer, pr: issueNumber, run_id: runId, run_attempt: runAttempt,
@@ -1912,6 +1960,9 @@ jobs:
               } catch (error) {
                 core.warning(`OpenCode transient tombstone could not be deleted: ${error.message}`);
               }
+            }
+            if (!succeeded) {
+              core.setFailed(`OpenCode review checkpoint failed: ${failureReason}`);
             }
 
   skipped:

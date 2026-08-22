@@ -861,7 +861,6 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert "Changed anchor" in python
     assert "concrete causal explanation" in python
     assert "Retracted" in python
-    assert "DIFF_LIMIT = 50000" in python
     assert "for attempt in range(3)" in python
 
     assert _step(gemini, "gemini-review", "Get PR details")["env"]["PR_NUMBER"] == (
@@ -1418,6 +1417,7 @@ const core = {
   info: () => {},
   warning: (m) => calls.push(['warning', m]),
   setOutput: (k, v) => calls.push(['output', k, v]),
+  setFailed: (m) => calls.push(['failed', m]),
 };
 (async () => {
   const fn = new Function(
@@ -1979,6 +1979,23 @@ def test_gemini_checkpoint_requires_full_coverage_and_sanitized_body(
         "diff_mode": "full",
         "full_diff_sha256": "34" * 32 if expected_status == "success" else None,
     }
+
+
+@node_required
+def test_gemini_failure_reports_machine_readable_coverage_reason(tmp_path):
+    calls = _gemini_upsert(
+        tmp_path,
+        "success",
+        [],
+        with_review=True,
+        review="PARTIAL REVIEW",
+        diff_ready="true",
+        diff_truncated="true",
+    )
+    assert "Reason: coverage_truncated" in _single_mutation_body(calls)
+    assert [call for call in calls if call[0] == "failed"] == [
+        ["failed", "Gemini review checkpoint failed: coverage_truncated"]
+    ]
 
 
 @node_required
@@ -2742,6 +2759,56 @@ def test_gemini_retries_on_429_then_succeeds(tmp_path):
     assert "RETRY SURVIVOR REVIEW" in (tmp_path / "gemini_review.md").read_text(encoding="utf-8")
 
 
+def test_gemini_reviews_every_deterministic_diff_chunk(tmp_path):
+    """A large diff is successful only after every bounded chunk reaches the model."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class _R:\n"
+        "    def __init__(self, text): self.text = text\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        counter = pathlib.Path('chunk-attempts.txt')\n"
+        "        n = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "        counter.write_text(str(n))\n"
+        "        pathlib.Path(f'chunk-prompt-{n}.txt').write_text(prompt)\n"
+        "        return _R(f'CHUNK REVIEW {n}')\n",
+        encoding="utf-8",
+    )
+    fixtures = {
+        "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
+        "review-full.diff": ("+" + ("x" * 98) + "\n") * 1_200,
+        "prev_review.txt": "", "human_comments.txt": "",
+    }
+    for name, content in fixtures.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    env = dict(os.environ)
+    env.update({
+        "GEMINI_API_KEY": "stub",
+        "PYTHONPATH": str(tmp_path / "stub"),
+        "GEMINI_429_RETRY_SLEEP": "0",
+        "REVIEW_DIFF_FILE": "review-full.diff",
+        "REVIEW_DIFF_MODE": "full",
+    })
+    subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=env, check=True, capture_output=True,
+    )
+    assert (tmp_path / "chunk-attempts.txt").read_text() == "3"
+    assert (tmp_path / "review_diff_truncated.txt").read_text() == "false"
+    saved = (tmp_path / "gemini_review.md").read_text(encoding="utf-8")
+    assert all(f"CHUNK REVIEW {index}" in saved for index in range(1, 4))
+    assert all(
+        f"CHUNK {index}/3" in (tmp_path / f"chunk-prompt-{index}.txt").read_text()
+        for index in range(1, 4)
+    )
+
+
 # ---------------------------------------------------------------------------
 # auto-rereview-request: reviewer detection (bash + jq)
 # ---------------------------------------------------------------------------
@@ -2795,6 +2862,7 @@ def _opencode_review(*findings: str) -> str:
     blocks = "\n\n".join(
         f"#### Finding {index}\n- Changed anchor: "
         f"{json.dumps({'path': OPENCODE_SCOPE_PATH, 'line': 1}, ensure_ascii=False, separators=(',', ':'))}\n"
+        f'- Current line: "added line 1"\n'
         f"{finding}"
         for index, finding in enumerate(findings, 1)
     )
@@ -2843,16 +2911,6 @@ def test_opencode_prompt_requires_verified_evidence():
     assert "unchanged line is supporting evidence only" in prompt
     assert "concrete causal explanation" in prompt
     assert "Retracted" in prompt
-
-
-def test_opencode_canonicalizer_discards_only_model_preamble_before_sections():
-    workflow = _load("opencode-auto-review.yml")
-    script = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")["with"]["script"]
-    assert "OpenCode may emit this exact harmless preamble" in script
-    assert "knownPreamble" in script
-    assert "firstSection = lines.findIndex" in script
-    assert "lines.slice(firstSection)" in script
-    assert "parseReview" in script
 
 
 def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
@@ -4450,6 +4508,36 @@ def test_opencode_scope_rejects_substantive_preamble_before_sections(tmp_path):
     body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "failure"
+    assert "Reason: output_grammar_invalid" in body
+    assert [call for call in calls if call[0] == "failed"] == [
+        ["failed", "OpenCode review checkpoint failed: output_grammar_invalid"]
+    ]
+
+
+@node_required
+def test_opencode_scope_normalizes_only_known_preamble_and_empty_carryover(tmp_path):
+    candidate = _bot(
+        "github-actions[bot]",
+        (
+            f"{OPENCODE_MARKER}\n"
+            "Looking at the diff for security and correctness issues:\n\n"
+            "### New findings\nNone\n\n"
+            "### Still open\nNone\n\n"
+            "### Resolved\nNone\n\n"
+            "### Retracted\nNone"
+        ),
+        9,
+        updated="u2",
+    )
+    calls = _run_opencode_canonicalize(tmp_path, [], [candidate])
+    body = _single_mutation_body(calls)
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+    assert "Looking at the diff" not in body
+    assert "### Still open" not in body
+    assert "### Resolved" not in body
+    assert "### Retracted" not in body
+    assert "### New findings\nNone" in body
 
 
 @node_required
@@ -4496,7 +4584,8 @@ def test_opencode_rereview_accepts_exact_still_open_resolved_and_retracted_bindi
     )
     current = (
         f"{OPENCODE_MARKER}\n### New findings\nNone\n"
-        f"### Still open\n#### Remains active\n- Changed anchor: {anchor}\nstill present\n"
+        f"### Still open\n#### Remains active\n- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\nstill present\n'
         "### Resolved\n#### Fixed now\ncurrent code proves the fix\n"
         "### Retracted\n#### Was incorrect\nprior claim disproved"
     )
@@ -4615,7 +4704,7 @@ def test_opencode_one_line_json_anchor_round_trips_every_utf8_path(tmp_path, pat
     )
     review = (
         f"{OPENCODE_MARKER}\n### New findings\n#### Exact path\n"
-        f"- Changed anchor: {anchor}\nbody"
+        f'- Changed anchor: {anchor}\n- Current line: "added line 1"\nbody'
     )
     manifest = {
         "schema": 1,
@@ -5423,6 +5512,54 @@ def test_opencode_changed_anchor_scope_rejects_invalid_output_grammar(tmp_path, 
 
 @node_required
 @pytest.mark.parametrize(
+    "current_line",
+    [None, "wrong line"],
+)
+def test_opencode_finding_requires_exact_current_changed_line(tmp_path, current_line):
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    lines = [
+        OPENCODE_MARKER,
+        "### New findings",
+        "#### [MEDIUM] Grounded finding",
+        f"- Changed anchor: {anchor}",
+    ]
+    if current_line is not None:
+        lines.append(f"- Current line: {json.dumps(current_line)}")
+    lines.append("Concrete impact.")
+    candidate = _bot("github-actions[bot]", "\n".join(lines), 10, updated="u2")
+    body = _single_mutation_body(_run_opencode_canonicalize(tmp_path, [], [candidate]))
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+
+
+@node_required
+def test_opencode_finding_accepts_exact_current_changed_line(tmp_path):
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    candidate = _bot(
+        "github-actions[bot]",
+        (
+            f"{OPENCODE_MARKER}\n### New findings\n"
+            f"#### [MEDIUM] Grounded finding\n- Changed anchor: {anchor}\n"
+            '- Current line: "added line 1"\nConcrete impact.'
+        ),
+        10,
+        updated="u2",
+    )
+    body = _single_mutation_body(_run_opencode_canonicalize(tmp_path, [], [candidate]))
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+
+
+@node_required
+@pytest.mark.parametrize(
     ("anchor", "manifest_files", "git_diff", "git_failure"),
     [
         ("old-name.js:1", [{"status": "renamed", "filename": OPENCODE_SCOPE_PATH, "previous_filename": "old-name.js"}], "@@ -1,0 +1,1 @@\n+x\n", False),
@@ -5474,7 +5611,8 @@ def test_opencode_changed_anchor_uses_json_path_and_literal_git_argv(tmp_path):
     candidate = _bot(
         "github-actions[bot]",
         f"{OPENCODE_MARKER}\n### New findings\n#### Finding\n- Changed anchor: "
-        f"{json.dumps({'path': leading_dash_path, 'line': 7}, ensure_ascii=False, separators=(',', ':'))}",
+        f"{json.dumps({'path': leading_dash_path, 'line': 7}, ensure_ascii=False, separators=(',', ':'))}\n"
+        '- Current line: "added line 1"',
         10,
         updated="u2",
     )
@@ -5501,13 +5639,16 @@ def _commit_anchor_repo(path: Path, message: str) -> str:
     return _git(path, "rev-parse", "HEAD")
 
 
-def _anchor_candidate(path: str, line: int, title: str = "Finding") -> dict:
+def _anchor_candidate(
+    path: str, line: int, title: str = "Finding", current_line: str = "added line 1"
+) -> dict:
     anchor = json.dumps(
         {"path": path, "line": line}, ensure_ascii=False, separators=(",", ":")
     )
     return _bot(
         "github-actions[bot]",
-        f"{OPENCODE_MARKER}\n### New findings\n#### {title}\n- Changed anchor: {anchor}",
+        f"{OPENCODE_MARKER}\n### New findings\n#### {title}\n- Changed anchor: {anchor}\n"
+        f"- Current line: {json.dumps(current_line, ensure_ascii=False)}",
         10,
         updated="u2",
     )
@@ -5899,7 +6040,7 @@ def test_opencode_modified_rename_accepts_only_the_real_added_destination_line(t
     calls = _run_opencode_canonicalize(
         tmp_path,
         [],
-        [_anchor_candidate(new_path, 6, "Modified rename")],
+        [_anchor_candidate(new_path, 6, "Modified rename", "real added line")],
         attempt_head=head,
         current_head=head,
         manifest=manifest,
@@ -5982,7 +6123,9 @@ def test_opencode_gitlink_anchor_ignores_hostile_submodule_ignore_configuration(
     calls = _run_opencode_canonicalize(
         tmp_path,
         [],
-        [_anchor_candidate("vendor/module", 1, "Gitlink pointer")],
+        [_anchor_candidate(
+            "vendor/module", 1, "Gitlink pointer", f"Subproject commit {updated_submodule}"
+        )],
         attempt_head=head,
         current_head=head,
         manifest=manifest,
@@ -6021,7 +6164,12 @@ def test_opencode_anchor_uses_only_added_lines_under_hostile_inter_hunk_context(
     calls = _run_opencode_canonicalize(
         tmp_path,
         [],
-        [_anchor_candidate(path, line, "Inter-hunk bridge")],
+        [_anchor_candidate(
+            path,
+            line,
+            "Inter-hunk bridge",
+            {1: "after one", 2: "unchanged bridge", 3: "after three"}[line],
+        )],
         attempt_head=head,
         current_head=head,
         manifest=manifest,
@@ -6053,7 +6201,7 @@ def test_opencode_anchor_diff_forces_no_color(tmp_path):
     calls = _run_opencode_canonicalize(
         tmp_path,
         [],
-        [_anchor_candidate(path, 1, "Colored diff")],
+        [_anchor_candidate(path, 1, "Colored diff", "after")],
         attempt_head=head,
         current_head=head,
         manifest=manifest,
@@ -6114,7 +6262,13 @@ def test_opencode_absolute_git_accepts_genuine_added_unusual_path(tmp_path):
     anchor = json.dumps(
         {"path": unusual, "line": 1}, ensure_ascii=False, separators=(",", ":")
     )
-    raw = _bot("github-actions[bot]", f"{OPENCODE_MARKER}\n### New findings\n#### Real\n- Changed anchor: {anchor}", 10, updated="u2")
+    raw = _bot(
+        "github-actions[bot]",
+        f"{OPENCODE_MARKER}\n### New findings\n#### Real\n- Changed anchor: {anchor}\n"
+        '- Current line: "real added line"',
+        10,
+        updated="u2",
+    )
     calls = _run_opencode_canonicalize(
         tmp_path, [], [raw], attempt_head=head, current_head=head,
         manifest=manifest, trusted_workspace=repo,
