@@ -512,6 +512,8 @@ jobs:
             unauthenticated UI clutter alone is not a security impact.
           - A deletion concern must still cite an added-side changed anchor that causally introduces
             the regression. Do not recommend weakening added-line scope validation just to cite a deletion.
+          - Never emit a `Cannot verify`, `Unverified`, or `Outside scope/diff` section. Items that
+            cannot be verified inside the selected prepared diff are omitted, not preserved as backlog.
           - Write the review in the same language as the PR description and commit history (e.g.
             respond in Korean if they are Korean); keep identifiers, file paths and log strings as-is.
 
@@ -722,6 +724,36 @@ jobs:
             // turn an infrastructure-only response into a successful checkpoint.
             const infraLine = /^(REPO: \S+$|PR NUMBER: [0-9]+$|Reviewer: Gemini Auto \(Diff Focus\)$|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Reviewed: [0-9a-f]{40}$|- Last attempt: |<!-- automation:[A-Za-z0-9_-]+|<!-- automation-state:|## 🔎 Gemini Code Review$|\*Reviewed by Gemini\*$)/;
             review = review.split('\n').filter((line) => !infraLine.test(line)).join('\n').trim();
+            const nonActionableHeading = (title) => (
+              /^(?:cannot verify\b|unverified(?:\s+findings?)?\b|outside\b.*\b(?:diff|scope)\b)/i.test(title)
+            );
+            const dropNonActionableSections = (text) => {
+              const kept = [];
+              let skippedLevel = 0;
+              let dropped = 0;
+              for (const line of (text || '').split('\n')) {
+                const heading = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+                if (heading && skippedLevel && heading[1].length <= skippedLevel) {
+                  skippedLevel = 0;
+                }
+                if (!skippedLevel && heading && nonActionableHeading(heading[2])) {
+                  skippedLevel = heading[1].length;
+                  dropped += 1;
+                  continue;
+                }
+                if (!skippedLevel) kept.push(line);
+              }
+              const filtered = kept.join('\n').trim();
+              return {
+                text: filtered || (dropped ? 'No blocking issues found.' : ''),
+                dropped,
+              };
+            };
+            const filteredReview = dropNonActionableSections(review);
+            review = filteredReview.text;
+            if (filteredReview.dropped) {
+              core.notice(`Dropped ${filteredReview.dropped} non-actionable Gemini review section(s).`);
+            }
             const reportedFailureReason = process.env.FAILURE_REASON || '';
             const allowedFailureReasons = new Set([
               'provider_failed', 'quota_exhausted', 'rate_limited', 'authentication_failed',

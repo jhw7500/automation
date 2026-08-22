@@ -869,6 +869,7 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert "Retracted" in python
     assert "Fail-closed behavior is not a finding" in python
     assert "unauthenticated UI clutter alone is not a security impact" in python
+    assert "Never emit a `Cannot verify`" in python
     assert "for attempt in range(3)" in python
 
     assert _step(gemini, "gemini-review", "Get PR details")["env"]["PR_NUMBER"] == (
@@ -2059,6 +2060,53 @@ def test_gemini_output_sanitizer_preserves_normal_reviewer_prose(tmp_path):
 
     assert "Reviewer: Gemini behavior changes the validation path." in body
     assert "REAL FINDING" in body
+
+
+@node_required
+def test_gemini_output_sanitizer_drops_explicit_unverified_sections(tmp_path):
+    review = """No blocking issues found.
+
+## Summary
+
+Verified summary stays visible.
+
+## Cannot verify (outside provided diff)
+
+- [HIGH] OLD OUTSIDE-SCOPE ITEM
+### Nested stale detail
+This is not reviewable in the selected diff.
+
+## Resolved
+
+Confirmed resolution stays visible.
+"""
+    calls = _gemini_upsert(tmp_path, "success", [], with_review=True, review=review)
+    body = _single_mutation_body(calls)
+
+    assert "Verified summary stays visible." in body
+    assert "Confirmed resolution stays visible." in body
+    assert "Cannot verify" not in body
+    assert "OLD OUTSIDE-SCOPE ITEM" not in body
+    assert "Nested stale detail" not in body
+    assert [call for call in calls if call[0] == "notice"] == [
+        ["notice", "Dropped 1 non-actionable Gemini review section(s)."]
+    ]
+
+
+@node_required
+def test_gemini_output_sanitizer_normalizes_only_unverified_sections_to_none(tmp_path):
+    review = """## Outside provided scope
+
+[MEDIUM] Unverifiable backlog item
+"""
+    body = _single_mutation_body(
+        _gemini_upsert(tmp_path, "success", [], with_review=True, review=review)
+    )
+
+    assert "No blocking issues found." in body
+    assert "Outside provided scope" not in body
+    assert "Unverifiable backlog item" not in body
+    assert "- Status: success" in body
 
 
 @node_required
