@@ -1189,6 +1189,18 @@ def test_gemini_canonical_v2_collection_and_shared_action_contract(tmp_path):
     }
 
 
+def test_gemini_review_job_terminates_before_ship_round_deadline():
+    workflow = _load("gemini-auto-review.yml")
+    job = workflow["jobs"]["gemini-review"]
+    review_step = _step(workflow, "gemini-review", "Run Gemini Code Review")
+    job_timeout_seconds = int(job["timeout-minutes"]) * 60
+    process_timeout_seconds = int(review_step["env"]["GEMINI_REVIEW_PROCESS_TIMEOUT"])
+
+    assert job_timeout_seconds < 12 * 60
+    assert process_timeout_seconds >= 420 + 30
+    assert process_timeout_seconds + 15 <= job_timeout_seconds - 120
+
+
 @pytest.mark.parametrize(
     ("run_url", "include_run"),
     [
@@ -2026,6 +2038,22 @@ def test_gemini_provider_quota_failure_keeps_specific_reason(tmp_path):
 
 
 @node_required
+def test_gemini_provider_timeout_failure_keeps_specific_reason(tmp_path):
+    calls = _gemini_upsert(
+        tmp_path,
+        "failure",
+        [],
+        with_review=True,
+        review="⚠️ Failed to generate Gemini review",
+        failure_reason="provider_timeout",
+    )
+    assert "Reason: provider_timeout" in _single_mutation_body(calls)
+    assert [call for call in calls if call[0] == "failed"] == [
+        ["failed", "Gemini review checkpoint failed: provider_timeout"]
+    ]
+
+
+@node_required
 def test_gemini_failure_after_success_preserves_body_and_hash_as_stale(tmp_path):
     old_head = "ab" * 20
     old_body = _v2_body(
@@ -2719,6 +2747,127 @@ def _extract_gemini_python() -> str:
     return match.group(1)
 
 
+def _write_gemini_script_inputs(tmp_path):
+    fixtures = {
+        "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
+        "review-full.diff": "+x\n", "prev_review.txt": "", "human_comments.txt": "",
+    }
+    for name, content in fixtures.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+
+
+def _gemini_script_env(tmp_path):
+    env = dict(os.environ)
+    env.update({
+        "GEMINI_API_KEY": "stub",
+        "PYTHONPATH": str(tmp_path / "stub"),
+        "REVIEW_DIFF_FILE": "review-full.diff",
+        "REVIEW_DIFF_MODE": "full",
+    })
+    return env
+
+
+def test_gemini_process_watchdog_records_provider_timeout(tmp_path):
+    """A stuck SDK process must terminate with a machine-readable timeout reason."""
+    workflow = _load("gemini-auto-review.yml")
+    run = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in {
+        "pip": "#!/bin/sh\nexit 0\n",
+        "python": "#!/bin/sh\nsleep 2\n",
+    }.items():
+        executable = bin_dir / name
+        executable.write_text(body, encoding="utf-8")
+        executable.chmod(0o755)
+    output = tmp_path / "github-output"
+    env = dict(os.environ)
+    env.update({
+        "PATH": f"{bin_dir}:{env['PATH']}",
+        "GEMINI_REVIEW_PROCESS_TIMEOUT": "1",
+        "GITHUB_OUTPUT": str(output),
+    })
+
+    result = subprocess.run(
+        ["bash", "-c", run], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True, timeout=5,
+    )
+
+    assert result.returncode == 124
+    assert _github_outputs(output)["failure_reason"] == "provider_timeout"
+
+
+def test_gemini_process_watchdog_records_timeout_after_hard_kill(tmp_path):
+    """The kill-after path must retain timeout identity instead of returning generic 137."""
+    workflow = _load("gemini-auto-review.yml")
+    original_run = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
+    run = original_run.replace("--kill-after=15s", "--kill-after=0.2s")
+    assert run != original_run
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in {
+        "pip": "#!/bin/sh\nexit 0\n",
+        "python": (
+            "#!/usr/bin/env python3\n"
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "time.sleep(3)\n"
+        ),
+    }.items():
+        executable = bin_dir / name
+        executable.write_text(body, encoding="utf-8")
+        executable.chmod(0o755)
+    output = tmp_path / "github-output"
+    env = dict(os.environ)
+    env.update({
+        "PATH": f"{bin_dir}:{env['PATH']}",
+        "GEMINI_REVIEW_PROCESS_TIMEOUT": "1",
+        "GITHUB_OUTPUT": str(output),
+    })
+
+    result = subprocess.run(
+        ["bash", "-c", run], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True, timeout=5,
+    )
+
+    assert result.returncode == 124
+    assert _github_outputs(output)["failure_reason"] == "provider_timeout"
+
+
+def test_gemini_process_watchdog_does_not_misclassify_early_sigkill(tmp_path):
+    """An unrelated early SIGKILL must not be reported as a provider deadline."""
+    workflow = _load("gemini-auto-review.yml")
+    run = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in {
+        "pip": "#!/bin/sh\nexit 0\n",
+        "python": (
+            "#!/usr/bin/env python3\n"
+            "import os, signal\n"
+            "os.kill(os.getpid(), signal.SIGKILL)\n"
+        ),
+    }.items():
+        executable = bin_dir / name
+        executable.write_text(body, encoding="utf-8")
+        executable.chmod(0o755)
+    output = tmp_path / "github-output"
+    env = dict(os.environ)
+    env.update({
+        "PATH": f"{bin_dir}:{env['PATH']}",
+        "GEMINI_REVIEW_PROCESS_TIMEOUT": "2",
+        "GITHUB_OUTPUT": str(output),
+    })
+
+    result = subprocess.run(
+        ["bash", "-c", run], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True, timeout=5,
+    )
+
+    assert result.returncode == 137
+    assert _github_outputs(output)["failure_reason"] == "provider_failed"
+
+
 def test_gemini_infra_lines_sanitized_from_output_and_context(tmp_path):
     """모델이 sticky 헤더(marker, '- Reviewed:')를 에코해도 게시본·프롬프트에 남지 않는다."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
@@ -2857,6 +3006,8 @@ def test_gemini_retries_empty_response_with_balanced_thinking(tmp_path):
         encoding="utf-8",
     )
     (genai_stub / "types.py").write_text(
+        "class HttpOptions:\n"
+        "    def __init__(self, timeout): self.timeout = timeout\n"
         "class ThinkingConfig:\n"
         "    def __init__(self, thinking_level): self.thinking_level = thinking_level\n"
         "class GenerateContentConfig:\n"
@@ -2883,7 +3034,7 @@ def test_gemini_retries_empty_response_with_balanced_thinking(tmp_path):
         "        counter.write_text(str(n + 1))\n"
         "        return _R('' if n == 0 else 'EMPTY RETRY SURVIVOR')\n"
         "class Client:\n"
-        "    def __init__(self, api_key=None): self.models = _Models()\n",
+        "    def __init__(self, api_key=None, http_options=None): self.models = _Models()\n",
         encoding="utf-8",
     )
     fixtures = {
@@ -2908,6 +3059,49 @@ def test_gemini_retries_empty_response_with_balanced_thinking(tmp_path):
     assert (tmp_path / "thinking.txt").read_text() == "medium"
     assert (tmp_path / "max-output.txt").read_text() == "None"
     assert "EMPTY RETRY SURVIVOR" in (tmp_path / "gemini_review.md").read_text()
+
+
+def test_gemini_current_sdk_sets_finite_request_timeout(tmp_path):
+    """The hosted SDK call must not inherit an unbounded transport timeout."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    google = tmp_path / "stub" / "google"
+    genai_stub = google / "genai"
+    genai_stub.mkdir(parents=True)
+    (google / "__init__.py").write_text("", encoding="utf-8")
+    (genai_stub / "types.py").write_text(
+        "class HttpOptions:\n"
+        "    def __init__(self, timeout): self.timeout = timeout\n"
+        "class ThinkingConfig:\n"
+        "    def __init__(self, thinking_level): self.thinking_level = thinking_level\n"
+        "class GenerateContentConfig:\n"
+        "    def __init__(self, thinking_config): self.thinking_config = thinking_config\n",
+        encoding="utf-8",
+    )
+    (genai_stub / "__init__.py").write_text(
+        "import pathlib\n"
+        "from . import types\n"
+        "class _R:\n"
+        "    text = 'FINITE TIMEOUT REVIEW'\n"
+        "    candidates = []\n"
+        "    prompt_feedback = None\n"
+        "    usage_metadata = None\n"
+        "class _Models:\n"
+        "    def generate_content(self, *, model, contents, config): return _R()\n"
+        "class Client:\n"
+        "    def __init__(self, api_key=None, http_options=None):\n"
+        "        pathlib.Path('request-timeout.txt').write_text(str(getattr(http_options, 'timeout', None)))\n"
+        "        self.models = _Models()\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+
+    subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=_gemini_script_env(tmp_path), check=True,
+        capture_output=True, text=True,
+    )
+
+    assert (tmp_path / "request-timeout.txt").read_text() == "420000"
 
 
 def test_gemini_rejects_nonempty_max_tokens_response(tmp_path):
@@ -3167,6 +3361,39 @@ def test_gemini_records_quota_failure_reason(tmp_path):
     )
     assert result.returncode != 0
     assert (tmp_path / "gemini_failure_reason.txt").read_text() == "quota_exhausted"
+
+
+def test_gemini_records_provider_timeout_failure_reason(tmp_path):
+    """A transport timeout remains distinguishable from other provider failures."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub_root = tmp_path / "stub"
+    stub = stub_root / "google"
+    stub.mkdir(parents=True)
+    (stub_root / "httpx.py").write_text(
+        "class TimeoutException(Exception): pass\n"
+        "class ReadTimeout(TimeoutException): pass\n",
+        encoding="utf-8",
+    )
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "from httpx import ReadTimeout\n"
+        "def configure(api_key=None): pass\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        raise ReadTimeout('Gemini request timed out')\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=_gemini_script_env(tmp_path), check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "provider_timeout"
 
 
 # ---------------------------------------------------------------------------

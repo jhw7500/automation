@@ -50,6 +50,7 @@ Automatically reviews pull requests when opened or updated.
 - Code quality suggestions
 - Performance considerations
 - Uses the Gemini model set by the `GEMINI_MODEL` repo/org variable (default: `gemini-3-flash-preview`)
+- Bounds provider waits with a 7-minute SDK timeout, 7.5-minute process watchdog, and 10-minute job ceiling
 
 **Triggers:** Automatically on PR opened or synchronized (new commits pushed)
 
@@ -245,6 +246,7 @@ Edit the respective `gemini-*.yml` files to modify:
 - Verify `GEMINI_API_KEY` is valid and not expired
 - Check API quota limits at https://aistudio.google.com
 - Ensure GCP credentials are correct (if using Vertex AI)
+- A sticky `Reason: provider_timeout` means the provider request exceeded its finite review deadline; inspect the linked run before rerunning
 
 ### Workflows don't trigger
 - Check branch protection rules

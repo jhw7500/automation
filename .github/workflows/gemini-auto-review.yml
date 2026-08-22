@@ -84,6 +84,7 @@ jobs:
       group: automation-gemini-auto-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write
@@ -259,6 +260,7 @@ jobs:
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3-flash-preview' }}
           GEMINI_THINKING_LEVEL: ${{ vars.GEMINI_THINKING_LEVEL || 'medium' }}
           GEMINI_DIFF_INPUT_CHARS: ${{ vars.GEMINI_DIFF_INPUT_CHARS || '900000' }}
+          GEMINI_REVIEW_PROCESS_TIMEOUT: '450'
           REVIEW_DIFF_FILE: ${{ steps.prepare-diff.outputs.diff-mode == 'delta' && 'review-delta.diff' || 'review-full.diff' }}
           REVIEW_DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode }}
         run: |
@@ -271,6 +273,11 @@ jobs:
           import random
           import re
           import time
+
+          try:
+              import httpx
+          except ImportError:
+              httpx = None
 
           try:
               from google import genai as google_genai
@@ -307,7 +314,10 @@ jobs:
               exit(1)
 
           if USING_CURRENT_SDK:
-              client = google_genai.Client(api_key=api_key)
+              client = google_genai.Client(
+                  api_key=api_key,
+                  http_options=genai_types.HttpOptions(timeout=420_000),
+              )
               generation_config = genai_types.GenerateContentConfig(
                   thinking_config=genai_types.ThinkingConfig(thinking_level=thinking_level),
               )
@@ -591,6 +601,10 @@ jobs:
                   return 'empty_output'
               if isinstance(err, TruncatedModelResponse):
                   return 'output_truncated'
+              if isinstance(err, TimeoutError) or (
+                  httpx is not None and isinstance(err, httpx.TimeoutException)
+              ):
+                  return 'provider_timeout'
               if is_rate_limited(err):
                   if 'quota exceeded' in message or 'exceeded your current quota' in message:
                       return 'quota_exhausted'
@@ -651,9 +665,18 @@ jobs:
 
           # Run the review script
           set +e
-          python gemini_review.py
+          review_started_at=$SECONDS
+          timeout --signal=TERM --kill-after=15s "${GEMINI_REVIEW_PROCESS_TIMEOUT}s" python gemini_review.py
           review_exit=$?
+          review_elapsed=$((SECONDS - review_started_at))
           set -e
+          if [ "$review_exit" -eq 124 ] || {
+            [ "$review_exit" -eq 137 ] && [ "$review_elapsed" -ge "$GEMINI_REVIEW_PROCESS_TIMEOUT" ]
+          }; then
+            review_exit=124
+            printf '%s' 'provider_timeout' > gemini_failure_reason.txt
+            printf '%s\n' '⚠️ Failed to generate Gemini review: provider request exceeded the process deadline' > gemini_review.md
+          fi
           printf 'diff_truncated=%s\n' "$(cat review_diff_truncated.txt 2>/dev/null || printf 'false')" >> "$GITHUB_OUTPUT"
           printf 'failure_reason=%s\n' "$(cat gemini_failure_reason.txt 2>/dev/null || printf 'provider_failed')" >> "$GITHUB_OUTPUT"
           exit "$review_exit"
@@ -757,6 +780,7 @@ jobs:
             const reportedFailureReason = process.env.FAILURE_REASON || '';
             const allowedFailureReasons = new Set([
               'provider_failed', 'quota_exhausted', 'rate_limited', 'authentication_failed',
+              'provider_timeout',
               'coverage_input_too_large', 'invalid_input_budget', 'invalid_thinking_level',
               'empty_output', 'output_truncated',
             ]);
