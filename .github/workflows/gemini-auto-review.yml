@@ -274,6 +274,8 @@ jobs:
           import re
           import time
 
+          PROCESS_STARTED_AT = time.monotonic()
+
           try:
               import httpx
           except ImportError:
@@ -537,6 +539,10 @@ jobs:
           RETRY_SLEEP = float(os.environ.get("GEMINI_429_RETRY_SLEEP", "35"))
           RETRY_JITTER = float(os.environ.get("GEMINI_429_RETRY_JITTER", "5"))
           EMPTY_RETRY_SLEEP = float(os.environ.get("GEMINI_EMPTY_RETRY_SLEEP", "2"))
+          PROCESS_TIMEOUT = max(
+              float(os.environ.get("GEMINI_REVIEW_PROCESS_TIMEOUT", "450")), 0
+          )
+          RETRY_DEADLINE_MARGIN = 5.0
 
           # 429 판정은 SDK의 정식 예외 타입을 우선 보고, 메시지 문자열은 SDK 포맷 변화
           # 대비 보조 조건으로 남긴다. google.api_core는 google-generativeai의 의존성이라
@@ -553,12 +559,24 @@ jobs:
           def server_retry_delay(err):
               message = str(err)
               candidates = []
-              for pattern in (
-                  r"Please retry in\s+([0-9]+(?:\.[0-9]+)?)s",
-                  r"retry_delay\s*\{\s*seconds:\s*([0-9]+(?:\.[0-9]+)?)",
+              for value, unit in re.findall(
+                  r"Please retry in\s+([0-9]+(?:\.[0-9]+)?)(ms|s)\b", message, re.I
               ):
-                  candidates.extend(float(value) for value in re.findall(pattern, message, re.I))
+                  seconds = float(value) / 1000 if unit.lower() == "ms" else float(value)
+                  candidates.append(seconds)
+              candidates.extend(
+                  float(value)
+                  for value in re.findall(
+                      r"retry_delay\s*\{\s*seconds:\s*([0-9]+(?:\.[0-9]+)?)",
+                      message,
+                      re.I,
+                  )
+              )
               return max(candidates, default=0.0)
+
+          def retry_delay_fits_process_budget(delay):
+              remaining = PROCESS_TIMEOUT - (time.monotonic() - PROCESS_STARTED_AT)
+              return delay + RETRY_DEADLINE_MARGIN < remaining
 
           def is_daily_request_quota_exhausted(err):
               # Per-day request quotas cannot recover during this job. Gemini surfaces the
@@ -620,14 +638,27 @@ jobs:
                   try:
                       response = generate_content(prompt)
                   except Exception as error:
-                      if is_rate_limited(error) and is_daily_request_quota_exhausted(error):
-                          print("Daily Gemini request quota exhausted; skipping unrecoverable retries")
+                      if (
+                          is_rate_limited(error)
+                          and is_daily_request_quota_exhausted(error)
+                          and server_retry_delay(error) <= 0
+                      ):
+                          print(
+                              "Daily Gemini request quota exhausted without retry guidance; "
+                              "skipping unrecoverable retries"
+                          )
                           raise
                       if not is_rate_limited(error) or attempt == 2:
                           raise
                       # 서버 대기시간을 절대 줄이지 않으며, 지터는 동시 재시도만 분산한다.
                       delay_floor = max(RETRY_SLEEP * (2 ** attempt), server_retry_delay(error))
                       delay = delay_floor + random.uniform(0, max(RETRY_JITTER, 0))
+                      if not retry_delay_fits_process_budget(delay):
+                          print(
+                              f"Retry delay {delay:.2f}s does not fit within the remaining "
+                              "Gemini process budget; skipping retry"
+                          )
+                          raise
                       print(f"Rate limited (attempt {attempt + 1}/3): {error}; retrying in {delay:.2f}s")
                       time.sleep(delay)
                       continue
