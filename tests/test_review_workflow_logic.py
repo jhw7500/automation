@@ -843,6 +843,10 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert "Changed anchor" in claude_model["with"]["prompt"]
     assert "concrete causal explanation" in claude_model["with"]["prompt"]
     assert "Retracted" in claude_model["with"]["prompt"]
+    assert "Do not report speculative, hypothetical, or unconfirmed risks" in claude_model["with"]["prompt"]
+    assert "external documentation or live service behavior" in claude_model["with"]["prompt"]
+    assert "Prior uncertainty is not evidence" in claude_model["with"]["prompt"]
+    assert "Report only findings at MEDIUM or above" in claude_model["with"]["prompt"]
     assert "Bash(gh pr" not in claude_model["with"]["claude_args"]
 
     gemini = _load("gemini-auto-review.yml")
