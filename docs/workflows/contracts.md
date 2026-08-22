@@ -298,10 +298,11 @@ Gemini 429 handling separates retry eligibility from the final failure classific
 provider `RetryInfo`/`Please retry in` delay remains authoritative even when the same response
 contains a requests-per-day quota ID. Second and millisecond guidance both use the existing
 three-attempt bounded backoff, and an eligible retry never waits less than the provider delay.
-A requests-per-day response without positive guidance, or with a delay that cannot fit inside the
-remaining process watchdog, is terminal for that job. If the bounded attempts are exhausted, a
-quota response is still published as `quota_exhausted`; retrying it does not weaken the sticky
-failure state or extend any of the nested deadlines above.
+A requests-per-day response without positive guidance is terminal for that job. For every 429,
+the computed backoff (including provider floor and jitter) must also fit inside the remaining
+process watchdog; otherwise the response remains terminal with its original `quota_exhausted` or
+`rate_limited` classification. Retrying does not weaken the sticky failure state or extend any of
+the nested deadlines above.
 
 Immediately before comment mutation, each reviewer refetches the PR head and requires it to
 equal `attempt_head`; it also refuses to write unless stored `(run_id, run_attempt)` is
