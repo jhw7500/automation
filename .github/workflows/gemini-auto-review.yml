@@ -548,6 +548,12 @@ jobs:
                   candidates.extend(float(value) for value in re.findall(pattern, message, re.I))
               return max(candidates, default=0.0)
 
+          def is_daily_request_quota_exhausted(err):
+              # Per-day request quotas cannot recover during this job. Gemini surfaces the
+              # quota ID in both current and legacy SDK exception strings.
+              compact = re.sub(r"[^a-z0-9]+", "", str(err).lower())
+              return "generaterequestsperday" in compact or "requestsperday" in compact
+
           class EmptyModelResponse(RuntimeError):
               pass
 
@@ -598,6 +604,9 @@ jobs:
                   try:
                       response = generate_content(prompt)
                   except Exception as error:
+                      if is_rate_limited(error) and is_daily_request_quota_exhausted(error):
+                          print("Daily Gemini request quota exhausted; skipping unrecoverable retries")
+                          raise
                       if not is_rate_limited(error) or attempt == 2:
                           raise
                       # 서버 대기시간을 절대 줄이지 않으며, 지터는 동시 재시도만 분산한다.

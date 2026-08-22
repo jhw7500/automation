@@ -3031,6 +3031,53 @@ def test_gemini_uses_server_retry_delay_as_a_floor(tmp_path):
     assert "retrying in 0.05s" in result.stdout
 
 
+def test_gemini_does_not_retry_daily_request_quota_exhaustion(tmp_path):
+    """An exhausted per-day quota cannot recover inside the job, so spend one call only."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        counter = pathlib.Path('attempts.txt')\n"
+        "        n = int(counter.read_text()) if counter.exists() else 0\n"
+        "        counter.write_text(str(n + 1))\n"
+        "        raise RuntimeError(\n"
+        "            '429 Quota exceeded for metric: generate_content_free_tier_requests; ' \n"
+        "            'quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier; ' \n"
+        "            'Please retry in 0.01s'\n"
+        "        )\n",
+        encoding="utf-8",
+    )
+    fixtures = {
+        "pr_title.txt": "T", "pr_body.txt": "B", "pr_number.txt": "7",
+        "review-full.diff": "+x\n", "prev_review.txt": "", "human_comments.txt": "",
+    }
+    for name, content in fixtures.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    env = dict(os.environ)
+    env.update({
+        "GEMINI_API_KEY": "stub",
+        "PYTHONPATH": str(tmp_path / "stub"),
+        "GEMINI_429_RETRY_SLEEP": "0",
+        "GEMINI_429_RETRY_JITTER": "0",
+        "REVIEW_DIFF_FILE": "review-full.diff",
+        "REVIEW_DIFF_MODE": "full",
+    })
+    result = subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=env, check=False, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert (tmp_path / "attempts.txt").read_text() == "1"
+    assert "retrying in" not in result.stdout
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "quota_exhausted"
+
+
 def test_gemini_records_quota_failure_reason(tmp_path):
     """A quota failure remains distinguishable from auth and generic provider failures."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
