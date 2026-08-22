@@ -665,10 +665,15 @@ jobs:
 
           # Run the review script
           set +e
-          timeout --foreground --signal=TERM --kill-after=15s "${GEMINI_REVIEW_PROCESS_TIMEOUT}s" python gemini_review.py
+          review_started_at=$SECONDS
+          timeout --signal=TERM --kill-after=15s "${GEMINI_REVIEW_PROCESS_TIMEOUT}s" python gemini_review.py
           review_exit=$?
+          review_elapsed=$((SECONDS - review_started_at))
           set -e
-          if [ "$review_exit" -eq 124 ]; then
+          if [ "$review_exit" -eq 124 ] || {
+            [ "$review_exit" -eq 137 ] && [ "$review_elapsed" -ge "$GEMINI_REVIEW_PROCESS_TIMEOUT" ]
+          }; then
+            review_exit=124
             printf '%s' 'provider_timeout' > gemini_failure_reason.txt
             printf '%s\n' '⚠️ Failed to generate Gemini review: provider request exceeded the process deadline' > gemini_review.md
           fi

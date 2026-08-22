@@ -2834,6 +2834,40 @@ def test_gemini_process_watchdog_records_timeout_after_hard_kill(tmp_path):
     assert _github_outputs(output)["failure_reason"] == "provider_timeout"
 
 
+def test_gemini_process_watchdog_does_not_misclassify_early_sigkill(tmp_path):
+    """An unrelated early SIGKILL must not be reported as a provider deadline."""
+    workflow = _load("gemini-auto-review.yml")
+    run = _step(workflow, "gemini-review", "Run Gemini Code Review")["run"]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in {
+        "pip": "#!/bin/sh\nexit 0\n",
+        "python": (
+            "#!/usr/bin/env python3\n"
+            "import os, signal\n"
+            "os.kill(os.getpid(), signal.SIGKILL)\n"
+        ),
+    }.items():
+        executable = bin_dir / name
+        executable.write_text(body, encoding="utf-8")
+        executable.chmod(0o755)
+    output = tmp_path / "github-output"
+    env = dict(os.environ)
+    env.update({
+        "PATH": f"{bin_dir}:{env['PATH']}",
+        "GEMINI_REVIEW_PROCESS_TIMEOUT": "2",
+        "GITHUB_OUTPUT": str(output),
+    })
+
+    result = subprocess.run(
+        ["bash", "-c", run], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True, timeout=5,
+    )
+
+    assert result.returncode == 137
+    assert _github_outputs(output)["failure_reason"] == "provider_failed"
+
+
 def test_gemini_infra_lines_sanitized_from_output_and_context(tmp_path):
     """모델이 sticky 헤더(marker, '- Reviewed:')를 에코해도 게시본·프롬프트에 남지 않는다."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
