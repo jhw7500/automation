@@ -314,8 +314,7 @@ class ReviewScope:
 
     def validate_trigger(self, evidence: TriggerEvidence) -> bool:
         if (not isinstance(evidence, TriggerEvidence) or not _safe_path(evidence.path)
-                or not _safe_line(evidence.line) or not isinstance(evidence.quote, str)
-                or evidence.path not in self.added_lines_by_path):
+                or not _safe_line(evidence.line) or not isinstance(evidence.quote, str)):
             return False
         try:
             record = _git(

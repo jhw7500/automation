@@ -245,3 +245,57 @@ def test_trigger_rejects_line_one_of_an_empty_tracked_blob(tmp_path: Path):
         diff_mode="full", previous_sha="", expected_repository="example/repo",
     )
     assert not scope.validate_trigger(TriggerEvidence("empty.py", 1, ""))
+
+
+@pytest.fixture
+def unchanged_trigger_repo(tmp_path: Path) -> ScopedRepo:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init")
+    (root / "src").mkdir()
+    (root / "src" / "anchor.py").write_text(
+        "def anchor():\n    return 'base'\n", encoding="utf-8"
+    )
+    (root / "benchmark.py").write_text(
+        "def benchmark():\n    return 42\n", encoding="utf-8"
+    )
+    (root / "target.py").write_text("target.py\n", encoding="utf-8")
+    (root / "link.py").symlink_to("target.py")
+    (root / "binary.dat").write_bytes(b"\xff\n")
+    _commit(root, "seed tracked evidence")
+    submodule = tmp_path / "submodule"
+    submodule.mkdir()
+    _git(submodule, "init")
+    (submodule / "README.md").write_text("submodule\n", encoding="utf-8")
+    _commit(submodule, "seed submodule")
+    _git(root, "-c", "protocol.file.allow=always", "submodule", "add", str(submodule), "vendor/module")
+    merge_base = _commit(root, "add tracked gitlink")
+    (root / "src" / "anchor.py").write_text(
+        "def anchor():\n    return 'head'\n", encoding="utf-8"
+    )
+    head = _commit(root, "change only anchor")
+    files = _scope_files(root, merge_base, head)
+    assert files == [{"status": "modified", "filename": "src/anchor.py"}]
+    manifest = _manifest(root, merge_base, head, files)
+    selected_diff = root / "review-full.diff"
+    selected_diff.write_bytes(
+        subprocess.run(
+            ["git", "diff", "--no-ext-diff", "--no-textconv", "-U0", f"{merge_base}..{head}"],
+            cwd=root, check=True, capture_output=True,
+        ).stdout
+    )
+    return ScopedRepo(root, manifest, selected_diff, merge_base, head)
+
+
+def test_trigger_allows_exact_unchanged_tracked_blob_and_preserves_rejections(
+    unchanged_trigger_repo: ScopedRepo,
+):
+    scope = unchanged_trigger_repo.load()
+    assert scope.validate_changed_anchor(SourceAnchor("src/anchor.py", 2))
+    assert scope.validate_trigger(TriggerEvidence("benchmark.py", 2, "    return 42"))
+    assert not scope.validate_trigger(TriggerEvidence("benchmark.py", 2, "    return 43"))
+    assert not scope.validate_trigger(TriggerEvidence("missing.py", 1, "x"))
+    assert not scope.validate_trigger(TriggerEvidence("../benchmark.py", 2, "    return 42"))
+    assert not scope.validate_trigger(TriggerEvidence("link.py", 1, "target.py"))
+    assert not scope.validate_trigger(TriggerEvidence("binary.dat", 1, "x"))
+    assert not scope.validate_trigger(TriggerEvidence("vendor/module", 1, "x"))
