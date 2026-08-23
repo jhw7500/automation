@@ -135,6 +135,129 @@ class ReviewCase:
         return result, self.canonical.read_text(encoding="utf-8") if self.canonical.exists() else None
 
 
+class ReviewQualityRepo:
+    """The fixed three-commit PR #101 corpus used by carryover tests."""
+
+    def __init__(self, root: Path):
+        root.mkdir()
+        self.root = root
+        self.repository = root / "repository"
+        self.repository.mkdir()
+        self.candidate = root / "candidate.md"
+        self.canonical = root / "canonical.md"
+        self.result = root / "result.json"
+        _git(self.repository, "init")
+        self._write_base()
+        self.merge_base = _commit(self.repository, "base")
+        head_text = self._head_text()
+        assert head_text.splitlines()[19] == '        return "completed 0/{}".format(total)'
+        assert head_text.splitlines()[24] == "        return int(value)"
+        assert head_text.splitlines()[25] == "    except ValueError:"
+        (self.repository / "review_cases.py").write_text(head_text, encoding="utf-8")
+        self.review_head = _commit(self.repository, "review change")
+        (self.repository / "review_cases.py").write_text(
+            head_text.replace('return "completed 0/{}".format(total)', 'return "rejected"'),
+            encoding="utf-8",
+        )
+        self.fixed_head = _commit(self.repository, "render rejected plan")
+        self.fixtures = ROOT / "tests" / "fixtures" / "review-finding-quality"
+
+    def _write_base(self) -> None:
+        (self.repository / "review_cases.py").write_text(
+            "from pathlib import Path\n\n"
+            "def load_profile(path: Path) -> str:\n"
+            "    return path.read_text(encoding=\"utf-8\")\n\n"
+            "def execute_plan(plan, plan_global=None):\n"
+            "    return plan_global\n\n"
+            "def call_plan(plan):\n"
+            "    return execute_plan(plan, plan_global=None)\n\n"
+            "def render_progress(accepted: int, total: int) -> str:\n"
+            "    return f\"{accepted}/{total}\"\n\n"
+            "def classify(value: str) -> int | str:\n"
+            "    return \"unknown\"\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _head_text() -> str:
+        return (
+            "from pathlib import Path\n\n"
+            "def load_profile(path: Path) -> str:\n"
+            "    return path.read_text(encoding=\"utf-8\")\n\n"
+            "def execute_plan(plan, plan_global=None):\n"
+            "    return plan_global\n\n"
+            "def call_plan(plan):\n"
+            "    return execute_plan(plan, plan_global=None)\n\n"
+            "def load_twice(path: Path) -> tuple[str, str]:\n"
+            "    first = load_profile(path)\n"
+            "    second = load_profile(path)\n"
+            "    return first, second\n\n\n"
+            "def render_progress(accepted: int, total: int) -> str:\n"
+            "    if accepted == 0:\n"
+            "        return \"completed 0/{}\".format(total)\n"
+            "    return f\"{accepted}/{total}\"\n\n"
+            "def classify(value: str) -> int | str:\n"
+            "    try:\n"
+            "        return int(value)\n"
+            "    except ValueError:\n"
+            "        return \"invalid\"\n"
+        )
+
+    def _request(
+        self, text: str, *, reviewer: str, head: str, diff_mode: str = "full",
+        previous_sha: str = "", previous_review: str | None = None,
+    ) -> CanonicalizationRequest:
+        _git(self.repository, "checkout", "--quiet", head)
+        self.candidate.write_text(text, encoding="utf-8")
+        manifest = self.root / "scope.json"
+        manifest.write_text(json.dumps({
+            "schema": 1, "repository": "example/repo", "pr_number": 101,
+            "merge_base_sha": self.merge_base, "head_sha": head,
+            "files": _scope_files(self.repository, self.merge_base, head),
+        }, separators=(",", ":")), encoding="utf-8")
+        selected_diff = self.root / "selected.diff"
+        left = self.merge_base if diff_mode == "full" else previous_sha
+        selected_diff.write_bytes(subprocess.run(
+            ["git", "diff", "--no-ext-diff", "--no-textconv", "-U0", f"{left}..{head}"],
+            cwd=self.repository, check=True, capture_output=True,
+        ).stdout)
+        previous_file = None
+        if previous_review is not None:
+            previous_file = self.root / "previous.md"
+            previous_file.write_text(previous_review, encoding="utf-8")
+        return CanonicalizationRequest(
+            reviewer=reviewer, candidate_file=self.candidate, canonical_file=self.canonical,
+            result_file=self.result, scope_manifest=manifest, selected_diff=selected_diff,
+            repository_root=self.repository, diff_mode=diff_mode, previous_sha=previous_sha,
+            previous_review_file=previous_file, expected_repository="example/repo",
+        )
+
+    def _run(self, request: CanonicalizationRequest) -> tuple[object, str]:
+        result = canonicalize(request)
+        return result, self.canonical.read_text(encoding="utf-8") if self.canonical.exists() else ""
+
+    def run_fixture(self, name: str, reviewer: str = "claude") -> tuple[object, str]:
+        return self._run(self._request(
+            (self.fixtures / name).read_text(encoding="utf-8"), reviewer=reviewer,
+            head=self.review_head,
+        ))
+
+    def run_text(self, text: str) -> tuple[object, str]:
+        return self._run(self._request(text, reviewer="claude", head=self.review_head))
+
+    def run_delta(self, previous_review: str, candidate: str) -> tuple[object, str]:
+        return self._run(self._request(
+            candidate, reviewer="gemini", head=self.fixed_head, diff_mode="delta",
+            previous_sha=self.review_head, previous_review=previous_review,
+        ))
+
+    def run_carryover(self, previous_review: str, candidate: str) -> tuple[object, str]:
+        return self._run(self._request(
+            candidate, reviewer="gemini", head=self.review_head, previous_sha=self.review_head,
+            previous_review=previous_review,
+        ))
+
+
 @pytest.fixture
 def case_factory(tmp_path: Path):
     def make(payload: bytes | None) -> ReviewCase:
@@ -148,6 +271,11 @@ def scoped_case(case_factory):
         def run(self, text: str) -> tuple[object, str | None]:
             return case_factory(text.encode("utf-8")).run()
     return ScopedCase()
+
+
+@pytest.fixture
+def review_quality_repo(tmp_path: Path) -> ReviewQualityRepo:
+    return ReviewQualityRepo(tmp_path / "review-quality")
 
 
 @pytest.mark.parametrize(
@@ -511,3 +639,148 @@ def test_parser_rejects_duplicate_json_keys_and_too_many_blocks(scoped_case):
     result, canonical = scoped_case.run(massive)
     assert result.failure_reason == "ambiguous_document"
     assert canonical is None
+
+
+def accepted_rejected_plan_review() -> str:
+    return '''### New findings
+
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Changed anchor: {"path":"review_cases.py","line":20}
+- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"completed 0/{}\\".format(total)"}
+- Impact class: user-visible
+- Material impact: A rejected plan is displayed as a successful zero-item completion.
+'''
+
+
+def first_round_false_resolved() -> str:
+    return '''### New findings
+None
+
+### Resolved
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Fix anchor: {"path":"review_cases.py","line":20}
+- Resolution: The rejection is now explicit.
+'''
+
+
+def resolved_rejected_plan_candidate() -> str:
+    return first_round_false_resolved()
+
+
+def duplicate_prior_binding_candidate() -> str:
+    return '''### New findings
+None
+
+### Still open
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Changed anchor: {"path":"review_cases.py","line":20}
+- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"rejected\\""}
+- Impact class: user-visible
+- Material impact: The rejected plan still appears successful.
+
+### Resolved
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Fix anchor: {"path":"review_cases.py","line":20}
+- Resolution: The rejection is now explicit.
+'''
+
+
+def retracted_rejected_plan_candidate() -> str:
+    return '''### New findings
+None
+
+### Retracted
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"completed 0/{}\\".format(total)"}
+- Reason: The rendered result is intentional product behavior.
+'''
+
+
+@pytest.mark.parametrize(
+    ("fixture", "reason", "accepted"),
+    (
+        ("plan-global.md", "invalid_trigger_evidence", 0),
+        ("duplicate-yaml.md", "unsupported_performance_basis", 0),
+        ("value-error.md", "", 1),
+        ("rejected-plan.md", "", 1),
+    ),
+)
+def test_pr101_quality_corpus(review_quality_repo, fixture, reason, accepted):
+    result, canonical = review_quality_repo.run_fixture(fixture)
+    assert result.accepted_count == accepted
+    assert result.document_valid is True
+    assert [item.reason for item in result.candidate_reasons] == ([reason] if reason else [])
+    assert ("No validated blocking issues found." in canonical) is (accepted == 0)
+
+
+def test_corpus_stable_ids_are_literal(review_quality_repo):
+    assert "RVW-61d4cd9ac260" in review_quality_repo.run_fixture("value-error.md")[1]
+    assert "RVW-3253866a28c6" in review_quality_repo.run_fixture("rejected-plan.md", reviewer="gemini")[1]
+
+
+def test_first_round_resolved_is_normalized_not_a_hard_failure(review_quality_repo):
+    result, canonical = review_quality_repo.run_text(first_round_false_resolved())
+    assert result.document_valid is True
+    assert result.normalized_count == 1
+    assert result.candidate_reasons[0].reason == "unknown_prior_id"
+    assert "### Resolved" not in canonical
+    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+def test_known_prior_resolution_requires_a_delta_fix_anchor(review_quality_repo):
+    result, canonical = review_quality_repo.run_delta(
+        previous_review=accepted_rejected_plan_review(),
+        candidate=resolved_rejected_plan_candidate(),
+    )
+    assert result.document_valid is True
+    assert result.normalized_count == 0
+    assert "### Resolved" in canonical
+    assert "RVW-3253866a28c6 [HIGH] Rejected plan" in canonical
+    assert canonical == '''### New findings
+
+None
+
+### Resolved
+
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Fix anchor: {"path":"review_cases.py","line":20}
+- Resolution: The rejection is now explicit.
+'''
+
+
+def test_one_prior_id_cannot_bind_twice(review_quality_repo):
+    result, canonical = review_quality_repo.run_delta(
+        previous_review=accepted_rejected_plan_review(),
+        candidate=duplicate_prior_binding_candidate(),
+    )
+    assert result.normalized_count == 2
+    assert {item.reason for item in result.candidate_reasons} == {"duplicate_prior_binding"}
+    assert "### Still open" not in canonical
+    assert "### Resolved" not in canonical
+    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+def test_retracted_prior_renders_canonical_reason(review_quality_repo):
+    result, canonical = review_quality_repo.run_carryover(
+        accepted_rejected_plan_review(), retracted_rejected_plan_candidate(),
+    )
+    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert canonical == '''### New findings
+
+None
+
+### Retracted
+
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"completed 0/{}\\".format(total)"}
+- Reason: The rendered result is intentional product behavior.
+'''
+
+
+def test_malformed_previous_canonical_file_is_scope_invalid(review_quality_repo):
+    result, canonical = review_quality_repo.run_carryover(
+        "### New findings\n\n#### [HIGH] unauthenticated heading\n", "### New findings\nNone\n",
+    )
+    assert result.document_valid is False
+    assert result.failure_reason == "scope_invalid"
+    assert canonical == ""
