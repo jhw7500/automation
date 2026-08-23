@@ -1,7 +1,7 @@
 # Review Finding Quality Gates Design
 
 Date: 2026-08-23
-Status: proposed; issues #41, #42, and #43 registered; implementation not started
+Status: approved; issues #41, #42, and #43 registered; implementation not started
 
 ## 1. Decision
 
