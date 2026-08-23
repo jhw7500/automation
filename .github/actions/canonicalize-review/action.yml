@@ -1,0 +1,65 @@
+name: Canonicalize review
+description: Canonicalize evidenced Claude or Gemini review findings
+inputs:
+  reviewer:
+    required: true
+  candidate-file:
+    required: true
+  canonical-file:
+    required: true
+  result-file:
+    required: true
+  scope-manifest:
+    required: true
+  selected-diff:
+    required: true
+  diff-mode:
+    required: true
+  previous-sha:
+    required: false
+    default: ''
+  previous-review-file:
+    required: false
+    default: ''
+outputs:
+  document-valid:
+    value: ${{ steps.canonicalize.outputs.document_valid }}
+  accepted-count:
+    value: ${{ steps.canonicalize.outputs.accepted_count }}
+  filtered-count:
+    value: ${{ steps.canonicalize.outputs.filtered_count }}
+  normalized-count:
+    value: ${{ steps.canonicalize.outputs.normalized_count }}
+  filtered-max-severity:
+    value: ${{ steps.canonicalize.outputs.filtered_max_severity }}
+  failure-reason:
+    value: ${{ steps.canonicalize.outputs.failure_reason }}
+runs:
+  using: composite
+  steps:
+    - id: canonicalize
+      shell: bash
+      env:
+        REVIEWER: ${{ inputs.reviewer }}
+        CANDIDATE_FILE: ${{ inputs.candidate-file }}
+        CANONICAL_FILE: ${{ inputs.canonical-file }}
+        RESULT_FILE: ${{ inputs.result-file }}
+        SCOPE_MANIFEST: ${{ inputs.scope-manifest }}
+        SELECTED_DIFF: ${{ inputs.selected-diff }}
+        DIFF_MODE: ${{ inputs.diff-mode }}
+        PREVIOUS_SHA: ${{ inputs.previous-sha }}
+        PREVIOUS_REVIEW_FILE: ${{ inputs.previous-review-file }}
+      run: >-
+        python3 "$GITHUB_ACTION_PATH/canonicalize_review.py"
+        --reviewer "$REVIEWER"
+        --candidate-file "$CANDIDATE_FILE"
+        --canonical-file "$CANONICAL_FILE"
+        --result-file "$RESULT_FILE"
+        --scope-manifest "$SCOPE_MANIFEST"
+        --selected-diff "$SELECTED_DIFF"
+        --diff-mode "$DIFF_MODE"
+        --previous-sha "$PREVIOUS_SHA"
+        --previous-review-file "$PREVIOUS_REVIEW_FILE"
+        --repository-root "$GITHUB_WORKSPACE"
+        --expected-repository "$GITHUB_REPOSITORY"
+        --github-output "$GITHUB_OUTPUT"

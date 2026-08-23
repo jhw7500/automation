@@ -846,7 +846,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository-root", required=True, type=Path)
     parser.add_argument("--diff-mode", required=True, choices=("full", "delta"))
     parser.add_argument("--previous-sha", default="")
-    parser.add_argument("--previous-review-file", type=Path)
+    parser.add_argument(
+        "--previous-review-file", type=lambda value: None if value == "" else Path(value)
+    )
     parser.add_argument("--expected-repository", required=True)
     parser.add_argument("--github-output", type=Path)
     return parser

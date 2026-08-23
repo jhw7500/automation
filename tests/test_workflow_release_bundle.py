@@ -35,6 +35,145 @@ EXACT_RELEASE_FILES = tuple(
 PREPARE_REVIEW_DIFF_ACTION = (
     ROOT / ".github/actions/prepare-review-diff/action.yml"
 )
+CANONICALIZE_REVIEW_ACTION = (
+    ROOT / ".github/actions/canonicalize-review/action.yml"
+)
+
+
+def test_canonicalize_review_composite_action_has_exact_safe_shell_contract() -> None:
+    """The public action surface must remain a mutation-free helper adapter."""
+    document = yaml.load(
+        CANONICALIZE_REVIEW_ACTION.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+    )
+
+    assert document == {
+        "name": "Canonicalize review",
+        "description": "Canonicalize evidenced Claude or Gemini review findings",
+        "inputs": {
+            "reviewer": {"required": "true"},
+            "candidate-file": {"required": "true"},
+            "canonical-file": {"required": "true"},
+            "result-file": {"required": "true"},
+            "scope-manifest": {"required": "true"},
+            "selected-diff": {"required": "true"},
+            "diff-mode": {"required": "true"},
+            "previous-sha": {"required": "false", "default": ""},
+            "previous-review-file": {"required": "false", "default": ""},
+        },
+        "outputs": {
+            "document-valid": {"value": "${{ steps.canonicalize.outputs.document_valid }}"},
+            "accepted-count": {"value": "${{ steps.canonicalize.outputs.accepted_count }}"},
+            "filtered-count": {"value": "${{ steps.canonicalize.outputs.filtered_count }}"},
+            "normalized-count": {"value": "${{ steps.canonicalize.outputs.normalized_count }}"},
+            "filtered-max-severity": {
+                "value": "${{ steps.canonicalize.outputs.filtered_max_severity }}"
+            },
+            "failure-reason": {"value": "${{ steps.canonicalize.outputs.failure_reason }}"},
+        },
+        "runs": {
+            "using": "composite",
+            "steps": [
+                {
+                    "id": "canonicalize",
+                    "shell": "bash",
+                    "env": {
+                        "REVIEWER": "${{ inputs.reviewer }}",
+                        "CANDIDATE_FILE": "${{ inputs.candidate-file }}",
+                        "CANONICAL_FILE": "${{ inputs.canonical-file }}",
+                        "RESULT_FILE": "${{ inputs.result-file }}",
+                        "SCOPE_MANIFEST": "${{ inputs.scope-manifest }}",
+                        "SELECTED_DIFF": "${{ inputs.selected-diff }}",
+                        "DIFF_MODE": "${{ inputs.diff-mode }}",
+                        "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
+                        "PREVIOUS_REVIEW_FILE": "${{ inputs.previous-review-file }}",
+                    },
+                    "run": (
+                        'python3 "$GITHUB_ACTION_PATH/canonicalize_review.py" '
+                        '--reviewer "$REVIEWER" '
+                        '--candidate-file "$CANDIDATE_FILE" '
+                        '--canonical-file "$CANONICAL_FILE" '
+                        '--result-file "$RESULT_FILE" '
+                        '--scope-manifest "$SCOPE_MANIFEST" '
+                        '--selected-diff "$SELECTED_DIFF" '
+                        '--diff-mode "$DIFF_MODE" '
+                        '--previous-sha "$PREVIOUS_SHA" '
+                        '--previous-review-file "$PREVIOUS_REVIEW_FILE" '
+                        '--repository-root "$GITHUB_WORKSPACE" '
+                        '--expected-repository "$GITHUB_REPOSITORY" '
+                        '--github-output "$GITHUB_OUTPUT"'
+                    ),
+                }
+            ],
+        },
+    }
+
+
+def test_canonicalize_review_action_run_passes_quoted_environment_values_to_helper(
+    tmp_path: Path,
+) -> None:
+    """Every action value is one inert argv entry, even when it resembles shell code."""
+    document = yaml.load(
+        CANONICALIZE_REVIEW_ACTION.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+    )
+    run = document["runs"]["steps"][0]["run"]
+    action_path = tmp_path / "action"
+    action_path.mkdir()
+    captured = tmp_path / "argv.json"
+    marker = tmp_path / "injection-ran"
+    (action_path / "canonicalize_review.py").write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['ARGV_CAPTURE']).write_text(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "-- workspace ; δ"
+    workspace.mkdir()
+    github_output = tmp_path / "-- output ; δ"
+    hostile = f'-- path ; $(touch {marker}) ; λ value'
+    values = {
+        "CANDIDATE_FILE": hostile + " candidate",
+        "CANONICAL_FILE": hostile + " canonical",
+        "RESULT_FILE": hostile + " result",
+        "SCOPE_MANIFEST": hostile + " manifest",
+        "SELECTED_DIFF": hostile + " diff",
+        "PREVIOUS_REVIEW_FILE": hostile + " previous",
+    }
+    environment = {
+        **os.environ,
+        "ARGV_CAPTURE": str(captured),
+        "GITHUB_ACTION_PATH": str(action_path),
+        "GITHUB_REPOSITORY": "owner/repository ; λ",
+        "GITHUB_WORKSPACE": str(workspace),
+        "GITHUB_OUTPUT": str(github_output),
+        "REVIEWER": "claude",
+        "DIFF_MODE": "full",
+        "PREVIOUS_SHA": "-- sha ; λ value",
+        **values,
+    }
+
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", run],
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    assert json.loads(captured.read_text(encoding="utf-8")) == [
+        "--reviewer", "claude",
+        "--candidate-file", values["CANDIDATE_FILE"],
+        "--canonical-file", values["CANONICAL_FILE"],
+        "--result-file", values["RESULT_FILE"],
+        "--scope-manifest", values["SCOPE_MANIFEST"],
+        "--selected-diff", values["SELECTED_DIFF"],
+        "--diff-mode", "full",
+        "--previous-sha", "-- sha ; λ value",
+        "--previous-review-file", values["PREVIOUS_REVIEW_FILE"],
+        "--repository-root", str(workspace),
+        "--expected-repository", "owner/repository ; λ",
+        "--github-output", str(github_output),
+    ]
 
 
 def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() -> None:

@@ -594,6 +594,30 @@ def test_cli_writes_bounded_schema_result_scalar_outputs_and_metadata_only_logs(
     assert case.canonical.read_text(encoding="utf-8") == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
 
 
+def test_cli_action_first_round_empty_previous_review_file_writes_runner_outputs(case_factory):
+    """The composite action's empty optional value denotes no previous review."""
+    case = case_factory(accepted_rejected_plan_review().encode("utf-8"))
+    github_output = case.root / "github-output.txt"
+    command = _cli_args(case, github_output)
+    command.extend(("--previous-review-file", ""))
+
+    completed = subprocess.run(command, cwd=ACTION_DIR, capture_output=True, text=True)
+
+    assert completed.returncode == 0, completed.stderr
+    assert github_output.read_text(encoding="utf-8") == (
+        "document_valid=true\n"
+        "accepted_count=1\n"
+        "filtered_count=0\n"
+        "normalized_count=0\n"
+        "filtered_max_severity=none\n"
+        "failure_reason=\n"
+    )
+    assert case.canonical.is_file() and not case.canonical.is_symlink()
+    assert case.result.is_file() and not case.result.is_symlink()
+    assert case.canonical.is_relative_to(case.root)
+    assert case.result.is_relative_to(case.root)
+
+
 @pytest.mark.parametrize("destination", ("result", "github"))
 def test_cli_refuses_symlink_result_and_github_output_destinations(case_factory, destination):
     """Atomic CLI output failures must be nonzero and never follow a symlink."""
