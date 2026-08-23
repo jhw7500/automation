@@ -18,6 +18,7 @@ import yaml
 from scripts.verify_workflow_release import ReleaseVerificationError
 import scripts.verify_workflow_release as release_verifier
 import scripts.workflow_release_bundle as release_bundle
+import scripts.workflow_release_inventory as release_inventory
 from scripts.workflow_release_bundle import materialize_release_bundle
 from scripts.workflow_release_inventory import EXACT_RELEASE_ROOTS, RELEASE_PATHS
 
@@ -303,6 +304,37 @@ def test_prepare_review_diff_action_is_bundled_as_regular_release_files() -> Non
     assert ".github/actions/prepare-review-diff/prepare_review_diff.py" in EXACT_RELEASE_FILES
 
 
+def test_canonicalize_review_action_is_bundled_as_regular_release_files() -> None:
+    """The action and both helpers travel at one immutable automation commit."""
+    assert {
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+        ".github/actions/canonicalize-review/review_scope.py",
+    } <= set(EXACT_RELEASE_FILES)
+
+
+def test_canonicalizer_capability_boundary_is_closed() -> None:
+    capability = getattr(
+        release_inventory, "release_supports_canonicalize_review", None
+    )
+    assert callable(capability)
+    assert capability("v1.45.2") is False
+    assert capability("v1.46") is True
+    canonicalizer_paths = {
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+        ".github/actions/canonicalize-review/review_scope.py",
+    }
+    assert canonicalizer_paths <= {
+        root.path.as_posix()
+        for root in release_inventory.release_roots_for("v1.46")
+    }
+    assert canonicalizer_paths.isdisjoint(
+        root.path.as_posix()
+        for root in release_inventory.release_roots_for("v1.45.2")
+    )
+
+
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -445,6 +477,22 @@ def test_release_archive_uses_only_authenticated_tree_and_blob_reads(
     monkeypatch.setattr(release_verifier.subprocess, "run", authenticated_only)
 
     assert release_bundle._git_archive(repo, release_commit)
+
+
+def test_latest_release_archive_default_includes_v146_canonicalizer_files(
+    release_repo: tuple[Path, str],
+) -> None:
+    repo, release_commit = release_repo
+
+    archive = release_bundle._git_archive(repo, release_commit)
+
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as stream:
+        names = set(stream.getnames())
+    assert {
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+        ".github/actions/canonicalize-review/review_scope.py",
+    } <= names
 
 
 def test_release_archive_rejects_semantically_valid_blob_at_wrong_object_name(
@@ -818,7 +866,7 @@ def test_bundle_binds_content_and_archive_across_aba_tag_movement(
         automation: Path,
         revision: str,
         *,
-        ref: str = "v1.45",
+        ref: str = "v1.46",
         tree: release_verifier.VerifiedCommitTree | None = None,
     ) -> bytes:
         archive_revisions.append(revision)

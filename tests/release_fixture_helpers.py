@@ -19,6 +19,13 @@ HISTORICAL_REVIEW_WORKFLOWS = (
     "gemini-auto-review.yml",
     "opencode-auto-review.yml",
 )
+V145_REVIEW_FIXTURE_ROOT = (
+    Path(__file__).parent / "fixtures/review-workflows-v1.45.2"
+)
+V145_REVIEW_WORKFLOWS = (
+    "claude-code-review.yml",
+    "gemini-auto-review.yml",
+)
 
 
 def restore_historical_automation_ref(repo: Path, historical_ref: str) -> None:
@@ -79,3 +86,18 @@ def restore_historical_review_workflows(
             1,
         )
         catalog.write_text(text, encoding="utf-8")
+
+
+def restore_v145_review_workflows(repo: Path) -> None:
+    """Restore immutable v1.45.2 Claude/Gemini workflow bytes.
+
+    These fixtures are the exact blobs published by commit
+    abf5e65cf6188277d9984be062d0b069c82cf25f.  Reading only checked-in
+    fixtures keeps historical verification available in shallow repositories.
+    """
+
+    for filename in V145_REVIEW_WORKFLOWS:
+        relative = f".github/workflows/{filename}"
+        (repo / relative).write_bytes(
+            (V145_REVIEW_FIXTURE_ROOT / filename).read_bytes()
+        )

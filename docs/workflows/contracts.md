@@ -143,6 +143,45 @@ therefore travel together at the immutable automation commit selected by the cal
 verification requires both regular `100644` action files for `v1.45+` and rejects a workflow
 dependency without that inventory; the historical `v1.44` inventory remains unchanged.
 
+Beginning with `v1.46`, Claude and Gemini then call the shared canonicalizer exactly once:
+
+```yaml
+uses: $/.github/actions/canonicalize-review
+```
+
+OpenCode continues to use only `prepare-review-diff`; adding `canonicalize-review` to OpenCode is a
+release-contract violation. The `v1.46+` closed release inventory adds exactly these regular,
+non-executable `100644` files:
+
+```text
+.github/actions/canonicalize-review/action.yml
+.github/actions/canonicalize-review/canonicalize_review.py
+.github/actions/canonicalize-review/review_scope.py
+```
+
+As with diff preparation, the `$/` reference binds the action and both helpers to the authenticated
+automation commit. A `v1.45` or `v1.45.2` release neither requires those future files nor permits a
+workflow dependency on them, even if an unrelated tree happens to contain paths with those names.
+
+The composite interface has exactly nine inputs:
+
+| Input | Contract |
+| --- | --- |
+| `reviewer` | Required; exactly `claude` or `gemini`. |
+| `candidate-file` | Required raw provider-output path; untrusted input. |
+| `canonical-file` | Required destination for canonical Markdown. |
+| `result-file` | Required destination for bounded schema-1 result JSON. |
+| `scope-manifest` | Required authenticated `review-scope.json` path. |
+| `selected-diff` | Required authenticated full or delta diff path. |
+| `diff-mode` | Required; exactly `full` or `delta`. |
+| `previous-sha` | Optional authenticated prior successful head; default empty on a first round, but it may remain set when delta safely falls back to full. |
+| `previous-review-file` | Optional authenticated prior canonical body; default empty. |
+
+It exposes exactly six scalar outputs: `document-valid`, `accepted-count`, `filtered-count`,
+`normalized-count`, `filtered-max-severity`, and `failure-reason`. The first is `true` or `false`;
+the three counts are non-negative integers; `filtered-max-severity` is `none`, `MEDIUM`, `HIGH`, or
+`CRITICAL`; and `failure-reason` is empty on a document-valid result or one fixed hard reason.
+
 The action captures validated PR base/head metadata, prepares `review-full.diff`, optionally
 prepares `review-delta.diff`, and writes `review-scope.json`. Its composite outputs are
 `diff-ready`, `diff-mode`, `head-sha`, `full-diff-sha256`, and
@@ -242,46 +281,125 @@ inter-hunk merging cannot turn an unchanged bridge line into a valid anchor. It 
 anchor form and changed-line membership; the causal explanation for supporting unchanged evidence
 remains a semantic review requirement.
 
-## Canonical automated-review state (v2)
+### Candidate and carryover grammar
 
-Claude, Gemini, and OpenCode publish review state in a workflow-generated v2 envelope.
-Only a bot comment whose first three lines are the reviewer's exact header, its exact v2
-marker, and one exact `<!-- automation-state:{...} -->` line is a state candidate. A marker
-quoted later in prose, a different reviewer or PR, malformed JSON, or an invalid field is not
-state. The highest lexicographic `(run_id, run_attempt)` candidate wins; comment ordering and
-timestamps do not. `run_id` and `run_attempt` are positive safe integers, so a manual rerun
-of the same run is newer when its attempt is larger.
+A Claude or Gemini candidate is one bounded UTF-8 document with exactly one `### New findings`
+section. Its body is exactly `None` or one or more `####` blocks. A new block uses
+`#### [SEVERITY] title`, where `SEVERITY` is exactly `CRITICAL`, `HIGH`, or `MEDIUM`, and contains
+exactly one canonical `Changed anchor`, one or more canonical `Trigger evidence` objects, one
+allowed `Impact class`, and one concrete `Material impact`. The allowed impact classes are
+`runtime`, `security`, `data-integrity`, `user-visible`, and `performance`. A performance claim
+also has exactly one `Performance basis` object whose kind is `measured` or
+`unbounded-amplification` and whose quoted source is validated. `LOW`, style, maintainability, and
+cleanup claims are non-actionable rather than blocking findings.
 
-The envelope fields are `schema` (always `2`), `reviewer`, `pr`, `run_id`, `run_attempt`,
-`attempt_head`, `successful_head`, `attempt_status`, `diff_mode`, and
-`full_diff_sha256`. `attempt_head` is the head this attempt prepared. The successful pair is
-atomic in meaning: `successful_head` is a 40-hex reviewed head only when
-`full_diff_sha256` is its 64-hex full-input hash; otherwise both are `null`. The status is
-`success` or `failure`, and `diff_mode` is `full`, `delta`, `unchanged`, or `unavailable`
-(`unavailable` is never a successful state). A `success` state requires the non-null successful
-pair and `successful_head == attempt_head`; a `failure` may carry either a null pair or a valid
-retained pair from an earlier success.
+Carryover sections are `### Still open`, `### Resolved`, and `### Retracted`. Every carryover
+heading has the exact form `#### RVW-<12 lowercase hex> [SEVERITY] title` and binds exactly one
+authenticated active prior finding. `Still open` must repeat current changed-anchor, trigger, impact,
+and material-impact proof. `Resolved` requires a selected-range `Fix anchor` and a resolution;
+`Retracted` requires current trigger evidence and a reason disproving the earlier claim. A first
+round has no authenticated prior active set, so model-authored carryovers are normalized out instead
+of becoming findings.
 
-The v2 contract requires the visible `- Run:` line to be the exact URL-only value
+The model never assigns authoritative IDs. For each accepted new finding the workflow derives
+`RVW-` plus the first 12 lowercase hexadecimal characters of SHA-256 over the NUL-separated
+reviewer, changed path, changed line, severity, and whitespace-normalized, case-folded title. That
+derivation makes later carryover bindings reproducible while keeping them under workflow ownership.
+
+### Hard checkpoints and soft finding filters
+
+The canonicalizer fails the whole document for exactly these hard reasons: `candidate_missing`,
+`invalid_utf8`, `candidate_oversize`, `ambiguous_document`, `scope_invalid`, and
+`canonicalizer_error`. A hard failure sets `document-valid=false`, makes the provider attempt a
+failed checkpoint, publishes no candidate prose, and cannot advance the successful head or hash.
+
+Once the document boundary and trusted scope are valid, a bad individual block does not discard
+valid siblings. It is filtered or normalized with exactly one of `invalid_anchor`,
+`invalid_trigger_evidence`, `invalid_severity`, `invalid_impact_class`,
+`missing_material_impact`, `unsupported_performance_basis`, `non_actionable_category`,
+`unknown_prior_id`, `duplicate_prior_binding`, or `missing_fix_anchor`. Rejected prose is absent
+from canonical Markdown, result JSON, workflow state, and the PR comment; only bounded counts,
+claimed maximum severity, and fixed reason codes are observable. `accepted-count` counts accepted
+new and still-open actionable blocks, `filtered-count` counts soft-rejected blocks, and
+`normalized-count` counts carryover blocks omitted without becoming actionable, including an
+unknown or duplicate prior binding or missing transition proof.
+
+## Canonical automated-review state
+
+Claude and Gemini publish workflow-generated schema-3 state under the exact markers
+`<!-- automation:claude-code-review:v3 -->` and
+`<!-- automation:gemini-auto-review:v3 -->`. OpenCode deliberately retains its existing v2 marker
+and schema. Only a bot comment whose first three lines are the reviewer's exact header, the marker
+for that reviewer and schema, and one exact `<!-- automation-state:{...} -->` line is a state
+candidate. Claude/Gemini v2 is never accepted as v3, and OpenCode never accepts v3. A marker quoted
+later in prose, a different reviewer or PR, malformed JSON, or an extra, missing, or invalid field
+is not state. The highest lexicographic `(run_id, run_attempt)` candidate wins; comment ordering and
+timestamps do not. Both values are positive safe integers, so a manual rerun of one run is newer
+when its attempt is larger.
+
+Every envelope has the common fields `schema`, `reviewer`, `pr`, `run_id`, `run_attempt`,
+`attempt_head`, `successful_head`, `attempt_status`, `diff_mode`, and `full_diff_sha256`.
+`attempt_head` is the head this attempt prepared. The successful pair is atomic:
+`successful_head` is a 40-hex reviewed head only when `full_diff_sha256` is its 64-hex full-input
+hash; otherwise both are `null`. Status is `success` or `failure`; mode is `full`, `delta`,
+`unchanged`, or `unavailable`, and unavailable is never successful. Success requires a non-null
+pair with `successful_head == attempt_head`; failure may carry either a null pair or a valid pair
+retained from an earlier success.
+
+Claude/Gemini schema 3 adds exactly `quality_schema`, `accepted_count`, `filtered_count`,
+`normalized_count`, and `filtered_max_severity`. `quality_schema` is always `1`. On full or delta
+success the counts are non-negative safe integers and the maximum is `none`, `MEDIUM`, `HIGH`, or
+`CRITICAL`. A first schema-3 failure has all four count/severity values `null`. A stale failure that
+preserves a prior schema-3 success also preserves that success's four values with its body, head,
+and full-diff hash; the values never describe the failed candidate. An authenticated unchanged
+success likewise preserves the prior canonical body and all four quality values while advancing
+only the permitted checkpoint identity. OpenCode schema 2 has only the ten common fields and no
+quality fields.
+
+Both schema contracts require the visible `- Run:` line to be the exact URL-only value
 `${{ github.server_url }}/${{ github.repository }}/actions/runs/<state.run_id>`; malformed,
 foreign-repository, or mismatched-run URLs are not state. Free-form review prose is untrusted
 presentation/comparison data only: reserved header, marker, state, and status lines are
 sanitized from model output and are constructed by the workflow, never treated as model
 authority.
 
-Legacy comments may be reused only as an exact legacy display target. Their marker, body, and
-`Reviewed` text never supply input state. The first v2 run performs a full review and
-establishes canonical v2 state; historical unstructured OpenCode comments are ignored.
+A v2 Claude/Gemini comment may be reused only as the exact in-place display target. Its state,
+body, previous SHA, full hash, finding IDs, validation text, and quality counters supply no v3
+authority or re-review context. The first v3 run is therefore forced to full mode, assigns the
+first workflow-owned IDs, establishes canonical quality counters, and replaces that display
+envelope in place. OpenCode continues its v2 collection and publication path; its historical
+unstructured comments remain ignored.
 
 A successful `full` or `delta` checkpoint requires a prepared covered input, a successful model
-step, non-empty sanitized prose, and a valid current write gate. A successful `unchanged`
-checkpoint instead requires the action's exact full hash to match an authenticated prior
-successful hash and preserves that prior non-empty prose while skipping the model. A failure
-preserves a prior successful body and successful pair only when both remain valid, records the
-failed `attempt_head`, and shows `Status: stale` plus `Last attempt: failure`; without prior
-success it is `Status: failure` with no `Reviewed` checkpoint. A stale run, missing/invalid input,
-empty sanitized output, or invalid prior state cannot advance coverage (invalid prior state falls
-back to a full review).
+step, a document-valid canonicalizer result, canonical publication content, and a valid current
+write gate. The workflow reads only `claude-review-canonical.md` or
+`gemini-review-canonical.md` for successful Claude/Gemini publication; it never reads the raw
+candidate in the upsert step. A successful `unchanged` checkpoint instead requires the exact full
+hash to match an authenticated prior success and preserves its non-empty canonical body and quality
+counters while skipping both provider and canonicalizer.
+
+Every successful Claude/Gemini comment contains the exact workflow-owned line
+`- Validation: accepted=N; filtered=N; normalized=N; filtered_max=LEVEL`. `N` values come from the
+schema-3 state and `LEVEL` is `none`, `MEDIUM`, `HIGH`, or `CRITICAL`; the visible line is not parsed
+back as authority. When no actionable block is accepted—including when every submitted block was
+soft-filtered—the canonical body says `No validated blocking issues found.`. That sentence proves
+only that this attempt produced zero mechanically validated actionable findings. It is not proof
+that the code is clean: filtered candidates can represent unsupported, malformed, or
+non-actionable claims, so monitoring reports their count and maximum claimed severity as a warning.
+Filtered severity is never rendered as a bracketed actionable label.
+
+Only accepted canonical headings with a bracketed severity (`[CRITICAL]`, `[HIGH]`, or `[MEDIUM]`)
+are eligible to block in merge tooling; the configured severity threshold decides which of them
+actually blocks. Tooling does not block on `filtered_max`, reason codes, raw provider prose, or a
+model-claimed severity that was filtered. A monitoring summary may therefore say, for example,
+`Gemini: CLEAN (0 validated blocking findings; 2 candidates filtered, max claimed HIGH)`, but the
+word `CLEAN` remains a display classification rather than stronger evidence about the code.
+
+A failure preserves a prior successful body, successful pair, and (for schema 3) quality counters
+only when all remain valid. It records the failed `attempt_head` and shows `Status: stale` plus
+`Last attempt: failure`; without prior success it is `Status: failure` with no `Reviewed`
+checkpoint and null quality values. A stale run, missing/invalid input, empty canonical output, or
+invalid prior state cannot advance coverage; an invalid prior state falls back to a full review.
 
 Gemini auto-review has nested finite deadlines so a provider or transport stall cannot occupy a
 review round indefinitely: the current SDK request timeout is 420,000 ms, the review subprocess

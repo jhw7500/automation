@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import difflib
@@ -29,10 +30,14 @@ from scripts.workflow_catalog import (
     load_fleet_config,
 )
 from scripts.workflow_release_inventory import (
+    CANONICALIZE_REVIEW_ACTION_ROOT,
+    CANONICALIZE_REVIEW_HELPER_ROOT,
     PREPARE_REVIEW_DIFF_ACTION_ROOT,
+    REVIEW_SCOPE_HELPER_ROOT,
     SETUP_GEMINI_AUTH_ROOT,
     release_paths_for,
     release_roots_for,
+    release_supports_canonicalize_review,
     release_supports_prepare_review_diff,
     validate_release_listing,
 )
@@ -243,6 +248,189 @@ EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
         ],
     },
 }
+EXPECTED_CANONICALIZE_REVIEW_ACTION = {
+    "name": "Canonicalize review",
+    "description": "Canonicalize evidenced Claude or Gemini review findings",
+    "inputs": {
+        "reviewer": {"required": "true"},
+        "candidate-file": {"required": "true"},
+        "canonical-file": {"required": "true"},
+        "result-file": {"required": "true"},
+        "scope-manifest": {"required": "true"},
+        "selected-diff": {"required": "true"},
+        "diff-mode": {"required": "true"},
+        "previous-sha": {"required": "false", "default": ""},
+        "previous-review-file": {"required": "false", "default": ""},
+    },
+    "outputs": {
+        "document-valid": {
+            "value": "${{ steps.canonicalize.outputs.document_valid }}"
+        },
+        "accepted-count": {
+            "value": "${{ steps.canonicalize.outputs.accepted_count }}"
+        },
+        "filtered-count": {
+            "value": "${{ steps.canonicalize.outputs.filtered_count }}"
+        },
+        "normalized-count": {
+            "value": "${{ steps.canonicalize.outputs.normalized_count }}"
+        },
+        "filtered-max-severity": {
+            "value": "${{ steps.canonicalize.outputs.filtered_max_severity }}"
+        },
+        "failure-reason": {
+            "value": "${{ steps.canonicalize.outputs.failure_reason }}"
+        },
+    },
+    "runs": {
+        "using": "composite",
+        "steps": [
+            {
+                "id": "canonicalize",
+                "shell": "bash",
+                "env": {
+                    "REVIEWER": "${{ inputs.reviewer }}",
+                    "CANDIDATE_FILE": "${{ inputs.candidate-file }}",
+                    "CANONICAL_FILE": "${{ inputs.canonical-file }}",
+                    "RESULT_FILE": "${{ inputs.result-file }}",
+                    "SCOPE_MANIFEST": "${{ inputs.scope-manifest }}",
+                    "SELECTED_DIFF": "${{ inputs.selected-diff }}",
+                    "DIFF_MODE": "${{ inputs.diff-mode }}",
+                    "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
+                    "PREVIOUS_REVIEW_FILE": "${{ inputs.previous-review-file }}",
+                },
+                "run": (
+                    'python3 "$GITHUB_ACTION_PATH/canonicalize_review.py" '
+                    '--reviewer "$REVIEWER" '
+                    '--candidate-file "$CANDIDATE_FILE" '
+                    '--canonical-file "$CANONICAL_FILE" '
+                    '--result-file "$RESULT_FILE" '
+                    '--scope-manifest "$SCOPE_MANIFEST" '
+                    '--selected-diff "$SELECTED_DIFF" '
+                    '--diff-mode "$DIFF_MODE" '
+                    '--previous-sha "$PREVIOUS_SHA" '
+                    '--previous-review-file "$PREVIOUS_REVIEW_FILE" '
+                    '--repository-root "$GITHUB_WORKSPACE" '
+                    '--expected-repository "$GITHUB_REPOSITORY" '
+                    '--github-output "$GITHUB_OUTPUT"'
+                ),
+            }
+        ],
+    },
+}
+EXPECTED_CANONICALIZER_HARD_REASONS = frozenset(
+    {
+        "candidate_missing",
+        "invalid_utf8",
+        "candidate_oversize",
+        "ambiguous_document",
+        "scope_invalid",
+        "canonicalizer_error",
+    }
+)
+EXPECTED_CANONICALIZER_SOFT_REASONS = frozenset(
+    {
+        "invalid_anchor",
+        "invalid_trigger_evidence",
+        "invalid_severity",
+        "invalid_impact_class",
+        "missing_material_impact",
+        "unsupported_performance_basis",
+        "non_actionable_category",
+        "unknown_prior_id",
+        "duplicate_prior_binding",
+        "missing_fix_anchor",
+    }
+)
+EXPECTED_SCOPE_GIT_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent/automation-review-scope/home",
+    "XDG_CONFIG_HOME": "/nonexistent/automation-review-scope/xdg",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "/bin/false",
+    "SSH_ASKPASS": "/bin/false",
+    "GIT_EXTERNAL_DIFF": "",
+}
+EXPECTED_CANONICALIZER_RECORDS = {
+    "CanonicalizationRequest": (
+        ("reviewer", "Literal['claude', 'gemini']"),
+        ("candidate_file", "Path"),
+        ("canonical_file", "Path"),
+        ("result_file", "Path"),
+        ("scope_manifest", "Path"),
+        ("selected_diff", "Path"),
+        ("repository_root", "Path"),
+        ("diff_mode", "Literal['full', 'delta']"),
+        ("previous_sha", "str"),
+        ("previous_review_file", "Path | None"),
+        ("expected_repository", "str"),
+    ),
+    "CandidateReason": (
+        ("index", "int"),
+        (
+            "section",
+            "Literal['New findings', 'Still open', 'Resolved', 'Retracted']",
+        ),
+        ("outcome", "Literal['filtered', 'normalized']"),
+        ("reason", "str"),
+        ("claimed_severity", "Literal['none', 'MEDIUM', 'HIGH', 'CRITICAL']"),
+    ),
+    "CanonicalizationResult": (
+        ("document_valid", "bool"),
+        ("accepted_count", "int"),
+        ("filtered_count", "int"),
+        ("normalized_count", "int"),
+        ("filtered_max_severity", "Literal['none', 'MEDIUM', 'HIGH', 'CRITICAL']"),
+        ("failure_reason", "str"),
+        ("candidate_reasons", "tuple[CandidateReason, ...]"),
+    ),
+}
+EXPECTED_SCOPE_RECORDS = {
+    "SourceAnchor": (("path", "str"), ("line", "int")),
+    "TriggerEvidence": (
+        ("path", "str"),
+        ("line", "int"),
+        ("quote", "str"),
+    ),
+    "ReviewScope": (
+        ("repository_root", "Path"),
+        ("manifest", "ScopeManifest"),
+        ("diff_mode", "Literal['full', 'delta']"),
+        ("added_lines_by_path", "dict[str, dict[int, str]]"),
+    ),
+}
+EXPECTED_CANONICALIZER_FUNCTIONS = {
+    "stable_finding_id": (
+        "def stable_finding_id(reviewer: str, anchor: SourceAnchor, severity: str, "
+        "title: str) -> str"
+    ),
+    "canonicalize": (
+        "def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult"
+    ),
+}
+EXPECTED_SCOPE_FUNCTIONS = {
+    "load_review_scope": (
+        "def load_review_scope(repository_root: Path, manifest_path: Path, "
+        "selected_diff_path: Path, *, diff_mode: Literal['full', 'delta'], "
+        "previous_sha: str, expected_repository: str) -> ReviewScope"
+    ),
+}
+EXPECTED_REVIEW_SCOPE_METHODS = {
+    "validate_changed_anchor": (
+        "def validate_changed_anchor(self, anchor: SourceAnchor) -> bool"
+    ),
+    "validate_fix_anchor": (
+        "def validate_fix_anchor(self, anchor: SourceAnchor) -> bool"
+    ),
+    "validate_trigger": (
+        "def validate_trigger(self, evidence: TriggerEvidence) -> bool"
+    ),
+}
 class ManualGeminiContract(NamedTuple):
     step_name: str
     step_id: str
@@ -289,11 +477,72 @@ APPROVED_GEMINI_ACTIONS = frozenset(
 PREPARE_REVIEW_DIFF_ACTION = (
     f"$/{PREPARE_REVIEW_DIFF_ACTION_ROOT.path.parent.as_posix()}"
 )
+CANONICALIZE_REVIEW_ACTION = (
+    f"$/{CANONICALIZE_REVIEW_ACTION_ROOT.path.parent.as_posix()}"
+)
 REVIEW_DIFF_DEPENDENCY_WORKFLOWS = (
     "claude-code-review.yml",
     "gemini-auto-review.yml",
     "opencode-auto-review.yml",
 )
+CANONICALIZE_REVIEW_WORKFLOWS = frozenset(
+    {"claude-code-review.yml", "gemini-auto-review.yml"}
+)
+QUALITY_STATE_KEYS = (
+    "accepted_count",
+    "attempt_head",
+    "attempt_status",
+    "diff_mode",
+    "filtered_count",
+    "filtered_max_severity",
+    "full_diff_sha256",
+    "normalized_count",
+    "pr",
+    "quality_schema",
+    "reviewer",
+    "run_attempt",
+    "run_id",
+    "schema",
+    "successful_head",
+)
+REVIEW_PUBLICATION_CONTRACTS = {
+    "claude-code-review.yml": {
+        "job": "claude-review",
+        "collector": "Collect previous review context",
+        "provider": "Run Claude Code Review",
+        "prompt_location": "with",
+        "reviewer": "claude",
+        "marker": "<!-- automation:claude-code-review:v3 -->",
+        "v2_marker": "<!-- automation:claude-code-review:v2 -->",
+        "raw": "claude-review.md",
+        "canonical": "claude-review-canonical.md",
+        "canonical_step": "Canonicalize Claude review",
+        "previous_sha": "${{ steps.prepare-review-input.outputs.previous_sha }}",
+        "previous_file": (
+            "${{ steps.prepare-review-input.outputs.previous_sha != '' && "
+            "format('{0}/claude-previous-review.md', github.workspace) || '' }}"
+        ),
+        "reset": "reset-claude-artifacts",
+    },
+    "gemini-auto-review.yml": {
+        "job": "gemini-review",
+        "collector": "Get PR details",
+        "provider": "Run Gemini Code Review",
+        "prompt_location": "run",
+        "reviewer": "gemini",
+        "marker": "<!-- automation:gemini-auto-review:v3 -->",
+        "v2_marker": "<!-- automation:gemini-auto-review:v2 -->",
+        "raw": "gemini_review.md",
+        "canonical": "gemini-review-canonical.md",
+        "canonical_step": "Canonicalize Gemini review",
+        "previous_sha": "${{ steps.pr-details.outputs.previous_sha }}",
+        "previous_file": (
+            "${{ steps.pr-details.outputs.previous_sha != '' && "
+            "format('{0}/gemini-previous-review.md', github.workspace) || '' }}"
+        ),
+        "reset": "reset-gemini-artifacts",
+    },
+}
 GIT_EXECUTABLE = "/usr/bin/git"
 CANONICAL_AUTOMATION_REMOTE = "https://github.com/jhw7500/automation.git"
 ACCEPTED_AUTOMATION_REMOTES = frozenset(
@@ -1450,6 +1699,200 @@ def _verify_prepare_review_diff_action(tree: VerifiedCommitTree) -> None:
         )
 
 
+def _module_assignment(module: ast.Module, name: str) -> ast.expr:
+    matches: list[ast.expr] = []
+    for node in module.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        ):
+            matches.append(node.value)
+    if len(matches) != 1:
+        raise ValueError("missing or duplicate assignment")
+    return matches[0]
+
+
+def _static_literal(module: ast.Module, name: str) -> object:
+    value = _module_assignment(module, name)
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "frozenset"
+        and len(value.args) == 1
+        and not value.keywords
+    ):
+        return frozenset(ast.literal_eval(value.args[0]))
+    return ast.literal_eval(value)
+
+
+def _class_node(module: ast.Module, name: str) -> ast.ClassDef:
+    matches = [
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == name
+    ]
+    if len(matches) != 1:
+        raise ValueError("missing or duplicate class")
+    return matches[0]
+
+
+def _record_fields(node: ast.ClassDef) -> tuple[tuple[str, str], ...]:
+    if [ast.unparse(item) for item in node.decorator_list] != [
+        "dataclass(frozen=True)"
+    ]:
+        raise ValueError("record is not frozen")
+    fields: list[tuple[str, str]] = []
+    for item in node.body:
+        if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+            if item.value is not None:
+                raise ValueError("record field has a default")
+            fields.append((item.target.id, ast.unparse(item.annotation)))
+    return tuple(fields)
+
+
+def _function_header(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    header, separator, _body = ast.unparse(node).partition(":\n")
+    if separator != ":\n":
+        raise ValueError("function cannot be rendered")
+    return header
+
+
+def _module_function_headers(module: ast.Module) -> dict[str, str]:
+    functions: dict[str, str] = {}
+    for node in module.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in functions:
+                raise ValueError("duplicate function")
+            functions[node.name] = _function_header(node)
+    return functions
+
+
+def _class_function_headers(node: ast.ClassDef) -> dict[str, str]:
+    functions: dict[str, str] = {}
+    for item in node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if item.name in functions:
+                raise ValueError("duplicate method")
+            functions[item.name] = _function_header(item)
+    return functions
+
+
+def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree) -> None:
+    canonical_path = CANONICALIZE_REVIEW_HELPER_ROOT.path.as_posix()
+    scope_path = REVIEW_SCOPE_HELPER_ROOT.path.as_posix()
+    try:
+        canonical_text = tree.read_text(canonical_path)
+        scope_text = tree.read_text(scope_path)
+        # Compilation is a syntax gate only.  Never import or execute release code.
+        compile(canonical_text, canonical_path, "exec", dont_inherit=True)
+        compile(scope_text, scope_path, "exec", dont_inherit=True)
+        canonical_module = ast.parse(canonical_text, filename=canonical_path)
+        scope_module = ast.parse(scope_text, filename=scope_path)
+
+        canonical_literals = {
+            "HARD_REASONS": EXPECTED_CANONICALIZER_HARD_REASONS,
+            "SOFT_REASONS": EXPECTED_CANONICALIZER_SOFT_REASONS,
+            "SEVERITIES": ("CRITICAL", "HIGH", "MEDIUM"),
+            "IMPACT_CLASSES": frozenset(
+                {
+                    "runtime",
+                    "security",
+                    "data-integrity",
+                    "user-visible",
+                    "performance",
+                }
+            ),
+            "MAX_CANDIDATE_BYTES": 60_000,
+            "MAX_PREVIOUS_CANONICAL_BYTES": 65_536,
+            "MAX_CANDIDATE_BLOCKS": 512,
+        }
+        if any(
+            _static_literal(canonical_module, name) != expected
+            for name, expected in canonical_literals.items()
+        ):
+            raise ValueError("canonical constants differ")
+        expected_safe_integer = ast.parse(
+            "(1 << 53) - 1", mode="eval"
+        ).body
+        if ast.dump(_module_assignment(canonical_module, "MAX_SAFE_INTEGER")) != ast.dump(
+            expected_safe_integer
+        ):
+            raise ValueError("safe integer constant differs")
+        if _static_literal(scope_module, "GIT_ENV") != EXPECTED_SCOPE_GIT_ENV:
+            raise ValueError("scope Git environment differs")
+
+        for name, expected in EXPECTED_CANONICALIZER_RECORDS.items():
+            if _record_fields(_class_node(canonical_module, name)) != expected:
+                raise ValueError("canonical record differs")
+        for name, expected in EXPECTED_SCOPE_RECORDS.items():
+            if _record_fields(_class_node(scope_module, name)) != expected:
+                raise ValueError("scope record differs")
+
+        scope_error = _class_node(scope_module, "ScopeValidationError")
+        if [ast.unparse(base) for base in scope_error.bases] != ["ValueError"]:
+            raise ValueError("scope error base differs")
+        canonical_functions = _module_function_headers(canonical_module)
+        scope_functions = _module_function_headers(scope_module)
+        if any(
+            canonical_functions.get(name) != expected
+            for name, expected in EXPECTED_CANONICALIZER_FUNCTIONS.items()
+        ) or any(
+            scope_functions.get(name) != expected
+            for name, expected in EXPECTED_SCOPE_FUNCTIONS.items()
+        ):
+            raise ValueError("public helper function differs")
+        review_scope_methods = _class_function_headers(
+            _class_node(scope_module, "ReviewScope")
+        )
+        if any(
+            review_scope_methods.get(name) != expected
+            for name, expected in EXPECTED_REVIEW_SCOPE_METHODS.items()
+        ):
+            raise ValueError("public scope method differs")
+    except (
+        ReleaseVerificationError,
+        SyntaxError,
+        TypeError,
+        ValueError,
+    ):
+        raise ReleaseVerificationError(
+            "canonicalize-review helper contract is invalid"
+        ) from None
+
+
+def _verify_canonicalize_review_action(tree: VerifiedCommitTree) -> None:
+    expected_files = {
+        (root.path.as_posix(), "100644", "blob")
+        for root in (
+            CANONICALIZE_REVIEW_ACTION_ROOT,
+            CANONICALIZE_REVIEW_HELPER_ROOT,
+            REVIEW_SCOPE_HELPER_ROOT,
+        )
+    }
+    actual_files = {
+        (entry.path.as_posix(), entry.mode, entry.object_type)
+        for entry in tree.files(CANONICALIZE_REVIEW_ACTION_ROOT.path.parent)
+    }
+    if actual_files != expected_files:
+        raise ReleaseVerificationError(
+            "canonicalize-review inventory is not closed"
+        )
+    path = CANONICALIZE_REVIEW_ACTION_ROOT.path.as_posix()
+    try:
+        document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
+    except (ReleaseVerificationError, yaml.YAMLError):
+        raise ReleaseVerificationError(
+            "canonicalize-review action contract is invalid"
+        ) from None
+    if document != EXPECTED_CANONICALIZE_REVIEW_ACTION:
+        raise ReleaseVerificationError(
+            "canonicalize-review action contract is invalid"
+        )
+    _verify_canonicalize_review_helpers(tree)
+
+
 def _verify_tag_catalog(
     tree: VerifiedCommitTree, ref: str
 ) -> WorkflowCatalog | None:
@@ -1755,35 +2198,220 @@ def _action_references(value: object) -> list[str]:
     return result
 
 
-def _verify_prepare_review_diff_dependencies(
+def expected_review_actions(ref: str, workflow: str) -> list[str]:
+    """Return the exact ordered release-local action dependencies."""
+
+    actions = (
+        [PREPARE_REVIEW_DIFF_ACTION]
+        if release_supports_prepare_review_diff(ref)
+        else []
+    )
+    if (
+        release_supports_canonicalize_review(ref)
+        and workflow in CANONICALIZE_REVIEW_WORKFLOWS
+    ):
+        actions.append(CANONICALIZE_REVIEW_ACTION)
+    return actions
+
+
+def _verify_review_action_dependencies(
     ref: str, documents: dict[str, dict]
 ) -> None:
-    supported = release_supports_prepare_review_diff(ref)
     for name in REVIEW_DIFF_DEPENDENCY_WORKFLOWS:
+        expected = expected_review_actions(ref, name)
         document = documents.get(name)
         if document is None:
-            if supported:
+            if expected:
                 raise ReleaseVerificationError(
-                    f"{name} prepare-review-diff dependency is missing"
+                    f"{name} prepare-review-diff dependency or review action "
+                    "dependency contract is missing"
                 )
             continue
         references = _action_references(document)
         local_references = [
             reference
             for reference in references
-            if reference.startswith(("$/", "./"))
+            if reference.startswith(
+                ("$/.github/actions/", "./.github/actions/")
+            )
         ]
-        if supported:
-            valid = (
-                references.count(PREPARE_REVIEW_DIFF_ACTION) == 1
-                and local_references == [PREPARE_REVIEW_DIFF_ACTION]
-            )
-        else:
-            valid = not local_references
-        if not valid:
+        if local_references != expected:
             raise ReleaseVerificationError(
-                f"{name} prepare-review-diff dependency contract is invalid"
+                f"{name} prepare-review-diff dependency or review action "
+                "dependency contract is invalid"
             )
+
+
+def _named_step(job: object, name: str) -> dict:
+    if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+        raise ValueError("review job has no steps")
+    matches = [
+        step
+        for step in job["steps"]
+        if isinstance(step, dict) and step.get("name") == name
+    ]
+    if len(matches) != 1:
+        raise ValueError("review step is missing or duplicated")
+    return matches[0]
+
+
+def _expected_canonicalize_step(contract: dict[str, str]) -> dict[str, object]:
+    reviewer = contract["reviewer"]
+    reset = contract["reset"]
+    return {
+        "name": contract["canonical_step"],
+        "id": "canonicalize-review",
+        "if": (
+            f"${{{{ always() && steps.{reset}.outcome == 'success' && "
+            "steps.prepare-diff.outputs.diff-ready == 'true' && "
+            "steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        ),
+        "uses": CANONICALIZE_REVIEW_ACTION,
+        "with": {
+            "reviewer": reviewer,
+            "candidate-file": f"${{{{ github.workspace }}}}/{contract['raw']}",
+            "canonical-file": (
+                f"${{{{ github.workspace }}}}/{contract['canonical']}"
+            ),
+            "result-file": (
+                f"${{{{ github.workspace }}}}/{reviewer}-review-result.json"
+            ),
+            "scope-manifest": "${{ github.workspace }}/review-scope.json",
+            "selected-diff": (
+                "${{ steps.prepare-diff.outputs.diff-mode == 'delta' && "
+                "format('{0}/review-delta.diff', github.workspace) || "
+                "format('{0}/review-full.diff', github.workspace) }}"
+            ),
+            "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
+            "previous-sha": contract["previous_sha"],
+            "previous-review-file": contract["previous_file"],
+        },
+    }
+
+
+def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
+    jq_state_keys = json.dumps(list(QUALITY_STATE_KEYS))
+    js_state_keys = ", ".join(repr(key) for key in QUALITY_STATE_KEYS)
+    expected_output_env = {
+        "CANONICAL_OUTCOME": "${{ steps.canonicalize-review.outcome }}",
+        "DOCUMENT_VALID": "${{ steps.canonicalize-review.outputs.document-valid }}",
+        "ACCEPTED_COUNT": "${{ steps.canonicalize-review.outputs.accepted-count }}",
+        "FILTERED_COUNT": "${{ steps.canonicalize-review.outputs.filtered-count }}",
+        "NORMALIZED_COUNT": "${{ steps.canonicalize-review.outputs.normalized-count }}",
+        "FILTERED_MAX_SEVERITY": (
+            "${{ steps.canonicalize-review.outputs.filtered-max-severity }}"
+        ),
+        "CANONICAL_FAILURE_REASON": (
+            "${{ steps.canonicalize-review.outputs.failure-reason }}"
+        ),
+    }
+    prompt_rules = (
+        "Changed anchor:",
+        "Trigger evidence:",
+        "Material impact:",
+        "Performance basis:",
+        "RVW-<12hex>",
+        "Resolved requires a code change; Retracted requires evidence",
+    )
+    try:
+        for name, raw_contract in REVIEW_PUBLICATION_CONTRACTS.items():
+            contract = {
+                key: value
+                for key, value in raw_contract.items()
+                if isinstance(value, str)
+            }
+            document = documents[name]
+            job = document["jobs"][contract["job"]]
+            canonical_step = _named_step(job, contract["canonical_step"])
+            if canonical_step != _expected_canonicalize_step(contract):
+                raise ValueError("canonicalizer call differs")
+
+            collector = _named_step(job, contract["collector"])
+            collector_script = collector.get("run", "")
+            if not isinstance(collector_script, str):
+                raise ValueError("collector script is unavailable")
+            marker = contract["marker"]
+            collector_marker = (
+                collector.get("env", {}).get("MARKER") == marker
+                if contract["reviewer"] == "claude"
+                else f"MARKER='{marker}'" in collector_script
+            )
+            collector_contract = (
+                collector_marker
+                and f"== {jq_state_keys}" in collector_script
+                and "$s.schema == 3" in collector_script
+                and "$s.quality_schema == 1" in collector_script
+                and "canonical_body" in collector_script
+                and "@base64" in collector_script
+                and 'base64 --decode > "$PREVIOUS_FILE"' in collector_script
+                and "- Validation: accepted=" in collector_script
+            )
+            if not collector_contract:
+                raise ValueError("collector state differs")
+
+            provider = _named_step(job, contract["provider"])
+            prompt = (
+                provider.get("with", {}).get("prompt", "")
+                if contract["prompt_location"] == "with"
+                else provider.get("run", "")
+            )
+            if not isinstance(prompt, str) or any(
+                prompt.count(rule) < 1 for rule in prompt_rules
+            ):
+                raise ValueError("quality prompt differs")
+
+            upsert = _named_step(job, "Upsert review comment")
+            upsert_script = upsert.get("with", {}).get("script", "")
+            if not isinstance(upsert_script, str):
+                raise ValueError("upsert script is unavailable")
+            validation_template = (
+                "`- Validation: accepted=${state.accepted_count}; "
+                "filtered=${state.filtered_count}; "
+                "normalized=${state.normalized_count}; "
+                "filtered_max=${state.filtered_max_severity}`"
+            )
+            upsert_contract = (
+                f"const marker = '{marker}';" in upsert_script
+                and f"const v2Marker = '{contract['v2_marker']}';" in upsert_script
+                and ":v1 -->" not in upsert_script
+                and f"const expectedStateKeys = [{js_state_keys}];" in upsert_script
+                and "state.schema === 3" in upsert_script
+                and "state.quality_schema === 1" in upsert_script
+                and "schema: 3" in upsert_script
+                and "quality_schema: 1" in upsert_script
+                and validation_template in upsert_script
+                and "const v2Target = existing ? null : exactDisplayTarget(v2Marker);"
+                in upsert_script
+                and (
+                    f"fs.readFileSync('{contract['canonical']}', 'utf8')"
+                    in upsert_script
+                )
+                and contract["raw"] not in upsert_script
+                and "const successQuality = unchangedInputIsValid ? {"
+                in upsert_script
+                and all(
+                    f"preserveSuccess ? existing.state.{field} : null"
+                    in upsert_script
+                    for field in (
+                        "accepted_count",
+                        "filtered_count",
+                        "normalized_count",
+                        "filtered_max_severity",
+                    )
+                )
+            )
+            if not upsert_contract:
+                raise ValueError("upsert publication differs")
+            upsert_env = upsert.get("env", {})
+            if not isinstance(upsert_env, dict) or any(
+                upsert_env.get(key) != value
+                for key, value in expected_output_env.items()
+            ):
+                raise ValueError("canonicalizer output bridge differs")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise ReleaseVerificationError(
+            "review publication contract is invalid"
+        ) from None
 
 
 def _verify_token_mapping(
@@ -1860,6 +2488,8 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
     approved_actions = APPROVED_GEMINI_ACTIONS
     if release_supports_prepare_review_diff(ref):
         approved_actions |= {PREPARE_REVIEW_DIFF_ACTION}
+    if release_supports_canonicalize_review(ref):
+        approved_actions |= {CANONICALIZE_REVIEW_ACTION}
     unapproved_actions = sorted(set(_action_references(document)) - approved_actions)
     if unapproved_actions:
         raise ReleaseVerificationError(
@@ -1967,6 +2597,8 @@ def _verify_commit_content(
         _verify_setup_gemini_auth(tree)
     if release_supports_prepare_review_diff(ref):
         _verify_prepare_review_diff_action(tree)
+    if release_supports_canonicalize_review(ref):
+        _verify_canonicalize_review_action(tree)
     _verify_approved_v140_policy(tree, ref)
     _verify_manual_gemini_output_contract(tree, ref)
     catalog = _verify_tag_catalog(tree, ref)
@@ -1989,7 +2621,9 @@ def _verify_commit_content(
         data = yaml.load(text, Loader=yaml.BaseLoader)
         documents[Path(name).name] = data if isinstance(data, dict) else {}
 
-    _verify_prepare_review_diff_dependencies(ref, documents)
+    _verify_review_action_dependencies(ref, documents)
+    if release_supports_canonicalize_review(ref):
+        _verify_review_publication_contracts(documents)
 
     if catalog is not None:
         gemini_targets = sorted(
