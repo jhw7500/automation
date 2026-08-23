@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from types import SimpleNamespace
 from pathlib import Path
 import subprocess
 import sys
@@ -218,6 +219,7 @@ The caller cannot distinguish invalid input from a supported value.
 @pytest.mark.parametrize(
     ("heading", "fields", "reason"),
     (
+        ("[HIGH] Style without anchor", "- Impact class: style\n- Material impact: cosmetic only.", "invalid_anchor"),
         ("[LOW] Low category", "- Changed anchor: {\"path\":\"review_cases.py\",\"line\":26}\n- Trigger evidence: {\"path\":\"review_cases.py\",\"line\":25,\"quote\":\"        return int(value)\"}\n- Impact class: runtime\n- Material impact: concrete.", "non_actionable_category"),
         ("[BOGUS] Invalid severity", "- Changed anchor: {\"path\":\"review_cases.py\",\"line\":26}\n- Trigger evidence: {\"path\":\"review_cases.py\",\"line\":25,\"quote\":\"        return int(value)\"}\n- Impact class: runtime\n- Material impact: concrete.", "invalid_severity"),
         ("[HIGH] Bad trigger", "- Changed anchor: {\"path\":\"review_cases.py\",\"line\":26}\n- Trigger evidence: {\"path\":\"review_cases.py\",\"line\":25,\"quote\":\"wrong\"}\n- Impact class: runtime\n- Material impact: concrete.", "invalid_trigger_evidence"),
@@ -277,6 +279,185 @@ def test_preexisting_canonical_symlink_is_never_followed(case_factory):
     result, canonical = case.run()
     assert result == canonicalize_review.CanonicalizationResult(False, 0, 0, 0, "none", "canonicalizer_error", ())
     assert canonical is None
+    assert target.read_text(encoding="utf-8") == "preserve"
+
+
+@pytest.mark.parametrize(
+    ("kind", "basis", "expected_basis"),
+    (
+        (
+            "measured",
+            '{"kind":"measured","path":"review_cases.py","line":20,"quote":"        return \\"completed 0/{}\\".format(total)"}',
+            '- Performance basis: {"kind":"measured","path":"review_cases.py","line":20,"quote":"        return \\\"completed 0/{}\\\".format(total)"}',
+        ),
+        (
+            "unbounded-amplification",
+            '{"kind":"unbounded-amplification","path":"review_cases.py","line":25,"quote":"        return int(value)"}',
+            '- Performance basis: {"kind":"unbounded-amplification","path":"review_cases.py","line":25,"quote":"        return int(value)"}',
+        ),
+    ),
+)
+def test_performance_basis_is_canonicalized_from_validated_fields(scoped_case, kind, basis, expected_basis):
+    """Dropping a validated performance basis would make the canonical finding unverifiable."""
+    result, canonical = scoped_case.run(f'''### New findings
+
+#### [MEDIUM] Measured performance regression
+- Changed anchor: {{"path":"review_cases.py","line":26}}
+- Trigger evidence: {{"path":"review_cases.py","line":25,"quote":"        return int(value)"}}
+- Impact class: performance
+- Material impact: The changed exception path is exercised for every invalid request.
+- Performance basis: {basis}
+''')
+    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", ())
+    assert expected_basis in canonical
+    assert canonical == f'''### New findings
+
+#### RVW-ce6c91192e93 [MEDIUM] Measured performance regression
+- Changed anchor: {{"path":"review_cases.py","line":26}}
+- Trigger evidence: {{"path":"review_cases.py","line":25,"quote":"        return int(value)"}}
+- Impact class: performance
+- Material impact: The changed exception path is exercised for every invalid request.
+{expected_basis}
+'''
+
+
+def test_deep_anchor_json_is_filtered_without_discarding_valid_neighbor(scoped_case):
+    """A JSON recursion limit must be a candidate filter, never a document-wide failure."""
+    nested = "[" * 1_500 + "]" * 1_500
+    result, canonical = scoped_case.run(f'''### New findings
+
+#### [HIGH] Deep malformed anchor
+- Changed anchor: {nested}
+- Trigger evidence: {{"path":"review_cases.py","line":25,"quote":"        return int(value)"}}
+- Impact class: runtime
+- Material impact: This must not escape candidate validation.
+
+#### [MEDIUM] Broad ValueError catch hides invalid configuration
+- Changed anchor: {{"path":"review_cases.py","line":26}}
+- Trigger evidence: {{"path":"review_cases.py","line":25,"quote":"        return int(value)"}}
+- Impact class: runtime
+- Material impact: An invalid numeric configuration is converted into a normal result.
+''')
+    assert result.document_valid is True
+    assert (result.accepted_count, result.filtered_count) == (1, 1)
+    assert result.candidate_reasons == (
+        CandidateReason(0, "New findings", "filtered", "invalid_anchor", "HIGH"),
+    )
+    assert "Deep malformed anchor" not in canonical
+    assert "RVW-61d4cd9ac260" in canonical
+
+
+def test_candidate_read_uses_a_bounded_os_read_after_a_size_race(case_factory, monkeypatch):
+    """Replacing bounded descriptor reads with Path.read_bytes would allocate an unbounded candidate."""
+    case = case_factory(b"x" * (canonicalize_review.MAX_CANDIDATE_BYTES + 1))
+    original_read = canonicalize_review.os.read
+    original_fstat = canonicalize_review.os.fstat
+    read_sizes: list[int] = []
+    monkeypatch.setattr(
+        canonicalize_review.os, "fstat",
+        lambda descriptor: SimpleNamespace(st_size=1, st_mode=original_fstat(descriptor).st_mode),
+    )
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        read_sizes.append(size)
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(canonicalize_review.os, "read", bounded_read)
+    result, canonical = case.run()
+    assert result.failure_reason == "candidate_oversize"
+    assert canonical is None
+    assert read_sizes and max(read_sizes) <= canonicalize_review.MAX_CANDIDATE_BYTES + 1
+
+
+def test_candidate_symlink_is_not_followed(case_factory):
+    """A candidate symlink must not become a privileged input alias."""
+    case = case_factory(None)
+    target = case.root / "model-output.md"
+    target.write_text("No blocking issues found.", encoding="utf-8")
+    case.candidate.symlink_to(target)
+    result, canonical = case.run()
+    assert result.failure_reason == "candidate_missing"
+    assert canonical is None
+
+
+def test_clean_canonical_output_round_trips_with_summary_prose(case_factory):
+    """Canonical clean output must remain a valid clean declaration when fed back as input."""
+    first, canonical = case_factory(b"No blocking issues found.").run()
+    second, round_trip = case_factory(canonical.encode("utf-8")).run()
+    assert first.document_valid is True
+    assert second.document_valid is True
+    assert round_trip == canonical
+
+
+def _cli_args(case: ReviewCase, github_output: Path | None = None) -> list[str]:
+    args = [
+        sys.executable, str(MODULE_PATH), "--reviewer", "claude",
+        "--candidate-file", str(case.candidate), "--canonical-file", str(case.canonical),
+        "--result-file", str(case.result), "--scope-manifest", str(case.request.scope_manifest),
+        "--selected-diff", str(case.request.selected_diff), "--repository-root", str(case.request.repository_root),
+        "--diff-mode", "full", "--expected-repository", "example/repo",
+    ]
+    if github_output is not None:
+        args.extend(("--github-output", str(github_output)))
+    return args
+
+
+def test_cli_writes_bounded_schema_result_scalar_outputs_and_metadata_only_logs(case_factory):
+    """CLI output must be consumable without leaking model prose into logs or result JSON."""
+    secret = "CLI-REJECTED-SECRET"
+    case = case_factory(f'''### New findings
+
+#### [HIGH] {secret}
+- Changed anchor: {{"path":"missing.py","line":9}}
+- Trigger evidence: {{"path":"review_cases.py","line":25,"quote":"        return int(value)"}}
+- Impact class: runtime
+- Material impact: Invalid state is reported as success.
+'''.encode("utf-8"))
+    github_output = case.root / "github-output.txt"
+    completed = subprocess.run(_cli_args(case, github_output), cwd=ACTION_DIR, capture_output=True, text=True)
+    assert completed.returncode == 0
+    result = json.loads(case.result.read_text(encoding="utf-8"))
+    assert set(result) == {"schema", "document_valid", "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity", "failure_reason", "candidate_reasons"}
+    assert len(case.result.read_bytes()) <= 131_072
+    assert secret not in case.result.read_text(encoding="utf-8")
+    assert secret not in completed.stdout
+    assert completed.stdout == "review-canonicalization: document_valid=true accepted=0 filtered=1 normalized=0 filtered_max=HIGH failure_reason=\ncandidate[0]: section=New findings outcome=filtered reason=invalid_anchor claimed_severity=HIGH\n"
+    assert github_output.read_text(encoding="utf-8") == "document_valid=true\naccepted_count=0\nfiltered_count=1\nnormalized_count=0\nfiltered_max_severity=HIGH\nfailure_reason=\n"
+    assert case.canonical.read_text(encoding="utf-8") == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+@pytest.mark.parametrize("destination", ("result", "github"))
+def test_cli_refuses_symlink_result_and_github_output_destinations(case_factory, destination):
+    """Atomic CLI output failures must be nonzero and never follow a symlink."""
+    case = case_factory(b"No blocking issues found.")
+    target = case.root / f"{destination}-target.txt"
+    target.write_text("preserve", encoding="utf-8")
+    if destination == "result":
+        case.result.symlink_to(target)
+        command = _cli_args(case)
+    else:
+        github_output = case.root / "github-output.txt"
+        github_output.symlink_to(target)
+        command = _cli_args(case, github_output)
+    completed = subprocess.run(command, cwd=ACTION_DIR, capture_output=True, text=True)
+    assert completed.returncode != 0
+    assert target.read_text(encoding="utf-8") == "preserve"
+
+
+def test_cli_canonical_symlink_becomes_closed_canonicalizer_error(case_factory):
+    """Canonical write refusal is a valid failure result rather than a partial output success."""
+    case = case_factory(b"No blocking issues found.")
+    target = case.root / "canonical-target.md"
+    target.write_text("preserve", encoding="utf-8")
+    case.canonical.symlink_to(target)
+    completed = subprocess.run(_cli_args(case), cwd=ACTION_DIR, capture_output=True, text=True)
+    assert completed.returncode == 0
+    assert json.loads(case.result.read_text(encoding="utf-8")) == {
+        "schema": 1, "document_valid": False, "accepted_count": 0,
+        "filtered_count": 0, "normalized_count": 0, "filtered_max_severity": "none",
+        "failure_reason": "canonicalizer_error", "candidate_reasons": [],
+    }
+    assert not case.canonical.exists()
     assert target.read_text(encoding="utf-8") == "preserve"
 
 

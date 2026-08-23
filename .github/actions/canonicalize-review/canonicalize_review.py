@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 from typing import Literal
@@ -116,6 +117,7 @@ class _Finding:
     impact_class: str
     material_impact: str
     prose: tuple[str, ...]
+    performance_basis: tuple[str, TriggerEvidence] | None
 
 
 def normalize_title(title: str) -> str:
@@ -142,7 +144,7 @@ def _strict_object(value: str, keys: set[str]) -> dict[str, object] | None:
 
     try:
         parsed = json.loads(value, object_pairs_hook=reject_duplicates)
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError, RecursionError):
         return None
     return parsed if isinstance(parsed, dict) and set(parsed) == keys else None
 
@@ -206,7 +208,7 @@ def _parse_document(text: str) -> dict[str, list[_Block]]:
         heading_positions = [position for position, line in enumerate(contents) if line.startswith("####")]
         if not heading_positions:
             meaningful = [line for line in contents if line.strip()]
-            if section == "New findings" and meaningful != ["None"]:
+            if section == "New findings" and (not meaningful or meaningful[0] != "None"):
                 raise ValueError("ambiguous")
             continue
         if section == "New findings" and any(line.strip() == "None" for line in contents):
@@ -263,6 +265,7 @@ def _validate_new(block: _Block, scope: object) -> tuple[_Finding | None, str | 
     material_text = " ".join((material, *extra_prose)).strip()
     if not material or PROOF_DEFICIT.search(material_text):
         return None, "missing_material_impact"
+    performance_basis: tuple[str, TriggerEvidence] | None = None
     if impact == "performance":
         bases = _field_values(block.lines, "Performance basis")
         if len(bases) != 1:
@@ -277,7 +280,10 @@ def _validate_new(block: _Block, scope: object) -> tuple[_Finding | None, str | 
             return None, "unsupported_performance_basis"
         if basis["kind"] == "measured" and re.search(r"[0-9]", basis["quote"]) is None:
             return None, "unsupported_performance_basis"
-    return _Finding(block.severity, block.title, anchor, evidence, impact, material, extra_prose), None
+        performance_basis = (basis["kind"], basis_evidence)
+    return _Finding(
+        block.severity, block.title, anchor, evidence, impact, material, extra_prose, performance_basis
+    ), None
 
 
 def _json_line(value: dict[str, object]) -> str:
@@ -305,6 +311,11 @@ def _render_new(reviewer: str, findings: list[_Finding]) -> str:
             f"- Impact class: {finding.impact_class}",
             f"- Material impact: {finding.material_impact}",
         ))
+        if finding.performance_basis is not None:
+            kind, basis = finding.performance_basis
+            lines.append("- Performance basis: " + _json_line({
+                "kind": kind, "path": basis.path, "line": basis.line, "quote": basis.quote,
+            }))
         lines.extend(finding.prose)
     return "\n".join(lines) + "\n"
 
@@ -316,60 +327,78 @@ def _remove_canonical(path: Path) -> None:
         pass
 
 
+def _read_candidate(path: Path) -> tuple[str, bytes | None]:
+    """Read at most one byte beyond the candidate ceiling from one regular descriptor."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except (FileNotFoundError, IsADirectoryError, OSError):
+        return "candidate_missing", None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return "candidate_missing", None
+        if os.fstat(descriptor).st_size > MAX_CANDIDATE_BYTES:
+            return "candidate_oversize", None
+        payload = os.read(descriptor, MAX_CANDIDATE_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) > MAX_CANDIDATE_BYTES:
+        return "candidate_oversize", None
+    return "", payload
+
+
 def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
     """Validate an untrusted candidate and create canonical Markdown only on success."""
     try:
-        if not request.candidate_file.is_file():
-            result = _hard("candidate_missing")
+        candidate_reason, payload = _read_candidate(request.candidate_file)
+        if candidate_reason:
+            result = _hard(candidate_reason)
         else:
-            payload = request.candidate_file.read_bytes()
-            if len(payload) > MAX_CANDIDATE_BYTES:
-                result = _hard("candidate_oversize")
+            assert payload is not None
+            try:
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                result = _hard("invalid_utf8")
             else:
                 try:
-                    text = payload.decode("utf-8")
-                except UnicodeDecodeError:
-                    result = _hard("invalid_utf8")
+                    sections = _parse_document(text)
+                    scope = load_review_scope(
+                        request.repository_root, request.scope_manifest, request.selected_diff,
+                        diff_mode=request.diff_mode, previous_sha=request.previous_sha,
+                        expected_repository=request.expected_repository,
+                    )
+                except ScopeValidationError:
+                    result = _hard("scope_invalid")
+                except ValueError:
+                    result = _hard("ambiguous_document")
                 else:
-                    try:
-                        sections = _parse_document(text)
-                        scope = load_review_scope(
-                            request.repository_root, request.scope_manifest, request.selected_diff,
-                            diff_mode=request.diff_mode, previous_sha=request.previous_sha,
-                            expected_repository=request.expected_repository,
-                        )
-                    except ScopeValidationError:
-                        result = _hard("scope_invalid")
-                    except ValueError:
-                        result = _hard("ambiguous_document")
-                    else:
-                        accepted: list[_Finding] = []
-                        reasons: list[CandidateReason] = []
-                        filtered_severities: list[str] = []
-                        filtered = normalized = 0
-                        for block in sections["New findings"]:
-                            finding, reason = _validate_new(block, scope)
-                            if reason is not None:
-                                filtered += 1
-                                filtered_severities.append(block.severity)
-                                reasons.append(_claim_reason(block, "filtered", reason))
-                            else:
-                                assert finding is not None
-                                accepted.append(finding)
-                        # Task 2 recognizes carryover grammar, but authenticated prior binding is Task 3.
-                        for section in ("Still open", "Resolved", "Retracted"):
-                            for block in sections[section]:
-                                normalized += 1
-                                reasons.append(_claim_reason(block, "normalized", "unknown_prior_id"))
-                        rank = {"none": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
-                        maximum = max(filtered_severities, key=lambda item: rank[item], default="none")
-                        result = CanonicalizationResult(
-                            True, len(accepted), filtered, normalized, maximum, "", tuple(reasons)
-                        )
-                        _write_atomic(
-                            request.canonical_file,
-                            _render_new(request.reviewer, accepted).encode("utf-8"),
-                        )
+                    accepted: list[_Finding] = []
+                    reasons: list[CandidateReason] = []
+                    filtered_severities: list[str] = []
+                    filtered = normalized = 0
+                    for block in sections["New findings"]:
+                        finding, reason = _validate_new(block, scope)
+                        if reason is not None:
+                            filtered += 1
+                            filtered_severities.append(block.severity)
+                            reasons.append(_claim_reason(block, "filtered", reason))
+                        else:
+                            assert finding is not None
+                            accepted.append(finding)
+                    # Task 2 recognizes carryover grammar, but authenticated prior binding is Task 3.
+                    for section in ("Still open", "Resolved", "Retracted"):
+                        for block in sections[section]:
+                            normalized += 1
+                            reasons.append(_claim_reason(block, "normalized", "unknown_prior_id"))
+                    rank = {"none": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+                    maximum = max(filtered_severities, key=lambda item: rank[item], default="none")
+                    result = CanonicalizationResult(
+                        True, len(accepted), filtered, normalized, maximum, "", tuple(reasons)
+                    )
+                    _write_atomic(
+                        request.canonical_file,
+                        _render_new(request.reviewer, accepted).encode("utf-8"),
+                    )
     except (OSError, TypeError, AttributeError):
         result = _hard("canonicalizer_error")
     if not result.document_valid:
