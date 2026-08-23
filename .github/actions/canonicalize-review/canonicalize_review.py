@@ -31,6 +31,7 @@ SOFT_REASONS = frozenset({
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
 IMPACT_CLASSES = frozenset({"runtime", "security", "data-integrity", "user-visible", "performance"})
 MAX_CANDIDATE_BYTES = 60_000
+MAX_PREVIOUS_CANONICAL_BYTES = 65_536
 MAX_CANDIDATE_BLOCKS = 512
 MAX_SAFE_INTEGER = (1 << 53) - 1
 PROOF_DEFICIT = re.compile(
@@ -511,10 +512,10 @@ def _read_previous(path: Path) -> str:
         raise ScopeValidationError("previous review is unavailable") from error
     try:
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CANDIDATE_BYTES:
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PREVIOUS_CANONICAL_BYTES:
             raise ScopeValidationError("previous review is unsafe")
         chunks: list[bytes] = []
-        remaining = MAX_CANDIDATE_BYTES + 1
+        remaining = MAX_PREVIOUS_CANONICAL_BYTES + 1
         while remaining:
             chunk = os.read(descriptor, remaining)
             if not chunk:

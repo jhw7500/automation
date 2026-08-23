@@ -1026,7 +1026,100 @@ def test_previous_review_legal_short_reads_preserve_valid_canonical_input(review
     )
     assert result.document_valid is True
     assert "### Resolved" in canonical
-    assert requested and max(requested) <= canonicalize_review.MAX_CANDIDATE_BYTES + 1
+    assert requested and max(requested) <= canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES + 1
+
+
+def test_previous_reader_accepts_exact_canonical_ceiling_across_short_reads(tmp_path, monkeypatch):
+    assert canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES == 65_536
+    payload = b"x" * canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES
+    previous = tmp_path / "previous.md"
+    previous.write_bytes(payload)
+    original_read = canonicalize_review.os.read
+    requested: list[int] = []
+    retained: list[int] = []
+
+    def short_reads(descriptor: int, size: int) -> bytes:
+        requested.append(size)
+        chunk = original_read(descriptor, min(size, 4_096))
+        retained.append(len(chunk))
+        return chunk
+
+    monkeypatch.setattr(canonicalize_review.os, "read", short_reads)
+    assert canonicalize_review._read_previous(previous).encode("utf-8") == payload
+    assert max(requested) <= canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES + 1
+    assert sum(retained) == canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES
+
+
+def test_previous_reader_rejects_one_byte_over_ceiling_after_size_race(tmp_path, monkeypatch):
+    assert canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES == 65_536
+    payload = b"x" * (canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES + 1)
+    previous = tmp_path / "previous.md"
+    previous.write_bytes(payload)
+    original_fstat = canonicalize_review.os.fstat
+    original_read = canonicalize_review.os.read
+    requested: list[int] = []
+    retained: list[int] = []
+    monkeypatch.setattr(
+        canonicalize_review.os,
+        "fstat",
+        lambda descriptor: SimpleNamespace(
+            st_size=1, st_mode=original_fstat(descriptor).st_mode,
+        ),
+    )
+
+    def short_then_remaining(descriptor: int, size: int) -> bytes:
+        requested.append(size)
+        chunk = original_read(descriptor, 1 if len(requested) == 1 else size)
+        retained.append(len(chunk))
+        return chunk
+
+    monkeypatch.setattr(canonicalize_review.os, "read", short_then_remaining)
+    with pytest.raises(review_scope.ScopeValidationError):
+        canonicalize_review._read_previous(previous)
+    assert len(requested) == 2
+    assert max(requested) <= canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES + 1
+    assert sum(retained) == canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES + 1
+
+
+def test_max_candidate_renderer_output_is_valid_authenticated_previous_input(review_quality_repo):
+    assert canonicalize_review.MAX_CANDIDATE_BYTES == 60_000
+    assert canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES == 65_536
+    blocks = []
+    for index in range(200):
+        blocks.append(f'''#### [HIGH] Finding {index:03d}
+- Changed anchor: {{"path":"review_cases.py","line":26}}
+- Trigger evidence: {{"path":"review_cases.py","line":25,"quote":"        return int(value)"}}
+- Impact class: runtime
+- Material impact: Concrete runtime impact {"PADDING" if index == 0 else "confirmed"}.
+''')
+    candidate = "### New findings\n\n" + "\n".join(blocks)
+    padding = canonicalize_review.MAX_CANDIDATE_BYTES - len(candidate.encode("utf-8"))
+    assert padding > 0
+    candidate = candidate.replace("PADDING", "x" * (len("PADDING") + padding), 1)
+    candidate_bytes = candidate.encode("utf-8")
+    assert len(candidate_bytes) == canonicalize_review.MAX_CANDIDATE_BYTES
+
+    initial, previous = review_quality_repo._run(review_quality_repo._request(
+        candidate, reviewer="gemini", head=review_quality_repo.review_head,
+    ))
+    previous_bytes = previous.encode("utf-8")
+    assert initial == canonicalize_review.CanonicalizationResult(True, 200, 0, 0, "none", "", ())
+    assert len(previous_bytes) == canonicalize_review.MAX_CANDIDATE_BYTES + (17 * 200)
+    assert (
+        canonicalize_review.MAX_CANDIDATE_BYTES
+        < len(previous_bytes)
+        <= canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES
+    )
+
+    request = review_quality_repo._request(
+        "### New findings\n\nNone\n", reviewer="gemini", head=review_quality_repo.review_head,
+        previous_sha=review_quality_repo.review_head, previous_review=previous,
+    )
+    assert request.previous_review_file is not None
+    assert request.previous_review_file.read_bytes() == previous_bytes
+    followup, canonical = review_quality_repo._run(request)
+    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
 
 
 def test_candidate_reason_indexes_follow_physical_source_block_order(review_quality_repo):
