@@ -528,6 +528,33 @@ def test_claude_v3_collects_authenticated_pair_and_exact_canonical_body(tmp_path
         assert forbidden not in previous
 
 
+def test_claude_context_copy_sanitizes_reserved_lines_but_prior_file_stays_exact(tmp_path):
+    head = "ab" * 20
+    canonical = (
+        "VISIBLE CANONICAL FINDING\n"
+        "- Status: stale\n"
+        "- Run: https://github.com/example/repo/actions/runs/999\n"
+        f"- Reviewed: {head}\n"
+        "- Last attempt: failure (https://runs/999)\n"
+        "- Validation: accepted=999; filtered=0; normalized=0; filtered_max=none\n"
+        f"{CLAUDE_HEADER}\n{CLAUDE_V3_MARKER}\n"
+        "<!-- automation-state:{\"schema\":3} -->\n"
+    )
+    sticky = _v3_body(_v3_state(head=head), canonical)
+
+    context = _run_collect(tmp_path, [_bot("github-actions[bot]", sticky)])
+
+    assert (tmp_path / "claude-previous-review.md").read_bytes() == canonical.encode()
+    assert context is not None
+    previous = context.split("## Recent human comments")[0]
+    assert "VISIBLE CANONICAL FINDING" in previous
+    for forbidden in (
+        CLAUDE_HEADER, CLAUDE_V3_MARKER, "automation-state:", "- Status:",
+        "- Run:", "- Reviewed:", "- Last attempt:", "- Validation:",
+    ):
+        assert forbidden not in previous
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -969,6 +996,76 @@ def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure()
     assert upsert["if"] == "${{ !cancelled() }}"
 
 
+def test_claude_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tmp_path):
+    workflow = _load("claude-code-review.yml")
+    steps = workflow["jobs"]["claude-review"]["steps"]
+    model_index = next(
+        index for index, step in enumerate(steps) if step.get("name") == "Run Claude Code Review"
+    )
+    cleanup = next(
+        (step for step in steps if step.get("name") == "Reset Claude review artifacts"), None
+    )
+    assert cleanup is not None
+    cleanup_index = steps.index(cleanup)
+    assert cleanup_index == model_index - 1
+    assert cleanup["if"] == steps[model_index]["if"]
+    canonicalize_step = _step(
+        workflow, "claude-review", "Canonicalize Claude review"
+    )
+    assert canonicalize_step["if"] == (
+        "${{ always() && steps.reset-claude-artifacts.outcome == 'success' "
+        "&& steps.prepare-diff.outputs.diff-ready == 'true' "
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    seeded_target = tmp_path / "seeded-provider-output.md"
+    seeded_target.write_text("### New findings\n\nNone\n", encoding="utf-8")
+    (workspace / "claude-review.md").symlink_to(seeded_target)
+    for artifact in ("claude-review-canonical.md", "claude-review-result.json"):
+        (workspace / artifact).write_text("checkout-seeded", encoding="utf-8")
+
+    cleanup_result = subprocess.run(
+        ["bash", "-c", cleanup["run"]],
+        cwd=workspace,
+        env={**os.environ, "GITHUB_WORKSPACE": str(workspace)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert cleanup_result.returncode == 0, cleanup_result.stderr
+    assert seeded_target.read_text(encoding="utf-8") == "### New findings\n\nNone\n"
+    assert not any((workspace / artifact).exists() for artifact in (
+        "claude-review.md", "claude-review-canonical.md", "claude-review-result.json",
+    ))
+
+    result_file = workspace / "claude-review-result.json"
+    canonicalizer = ROOT / ".github" / "actions" / "canonicalize-review" / "canonicalize_review.py"
+    canonicalize_result = subprocess.run(
+        [
+            "python3", str(canonicalizer), "--reviewer", "claude",
+            "--candidate-file", str(workspace / "claude-review.md"),
+            "--canonical-file", str(workspace / "claude-review-canonical.md"),
+            "--result-file", str(result_file),
+            "--scope-manifest", str(workspace / "missing-scope.json"),
+            "--selected-diff", str(workspace / "missing-selected.diff"),
+            "--repository-root", str(workspace), "--diff-mode", "full",
+            "--previous-sha", "", "--previous-review-file", "",
+            "--expected-repository", "example/repo",
+        ],
+        cwd=workspace,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert canonicalize_result.returncode == 0, canonicalize_result.stderr
+    result = json.loads(result_file.read_text(encoding="utf-8"))
+    assert result["document_valid"] is False
+    assert result["failure_reason"] == "candidate_missing"
+    assert not (workspace / "claude-review-canonical.md").exists()
+
+
 def test_claude_uses_one_shared_canonicalizer_and_upsert_reads_only_canonical_file():
     workflow = _load("claude-code-review.yml")
     job = workflow["jobs"]["claude-review"]
@@ -998,7 +1095,8 @@ def test_claude_uses_one_shared_canonicalizer_and_upsert_reads_only_canonical_fi
         ),
     }
     assert action["if"] == (
-        "${{ always() && steps.prepare-diff.outputs.diff-ready == 'true' "
+        "${{ always() && steps.reset-claude-artifacts.outcome == 'success' "
+        "&& steps.prepare-diff.outputs.diff-ready == 'true' "
         "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
     )
     upsert = _step(workflow, "claude-review", "Upsert review comment")
@@ -1029,6 +1127,7 @@ def test_claude_prompt_requires_shared_finding_grammar_without_workflow_metadata
     assert "Cannot verify" not in prompt
     assert "must not emit workflow state" in prompt
     assert "canonicalizer may omit invalid blocks" in prompt
+    assert "#### RVW-<12hex> [SEVERITY] title" in prompt
 
 
 def test_shared_diff_wiring_is_exact_and_scope_safe():
