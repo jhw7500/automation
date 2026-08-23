@@ -342,6 +342,8 @@ def _safe_line(value: object) -> bool:
 
 
 def _line_at(text: str, line: int) -> str | None:
+    if not text:
+        return None
     segments = text.split("\n")
     terminated = text.endswith("\n")
     if terminated:

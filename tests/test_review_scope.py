@@ -222,3 +222,26 @@ def test_trigger_rejects_symlink_missing_non_utf8_and_quote_mismatch(scope_attac
     assert not scope.validate_trigger(TriggerEvidence("missing.py", 1, "x"))
     assert not scope.validate_trigger(TriggerEvidence("binary.dat", 1, "x"))
     assert not scope.validate_trigger(TriggerEvidence("src/runner.py", 3, "return value + 1"))
+
+
+def test_trigger_rejects_line_one_of_an_empty_tracked_blob(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init")
+    (root / "empty.py").write_text("was present\n", encoding="utf-8")
+    merge_base = _commit(root, "base")
+    (root / "empty.py").write_bytes(b"")
+    head = _commit(root, "empty tracked blob")
+    manifest = _manifest(root, merge_base, head, _scope_files(root, merge_base, head))
+    selected_diff = root / "review-full.diff"
+    selected_diff.write_bytes(
+        subprocess.run(
+            ["git", "diff", "--no-ext-diff", "--no-textconv", "-U0", f"{merge_base}..{head}"],
+            cwd=root, check=True, capture_output=True,
+        ).stdout
+    )
+    scope = load_review_scope(
+        root, manifest, selected_diff,
+        diff_mode="full", previous_sha="", expected_repository="example/repo",
+    )
+    assert not scope.validate_trigger(TriggerEvidence("empty.py", 1, ""))
