@@ -1090,9 +1090,17 @@ If `rtk actionlint --version` is unavailable, install actionlint 1.7.12 using th
 
 - [ ] **Step 4: Verify proposed v1.46 commit content before tagging**
 
-Run: `rtk python3 -m scripts.verify_workflow_release --automation . --ref v1.46 --expected-commit HEAD --commit-only`
+Resolve the proposed commit first and copy the exact 40-character output. Replace the placeholder
+in the second command with that literal output before running it; do not execute the placeholder
+text itself.
 
-Expected: `PASS: v1.46 commit content is secure at` followed by the exact HEAD SHA.
+```bash
+rtk git rev-parse HEAD
+rtk python3 -m scripts.verify_workflow_release --automation . --ref v1.46 --expected-commit <40-character-HEAD-SHA> --commit-only
+```
+
+Expected: `PASS: v1.46 commit content is secure at` followed by the copied exact HEAD SHA. Symbolic
+`HEAD` is intentionally rejected by the verifier because `--expected-commit` is a raw-OID pin.
 
 - [ ] **Step 5: Audit the final diff and workspace ownership**
 
@@ -1146,15 +1154,21 @@ Expected: the parser authenticates schema 3 for Claude/Gemini, preserves OpenCod
 
 - [ ] **Step 2: Create and verify the immutable annotated release**
 
-From updated `main`, rerun Task 8 Steps 1-5, then create annotated tag `v1.46`, push the tag, and verify both local and remote identities:
+From updated `main`, rerun Task 8 Steps 1-5. Resolve merged `main` and copy the exact 40-character
+output. Replace the placeholder below with that literal output before running the verification
+command; do not execute the placeholder text itself. Then create annotated tag `v1.46`, push the
+tag, and verify both local and remote identities in this order:
 
 ```bash
+rtk git rev-parse main
 rtk git tag -a v1.46 -m "automation workflows v1.46"
 rtk git push origin refs/tags/v1.46
-rtk python3 -m scripts.verify_workflow_release --automation . --ref v1.46 --expected-commit main --remote origin
+rtk python3 -m scripts.verify_workflow_release --automation . --ref v1.46 --expected-commit <40-character-merged-main-SHA> --remote origin
 ```
 
-Expected: local annotated tag, peeled commit, remote tag, and authenticated release content all resolve to the same merged main commit. Never move or recreate the tag.
+Expected: local annotated tag, peeled commit, remote tag, and authenticated release content all
+resolve to the copied exact merged-main commit. Symbolic `main` is intentionally rejected by the
+raw-OID pin contract. Never move or recreate the tag.
 
 - [ ] **Step 3: Advance the fleet default only after tag verification**
 
