@@ -127,6 +127,13 @@ class _PriorFinding:
     finding: _Finding
 
 
+@dataclass(frozen=True)
+class _PriorHeading:
+    finding_id: str
+    severity: Literal["MEDIUM", "HIGH", "CRITICAL"]
+    title: str
+
+
 def normalize_title(title: str) -> str:
     return " ".join(title.split()).casefold()
 
@@ -191,6 +198,7 @@ def _parse_document(text: str) -> dict[str, list[_Block]]:
         return {name: [] for name in SECTION_NAMES}
     lines = text.splitlines()
     sections: dict[str, list[str]] = {}
+    section_order: list[str] = []
     active: str | None = None
     for line in lines:
         if line.startswith("####"):
@@ -204,13 +212,14 @@ def _parse_document(text: str) -> dict[str, list[_Block]]:
             if active in sections:
                 raise ValueError("ambiguous")
             sections[active] = []
+            section_order.append(active)
         elif active is not None:
             sections[active].append(line)
     if "New findings" not in sections:
         raise ValueError("ambiguous")
     parsed: dict[str, list[_Block]] = {name: [] for name in SECTION_NAMES}
     index = 0
-    for section in SECTION_NAMES:
+    for section in section_order:
         contents = sections.get(section, [])
         heading_positions = [position for position, line in enumerate(contents) if line.startswith("####")]
         if not heading_positions:
@@ -330,25 +339,33 @@ def _render_active_section(name: str, findings: list[_PriorFinding]) -> str:
     return "\n".join(lines)
 
 
-def _render_resolved_section(resolved: list[tuple[_PriorFinding, SourceAnchor, str]]) -> str:
+def _prior_severity(prior: _PriorFinding | _PriorHeading) -> str:
+    return prior.finding.severity if isinstance(prior, _PriorFinding) else prior.severity
+
+
+def _prior_title(prior: _PriorFinding | _PriorHeading) -> str:
+    return prior.finding.title if isinstance(prior, _PriorFinding) else prior.title
+
+
+def _render_resolved_section(resolved: list[tuple[_PriorFinding | _PriorHeading, SourceAnchor, str]]) -> str:
     lines = ["### Resolved", ""]
     for position, (prior, anchor, resolution) in enumerate(resolved):
         if position:
             lines.append("")
         lines.extend((
-            f"#### {prior.finding_id} [{prior.finding.severity}] {prior.finding.title}",
+            f"#### {prior.finding_id} [{_prior_severity(prior)}] {_prior_title(prior)}",
             "- Fix anchor: " + _json_line({"path": anchor.path, "line": anchor.line}),
             f"- Resolution: {resolution}",
         ))
     return "\n".join(lines)
 
 
-def _render_retracted_section(retracted: list[tuple[_PriorFinding, tuple[TriggerEvidence, ...], str]]) -> str:
+def _render_retracted_section(retracted: list[tuple[_PriorFinding | _PriorHeading, tuple[TriggerEvidence, ...], str]]) -> str:
     lines = ["### Retracted", ""]
     for position, (prior, evidence, reason) in enumerate(retracted):
         if position:
             lines.append("")
-        lines.append(f"#### {prior.finding_id} [{prior.finding.severity}] {prior.finding.title}")
+        lines.append(f"#### {prior.finding_id} [{_prior_severity(prior)}] {_prior_title(prior)}")
         lines.extend("- Trigger evidence: " + _json_line({
             "path": item.path, "line": item.line, "quote": item.quote,
         }) for item in evidence)
@@ -358,8 +375,8 @@ def _render_retracted_section(retracted: list[tuple[_PriorFinding, tuple[Trigger
 
 def _render_document(
     new: list[_PriorFinding], still_open: list[_PriorFinding],
-    resolved: list[tuple[_PriorFinding, SourceAnchor, str]],
-    retracted: list[tuple[_PriorFinding, tuple[TriggerEvidence, ...], str]],
+    resolved: list[tuple[_PriorFinding | _PriorHeading, SourceAnchor, str]],
+    retracted: list[tuple[_PriorFinding | _PriorHeading, tuple[TriggerEvidence, ...], str]],
 ) -> str:
     sections = [_render_active_section("New findings", new)]
     if still_open:
@@ -389,7 +406,8 @@ def _trim_section_padding(lines: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _prior_heading(block: _Block) -> None:
-    if block.finding_id is None or block.severity == "none" or block.low_severity:
+    if (block.finding_id is None or block.severity == "none" or block.low_severity
+            or WORKFLOW_OWNED.search(block.title)):
         raise ScopeValidationError("previous canonical heading is invalid")
 
 
@@ -404,7 +422,7 @@ def _parse_prior_active(block: _Block, reviewer: str) -> _PriorFinding:
     impact = impact_values[0] if len(impact_values) == 1 else ""
     material = material_values[0].strip() if len(material_values) == 1 else ""
     if (anchor is None or not evidence or any(item is None for item in evidence)
-            or impact not in IMPACT_CLASSES or not material):
+            or impact not in IMPACT_CLASSES or not material or WORKFLOW_OWNED.search(material)):
         raise ScopeValidationError("previous canonical finding is invalid")
     basis: tuple[str, TriggerEvidence] | None = None
     bases = _field_values(block.lines, "Performance basis")
@@ -420,6 +438,8 @@ def _parse_prior_active(block: _Block, reviewer: str) -> _PriorFinding:
     elif bases:
         raise ScopeValidationError("previous canonical finding is invalid")
     prose = tuple(line for line in block.lines if line and not line.startswith("- "))
+    if any(WORKFLOW_OWNED.search(line) for line in prose):
+        raise ScopeValidationError("previous canonical prose is workflow-owned")
     finding = _Finding(block.severity, block.title, anchor, tuple(evidence), impact, material, prose, basis)
     assert block.finding_id is not None
     if block.finding_id != stable_finding_id(reviewer, anchor, block.severity, block.title):
@@ -429,7 +449,9 @@ def _parse_prior_active(block: _Block, reviewer: str) -> _PriorFinding:
     return _PriorFinding(block.finding_id, finding)
 
 
-def _validate_prior_closed(block: _Block) -> None:
+def _validate_prior_closed(
+    block: _Block,
+) -> tuple[_PriorHeading, SourceAnchor | tuple[TriggerEvidence, ...], str]:
     _prior_heading(block)
     assert block.finding_id is not None
     if block.section == "Resolved":
@@ -437,7 +459,7 @@ def _validate_prior_closed(block: _Block) -> None:
         resolutions = _field_values(block.lines, "Resolution")
         anchor = _anchor(anchors[0]) if len(anchors) == 1 else None
         resolution = resolutions[0].strip() if len(resolutions) == 1 else ""
-        expected = () if anchor is None or not resolution else (
+        expected = () if anchor is None or not resolution or WORKFLOW_OWNED.search(resolution) else (
             "- Fix anchor: " + _json_line({"path": anchor.path, "line": anchor.line}),
             f"- Resolution: {resolution}",
         )
@@ -445,12 +467,18 @@ def _validate_prior_closed(block: _Block) -> None:
         triggers = tuple(_trigger(value) for value in _field_values(block.lines, "Trigger evidence"))
         reasons = _field_values(block.lines, "Reason")
         reason = reasons[0].strip() if len(reasons) == 1 else ""
-        expected = () if not triggers or any(item is None for item in triggers) or not reason else tuple(
+        expected = () if (not triggers or any(item is None for item in triggers) or not reason
+                          or WORKFLOW_OWNED.search(reason)) else tuple(
             "- Trigger evidence: " + _json_line({"path": item.path, "line": item.line, "quote": item.quote})
             for item in triggers if item is not None
         ) + (f"- Reason: {reason}",)
     if not expected or _trim_section_padding(block.lines) != expected:
         raise ScopeValidationError("previous canonical closed finding is invalid")
+    heading = _PriorHeading(block.finding_id, block.severity, block.title)
+    if block.section == "Resolved":
+        assert anchor is not None
+        return heading, anchor, resolution
+    return heading, tuple(item for item in triggers if item is not None), reason
 
 
 def _read_previous(path: Path) -> str:
@@ -463,13 +491,20 @@ def _read_previous(path: Path) -> str:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CANDIDATE_BYTES:
             raise ScopeValidationError("previous review is unsafe")
-        payload = os.read(descriptor, MAX_CANDIDATE_BYTES + 1)
-        if len(payload) > MAX_CANDIDATE_BYTES or os.read(descriptor, 1):
+        chunks: list[bytes] = []
+        remaining = MAX_CANDIDATE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if remaining == 0:
             raise ScopeValidationError("previous review is oversized")
     finally:
         os.close(descriptor)
     try:
-        return payload.decode("utf-8")
+        return b"".join(chunks).decode("utf-8")
     except UnicodeDecodeError as error:
         raise ScopeValidationError("previous review is not UTF-8") from error
 
@@ -526,6 +561,10 @@ def _load_prior_active(request: CanonicalizationRequest) -> dict[str, _PriorFind
         raise ScopeValidationError("previous canonical document is invalid") from error
     _validate_previous_layout(text, sections)
     prior: dict[str, _PriorFinding] = {}
+    prior_new: list[_PriorFinding] = []
+    prior_still_open: list[_PriorFinding] = []
+    prior_resolved: list[tuple[_PriorHeading, SourceAnchor, str]] = []
+    prior_retracted: list[tuple[_PriorHeading, tuple[TriggerEvidence, ...], str]] = []
     seen: set[str] = set()
     for section in SECTION_NAMES:
         for block in sections[section]:
@@ -535,9 +574,22 @@ def _load_prior_active(request: CanonicalizationRequest) -> dict[str, _PriorFind
                 raise ScopeValidationError("duplicate previous canonical identity")
             seen.add(block.finding_id)
             if section in {"New findings", "Still open"}:
-                prior[block.finding_id] = _parse_prior_active(block, request.reviewer)
+                finding = _parse_prior_active(block, request.reviewer)
+                prior[block.finding_id] = finding
+                if section == "New findings":
+                    prior_new.append(finding)
+                else:
+                    prior_still_open.append(finding)
             else:
-                _validate_prior_closed(block)
+                heading, value, text_value = _validate_prior_closed(block)
+                if section == "Resolved":
+                    assert isinstance(value, SourceAnchor)
+                    prior_resolved.append((heading, value, text_value))
+                else:
+                    assert isinstance(value, tuple)
+                    prior_retracted.append((heading, value, text_value))
+    if text != _render_document(prior_new, prior_still_open, prior_resolved, prior_retracted):
+        raise ScopeValidationError("previous canonical bytes are not renderer output")
     return prior
 
 
@@ -588,7 +640,8 @@ def _validate_resolved(block: _Block, scope: object) -> tuple[SourceAnchor | Non
     resolutions = _field_values(block.lines, "Resolution")
     anchor = _anchor(anchors[0]) if len(anchors) == 1 else None
     resolution = resolutions[0].strip() if len(resolutions) == 1 else ""
-    if anchor is None or not scope.validate_fix_anchor(anchor) or not resolution:
+    if (anchor is None or not scope.validate_fix_anchor(anchor) or not resolution
+            or WORKFLOW_OWNED.search(resolution)):
         return None, None
     if _trim_section_padding(block.lines) != (
         "- Fix anchor: " + _json_line({"path": anchor.path, "line": anchor.line}),
@@ -603,7 +656,7 @@ def _validate_retracted(block: _Block, scope: object) -> tuple[tuple[TriggerEvid
     reasons = _field_values(block.lines, "Reason")
     reason = reasons[0].strip() if len(reasons) == 1 else ""
     if (not evidence or any(item is None or not scope.validate_trigger(item) for item in evidence)
-            or not reason):
+            or not reason or WORKFLOW_OWNED.search(reason)):
         return None, None
     parsed = tuple(item for item in evidence if item is not None)
     expected = tuple(

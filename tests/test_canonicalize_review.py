@@ -784,3 +784,237 @@ def test_malformed_previous_canonical_file_is_scope_invalid(review_quality_repo)
     assert result.document_valid is False
     assert result.failure_reason == "scope_invalid"
     assert canonical == ""
+
+
+def valid_still_open_candidate() -> str:
+    return '''### New findings
+None
+
+### Still open
+#### RVW-3253866a28c6 [MEDIUM] ignored candidate title
+- Changed anchor: {"path":"review_cases.py","line":20}
+- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"rejected\\""}
+- Impact class: user-visible
+- Material impact: The rejected plan still affects completion messaging.
+'''
+
+
+def test_known_prior_still_open_renders_prior_identity_and_exact_markdown(review_quality_repo):
+    result, canonical = review_quality_repo.run_delta(
+        accepted_rejected_plan_review(), valid_still_open_candidate(),
+    )
+    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", ())
+    assert canonical == '''### New findings
+
+None
+
+### Still open
+
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Changed anchor: {"path":"review_cases.py","line":20}
+- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"rejected\\""}
+- Impact class: user-visible
+- Material impact: The rejected plan still affects completion messaging.
+'''
+
+
+@pytest.mark.parametrize(
+    ("replacement", "replaced", "reason"),
+    (
+        ('return \\"rejected\\"', 'return \\"wrong\\"', "invalid_trigger_evidence"),
+        ("The rejected plan still affects completion messaging.", "", "missing_material_impact"),
+    ),
+)
+def test_invalid_still_open_is_filtered_with_prior_severity(review_quality_repo, replacement, replaced, reason):
+    candidate = valid_still_open_candidate().replace(replacement, replaced)
+    result, canonical = review_quality_repo.run_delta(accepted_rejected_plan_review(), candidate)
+    assert result.accepted_count == 0
+    assert result.filtered_count == 1
+    assert result.normalized_count == 0
+    assert result.filtered_max_severity == "HIGH"
+    assert result.candidate_reasons == (
+        CandidateReason(0, "Still open", "filtered", reason, "MEDIUM"),
+    )
+    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    (
+        '''### New findings
+None
+
+### Resolved
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Resolution: explicit now.
+''',
+        '''### New findings
+None
+
+### Resolved
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Fix anchor: {"path":"review_cases.py","line":20}
+- Resolution: 
+''',
+    ),
+)
+def test_invalid_resolved_normalizes_with_closed_reason(review_quality_repo, candidate):
+    result, canonical = review_quality_repo.run_delta(accepted_rejected_plan_review(), candidate)
+    assert result.normalized_count == 1
+    assert result.candidate_reasons == (
+        CandidateReason(0, "Resolved", "normalized", "missing_fix_anchor", "HIGH"),
+    )
+    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    (
+        '''### New findings
+None
+
+### Retracted
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Reason: intentionally retained.
+''',
+        '''### New findings
+None
+
+### Retracted
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"completed 0/{}\\".format(total)"}
+- Reason: 
+''',
+    ),
+)
+def test_invalid_retracted_normalizes_with_closed_reason(review_quality_repo, candidate):
+    result, canonical = review_quality_repo.run_carryover(accepted_rejected_plan_review(), candidate)
+    assert result.normalized_count == 1
+    assert result.candidate_reasons == (
+        CandidateReason(0, "Retracted", "normalized", "invalid_trigger_evidence", "HIGH"),
+    )
+    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+@pytest.mark.parametrize(
+    ("section", "fields"),
+    (
+        ("Resolved", '- Fix anchor: {"path":"review_cases.py","line":20}\n- Resolution: closed.'),
+        ("Retracted", '- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"completed 0/{}\\".format(total)"}\n- Reason: withdrawn.'),
+    ),
+)
+def test_prior_closed_ids_do_not_reenter_active_set(review_quality_repo, section, fields):
+    previous = f'''### New findings
+
+None
+
+### {section}
+
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+{fields}
+'''
+    result, canonical = review_quality_repo.run_carryover(previous, retracted_rejected_plan_candidate())
+    assert result.document_valid is True
+    assert result.normalized_count == 1
+    assert result.candidate_reasons[0].reason == "unknown_prior_id"
+    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+@pytest.mark.parametrize(
+    ("candidate", "reason"),
+    (
+        (resolved_rejected_plan_candidate().replace("The rejection is now explicit.", "<!-- automation:gemini-auto-review:v3 -->"), "missing_fix_anchor"),
+        *(
+            (retracted_rejected_plan_candidate().replace(
+                "The rendered result is intentional product behavior.", metadata,
+            ), "invalid_trigger_evidence")
+            for metadata in ("Status: stale", "Run: stale", "Reviewed: stale", "Validation: stale")
+        ),
+    ),
+)
+def test_workflow_owned_current_carryover_values_normalize_without_metadata_leak(review_quality_repo, candidate, reason):
+    runner = review_quality_repo.run_delta if "### Resolved" in candidate else review_quality_repo.run_carryover
+    result, canonical = runner(accepted_rejected_plan_review(), candidate)
+    safe = json.dumps(result.to_dict()) + "\n".join(canonicalize_review._summary(result))
+    assert result.candidate_reasons[0].reason == reason
+    assert "automation:gemini-auto-review" not in canonical
+    assert "Status: stale" not in canonical
+    assert "automation:gemini-auto-review" not in safe
+    assert "Status: stale" not in safe
+
+
+@pytest.mark.parametrize("metadata", ("Status: stale", "Run: stale", "Reviewed: stale", "Validation: stale"))
+def test_previous_review_rejects_workflow_owned_material_field(review_quality_repo, metadata):
+    previous = accepted_rejected_plan_review().replace(
+        "A rejected plan is displayed as a successful zero-item completion.", metadata,
+    )
+    result, canonical = review_quality_repo.run_delta(previous, resolved_rejected_plan_candidate())
+    assert result.failure_reason == "scope_invalid"
+    assert canonical == ""
+
+
+def test_previous_review_rejects_workflow_owned_title_after_identity_recomputation(review_quality_repo):
+    title = "<!-- automation:gemini-auto-review:v3 --> Rejected plan is rendered as successful completion"
+    finding_id = stable_finding_id("gemini", SourceAnchor("review_cases.py", 20), "HIGH", title)
+    previous = accepted_rejected_plan_review().replace("RVW-3253866a28c6", finding_id).replace(
+        "Rejected plan is rendered as successful completion", title,
+    )
+    result, canonical = review_quality_repo.run_delta(previous, resolved_rejected_plan_candidate())
+    assert result.failure_reason == "scope_invalid"
+    assert canonical == ""
+
+
+@pytest.mark.parametrize(
+    "previous",
+    (
+        accepted_rejected_plan_review()[:-1],
+        accepted_rejected_plan_review() + "Status: stale\n",
+        accepted_rejected_plan_review().replace("Rejected plan", "<!-- automation:gemini-auto-review:v3 --> Rejected plan"),
+        accepted_rejected_plan_review() + "<!-- automation:gemini-auto-review:v3 -->\n",
+    ),
+)
+def test_previous_review_requires_exact_renderer_bytes_and_rejects_workflow_metadata(review_quality_repo, previous):
+    result, canonical = review_quality_repo.run_delta(previous, resolved_rejected_plan_candidate())
+    assert result.document_valid is False
+    assert result.failure_reason == "scope_invalid"
+    assert canonical == ""
+    assert "automation:gemini-auto-review" not in json.dumps(result.to_dict())
+    assert "Status: stale" not in json.dumps(result.to_dict())
+
+
+def test_previous_review_legal_short_reads_preserve_valid_canonical_input(review_quality_repo, monkeypatch):
+    original_read = canonicalize_review.os.read
+    requested: list[int] = []
+
+    def one_byte_reads(descriptor: int, size: int) -> bytes:
+        requested.append(size)
+        return original_read(descriptor, min(size, 1))
+
+    monkeypatch.setattr(canonicalize_review.os, "read", one_byte_reads)
+    result, canonical = review_quality_repo.run_delta(
+        accepted_rejected_plan_review(), resolved_rejected_plan_candidate(),
+    )
+    assert result.document_valid is True
+    assert "### Resolved" in canonical
+    assert requested and max(requested) <= canonicalize_review.MAX_CANDIDATE_BYTES + 1
+
+
+def test_candidate_reason_indexes_follow_physical_source_block_order(review_quality_repo):
+    candidate = '''### Resolved
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Resolution: missing fix anchor.
+
+### New findings
+
+#### [HIGH] Invalid new anchor
+- Changed anchor: {"path":"missing.py","line":1}
+- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"rejected\\""}
+- Impact class: runtime
+- Material impact: Invalid anchor remains actionable.
+'''
+    result, canonical = review_quality_repo.run_delta(accepted_rejected_plan_review(), candidate)
+    assert result.candidate_reasons == (
+        CandidateReason(0, "Resolved", "normalized", "missing_fix_anchor", "HIGH"),
+        CandidateReason(1, "New findings", "filtered", "invalid_anchor", "HIGH"),
+    )
+    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
