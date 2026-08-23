@@ -38,6 +38,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
+ACTIONLINT_CONFIG = ROOT / ".github" / "actionlint.yaml"
 
 pytestmark = [
     pytest.mark.skipif(shutil.which("bash") is None, reason="bash required"),
@@ -298,6 +299,49 @@ def _state_line_without(head: str, field: str) -> str:
 
 def _load(name: str) -> dict:
     return yaml.load((WORKFLOWS / name).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+
+def test_actionlint_has_exact_compatibility_exception_for_every_self_action():
+    def self_actions(node: object):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (
+                    key == "uses"
+                    and isinstance(value, str)
+                    and value.startswith("$/.github/actions/")
+                ):
+                    yield value
+                yield from self_actions(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from self_actions(value)
+
+    config = yaml.load(
+        ACTIONLINT_CONFIG.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+    )
+    missing: dict[str, list[str]] = {}
+    for name in (
+        "claude-code-review.yml",
+        "gemini-auto-review.yml",
+        "opencode-auto-review.yml",
+    ):
+        actions = set(self_actions(_load(name)))
+        assert actions
+        expected = set()
+        for action in actions:
+            suffix = action.removeprefix("$/.github/actions/")
+            assert re.fullmatch(r"[A-Za-z0-9_./-]+", suffix)
+            escaped_action = action.replace("$", r"\$").replace(".", r"\.")
+            expected.add(
+                f'specifying action "{escaped_action}" in invalid format '
+                "because ref is missing"
+            )
+        path = f".github/workflows/{name}"
+        ignores = set(config.get("paths", {}).get(path, {}).get("ignore", []))
+        if absent := expected - ignores:
+            missing[path] = sorted(absent)
+
+    assert missing == {}
 
 
 def _step(workflow: dict, job: str, name: str) -> dict:
