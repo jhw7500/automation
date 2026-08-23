@@ -40,7 +40,7 @@ PROOF_DEFICIT = re.compile(
 )
 WORKFLOW_OWNED = re.compile(
     r"(?:<!--.*automation:|^#{1,6}\s*(?:status|run|reviewed|validation)\b|"
-    r"^\s*(?:status|run|reviewed|validation)\s*:)", re.IGNORECASE,
+    r"^\s*(?:-\s*)?(?:status|run|reviewed|validation)\s*:)", re.IGNORECASE,
 )
 SECTION_NAMES = ("New findings", "Still open", "Resolved", "Retracted")
 

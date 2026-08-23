@@ -1018,3 +1018,71 @@ def test_candidate_reason_indexes_follow_physical_source_block_order(review_qual
         CandidateReason(1, "New findings", "filtered", "invalid_anchor", "HIGH"),
     )
     assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+@pytest.mark.parametrize("metadata", ("Status", "Run", "Reviewed", "Validation"))
+@pytest.mark.parametrize(
+    ("candidate_factory", "expected_reason"),
+    (
+        (
+            lambda metadata: resolved_rejected_plan_candidate().replace(
+                "The rejection is now explicit.", f"- {metadata}: stale",
+            ),
+            "missing_fix_anchor",
+        ),
+        (
+            lambda metadata: retracted_rejected_plan_candidate().replace(
+                "The rendered result is intentional product behavior.", f"- {metadata}: stale",
+            ),
+            "invalid_trigger_evidence",
+        ),
+    ),
+)
+def test_bulleted_workflow_metadata_in_current_carryover_values_is_never_rendered(
+    review_quality_repo, metadata, candidate_factory, expected_reason,
+):
+    candidate = candidate_factory(metadata)
+    runner = review_quality_repo.run_delta if "### Resolved" in candidate else review_quality_repo.run_carryover
+    result, canonical = runner(accepted_rejected_plan_review(), candidate)
+    safe = json.dumps(result.to_dict()) + "\n".join(canonicalize_review._summary(result))
+    assert result.candidate_reasons[0].reason == expected_reason
+    assert f"- {metadata}: stale" not in canonical
+    assert f"- {metadata}: stale" not in safe
+
+
+@pytest.mark.parametrize("metadata", ("Status", "Run", "Reviewed", "Validation"))
+def test_bulleted_workflow_metadata_in_prior_active_material_is_scope_invalid(review_quality_repo, metadata):
+    previous = accepted_rejected_plan_review().replace(
+        "A rejected plan is displayed as a successful zero-item completion.", f"- {metadata}: stale",
+    )
+    result, canonical = review_quality_repo.run_delta(previous, resolved_rejected_plan_candidate())
+    assert result.failure_reason == "scope_invalid"
+    assert canonical == ""
+
+
+@pytest.mark.parametrize("metadata", ("Status", "Run", "Reviewed", "Validation"))
+@pytest.mark.parametrize(
+    "section", ("Resolved", "Retracted"),
+)
+def test_bulleted_workflow_metadata_in_prior_closed_fields_is_scope_invalid(review_quality_repo, metadata, section):
+    field = (
+        f'- Fix anchor: {{"path":"review_cases.py","line":20}}\n- Resolution: - {metadata}: stale'
+        if section == "Resolved" else
+        f'- Trigger evidence: {{"path":"review_cases.py","line":20,"quote":"        return \\"completed 0/{{}}\\".format(total)"}}\n- Reason: - {metadata}: stale'
+    )
+    previous = f'''### New findings
+
+#### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
+- Changed anchor: {{"path":"review_cases.py","line":20}}
+- Trigger evidence: {{"path":"review_cases.py","line":20,"quote":"        return \\"completed 0/{{}}\\".format(total)"}}
+- Impact class: user-visible
+- Material impact: A rejected plan is displayed as a successful zero-item completion.
+
+### {section}
+
+#### RVW-deadbeefcafe [HIGH] Historical closure
+{field}
+'''
+    result, canonical = review_quality_repo.run_delta(previous, resolved_rejected_plan_candidate())
+    assert result.failure_reason == "scope_invalid"
+    assert canonical == ""
