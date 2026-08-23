@@ -317,8 +317,13 @@ def _validate_new(block: _Block, scope: object) -> tuple[_Finding | None, str | 
     ), None
 
 
+def _candidate_json_line(value: dict[str, object]) -> str:
+    """Serialize the exact literal JSON form accepted from a current candidate."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 def _json_line(value: dict[str, object]) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).translate(str.maketrans({
+    return _candidate_json_line(value).translate(str.maketrans({
         "<": "\\u003c", ">": "\\u003e", "&": "\\u0026",
     }))
 
@@ -661,7 +666,7 @@ def _validate_resolved(block: _Block, scope: object) -> tuple[SourceAnchor | Non
             or WORKFLOW_OWNED.search(resolution)):
         return None, None
     if _trim_section_padding(block.lines) != (
-        "- Fix anchor: " + _json_line({"path": anchor.path, "line": anchor.line}),
+        "- Fix anchor: " + _candidate_json_line({"path": anchor.path, "line": anchor.line}),
         f"- Resolution: {resolution}",
     ):
         return None, None
@@ -677,7 +682,9 @@ def _validate_retracted(block: _Block, scope: object) -> tuple[tuple[TriggerEvid
         return None, None
     parsed = tuple(item for item in evidence if item is not None)
     expected = tuple(
-        "- Trigger evidence: " + _json_line({"path": item.path, "line": item.line, "quote": item.quote})
+        "- Trigger evidence: " + _candidate_json_line({
+            "path": item.path, "line": item.line, "quote": item.quote,
+        })
         for item in parsed
     ) + (f"- Reason: {reason}",)
     if _trim_section_padding(block.lines) != expected:

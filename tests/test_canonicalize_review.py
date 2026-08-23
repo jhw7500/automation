@@ -154,11 +154,17 @@ class ReviewQualityRepo:
         assert head_text.splitlines()[24] == "        return int(value)"
         assert head_text.splitlines()[25] == "    except ValueError:"
         (self.repository / "review_cases.py").write_text(head_text, encoding="utf-8")
+        (self.repository / "evidence.py").write_text(
+            "a < b > c & d\n", encoding="utf-8",
+        )
         self.review_head = _commit(self.repository, "review change")
         (self.repository / "review_cases.py").write_text(
             head_text.replace('return "completed 0/{}".format(total)', 'return "rejected"'),
             encoding="utf-8",
         )
+        special_path = self.repository / "dir" / "a&b<q>.py"
+        special_path.parent.mkdir()
+        special_path.write_text("FIXED = True\n", encoding="utf-8")
         self.fixed_head = _commit(self.repository, "render rejected plan")
         self.fixtures = ROOT / "tests" / "fixtures" / "review-finding-quality"
 
@@ -1191,6 +1197,60 @@ def test_json_renderer_escapes_control_bytes_without_changing_decoded_trigger_or
         assert "<" not in encoded and ">" not in encoded and "&" not in encoded
         assert "\\u003c" in encoded and "\\u003e" in encoded and "\\u0026" in encoded
         assert json.loads(encoded)["quote"] == marker
+
+
+def test_current_resolved_fix_anchor_accepts_literal_json_controls_and_authenticates_output(
+    review_quality_repo,
+):
+    """Candidate structure accepts literal path data while canonical prior bytes stay escaped."""
+    path = "dir/a&b<q>.py"
+    candidate = resolved_rejected_plan_candidate().replace(
+        '"path":"review_cases.py","line":20', f'"path":"{path}","line":1',
+    )
+    result, canonical = review_quality_repo.run_delta(accepted_rejected_plan_review(), candidate)
+
+    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    encoded = next(
+        line.removeprefix("- Fix anchor: ")
+        for line in canonical.splitlines()
+        if line.startswith("- Fix anchor: ")
+    )
+    assert all(character not in encoded for character in "<>&")
+    assert "\\u003c" in encoded and "\\u003e" in encoded and "\\u0026" in encoded
+    assert json.loads(encoded) == {"path": path, "line": 1}
+
+    followup, _ = review_quality_repo._run(review_quality_repo._request(
+        "### New findings\n\nNone\n", reviewer="gemini", head=review_quality_repo.fixed_head,
+        previous_sha=review_quality_repo.fixed_head, previous_review=canonical,
+    ))
+    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+
+
+def test_current_retracted_trigger_accepts_literal_json_controls_and_authenticates_output(
+    review_quality_repo,
+):
+    """Candidate structure accepts literal quote data while canonical prior bytes stay escaped."""
+    quote = "a < b > c & d"
+    candidate = retracted_rejected_plan_candidate().replace(
+        '"path":"review_cases.py","line":20,"quote":"        return \\"completed 0/{}\\".format(total)"',
+        f'"path":"evidence.py","line":1,"quote":"{quote}"',
+    )
+    result, canonical = review_quality_repo.run_carryover(accepted_rejected_plan_review(), candidate)
+
+    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    encoded = next(
+        line.removeprefix("- Trigger evidence: ")
+        for line in canonical.splitlines()
+        if line.startswith("- Trigger evidence: ")
+    )
+    assert all(character not in encoded for character in "<>&")
+    assert "\\u003c" in encoded and "\\u003e" in encoded and "\\u0026" in encoded
+    assert json.loads(encoded) == {"path": "evidence.py", "line": 1, "quote": quote}
+
+    followup, _ = review_quality_repo.run_carryover(
+        canonical, "### New findings\n\nNone\n",
+    )
+    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
 
 
 def test_canonicalized_marker_title_is_strict_byte_stable_authenticated_prior_input(review_quality_repo):
