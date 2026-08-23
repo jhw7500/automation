@@ -1185,6 +1185,77 @@ def test_v146_rejects_canonicalizer_constant_drift(
 
 
 @pytest.mark.parametrize(
+    ("relative", "rebind"),
+    (
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "HARD_REASONS: object = frozenset({'bypass_reason'})",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "MAX_CANDIDATE_BLOCKS += 1",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "del MAX_CANDIDATE_BYTES",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "import json as MAX_SAFE_INTEGER",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "for MAX_PREVIOUS_CANONICAL_BYTES in [1]:\n    pass",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "with open(__file__, encoding='utf-8') as SEVERITIES:\n    pass",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "try:\n    raise ValueError\nexcept ValueError as IMPACT_CLASSES:\n    pass",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "match object():\n    case SOFT_REASONS:\n        pass",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "if True:\n    HARD_REASONS = frozenset({'nested_bypass'})",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "_sentinel = lambda value=(HARD_REASONS := "
+            "frozenset({'lambda_default'})): value",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "canonicalize = lambda request: None",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "CanonicalizationResult = object",
+        ),
+    ),
+)
+def test_v146_rejects_every_effective_protected_module_rebinding(
+    current_release_repo: tuple[Path, str], relative: str, rebind: str
+) -> None:
+    repo, _ = current_release_repo
+    helper = repo / relative
+    helper.write_text(
+        helper.read_text(encoding="utf-8") + "\n" + rebind + "\n",
+        encoding="utf-8",
+    )
+    bad_commit = commit(repo, "rebind protected canonicalizer symbol")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
     ("relative", "old", "new"),
     (
         (
@@ -1362,6 +1433,64 @@ def test_v145_rejects_canonicalizer_dependency_regardless_of_future_files(
         release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
 
 
+def test_v146_binds_review_contract_to_the_exact_root_workflow_path(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    root = repo / ".github/workflows/claude-code-review.yml"
+    nested = repo / ".github/workflows/zz/claude-code-review.yml"
+    nested.parent.mkdir(parents=True)
+    shutil.copy2(root, nested)
+
+    def corrupt_root(step: dict) -> None:
+        step["with"]["script"] = step["with"]["script"].replace(
+            "state.schema === 3", "state.schema === 2", 1
+        )
+
+    mutate_named_step(root, "claude-review", "Upsert review comment", corrupt_root)
+    bad_commit = commit(repo, "shadow malicious root review with nested decoy")
+
+    with pytest.raises(ReleaseVerificationError, match="central review workflow"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+def test_v146_rejects_nested_central_workflow_before_the_root_sort_order(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    root = repo / ".github/workflows/claude-code-review.yml"
+    nested = repo / ".github/workflows/aa/claude-code-review.yml"
+    nested.parent.mkdir(parents=True)
+    shutil.copy2(root, nested)
+    bad_commit = commit(repo, "add early-sorting nested central workflow")
+
+    with pytest.raises(ReleaseVerificationError, match="central review workflow"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+def test_v146_allows_an_unrelated_nested_workflow_without_shadowing_root_contracts(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    nested = repo / ".github/workflows/zz/unrelated.yml"
+    nested.parent.mkdir(parents=True)
+    nested.write_text(
+        "name: Nested fixture\n"
+        "on:\n"
+        "  workflow_call:\n"
+        "jobs: {}\n",
+        encoding="utf-8",
+    )
+    commit_with_nested = commit(repo, "add unrelated nested workflow")
+
+    assert (
+        release_verifier.verify_commit_content(
+            repo, "v1.46", commit_with_nested
+        )
+        == commit_with_nested
+    )
+
+
 @pytest.mark.parametrize(
     "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
 )
@@ -1396,6 +1525,65 @@ def test_v146_rejects_reviewer_upsert_reading_the_raw_candidate(
 
     mutate_named_step(path, contract["job"], "Upsert review comment", publish_raw)
     bad_commit = commit(repo, f"publish raw candidate from {workflow}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review publication contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    "read_variant", ("concatenated-path", "aliased-reader", "helper-reader")
+)
+def test_v146_rejects_dead_canonical_read_decoys_and_dynamic_raw_reads(
+    current_release_repo: tuple[Path, str], workflow: str, read_variant: str
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def bypass_canonical_read(step: dict) -> None:
+        script = step["with"]["script"]
+        canonical_read = (
+            f"fs.readFileSync('{contract['canonical']}', 'utf8')"
+        )
+        live_statement = f"review = stripValidation({canonical_read});"
+        assert script.count(canonical_read) == 1
+        assert live_statement in script
+
+        separator = "-" if "-" in contract["raw"] else "_"
+        head, tail = contract["raw"].split(separator, 1)
+        dynamic_path = f"'{head}{separator}' + '{tail}'"
+        decoy = f"if (false) {{ stripValidation({canonical_read}); }}\n"
+        if read_variant == "concatenated-path":
+            live_read = f"fs.readFileSync({dynamic_path}, 'utf8')"
+            prefix = ""
+        elif read_variant == "aliased-reader":
+            live_read = f"candidateRead({dynamic_path}, 'utf8')"
+            prefix = "const candidateRead = fs.readFileSync;\n"
+        else:
+            live_read = "readCandidate()"
+            prefix = (
+                "const readCandidate = () => "
+                f"fs.readFileSync([{dynamic_path}].join(''), 'utf8');\n"
+            )
+        step["with"]["script"] = (
+            prefix
+            + decoy
+            + script.replace(
+                live_statement,
+                f"review = stripValidation({live_read});",
+                1,
+            )
+        )
+
+    mutate_named_step(
+        path, contract["job"], "Upsert review comment", bypass_canonical_read
+    )
+    bad_commit = commit(repo, f"bypass canonical read in {workflow}")
 
     with pytest.raises(
         ReleaseVerificationError, match="review publication contract"

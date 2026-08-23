@@ -517,6 +517,12 @@ REVIEW_PUBLICATION_CONTRACTS = {
         "raw": "claude-review.md",
         "canonical": "claude-review-canonical.md",
         "canonical_step": "Canonicalize Claude review",
+        # Intentional whole-program v1.46 publication boundary. Any Upsert
+        # program change requires an explicit verifier contract update.
+        "upsert_sha256": (
+            "f5edbcfad0a765ab321d2df22a18d278"
+            "9524d3a0b82ba7284668034c653f2ed7"
+        ),
         "previous_sha": "${{ steps.prepare-review-input.outputs.previous_sha }}",
         "previous_file": (
             "${{ steps.prepare-review-input.outputs.previous_sha != '' && "
@@ -535,6 +541,10 @@ REVIEW_PUBLICATION_CONTRACTS = {
         "raw": "gemini_review.md",
         "canonical": "gemini-review-canonical.md",
         "canonical_step": "Canonicalize Gemini review",
+        "upsert_sha256": (
+            "2c8f9e8a02d1683b0a1a1905a7c323d9"
+            "a4ab8cb7f3f6e3830a671d92a5371e59"
+        ),
         "previous_sha": "${{ steps.pr-details.outputs.previous_sha }}",
         "previous_file": (
             "${{ steps.pr-details.outputs.previous_sha != '' && "
@@ -1699,6 +1709,204 @@ def _verify_prepare_review_diff_action(tree: VerifiedCommitTree) -> None:
         )
 
 
+def _bound_target_names(target: ast.AST) -> tuple[str, ...]:
+    if isinstance(target, ast.Name):
+        return (target.id,)
+    if isinstance(target, ast.Starred):
+        return _bound_target_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return tuple(
+            name for item in target.elts for name in _bound_target_names(item)
+        )
+    return ()
+
+
+class _NamedExpressionBindingVisitor(ast.NodeVisitor):
+    """Collect walrus targets evaluated in the surrounding module scope."""
+
+    def __init__(self) -> None:
+        self.names: list[str] = []
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.names.extend(_bound_target_names(node.target))
+        self.visit(node.value)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        # Defaults execute in the surrounding scope when the lambda is created;
+        # its body executes later in the lambda's own local scope.
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+
+def _expression_binding_names(node: ast.AST | None) -> tuple[str, ...]:
+    if node is None:
+        return ()
+    visitor = _NamedExpressionBindingVisitor()
+    visitor.visit(node)
+    return tuple(visitor.names)
+
+
+def _match_binding_names(pattern: ast.AST) -> tuple[str, ...]:
+    names: list[str] = []
+    for node in ast.walk(pattern):
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            names.append(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.append(node.rest)
+    return tuple(names)
+
+
+def _module_scope_binding_counts(
+    module: ast.Module, protected: frozenset[str]
+) -> dict[str, int]:
+    """Count syntactic bindings that execute in the module namespace.
+
+    Function and class bodies own separate namespaces. Their decorators, bases,
+    defaults, and annotations are still evaluated by the surrounding module, and
+    any nested ``global`` declaration for a protected name is rejected by the
+    caller because it can mutate that module binding later.
+    """
+
+    counts = {name: 0 for name in protected}
+    try_statement_types: tuple[type[ast.AST], ...] = (ast.Try,)
+    try_star_type = getattr(ast, "TryStar", None)
+    if try_star_type is not None:
+        try_statement_types += (try_star_type,)
+    type_alias_type = getattr(ast, "TypeAlias", None)
+
+    def record(names: Iterable[str]) -> None:
+        for name in names:
+            if name in counts:
+                counts[name] += 1
+
+    def expression(node: ast.AST | None) -> None:
+        record(_expression_binding_names(node))
+
+    def function_definition(
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
+        record((node.name,))
+        for decorator in node.decorator_list:
+            expression(decorator)
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            expression(default)
+        arguments = (
+            *getattr(node.args, "posonlyargs", ()),
+            *node.args.args,
+            *node.args.kwonlyargs,
+        )
+        for argument in arguments:
+            expression(argument.annotation)
+        if node.args.vararg is not None:
+            expression(node.args.vararg.annotation)
+        if node.args.kwarg is not None:
+            expression(node.args.kwarg.annotation)
+        expression(node.returns)
+        for type_parameter in getattr(node, "type_params", ()):
+            expression(type_parameter)
+
+    def statements(nodes: Iterable[ast.stmt]) -> None:
+        for node in nodes:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    record(_bound_target_names(target))
+                expression(node.value)
+            elif isinstance(node, ast.AnnAssign):
+                record(_bound_target_names(node.target))
+                expression(node.annotation)
+                expression(node.value)
+            elif isinstance(node, ast.AugAssign):
+                record(_bound_target_names(node.target))
+                expression(node.value)
+            elif isinstance(node, ast.Delete):
+                for target in node.targets:
+                    record(_bound_target_names(target))
+            elif isinstance(node, ast.Import):
+                record(
+                    alias.asname or alias.name.partition(".")[0]
+                    for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                if any(alias.name == "*" for alias in node.names):
+                    record(protected)
+                else:
+                    record(alias.asname or alias.name for alias in node.names)
+            elif type_alias_type is not None and isinstance(node, type_alias_type):
+                record(_bound_target_names(node.name))
+                expression(node.value)
+                for type_parameter in getattr(node, "type_params", ()):
+                    expression(type_parameter)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                function_definition(node)
+            elif isinstance(node, ast.ClassDef):
+                record((node.name,))
+                for decorator in node.decorator_list:
+                    expression(decorator)
+                for base in node.bases:
+                    expression(base)
+                for keyword in node.keywords:
+                    expression(keyword.value)
+                for type_parameter in getattr(node, "type_params", ()):
+                    expression(type_parameter)
+            elif isinstance(node, ast.If):
+                expression(node.test)
+                statements(node.body)
+                statements(node.orelse)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                record(_bound_target_names(node.target))
+                expression(node.iter)
+                statements(node.body)
+                statements(node.orelse)
+            elif isinstance(node, ast.While):
+                expression(node.test)
+                statements(node.body)
+                statements(node.orelse)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    expression(item.context_expr)
+                    if item.optional_vars is not None:
+                        record(_bound_target_names(item.optional_vars))
+                statements(node.body)
+            elif isinstance(node, try_statement_types):
+                statements(node.body)
+                for handler in node.handlers:
+                    expression(handler.type)
+                    if handler.name is not None:
+                        record((handler.name,))
+                    statements(handler.body)
+                statements(node.orelse)
+                statements(node.finalbody)
+            elif isinstance(node, ast.Match):
+                expression(node.subject)
+                for case in node.cases:
+                    record(_match_binding_names(case.pattern))
+                    expression(case.guard)
+                    statements(case.body)
+            elif isinstance(node, ast.Expr):
+                expression(node.value)
+            elif isinstance(node, ast.Assert):
+                expression(node.test)
+                expression(node.msg)
+            elif isinstance(node, ast.Raise):
+                expression(node.exc)
+                expression(node.cause)
+
+    statements(module.body)
+    return counts
+
+
+def _require_unique_module_bindings(
+    module: ast.Module, protected: frozenset[str]
+) -> None:
+    for node in ast.walk(module):
+        if isinstance(node, ast.Global) and protected.intersection(node.names):
+            raise ValueError("protected symbol has a nested global binding")
+    counts = _module_scope_binding_counts(module, protected)
+    if any(count != 1 for count in counts.values()):
+        raise ValueError("protected symbol binding is missing or duplicated")
+
+
 def _module_assignment(module: ast.Module, name: str) -> ast.expr:
     matches: list[ast.expr] = []
     for node in module.body:
@@ -1808,6 +2016,28 @@ def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree) -> None:
             "MAX_PREVIOUS_CANONICAL_BYTES": 65_536,
             "MAX_CANDIDATE_BLOCKS": 512,
         }
+        _require_unique_module_bindings(
+            canonical_module,
+            frozenset(
+                {
+                    *canonical_literals,
+                    "MAX_SAFE_INTEGER",
+                    *EXPECTED_CANONICALIZER_RECORDS,
+                    *EXPECTED_CANONICALIZER_FUNCTIONS,
+                }
+            ),
+        )
+        _require_unique_module_bindings(
+            scope_module,
+            frozenset(
+                {
+                    "GIT_ENV",
+                    "ScopeValidationError",
+                    *EXPECTED_SCOPE_RECORDS,
+                    *EXPECTED_SCOPE_FUNCTIONS,
+                }
+            ),
+        )
         if any(
             _static_literal(canonical_module, name) != expected
             for name, expected in canonical_literals.items()
@@ -2364,6 +2594,11 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
             upsert_script = upsert.get("with", {}).get("script", "")
             if not isinstance(upsert_script, str):
                 raise ValueError("upsert script is unavailable")
+            if (
+                hashlib.sha256(upsert_script.encode("utf-8")).hexdigest()
+                != contract["upsert_sha256"]
+            ):
+                raise ValueError("upsert publication program differs")
             validation_template = (
                 "`- Validation: accepted=${state.accepted_count}; "
                 "filtered=${state.filtered_count}; "
@@ -2607,6 +2842,14 @@ def _verify_commit_content(
     if not workflows:
         raise ReleaseVerificationError(f"tag {ref} contains no reusable workflows")
 
+    central_workflows = set(REVIEW_DIFF_DEPENDENCY_WORKFLOWS)
+    if catalog is not None:
+        central_workflows.update(
+            entry.central_workflow
+            for entry in catalog.callers
+            if entry.central_workflow is not None
+        )
+    workflow_root = PurePosixPath(".github/workflows")
     documents: dict[str, dict] = {}
     for name in workflows:
         text = tree.read_text(name)
@@ -2619,7 +2862,14 @@ def _verify_commit_content(
                     f"{name} checkout reference is not the approved immutable commit"
                 )
         data = yaml.load(text, Loader=yaml.BaseLoader)
-        documents[Path(name).name] = data if isinstance(data, dict) else {}
+        relative = PurePosixPath(name).relative_to(workflow_root)
+        if len(relative.parts) != 1:
+            if relative.name in central_workflows:
+                raise ReleaseVerificationError(
+                    f"{name} is an unexpected nested central review workflow"
+                )
+            continue
+        documents[relative.name] = data if isinstance(data, dict) else {}
 
     _verify_review_action_dependencies(ref, documents)
     if release_supports_canonicalize_review(ref):
