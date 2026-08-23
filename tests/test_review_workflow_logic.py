@@ -47,6 +47,7 @@ pytestmark = [
 CLAUDE_MARKER = "<!-- automation:claude-code-review -->"
 CLAUDE_HEADER = "## Claude Code Review (latest)"
 CLAUDE_V2_MARKER = "<!-- automation:claude-code-review:v2 -->"
+CLAUDE_V3_MARKER = "<!-- automation:claude-code-review:v3 -->"
 
 
 def _state_line(
@@ -95,6 +96,114 @@ def _v2_body(
                 url = run_url or f"https://github.com/example/repo/actions/runs/{parsed['run_id']}"
                 run_line = f"\n\n- Run: {url}\n"
     return f"{header}\n{marker}\n{state}{run_line}\n{body}"
+
+
+def _v3_state(
+    reviewer: str = "claude",
+    pr: int = 7,
+    run_id: int = 1,
+    head: str = "ab" * 20,
+    run_attempt: int = 1,
+    **changes: object,
+) -> dict[str, object]:
+    state: dict[str, object] = {
+        "schema": 3,
+        "reviewer": reviewer,
+        "pr": pr,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "attempt_head": head,
+        "successful_head": head,
+        "attempt_status": "success",
+        "diff_mode": "full",
+        "full_diff_sha256": "12" * 32,
+        "quality_schema": 1,
+        "accepted_count": 1,
+        "filtered_count": 2,
+        "normalized_count": 3,
+        "filtered_max_severity": "HIGH",
+    }
+    state.update(changes)
+    return state
+
+
+def _v3_body(
+    state: dict[str, object],
+    body: str = "CANONICAL REVIEW BODY",
+    *,
+    marker: str = CLAUDE_V3_MARKER,
+    header: str = CLAUDE_HEADER,
+) -> str:
+    status = "success" if state.get("attempt_status") == "success" else (
+        "stale" if state.get("successful_head") is not None else "failure"
+    )
+    run_url = f"https://github.com/example/repo/actions/runs/{state.get('run_id')}"
+    meta = [f"- Status: {status}", f"- Run: {run_url}"]
+    if state.get("successful_head") is not None:
+        meta.append(f"- Reviewed: {state.get('successful_head')}")
+    if state.get("accepted_count") is not None:
+        meta.append(
+            "- Validation: "
+            f"accepted={state.get('accepted_count')}; filtered={state.get('filtered_count')}; "
+            f"normalized={state.get('normalized_count')}; "
+            f"filtered_max={state.get('filtered_max_severity')}"
+        )
+    if state.get("attempt_status") == "failure":
+        meta.append(f"- Last attempt: failure ({run_url})")
+    encoded = json.dumps(state, separators=(",", ":"))
+    return f"{header}\n{marker}\n<!-- automation-state:{encoded} -->\n\n" + "\n".join(meta) + f"\n\n{body}"
+
+
+def _upgrade_claude_v2_fixture(comment: dict) -> dict:
+    """Move legacy test fixtures onto the v3 parser without masking malformed state."""
+    body = comment.get("body", "")
+    prefix = f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n"
+    if not body.startswith(prefix):
+        return comment
+    lines = body.split("\n")
+    match = re.fullmatch(r"<!-- automation-state:(\{.*\}) -->", lines[2] if len(lines) > 2 else "")
+    if not match:
+        upgraded = dict(comment)
+        upgraded["body"] = body.replace(CLAUDE_V2_MARKER, CLAUDE_V3_MARKER, 1)
+        return upgraded
+    try:
+        old = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        upgraded = dict(comment)
+        upgraded["body"] = body.replace(CLAUDE_V2_MARKER, CLAUDE_V3_MARKER, 1)
+        return upgraded
+    state = _v3_state(
+        reviewer=old.get("reviewer", "claude"),
+        pr=old.get("pr", 7),
+        run_id=old.get("run_id", 1),
+        head=old.get("attempt_head", "ab" * 20),
+        run_attempt=old.get("run_attempt", 1),
+    )
+    for key, value in old.items():
+        if key != "schema":
+            state[key] = value
+    state["schema"] = 3 if old.get("schema") == 2 else old.get("schema")
+    for required in (
+        "reviewer", "pr", "run_id", "run_attempt", "attempt_head", "successful_head",
+        "attempt_status", "diff_mode", "full_diff_sha256",
+    ):
+        if required not in old:
+            state.pop(required, None)
+    run_match = re.match(
+        r"^.*?\n\n- Run: (?P<run>[^\n]+)\n\n(?P<body>.*)$", body, re.S
+    )
+    if run_match:
+        canonical = run_match.group("body")
+        converted = _v3_body(state, canonical)
+        expected = f"https://github.com/example/repo/actions/runs/{state.get('run_id')}"
+        converted = converted.replace(expected, run_match.group("run"), 1)
+    else:
+        canonical = body.split("\n", 3)[-1]
+        converted = _v3_body(state, canonical)
+        converted = re.sub(r"\n- Run: [^\n]+", "", converted, count=1)
+    upgraded = dict(comment)
+    upgraded["body"] = converted
+    return upgraded
 
 
 def _opencode_v2_body(state: str, body: str = "REAL REVIEW", *, run_url: str | None = None) -> str:
@@ -347,15 +456,18 @@ def _run_collect(
     comments: list[dict],
     head_sha: str = "",
     pr_files: list[str] | None = None,
+    literal_schema: bool = False,
 ) -> str | None:
     workflow = _load("claude-code-review.yml")
     run = _step(workflow, "claude-review", "Collect previous review context")["run"]
+    if not literal_schema:
+        comments = [_upgrade_claude_v2_fixture(comment) for comment in comments]
     env = _gh_stub(tmp_path, comments, head_sha=head_sha, pr_files=pr_files)
     output = tmp_path / "github-output"
     env.update(
         {
             "HEADER": CLAUDE_HEADER,
-            "MARKER": CLAUDE_V2_MARKER,
+            "MARKER": CLAUDE_V3_MARKER,
             "REVIEWER": "claude",
             "SERVER_URL": "https://github.com",
             "REPOSITORY": "example/repo",
@@ -372,6 +484,79 @@ def _run_collect(
         )
     context = tmp_path / "claude-review-context.md"
     return context.read_text(encoding="utf-8") if context.exists() else None
+
+
+def test_claude_v2_is_display_only_and_cannot_enable_incremental_input(tmp_path):
+    head = "ab" * 20
+    legacy = _v2_body(
+        CLAUDE_HEADER,
+        CLAUDE_V2_MARKER,
+        _state_line("claude", 7, 99, head),
+        "UNAUTHENTICATED V2 PROSE",
+    )
+
+    context = _run_collect(
+        tmp_path, [_bot("github-actions[bot]", legacy)], literal_schema=True
+    )
+
+    assert context is None
+    assert _github_outputs(tmp_path / "github-output") == {
+        "previous_sha": "",
+        "previous_full_hash": "",
+    }
+    assert not (tmp_path / "claude-previous-review.md").exists()
+
+
+def test_claude_v3_collects_authenticated_pair_and_exact_canonical_body(tmp_path):
+    head = "ab" * 20
+    canonical = "### New findings\n\nNone\n"
+    sticky = _v3_body(_v3_state(head=head), canonical)
+
+    context = _run_collect(tmp_path, [_bot("github-actions[bot]", sticky)])
+
+    assert _github_outputs(tmp_path / "github-output") == {
+        "previous_sha": head,
+        "previous_full_hash": "12" * 32,
+    }
+    assert (tmp_path / "claude-previous-review.md").read_bytes() == canonical.encode()
+    assert context is not None and "### New findings" in context
+    previous = context.split("## Recent human comments")[0]
+    for forbidden in (
+        CLAUDE_HEADER, CLAUDE_V3_MARKER, "automation-state:", "- Status:",
+        "- Run:", "- Reviewed:", "- Last attempt:", "- Validation:",
+    ):
+        assert forbidden not in previous
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"reviewer": "gemini"},
+        {"schema": 2},
+        {"extra": "no"},
+        {"accepted_count": -1},
+        {"filtered_count": 1.5},
+        {"normalized_count": 9007199254740992},
+        {"filtered_max_severity": "LOW"},
+    ],
+    ids=(
+        "wrong-reviewer", "wrong-schema", "extra-key", "negative-count",
+        "fractional-count", "unsafe-count", "invalid-max-severity",
+    ),
+)
+def test_claude_collector_rejects_unauthenticated_v3_state(tmp_path, changes):
+    state = _v3_state(**changes)
+    _run_collect(tmp_path, [_bot("github-actions[bot]", _v3_body(state, "POISON"))])
+    assert _github_outputs(tmp_path / "github-output")["previous_sha"] == ""
+    assert not (tmp_path / "claude-previous-review.md").exists()
+
+
+def test_claude_collector_rejects_v3_state_with_missing_key(tmp_path):
+    state = _v3_state()
+    state.pop("normalized_count")
+    _run_collect(tmp_path, [_bot("github-actions[bot]", _v3_body(state, "POISON"))])
+    assert _github_outputs(tmp_path / "github-output")["previous_sha"] == ""
+    assert not (tmp_path / "claude-previous-review.md").exists()
 
 
 def test_collect_picks_newest_bot_sticky_and_ignores_human_marker_quote(tmp_path):
@@ -674,7 +859,7 @@ def test_claude_collect_excludes_generated_first_failure_from_context(tmp_path):
     assert _run_collect(tmp_path, [_bot("github-actions[bot]", first_failure)]) is None
 
 
-def test_collect_drops_state_with_empty_sanitized_prose(tmp_path):
+def test_collect_preserves_authenticated_canonical_body_bytes_without_resanitizing(tmp_path):
     sha1, sha2 = _two_commit_repo(tmp_path)
     body = _v2_body(
         CLAUDE_HEADER,
@@ -690,7 +875,10 @@ def test_collect_drops_state_with_empty_sanitized_prose(tmp_path):
         pr_files=["a.py"],
     )
 
-    assert context is None
+    assert context is not None
+    assert (tmp_path / "claude-previous-review.md").read_text(encoding="utf-8") == (
+        f"- Status: success\n- Reviewed: {sha1}"
+    )
     assert not (tmp_path / "claude-review-delta.diff").exists()
 
 
@@ -779,6 +967,68 @@ def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure()
         "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
     )
     assert upsert["if"] == "${{ !cancelled() }}"
+
+
+def test_claude_uses_one_shared_canonicalizer_and_upsert_reads_only_canonical_file():
+    workflow = _load("claude-code-review.yml")
+    job = workflow["jobs"]["claude-review"]
+    steps = [
+        step for step in job["steps"]
+        if step.get("uses") == "$/.github/actions/canonicalize-review"
+    ]
+    assert len(steps) == 1
+    action = steps[0]
+    assert action["id"] == "canonicalize-review"
+    assert action["with"] == {
+        "reviewer": "claude",
+        "candidate-file": "${{ github.workspace }}/claude-review.md",
+        "canonical-file": "${{ github.workspace }}/claude-review-canonical.md",
+        "result-file": "${{ github.workspace }}/claude-review-result.json",
+        "scope-manifest": "${{ github.workspace }}/review-scope.json",
+        "selected-diff": (
+            "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
+            "&& format('{0}/review-delta.diff', github.workspace) "
+            "|| format('{0}/review-full.diff', github.workspace) }}"
+        ),
+        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
+        "previous-sha": "${{ steps.prepare-review-input.outputs.previous_sha }}",
+        "previous-review-file": (
+            "${{ steps.prepare-review-input.outputs.previous_sha != '' "
+            "&& format('{0}/claude-previous-review.md', github.workspace) || '' }}"
+        ),
+    }
+    assert action["if"] == (
+        "${{ always() && steps.prepare-diff.outputs.diff-ready == 'true' "
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+    )
+    upsert = _step(workflow, "claude-review", "Upsert review comment")
+    script = upsert["with"]["script"]
+    assert "claude-review-canonical.md" in script
+    assert "readFileSync('claude-review.md'" not in script
+
+
+def test_claude_first_v3_wiring_does_not_supply_unauthenticated_prior_file():
+    action = _step(_load("claude-code-review.yml"), "claude-review", "Canonicalize Claude review")
+    expression = action["with"]["previous-review-file"]
+    assert "steps.prepare-review-input.outputs.previous_sha != ''" in expression
+    assert expression.endswith("|| '' }}")
+
+
+def test_claude_prompt_requires_shared_finding_grammar_without_workflow_metadata():
+    prompt = _step(
+        _load("claude-code-review.yml"), "claude-review", "Run Claude Code Review"
+    )["with"]["prompt"]
+    for required in (
+        "### New findings", "### Still open", "### Resolved", "### Retracted",
+        "Changed anchor: {\"path\":", "Trigger evidence: {\"path\":",
+        "Impact class:", "Material impact:", "Performance basis:",
+        "Fix anchor:", "Resolution:", "Reason:", "RVW-",
+        "runtime", "security", "data-integrity", "user-visible", "performance",
+    ):
+        assert required in prompt
+    assert "Cannot verify" not in prompt
+    assert "must not emit workflow state" in prompt
+    assert "canonicalizer may omit invalid blocks" in prompt
 
 
 def test_shared_diff_wiring_is_exact_and_scope_safe():
@@ -880,11 +1130,7 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
 def test_collect_strips_sticky_meta_from_injected_context(tmp_path):
     """주입 컨텍스트에서 marker/메타 라인은 제거된다 — 모델의 에코 유혹 차단."""
     sha = "ab" * 20
-    body = (
-        f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 1, sha)}\n\n"
-        f"- Status: success\n- Run: https://github.com/example/repo/actions/runs/1\n- Reviewed: {sha}\n"
-        "- Last attempt: failure (https://runs/2)\n\nREAL FINDINGS"
-    )
+    body = _v3_body(_v3_state(head=sha), "REAL FINDINGS")
     context = _run_collect(tmp_path, [_bot("github-actions[bot]", body)])
     assert context is not None
     previous = context.split("## Recent human comments")[0]
@@ -1001,12 +1247,10 @@ def test_collect_exports_pair_when_prior_head_equals_current_fixture(tmp_path):
 def test_collect_ignores_meta_echo_outside_header_region(tmp_path):
     """본문에 에코된 '- Status: failure'/'- Reviewed:'는 메타로 오인되지 않는다."""
     sha1, sha2 = _two_commit_repo(tmp_path)
-    body = (
-        f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 1, sha1)}\n\n"
-        f"- Status: success\n- Run: https://github.com/example/repo/actions/runs/1\n- Reviewed: {sha1}\n\n"
+    body = _v3_body(
+        _v3_state(head=sha1),
         "findings...\n" + "filler\n" * 5
-        + "- Status: failure\n"
-        + f"- Reviewed: {'f' * 40}\n"
+        + "- Status: failure\n" + f"- Reviewed: {'f' * 40}\n",
     )
     context = _run_collect(
         tmp_path,
@@ -1532,6 +1776,7 @@ def _claude_upsert(
     with_review: bool,
     *,
     review: str = "REVIEW BODY OK",
+    raw_review: str | None = None,
     diff_ready: str = "true",
     run_id: str = "42",
     run_attempt: str = "1",
@@ -1539,12 +1784,22 @@ def _claude_upsert(
     full_diff_sha256: str = "34" * 32,
     diff_mode: str = "full",
     unchanged_since_previous: str = "false",
+    canonical_outcome: str = "success",
+    document_valid: str = "true",
+    accepted_count: str = "1",
+    filtered_count: str = "2",
+    normalized_count: str = "3",
+    filtered_max_severity: str = "HIGH",
+    canonical_failure_reason: str = "",
+    literal_schema: bool = False,
     current_head: str | None = None,
 ) -> list:
     workdir = tmp_path / ("with-review" if with_review else "without-review")
     workdir.mkdir()
     if with_review:
-        (workdir / "claude-review.md").write_text(review, encoding="utf-8")
+        (workdir / "claude-review-canonical.md").write_text(review, encoding="utf-8")
+    if raw_review is not None:
+        (workdir / "claude-review.md").write_text(raw_review, encoding="utf-8")
     env = {
         "PR_NUMBER": "7",
         "RUN_URL": "https://github.com/example/repo/actions/runs/42",
@@ -1558,11 +1813,208 @@ def _claude_upsert(
         "FULL_DIFF_SHA256": full_diff_sha256,
         "DIFF_MODE": diff_mode,
         "UNCHANGED_SINCE_PREVIOUS": unchanged_since_previous,
+        "CANONICAL_OUTCOME": canonical_outcome,
+        "DOCUMENT_VALID": document_valid,
+        "ACCEPTED_COUNT": accepted_count,
+        "FILTERED_COUNT": filtered_count,
+        "NORMALIZED_COUNT": normalized_count,
+        "FILTERED_MAX_SEVERITY": filtered_max_severity,
+        "CANONICAL_FAILURE_REASON": canonical_failure_reason,
     }
+    if not literal_schema:
+        comments = [_upgrade_claude_v2_fixture(comment) for comment in comments]
     return _run_upsert(
         tmp_path, "claude-code-review.yml", "claude-review", "Upsert review comment",
         env, comments, cwd=workdir, current_head=current_head or attempt_head,
     )
+
+
+def _posted_state(body: str) -> dict[str, object]:
+    match = re.search(r"^<!-- automation-state:(\{.*\}) -->$", body, re.M)
+    assert match
+    return json.loads(match.group(1))
+
+
+@node_required
+def test_claude_first_v3_success_reuses_v2_display_target_without_trusting_prose(tmp_path):
+    v2 = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            CLAUDE_HEADER, CLAUDE_V2_MARKER,
+            _state_line("claude", 7, 99, "ab" * 20),
+            "V2 PROSE MUST NOT SURVIVE",
+        ),
+        17,
+    )
+    calls = _claude_upsert(
+        tmp_path, "success", [v2], with_review=True,
+        review="### New findings\n\nNone",
+        raw_review="RAW MODEL POISON",
+        literal_schema=True,
+    )
+
+    updates = [call for call in calls if call[0] == "update"]
+    assert [call[1]["comment_id"] for call in updates] == [17]
+    body = updates[0][1]["body"]
+    assert body.splitlines()[:2] == [CLAUDE_HEADER, CLAUDE_V3_MARKER]
+    assert "### New findings\n\nNone" in body
+    assert "V2 PROSE MUST NOT SURVIVE" not in body
+    assert "RAW MODEL POISON" not in body
+
+
+@node_required
+def test_claude_success_publishes_only_canonical_file_bytes(tmp_path):
+    canonical = "### New findings\n\nNone\n- Run: `pytest -q` is evidence\n"
+    calls = _claude_upsert(
+        tmp_path, "success", [], with_review=True, review=canonical,
+        raw_review="[CRITICAL] RAW UNVALIDATED CLAIM",
+        accepted_count="0", filtered_count="7", normalized_count="1",
+        filtered_max_severity="CRITICAL",
+    )
+    body = _single_mutation_body(calls)
+    assert canonical in body
+    assert "RAW UNVALIDATED CLAIM" not in body
+    assert body.count("- Validation: accepted=0; filtered=7; normalized=1; filtered_max=CRITICAL") == 1
+
+
+@node_required
+def test_claude_first_v3_failure_has_null_quality_state(tmp_path):
+    calls = _claude_upsert(
+        tmp_path, "failure", [], with_review=False,
+        canonical_outcome="skipped", document_valid="false",
+    )
+    body = _single_mutation_body(calls)
+    state = _posted_state(body)
+    assert state["schema"] == 3
+    assert state["quality_schema"] == 1
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] is None
+    assert state["full_diff_sha256"] is None
+    assert {
+        key: state[key]
+        for key in ("accepted_count", "filtered_count", "normalized_count", "filtered_max_severity")
+    } == {
+        "accepted_count": None,
+        "filtered_count": None,
+        "normalized_count": None,
+        "filtered_max_severity": None,
+    }
+    assert "provider_failure" in body
+
+
+@node_required
+def test_claude_stale_v3_failure_preserves_authenticated_success_and_quality(tmp_path):
+    prior_head = "ab" * 20
+    prior_state = _v3_state(
+        run_id=1, head=prior_head, accepted_count=4, filtered_count=5,
+        normalized_count=6, filtered_max_severity="CRITICAL",
+    )
+    prior_body = "### New findings\n\n#### RVW-aaaaaaaaaaaa [HIGH] Prior\n"
+    existing = _bot("github-actions[bot]", _v3_body(prior_state, prior_body), 11)
+
+    calls = _claude_upsert(
+        tmp_path, "success", [existing], with_review=False,
+        document_valid="false", canonical_failure_reason="candidate_missing",
+    )
+    body = _single_mutation_body(calls)
+    state = _posted_state(body)
+    assert "- Status: stale" in body
+    assert prior_body in body
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] == prior_head
+    assert state["full_diff_sha256"] == "12" * 32
+    assert [state[key] for key in (
+        "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity"
+    )] == [4, 5, 6, "CRITICAL"]
+    assert [call for call in calls if call[0] == "notice"] == [
+        ["notice", "Claude review attempt failed: candidate_missing"]
+    ]
+
+
+@node_required
+def test_claude_unchanged_v3_success_advances_head_and_preserves_body_hash_quality(tmp_path):
+    prior_head = "ab" * 20
+    current_head = "cd" * 20
+    prior_state = _v3_state(run_id=1, head=prior_head)
+    canonical = "### New findings\n\nNone\n"
+    existing = _bot("github-actions[bot]", _v3_body(prior_state, canonical), 11)
+    calls = _claude_upsert(
+        tmp_path, "skipped", [existing], with_review=False,
+        diff_mode="unchanged", unchanged_since_previous="true",
+        attempt_head=current_head, current_head=current_head,
+        full_diff_sha256="12" * 32, canonical_outcome="skipped", document_valid="false",
+    )
+    body = _single_mutation_body(calls)
+    state = _posted_state(body)
+    assert state["attempt_status"] == "success"
+    assert state["attempt_head"] == current_head
+    assert state["successful_head"] == current_head
+    assert state["full_diff_sha256"] == "12" * 32
+    assert [state[key] for key in (
+        "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity"
+    )] == [1, 2, 3, "HIGH"]
+    assert canonical in body
+
+
+@node_required
+def test_claude_oversize_success_becomes_candidate_oversize_without_truncation(tmp_path):
+    prior_head = "ab" * 20
+    prior_body = "### New findings\n\nNone\n"
+    existing = _bot(
+        "github-actions[bot]", _v3_body(_v3_state(run_id=1, head=prior_head), prior_body), 11
+    )
+    oversized = "X" * 65536
+    calls = _claude_upsert(
+        tmp_path, "success", [existing], with_review=True, review=oversized,
+    )
+    body = _single_mutation_body(calls)
+    state = _posted_state(body)
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] == prior_head
+    assert prior_body in body
+    assert [call for call in calls if call[0] == "notice"] == [
+        ["notice", "Claude review attempt failed: candidate_oversize"]
+    ]
+    assert "X" * 100 not in body
+    assert "truncated" not in body
+
+
+@node_required
+def test_claude_oversize_stale_envelope_leaves_prior_success_untouched(tmp_path):
+    prior = _v3_body(_v3_state(run_id=1), "X" * 64810)
+    assert len(prior.encode("utf-8")) == 65533
+    existing = _bot("github-actions[bot]", prior, 11)
+
+    calls = _claude_upsert(
+        tmp_path, "success", [existing], with_review=False,
+        document_valid="false", canonical_failure_reason="candidate_missing",
+    )
+
+    assert not any(call[0] in {"create", "update"} for call in calls)
+    assert [call for call in calls if call[0] == "notice"] == [
+        ["notice", "Claude review failure envelope exceeds 65536 bytes; preserved existing success."]
+    ]
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("outcome", "diff_ready", "canonical_outcome", "document_valid", "hard_reason", "expected"),
+    [
+        ("failure", "false", "failure", "false", "candidate_missing", "diff_unavailable"),
+        ("failure", "true", "failure", "false", "candidate_missing", "provider_failure"),
+        ("success", "true", "failure", "false", "candidate_missing", "candidate_missing"),
+        ("success", "true", "failure", "false", "invented", "canonicalizer_error"),
+    ],
+)
+def test_claude_failure_reason_precedence_is_closed(
+    tmp_path, outcome, diff_ready, canonical_outcome, document_valid, hard_reason, expected
+):
+    calls = _claude_upsert(
+        tmp_path, outcome, [], with_review=False, diff_ready=diff_ready,
+        canonical_outcome=canonical_outcome, document_valid=document_valid,
+        canonical_failure_reason=hard_reason,
+    )
+    assert expected in _single_mutation_body(calls)
 
 
 def _gemini_upsert(
@@ -2222,16 +2674,16 @@ def test_gemini_upsert_discards_stale_head_before_comment_mutation(tmp_path):
 
 @node_required
 @pytest.mark.parametrize(
-    ("outcome", "diff_ready", "review", "expected_status"),
+    ("outcome", "diff_ready", "review", "document_valid", "expected_status"),
     [
-        ("success", "false", "diff unavailable", "failure"),
-        ("success", "true", "", "failure"),
-        ("success", "true", "<!-- automation:x -->", "failure"),
-        ("success", "true", "REAL FINDING", "success"),
+        ("success", "false", "diff unavailable", "true", "failure"),
+        ("success", "true", "", "true", "failure"),
+        ("success", "true", "<!-- automation:x -->", "false", "failure"),
+        ("success", "true", "REAL FINDING", "true", "success"),
     ],
 )
-def test_claude_checkpoint_requires_coverage_and_sanitized_body(
-    tmp_path, outcome, diff_ready, review, expected_status
+def test_claude_checkpoint_requires_coverage_and_valid_canonical_document(
+    tmp_path, outcome, diff_ready, review, document_valid, expected_status
 ):
     calls = _claude_upsert(
         tmp_path,
@@ -2240,6 +2692,8 @@ def test_claude_checkpoint_requires_coverage_and_sanitized_body(
         with_review=bool(review),
         review=review,
         diff_ready=diff_ready,
+        document_valid=document_valid,
+        canonical_failure_reason="ambiguous_document" if document_valid == "false" else "",
     )
     body = [c for c in calls if c[0] == "create"][0][1]["body"]
     assert f"- Status: {expected_status}" in body
@@ -2248,7 +2702,8 @@ def test_claude_checkpoint_requires_coverage_and_sanitized_body(
     state = json.loads(states[0])
     assert state["attempt_status"] == expected_status
     assert state["diff_mode"] == "full"
-    assert state["schema"] == 2
+    assert state["schema"] == 3
+    assert state["quality_schema"] == 1
     assert state["reviewer"] == "claude"
     assert state["pr"] == 7
     assert state["run_id"] == 42
@@ -2267,18 +2722,14 @@ def test_claude_checkpoint_requires_coverage_and_sanitized_body(
 @node_required
 def test_claude_infra_only_output_preserves_prior_success_as_stale(tmp_path):
     old_head = "ab" * 20
-    old_body = _v2_body(
-        CLAUDE_HEADER,
-        CLAUDE_V2_MARKER,
-        _state_line("claude", 7, 1, old_head),
-        "LAST GOOD REVIEW",
-    )
+    old_body = _v3_body(_v3_state(head=old_head), "LAST GOOD REVIEW")
     calls = _claude_upsert(
         tmp_path,
         "success",
         [_bot("github-actions[bot]", old_body, 11)],
-        with_review=True,
-        review="<!-- automation:x -->",
+        with_review=False,
+        document_valid="false",
+        canonical_failure_reason="ambiguous_document",
     )
     new_body = [c for c in calls if c[0] == "update"][0][1]["body"]
     assert "LAST GOOD REVIEW" in new_body
@@ -2471,7 +2922,7 @@ def test_upsert_updates_newest_bot_sticky_not_human_quote(tmp_path):
 
 
 @node_required
-def test_claude_exact_v1_display_target_migrates_to_v2_in_place(tmp_path):
+def test_claude_exact_v1_display_target_is_not_reused_for_v3(tmp_path):
     legacy = _bot(
         "github-actions[bot]",
         f"{CLAUDE_HEADER}\n{CLAUDE_MARKER}\n- Reviewed: {'ab' * 20}\nLEGACY DISPLAY BODY",
@@ -2480,14 +2931,11 @@ def test_claude_exact_v1_display_target_migrates_to_v2_in_place(tmp_path):
 
     calls = _claude_upsert(tmp_path, "success", [legacy], with_review=True)
 
-    updates = [call for call in calls if call[0] == "update"]
-    assert [call[1]["comment_id"] for call in updates] == [17]
-    assert not any(call[0] == "create" for call in calls)
-    body = updates[0][1]["body"]
-    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
-    assert body.splitlines()[:2] == [CLAUDE_HEADER, CLAUDE_V2_MARKER]
-    assert state["successful_head"] == "cd" * 20
-    assert state["diff_mode"] == "full"
+    assert not any(call[0] == "update" for call in calls)
+    creates = [call for call in calls if call[0] == "create"]
+    assert len(creates) == 1
+    body = creates[0][1]["body"]
+    assert body.splitlines()[:2] == [CLAUDE_HEADER, CLAUDE_V3_MARKER]
     assert "REVIEW BODY OK" in body
     assert "LEGACY DISPLAY BODY" not in body
 
@@ -2553,29 +3001,24 @@ def test_upsert_failure_preserves_sticky_and_stamps_attempt(tmp_path):
 @node_required
 def test_upsert_failure_stamp_replaces_previous_attempt_line(tmp_path):
     sha = "ab" * 20
-    body = (
-        f"{CLAUDE_HEADER}\n{CLAUDE_V2_MARKER}\n{_state_line('claude', 7, 1, sha)}\n\n"
-        "- Status: success\n- Run: https://github.com/example/repo/actions/runs/1\n"
-        f"- Reviewed: {sha}\n- Last attempt: failure (old-run)\n\nOLD"
+    body = _v3_body(
+        _v3_state(head=sha, attempt_status="failure"),
+        "OLD",
     )
     calls = _claude_upsert(
         tmp_path, "failure", [_bot("github-actions[bot]", body, 11)], with_review=False
     )
     new_body = [c for c in calls if c[0] == "update"][0][1]["body"]
     assert new_body.count("- Last attempt: ") == 1
-    assert "old-run" not in new_body
+    assert "actions/runs/1" not in new_body
     assert "https://github.com/example/repo/actions/runs/42" in new_body
 
 
 @node_required
-def test_upsert_strips_echoed_meta_from_review_output(tmp_path):
-    """에코된 헤더/메타 형태만 정밀 제거하고 정상 리뷰 라인은 살린다."""
+def test_upsert_strips_model_validation_line_from_canonical_output(tmp_path):
     review = (
-        f"{CLAUDE_HEADER}\n"
-        f"{CLAUDE_V2_MARKER}\n"
-        "- Status: success\n"
-        f"- Reviewed: {'cd' * 20}\n"
         "REAL FINDING\n"
+        "- Validation: accepted=999; filtered=0; normalized=0; filtered_max=none\n"
         "- Run: `pytest -q` to reproduce\n"
     )
     calls = _claude_upsert(
@@ -2584,9 +3027,9 @@ def test_upsert_strips_echoed_meta_from_review_output(tmp_path):
     body = [c for c in calls if c[0] == "create"][0][1]["body"]
     assert "REAL FINDING" in body
     assert "- Run: `pytest -q` to reproduce" in body   # 정상 리뷰 라인 생존
-    assert body.count(CLAUDE_V2_MARKER) == 1           # 워크플로우 헤더의 마커만
     assert body.count("## Claude Code Review (latest)") == 1
-    assert f"- Reviewed: {'cd' * 20}" not in body      # 에코 Reviewed 제거
+    assert "accepted=999" not in body
+    assert body.count("- Validation: ") == 1
 
 
 @node_required
