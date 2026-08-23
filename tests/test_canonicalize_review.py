@@ -369,6 +369,40 @@ def test_candidate_read_uses_a_bounded_os_read_after_a_size_race(case_factory, m
     assert read_sizes and max(read_sizes) <= canonicalize_review.MAX_CANDIDATE_BYTES + 1
 
 
+def test_candidate_short_read_does_not_hide_remaining_oversize_bytes(case_factory, monkeypatch):
+    """A one-shot short read must not turn an oversized candidate prefix into a clean result."""
+    clean_prefix = b"No blocking issues found."
+    payload = clean_prefix + b"x" * (canonicalize_review.MAX_CANDIDATE_BYTES + 1 - len(clean_prefix))
+    case = case_factory(payload)
+    original_read = canonicalize_review.os.read
+    original_fstat = canonicalize_review.os.fstat
+    requested: list[int] = []
+    retained: list[int] = []
+    monkeypatch.setattr(
+        canonicalize_review.os, "fstat",
+        lambda descriptor: SimpleNamespace(
+            st_size=len(clean_prefix), st_mode=original_fstat(descriptor).st_mode,
+        ),
+    )
+
+    def short_then_remaining(descriptor: int, size: int) -> bytes:
+        requested.append(size)
+        if len(requested) == 1:
+            chunk = original_read(descriptor, len(clean_prefix))
+        else:
+            chunk = original_read(descriptor, size)
+        retained.append(len(chunk))
+        return chunk
+
+    monkeypatch.setattr(canonicalize_review.os, "read", short_then_remaining)
+    result, canonical = case.run()
+    assert result.failure_reason == "candidate_oversize"
+    assert canonical is None
+    assert len(requested) == 2
+    assert max(requested) <= canonicalize_review.MAX_CANDIDATE_BYTES + 1
+    assert sum(retained) <= canonicalize_review.MAX_CANDIDATE_BYTES + 1
+
+
 def test_candidate_symlink_is_not_followed(case_factory):
     """A candidate symlink must not become a privileged input alias."""
     case = case_factory(None)

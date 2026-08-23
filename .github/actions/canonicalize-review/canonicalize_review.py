@@ -339,12 +339,19 @@ def _read_candidate(path: Path) -> tuple[str, bytes | None]:
             return "candidate_missing", None
         if os.fstat(descriptor).st_size > MAX_CANDIDATE_BYTES:
             return "candidate_oversize", None
-        payload = os.read(descriptor, MAX_CANDIDATE_BYTES + 1)
+        chunks: list[bytes] = []
+        remaining = MAX_CANDIDATE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
     finally:
         os.close(descriptor)
-    if len(payload) > MAX_CANDIDATE_BYTES:
+    if remaining == 0:
         return "candidate_oversize", None
-    return "", payload
+    return "", b"".join(chunks)
 
 
 def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
