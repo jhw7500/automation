@@ -48,6 +48,10 @@ CLAUDE_MARKER = "<!-- automation:claude-code-review -->"
 CLAUDE_HEADER = "## Claude Code Review (latest)"
 CLAUDE_V2_MARKER = "<!-- automation:claude-code-review:v2 -->"
 CLAUDE_V3_MARKER = "<!-- automation:claude-code-review:v3 -->"
+GEMINI_MARKER = "<!-- automation:gemini-auto-review -->"
+GEMINI_HEADER = "## 🔎 Gemini Code Review"
+GEMINI_V2_MARKER = "<!-- automation:gemini-auto-review:v2 -->"
+GEMINI_V3_MARKER = "<!-- automation:gemini-auto-review:v3 -->"
 
 
 def _state_line(
@@ -200,6 +204,62 @@ def _upgrade_claude_v2_fixture(comment: dict) -> dict:
     else:
         canonical = body.split("\n", 3)[-1]
         converted = _v3_body(state, canonical)
+        converted = re.sub(r"\n- Run: [^\n]+", "", converted, count=1)
+    upgraded = dict(comment)
+    upgraded["body"] = converted
+    return upgraded
+
+
+def _upgrade_gemini_v2_fixture(comment: dict) -> dict:
+    """Move legacy Gemini fixtures onto the v3 parser without hiding malformed state."""
+    body = comment.get("body", "")
+    prefix = f"{GEMINI_HEADER}\n{GEMINI_V2_MARKER}\n"
+    if not body.startswith(prefix):
+        return comment
+    lines = body.split("\n")
+    match = re.fullmatch(r"<!-- automation-state:(\{.*\}) -->", lines[2] if len(lines) > 2 else "")
+    if not match:
+        upgraded = dict(comment)
+        upgraded["body"] = body.replace(GEMINI_V2_MARKER, GEMINI_V3_MARKER, 1)
+        return upgraded
+    try:
+        old = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        upgraded = dict(comment)
+        upgraded["body"] = body.replace(GEMINI_V2_MARKER, GEMINI_V3_MARKER, 1)
+        return upgraded
+    state = _v3_state(
+        reviewer=old.get("reviewer", "gemini"),
+        pr=old.get("pr", 7),
+        run_id=old.get("run_id", 1),
+        head=old.get("attempt_head", "ab" * 20),
+        run_attempt=old.get("run_attempt", 1),
+    )
+    for key, value in old.items():
+        if key != "schema":
+            state[key] = value
+    state["schema"] = 3 if old.get("schema") == 2 else old.get("schema")
+    for required in (
+        "reviewer", "pr", "run_id", "run_attempt", "attempt_head", "successful_head",
+        "attempt_status", "diff_mode", "full_diff_sha256",
+    ):
+        if required not in old:
+            state.pop(required, None)
+    run_match = re.match(
+        r"^.*?\n\n- Run: (?P<run>[^\n]+)\n\n(?P<body>.*)$", body, re.S
+    )
+    if run_match:
+        canonical = run_match.group("body")
+        converted = _v3_body(
+            state, canonical, marker=GEMINI_V3_MARKER, header=GEMINI_HEADER
+        )
+        expected = f"https://github.com/example/repo/actions/runs/{state.get('run_id')}"
+        converted = converted.replace(expected, run_match.group("run"), 1)
+    else:
+        canonical = body.split("\n", 3)[-1]
+        converted = _v3_body(
+            state, canonical, marker=GEMINI_V3_MARKER, header=GEMINI_HEADER
+        )
         converted = re.sub(r"\n- Run: [^\n]+", "", converted, count=1)
     upgraded = dict(comment)
     upgraded["body"] = converted
@@ -1112,6 +1172,182 @@ def test_claude_first_v3_wiring_does_not_supply_unauthenticated_prior_file():
     assert expression.endswith("|| '' }}")
 
 
+def test_gemini_uses_the_same_canonicalizer_contract_as_claude():
+    workflow = _load("gemini-auto-review.yml")
+    job = workflow["jobs"]["gemini-review"]
+    actions = [
+        step for step in job["steps"]
+        if step.get("uses") == "$/.github/actions/canonicalize-review"
+    ]
+    assert len(actions) == 1
+    action = actions[0]
+    assert action["id"] == "canonicalize-review"
+    assert action["with"] == {
+        "reviewer": "gemini",
+        "candidate-file": "${{ github.workspace }}/gemini_review.md",
+        "canonical-file": "${{ github.workspace }}/gemini-review-canonical.md",
+        "result-file": "${{ github.workspace }}/gemini-review-result.json",
+        "scope-manifest": "${{ github.workspace }}/review-scope.json",
+        "selected-diff": (
+            "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
+            "&& format('{0}/review-delta.diff', github.workspace) "
+            "|| format('{0}/review-full.diff', github.workspace) }}"
+        ),
+        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
+        "previous-sha": "${{ steps.pr-details.outputs.previous_sha }}",
+        "previous-review-file": (
+            "${{ steps.pr-details.outputs.previous_sha != '' "
+            "&& format('{0}/gemini-previous-review.md', github.workspace) || '' }}"
+        ),
+    }
+    assert action["if"] == (
+        "${{ always() && steps.reset-gemini-artifacts.outcome == 'success' "
+        "&& steps.prepare-diff.outputs.diff-ready == 'true' "
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+    )
+
+    python = _extract_gemini_python()
+    assert "Cannot verify (outside provided diff)" not in python
+    assert "Never emit a `Cannot verify`" in python
+    for required in (
+        "### New findings", "### Still open", "### Resolved", "### Retracted",
+        "Changed anchor:", "Trigger evidence:",
+        "Impact class:", "Material impact:", "Performance basis:",
+        "Fix anchor:", "Resolution:", "Reason:",
+        "#### RVW-<12hex> [SEVERITY] title",
+    ):
+        assert required in python
+
+
+def test_reviewers_share_one_canonicalizer_each_and_opencode_has_no_shared_action():
+    counts = {}
+    for workflow_name, job_name in (
+        ("claude-code-review.yml", "claude-review"),
+        ("gemini-auto-review.yml", "gemini-review"),
+        ("opencode-auto-review.yml", "opencode-canonicalize"),
+    ):
+        job = _load(workflow_name)["jobs"][job_name]
+        counts[workflow_name] = sum(
+            step.get("uses") == "$/.github/actions/canonicalize-review"
+            for step in job["steps"]
+        )
+    assert counts == {
+        "claude-code-review.yml": 1,
+        "gemini-auto-review.yml": 1,
+        "opencode-auto-review.yml": 0,
+    }
+    for workflow_name, job_name in (
+        ("claude-code-review.yml", "claude-review"),
+        ("gemini-auto-review.yml", "gemini-review"),
+    ):
+        script = _step(_load(workflow_name), job_name, "Upsert review comment")["with"]["script"]
+        raw_name = "claude-review.md" if job_name == "claude-review" else "gemini_review.md"
+        assert f"readFileSync('{raw_name}'" not in script
+
+
+def test_gemini_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tmp_path):
+    workflow = _load("gemini-auto-review.yml")
+    steps = workflow["jobs"]["gemini-review"]["steps"]
+    model_index = next(
+        index for index, step in enumerate(steps) if step.get("name") == "Run Gemini Code Review"
+    )
+    cleanup = next(
+        (step for step in steps if step.get("name") == "Reset Gemini review artifacts"), None
+    )
+    assert cleanup is not None
+    assert steps.index(cleanup) == model_index - 1
+    expected_ready = (
+        "steps.prepare-diff.outputs.diff-ready == 'true' "
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged'"
+    )
+    assert cleanup["if"] == "${{ " + expected_ready + " }}"
+    assert steps[model_index]["if"] == (
+        "${{ steps.reset-gemini-artifacts.outcome == 'success' && " + expected_ready + " }}"
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    seeded_target = tmp_path / "seeded-provider-output.md"
+    seeded_target.write_text("### New findings\n\nNone\n", encoding="utf-8")
+    (workspace / "gemini_review.md").symlink_to(seeded_target)
+    artifacts = (
+        "gemini_review.md", "gemini-review-canonical.md", "gemini-review-result.json",
+        "gemini_review.py", "gemini_failure_reason.txt", "review_diff_truncated.txt",
+    )
+    for artifact in artifacts[1:]:
+        (workspace / artifact).write_text("checkout-seeded", encoding="utf-8")
+
+    cleanup_result = subprocess.run(
+        ["bash", "-c", cleanup["run"]], cwd=workspace,
+        env={**os.environ, "GITHUB_WORKSPACE": str(workspace)},
+        check=False, capture_output=True, text=True,
+    )
+    assert cleanup_result.returncode == 0, cleanup_result.stderr
+    assert seeded_target.read_text(encoding="utf-8") == "### New findings\n\nNone\n"
+    assert not any((workspace / artifact).exists() for artifact in artifacts)
+
+    result_file = workspace / "gemini-review-result.json"
+    canonicalizer = ROOT / ".github" / "actions" / "canonicalize-review" / "canonicalize_review.py"
+    canonicalize_result = subprocess.run(
+        [
+            "python3", str(canonicalizer), "--reviewer", "gemini",
+            "--candidate-file", str(workspace / "gemini_review.md"),
+            "--canonical-file", str(workspace / "gemini-review-canonical.md"),
+            "--result-file", str(result_file),
+            "--scope-manifest", str(workspace / "missing-scope.json"),
+            "--selected-diff", str(workspace / "missing-selected.diff"),
+            "--repository-root", str(workspace), "--diff-mode", "full",
+            "--previous-sha", "", "--previous-review-file", "",
+            "--expected-repository", "example/repo",
+        ],
+        cwd=workspace, check=False, capture_output=True, text=True,
+    )
+    assert canonicalize_result.returncode == 0, canonicalize_result.stderr
+    result = json.loads(result_file.read_text(encoding="utf-8"))
+    assert result["document_valid"] is False
+    assert result["failure_reason"] == "candidate_missing"
+    assert not (workspace / "gemini-review-canonical.md").exists()
+
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "gemini_review.md").mkdir()
+    blocked_result = subprocess.run(
+        ["bash", "-c", cleanup["run"]], cwd=blocked,
+        env={**os.environ, "GITHUB_WORKSPACE": str(blocked)},
+        check=False, capture_output=True, text=True,
+    )
+    assert blocked_result.returncode != 0
+
+
+def test_gemini_collector_unlinks_seeded_destinations_before_redirection(tmp_path):
+    targets = {}
+    destinations = (
+        "pr_title.txt", "pr_body.txt", "pr_number.txt", "pr_comments.json",
+        "gemini-previous-review.md", "prev_review.txt", "human_comments.txt",
+    )
+    for index, destination in enumerate(destinations):
+        target = tmp_path / f"outside-{index}.txt"
+        target.write_text(f"sentinel-{index}", encoding="utf-8")
+        (tmp_path / destination).symlink_to(target)
+        targets[destination] = target
+
+    previous, outputs = _run_gemini_details(
+        tmp_path, [], head_sha="ab" * 20, literal_schema=True
+    )
+
+    assert previous == ""
+    assert outputs == {"previous_sha": "", "previous_full_hash": ""}
+    for index, destination in enumerate(destinations):
+        assert targets[destination].read_text(encoding="utf-8") == f"sentinel-{index}"
+    assert not (tmp_path / "gemini-previous-review.md").exists()
+    for destination in (
+        "pr_title.txt", "pr_body.txt", "pr_number.txt", "pr_comments.json",
+        "prev_review.txt", "human_comments.txt",
+    ):
+        assert (tmp_path / destination).is_file()
+        assert not (tmp_path / destination).is_symlink()
+
+
 def test_claude_prompt_requires_shared_finding_grammar_without_workflow_metadata():
     prompt = _step(
         _load("claude-code-review.yml"), "claude-review", "Run Claude Code Review"
@@ -1203,7 +1439,8 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     gemini = _load("gemini-auto-review.yml")
     gemini_model = _step(gemini, "gemini-review", "Run Gemini Code Review")
     assert gemini_model["if"] == (
-        "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
+        "${{ steps.reset-gemini-artifacts.outcome == 'success' "
+        "&& steps.prepare-diff.outputs.diff-ready == 'true' "
         "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
     )
     assert gemini_model["env"]["REVIEW_DIFF_FILE"] == (
@@ -1385,11 +1622,6 @@ def test_collect_ignores_forged_reviewed_sha_in_body(tmp_path):
     }
 
 
-GEMINI_MARKER = "<!-- automation:gemini-auto-review -->"
-GEMINI_HEADER = "## 🔎 Gemini Code Review"
-GEMINI_V2_MARKER = "<!-- automation:gemini-auto-review:v2 -->"
-
-
 def test_gemini_collection_strips_reserved_lines_from_human_context(tmp_path):
     head = "ab" * 20
     comments = [
@@ -1417,15 +1649,20 @@ def test_gemini_collection_strips_reserved_lines_from_human_context(tmp_path):
     assert "- Reviewed:" not in human_context
 
 
-def _run_gemini_collection(tmp_path: Path, comments: list[dict]) -> str:
+def _run_gemini_collection(
+    tmp_path: Path, comments: list[dict], *, literal_schema: bool = False
+) -> str:
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Get PR details")["run"]
+    if not literal_schema:
+        comments = [_upgrade_gemini_v2_fixture(comment) for comment in comments]
     output = tmp_path / "github-output"
     env = _gh_stub(tmp_path, comments)
     env.update(
         {
             "SERVER_URL": "https://github.com",
             "REPOSITORY": "example/repo",
+            "GITHUB_WORKSPACE": str(tmp_path),
             "GITHUB_OUTPUT": str(output),
         }
     )
@@ -1439,16 +1676,23 @@ def _run_gemini_collection(tmp_path: Path, comments: list[dict]) -> str:
 
 
 def _run_gemini_details(
-    tmp_path: Path, comments: list[dict], *, head_sha: str = "ab" * 20
+    tmp_path: Path,
+    comments: list[dict],
+    *,
+    head_sha: str = "ab" * 20,
+    literal_schema: bool = False,
 ) -> tuple[str, dict[str, str]]:
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Get PR details")["run"]
+    if not literal_schema:
+        comments = [_upgrade_gemini_v2_fixture(comment) for comment in comments]
     output = tmp_path / "github-output"
     env = _gh_stub(tmp_path, comments, head_shas=[head_sha, head_sha])
     env.update(
         {
             "SERVER_URL": "https://github.com",
             "REPOSITORY": "example/repo",
+            "GITHUB_WORKSPACE": str(tmp_path),
             "GITHUB_OUTPUT": str(output),
         }
     )
@@ -1459,6 +1703,108 @@ def _run_gemini_details(
         (tmp_path / "prev_review.txt").read_text(encoding="utf-8"),
         _github_outputs(output),
     )
+
+
+def test_gemini_v2_is_display_only_and_cannot_enable_incremental_input(tmp_path):
+    head = "ab" * 20
+    legacy = _v2_body(
+        GEMINI_HEADER,
+        GEMINI_V2_MARKER,
+        _state_line("gemini", 7, 99, head),
+        "UNAUTHENTICATED V2 PROSE",
+    )
+
+    previous, outputs = _run_gemini_details(
+        tmp_path,
+        [_bot("github-actions[bot]", legacy)],
+        head_sha=head,
+        literal_schema=True,
+    )
+
+    assert previous == ""
+    assert outputs == {"previous_sha": "", "previous_full_hash": ""}
+    assert not (tmp_path / "gemini-previous-review.md").exists()
+
+
+def test_gemini_v3_collects_authenticated_pair_and_exact_canonical_body(tmp_path):
+    head = "ab" * 20
+    canonical = "### New findings\n\nNone\n"
+    sticky = _v3_body(
+        _v3_state(reviewer="gemini", head=head),
+        canonical,
+        marker=GEMINI_V3_MARKER,
+        header=GEMINI_HEADER,
+    )
+
+    previous, outputs = _run_gemini_details(
+        tmp_path, [_bot("github-actions[bot]", sticky)], head_sha=head
+    )
+
+    assert outputs == {"previous_sha": head, "previous_full_hash": "12" * 32}
+    assert (tmp_path / "gemini-previous-review.md").read_bytes() == canonical.encode()
+    assert "### New findings" in previous
+    for forbidden in (
+        GEMINI_HEADER, GEMINI_V3_MARKER, "automation-state:", "- Status:",
+        "- Run:", "- Reviewed:", "- Last attempt:", "- Validation:",
+    ):
+        assert forbidden not in previous
+
+
+def test_gemini_context_copy_sanitizes_reserved_lines_but_prior_file_stays_exact(tmp_path):
+    head = "ab" * 20
+    canonical = (
+        "VISIBLE CANONICAL FINDING\n"
+        "- Status: stale\n"
+        "- Run: https://github.com/example/repo/actions/runs/999\n"
+        f"- Reviewed: {head}\n"
+        "- Last attempt: failure (https://runs/999)\n"
+        "- Validation: accepted=999; filtered=0; normalized=0; filtered_max=none\n"
+        f"{GEMINI_HEADER}\n{GEMINI_V3_MARKER}\n"
+        "<!-- automation-state:{\"schema\":3} -->\n"
+    )
+    sticky = _v3_body(
+        _v3_state(reviewer="gemini", head=head),
+        canonical,
+        marker=GEMINI_V3_MARKER,
+        header=GEMINI_HEADER,
+    )
+
+    previous, _outputs = _run_gemini_details(
+        tmp_path, [_bot("github-actions[bot]", sticky)], head_sha=head
+    )
+
+    assert (tmp_path / "gemini-previous-review.md").read_bytes() == canonical.encode()
+    assert "VISIBLE CANONICAL FINDING" in previous
+    for forbidden in (
+        GEMINI_HEADER, GEMINI_V3_MARKER, "automation-state:", "- Status:",
+        "- Run:", "- Reviewed:", "- Last attempt:", "- Validation:",
+    ):
+        assert forbidden not in previous
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"reviewer": "claude"},
+        {"schema": 2},
+        {"extra": "no"},
+        {"accepted_count": -1},
+        {"filtered_count": 1.5},
+        {"normalized_count": 9007199254740992},
+        {"filtered_max_severity": "LOW"},
+    ],
+)
+def test_gemini_collector_rejects_unauthenticated_v3_state(tmp_path, changes):
+    state = _v3_state(reviewer="gemini")
+    state.update(changes)
+    sticky = _v3_body(
+        state, "POISON", marker=GEMINI_V3_MARKER, header=GEMINI_HEADER
+    )
+    _run_gemini_collection(
+        tmp_path, [_bot("github-actions[bot]", sticky)], literal_schema=True
+    )
+    assert _github_outputs(tmp_path / "github-output")["previous_sha"] == ""
+    assert not (tmp_path / "gemini-previous-review.md").exists()
 
 
 def test_gemini_canonical_v2_collection_and_shared_action_contract(tmp_path):
@@ -1521,7 +1867,7 @@ def test_gemini_canonical_v2_collection_and_shared_action_contract(tmp_path):
     details = _step(workflow, "gemini-review", "Get PR details")["run"]
     action = _step(workflow, "gemini-review", "Prepare review diff")
 
-    assert "<!-- automation:gemini-auto-review:v2 -->" in details
+    assert "<!-- automation:gemini-auto-review:v3 -->" in details
     assert "sort_by(.state.run_id, .state.run_attempt)" in details
     assert "gh pr diff" not in details
     assert action["uses"] == "$/.github/actions/prepare-review-diff"
@@ -2123,6 +2469,7 @@ def _gemini_upsert(
     with_review: bool,
     *,
     review: str = "GEMINI REVIEW BODY",
+    raw_review: str | None = None,
     diff_ready: str = "true",
     diff_truncated: str = "false",
     run_id: str = "42",
@@ -2132,12 +2479,22 @@ def _gemini_upsert(
     diff_mode: str = "full",
     unchanged_since_previous: str = "false",
     failure_reason: str = "",
+    canonical_outcome: str = "success",
+    document_valid: str = "true",
+    accepted_count: str = "1",
+    filtered_count: str = "2",
+    normalized_count: str = "3",
+    filtered_max_severity: str = "HIGH",
+    canonical_failure_reason: str = "",
+    literal_schema: bool = False,
     current_head: str | None = None,
 ) -> list:
     workdir = tmp_path / ("gemini-with-review" if with_review else "gemini-without-review")
-    workdir.mkdir()
+    workdir.mkdir(parents=True)
     if with_review:
-        (workdir / "gemini_review.md").write_text(review, encoding="utf-8")
+        (workdir / "gemini-review-canonical.md").write_text(review, encoding="utf-8")
+    if raw_review is not None:
+        (workdir / "gemini_review.md").write_text(raw_review, encoding="utf-8")
     env = {
         "PR_NUMBER": "7",
         "RUN_URL": "https://github.com/example/repo/actions/runs/42",
@@ -2153,7 +2510,16 @@ def _gemini_upsert(
         "DIFF_MODE": diff_mode,
         "UNCHANGED_SINCE_PREVIOUS": unchanged_since_previous,
         "FAILURE_REASON": failure_reason,
+        "CANONICAL_OUTCOME": canonical_outcome,
+        "DOCUMENT_VALID": document_valid,
+        "ACCEPTED_COUNT": accepted_count,
+        "FILTERED_COUNT": filtered_count,
+        "NORMALIZED_COUNT": normalized_count,
+        "FILTERED_MAX_SEVERITY": filtered_max_severity,
+        "CANONICAL_FAILURE_REASON": canonical_failure_reason,
     }
+    if not literal_schema:
+        comments = [_upgrade_gemini_v2_fixture(comment) for comment in comments]
     return _run_upsert(
         tmp_path, "gemini-auto-review.yml", "gemini-review", "Upsert review comment",
         env, comments, cwd=workdir, current_head=current_head or attempt_head,
@@ -2515,17 +2881,17 @@ def test_shared_diff_unchanged_still_obeys_head_and_generation_gates(tmp_path, u
 
 @node_required
 @pytest.mark.parametrize(
-    ("outcome", "diff_ready", "diff_truncated", "review", "expected_status"),
+    ("outcome", "diff_ready", "diff_truncated", "review", "document_valid", "expected_status"),
     [
-        ("success", "false", "false", "diff unavailable", "failure"),
-        ("success", "true", "false", "", "failure"),
-        ("success", "true", "false", "<!-- automation:x -->", "failure"),
-        ("success", "true", "true", "PARTIAL REVIEW", "failure"),
-        ("success", "true", "false", "REAL FINDING", "success"),
+        ("success", "false", "false", "diff unavailable", "true", "failure"),
+        ("success", "true", "false", "", "true", "failure"),
+        ("success", "true", "false", "INVALID CANDIDATE", "false", "failure"),
+        ("success", "true", "true", "PARTIAL REVIEW", "true", "failure"),
+        ("success", "true", "false", "REAL FINDING", "true", "success"),
     ],
 )
 def test_gemini_checkpoint_requires_full_coverage_and_sanitized_body(
-    tmp_path, outcome, diff_ready, diff_truncated, review, expected_status
+    tmp_path, outcome, diff_ready, diff_truncated, review, document_valid, expected_status
 ):
     calls = _gemini_upsert(
         tmp_path,
@@ -2535,24 +2901,32 @@ def test_gemini_checkpoint_requires_full_coverage_and_sanitized_body(
         review=review,
         diff_ready=diff_ready,
         diff_truncated=diff_truncated,
+        document_valid=document_valid,
+        canonical_outcome="failure" if document_valid == "false" else "success",
+        canonical_failure_reason="ambiguous_document" if document_valid == "false" else "",
     )
     body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
 
-    assert body.splitlines()[:2] == [GEMINI_HEADER, GEMINI_V2_MARKER]
+    assert body.splitlines()[:2] == [GEMINI_HEADER, GEMINI_V3_MARKER]
     assert f"- Status: {expected_status}" in body
-    assert state == {
-        "schema": 2,
-        "reviewer": "gemini",
-        "pr": 7,
-        "run_id": 42,
-        "run_attempt": 1,
-        "attempt_head": "cd" * 20,
-        "successful_head": "cd" * 20 if expected_status == "success" else None,
-        "attempt_status": expected_status,
-        "diff_mode": "full",
-        "full_diff_sha256": "34" * 32 if expected_status == "success" else None,
-    }
+    assert state["schema"] == 3
+    assert state["quality_schema"] == 1
+    assert state["reviewer"] == "gemini"
+    assert state["pr"] == 7
+    assert state["run_id"] == 42
+    assert state["run_attempt"] == 1
+    assert state["attempt_head"] == "cd" * 20
+    assert state["successful_head"] == ("cd" * 20 if expected_status == "success" else None)
+    assert state["attempt_status"] == expected_status
+    assert state["diff_mode"] == "full"
+    assert state["full_diff_sha256"] == ("34" * 32 if expected_status == "success" else None)
+    quality = [
+        state[key] for key in (
+            "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity"
+        )
+    ]
+    assert quality == ([1, 2, 3, "HIGH"] if expected_status == "success" else [None] * 4)
 
 
 @node_required
@@ -2582,7 +2956,11 @@ def test_gemini_provider_quota_failure_keeps_specific_reason(tmp_path):
         review="⚠️ Failed to generate Gemini review",
         failure_reason="quota_exhausted",
     )
-    assert "Reason: quota_exhausted" in _single_mutation_body(calls)
+    body = _single_mutation_body(calls)
+    assert "Reason: quota_exhausted" in body
+    state = _posted_state(body)
+    assert state["attempt_status"] == "failure"
+    assert state["accepted_count"] is None
     assert [call for call in calls if call[0] == "failed"] == [
         ["failed", "Gemini review checkpoint failed: quota_exhausted"]
     ]
@@ -2617,8 +2995,10 @@ def test_gemini_failure_after_success_preserves_body_and_hash_as_stale(tmp_path)
         tmp_path,
         "success",
         [_bot("github-actions[bot]", old_body, 11)],
-        with_review=True,
-        review="<!-- automation:x -->",
+        with_review=False,
+        canonical_outcome="failure",
+        document_valid="false",
+        canonical_failure_reason="ambiguous_document",
     )
     body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
@@ -2628,6 +3008,9 @@ def test_gemini_failure_after_success_preserves_body_and_hash_as_stale(tmp_path)
     assert state["attempt_status"] == "failure"
     assert state["successful_head"] == old_head
     assert state["full_diff_sha256"] == "12" * 32
+    assert [state[key] for key in (
+        "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity"
+    )] == [1, 2, 3, "HIGH"]
 
 
 @node_required
@@ -2642,50 +3025,268 @@ def test_gemini_output_sanitizer_preserves_normal_reviewer_prose(tmp_path):
 
 
 @node_required
-def test_gemini_output_sanitizer_drops_explicit_unverified_sections(tmp_path):
-    review = """No blocking issues found.
+def test_gemini_upsert_publishes_canonical_only_and_never_raw_unverified_text(tmp_path):
+    canonical = "### New findings\n\nNone\n"
+    raw = """### Cannot verify (outside provided diff)
 
-## Summary
-
-Verified summary stays visible.
-
-## Cannot verify (outside provided diff)
-
-- [HIGH] OLD OUTSIDE-SCOPE ITEM
-### Nested stale detail
-This is not reviewable in the selected diff.
-
-## Resolved
-
-Confirmed resolution stays visible.
+#### [HIGH] OLD OUTSIDE-SCOPE ITEM
 """
-    calls = _gemini_upsert(tmp_path, "success", [], with_review=True, review=review)
+    calls = _gemini_upsert(
+        tmp_path, "success", [], with_review=True, review=canonical, raw_review=raw,
+        accepted_count="0", filtered_count="1", normalized_count="0",
+        filtered_max_severity="HIGH",
+    )
     body = _single_mutation_body(calls)
 
-    assert "Verified summary stays visible." in body
-    assert "Confirmed resolution stays visible." in body
+    assert canonical in body
     assert "Cannot verify" not in body
     assert "OLD OUTSIDE-SCOPE ITEM" not in body
-    assert "Nested stale detail" not in body
-    assert [call for call in calls if call[0] == "notice"] == [
-        ["notice", "Dropped 1 non-actionable Gemini review section(s)."]
+    assert body.count(
+        "- Validation: accepted=0; filtered=1; normalized=0; filtered_max=HIGH"
+    ) == 1
+
+
+@node_required
+def test_gemini_upsert_strips_model_validation_line_from_canonical_output(tmp_path):
+    review = (
+        "### New findings\n\nNone\n"
+        "- Validation: accepted=999; filtered=0; normalized=0; filtered_max=none\n"
+        "- Run: `pytest -q` before merging\n"
+    )
+    body = _single_mutation_body(
+        _gemini_upsert(
+            tmp_path, "success", [], with_review=True, review=review,
+            accepted_count="0", filtered_count="2", normalized_count="1",
+            filtered_max_severity="CRITICAL",
+        )
+    )
+
+    assert "accepted=999" not in body
+    assert "- Run: `pytest -q` before merging" in body
+    assert body.count(
+        "- Validation: accepted=0; filtered=2; normalized=1; filtered_max=CRITICAL"
+    ) == 1
+    assert "- Status: success" in body
+
+
+@node_required
+def test_gemini_first_v3_success_reuses_v2_display_target_without_trusting_prose(tmp_path):
+    v2 = _bot(
+        "github-actions[bot]",
+        _v2_body(
+            GEMINI_HEADER, GEMINI_V2_MARKER,
+            _state_line("gemini", 7, 99, "ab" * 20),
+            "V2 PROSE MUST NOT SURVIVE",
+        ),
+        17,
+    )
+    calls = _gemini_upsert(
+        tmp_path, "success", [v2], with_review=True,
+        review="### New findings\n\nNone",
+        raw_review="RAW MODEL POISON",
+        literal_schema=True,
+    )
+
+    updates = [call for call in calls if call[0] == "update"]
+    assert [call[1]["comment_id"] for call in updates] == [17]
+    body = updates[0][1]["body"]
+    assert body.splitlines()[:2] == [GEMINI_HEADER, GEMINI_V3_MARKER]
+    assert "### New findings\n\nNone" in body
+    assert "V2 PROSE MUST NOT SURVIVE" not in body
+    assert "RAW MODEL POISON" not in body
+
+
+@node_required
+def test_gemini_v1_display_target_is_not_reused_for_v3(tmp_path):
+    legacy = _bot(
+        "github-actions[bot]",
+        f"REPO: example/repo\nPR NUMBER: 7\nReviewer: Gemini Auto (Diff Focus)\n"
+        f"{GEMINI_MARKER}\n{GEMINI_HEADER}\nLEGACY DISPLAY BODY",
+        17,
+    )
+
+    calls = _gemini_upsert(
+        tmp_path, "success", [legacy], with_review=True, literal_schema=True
+    )
+
+    assert not any(call[0] == "update" for call in calls)
+    creates = [call for call in calls if call[0] == "create"]
+    assert len(creates) == 1
+    assert creates[0][1]["body"].splitlines()[:2] == [GEMINI_HEADER, GEMINI_V3_MARKER]
+    assert "LEGACY DISPLAY BODY" not in creates[0][1]["body"]
+
+
+@node_required
+def test_gemini_soft_filtered_candidate_is_success_with_quality_metadata(tmp_path):
+    calls = _gemini_upsert(
+        tmp_path, "success", [], with_review=True,
+        review="### New findings\n\nNo validated blocking issues found.",
+        accepted_count="0", filtered_count="2", normalized_count="0",
+        filtered_max_severity="HIGH",
+    )
+    body = _single_mutation_body(calls)
+    state = _posted_state(body)
+
+    assert state["attempt_status"] == "success"
+    assert [state[key] for key in (
+        "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity"
+    )] == [0, 2, 0, "HIGH"]
+    assert "[HIGH]" not in body
+    assert not any(call[0] == "failed" for call in calls)
+
+
+@node_required
+def test_gemini_unchanged_v3_success_advances_head_and_preserves_body_hash_quality(tmp_path):
+    prior_head = "ab" * 20
+    current_head = "cd" * 20
+    prior_state = _v3_state(
+        reviewer="gemini", run_id=1, head=prior_head,
+        accepted_count=4, filtered_count=5, normalized_count=6,
+        filtered_max_severity="CRITICAL",
+    )
+    canonical = "### New findings\n\nNone\n"
+    existing = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            prior_state, canonical, marker=GEMINI_V3_MARKER, header=GEMINI_HEADER
+        ),
+        11,
+    )
+    calls = _gemini_upsert(
+        tmp_path, "skipped", [existing], with_review=False,
+        diff_mode="unchanged", unchanged_since_previous="true",
+        attempt_head=current_head, current_head=current_head,
+        full_diff_sha256="12" * 32,
+        canonical_outcome="skipped", document_valid="false",
+    )
+    body = _single_mutation_body(calls)
+    state = _posted_state(body)
+
+    assert state["attempt_status"] == "success"
+    assert state["successful_head"] == current_head
+    assert state["full_diff_sha256"] == "12" * 32
+    assert [state[key] for key in (
+        "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity"
+    )] == [4, 5, 6, "CRITICAL"]
+    assert canonical in body
+
+
+@node_required
+def test_gemini_final_comment_gate_counts_utf8_bytes_and_never_truncates(tmp_path):
+    prior_head = "ab" * 20
+    prior_body = "### New findings\n\nNone\n"
+    existing = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer="gemini", run_id=1, head=prior_head),
+            prior_body,
+            marker=GEMINI_V3_MARKER,
+            header=GEMINI_HEADER,
+        ),
+        11,
+    )
+    multibyte = "한" * 30_000
+    assert len(multibyte) < 65_536
+    assert len(multibyte.encode("utf-8")) > 65_536
+
+    calls = _gemini_upsert(
+        tmp_path, "success", [existing], with_review=True, review=multibyte
+    )
+    body = _single_mutation_body(calls)
+    state = _posted_state(body)
+
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] == prior_head
+    assert prior_body in body
+    assert "한" * 100 not in body
+    assert "truncated" not in body
+    assert [call for call in calls if call[0] == "failed"] == [
+        ["failed", "Gemini review checkpoint failed: candidate_oversize"]
     ]
 
 
 @node_required
-def test_gemini_output_sanitizer_normalizes_only_unverified_sections_to_none(tmp_path):
-    review = """## Outside provided scope
+def test_gemini_exact_65536_envelope_is_accepted_and_65537_is_rejected(tmp_path):
+    state = _v3_state(
+        reviewer="gemini", pr=7, run_id=42, head="cd" * 20,
+        full_diff_sha256="34" * 32,
+    )
+    empty_envelope = _v3_body(
+        state, "", marker=GEMINI_V3_MARKER, header=GEMINI_HEADER
+    )
+    body_bytes = len(empty_envelope.encode("utf-8"))
+    exact = "X" * (65_536 - body_bytes)
 
-[MEDIUM] Unverifiable backlog item
-"""
-    body = _single_mutation_body(
-        _gemini_upsert(tmp_path, "success", [], with_review=True, review=review)
+    accepted = _gemini_upsert(
+        tmp_path / "accepted", "success", [], with_review=True, review=exact
+    )
+    accepted_body = _single_mutation_body(accepted)
+    assert len(accepted_body.encode("utf-8")) == 65_536
+    assert _posted_state(accepted_body)["attempt_status"] == "success"
+
+    rejected = _gemini_upsert(
+        tmp_path / "rejected", "success", [], with_review=True, review=exact + "X"
+    )
+    rejected_body = _single_mutation_body(rejected)
+    assert _posted_state(rejected_body)["attempt_status"] == "failure"
+    assert "Reason: candidate_oversize" in rejected_body
+    assert "X" * 100 not in rejected_body
+
+
+@node_required
+def test_gemini_oversize_stale_envelope_leaves_prior_success_untouched(tmp_path):
+    empty = _v3_body(
+        _v3_state(reviewer="gemini", run_id=1), "",
+        marker=GEMINI_V3_MARKER, header=GEMINI_HEADER,
+    )
+    prior = empty + ("X" * (65_533 - len(empty.encode("utf-8"))))
+    assert len(prior.encode("utf-8")) == 65_533
+    existing = _bot("github-actions[bot]", prior, 11)
+
+    calls = _gemini_upsert(
+        tmp_path, "success", [existing], with_review=False,
+        document_valid="false", canonical_outcome="failure",
+        canonical_failure_reason="candidate_missing",
     )
 
-    assert "No blocking issues found." in body
-    assert "Outside provided scope" not in body
-    assert "Unverifiable backlog item" not in body
-    assert "- Status: success" in body
+    assert not any(call[0] in {"create", "update"} for call in calls)
+    assert [call for call in calls if call[0] == "notice"] == [
+        ["notice", "Gemini review failure envelope exceeds 65536 bytes; preserved existing success."]
+    ]
+    assert [call for call in calls if call[0] == "failed"] == [
+        ["failed", "Gemini review checkpoint failed: candidate_missing"]
+    ]
+
+
+@node_required
+@pytest.mark.parametrize(
+    (
+        "outcome", "diff_ready", "diff_truncated", "provider_reason",
+        "canonical_reason", "expected",
+    ),
+    [
+        ("failure", "false", "true", "quota_exhausted", "candidate_missing", "diff_unavailable"),
+        ("failure", "true", "true", "quota_exhausted", "candidate_missing", "coverage_truncated"),
+        ("failure", "true", "false", "quota_exhausted", "candidate_missing", "quota_exhausted"),
+        ("success", "true", "false", "provider_failed", "candidate_missing", "candidate_missing"),
+        ("success", "true", "false", "provider_failed", "invented", "canonicalizer_error"),
+    ],
+)
+def test_gemini_failure_reason_precedence_is_closed(
+    tmp_path, outcome, diff_ready, diff_truncated, provider_reason, canonical_reason, expected
+):
+    calls = _gemini_upsert(
+        tmp_path, outcome, [], with_review=False,
+        diff_ready=diff_ready, diff_truncated=diff_truncated,
+        failure_reason=provider_reason,
+        canonical_outcome="failure", document_valid="false",
+        canonical_failure_reason=canonical_reason,
+    )
+    body = _single_mutation_body(calls)
+    assert f"Reason: {expected}" in body
+    assert [call for call in calls if call[0] == "failed"] == [
+        ["failed", f"Gemini review checkpoint failed: {expected}"]
+    ]
 
 
 @node_required
