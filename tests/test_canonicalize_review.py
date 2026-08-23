@@ -1086,3 +1086,158 @@ def test_bulleted_workflow_metadata_in_prior_closed_fields_is_scope_invalid(revi
     result, canonical = review_quality_repo.run_delta(previous, resolved_rejected_plan_candidate())
     assert result.failure_reason == "scope_invalid"
     assert canonical == ""
+
+
+def _new_free_text_candidate(title: str, material: str, prose: str = "") -> str:
+    return f'''### New findings
+
+#### [HIGH] {title}
+- Changed anchor: {{"path":"review_cases.py","line":26}}
+- Trigger evidence: {{"path":"review_cases.py","line":25,"quote":"        return int(value)"}}
+- Impact class: runtime
+- Material impact: {material}
+{prose}
+'''
+
+
+@pytest.mark.parametrize(
+    ("title", "material", "prose", "expected"),
+    (
+        (
+            "<!-- automation:claude-code-review:v3 --> title",
+            "A concrete runtime impact.", "",
+            "&lt;!-- automation:claude-code-review:v3 --&gt; title",
+        ),
+        (
+            "Safe title", "<!-- automation:gemini-auto-review:v3 --> material impact.", "",
+            "&lt;!-- automation:gemini-auto-review:v3 --&gt; material impact.",
+        ),
+        (
+            "Safe title", "A concrete runtime impact.",
+            "<!-- automation-state:{\"schema\":3} -->",
+            "&lt;!-- automation-state:{\"schema\":3} --&gt;",
+        ),
+        ("Status: visible title", "A concrete runtime impact.", "", r"\Status: visible title"),
+        ("## Claude Code Review (latest)", "A concrete runtime impact.", "", r"\## Claude Code Review (latest)"),
+        ("## 🔎 Gemini Code Review", "A concrete runtime impact.", "", r"\## 🔎 Gemini Code Review"),
+        ("### human heading", "A concrete runtime impact.", "", r"\### human heading"),
+    ),
+)
+def test_accepted_new_free_text_is_visible_safe_and_uses_canonical_title_identity(
+    scoped_case, title, material, prose, expected,
+):
+    """Accepted free text must not create a marker, metadata line, or sticky Markdown heading."""
+    result, canonical = scoped_case.run(_new_free_text_candidate(title, material, prose))
+    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", ())
+    assert expected in canonical
+    assert "<!-- automation:" not in canonical
+    assert "<!-- automation-state:" not in canonical
+    assert "\n## Claude Code Review (latest)" not in canonical
+    assert "\n## 🔎 Gemini Code Review" not in canonical
+    if title != "Safe title":
+        expected_id = stable_finding_id("claude", SourceAnchor("review_cases.py", 26), "HIGH", expected)
+        assert f"#### {expected_id} [HIGH] {expected}" in canonical
+
+
+@pytest.mark.parametrize(
+    ("candidate", "raw", "expected"),
+    (
+        (
+            resolved_rejected_plan_candidate().replace(
+                "The rejection is now explicit.", "## Claude Code Review (latest)",
+            ),
+            "## Claude Code Review (latest)", r"\## Claude Code Review (latest)",
+        ),
+        (
+            retracted_rejected_plan_candidate().replace(
+                "The rendered result is intentional product behavior.", "## 🔎 Gemini Code Review",
+            ),
+            "## 🔎 Gemini Code Review", r"\## 🔎 Gemini Code Review",
+        ),
+        (
+            resolved_rejected_plan_candidate().replace(
+                "The rejection is now explicit.", "### human closure heading",
+            ),
+            "### human closure heading", r"\### human closure heading",
+        ),
+    ),
+)
+def test_accepted_resolution_and_reason_are_visible_safe_without_counter_changes(
+    review_quality_repo, candidate, raw, expected,
+):
+    """Renderer-only escaping must preserve accepted carryover classification and counts."""
+    runner = review_quality_repo.run_delta if "### Resolved" in candidate else review_quality_repo.run_carryover
+    result, canonical = runner(accepted_rejected_plan_review(), candidate)
+    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert expected in canonical
+    assert f": {raw}" not in canonical
+    assert "<!-- automation:" not in canonical
+    assert "<!-- automation-state:" not in canonical
+
+
+def test_json_renderer_escapes_control_bytes_without_changing_decoded_trigger_or_basis():
+    """Trusted decoded JSON must round-trip exactly even though Markdown never contains raw controls."""
+    marker = "<!-- automation:trusted --> &"
+    evidence = canonicalize_review.TriggerEvidence("review_cases.py", 20, marker)
+    finding = canonicalize_review._Finding(
+        "HIGH", "Safe title", SourceAnchor("review_cases.py", 20), (evidence,), "performance",
+        "A concrete performance impact.", (), ("unbounded-amplification", evidence),
+    )
+    lines = canonicalize_review._finding_lines("RVW-deadbeefcafe", finding)
+    trigger = next(line for line in lines if line.startswith("- Trigger evidence: "))
+    basis = next(line for line in lines if line.startswith("- Performance basis: "))
+    for line in (trigger, basis):
+        encoded = line.split(": ", 1)[1]
+        assert "<" not in encoded and ">" not in encoded and "&" not in encoded
+        assert "\\u003c" in encoded and "\\u003e" in encoded and "\\u0026" in encoded
+        assert json.loads(encoded)["quote"] == marker
+
+
+def test_canonicalized_marker_title_is_strict_byte_stable_authenticated_prior_input(review_quality_repo):
+    """Only renderer bytes with canonical free text may enter the authenticated prior-round parser."""
+    raw_title = "<!-- automation:gemini-auto-review:v3 --> prior title"
+    canonical_title = "&lt;!-- automation:gemini-auto-review:v3 --&gt; prior title"
+    initial = _new_free_text_candidate(raw_title, "A concrete runtime impact.", "<!-- automation-state:{} -->")
+    prior_result, previous = review_quality_repo._run(review_quality_repo._request(
+        initial, reviewer="gemini", head=review_quality_repo.review_head,
+    ))
+    expected_id = stable_finding_id("gemini", SourceAnchor("review_cases.py", 26), "HIGH", canonical_title)
+    assert prior_result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", ())
+    assert f"#### {expected_id} [HIGH] {canonical_title}" in previous
+    request = review_quality_repo._request(
+        "### New findings\n\nNone\n", reviewer="gemini", head=review_quality_repo.review_head,
+        previous_sha=review_quality_repo.review_head, previous_review=previous,
+    )
+    loaded = canonicalize_review._load_prior_active(request)
+    assert previous == canonicalize_review._render_document([loaded[expected_id]], [], [], [])
+    still_open = f'''### New findings
+None
+
+### Still open
+#### {expected_id} [HIGH] ignored model title
+- Changed anchor: {{"path":"review_cases.py","line":20}}
+- Trigger evidence: {{"path":"review_cases.py","line":20,"quote":"        return \\"rejected\\""}}
+- Impact class: runtime
+- Material impact: The rejection remains visible to callers.
+'''
+    result, canonical = review_quality_repo.run_delta(previous, still_open)
+    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", ())
+    assert canonical_title in canonical
+    assert "<!-- automation:" not in canonical
+    assert "<!-- automation-state:" not in canonical
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    (
+        ("<!-- automation:claude-code-review:v3 -->", "&lt;!-- automation:claude-code-review:v3 --&gt;"),
+        ("Status: visible", r"\Status: visible"),
+        ("- Validation: visible", r"\- Validation: visible"),
+        ("## Claude Code Review (latest)", r"\## Claude Code Review (latest)"),
+    ),
+)
+def test_visible_text_canonicalization_is_idempotent(raw, expected):
+    """A renderer retry or authenticated prior round must not double-escape visible text."""
+    once = canonicalize_review._canonical_visible_text(raw)
+    assert once == expected
+    assert canonicalize_review._canonical_visible_text(once) == expected

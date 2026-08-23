@@ -43,6 +43,9 @@ WORKFLOW_OWNED = re.compile(
     r"^\s*(?:-\s*)?(?:status|run|reviewed|validation)\s*:)", re.IGNORECASE,
 )
 SECTION_NAMES = ("New findings", "Still open", "Resolved", "Retracted")
+VISIBLE_METADATA = re.compile(r"^(?:-\s*)?(?:status|run|reviewed|validation)\s*:", re.IGNORECASE)
+VISIBLE_HEADING = re.compile(r"^#{1,6}(?:\s|$)")
+STICKY_HEADERS = frozenset({"## Claude Code Review (latest)", "## 🔎 Gemini Code Review"})
 
 
 @dataclass(frozen=True)
@@ -134,12 +137,24 @@ class _PriorHeading:
     title: str
 
 
+def _canonical_visible_text(value: str) -> str:
+    """Render untrusted free text visibly without allowing workflow control syntax."""
+    safe = value.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+    offset = len(safe) - len(safe.lstrip())
+    leading, body = safe[:offset], safe[offset:]
+    if body in STICKY_HEADERS or VISIBLE_METADATA.match(body) or VISIBLE_HEADING.match(body):
+        return leading + "\\" + body
+    return safe
+
+
 def normalize_title(title: str) -> str:
     return " ".join(title.split()).casefold()
 
 
 def stable_finding_id(reviewer: str, anchor: SourceAnchor, severity: str, title: str) -> str:
-    identity = "\0".join((reviewer, anchor.path, str(anchor.line), severity, normalize_title(title)))
+    identity = "\0".join((
+        reviewer, anchor.path, str(anchor.line), severity, normalize_title(_canonical_visible_text(title)),
+    ))
     return "RVW-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
 
 
@@ -275,8 +290,7 @@ def _validate_new(block: _Block, scope: object) -> tuple[_Finding | None, str | 
     material_values = _field_values(block.lines, "Material impact")
     material = material_values[0].strip() if len(material_values) == 1 else ""
     extra_prose = tuple(
-        line for line in block.lines
-        if line and not line.startswith("- ") and not WORKFLOW_OWNED.search(line)
+        _canonical_visible_text(line) for line in block.lines if line and not line.startswith("- ")
     )
     material_text = " ".join((material, *extra_prose)).strip()
     if not material or PROOF_DEFICIT.search(material_text):
@@ -298,17 +312,20 @@ def _validate_new(block: _Block, scope: object) -> tuple[_Finding | None, str | 
             return None, "unsupported_performance_basis"
         performance_basis = (basis["kind"], basis_evidence)
     return _Finding(
-        block.severity, block.title, anchor, evidence, impact, material, extra_prose, performance_basis
+        block.severity, _canonical_visible_text(block.title), anchor, evidence, impact,
+        _canonical_visible_text(material), extra_prose, performance_basis,
     ), None
 
 
 def _json_line(value: dict[str, object]) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).translate(str.maketrans({
+        "<": "\\u003c", ">": "\\u003e", "&": "\\u0026",
+    }))
 
 
 def _finding_lines(finding_id: str, finding: _Finding) -> list[str]:
     lines = [
-        f"#### {finding_id} [{finding.severity}] {finding.title}",
+        f"#### {finding_id} [{finding.severity}] {_canonical_visible_text(finding.title)}",
         "- Changed anchor: " + _json_line({"path": finding.anchor.path, "line": finding.anchor.line}),
     ]
     for evidence in finding.evidence:
@@ -317,14 +334,14 @@ def _finding_lines(finding_id: str, finding: _Finding) -> list[str]:
         }))
     lines.extend((
         f"- Impact class: {finding.impact_class}",
-        f"- Material impact: {finding.material_impact}",
+        f"- Material impact: {_canonical_visible_text(finding.material_impact)}",
     ))
     if finding.performance_basis is not None:
         kind, basis = finding.performance_basis
         lines.append("- Performance basis: " + _json_line({
             "kind": kind, "path": basis.path, "line": basis.line, "quote": basis.quote,
         }))
-    lines.extend(finding.prose)
+    lines.extend(_canonical_visible_text(line) for line in finding.prose)
     return lines
 
 
@@ -344,7 +361,7 @@ def _prior_severity(prior: _PriorFinding | _PriorHeading) -> str:
 
 
 def _prior_title(prior: _PriorFinding | _PriorHeading) -> str:
-    return prior.finding.title if isinstance(prior, _PriorFinding) else prior.title
+    return _canonical_visible_text(prior.finding.title if isinstance(prior, _PriorFinding) else prior.title)
 
 
 def _render_resolved_section(resolved: list[tuple[_PriorFinding | _PriorHeading, SourceAnchor, str]]) -> str:
@@ -355,7 +372,7 @@ def _render_resolved_section(resolved: list[tuple[_PriorFinding | _PriorHeading,
         lines.extend((
             f"#### {prior.finding_id} [{_prior_severity(prior)}] {_prior_title(prior)}",
             "- Fix anchor: " + _json_line({"path": anchor.path, "line": anchor.line}),
-            f"- Resolution: {resolution}",
+            f"- Resolution: {_canonical_visible_text(resolution)}",
         ))
     return "\n".join(lines)
 
@@ -369,7 +386,7 @@ def _render_retracted_section(retracted: list[tuple[_PriorFinding | _PriorHeadin
         lines.extend("- Trigger evidence: " + _json_line({
             "path": item.path, "line": item.line, "quote": item.quote,
         }) for item in evidence)
-        lines.append(f"- Reason: {reason}")
+        lines.append(f"- Reason: {_canonical_visible_text(reason)}")
     return "\n".join(lines)
 
 
@@ -648,7 +665,7 @@ def _validate_resolved(block: _Block, scope: object) -> tuple[SourceAnchor | Non
         f"- Resolution: {resolution}",
     ):
         return None, None
-    return anchor, resolution
+    return anchor, _canonical_visible_text(resolution)
 
 
 def _validate_retracted(block: _Block, scope: object) -> tuple[tuple[TriggerEvidence, ...] | None, str | None]:
@@ -665,7 +682,7 @@ def _validate_retracted(block: _Block, scope: object) -> tuple[tuple[TriggerEvid
     ) + (f"- Reason: {reason}",)
     if _trim_section_padding(block.lines) != expected:
         return None, None
-    return parsed, reason
+    return parsed, _canonical_visible_text(reason)
 
 
 def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
