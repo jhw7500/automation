@@ -1256,6 +1256,57 @@ def test_v146_rejects_every_effective_protected_module_rebinding(
 
 
 @pytest.mark.parametrize(
+    ("relative", "suffix"),
+    (
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "\n",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "\n",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "\n# harmless authenticated-source drift\n",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "\n# harmless authenticated-source drift\n",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "\nglobals().update({})\n",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "\nglobals()[\"unprotected_probe\"] = None\n",
+        ),
+    ),
+    ids=(
+        "canonicalizer-whitespace",
+        "scope-whitespace",
+        "canonicalizer-comment-append",
+        "scope-comment-append",
+        "canonicalizer-globals-update",
+        "scope-globals-subscript",
+    ),
+)
+def test_v146_authenticates_exact_helper_source_bytes(
+    current_release_repo: tuple[Path, str], relative: str, suffix: str
+) -> None:
+    repo, _ = current_release_repo
+    helper = repo / relative
+    helper.write_bytes(helper.read_bytes() + suffix.encode("utf-8"))
+    bad_commit = commit(repo, f"drift authenticated helper bytes in {relative}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
     ("relative", "old", "new"),
     (
         (
@@ -1351,12 +1402,12 @@ def test_v146_helper_verification_compiles_but_never_executes_commit_code(
     )
     commit_with_side_effect = commit(repo, "prove helper verifier is static")
 
-    assert (
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract"
+    ):
         release_verifier.verify_commit_content(
             repo, "v1.46", commit_with_side_effect
         )
-        == commit_with_side_effect
-    )
     assert not sentinel.exists()
 
 

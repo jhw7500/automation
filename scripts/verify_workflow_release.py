@@ -342,6 +342,12 @@ EXPECTED_CANONICALIZER_SOFT_REASONS = frozenset(
         "missing_fix_anchor",
     }
 )
+EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256 = (
+    "70236fc7272235a762a1190fef2198f79945915460786d8b2d9b842c702b6cc6"
+)
+EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
+    "cf170639e9dc76ee361086074cf327d091dc8c002c9a3108baf7eb3b02b875bd"
+)
 EXPECTED_SCOPE_GIT_ENV = {
     "PATH": "/usr/bin:/bin",
     "HOME": "/nonexistent/automation-review-scope/home",
@@ -1991,8 +1997,17 @@ def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree) -> None:
     canonical_path = CANONICALIZE_REVIEW_HELPER_ROOT.path.as_posix()
     scope_path = REVIEW_SCOPE_HELPER_ROOT.path.as_posix()
     try:
-        canonical_text = tree.read_text(canonical_path)
-        scope_text = tree.read_text(scope_path)
+        canonical_source = tree.read_file(canonical_path)
+        scope_source = tree.read_file(scope_path)
+        if (
+            hashlib.sha256(canonical_source).hexdigest()
+            != EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256
+            or hashlib.sha256(scope_source).hexdigest()
+            != EXPECTED_REVIEW_SCOPE_HELPER_SHA256
+        ):
+            raise ValueError("helper source digest differs")
+        canonical_text = canonical_source.decode("utf-8")
+        scope_text = scope_source.decode("utf-8")
         # Compilation is a syntax gate only.  Never import or execute release code.
         compile(canonical_text, canonical_path, "exec", dont_inherit=True)
         compile(scope_text, scope_path, "exec", dont_inherit=True)
