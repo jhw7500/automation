@@ -884,7 +884,7 @@ None
 ### Resolved
 #### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
 - Fix anchor: {"path":"review_cases.py","line":20}
-- Resolution: 
+- Resolution:\x20
 ''',
     ),
 )
@@ -913,7 +913,7 @@ None
 ### Retracted
 #### RVW-3253866a28c6 [HIGH] Rejected plan is rendered as successful completion
 - Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"completed 0/{}\\".format(total)"}
-- Reason: 
+- Reason:\x20
 ''',
     ),
 )
