@@ -748,6 +748,58 @@ def test_corpus_stable_ids_are_literal(review_quality_repo):
     assert "RVW-3253866a28c6" in review_quality_repo.run_fixture("rejected-plan.md", reviewer="gemini")[1]
 
 
+def test_duplicate_generated_new_id_is_normalized_before_rendering(review_quality_repo):
+    candidate = (review_quality_repo.fixtures / "value-error.md").read_text(encoding="utf-8")
+    block = candidate.split("### New findings\n\n", 1)[1].strip()
+    result, canonical = review_quality_repo.run_text(
+        f"### New findings\n\n{block}\n\n{block}\n"
+    )
+
+    assert result == canonicalize_review.CanonicalizationResult(
+        True, 1, 0, 1, "none", "",
+        (canonicalize_review.CandidateReason(
+            1, "New findings", "normalized", "duplicate_prior_binding", "MEDIUM",
+        ),),
+    )
+    assert canonical.count("#### RVW-61d4cd9ac260 [MEDIUM]") == 1
+    followup, _ = review_quality_repo._run(review_quality_repo._request(
+        "### New findings\n\nNone\n", reviewer="claude",
+        head=review_quality_repo.review_head, previous_sha=review_quality_repo.review_head,
+        previous_review=canonical,
+    ))
+    assert followup.document_valid is True
+
+
+def test_new_finding_cannot_duplicate_a_carried_active_id(review_quality_repo):
+    candidate = '''### New findings
+
+#### [HIGH] Rejected plan is rendered as successful completion
+- Changed anchor: {"path":"review_cases.py","line":20}
+- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"rejected\\""}
+- Impact class: user-visible
+- Material impact: A rejected plan is displayed as a successful zero-item completion.
+
+### Still open
+#### RVW-3253866a28c6 [HIGH] ignored candidate title
+- Changed anchor: {"path":"review_cases.py","line":20}
+- Trigger evidence: {"path":"review_cases.py","line":20,"quote":"        return \\"rejected\\""}
+- Impact class: user-visible
+- Material impact: The rejected plan still affects completion messaging.
+'''
+    result, canonical = review_quality_repo.run_delta(
+        accepted_rejected_plan_review(), candidate,
+    )
+
+    assert result == canonicalize_review.CanonicalizationResult(
+        True, 1, 0, 1, "none", "",
+        (canonicalize_review.CandidateReason(
+            0, "New findings", "normalized", "duplicate_prior_binding", "HIGH",
+        ),),
+    )
+    assert canonical.count("#### RVW-3253866a28c6 [HIGH]") == 1
+    assert "### Still open" in canonical
+
+
 def test_first_round_resolved_is_normalized_not_a_hard_failure(review_quality_repo):
     result, canonical = review_quality_repo.run_text(first_round_false_resolved())
     assert result.document_valid is True
@@ -1402,6 +1454,16 @@ None
     assert canonical_title in canonical
     assert "<!-- automation:" not in canonical
     assert "<!-- automation-state:" not in canonical
+
+    followup_request = review_quality_repo._request(
+        "### New findings\n\nNone\n", reviewer="gemini", head=review_quality_repo.fixed_head,
+        previous_sha=review_quality_repo.fixed_head, previous_review=canonical,
+    )
+    loaded_followup = canonicalize_review._load_prior_active(followup_request)
+    assert loaded_followup[expected_id].finding.anchor == SourceAnchor("review_cases.py", 20)
+    followup, followup_canonical = review_quality_repo._run(followup_request)
+    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert followup_canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
 
 
 @pytest.mark.parametrize(

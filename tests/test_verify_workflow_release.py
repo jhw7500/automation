@@ -1441,6 +1441,53 @@ def test_v146_rejects_nonexact_reviewer_canonicalizer_dependencies(
         release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    "mutation", ("missing", "wrong-ref", "cleaning", "late", "canonicalizer-early")
+)
+def test_v146_requires_exact_prepared_head_checkout_before_the_provider(
+    current_release_repo: tuple[Path, str], workflow: str, mutation: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def drift(document: dict) -> None:
+        steps = document["jobs"][contract["job"]]["steps"]
+        checkout = next(
+            item for item in steps if item.get("name") == "Checkout prepared review head"
+        )
+        if mutation == "missing":
+            steps.remove(checkout)
+        elif mutation == "wrong-ref":
+            checkout["with"]["ref"] = "${{ github.sha }}"
+        elif mutation == "cleaning":
+            checkout["with"]["clean"] = "true"
+        elif mutation == "late":
+            steps.remove(checkout)
+            provider_index = next(
+                index for index, item in enumerate(steps)
+                if item.get("name") == contract["provider_step"]
+            )
+            steps.insert(provider_index + 1, checkout)
+        else:
+            canonicalizer = next(
+                item for item in steps
+                if item.get("uses") == CANONICALIZE_REVIEW_ACTION
+            )
+            steps.remove(canonicalizer)
+            checkout_index = steps.index(checkout)
+            steps.insert(checkout_index, canonicalizer)
+
+    mutate_yaml(path, drift)
+    bad_commit = commit(repo, f"drift {workflow} prepared head checkout")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
 def test_v146_rejects_an_opencode_canonicalizer_dependency(
     current_release_repo: tuple[Path, str],
 ) -> None:

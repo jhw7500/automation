@@ -343,7 +343,7 @@ EXPECTED_CANONICALIZER_SOFT_REASONS = frozenset(
     }
 )
 EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256 = (
-    "70236fc7272235a762a1190fef2198f79945915460786d8b2d9b842c702b6cc6"
+    "03fae790f16f1188132a74682bed66495d0f682f2d0f119db061e67474500cf9"
 )
 EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
     "cf170639e9dc76ee361086074cf327d091dc8c002c9a3108baf7eb3b02b875bd"
@@ -2534,6 +2534,20 @@ def _expected_canonicalize_step(contract: dict[str, str]) -> dict[str, object]:
     }
 
 
+def _expected_prepared_head_checkout_step() -> dict[str, object]:
+    return {
+        "name": "Checkout prepared review head",
+        "if": "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}",
+        "uses": CHECKOUT_ACTION,
+        "with": {
+            "ref": "${{ steps.prepare-diff.outputs.head-sha }}",
+            "fetch-depth": "0",
+            "clean": "false",
+            "persist-credentials": "false",
+        },
+    }
+
+
 def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
     jq_state_keys = json.dumps(list(QUALITY_STATE_KEYS))
     js_state_keys = ", ".join(repr(key) for key in QUALITY_STATE_KEYS)
@@ -2570,6 +2584,11 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
             canonical_step = _named_step(job, contract["canonical_step"])
             if canonical_step != _expected_canonicalize_step(contract):
                 raise ValueError("canonicalizer call differs")
+            prepared_head_checkout = _named_step(
+                job, "Checkout prepared review head"
+            )
+            if prepared_head_checkout != _expected_prepared_head_checkout_step():
+                raise ValueError("prepared review head checkout differs")
 
             collector = _named_step(job, contract["collector"])
             collector_script = collector.get("run", "")
@@ -2595,6 +2614,14 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 raise ValueError("collector state differs")
 
             provider = _named_step(job, contract["provider"])
+            prepare = _named_step(job, "Prepare review diff")
+            if not (
+                job["steps"].index(prepare)
+                < job["steps"].index(prepared_head_checkout)
+                < job["steps"].index(provider)
+                < job["steps"].index(canonical_step)
+            ):
+                raise ValueError("prepared review head checkout order differs")
             prompt = (
                 provider.get("with", {}).get("prompt", "")
                 if contract["prompt_location"] == "with"

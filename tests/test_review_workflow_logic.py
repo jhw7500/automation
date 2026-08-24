@@ -1469,6 +1469,45 @@ def test_shared_diff_wiring_is_exact_and_scope_safe():
         assert "git diff \"$PREV_SHA\"..\"$HEAD_SHA\"" not in workflow_text
 
 
+@pytest.mark.parametrize(
+    ("filename", "job_name", "provider_name"),
+    (
+        ("claude-code-review.yml", "claude-review", "Run Claude Code Review"),
+        ("gemini-auto-review.yml", "gemini-review", "Run Gemini Code Review"),
+    ),
+)
+def test_shared_canonicalizer_runs_from_the_prepared_pr_head(
+    filename, job_name, provider_name,
+):
+    workflow = _load(filename)
+    steps = workflow["jobs"][job_name]["steps"]
+    prepare = _step(workflow, job_name, "Prepare review diff")
+    checkout = _step(workflow, job_name, "Checkout prepared review head")
+    provider = _step(workflow, job_name, provider_name)
+    canonicalizer = next(
+        step for step in steps
+        if step.get("uses") == "$/.github/actions/canonicalize-review"
+    )
+
+    assert (
+        steps.index(prepare)
+        < steps.index(checkout)
+        < steps.index(provider)
+        < steps.index(canonicalizer)
+    )
+    assert checkout == {
+        "name": "Checkout prepared review head",
+        "if": "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}",
+        "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "with": {
+            "ref": "${{ steps.prepare-diff.outputs.head-sha }}",
+            "fetch-depth": "0",
+            "clean": "false",
+            "persist-credentials": "false",
+        },
+    }
+
+
 def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     claude = _load("claude-code-review.yml")
     checkout = _step(claude, "claude-review", "Checkout repository")

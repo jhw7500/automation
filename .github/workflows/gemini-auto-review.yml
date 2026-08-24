@@ -304,6 +304,15 @@ jobs:
           previous-full-hash: ${{ steps.pr-details.outputs.previous_full_hash }}
           context-lines: '20'
 
+      - name: Checkout prepared review head
+        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.prepare-diff.outputs.head-sha }}
+          fetch-depth: 0
+          clean: false
+          persist-credentials: false
+
       - name: Reset Gemini review artifacts
         id: reset-gemini-artifacts
         if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}

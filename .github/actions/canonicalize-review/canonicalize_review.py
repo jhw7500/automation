@@ -465,7 +465,13 @@ def _parse_prior_active(block: _Block, reviewer: str) -> _PriorFinding:
         raise ScopeValidationError("previous canonical prose is workflow-owned")
     finding = _Finding(block.severity, block.title, anchor, tuple(evidence), impact, material, prose, basis)
     assert block.finding_id is not None
-    if block.finding_id != stable_finding_id(reviewer, anchor, block.severity, block.title):
+    # New IDs are assigned from their original anchor. A workflow-rendered
+    # Still-open finding keeps that authenticated ID while its current anchor
+    # is refreshed on later deltas.
+    if (block.section == "New findings"
+            and block.finding_id != stable_finding_id(
+                reviewer, anchor, block.severity, block.title,
+            )):
         raise ScopeValidationError("previous canonical identity is invalid")
     if _trim_section_padding(block.lines) != tuple(_finding_lines(block.finding_id, finding)[1:]):
         raise ScopeValidationError("previous canonical finding is not rendered")
@@ -719,7 +725,7 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                 except ValueError:
                     result = _hard("ambiguous_document")
                 else:
-                    accepted: list[_Finding] = []
+                    accepted: list[tuple[_Block, _Finding]] = []
                     still_open: list[_PriorFinding] = []
                     resolved: list[tuple[_PriorFinding, SourceAnchor, str]] = []
                     retracted: list[tuple[_PriorFinding, tuple[TriggerEvidence, ...], str]] = []
@@ -734,7 +740,7 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                             reasons.append(_claim_reason(block, "filtered", reason))
                         else:
                             assert finding is not None
-                            accepted.append(finding)
+                            accepted.append((block, finding))
                     bound: dict[str, list[_Block]] = {}
                     for section in ("Still open", "Resolved", "Retracted"):
                         for block in sections[section]:
@@ -776,19 +782,30 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                                     reasons.append(_claim_reason(block, "normalized", "invalid_trigger_evidence"))
                                 else:
                                     retracted.append((prior, evidence, reason))
+                    canonical_new: list[_PriorFinding] = []
+                    active_ids = set(prior_active)
+                    for block, finding in accepted:
+                        finding_id = stable_finding_id(
+                            request.reviewer, finding.anchor, finding.severity, finding.title,
+                        )
+                        if finding_id in active_ids:
+                            normalized += 1
+                            reasons.append(_claim_reason(
+                                block, "normalized", "duplicate_prior_binding",
+                            ))
+                            continue
+                        active_ids.add(finding_id)
+                        canonical_new.append(_PriorFinding(finding_id, finding))
                     rank = {"none": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
                     maximum = max(filtered_severities, key=lambda item: rank[item], default="none")
                     result = CanonicalizationResult(
-                        True, len(accepted) + len(still_open), filtered, normalized, maximum, "",
+                        True, len(canonical_new) + len(still_open), filtered, normalized, maximum, "",
                         tuple(sorted(reasons, key=lambda item: item.index)),
                     )
                     _write_atomic(
                         request.canonical_file,
                         _render_document(
-                            [_PriorFinding(
-                                stable_finding_id(request.reviewer, finding.anchor, finding.severity, finding.title),
-                                finding,
-                            ) for finding in accepted],
+                            canonical_new,
                             still_open, resolved, retracted,
                         ).encode("utf-8"),
                     )
