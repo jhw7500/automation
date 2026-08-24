@@ -759,7 +759,9 @@ jobs:
           )
           BLOCK_HEADING = re.compile(r"#### \S.*")
           FINDING_PREFIX = re.compile(
-              r"^\s*(?:####(?:\s|$)|-\s*(?:changed anchor|current line):)",
+              r"^\s*(?:####(?:\s|$)"
+              r"|###\s+\[(?:critical|high|medium|low)\](?:\s|$)"
+              r"|-\s*(?:changed anchor|current line):)",
               re.IGNORECASE,
           )
           MARKDOWN_CONTAINER = re.compile(
@@ -806,16 +808,14 @@ jobs:
               for index, line in enumerate(lines):
                   if not TOP_HEADING.match(line):
                       continue
-                  if VALID_HEADING.fullmatch(line) is None:
-                      reject()
-                  return index
+                  if VALID_HEADING.fullmatch(line) is not None:
+                      return index
               reject()
 
           def strip_enclosing_markdown_fence(lines, first_section):
               nonblank = [index for index, line in enumerate(lines) if line.strip()]
               if not nonblank:
                   reject()
-              close_index = nonblank[-1]
               active_fence = None
               for index in range(first_section):
                   line = lines[index]
@@ -833,36 +833,48 @@ jobs:
                           and not match.group(2).strip()
                       ):
                           active_fence = None
-              closing_fence = BACKTICK_FENCE.fullmatch(lines[close_index])
-              if (
-                  active_fence is not None
-                  and close_index > first_section
-                  and closing_fence is not None
-                  and closing_fence.group(1) == active_fence[1]
-                  and not closing_fence.group(2).strip()
+              if active_fence is None:
+                  return lines
+
+              close_indices = []
+              for index in range(first_section + 1, len(lines)):
+                  match = BACKTICK_FENCE.fullmatch(lines[index])
+                  if (
+                      match is not None
+                      and match.group(1) == active_fence[1]
+                      and not match.group(2).strip()
+                  ):
+                      close_indices.append(index)
+              if not close_indices:
+                  return lines
+              close_index = close_indices[-1]
+
+              inner_fence_length = None
+              for line in lines[first_section:close_index]:
+                  match = BACKTICK_FENCE.fullmatch(line)
+                  if match is None:
+                      continue
+                  fence_length = len(match.group(1))
+                  if inner_fence_length is None:
+                      inner_fence_length = fence_length
+                  elif (
+                      not match.group(2).strip()
+                      and fence_length >= inner_fence_length
+                  ):
+                      inner_fence_length = None
+              if inner_fence_length is not None:
+                  return lines
+
+              suffix = lines[close_index + 1:]
+              if any(
+                  is_finding_prefix_line(line)
+                  or VALID_HEADING.fullmatch(line) is not None
+                  for line in suffix
               ):
-                  open_index = active_fence[0]
-                  inner_fence_length = None
-                  for line in lines[first_section:close_index]:
-                      match = BACKTICK_FENCE.fullmatch(line)
-                      if match is None:
-                          continue
-                      fence_length = len(match.group(1))
-                      if inner_fence_length is None:
-                          inner_fence_length = fence_length
-                      elif (
-                          not match.group(2).strip()
-                          and fence_length >= inner_fence_length
-                      ):
-                          inner_fence_length = None
-                  if inner_fence_length is not None:
-                      return lines
-                  return (
-                      lines[:open_index]
-                      + lines[open_index + 1:close_index]
-                      + lines[close_index + 1:]
-                  )
-              return lines
+                  return lines
+
+              open_index = active_fence[0]
+              return lines[:open_index] + lines[open_index + 1:close_index]
 
           def parse_sections(lines):
               sections = []

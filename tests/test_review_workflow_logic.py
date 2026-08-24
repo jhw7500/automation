@@ -4088,6 +4088,59 @@ def test_opencode_format_repair_allows_benign_field_words_in_wrapper(tmp_path):
     ("### New findings\nNone", OPENCODE_FINDING_BODY),
     ids=("none", "finding"),
 )
+def test_opencode_format_repair_allows_level_three_wrapper_heading(
+    tmp_path, body
+):
+    repaired = _opencode_candidate(body)
+    malformed = "### Review summary\n\nI reviewed the diff.\n\n" + repaired
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_cannot_drop_severity_heading_in_wrapper(
+    tmp_path,
+):
+    repaired = _opencode_candidate()
+    malformed = (
+        "### [HIGH] Authentication bypass remains\n"
+        "This substantive finding must not be discarded as wrapper prose.\n\n"
+        + repaired
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_allows_nonseverity_bracketed_wrapper_heading(
+    tmp_path,
+):
+    repaired = _opencode_candidate()
+    malformed = "### [Note] Review summary\n\nI reviewed the diff.\n\n" + repaired
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "body",
+    ("### New findings\nNone", OPENCODE_FINDING_BODY),
+    ids=("none", "finding"),
+)
 def test_opencode_format_repair_allows_matching_outer_markdown_fence(
     tmp_path, body
 ):
@@ -4121,6 +4174,92 @@ def test_opencode_format_repair_allows_outer_fence_after_wrapper_prose(
     assert result.returncode == 0, result.stderr
     assert len(calls) == 2
     assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "body",
+    ("### New findings\nNone", OPENCODE_FINDING_BODY),
+    ids=("none", "finding"),
+)
+def test_opencode_format_repair_allows_prose_after_outer_fence(tmp_path, body):
+    repaired = _opencode_candidate(body)
+    malformed = "```markdown\n" + repaired + "\n```\n\nReview complete."
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_allows_inner_fence_and_trailing_wrapper(tmp_path):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n```python\nraise RuntimeError\n```"
+    )
+    repaired = _opencode_candidate(fenced_body)
+    malformed = (
+        "```markdown\n" + repaired + "\n```\n\nReview complete."
+    )
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_cannot_drop_finding_after_outer_fence(tmp_path):
+    repaired = _opencode_candidate()
+    malformed = (
+        "```markdown\n"
+        + repaired
+        + "\n```\n"
+        + OPENCODE_FINDING_BLOCK
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_cannot_drop_section_after_outer_fence(tmp_path):
+    repaired = _opencode_candidate()
+    malformed = "```markdown\n" + repaired + "\n```\n### Still open\nNone"
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_cannot_drop_severity_heading_after_outer_fence(
+    tmp_path,
+):
+    repaired = _opencode_candidate()
+    malformed = (
+        "```markdown\n"
+        + repaired
+        + "\n```\n"
+        "### [HIGH] Authentication bypass remains\n"
+        "This substantive finding must not be discarded as wrapper prose."
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
 
 
 def test_opencode_format_repair_allows_three_space_outer_fence(tmp_path):
