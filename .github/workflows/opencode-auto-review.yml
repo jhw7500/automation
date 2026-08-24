@@ -764,20 +764,20 @@ jobs:
               r"### (New findings|Still open|Resolved|Retracted)"
           )
           BLOCK_HEADING = re.compile(r"#### \S.*")
+          FINDING_LEVEL = r"(?:critical|high|medium|low|p[0-3])"
+          FINDING_DECORATOR = r"[*_~`]+"
           FINDING_PREFIX = re.compile(
               r"^\s*(?:####(?:\s|$)"
-              r"|(?:#{1,6}\s+)?(?:[*_~`]+\s*)?"
-              r"\[(?:critical|high|medium|low|p[0-3])\]"
+              rf"|(?:#{{1,6}}\s+)?(?:{FINDING_DECORATOR}\s*)?"
+              rf"(?:\[{FINDING_LEVEL}\]|{FINDING_LEVEL}"
+              rf"(?:[ \t]*{FINDING_DECORATOR})?[ \t]*:)"
               r"|-\s*(?:changed anchor|current line):)",
               re.IGNORECASE,
           )
           MARKDOWN_CONTAINER = re.compile(
               r"^(?:>\s*|[-+*]\s+|\d+[.)]\s+|\[[ xX]\]\s+)"
           )
-          MARKDOWN_FENCE = re.compile(
-              r"^ {0,3}(`{3,})(?:markdown|md)?\s*$", re.IGNORECASE
-          )
-          BACKTICK_FENCE = re.compile(r"^ {0,3}(`{3,})([^`]*)$")
+          FENCE_LINE = re.compile(r"^ {0,3}((?:`{3,}|~{3,}))(.*)$")
 
           def reject():
               raise SystemExit(1)
@@ -811,6 +811,22 @@ jobs:
                   remainder = remainder[container.end():].lstrip()
               return False
 
+          def parse_fence_line(line):
+              match = FENCE_LINE.fullmatch(line)
+              if match is None:
+                  return None
+              marker, info = match.groups()
+              if marker[0] == "`" and "`" in info:
+                  return None
+              return marker, info
+
+          def closes_fence(open_marker, marker, info):
+              return (
+                  marker[0] == open_marker[0]
+                  and len(marker) >= len(open_marker)
+                  and re.fullmatch(r"[ \t]*", info) is not None
+              )
+
           def first_section_index(lines):
               for index, line in enumerate(lines):
                   if not TOP_HEADING.match(line):
@@ -828,48 +844,39 @@ jobs:
                   line = lines[index]
                   if not line.strip():
                       continue
+                  fence = parse_fence_line(line)
                   if active_fence is None:
-                      match = MARKDOWN_FENCE.fullmatch(line)
-                      if match is not None:
-                          active_fence = (index, match.group(1))
-                  else:
-                      match = BACKTICK_FENCE.fullmatch(line)
-                      if (
-                          match is not None
-                          and len(match.group(1)) >= len(active_fence[1])
-                          and not match.group(2).strip()
-                      ):
-                          active_fence = None
+                      if fence is not None:
+                          active_fence = (index, fence[0])
+                  elif fence is not None and closes_fence(
+                      active_fence[1], *fence
+                  ):
+                      active_fence = None
               if active_fence is None:
                   return lines
 
               close_indices = []
               for index in range(first_section + 1, len(lines)):
-                  match = BACKTICK_FENCE.fullmatch(lines[index])
-                  if (
-                      match is not None
-                      and len(match.group(1)) >= len(active_fence[1])
-                      and not match.group(2).strip()
+                  fence = parse_fence_line(lines[index])
+                  if fence is not None and closes_fence(
+                      active_fence[1], *fence
                   ):
                       close_indices.append(index)
               if not close_indices:
                   return lines
               close_index = close_indices[-1]
 
-              inner_fence_length = None
+              inner_fence = None
               for line in lines[first_section:close_index]:
-                  match = BACKTICK_FENCE.fullmatch(line)
-                  if match is None:
+                  fence = parse_fence_line(line)
+                  if fence is None:
                       continue
-                  fence_length = len(match.group(1))
-                  if inner_fence_length is None:
-                      inner_fence_length = fence_length
-                  elif (
-                      not match.group(2).strip()
-                      and fence_length >= inner_fence_length
-                  ):
-                      inner_fence_length = None
-              if inner_fence_length is not None:
+                  marker, info = fence
+                  if inner_fence is None:
+                      inner_fence = marker
+                  elif closes_fence(inner_fence, marker, info):
+                      inner_fence = None
+              if inner_fence is not None:
                   return lines
 
               suffix = lines[close_index + 1:]

@@ -331,14 +331,18 @@ substance. The model job then derives a deterministic signature from each candid
 blocks grouped by section plus the `New findings: None` meaning. It accepts only a repaired candidate
 with the same signature; dropping, adding, moving, reclassifying, rewording, or changing an anchor is
 terminal. Only non-finding-like wrapper text surrounding the signed document, one matching
-enclosing Markdown fence, required marker/nonce framing, empty carryover sections, and section
-ordering are excluded from that comparison. Empty optional carryover sections are equivalent to
-omission; an empty `New findings` section remains terminal. Fences inside a finding remain signed
-substance. A finding heading with an explicit `[CRITICAL]`, `[HIGH]`, `[MEDIUM]`, `[LOW]`, or
-`[P0]`–`[P3]`
-marker, or an anchor/current-line field before the first section, remains unsafe to drop even when
-nested under Markdown quote or list containers. Finding-like content or an allowed review
-section after an enclosing fence is likewise preserved rather than treated as wrapper text. An
+enclosing CommonMark fence, required marker/nonce framing, empty carryover sections, and section
+ordering are excluded from that comparison. An enclosing fence may use backticks or tildes with
+any valid info string; its closing run must use the same character and be at least as long as the
+opening run, and only ASCII spaces or tabs may follow a closing run. Empty optional carryover
+sections are equivalent to omission; an empty `New findings` section remains terminal. Fences
+inside a finding remain signed substance. A finding heading with an explicit bracketed or
+colon-delimited `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, or `P0`–`P3` marker remains unsafe to drop;
+this includes emphasis or code-span delimiters that close immediately before the colon. The same
+applies to an anchor/current-line field before the first section, even when nested under Markdown
+quote or list containers. Generic labels such as `Summary:`, `Medium-term:`, `P4:`, and `P10:`
+remain wrapper text. Finding-like content or an allowed review section after an enclosing fence is
+likewise preserved rather than treated as wrapper text. An
 unsafe-to-sign or malformed repair is terminal; there is no third call and no candidate upload. The
 model job reports `model_job_failed` for setup/infrastructure failure, `provider_failed` only when a
 model process fails, and `candidate_contract_failed` when post-response preflight rejects the

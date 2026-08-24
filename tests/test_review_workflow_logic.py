@@ -4251,6 +4251,13 @@ def test_opencode_format_repair_allows_nonseverity_bracketed_wrapper_heading(
         "[P1] Authentication bypass remains",
         "## **[P2] Authorization check is missing**",
         "- [ ] **[P3] Noisy but substantive finding**",
+        "**MEDIUM: Authentication bypass remains**",
+        "## **LOW : Noisy but substantive finding**",
+        "> CRITICAL: Quoted substantive finding",
+        "- [ ] **P1: Authorization check is missing**",
+        "**MEDIUM**: Authentication bypass remains",
+        "## _HIGH_: Authorization check is missing",
+        "`P1`: Noisy but substantive finding",
     ),
     ids=(
         "bold",
@@ -4262,6 +4269,13 @@ def test_opencode_format_repair_allows_nonseverity_bracketed_wrapper_heading(
         "p1-plain",
         "p2-heading-bold",
         "p3-task-list",
+        "colon-bold",
+        "colon-heading-bold",
+        "colon-quoted",
+        "colon-p1-task-list",
+        "colon-after-bold",
+        "colon-after-heading-emphasis",
+        "colon-after-code-span",
     ),
 )
 def test_opencode_format_repair_cannot_drop_common_finding_heading_in_wrapper(
@@ -4285,6 +4299,31 @@ def test_opencode_format_repair_cannot_drop_common_finding_heading_in_wrapper(
 def test_opencode_format_repair_allows_bold_nonfinding_wrapper(tmp_path):
     repaired = _opencode_candidate()
     malformed = "**Review complete**\n\n" + repaired
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Summary: Review complete",
+        "Medium-term: Review complete",
+        "P4: Review complete",
+        "P10: Review complete",
+    ),
+    ids=("summary", "hyphenated", "p4", "p10"),
+)
+def test_opencode_format_repair_allows_nonfinding_colon_wrapper(
+    tmp_path, heading
+):
+    repaired = _opencode_candidate()
+    malformed = heading + "\n\n" + repaired
 
     result, calls, candidate = _run_opencode_model_step(
         tmp_path, [malformed, repaired]
@@ -4344,6 +4383,83 @@ def test_opencode_format_repair_allows_matching_outer_markdown_fence(
     assert result.returncode == 0, result.stderr
     assert len(calls) == 2
     assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    ("opener", "closer"),
+    (
+        ("```text", "```"),
+        ("```review-output", "```"),
+        ("~~~text", "~~~"),
+        ("~~~text `code`", "~~~"),
+    ),
+    ids=("text", "custom", "tilde", "tilde-backtick-info"),
+)
+def test_opencode_format_repair_allows_commonmark_outer_fence_info(
+    tmp_path, opener, closer
+):
+    repaired = _opencode_candidate(OPENCODE_FINDING_BODY)
+    malformed = opener + "\n" + repaired + "\n" + closer
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_allows_longer_tilde_outer_close(tmp_path):
+    repaired = _opencode_candidate(OPENCODE_FINDING_BODY)
+    malformed = "~~~text\n" + repaired + "\n~~~~"
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_rejects_backtick_in_backtick_fence_info(
+    tmp_path,
+):
+    repaired = _opencode_candidate(OPENCODE_FINDING_BODY)
+    malformed = "```te`xt\n" + repaired + "\n```"
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "invalid_space",
+    ("\u00a0", "\v"),
+    ids=("nbsp", "vertical-tab"),
+)
+def test_opencode_format_repair_rejects_non_commonmark_close_whitespace(
+    tmp_path, invalid_space
+):
+    repaired = _opencode_candidate(OPENCODE_FINDING_BODY)
+    malformed = (
+        "```text\n"
+        + repaired
+        + "\n```"
+        + invalid_space
+        + "\nSubstantive explanation must remain signed."
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -4523,6 +4639,37 @@ def test_opencode_format_repair_cannot_drop_priority_after_outer_fence(
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "**MEDIUM: Authentication bypass remains**",
+        "**MEDIUM**: Authentication bypass remains",
+        "## _HIGH_: Authorization check is missing",
+        "`P1`: Noisy but substantive finding",
+    ),
+    ids=("inside-bold", "after-bold", "after-emphasis", "after-code-span"),
+)
+def test_opencode_format_repair_cannot_drop_colon_severity_after_outer_fence(
+    tmp_path, heading
+):
+    repaired = _opencode_candidate()
+    malformed = (
+        "```markdown\n"
+        + repaired
+        + "\n```\n"
+        + heading
+        + "\n"
+        "This substantive finding must not be discarded as wrapper prose."
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
 def test_opencode_format_repair_cannot_drop_task_list_severity_after_fence(
     tmp_path,
 ):
@@ -4557,15 +4704,15 @@ def test_opencode_format_repair_allows_three_space_outer_fence(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "indented_backticks",
-    ("    ```", "\t```"),
-    ids=("four-spaces", "tab"),
+    "indented_fence",
+    ("    ```", "\t```", "    ~~~", "\t~~~"),
+    ids=("backtick-four-spaces", "backtick-tab", "tilde-four-spaces", "tilde-tab"),
 )
-def test_opencode_format_repair_cannot_drop_indented_terminal_backticks(
-    tmp_path, indented_backticks
+def test_opencode_format_repair_cannot_drop_indented_terminal_fence(
+    tmp_path, indented_fence
 ):
-    fenced_body = OPENCODE_FINDING_BODY + "\n" + indented_backticks
-    repaired_body = fenced_body.removesuffix(indented_backticks).rstrip("\n")
+    fenced_body = OPENCODE_FINDING_BODY + "\n" + indented_fence
+    repaired_body = fenced_body.removesuffix(indented_fence).rstrip("\n")
     malformed = "```markdown\n" + _opencode_candidate(fenced_body)
 
     result, calls, _ = _run_opencode_model_step(
@@ -4629,6 +4776,93 @@ def test_opencode_format_repair_allows_balanced_inner_and_outer_fences(tmp_path)
     assert result.returncode == 0, result.stderr
     assert len(calls) == 2
     assert candidate == repaired
+
+
+def test_opencode_format_repair_allows_mixed_inner_and_tilde_outer_fences(
+    tmp_path,
+):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n```python\nraise RuntimeError\n```"
+    )
+    repaired = _opencode_candidate(fenced_body)
+    malformed = "~~~text\n" + repaired + "\n~~~\n\nReview complete."
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_allows_tilde_inner_and_text_outer_fences(
+    tmp_path,
+):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n~~~python\nraise RuntimeError\n~~~"
+    )
+    repaired = _opencode_candidate(fenced_body)
+    malformed = "```text\n" + repaired + "\n```"
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_allows_balanced_tilde_inner_and_outer_fences(
+    tmp_path,
+):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n~~~python\nraise RuntimeError\n~~~"
+    )
+    repaired = _opencode_candidate(fenced_body)
+    malformed = "~~~~text\n" + repaired + "\n~~~~"
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_rejects_different_outer_fence_closer(tmp_path):
+    repaired = _opencode_candidate(OPENCODE_FINDING_BODY)
+    malformed = "~~~text\n" + repaired + "\n```"
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_cannot_use_tilde_inner_close_as_outer_close(
+    tmp_path,
+):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n~~~python\nraise RuntimeError\n~~~~"
+    )
+    repaired_body = fenced_body.removesuffix("\n~~~~")
+    malformed = "~~~~text\n" + _opencode_candidate(fenced_body)
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate(repaired_body)]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
 
 
 def test_opencode_format_repair_cannot_use_longer_inner_close_as_outer_close(
