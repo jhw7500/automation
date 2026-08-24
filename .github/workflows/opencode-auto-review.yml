@@ -760,12 +760,13 @@ jobs:
           BLOCK_HEADING = re.compile(r"#### \S.*")
           FINDING_PREFIX = re.compile(
               r"^\s*(?:####(?:\s|$)"
-              r"|###\s+\[(?:critical|high|medium|low)\](?:\s|$)"
+              r"|(?:#{1,6}\s+)?(?:[*_~`]+\s*)?"
+              r"\[(?:critical|high|medium|low)\]"
               r"|-\s*(?:changed anchor|current line):)",
               re.IGNORECASE,
           )
           MARKDOWN_CONTAINER = re.compile(
-              r"^(?:>\s*|[-+*]\s+|\d+[.)]\s+)"
+              r"^(?:>\s*|[-+*]\s+|\d+[.)]\s+|\[[ xX]\]\s+)"
           )
           MARKDOWN_FENCE = re.compile(
               r"^ {0,3}(`{3,})(?:markdown|md)?\s*$", re.IGNORECASE

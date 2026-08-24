@@ -4137,6 +4137,79 @@ def test_opencode_format_repair_allows_nonseverity_bracketed_wrapper_heading(
 
 
 @pytest.mark.parametrize(
+    "heading",
+    (
+        "**[HIGH] Authentication bypass remains**",
+        "[MEDIUM] Authorization check is missing",
+        "## **[LOW] Noisy but substantive finding**",
+        "> **[CRITICAL] Quoted substantive finding**",
+        "- **[HIGH] Listed substantive finding**",
+    ),
+    ids=("bold", "plain", "heading-bold", "quoted", "listed"),
+)
+def test_opencode_format_repair_cannot_drop_common_severity_heading_in_wrapper(
+    tmp_path, heading
+):
+    repaired = _opencode_candidate()
+    malformed = (
+        heading
+        + "\nThis substantive finding must not be discarded as wrapper prose.\n\n"
+        + repaired
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_allows_bold_nonfinding_wrapper(tmp_path):
+    repaired = _opencode_candidate()
+    malformed = "**Review complete**\n\n" + repaired
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_cannot_drop_task_list_severity_in_wrapper(
+    tmp_path,
+):
+    repaired = _opencode_candidate()
+    malformed = (
+        "- [ ] **[HIGH] Authentication bypass remains**\n"
+        "  This substantive finding must not be discarded as wrapper prose.\n\n"
+        + repaired
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_allows_benign_task_list_wrapper(tmp_path):
+    repaired = _opencode_candidate()
+    malformed = "- [ ] Review complete\n\n" + repaired
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
     "body",
     ("### New findings\nNone", OPENCODE_FINDING_BODY),
     ids=("none", "finding"),
@@ -4283,6 +4356,46 @@ def test_opencode_format_repair_cannot_drop_severity_heading_after_outer_fence(
         + "\n```\n"
         "### [HIGH] Authentication bypass remains\n"
         "This substantive finding must not be discarded as wrapper prose."
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_cannot_drop_bold_severity_after_outer_fence(
+    tmp_path,
+):
+    repaired = _opencode_candidate()
+    malformed = (
+        "```markdown\n"
+        + repaired
+        + "\n```\n"
+        "**[HIGH] Authentication bypass remains**\n"
+        "This substantive finding must not be discarded as wrapper prose."
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_cannot_drop_task_list_severity_after_fence(
+    tmp_path,
+):
+    repaired = _opencode_candidate()
+    malformed = (
+        "```markdown\n"
+        + repaired
+        + "\n```\n"
+        "1. [x] **[CRITICAL] Data loss remains**\n"
+        "   This substantive finding must not be discarded as wrapper prose."
     )
 
     result, calls, _ = _run_opencode_model_step(
