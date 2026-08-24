@@ -829,7 +829,7 @@ jobs:
                       match = BACKTICK_FENCE.fullmatch(line)
                       if (
                           match is not None
-                          and match.group(1) == active_fence[1]
+                          and len(match.group(1)) >= len(active_fence[1])
                           and not match.group(2).strip()
                       ):
                           active_fence = None
@@ -841,7 +841,7 @@ jobs:
                   match = BACKTICK_FENCE.fullmatch(lines[index])
                   if (
                       match is not None
-                      and match.group(1) == active_fence[1]
+                      and len(match.group(1)) >= len(active_fence[1])
                       and not match.group(2).strip()
                   ):
                       close_indices.append(index)
