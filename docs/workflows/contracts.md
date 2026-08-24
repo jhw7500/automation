@@ -333,8 +333,9 @@ with the same signature; dropping, adding, moving, reclassifying, rewording, or 
 terminal. Only non-finding-like wrapper text surrounding the signed document, one matching
 enclosing Markdown fence, required marker/nonce framing, empty carryover sections, and section
 ordering are excluded from that comparison. Fences inside a finding remain signed substance. A
-finding heading or anchor/current-line field before the first section remains unsafe to drop even
-when nested under Markdown quote or list containers. Finding-like content or an allowed review
+finding heading with an explicit `[CRITICAL]`, `[HIGH]`, `[MEDIUM]`, `[LOW]`, or `[P0]`–`[P3]`
+marker, or an anchor/current-line field before the first section, remains unsafe to drop even when
+nested under Markdown quote or list containers. Finding-like content or an allowed review
 section after an enclosing fence is likewise preserved rather than treated as wrapper text. An
 unsafe-to-sign or malformed repair is terminal; there is no third call and no candidate upload. The
 candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name artifact. This

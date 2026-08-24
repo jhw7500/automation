@@ -761,7 +761,7 @@ jobs:
           FINDING_PREFIX = re.compile(
               r"^\s*(?:####(?:\s|$)"
               r"|(?:#{1,6}\s+)?(?:[*_~`]+\s*)?"
-              r"\[(?:critical|high|medium|low)\]"
+              r"\[(?:critical|high|medium|low|p[0-3])\]"
               r"|-\s*(?:changed anchor|current line):)",
               re.IGNORECASE,
           )

@@ -4144,10 +4144,24 @@ def test_opencode_format_repair_allows_nonseverity_bracketed_wrapper_heading(
         "## **[LOW] Noisy but substantive finding**",
         "> **[CRITICAL] Quoted substantive finding**",
         "- **[HIGH] Listed substantive finding**",
+        "**[P0] Data loss remains**",
+        "[P1] Authentication bypass remains",
+        "## **[P2] Authorization check is missing**",
+        "- [ ] **[P3] Noisy but substantive finding**",
     ),
-    ids=("bold", "plain", "heading-bold", "quoted", "listed"),
+    ids=(
+        "bold",
+        "plain",
+        "heading-bold",
+        "quoted",
+        "listed",
+        "p0-bold",
+        "p1-plain",
+        "p2-heading-bold",
+        "p3-task-list",
+    ),
 )
-def test_opencode_format_repair_cannot_drop_common_severity_heading_in_wrapper(
+def test_opencode_format_repair_cannot_drop_common_finding_heading_in_wrapper(
     tmp_path, heading
 ):
     repaired = _opencode_candidate()
@@ -4375,6 +4389,26 @@ def test_opencode_format_repair_cannot_drop_bold_severity_after_outer_fence(
         + repaired
         + "\n```\n"
         "**[HIGH] Authentication bypass remains**\n"
+        "This substantive finding must not be discarded as wrapper prose."
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_cannot_drop_priority_after_outer_fence(
+    tmp_path,
+):
+    repaired = _opencode_candidate()
+    malformed = (
+        "```markdown\n"
+        + repaired
+        + "\n```\n"
+        "**[P1] Authentication bypass remains**\n"
         "This substantive finding must not be discarded as wrapper prose."
     )
 
