@@ -765,6 +765,7 @@ jobs:
           MARKDOWN_CONTAINER = re.compile(
               r"^(?:>\s*|[-+*]\s+|\d+[.)]\s+)"
           )
+          MARKDOWN_FENCE = re.compile(r"^(`{3,})(?:markdown|md)?\s*$", re.IGNORECASE)
 
           def reject():
               raise SystemExit(1)
@@ -797,6 +798,38 @@ jobs:
                       return False
                   remainder = remainder[container.end():].lstrip()
               return False
+
+          def first_section_index(lines):
+              for index, line in enumerate(lines):
+                  if not TOP_HEADING.match(line):
+                      continue
+                  if VALID_HEADING.fullmatch(line) is None:
+                      reject()
+                  return index
+              reject()
+
+          def strip_enclosing_markdown_fence(lines, first_section):
+              nonblank = [index for index, line in enumerate(lines) if line.strip()]
+              if not nonblank:
+                  reject()
+              close_index = nonblank[-1]
+              prefix_nonblank = [index for index in nonblank if index < first_section]
+              candidates = [nonblank[0]]
+              if prefix_nonblank and prefix_nonblank[-1] not in candidates:
+                  candidates.append(prefix_nonblank[-1])
+              for open_index in candidates:
+                  match = MARKDOWN_FENCE.fullmatch(lines[open_index].strip())
+                  if (
+                      match is not None
+                      and close_index > first_section
+                      and lines[close_index].strip() == match.group(1)
+                  ):
+                      return (
+                          lines[:open_index]
+                          + lines[open_index + 1:close_index]
+                          + lines[close_index + 1:]
+                      )
+              return lines
 
           def parse_sections(lines):
               sections = []
@@ -864,16 +897,9 @@ jobs:
 
           def substance_signature(text):
               lines = text.split("\n")
-              first_section = None
-              for index, line in enumerate(lines):
-                  if not TOP_HEADING.match(line):
-                      continue
-                  if VALID_HEADING.fullmatch(line) is None:
-                      reject()
-                  first_section = index
-                  break
-              if first_section is None:
-                  reject()
+              first_section = first_section_index(lines)
+              lines = strip_enclosing_markdown_fence(lines, first_section)
+              first_section = first_section_index(lines)
               prefix = lines[:first_section]
               if any(is_finding_prefix_line(line) for line in prefix):
                   reject()

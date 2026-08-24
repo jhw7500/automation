@@ -4083,6 +4083,43 @@ def test_opencode_format_repair_allows_benign_field_words_in_wrapper(tmp_path):
     assert candidate == repaired
 
 
+@pytest.mark.parametrize(
+    "body",
+    ("### New findings\nNone", OPENCODE_FINDING_BODY),
+    ids=("none", "finding"),
+)
+def test_opencode_format_repair_allows_matching_outer_markdown_fence(
+    tmp_path, body
+):
+    repaired = _opencode_candidate(body)
+    malformed = "```markdown\n" + repaired + "\n```"
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_cannot_drop_fence_inside_finding(tmp_path):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n```python\nraise RuntimeError\n```\n"
+        + "The fenced reproducer is part of the explanation."
+    )
+    repaired_body = fenced_body.replace("```python\n", "").replace("\n```\n", "\n")
+    malformed = "````markdown\n" + _opencode_candidate(fenced_body) + "\n````"
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate(repaired_body)]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
 def test_opencode_format_repair_preserves_substantive_finding_bytes(tmp_path):
     malformed = "I reviewed the diff.\n\n" + _opencode_candidate(
         OPENCODE_FINDING_BODY

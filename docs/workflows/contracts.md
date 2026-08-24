@@ -330,13 +330,14 @@ JSON-encoded and explicitly labeled as untrusted data. The repair prompt forbids
 substance. The model job then derives a deterministic signature from each candidate's exact finding
 blocks grouped by section plus the `New findings: None` meaning. It accepts only a repaired candidate
 with the same signature; dropping, adding, moving, reclassifying, rewording, or changing an anchor is
-terminal. Only non-finding-like wrapper text, required marker/nonce framing, empty carryover sections,
-and section ordering are excluded from that comparison. A finding heading or anchor/current-line
-field before the first section remains unsafe to drop even when nested under Markdown quote or list
-containers. An unsafe-to-sign or malformed repair is terminal; there is no third call and no candidate
-upload. The candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name artifact.
-This preflight never replaces or relaxes the clean canonicalizer's semantic, scope, and provenance
-checks.
+terminal. Only non-finding-like wrapper text, one matching enclosing Markdown fence, required
+marker/nonce framing, empty carryover sections, and section ordering are excluded from that
+comparison. Fences inside a finding remain signed substance. A finding heading or
+anchor/current-line field before the first section remains unsafe to drop even when nested under
+Markdown quote or list containers. An unsafe-to-sign or malformed repair is terminal; there is no
+third call and no candidate upload. The candidate is limited to 60,000 UTF-8 bytes and uploaded as a
+separate exact-name artifact. This preflight never replaces or relaxes the clean canonicalizer's
+semantic, scope, and provenance checks.
 
 For modern releases, release verification also authenticates the exact Git blob of the complete
 OpenCode auto-review workflow. Changes to installation, step topology, workflow/job environment,
