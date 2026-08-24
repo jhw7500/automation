@@ -679,7 +679,7 @@ jobs:
             Output grammar after the marker is strict:
             - Include exactly one `### New findings` section. Its body is exactly `None`, or
               one or more `####` finding blocks.
-            - Every finding block has at least one exact one-line JSON anchor
+            - Every finding block has exactly one exact one-line JSON anchor
               `- Changed anchor: {"path":"path/to/file","line":1}`. Escape the path as JSON;
               every anchor must name an added-side line.
             - Every New finding and Still open block has exactly one Changed anchor and exactly
@@ -692,6 +692,14 @@ jobs:
               active prior heading under `New findings`.
             - Put no prose before the first `###` heading and no prose before the first finding
               block in `### New findings`.
+
+            A valid New finding starts exactly like this:
+            #### [MEDIUM] Concise title
+            - Changed anchor: {"path":"path/to/file","line":1}
+            - Current line: "exact complete added-side source line"
+            Continue with concise causal and impact prose. If a defect spans multiple source lines,
+            choose the single added-side line that most directly causes it and describe supporting
+            lines in prose without adding another Changed anchor or Current line field.
 
             TRUSTED REVIEW SCOPE (final authority): `review-full.diff` and `review-scope.json`
             are the exclusive set of changes under review. Always read `review-full.diff`, including when the prepared

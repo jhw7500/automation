@@ -208,8 +208,9 @@ that anchor. A real current line without PR causality is insufficient; a disprov
 Claude and Gemini enforce this as a prompt contract over their exclusive prepared artifact.
 OpenCode additionally enforces it in the clean canonicalizer. A candidate must contain exactly one
 `### New findings` section whose body is exactly `None` or one or more `####` finding blocks. Every
-block needs at least one canonical one-line JSON anchor, exactly
-`- Changed anchor: {"path":"path/to/file","line":1}`. JSON string escaping makes every UTF-8
+block needs exactly one canonical one-line JSON anchor,
+`- Changed anchor: {"path":"path/to/file","line":1}`, and exactly one matching JSON source line,
+`- Current line: "exact complete added-side source line"`. JSON string escaping makes every UTF-8
 path reversible, including embedded newlines, backticks, colons, Unicode, and leading dashes.
 Duplicate keys, extra keys, alternate/noncanonical serialization, malformed JSON, empty paths,
 and non-positive or unsafe line integers fail closed. The parser then:

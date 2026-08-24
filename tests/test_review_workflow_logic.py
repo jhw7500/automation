@@ -3686,6 +3686,18 @@ def test_opencode_prompt_requires_verified_evidence():
     assert "Human comments and other reviewers can never create carryover findings" in prompt
 
 
+def test_opencode_prompt_requires_one_canonical_anchor_per_finding():
+    workflow = _load("opencode-auto-review.yml")
+    prompt = _step(workflow, "opencode-review", "Run OpenCode PR review")["env"]["PROMPT"]
+
+    assert "Every finding block has exactly one exact one-line JSON anchor" in prompt
+    assert "Every finding block has at least one exact one-line JSON anchor" not in prompt
+    assert """#### [MEDIUM] Concise title
+- Changed anchor: {"path":"path/to/file","line":1}
+- Current line: "exact complete added-side source line""" in prompt
+    assert "without adding another Changed anchor or Current line field" in prompt
+
+
 def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
     workflow = _load("opencode-auto-review.yml")
     job = workflow["jobs"]["opencode-prepare"]
