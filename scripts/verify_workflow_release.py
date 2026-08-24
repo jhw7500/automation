@@ -47,10 +47,10 @@ OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
 )
 OPENCODE_REVIEW_RUN_SHA256 = (
-    "a876eb150f3b843fec271e2a8d67f3650a1c94a29cb6a3c6b8146bc0723e005a"
+    "83ceb3a0dfb5ec195bcf9b50b3b21282691384d8ce7e10ead56b65535070629b"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
-    "22cc07ee141b3d1a0b4d79bd16fdb2b4498f7cc82f0e1c25d01487b4aa86aded"
+    "3b2f0e16b0de234dcac5fb5637d96aa12fa7506aac6ca71b05d6b1e40486c3a2"
 )
 # These immutable annotated v1.45 patch releases predate format repair. Only their
 # exact peeled commits may retain the legacy generic command; no new commit may opt in.

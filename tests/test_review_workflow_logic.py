@@ -4140,6 +4140,94 @@ def test_opencode_format_repair_cannot_drop_indented_finding_heading(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "field",
+    (
+        '* Changed anchor: {"path":"app.py","line":1}',
+        '+ Current line: "reviewed = True"',
+        '1. Changed anchor: {"path":"app.py","line":1}',
+        '[ ] Current line: "reviewed = True"',
+        'Changed anchor: {"path":"app.py","line":1}',
+        '> 1. [x] + Current line: "reviewed = True"',
+        '**Changed anchor:** {"path":"app.py","line":1}',
+        '_Current line:_ "reviewed = True"',
+        '### Changed anchor: {"path":"app.py","line":1}',
+        'Changed anchor : {"path":"app.py","line":1}',
+        '## **Changed anchor** : {"path":"app.py","line":1}',
+        '`Current line`: "reviewed = True"',
+    ),
+    ids=(
+        "star",
+        "plus",
+        "ordered",
+        "task",
+        "bare",
+        "nested",
+        "decorated-colon-inside",
+        "emphasized-colon-inside",
+        "heading",
+        "spaced-colon",
+        "heading-decorated-colon-outside",
+        "code-span-colon-outside",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_cannot_drop_noncanonical_finding_field(
+    tmp_path, field, placement
+):
+    repaired = _opencode_candidate()
+    evidence = field + "\nThis finding evidence must remain signed."
+    if placement == "prefix":
+        malformed = evidence + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + evidence
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "Changed anchors: Review complete",
+        "Current lines: Review complete",
+        "Unchanged anchor: Review complete",
+        "**Changed anchors:** Review complete",
+        "## _Current lines:_ Review complete",
+        "`Unchanged anchor`: Review complete",
+    ),
+    ids=(
+        "plural-anchor",
+        "plural-line",
+        "unchanged",
+        "decorated-plural-anchor",
+        "heading-plural-line",
+        "code-span-unchanged",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_nonfinding_field_lookalike_wrapper(
+    tmp_path, field, placement
+):
+    repaired = _opencode_candidate()
+    if placement == "prefix":
+        malformed = field + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + field
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
     "prefix",
     [
         (

@@ -339,8 +339,11 @@ sections are equivalent to omission; an empty `New findings` section remains ter
 inside a finding remain signed substance. A finding heading with an explicit bracketed or
 colon-delimited `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, or `P0`–`P3` marker remains unsafe to drop;
 this includes emphasis or code-span delimiters that close immediately before the colon. The same
-applies to an anchor/current-line field before the first section, even when nested under Markdown
-quote or list containers. Generic labels such as `Summary:`, `Medium-term:`, `P4:`, and `P10:`
+applies to an exact `Changed anchor` or `Current line` field before the first section, including
+optional H1–H6, emphasis, or code-span decoration and horizontal space before its colon. The field
+may be bare, introduced by `-`, `+`, or `*`, or reached inside nested Markdown quote, ordered-list,
+or task-list containers. Lookalikes such as `Changed anchors:`, `Current lines:`, and
+`Unchanged anchor:`, and generic labels such as `Summary:`, `Medium-term:`, `P4:`, and `P10:`,
 remain wrapper text. Finding-like content or an allowed review section after an enclosing fence is
 likewise preserved rather than treated as wrapper text. An
 unsafe-to-sign or malformed repair is terminal; there is no third call and no candidate upload. The

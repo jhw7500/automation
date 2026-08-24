@@ -766,12 +766,15 @@ jobs:
           BLOCK_HEADING = re.compile(r"#### \S.*")
           FINDING_LEVEL = r"(?:critical|high|medium|low|p[0-3])"
           FINDING_DECORATOR = r"[*_~`]+"
+          FINDING_FIELD = r"(?:changed anchor|current line)"
           FINDING_PREFIX = re.compile(
               r"^\s*(?:####(?:\s|$)"
               rf"|(?:#{{1,6}}\s+)?(?:{FINDING_DECORATOR}\s*)?"
               rf"(?:\[{FINDING_LEVEL}\]|{FINDING_LEVEL}"
               rf"(?:[ \t]*{FINDING_DECORATOR})?[ \t]*:)"
-              r"|-\s*(?:changed anchor|current line):)",
+              rf"|(?:[-+*]\s*)?(?:#{{1,6}}\s+)?"
+              rf"(?:{FINDING_DECORATOR}\s*)?{FINDING_FIELD}"
+              rf"(?:[ \t]*{FINDING_DECORATOR})?[ \t]*:)",
               re.IGNORECASE,
           )
           MARKDOWN_CONTAINER = re.compile(
