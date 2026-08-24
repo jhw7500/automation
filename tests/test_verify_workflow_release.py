@@ -895,7 +895,63 @@ def test_current_release_rejects_opencode_interpreter_poisoning_before_review(
         ),
         (
             ".github/workflows/opencode-auto-review.yml",
-            "match[1] !== JSON.stringify({ path: anchor.path, line: anchor.line })",
+            "raw !== JSON.stringify({ path: anchor.path, line: anchor.line })",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "evidence.removedLines[0] !== previous[0].currentLines[0]",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'merge-base', '--is-ancestor', previousHead, attemptHead",
+            "'merge-base', previousHead, attemptHead",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "!['changed', 'modified', 'removed'].includes(identityRecords[0].status)",
+            "!['changed', 'modified', 'removed', 'renamed'].includes(identityRecords[0].status)",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "ranges.removedLines.get(removal.line) !== removal.currentLine",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "hasMarkdownEvidenceField(normalizedEvidenceLine)",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "HTML_NUMERIC_EVIDENCE_ENTITY, (raw, hex, decimal) => {",
+            "HTML_NUMERIC_EVIDENCE_ENTITY, () => {",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "if (quote !== null) {",
+            "if (false) {",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "NAMED_EVIDENCE_REPLACEMENTS.get(name) ?? raw",
+            "' '",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'diff', '--no-ext-diff', '--no-textconv', '--text', "
+            "'--find-renames=50%',",
+            "'diff', '--no-ext-diff', '--no-textconv', '--find-renames=50%',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'--output-indicator-new=%', `${previousHead}..${attemptHead}`",
+            "'--output-indicator-new=+', `${previousHead}..${attemptHead}`",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "globallyAddedLines.has(removal.currentLine)",
             "false",
         ),
         (
@@ -1043,6 +1099,17 @@ def test_current_release_rejects_opencode_interpreter_poisoning_before_review(
         "prepared-attempt-binding",
         "bounded-marker-cleanup",
         "canonical-json-anchor",
+        "canonical-removed-prior-binding",
+        "canonical-removed-ancestor",
+        "canonical-removed-rename-rejection",
+        "canonical-removed-line-membership",
+        "canonical-evidence-wrapper-normalization",
+        "canonical-evidence-entity-normalization",
+        "canonical-evidence-link-title-quoting",
+        "canonical-evidence-named-entity-whitelist",
+        "canonical-global-added-text-mode",
+        "canonical-global-added-indicator",
+        "canonical-global-readd-rejection",
         "canonical-rename-endpoints",
         "canonical-name-status-flags",
         "canonical-hunk-flags",

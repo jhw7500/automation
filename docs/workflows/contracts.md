@@ -207,13 +207,24 @@ that anchor. A real current line without PR causality is insufficient; a disprov
 
 Claude and Gemini enforce this as a prompt contract over their exclusive prepared artifact.
 OpenCode additionally enforces it in the clean canonicalizer. A candidate must contain exactly one
-`### New findings` section whose body is exactly `None` or one or more `####` finding blocks. Every
-block needs exactly one canonical one-line JSON anchor,
+`### New findings` section whose body is exactly `None` or one or more `####` finding blocks. Each
+`New findings`, `Still open`, and `Retracted` block needs exactly one canonical one-line JSON anchor,
 `- Changed anchor: {"path":"path/to/file","line":1}`, and exactly one matching JSON source line,
-`- Current line: "exact complete added-side source line"`. JSON string escaping makes every UTF-8
-path reversible, including embedded newlines, backticks, colons, Unicode, and leading dashes.
-Duplicate keys, extra keys, alternate/noncanonical serialization, malformed JSON, empty paths,
-and non-positive or unsafe line integers fail closed. The parser then:
+`- Current line: "exact complete added-side source line"`. A `Resolved` block normally uses that
+same pair. If the exact authenticated prior evidence line was deleted in the current round, a
+`Resolved` block may instead copy it exactly as `- Removed anchor: {"path":"path/to/file","line":1}`
+and `- Removed line: "exact previous source line"`; no other section may use that alternative, and
+current and removed pairs cannot be mixed. JSON string escaping makes every UTF-8 path reversible,
+including embedded newlines, backticks, colons, Unicode, and leading dashes. Duplicate keys, extra
+keys, alternate/noncanonical serialization, malformed JSON, empty paths, non-positive or unsafe
+line integers, and evidence-like noncanonical field labels fail closed. Markdown link/image,
+HTML tag/comment, and HTML entity wrappers are normalized only for reserved-label detection.
+Markdown destinations are consumed with balanced delimiters and quoted-title state rather than a
+greedy match. The complete semicolon-terminated HTML5 alias set whose decoded value consists only
+of whitespace, invisible format characters, supported decorators, or a colon is normalized;
+unrelated and unknown named entities remain literal. Wrapper syntax therefore cannot
+disguise a second unverified evidence field without turning benign prose into a reserved label. The
+parser then:
 
 1. verifies the sealed full diff and manifest hashes and their repository, PR, merge-base, and head
    identity;
@@ -232,6 +243,16 @@ and non-positive or unsafe line integers fail closed. The parser then:
    its relevant side; once that side is EOF-marked, a later hunk cannot reopen it. Malformed or
    truncated hunk bodies, counters, coordinates, and controls fail closed; diff prelude metadata is
    not treated as hunk-body evidence.
+
+For the `Resolved`-only removed-evidence alternative, the canonicalizer first requires an exact
+path, old line number, and line-content match against the unique authenticated active prior block.
+It then requires that prior successful HEAD to be an ancestor of the current attempt HEAD and
+re-derives their literal-path, zero-context diff with the same hardened Git options. The exact old
+line must be consumed by a real `-` record, the prior path must have one non-rename/non-copy status
+record, and the same content must not be re-added anywhere in the authenticated prior-to-current
+diff. This permits deletion-only fixes even when the file disappears from the base-to-current
+manifest, without treating a pure rename as a fix or allowing an unsupported `Resolved` or
+`Retracted` disposition to advance the checkpoint.
 
 Rename preparation consequently transports both old and current identities, but a reportable
 anchor names a changed added-side line in the current filename. A pure 100% rename has no such

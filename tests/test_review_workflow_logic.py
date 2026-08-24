@@ -26,11 +26,13 @@ run it against fixtures, so the review-round rules stay locked:
 from __future__ import annotations
 
 import hashlib
+import html.entities
 import json
 import os
 import re
 import shutil
 import subprocess
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -3671,9 +3673,10 @@ def test_opencode_prompt_requires_verified_evidence():
     # 신규 finding: 실존 현재 라인 인용 의무
     assert "quote the exact current line" in prompt
     assert "do not report it" in prompt
-    # Resolved: 자기 finding 한정 + 현재 코드 확인 + 해결 라인 인용
+    # Resolved: 자기 finding 한정 + 현재 코드/인증된 삭제 확인 + 해결 라인 인용
     assert "never adopt or resolve another reviewer's findings" in prompt
-    assert "current line(s) proving the fix" in prompt
+    assert "current or removed line proving the fix" in prompt
+    assert "authenticated prior evidence line was deleted in this round" in prompt
     assert "Still open, not Resolved" in prompt
     assert "Changed anchor" in prompt
     assert "unchanged line is supporting evidence only" in prompt
@@ -3690,8 +3693,12 @@ def test_opencode_prompt_requires_one_canonical_anchor_per_finding():
     workflow = _load("opencode-auto-review.yml")
     prompt = _step(workflow, "opencode-review", "Run OpenCode PR review")["env"]["PROMPT"]
 
-    assert "Every finding block has exactly one exact one-line JSON anchor" in prompt
+    assert "Every New findings, Still open, and Retracted block has exactly one" in prompt
     assert "Every finding block has at least one exact one-line JSON anchor" not in prompt
+    assert "Every Resolved block has either that exact current pair" in prompt
+    assert "Never mix current and removed pairs" in prompt
+    assert '- Removed anchor: {"path":"path/to/file","line":1}' in prompt
+    assert '- Removed line: "exact previous source line"' in prompt
     assert "must be the first top-level section and appear exactly once" in prompt
     canonical_example = (
         '#### [MEDIUM] Concise title\n'
@@ -4144,6 +4151,11 @@ def test_opencode_format_repair_cannot_drop_indented_finding_heading(tmp_path):
     (
         '* Changed anchor: {"path":"app.py","line":1}',
         '+ Current line: "reviewed = True"',
+        '* Removed anchor: {"path":"app.py","line":1}',
+        '_Removed line:_ "reviewed = True"',
+        'Previous anchor: {"path":"app.py","line":1}',
+        '> Changed **anchor**: {"path":"app.py","line":1}',
+        '- [ ] Current _line_: "reviewed = True"',
         '1. Changed anchor: {"path":"app.py","line":1}',
         '[ ] Current line: "reviewed = True"',
         'Changed anchor: {"path":"app.py","line":1}',
@@ -4154,12 +4166,36 @@ def test_opencode_format_repair_cannot_drop_indented_finding_heading(tmp_path):
         'Changed anchor : {"path":"app.py","line":1}',
         '## **Changed anchor** : {"path":"app.py","line":1}',
         '`Current line`: "reviewed = True"',
+        '[Changed anchor](https://example.invalid/evidence): {"path":"app.py","line":1}',
+        '[Changed anchor](https://example.invalid/evidence): {"path":"app.py","line":1} (extra)',
+        '[Changed anchor](https://example.invalid/a_(b)): {"path":"app.py","line":1}',
+        '[Changed anchor](https://example.invalid "title ) extra"): {"path":"app.py","line":1}',
+        "[Changed anchor](https://example.invalid 'title ) extra'): {\"path\":\"app.py\",\"line\":1}",
+        '[Changed anchor] (https://example.invalid/evidence): {"path":"app.py","line":1}',
+        '![Current line](https://example.invalid/evidence): "reviewed = True"',
+        '[Current line][evidence]: "reviewed = True"',
+        '[Changed anchor]: {"path":"app.py","line":1}',
+        '<strong>Removed anchor</strong>: {"path":"app.py","line":1}',
+        'Changed<!--hidden--> anchor: {"path":"app.py","line":1}',
+        'Changed&#32;anchor: {"path":"app.py","line":1}',
+        'Changed&#X20;anchor: {"path":"app.py","line":1}',
+        'Changed&nbsp;anchor: {"path":"app.py","line":1}',
+        'Changed&af;anchor: {"path":"app.py","line":1}',
+        'Current&ic;line: "reviewed = True"',
+        'Current&it;line: "reviewed = True"',
+        'Changed&midast;anchor: {"path":"app.py","line":1}',
+        'Current&DiacriticalGrave;line: "reviewed = True"',
         'Changed anchor\u202f: {"path":"app.py","line":1}',
         '_Current line_\u00a0: "reviewed = True"',
     ),
     ids=(
         "star",
         "plus",
+        "removed-anchor",
+        "removed-line",
+        "previous-anchor",
+        "internal-decorated-anchor",
+        "task-internal-decorated-line",
         "ordered",
         "task",
         "bare",
@@ -4170,6 +4206,25 @@ def test_opencode_format_repair_cannot_drop_indented_finding_heading(tmp_path):
         "spaced-colon",
         "heading-decorated-colon-outside",
         "code-span-colon-outside",
+        "linked-anchor",
+        "linked-anchor-trailing-parens",
+        "linked-anchor-balanced-parens",
+        "linked-anchor-double-quoted-title",
+        "linked-anchor-single-quoted-title",
+        "linked-anchor-spaced-destination",
+        "image-linked-line",
+        "reference-linked-line",
+        "shortcut-linked-anchor",
+        "html-wrapped-anchor",
+        "html-comment-anchor",
+        "html-entity-anchor",
+        "html-hex-entity-anchor",
+        "html-named-entity-anchor",
+        "html-alias-apply-function-anchor",
+        "html-alias-invisible-comma-line",
+        "html-alias-invisible-times-line",
+        "html-alias-midast-anchor",
+        "html-alias-diacritical-grave-line",
         "narrow-nbsp-colon",
         "decorated-nbsp-colon",
     ),
@@ -4202,6 +4257,10 @@ def test_opencode_format_repair_cannot_drop_noncanonical_finding_field(
         "**Changed anchors:** Review complete",
         "## _Current lines:_ Review complete",
         "`Unchanged anchor`: Review complete",
+        "[Changed anchor](https://example.invalid/evidence) documentation",
+        "Changed&amp;anchor: Review complete",
+        "Changed&copy;anchor: Review complete",
+        "Changed&notARealEntity;anchor: Review complete",
     ),
     ids=(
         "plural-anchor",
@@ -4210,6 +4269,10 @@ def test_opencode_format_repair_cannot_drop_noncanonical_finding_field(
         "decorated-plural-anchor",
         "heading-plural-line",
         "code-span-unchanged",
+        "linked-anchor-prose",
+        "amp-entity-prose",
+        "copy-entity-prose",
+        "unknown-entity-prose",
     ),
 )
 @pytest.mark.parametrize("placement", ("prefix", "suffix"))
@@ -4229,6 +4292,36 @@ def test_opencode_format_repair_allows_nonfinding_field_lookalike_wrapper(
     assert result.returncode == 0, result.stderr
     assert len(calls) == 2
     assert candidate == repaired
+
+
+def test_opencode_evidence_entity_maps_cover_all_html5_wrapper_aliases():
+    source = (WORKFLOWS / "opencode-auto-review.yml").read_text(encoding="utf-8")
+    python_map = source.split("NAMED_EVIDENCE_REPLACEMENTS = {", 1)[1].split(
+        "}", 1
+    )[0]
+    javascript_map = source.split(
+        "const NAMED_EVIDENCE_REPLACEMENTS = new Map([", 1
+    )[1].split("]);", 1)[0]
+    python_names = set(re.findall(r'"([A-Za-z][A-Za-z0-9]+)"\s*:', python_map))
+    javascript_names = set(
+        re.findall(r"\['([A-Za-z][A-Za-z0-9]+)',", javascript_map)
+    )
+    decorators = set("*_~`:")
+    expected = {
+        name[:-1]
+        for name, value in html.entities.html5.items()
+        if name.endswith(";")
+        and value
+        and all(
+            character.isspace()
+            or unicodedata.category(character) == "Cf"
+            or character in decorators
+            for character in value
+        )
+    }
+
+    assert python_names == expected
+    assert javascript_names == expected
 
 
 @pytest.mark.parametrize(
@@ -6986,8 +7079,11 @@ def test_opencode_rereview_accepts_exact_still_open_resolved_and_retracted_bindi
         f"{OPENCODE_MARKER}\n### New findings\nNone\n"
         f"### Still open\n#### Remains active\n- Changed anchor: {anchor}\n"
         '- Current line: "added line 1"\nstill present\n'
-        "### Resolved\n#### Fixed now\ncurrent code proves the fix\n"
-        "### Retracted\n#### Was incorrect\nprior claim disproved"
+        f"### Resolved\n#### Fixed now\n- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\n'
+        "The current line and changed anchor prove the fix without forming fields.\n"
+        f"### Retracted\n#### Was incorrect\n- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\nprior claim disproved'
     )
 
     calls = _run_opencode_canonicalize(
@@ -7002,6 +7098,392 @@ def test_opencode_rereview_accepts_exact_still_open_resolved_and_retracted_bindi
     assert "#### Remains active" in body
     assert "#### Fixed now" in body
     assert "#### Was incorrect" in body
+
+
+@node_required
+@pytest.mark.parametrize("section", ["Resolved", "Retracted"])
+def test_opencode_rereview_rejects_carryover_without_current_evidence(
+    tmp_path, section
+):
+    head = "ab" * 20
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    prior_body = (
+        "### New findings\n"
+        f"#### Active finding\n- Changed anchor: {anchor}\nprior evidence"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### {section}\n#### Active finding\nunsupported disposition"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+    assert state["attempt_status"] == "failure"
+    assert "Reason: output_grammar_invalid" in body
+
+
+@node_required
+@pytest.mark.parametrize(
+    "extra_line",
+    (
+        '- Changed  anchor: {"path":"outside.js","line":999}',
+        '- Current\u00a0line: "unvalidated evidence"',
+        '> Changed **anchor**: {"path":"outside.js","line":999}',
+        '- [ ] Current _line_: "unvalidated evidence"',
+        '- [Changed anchor](https://example.invalid/evidence): {"path":"outside.js","line":999}',
+        '- [Changed anchor](https://example.invalid/evidence): {"path":"outside.js","line":999} (extra)',
+        '- [Changed anchor](https://example.invalid/a_(b)): {"path":"outside.js","line":999}',
+        '- [Changed anchor](https://example.invalid "title ) extra"): {"path":"outside.js","line":999}',
+        "- [Changed anchor](https://example.invalid 'title ) extra'): {\"path\":\"outside.js\",\"line\":999}",
+        '- [Changed anchor] (https://example.invalid/evidence): {"path":"outside.js","line":999}',
+        '- [Current line][evidence]: "unvalidated evidence"',
+        '- [Changed anchor]: {"path":"outside.js","line":999}',
+        '- <strong>Current line</strong>: "unvalidated evidence"',
+        '- Current<!--hidden--> line: "unvalidated evidence"',
+        '- Current&#32;line: "unvalidated evidence"',
+        '- Current&#X20;line: "unvalidated evidence"',
+        '- Current&nbsp;line: "unvalidated evidence"',
+        '- Changed&af;anchor: {"path":"outside.js","line":999}',
+        '- Current&ic;line: "unvalidated evidence"',
+        '- Current&it;line: "unvalidated evidence"',
+        '- Changed&midast;anchor: {"path":"outside.js","line":999}',
+        '- Current&DiacriticalGrave;line: "unvalidated evidence"',
+    ),
+    ids=(
+        "double-space",
+        "nbsp",
+        "decorated-anchor",
+        "task-decorated-line",
+        "linked-anchor",
+        "linked-anchor-trailing-parens",
+        "linked-anchor-balanced-parens",
+        "linked-anchor-double-quoted-title",
+        "linked-anchor-single-quoted-title",
+        "linked-anchor-spaced-destination",
+        "reference-linked-line",
+        "shortcut-linked-anchor",
+        "html-wrapped-line",
+        "html-comment-line",
+        "html-entity-line",
+        "html-hex-entity-line",
+        "html-named-entity-line",
+        "html-alias-apply-function-anchor",
+        "html-alias-invisible-comma-line",
+        "html-alias-invisible-times-line",
+        "html-alias-midast-anchor",
+        "html-alias-diacritical-grave-line",
+    ),
+)
+def test_opencode_rereview_rejects_noncanonical_duplicate_evidence_field(
+    tmp_path, extra_line
+):
+    head = "ab" * 20
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    prior_body = (
+        "### New findings\n"
+        f"#### Active finding\n- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\nprior evidence'
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Resolved\n#### Active finding\n- Changed anchor: {anchor}\n"
+        f'- Current line: "added line 1"\n{extra_line}\nresolved evidence'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+    assert state["attempt_status"] == "failure"
+    assert "Reason: output_grammar_invalid" in body
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("current_source", "renamed_path", "readded_path", "expected_status"),
+    (
+        ("base = True\ntail = True\n", None, None, "success"),
+        (None, None, None, "success"),
+        (
+            "base = True\nvulnerable = True\ntail = True\nunrelated = True\n",
+            None,
+            None,
+            "failure",
+        ),
+        (
+            "base = True\ntail = True\nvulnerable = True\n",
+            None,
+            None,
+            "failure",
+        ),
+        (
+            "base = True\nvulnerable = True\ntail = True\n",
+            "src/moved.py",
+            None,
+            "failure",
+        ),
+        (
+            "base = True\ntail = True\nrenamed = True\n",
+            "src/moved.py",
+            None,
+            "failure",
+        ),
+        (
+            "base = True\ntail = True\n",
+            None,
+            "src/moved.py",
+            "failure",
+        ),
+    ),
+    ids=(
+        "deleted-line",
+        "deleted-file",
+        "not-deleted",
+        "moved-in-same-path",
+        "renamed-path",
+        "renamed-path-with-edit",
+        "readded-in-other-path",
+    ),
+)
+def test_opencode_rereview_verifies_authenticated_removed_line(
+    tmp_path, current_source, renamed_path, readded_path, expected_status
+):
+    trusted = tmp_path / "trusted-repo"
+    trusted.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=trusted, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=trusted,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=trusted, check=True
+    )
+    source = trusted / OPENCODE_SCOPE_PATH
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("base = True\ntail = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--all"], cwd=trusted, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=trusted, check=True)
+    merge_base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=trusted,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source.write_text(
+        "base = True\nvulnerable = True\ntail = True\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "--all"], cwd=trusted, check=True)
+    subprocess.run(["git", "commit", "-qm", "prior finding"], cwd=trusted, check=True)
+    prior_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=trusted,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if current_source is None:
+        source.unlink()
+    else:
+        source.write_text(current_source, encoding="utf-8")
+    if renamed_path is not None:
+        (trusted / renamed_path).parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "mv", "--", OPENCODE_SCOPE_PATH, renamed_path],
+            cwd=trusted,
+            check=True,
+        )
+    if readded_path is not None:
+        readded = trusted / readded_path
+        readded.parent.mkdir(parents=True, exist_ok=True)
+        readded.write_text("vulnerable = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--all"], cwd=trusted, check=True)
+    subprocess.run(["git", "commit", "-qm", "remove defect"], cwd=trusted, check=True)
+    current_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=trusted,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 2},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    prior_body = (
+        "### New findings\n"
+        f"#### Deleted defect\n- Changed anchor: {anchor}\n"
+        '- Current line: "vulnerable = True"\nprior evidence'
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 1, prior_head), prior_body
+        ),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Resolved\n#### Deleted defect\n- Removed anchor: {anchor}\n"
+        '- Removed line: "vulnerable = True"\nremoval resolves the defect'
+    )
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": merge_base,
+        "head_sha": current_head,
+        "files": [],
+    }
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+
+    calls = _run_opencode_canonicalize(
+        case_dir,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+        attempt_head=current_head,
+        current_head=current_head,
+        trusted_workspace=trusted,
+        manifest=manifest,
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+    assert state["attempt_status"] == expected_status
+    if expected_status == "success":
+        assert "- Removed line: \"vulnerable = True\"" in body
+    else:
+        assert "Reason: anchor_out_of_scope" in body
+
+
+@node_required
+@pytest.mark.parametrize("section", ["Still open", "Retracted"])
+def test_opencode_rereview_rejects_removed_evidence_outside_resolved(
+    tmp_path, section
+):
+    head = "ab" * 20
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    prior_body = (
+        "### New findings\n"
+        f"#### Active finding\n- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\nprior evidence'
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### {section}\n#### Active finding\n- Removed anchor: {anchor}\n"
+        '- Removed line: "added line 1"\nunsupported disposition'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+    assert state["attempt_status"] == "failure"
+    assert "Reason: output_grammar_invalid" in body
+
+
+@node_required
+@pytest.mark.parametrize("mismatch", ["path", "line", "source"])
+def test_opencode_rereview_rejects_removed_evidence_not_copied_from_prior(
+    tmp_path, mismatch
+):
+    head = "ab" * 20
+    prior_anchor = {"path": OPENCODE_SCOPE_PATH, "line": 1}
+    removed_anchor = dict(prior_anchor)
+    removed_line = "added line 1"
+    if mismatch == "path":
+        removed_anchor["path"] = "other.py"
+    elif mismatch == "line":
+        removed_anchor["line"] = 2
+    else:
+        removed_line = "different source"
+    prior_anchor_json = json.dumps(
+        prior_anchor, ensure_ascii=False, separators=(",", ":")
+    )
+    removed_anchor_json = json.dumps(
+        removed_anchor, ensure_ascii=False, separators=(",", ":")
+    )
+    prior_body = (
+        "### New findings\n"
+        f"#### Active finding\n- Changed anchor: {prior_anchor_json}\n"
+        '- Current line: "added line 1"\nprior evidence'
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Resolved\n#### Active finding\n- Removed anchor: {removed_anchor_json}\n"
+        f"- Removed line: {json.dumps(removed_line)}\nunsupported disposition"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+    assert state["attempt_status"] == "failure"
+    assert "Reason: output_grammar_invalid" in body
 
 
 @node_required
@@ -7991,6 +8473,43 @@ def test_opencode_finding_accepts_exact_current_changed_line(tmp_path):
     )
     body = _single_mutation_body(_run_opencode_canonicalize(tmp_path, [], [candidate]))
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+
+
+@node_required
+@pytest.mark.parametrize(
+    "prose",
+    (
+        "Changed&amp;anchor: benign prose",
+        "Changed&copy;anchor: benign prose",
+        "Changed&notARealEntity;anchor: benign prose",
+    ),
+    ids=("amp", "copy", "unknown"),
+)
+def test_opencode_finding_allows_nonseparator_named_entity_prose(
+    tmp_path, prose
+):
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    candidate = _bot(
+        "github-actions[bot]",
+        (
+            f"{OPENCODE_MARKER}\n### New findings\n"
+            f"#### [MEDIUM] Grounded finding\n- Changed anchor: {anchor}\n"
+            f'- Current line: "added line 1"\n{prose}'
+        ),
+        10,
+        updated="u2",
+    )
+    body = _single_mutation_body(
+        _run_opencode_canonicalize(tmp_path, [], [candidate])
+    )
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
     assert state["attempt_status"] == "success"
 
 

@@ -47,10 +47,10 @@ OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
 )
 OPENCODE_REVIEW_RUN_SHA256 = (
-    "687772d067872cb18bf5b6c7a85cf9885d257ff114050732b10cf87ca6dd003e"
+    "e8e880af0f5b597f3e11f7720b67adb1eb81500e49a6e100d09a806cc92fd837"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
-    "d420646a0db6013bbab99e40b91a5a7f64bba1fb16c4c7266dbb1d54a2844745"
+    "cde632df0947981c4861d3b94ee07a92005c5340b29039e4bec3c16540b3f070"
 )
 # These immutable annotated v1.45 patch releases predate format repair. Only their
 # exact peeled commits may retain the legacy generic command; no new commit may opt in.
@@ -2133,15 +2133,16 @@ def _verify_commit_content(
     except (KeyError, TypeError) as exc:
         raise ReleaseVerificationError("OpenCode security structure is missing") from exc
     modern_auto_review = release_supports_prepare_review_diff(ref)
+    approved_legacy_opencode_release = (
+        ref,
+        revision,
+    ) in APPROVED_LEGACY_GENERIC_OPENCODE_RELEASES
     step = verify_opencode_runtime(
         job,
         "Run OpenCode PR review",
         "opencode-auto-review.yml",
         generic_run=modern_auto_review,
-        allow_legacy_generic=(
-            ref,
-            revision,
-        ) in APPROVED_LEGACY_GENERIC_OPENCODE_RELEASES,
+        allow_legacy_generic=approved_legacy_opencode_release,
         workflow_sha256=hashlib.sha256(
             tree.read_file(".github/workflows/opencode-auto-review.yml")
         ).hexdigest(),
@@ -2189,7 +2190,7 @@ def _verify_commit_content(
                 "'--no-replace-objects', '--literal-pathspecs', '-c', "
                 "'diff.external=',"
             )
-            == 2
+            == (2 if approved_legacy_opencode_release else 5)
             and (
                 "'diff', '--no-ext-diff', '--no-textconv', '--name-status', "
                 "'-z',\n      '--find-renames=50%', "
@@ -2269,6 +2270,81 @@ def _verify_commit_content(
             and "const ranges = parseAddedRanges(result.stdout);" in canonical_script
             and "const start = Number(match[1]);" not in canonical_script
         )
+        canonical_removed_contract = (
+            "const EVIDENCE_FIELD = /" in canonical_script
+            and "const EVIDENCE_FIELD_NAME = /" in canonical_script
+            and "const MARKDOWN_EVIDENCE_LABEL = /" in canonical_script
+            and "const HTML_NUMERIC_EVIDENCE_ENTITY = /&#(?:(?:[xX]"
+            in canonical_script
+            and "const HTML_NAMED_EVIDENCE_ENTITY = /" in canonical_script
+            and "const NAMED_EVIDENCE_REPLACEMENTS = new Map(["
+            in canonical_script
+            and "const HTML_EVIDENCE_COMMENT = /" in canonical_script
+            and "const HTML_EVIDENCE_TAG = /" in canonical_script
+            and "const normalizeEvidenceFieldWrappers = (line) => {" in canonical_script
+            and "HTML_NUMERIC_EVIDENCE_ENTITY, (raw, hex, decimal) => {"
+            in canonical_script
+            and ").replace(HTML_NAMED_EVIDENCE_ENTITY, (raw, name) =>"
+            in canonical_script
+            and "NAMED_EVIDENCE_REPLACEMENTS.get(name) ?? raw"
+            in canonical_script
+            and "const consumeBalanced = (value, start, opening, closing) => {"
+            in canonical_script
+            and "let quote = null;" in canonical_script
+            and "if (quote !== null) {" in canonical_script
+            and "const hasMarkdownEvidenceField = (line) => {" in canonical_script
+            and canonical_script.count(
+                "while (cursor < line.length "
+                "&& EVIDENCE_FIELD_PADDING.test(line[cursor]))"
+            )
+            == 2
+            and "replace(HTML_EVIDENCE_COMMENT, '')" in canonical_script
+            and "normalized.replace(HTML_EVIDENCE_TAG, '')" in canonical_script
+            and "EVIDENCE_FIELD.test(normalizedEvidenceLine)" in canonical_script
+            and "hasMarkdownEvidenceField(normalizedEvidenceLine)"
+            in canonical_script
+            and (
+                "if (section.name !== 'Resolved' || !removedPair || "
+                "!noCurrentPair) return null;"
+            )
+            in canonical_script
+            and (
+                "evidence.removedLines[0] !== previous[0].currentLines[0]"
+            )
+            in canonical_script
+            and "const removedLines = new Map();" in canonical_script
+            and "removedLines.set(oldLine, line.slice(1));" in canonical_script
+            and "ranges.removedLines = removedLines;" in canonical_script
+            and (
+                "'merge-base', '--is-ancestor', previousHead, attemptHead"
+            )
+            in canonical_script
+            and "const previousNameStatus = spawnSync('/usr/bin/git'" in canonical_script
+            and "identityRecords.length !== 1" in canonical_script
+            and (
+                "!['changed', 'modified', 'removed'].includes("
+                "identityRecords[0].status)"
+            )
+            in canonical_script
+            and (
+                "ranges.removedLines.get(removal.line) !== removal.currentLine"
+            )
+            in canonical_script
+            and "const previousContentDiff = spawnSync('/usr/bin/git'"
+            in canonical_script
+            and (
+                "'diff', '--no-ext-diff', '--no-textconv', '--text', "
+                "'--find-renames=50%',"
+            )
+            in canonical_script
+            and (
+                "'--output-indicator-new=%', "
+                "`${previousHead}..${attemptHead}`"
+            )
+            in canonical_script
+            and "const globallyAddedLines = new Set(" in canonical_script
+            and "globallyAddedLines.has(removal.currentLine)" in canonical_script
+        )
         body_limit_gate = canonical_script.find(
             "if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') "
             "> 65536)"
@@ -2310,8 +2386,14 @@ def _verify_commit_content(
             and "entries.length !== 1 || entries[0].name !== 'review.md'" in canonical_script
             and "candidateStat.size > 60000" in canonical_script
             and "Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536" in canonical_script
-            and "match[1] !== JSON.stringify({ path: anchor.path, line: anchor.line })" in canonical_script
+            and (
+                "match[1] !== JSON.stringify({ path: anchor.path, line: anchor.line })"
+                if approved_legacy_opencode_release
+                else "raw !== JSON.stringify({ path: anchor.path, line: anchor.line })"
+            )
+            in canonical_script
             and canonical_anchor_contract
+            and (canonical_removed_contract or approved_legacy_opencode_release)
             and canonical_pre_mutation_size_contract
             and "github.rest.checks.create" in canonical_script
             and "github.rest.checks.update" in canonical_script
