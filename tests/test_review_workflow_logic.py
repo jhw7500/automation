@@ -4399,6 +4399,124 @@ def test_opencode_format_repair_allows_level_three_wrapper_heading(
     assert candidate == repaired
 
 
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "# Review",
+        "## Review summary",
+        "### Code review results",
+        "# Pull request review report",
+        "## PR review overview",
+        "### Automated code review",
+        "## OpenCode PR review complete",
+        "## Summary",
+        "## Overview",
+        "> ## **Review summary** ##",
+        "## [Note] **Review summary**",
+        "## **[Note] Review summary**",
+        "## `[Info] Code review results`",
+        "## **Changed anchors: Review complete**",
+        "## `Current lines: Review complete`",
+    ),
+    ids=(
+        "review",
+        "review-summary",
+        "code-review-results",
+        "pull-request-review-report",
+        "pr-review-overview",
+        "automated-code-review",
+        "opencode-pr-review-complete",
+        "summary",
+        "overview",
+        "quoted-decorated-closing-sequence",
+        "tagged-decorated-generic",
+        "decorated-tagged-generic",
+        "code-decorated-tagged-generic",
+        "decorated-field-lookalike",
+        "code-decorated-field-lookalike",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_exact_benign_wrapper_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    wrapper = heading + "\nI reviewed the supplied diff."
+    if placement == "prefix":
+        malformed = wrapper + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + wrapper
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "# Authentication bypass remains",
+        "## Authorization check is missing",
+        "### Stale state persists",
+        "#### Cancellation leaks resources",
+        "##### Token disclosure remains",
+        "###### Race condition remains",
+        "> ## Quoted authentication bypass",
+        "- ### Listed authorization bypass",
+        "## **Authentication bypass remains**",
+        "## Authentication bypass remains ##",
+        "## Review: Authentication bypass remains",
+        "## Security review",
+        "## Summary of authorization bypass",
+        "#### Review",
+        "##### Review summary",
+        "###### Summary",
+    ),
+    ids=(
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "quoted",
+        "listed",
+        "decorated",
+        "closing-sequence",
+        "benign-prefix-only",
+        "benign-suffix-only",
+        "summary-prefix-only",
+        "h4-benign-title",
+        "h5-benign-title",
+        "h6-benign-title",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_cannot_drop_unapproved_wrapper_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    finding = (
+        heading
+        + "\nThis substantive finding must not be discarded as wrapper prose."
+    )
+    if placement == "prefix":
+        malformed = finding + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + finding
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
 def test_opencode_format_repair_cannot_drop_severity_heading_in_wrapper(
     tmp_path,
 ):

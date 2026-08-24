@@ -838,6 +838,35 @@ jobs:
               rf"^\s*(?:#{{1,6}}\s+)?"
               rf"(?:{FINDING_DECORATOR}{HORIZONTAL_SPACE}*)?$"
           )
+          MARKDOWN_ATX_HEADING = re.compile(r"^(#{1,6})(?:[ \t]+(.*)|[ \t]*)$")
+          MARKDOWN_ATX_CLOSING = re.compile(r"[ \t]+#+[ \t]*$")
+          GENERIC_WRAPPER_TITLE = (
+              rf"(?:(?:(?:automated|opencode){HORIZONTAL_SPACE}+)?"
+              rf"(?:(?:code|pr|pull{HORIZONTAL_SPACE}+request)"
+              rf"{HORIZONTAL_SPACE}+)?review"
+              rf"(?:{HORIZONTAL_SPACE}+(?:summary|overview|results|report|complete))?"
+              rf"|summary|overview)"
+          )
+          DECORATED_GENERIC_WRAPPER_TITLE = (
+              rf"(?:{FINDING_DECORATOR}{HORIZONTAL_SPACE}*)?"
+              rf"{GENERIC_WRAPPER_TITLE}"
+              rf"(?:{HORIZONTAL_SPACE}*{FINDING_DECORATOR})?"
+          )
+          BENIGN_WRAPPER_HEADING = re.compile(
+              rf"^(?:{DECORATED_GENERIC_WRAPPER_TITLE}"
+              rf"|(?:{FINDING_DECORATOR}{HORIZONTAL_SPACE}*)?"
+              rf"\[(?:note|info|context)\]{HORIZONTAL_SPACE}+"
+              rf"{DECORATED_GENERIC_WRAPPER_TITLE}"
+              rf"|(?:{FINDING_DECORATOR}{HORIZONTAL_SPACE}*)?"
+              rf"(?:changed{HORIZONTAL_SPACE}+anchors|current{HORIZONTAL_SPACE}+lines|"
+              rf"unchanged{HORIZONTAL_SPACE}+anchor)"
+              rf"(?:{HORIZONTAL_SPACE}*{FINDING_DECORATOR})?"
+              rf"{HORIZONTAL_SPACE}*:{HORIZONTAL_SPACE}*"
+              rf"(?:{FINDING_DECORATOR}{HORIZONTAL_SPACE}*)?review"
+              rf"{HORIZONTAL_SPACE}+complete"
+              rf"(?:{HORIZONTAL_SPACE}*{FINDING_DECORATOR})?)$",
+              re.IGNORECASE,
+          )
           FINDING_FIELD_TRAILING = re.compile(FINDING_FIELD_PADDING)
           MARKDOWN_EVIDENCE_LABEL = re.compile(r"!?\[([^\]\r\n]*)\]")
           HTML_NUMERIC_ENTITY = re.compile(
@@ -987,6 +1016,23 @@ jobs:
                   remainder = remainder[container.end():].lstrip()
               return False
 
+          def is_unapproved_wrapper_heading(line):
+              remainder = normalize_finding_field_wrappers(line).lstrip()
+              while remainder:
+                  heading = MARKDOWN_ATX_HEADING.fullmatch(remainder)
+                  if heading is not None:
+                      if len(heading.group(1)) >= 4:
+                          return True
+                      title = MARKDOWN_ATX_CLOSING.sub(
+                          "", heading.group(2) or ""
+                      ).strip(" \t")
+                      return BENIGN_WRAPPER_HEADING.fullmatch(title) is None
+                  container = MARKDOWN_CONTAINER.match(remainder)
+                  if container is None:
+                      return False
+                  remainder = remainder[container.end():].lstrip()
+              return False
+
           def parse_fence_line(line):
               match = FENCE_LINE.fullmatch(line)
               if match is None:
@@ -1058,6 +1104,7 @@ jobs:
               suffix = lines[close_index + 1:]
               if any(
                   is_finding_prefix_line(line)
+                  or is_unapproved_wrapper_heading(line)
                   or VALID_HEADING.fullmatch(line) is not None
                   for line in suffix
               ):
@@ -1136,7 +1183,11 @@ jobs:
               lines = strip_enclosing_markdown_fence(lines, first_section)
               first_section = first_section_index(lines)
               prefix = lines[:first_section]
-              if any(is_finding_prefix_line(line) for line in prefix):
+              if any(
+                  is_finding_prefix_line(line)
+                  or is_unapproved_wrapper_heading(line)
+                  for line in prefix
+              ):
                   reject()
 
               sections = parse_sections(lines[first_section:])

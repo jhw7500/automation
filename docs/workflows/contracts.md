@@ -380,8 +380,18 @@ optional H1–H6, emphasis, or code-span decoration and horizontal space before 
 may be bare, introduced by `-`, `+`, or `*`, or reached inside nested Markdown quote, ordered-list,
 or task-list containers. Lookalikes such as `Changed anchors:`, `Current lines:`, and
 `Unchanged anchor:`, and generic labels such as `Summary:`, `Medium-term:`, `P4:`, and `P10:`,
-remain wrapper text. Finding-like content or an allowed review section after an enclosing fence is
-likewise preserved rather than treated as wrapper text. An
+remain wrapper text. Unlabeled ATX headings are not assumed to be harmless: an H1–H6 heading before
+the first review section or after an enclosing fence makes repair terminal unless an H1–H3 title
+exactly matches the closed generic wrapper vocabulary (`Review`, an optional automated/OpenCode and
+code/PR/pull-request qualifier, an optional summary/overview/results/report/complete suffix, or the
+standalone `Summary`/`Overview`). The same vocabulary may follow an exact `[Note]`, `[Info]`, or
+`[Context]` tag; the documented plural evidence-field lookalikes remain harmless only in the exact
+`...: Review complete` title form. Matching is case-insensitive and may carry whole-title
+emphasis/code decoration or an ATX closing sequence, but prefix matches such as
+`Review: Authentication bypass`, `Security review`, and `Summary of failures` remain protected.
+H4–H6 headings always remain finding-like because they overlap the canonical finding-block syntax.
+Finding-like content or an allowed review section after an enclosing fence is likewise preserved
+rather than treated as wrapper text. An
 unsafe-to-sign or malformed repair is terminal; there is no third call and no candidate upload. The
 model job reports `model_job_failed` for setup/infrastructure failure, `provider_failed` only when a
 model process fails, and `candidate_contract_failed` when post-response preflight rejects the

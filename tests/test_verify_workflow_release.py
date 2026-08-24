@@ -675,6 +675,14 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
             '          EXPLICIT_DEFECT_LABEL = r"(?!)"',
         ),
         (
+            "                      return BENIGN_WRAPPER_HEADING.fullmatch(title) is None",
+            "                      return False",
+        ),
+        (
+            "                      if len(heading.group(1)) >= 4:",
+            "                      if False:",
+        ),
+        (
             '                  " " if unicodedata.category(character) == "Cf" else character',
             '                  character',
         ),
@@ -699,6 +707,8 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
         "initial-signature-polarity",
         "repaired-signature-polarity",
         "explicit-defect-label",
+        "unapproved-wrapper-heading",
+        "canonical-finding-heading-depth",
         "format-control-normalization",
         "constant-signature-groups",
         "post-heredoc-contract-rewrite",
