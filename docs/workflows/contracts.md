@@ -320,8 +320,16 @@ has empty job permissions, no repository checkout, and no `GITHUB_TOKEN`, `GH_TO
 non-repository directory, sends the prompt on stdin, attaches only `review-full.diff` and
 `review-scope.json`, and enables pure/project-config-disabled mode with sharing and all tools
 denied. Every non-empty stdout line must be a JSON object; the last completed text event becomes
-an untrusted `review.md` candidate, while malformed JSONL or no text event fails closed. The
-candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name artifact.
+an untrusted `review.md` candidate, while malformed JSONL or no text event fails closed. Before
+upload, a strict outer-format preflight requires the exact review marker, the handoff-bound nonce
+on the next line, `New findings` as the first and only required section, unique allowed sections,
+and non-empty `None`/finding-block bodies. A valid first candidate incurs no extra model call. If
+only this outer framing is malformed, the model job makes exactly one format-only call in the same
+tokenless, tool-denied environment, with no repository attachments and with the original candidate
+JSON-encoded and explicitly labeled as untrusted data. The repair prompt forbids changing finding
+substance. A malformed repair is terminal; there is no third call and no candidate upload. The
+candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name artifact. This
+preflight never replaces or relaxes the clean canonicalizer's semantic, scope, and provenance checks.
 
 A clean privileged job downloads that artifact by its exact server-issued ID and verifies the
 reported and REST digest, repository/run identity, exact run-scoped name, one-file inventory,

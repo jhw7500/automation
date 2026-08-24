@@ -612,6 +612,56 @@ def test_current_release_commit_only_uses_authenticated_objects(
 
 
 @pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        (
+            "          CANDIDATE_NONCE: ${{ needs.opencode-prepare.outputs.candidate_nonce }}",
+            "          CANDIDATE_NONCE: unbound",
+        ),
+        (
+            "--file review-full.diff --file review-scope.json",
+            "--file review-full.diff",
+        ),
+        (
+            "BEGIN_UNTRUSTED_CANDIDATE_JSON",
+            "BEGIN_INSTRUCTION_CANDIDATE_JSON",
+        ),
+        (
+            'candidate_outer_format_valid "$candidate_dir/review-repaired.md"',
+            "true",
+        ),
+        (
+            'if ! candidate_outer_format_valid "$candidate_dir/review.md"; then',
+            'if candidate_outer_format_valid "$candidate_dir/review.md"; then',
+        ),
+        (
+            'echo "OpenCode format repair still violates the required outer grammar" >&2\n'
+            "              exit 1",
+            'echo "OpenCode format repair still violates the required outer grammar" >&2\n'
+            "              true",
+        ),
+    ),
+    ids=(
+        "nonce",
+        "repair-files",
+        "untrusted-boundary",
+        "repair-preflight",
+        "initial-preflight-polarity",
+        "terminal-exit",
+    ),
+)
+def test_current_release_rejects_opencode_format_repair_runtime_drift(
+    current_release_repo: tuple[Path, str], old: str, new: str
+) -> None:
+    repo, _ = current_release_repo
+    replace(repo / ".github/workflows/opencode-auto-review.yml", old, new, count=1)
+    bad_commit = commit(repo, "weaken OpenCode format repair runtime")
+
+    with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+@pytest.mark.parametrize(
     ("relative", "old", "new"),
     (
         (

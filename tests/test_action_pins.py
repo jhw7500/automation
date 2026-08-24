@@ -103,10 +103,17 @@ class ActionPinsTest(unittest.TestCase):
                 if filename == "opencode-auto-review.yml":
                     self.assertNotIn("opencode github run", run_step["run"])
                     self.assertIn(
-                        "opencode run --model zai-coding-plan/glm-4.7 --format json "
+                        'opencode run --model zai-coding-plan/glm-4.7 '
+                        '--format json "$@"',
+                        run_step["run"],
+                    )
+                    self.assertIn(
                         "--file review-full.diff --file review-scope.json",
                         run_step["run"],
                     )
+                    self.assertEqual(2, run_step["run"].count("--file"))
+                    self.assertEqual(1, run_step["run"].count("env -i"))
+                    self.assertEqual(3, run_step["run"].count("run_opencode"))
                     self.assertEqual("true", run_step["env"]["OPENCODE_PURE"])
                     self.assertEqual(
                         "true", run_step["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"]
