@@ -544,6 +544,7 @@ jobs:
       OPENCODE_ARCHIVE_SHA256: '3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a'
     outputs:
       review_outcome: ${{ steps.opencode-review.outcome }}
+      review_failure_reason: ${{ steps.opencode-review.outputs.failure_reason }}
       candidate_artifact_id: ${{ steps.upload-candidate.outputs.artifact-id }}
       candidate_artifact_digest: ${{ steps.upload-candidate.outputs.artifact-digest }}
     steps:
@@ -710,6 +711,11 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          review_failure_reason=model_job_failed
+          write_review_failure_reason() {
+            printf 'failure_reason=%s\n' "$review_failure_reason" >> "$GITHUB_OUTPUT"
+          }
+          trap write_review_failure_reason EXIT
           sandbox="$RUNNER_TEMP/opencode-model-sandbox"
           candidate_dir="$RUNNER_TEMP/opencode-candidate"
           isolated_home="$RUNNER_TEMP/opencode-model-home"
@@ -956,7 +962,9 @@ jobs:
               for item in sections:
                   body_lines = trim_blank_edges(item["lines"])
                   if not body_lines:
-                      reject()
+                      if item["name"] == "New findings":
+                          reject()
+                      continue
                   if body_lines == ["None"]:
                       if item["name"] == "New findings":
                           new_findings_none = True
@@ -1023,8 +1031,10 @@ jobs:
 
           initial_prompt="$RUNNER_TEMP/opencode-review-prompt.txt"
           printf '%s\n' "$PROMPT" > "$initial_prompt"
+          review_failure_reason=provider_failed
           run_opencode "$initial_prompt" "$RUNNER_TEMP/opencode-review.jsonl" \
             --file review-full.diff --file review-scope.json
+          review_failure_reason=candidate_contract_failed
           extract_candidate \
             "$RUNNER_TEMP/opencode-review.jsonl" "$candidate_dir/review.md"
 
@@ -1056,8 +1066,10 @@ jobs:
               cat "$candidate_json"
               printf '%s\n' 'END_UNTRUSTED_CANDIDATE_JSON'
             } > "$repair_prompt"
+            review_failure_reason=provider_failed
             run_opencode \
               "$repair_prompt" "$RUNNER_TEMP/opencode-format-repair.jsonl"
+            review_failure_reason=candidate_contract_failed
             extract_candidate \
               "$RUNNER_TEMP/opencode-format-repair.jsonl" "$candidate_dir/review-repaired.md"
             if ! candidate_outer_format_valid "$candidate_dir/review-repaired.md"; then
@@ -1080,6 +1092,7 @@ jobs:
           fi
 
           chmod 0400 "$candidate_dir/review.md"
+          review_failure_reason=none
 
       - name: Upload untrusted OpenCode candidate
         id: upload-candidate
@@ -1167,6 +1180,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           WORKFLOW_NAME: '.github/workflows/opencode-auto-review.yml'
           REVIEW_OUTCOME: ${{ needs.opencode-review.outputs.review_outcome }}
+          REVIEW_FAILURE_REASON: ${{ needs.opencode-review.outputs.review_failure_reason }}
           MODEL_JOB_RESULT: ${{ needs.opencode-review.result }}
           ARTIFACT_DOWNLOAD_OUTCOME: ${{ steps.download-handoff.outcome }}
           CANDIDATE_DOWNLOAD_OUTCOME: ${{ steps.download-candidate.outcome }}
@@ -1356,6 +1370,10 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber, per_page: 100,
             });
             const modelOk = (process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success';
+            const reportedReviewFailure = process.env.REVIEW_FAILURE_REASON || '';
+            const modelFailureReason = new Set([
+              'model_job_failed', 'provider_failed', 'candidate_contract_failed',
+            ]).has(reportedReviewFailure) ? reportedReviewFailure : 'model_job_failed';
             const parseRecord = (comment) => {
               const lines = (comment.body || '').split('\n');
               if (comment.user?.type !== 'Bot' || lines[0] !== header || lines[1] !== marker) return null;
@@ -2158,7 +2176,7 @@ jobs:
             const successBody = unchangedSucceeded ? previousBody : review;
             const failureReason = !diffReady ? 'diff_unavailable'
               : !artifactsValid ? 'prepared_artifact_invalid'
-              : !modelOk ? 'provider_failed'
+              : !modelOk ? modelFailureReason
               : !candidateArtifactValid ? 'candidate_artifact_invalid'
               : parsedReview === null ? 'output_grammar_invalid'
               : !anchorsCovered ? 'anchor_out_of_scope'

@@ -3864,7 +3864,12 @@ OPENCODE_SECOND_FINDING_BLOCK = (
 OPENCODE_FINDING_BODY = "### New findings\n" + OPENCODE_FINDING_BLOCK
 
 
-def _run_opencode_model_step(tmp_path: Path, responses: list[str]):
+def _run_opencode_model_step(
+    tmp_path: Path,
+    responses: list[str],
+    *,
+    fail_before_provider: bool = False,
+):
     model = _step(
         _load("opencode-auto-review.yml"), "opencode-review", "Run OpenCode PR review"
     )
@@ -3878,9 +3883,12 @@ def _run_opencode_model_step(tmp_path: Path, responses: list[str]):
         "diff --git a/app.py b/app.py\n+reviewed = True\n", encoding="utf-8"
     )
     (handoff / "review-scope.json").write_text("{}\n", encoding="utf-8")
+    if fail_before_provider:
+        (handoff / "review-scope.json").unlink()
     (stub_dir / "responses.json").write_text(
         json.dumps(responses, ensure_ascii=False), encoding="utf-8"
     )
+    github_output = tmp_path / "github-output"
     opencode = bin_dir / "opencode"
     opencode.write_text(
         "#!/usr/bin/env python3\n"
@@ -3925,6 +3933,7 @@ def _run_opencode_model_step(tmp_path: Path, responses: list[str]):
             "OPENCODE_DISABLE_PROJECT_CONFIG"
         ],
         "OPENCODE_CONFIG_CONTENT": model["env"]["OPENCODE_CONFIG_CONTENT"],
+        "GITHUB_OUTPUT": str(github_output),
     }
     result = subprocess.run(
         ["bash", "-c", model["run"]],
@@ -3955,6 +3964,7 @@ def test_opencode_valid_outer_format_does_not_spend_a_repair_call(tmp_path):
     assert result.returncode == 0, result.stderr
     assert len(calls) == 1
     assert candidate == valid
+    assert _github_outputs(tmp_path / "github-output")["failure_reason"] == "none"
 
 
 @pytest.mark.parametrize(
@@ -3991,6 +4001,99 @@ def test_opencode_malformed_outer_format_gets_exactly_one_repair(
     assert result.returncode == 0, result.stderr
     assert len(calls) == 2
     assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "section",
+    ("Still open", "Resolved", "Retracted"),
+)
+def test_opencode_format_repair_can_omit_empty_optional_section(
+    tmp_path, section
+):
+    malformed = _opencode_candidate(
+        f"### New findings\nNone\n\n### {section}"
+    )
+    repaired = _opencode_candidate()
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_cannot_fill_empty_new_findings(tmp_path):
+    malformed = _opencode_candidate("### New findings")
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate()]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_model_step_reports_candidate_contract_failure(tmp_path):
+    malformed = _opencode_candidate("### New findings\nNone\n\n### Notes\nNone")
+
+    result, _, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate()]
+    )
+
+    assert result.returncode != 0
+    assert _github_outputs(tmp_path / "github-output")["failure_reason"] == (
+        "candidate_contract_failed"
+    )
+
+
+def test_opencode_model_step_reports_provider_process_failure(tmp_path):
+    result, _, _ = _run_opencode_model_step(tmp_path, [])
+
+    assert result.returncode != 0
+    assert _github_outputs(tmp_path / "github-output")["failure_reason"] == (
+        "provider_failed"
+    )
+
+
+def test_opencode_model_step_reports_pre_provider_setup_failure(tmp_path):
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [_opencode_candidate()], fail_before_provider=True
+    )
+
+    assert result.returncode != 0
+    assert calls == []
+    assert _github_outputs(tmp_path / "github-output")["failure_reason"] == (
+        "model_job_failed"
+    )
+
+
+def test_opencode_model_step_reports_repair_provider_failure(tmp_path):
+    malformed = "I reviewed the diff.\n\n" + _opencode_candidate()
+
+    result, calls, _ = _run_opencode_model_step(tmp_path, [malformed])
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+    assert _github_outputs(tmp_path / "github-output")["failure_reason"] == (
+        "provider_failed"
+    )
+
+
+def test_opencode_failure_reason_output_is_wired_to_canonicalizer():
+    workflow = _load("opencode-auto-review.yml")
+    model_job = workflow["jobs"]["opencode-review"]
+    canonicalize = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )
+
+    assert model_job["outputs"]["review_failure_reason"] == (
+        "${{ steps.opencode-review.outputs.failure_reason }}"
+    )
+    assert canonicalize["env"]["REVIEW_FAILURE_REASON"] == (
+        "${{ needs.opencode-review.outputs.review_failure_reason }}"
+    )
 
 
 def test_opencode_unknown_section_gets_one_repair_but_remains_fail_closed(tmp_path):
@@ -5938,6 +6041,7 @@ def _run_opencode_canonicalize(
     caller_event: str = "pull_request",
     candidate_artifact_case: str = "valid",
     candidate_review: str | None = None,
+    failure_reason: str = "",
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
     script = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")["with"]["script"]
@@ -6186,6 +6290,7 @@ def _run_opencode_canonicalize(
         "CANDIDATE_DOWNLOAD_OUTCOME": "success" if candidate_available else "skipped",
         "HANDOFF_PATH": str(handoff),
         "REVIEW_OUTCOME": outcome,
+        "REVIEW_FAILURE_REASON": failure_reason,
         "SNAPSHOT_PATH": str(snapshot_override or snapshot),
         "ATTESTATIONS_PATH": str(attestations),
         "REVIEW_DIFF_PATH": str(full_diff),
@@ -8362,11 +8467,36 @@ def test_opencode_failure_preserves_prior_success_as_stale(tmp_path):
     body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert "LAST GOOD OPENCODE REVIEW" in body
-    assert "Reason: provider_failed" in body
+    assert "Reason: model_job_failed" in body
     assert "- Status: stale" in body
     assert state["attempt_status"] == "failure"
     assert state["successful_head"] == old_head
     assert state["full_diff_sha256"] == "12" * 32
+
+
+@node_required
+def test_opencode_contract_failure_is_not_reported_as_provider_failure(tmp_path):
+    old_head = "ab" * 20
+    old = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 41, old_head),
+            f"{OPENCODE_MARKER}\nLAST GOOD OPENCODE REVIEW",
+        ),
+        9,
+        updated="u1",
+    )
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [old],
+        [old],
+        outcome="failure",
+        failure_reason="candidate_contract_failed",
+    )
+
+    body = _single_mutation_body(calls)
+    assert "Reason: candidate_contract_failed" in body
+    assert "Reason: provider_failed" not in body
 
 
 @node_required

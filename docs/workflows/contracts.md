@@ -332,15 +332,19 @@ blocks grouped by section plus the `New findings: None` meaning. It accepts only
 with the same signature; dropping, adding, moving, reclassifying, rewording, or changing an anchor is
 terminal. Only non-finding-like wrapper text surrounding the signed document, one matching
 enclosing Markdown fence, required marker/nonce framing, empty carryover sections, and section
-ordering are excluded from that comparison. Fences inside a finding remain signed substance. A
-finding heading with an explicit `[CRITICAL]`, `[HIGH]`, `[MEDIUM]`, `[LOW]`, or `[P0]`–`[P3]`
+ordering are excluded from that comparison. Empty optional carryover sections are equivalent to
+omission; an empty `New findings` section remains terminal. Fences inside a finding remain signed
+substance. A finding heading with an explicit `[CRITICAL]`, `[HIGH]`, `[MEDIUM]`, `[LOW]`, or
+`[P0]`–`[P3]`
 marker, or an anchor/current-line field before the first section, remains unsafe to drop even when
 nested under Markdown quote or list containers. Finding-like content or an allowed review
 section after an enclosing fence is likewise preserved rather than treated as wrapper text. An
 unsafe-to-sign or malformed repair is terminal; there is no third call and no candidate upload. The
-candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name artifact. This
-preflight never replaces or relaxes the clean canonicalizer's semantic, scope, and provenance
-checks.
+model job reports `model_job_failed` for setup/infrastructure failure, `provider_failed` only when a
+model process fails, and `candidate_contract_failed` when post-response preflight rejects the
+candidate. The candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name
+artifact. This preflight never replaces or relaxes the clean canonicalizer's semantic, scope, and
+provenance checks.
 
 For modern releases, release verification also authenticates the exact Git blob of the complete
 OpenCode auto-review workflow. Changes to installation, step topology, workflow/job environment,
