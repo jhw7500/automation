@@ -767,14 +767,19 @@ jobs:
           FINDING_LEVEL = r"(?:critical|high|medium|low|p[0-3])"
           FINDING_DECORATOR = r"[*_~`]+"
           FINDING_FIELD = r"(?:changed anchor|current line)"
+          HORIZONTAL_SPACE = r"[ \t\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]"
           FINDING_PREFIX = re.compile(
               r"^\s*(?:####(?:\s|$)"
-              rf"|(?:#{{1,6}}\s+)?(?:{FINDING_DECORATOR}\s*)?"
+              rf"|(?:#{{1,6}}\s+)?(?:{FINDING_DECORATOR}{HORIZONTAL_SPACE}*)?"
               rf"(?:\[{FINDING_LEVEL}\]|{FINDING_LEVEL}"
-              rf"(?:[ \t]*{FINDING_DECORATOR})?[ \t]*:)"
+              rf"(?:{HORIZONTAL_SPACE}*{FINDING_DECORATOR})?"
+              rf"(?:{HORIZONTAL_SPACE}*:"
+              rf"|{HORIZONTAL_SPACE}+[-–]{HORIZONTAL_SPACE}+"
+              rf"|{HORIZONTAL_SPACE}*—{HORIZONTAL_SPACE}*))"
               rf"|(?:[-+*]\s*)?(?:#{{1,6}}\s+)?"
-              rf"(?:{FINDING_DECORATOR}\s*)?{FINDING_FIELD}"
-              rf"(?:[ \t]*{FINDING_DECORATOR})?[ \t]*:)",
+              rf"(?:{FINDING_DECORATOR}{HORIZONTAL_SPACE}*)?{FINDING_FIELD}"
+              rf"(?:{HORIZONTAL_SPACE}*{FINDING_DECORATOR})?"
+              rf"{HORIZONTAL_SPACE}*:)",
               re.IGNORECASE,
           )
           MARKDOWN_CONTAINER = re.compile(

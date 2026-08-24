@@ -337,9 +337,14 @@ any valid info string; its closing run must use the same character and be at lea
 opening run, and only ASCII spaces or tabs may follow a closing run. Empty optional carryover
 sections are equivalent to omission; an empty `New findings` section remains terminal. Fences
 inside a finding remain signed substance. A finding heading with an explicit bracketed or
-colon-delimited `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, or `P0`–`P3` marker remains unsafe to drop;
-this includes emphasis or code-span delimiters that close immediately before the colon. The same
-applies to an exact `Changed anchor` or `Current line` field before the first section, including
+colon-delimited `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, or `P0`–`P3` marker remains unsafe to drop.
+The same applies when that exact marker is separated from its title by `-` or `–` with horizontal
+space on both sides, or by `—` with or without surrounding horizontal space. This does not include
+hyphenated prose or ranges such as `Medium-term`, `P1-Review`, or `P1–P3`. Emphasis or code-span
+delimiters may close immediately before any separator. Separator and field-colon boundaries accept
+only the closed Unicode horizontal-space set: ASCII space/tab, no-break and Ogham spaces,
+U+2000–U+200A spaces, narrow no-break space, medium mathematical space, and ideographic space. An
+exact `Changed anchor` or `Current line` field before the first section is also protected, including
 optional H1–H6, emphasis, or code-span decoration and horizontal space before its colon. The field
 may be bare, introduced by `-`, `+`, or `*`, or reached inside nested Markdown quote, ordered-list,
 or task-list containers. Lookalikes such as `Changed anchors:`, `Current lines:`, and

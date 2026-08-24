@@ -4154,6 +4154,8 @@ def test_opencode_format_repair_cannot_drop_indented_finding_heading(tmp_path):
         'Changed anchor : {"path":"app.py","line":1}',
         '## **Changed anchor** : {"path":"app.py","line":1}',
         '`Current line`: "reviewed = True"',
+        'Changed anchor\u202f: {"path":"app.py","line":1}',
+        '_Current line_\u00a0: "reviewed = True"',
     ),
     ids=(
         "star",
@@ -4168,6 +4170,8 @@ def test_opencode_format_repair_cannot_drop_indented_finding_heading(tmp_path):
         "spaced-colon",
         "heading-decorated-colon-outside",
         "code-span-colon-outside",
+        "narrow-nbsp-colon",
+        "decorated-nbsp-colon",
     ),
 )
 @pytest.mark.parametrize("placement", ("prefix", "suffix"))
@@ -4346,6 +4350,7 @@ def test_opencode_format_repair_allows_nonseverity_bracketed_wrapper_heading(
         "**MEDIUM**: Authentication bypass remains",
         "## _HIGH_: Authorization check is missing",
         "`P1`: Noisy but substantive finding",
+        "**P1**\u00a0:\u00a0Authentication bypass remains",
     ),
     ids=(
         "bold",
@@ -4364,6 +4369,7 @@ def test_opencode_format_repair_allows_nonseverity_bracketed_wrapper_heading(
         "colon-after-bold",
         "colon-after-heading-emphasis",
         "colon-after-code-span",
+        "colon-after-bold-nbsp",
     ),
 )
 def test_opencode_format_repair_cannot_drop_common_finding_heading_in_wrapper(
@@ -4412,6 +4418,95 @@ def test_opencode_format_repair_allows_nonfinding_colon_wrapper(
 ):
     repaired = _opencode_candidate()
     malformed = heading + "\n\n" + repaired
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "P1 - Authentication bypass remains",
+        "**HIGH** - Data loss remains",
+        "## _MEDIUM_ — Authorization check is missing",
+        "> LOW – Quoted substantive finding",
+        "- [ ] `P2` - Noisy but substantive finding",
+        "P1—Authentication bypass remains",
+        "HIGH\u00a0—\u00a0Data loss remains",
+        "MEDIUM\u202f–\u202fAuthorization check is missing",
+        "LOW\u2009-\u2009Noisy but substantive finding",
+    ),
+    ids=(
+        "hyphen",
+        "bold-hyphen",
+        "heading-em-dash",
+        "quoted-en-dash",
+        "task-code",
+        "compact-em-dash",
+        "nbsp-em-dash",
+        "narrow-nbsp-en-dash",
+        "thin-space-hyphen",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_cannot_drop_dash_delimited_finding_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    finding = (
+        heading
+        + "\nThis substantive finding must not be discarded as wrapper prose."
+    )
+    if placement == "prefix":
+        malformed = finding + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + finding
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Medium-term: Review complete",
+        "P4 - Review complete",
+        "P10 — Review complete",
+        "P1-Review complete",
+        "HIGH-level: Review complete",
+        "MEDIUM -term review",
+        "P1–P3 priority range",
+        "Medium–term review",
+    ),
+    ids=(
+        "medium-term",
+        "p4",
+        "p10",
+        "unspaced-p1",
+        "high-level",
+        "unspaced-term",
+        "priority-range",
+        "medium-en-dash-term",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_nonfinding_dash_wrapper(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    if placement == "prefix":
+        malformed = heading + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + heading
 
     result, calls, candidate = _run_opencode_model_step(
         tmp_path, [malformed, repaired]
@@ -4734,8 +4829,15 @@ def test_opencode_format_repair_cannot_drop_priority_after_outer_fence(
         "**MEDIUM**: Authentication bypass remains",
         "## _HIGH_: Authorization check is missing",
         "`P1`: Noisy but substantive finding",
+        "**P1**\u00a0:\u00a0Authentication bypass remains",
     ),
-    ids=("inside-bold", "after-bold", "after-emphasis", "after-code-span"),
+    ids=(
+        "inside-bold",
+        "after-bold",
+        "after-emphasis",
+        "after-code-span",
+        "after-bold-nbsp",
+    ),
 )
 def test_opencode_format_repair_cannot_drop_colon_severity_after_outer_fence(
     tmp_path, heading
