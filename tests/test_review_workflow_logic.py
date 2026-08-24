@@ -3692,9 +3692,12 @@ def test_opencode_prompt_requires_one_canonical_anchor_per_finding():
 
     assert "Every finding block has exactly one exact one-line JSON anchor" in prompt
     assert "Every finding block has at least one exact one-line JSON anchor" not in prompt
-    assert """#### [MEDIUM] Concise title
-- Changed anchor: {"path":"path/to/file","line":1}
-- Current line: "exact complete added-side source line""" in prompt
+    canonical_example = (
+        '#### [MEDIUM] Concise title\n'
+        '- Changed anchor: {"path":"path/to/file","line":1}\n'
+        '- Current line: "exact complete added-side source line"'
+    )
+    assert canonical_example in prompt
     assert "without adding another Changed anchor or Current line field" in prompt
 
 
