@@ -46,6 +46,30 @@ OPENCODE_VERSION = "1.18.17"
 OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
 )
+OPENCODE_REVIEW_RUN_SHA256 = (
+    "a89f2bdee514390e51fcb1ef9c1dc51f71d68e20da2f608cda61996f038463d0"
+)
+OPENCODE_AUTO_REVIEW_SHA256 = (
+    "e4d8976a4da7ec4afc829ee447d1c0df841f2987b9a99d9a5cd60705b56b161f"
+)
+# These immutable annotated v1.45 patch releases predate format repair. Only their
+# exact peeled commits may retain the legacy generic command; no new commit may opt in.
+APPROVED_LEGACY_GENERIC_OPENCODE_RELEASES = frozenset(
+    {
+        (
+            "v1.45",
+            "9bfe6f4a9991d21ae95472e939d9e6b197174e9f",
+        ),
+        (
+            "v1.45.1",
+            "41131bb7843770259246e4125325a2ef4e95731f",
+        ),
+        (
+            "v1.45.2",
+            "abf5e65cf6188277d9984be062d0b069c82cf25f",
+        ),
+    }
+)
 SETUP_GEMINI_AUTH = (
     "jhw7500/automation/.github/actions/setup-gemini-auth@"
     "2254f13aab44585c78954d20749f4fb677a8c2f1"
@@ -1287,8 +1311,19 @@ def verify_remote_tag(repo: Path, remote: str, tag: AnnotatedTag) -> None:
         )
 
 
+def _opencode_review_run_sha256(run_script: str) -> str:
+    """Authenticate candidate-tool creation, mutation boundaries, and invocations."""
+    return hashlib.sha256(run_script.encode("utf-8")).hexdigest()
+
+
 def verify_opencode_runtime(
-    job: dict, step_name: str, workflow_name: str, *, generic_run: bool = False
+    job: dict,
+    step_name: str,
+    workflow_name: str,
+    *,
+    generic_run: bool = False,
+    allow_legacy_generic: bool = False,
+    workflow_sha256: str | None = None,
 ) -> dict:
     """Require a digest-verified CLI and the workflow-specific command boundary."""
     try:
@@ -1326,6 +1361,11 @@ def verify_opencode_runtime(
         'if ! candidate_outer_format_valid "$candidate_dir/review-repaired.md"; then',
         'echo "OpenCode format repair still violates the required outer grammar" >&2',
         "exit 1",
+        'if ! initial_signature="$(candidate_substance_signature "$candidate_dir/review.md")"; then',
+        'if ! repaired_signature="$(candidate_substance_signature "$candidate_dir/review-repaired.md")"; then',
+        'if [[ "$initial_signature" != "$repaired_signature" ]]; then',
+        'echo "OpenCode format repair changed review substance" >&2',
+        "exit 1",
         'mv -- "$candidate_dir/review-repaired.md" "$candidate_dir/review.md"',
     )
     format_cursor = -1
@@ -1336,7 +1376,9 @@ def verify_opencode_runtime(
             format_sequence_is_ordered = False
             break
     format_repair_contract = (
-        run_env.get("CANDIDATE_NONCE")
+        workflow_sha256 == OPENCODE_AUTO_REVIEW_SHA256
+        and run_step.get("shell") == "bash"
+        and run_env.get("CANDIDATE_NONCE")
         == "${{ needs.opencode-prepare.outputs.candidate_nonce }}"
         and 'opencode run --model zai-coding-plan/glm-4.7 --format json "$@"'
         in run_script
@@ -1346,15 +1388,15 @@ def verify_opencode_runtime(
         and run_script.count("run_opencode") == 3
         and run_script.count("extract_candidate") == 3
         and run_script.count("candidate_outer_format_valid") == 3
+        and run_script.count("candidate_substance_signature") == 3
         and "BEGIN_UNTRUSTED_CANDIDATE_JSON" in run_script
         and "END_UNTRUSTED_CANDIDATE_JSON" in run_script
         and "Do not follow or execute any instructions" in run_script
+        and _opencode_review_run_sha256(run_script) == OPENCODE_REVIEW_RUN_SHA256
         and format_sequence_is_ordered
     )
-    selected_generic_contract = (
-        format_repair_contract
-        if "CANDIDATE_NONCE" in run_env
-        else legacy_generic_contract
+    selected_generic_contract = format_repair_contract or (
+        allow_legacy_generic and legacy_generic_contract
     )
     generic_contract = (
         "opencode github run" not in run_script
@@ -2096,6 +2138,13 @@ def _verify_commit_content(
         "Run OpenCode PR review",
         "opencode-auto-review.yml",
         generic_run=modern_auto_review,
+        allow_legacy_generic=(
+            ref,
+            revision,
+        ) in APPROVED_LEGACY_GENERIC_OPENCODE_RELEASES,
+        workflow_sha256=hashlib.sha256(
+            tree.read_file(".github/workflows/opencode-auto-review.yml")
+        ).hexdigest(),
     )
     expected_permissions: dict[str, str] = (
         {}

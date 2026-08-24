@@ -612,6 +612,20 @@ def test_current_release_commit_only_uses_authenticated_objects(
 
 
 @pytest.mark.parametrize(
+    ("ref", "revision"),
+    (
+        ("v1.45", "9bfe6f4a9991d21ae95472e939d9e6b197174e9f"),
+        ("v1.45.1", "41131bb7843770259246e4125325a2ef4e95731f"),
+        ("v1.45.2", "abf5e65cf6188277d9984be062d0b069c82cf25f"),
+    ),
+)
+def test_approved_legacy_opencode_releases_remain_verifiable(
+    ref: str, revision: str
+) -> None:
+    assert release_verifier.verify_commit_content(ROOT, ref, revision) == revision
+
+
+@pytest.mark.parametrize(
     ("old", "new"),
     (
         (
@@ -640,6 +654,27 @@ def test_current_release_commit_only_uses_authenticated_objects(
             'echo "OpenCode format repair still violates the required outer grammar" >&2\n'
             "              true",
         ),
+        (
+            'if [[ "$initial_signature" != "$repaired_signature" ]]; then',
+            'if [[ "$initial_signature" == "$repaired_signature" ]]; then',
+        ),
+        (
+            'if ! initial_signature="$(candidate_substance_signature "$candidate_dir/review.md")"; then',
+            'if initial_signature="$(candidate_substance_signature "$candidate_dir/review.md")"; then',
+        ),
+        (
+            'if ! repaired_signature="$(candidate_substance_signature "$candidate_dir/review-repaired.md")"; then',
+            'if repaired_signature="$(candidate_substance_signature "$candidate_dir/review-repaired.md")"; then',
+        ),
+        (
+            '                  "blocks": groups,',
+            '                  "blocks": {name: [] for name in ALLOWED},',
+        ),
+        (
+            '          chmod 0500 "$contract_tool"',
+            '          chmod 0500 "$contract_tool"\n'
+            "          sed -i 's/\"blocks\": groups/\"blocks\": {name: [] for name in ALLOWED}/' \"$contract_tool\"",
+        ),
     ),
     ids=(
         "nonce",
@@ -648,6 +683,11 @@ def test_current_release_commit_only_uses_authenticated_objects(
         "repair-preflight",
         "initial-preflight-polarity",
         "terminal-exit",
+        "substance-comparison-polarity",
+        "initial-signature-polarity",
+        "repaired-signature-polarity",
+        "constant-signature-groups",
+        "post-heredoc-contract-rewrite",
     ),
 )
 def test_current_release_rejects_opencode_format_repair_runtime_drift(
@@ -656,6 +696,97 @@ def test_current_release_rejects_opencode_format_repair_runtime_drift(
     repo, _ = current_release_repo
     replace(repo / ".github/workflows/opencode-auto-review.yml", old, new, count=1)
     bad_commit = commit(repo, "weaken OpenCode format repair runtime")
+
+    with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+def test_current_release_rejects_full_legacy_opencode_runtime_downgrade(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+
+    def downgrade(document: dict) -> None:
+        job = document["jobs"]["opencode-review"]
+        step = next(
+            item for item in job["steps"]
+            if item.get("name") == "Run OpenCode PR review"
+        )
+        step["env"].pop("CANDIDATE_NONCE")
+        step["run"] = (
+            "opencode run --model zai-coding-plan/glm-4.7 --format json "
+            "--file review-full.diff --file review-scope.json\n"
+            "jq -Rrs 'map(fromjson) | if length == 0 then error(\"empty\") "
+            "else last end' opencode-review.jsonl\n"
+        )
+
+    mutate_yaml(path, downgrade)
+    bad_commit = commit(repo, "downgrade OpenCode format runtime")
+
+    with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+def test_current_release_rejects_opencode_custom_shell_preprocessor(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+
+    def mutate_shell(document: dict) -> None:
+        step = next(
+            item
+            for item in document["jobs"]["opencode-review"]["steps"]
+            if item.get("name") == "Run OpenCode PR review"
+        )
+        step["shell"] = "python3 {0}"
+
+    mutate_yaml(path, mutate_shell)
+    bad_commit = commit(repo, "preprocess OpenCode review script with a custom shell")
+
+    with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+@pytest.mark.parametrize("placement", ("install-body", "extra-step"))
+def test_current_release_rejects_opencode_interpreter_poisoning_before_review(
+    current_release_repo: tuple[Path, str], placement: str
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+    poison = (
+        "printf '%s\\n' '#!/bin/sh' 'printf \"{}\\n\"' "
+        '> "$RUNNER_TEMP/opencode-cli/python3"\n'
+        'chmod 0755 "$RUNNER_TEMP/opencode-cli/python3"'
+    )
+
+    def mutate_runtime(document: dict) -> None:
+        steps = document["jobs"]["opencode-review"]["steps"]
+        run_index = next(
+            index
+            for index, item in enumerate(steps)
+            if item.get("name") == "Run OpenCode PR review"
+        )
+        if placement == "install-body":
+            install = next(
+                item
+                for item in steps
+                if item.get("name") == "Install pinned OpenCode CLI"
+            )
+            install["run"] += "\n" + poison
+        else:
+            steps.insert(
+                run_index,
+                {
+                    "name": "Poison Python before review",
+                    "shell": "bash",
+                    "run": poison,
+                },
+            )
+
+    mutate_yaml(path, mutate_runtime)
+    bad_commit = commit(repo, f"poison OpenCode interpreter via {placement}")
 
     with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
         release_verifier.verify_commit_content(repo, "v1.45", bad_commit)

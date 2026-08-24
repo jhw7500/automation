@@ -327,9 +327,21 @@ and non-empty `None`/finding-block bodies. A valid first candidate incurs no ext
 only this outer framing is malformed, the model job makes exactly one format-only call in the same
 tokenless, tool-denied environment, with no repository attachments and with the original candidate
 JSON-encoded and explicitly labeled as untrusted data. The repair prompt forbids changing finding
-substance. A malformed repair is terminal; there is no third call and no candidate upload. The
-candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name artifact. This
-preflight never replaces or relaxes the clean canonicalizer's semantic, scope, and provenance checks.
+substance. The model job then derives a deterministic signature from each candidate's exact finding
+blocks grouped by section plus the `New findings: None` meaning. It accepts only a repaired candidate
+with the same signature; dropping, adding, moving, reclassifying, rewording, or changing an anchor is
+terminal. Only non-finding-like wrapper text, required marker/nonce framing, empty carryover sections,
+and section ordering are excluded from that comparison. A finding heading or anchor/current-line
+field before the first section remains unsafe to drop even when nested under Markdown quote or list
+containers. An unsafe-to-sign or malformed repair is terminal; there is no third call and no candidate
+upload. The candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name artifact.
+This preflight never replaces or relaxes the clean canonicalizer's semantic, scope, and provenance
+checks.
+
+For modern releases, release verification also authenticates the exact Git blob of the complete
+OpenCode auto-review workflow. Changes to installation, step topology, workflow/job environment,
+shell selection, or review execution therefore require an explicit reviewed digest update. The only
+legacy generic-runtime exceptions are the exact approved tag-and-peeled-commit identities.
 
 A clean privileged job downloads that artifact by its exact server-issued ID and verifies the
 reported and REST digest, repository/run identity, exact run-scoped name, one-file inventory,

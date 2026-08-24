@@ -744,90 +744,209 @@ jobs:
             test "$(wc -c < "$candidate_path")" -le 60000
           }
 
-          candidate_outer_format_valid() {
-            python3 - "$1" "$CANDIDATE_NONCE" <<'PY'
+          contract_tool="$RUNNER_TEMP/opencode-candidate-contract.py"
+          cat > "$contract_tool" <<'PY'
+          import json
           import re
           import sys
           from pathlib import Path
 
-          candidate_path = Path(sys.argv[1])
-          nonce = sys.argv[2]
-          marker = "<!-- automation:opencode-auto-review -->"
-          nonce_line = f"<!-- automation-candidate:{nonce} -->"
+          ALLOWED = ("New findings", "Still open", "Resolved", "Retracted")
+          MARKER = "<!-- automation:opencode-auto-review -->"
+          TOP_HEADING = re.compile(r"^###(?: |$)")
+          VALID_HEADING = re.compile(
+              r"### (New findings|Still open|Resolved|Retracted)"
+          )
+          BLOCK_HEADING = re.compile(r"#### \S.*")
+          FINDING_PREFIX = re.compile(
+              r"^\s*(?:####(?:\s|$)|-\s*(?:changed anchor|current line):)",
+              re.IGNORECASE,
+          )
+          MARKDOWN_CONTAINER = re.compile(
+              r"^(?:>\s*|[-+*]\s+|\d+[.)]\s+)"
+          )
 
           def reject():
               raise SystemExit(1)
 
-          if re.fullmatch(r"[0-9a-f]{64}", nonce) is None:
-              reject()
-          try:
-              payload = candidate_path.read_bytes()
-              if not 1 <= len(payload) <= 60000:
-                  reject()
-              text = payload.decode("utf-8", errors="strict")
-          except (OSError, UnicodeDecodeError):
-              reject()
-
-          lines = text.split("\n")
-          if len(lines) < 3 or lines[0] != marker or lines[1] != nonce_line:
-              reject()
-          if lines.count(marker) != 1:
-              reject()
-          nonce_markers = [
-              index for index, line in enumerate(lines)
-              if line.startswith("<!-- automation-candidate:")
-          ]
-          if nonce_markers != [1]:
-              reject()
-
-          review = "\n".join(lines[2:]).strip()
-          if not review:
-              reject()
-          allowed = {"New findings", "Still open", "Resolved", "Retracted"}
-          sections = []
-          section = None
-          for line in review.split("\n"):
-              if re.match(r"^###(?: |$)", line):
-                  match = re.fullmatch(
-                      r"### (New findings|Still open|Resolved|Retracted)", line
-                  )
-                  if match is None or match.group(1) not in allowed:
+          def read_candidate(path):
+              try:
+                  payload = Path(path).read_bytes()
+                  if not 1 <= len(payload) <= 60000:
                       reject()
-                  section = {"name": match.group(1), "lines": []}
-                  sections.append(section)
-              elif section is None:
-                  if line.strip():
-                      reject()
-              else:
-                  section["lines"].append(line)
-
-          names = [item["name"] for item in sections]
-          if not names or names[0] != "New findings":
-              reject()
-          if names.count("New findings") != 1 or len(set(names)) != len(names):
-              reject()
-          if any(not "\n".join(item["lines"]).strip() for item in sections):
-              reject()
-
-          headings = set()
-          for item in sections:
-              body = "\n".join(item["lines"]).strip()
-              if item["name"] == "New findings" and body == "None":
-                  continue
-              if re.match(r"^None(?:\s|$)", body):
+                  return payload.decode("utf-8", errors="strict")
+              except (OSError, UnicodeDecodeError):
                   reject()
-              has_block = False
-              for line in item["lines"]:
-                  if line.startswith("####"):
-                      if re.fullmatch(r"#### \S.*", line) is None or line in headings:
+
+          def trim_blank_edges(lines):
+              start = 0
+              end = len(lines)
+              while start < end and not lines[start].strip():
+                  start += 1
+              while end > start and not lines[end - 1].strip():
+                  end -= 1
+              return lines[start:end]
+
+          def is_finding_prefix_line(line):
+              remainder = line.lstrip()
+              while remainder:
+                  if FINDING_PREFIX.match(remainder):
+                      return True
+                  container = MARKDOWN_CONTAINER.match(remainder)
+                  if container is None:
+                      return False
+                  remainder = remainder[container.end():].lstrip()
+              return False
+
+          def parse_sections(lines):
+              sections = []
+              section = None
+              for line in lines:
+                  if TOP_HEADING.match(line):
+                      match = VALID_HEADING.fullmatch(line)
+                      if match is None:
                           reject()
-                      headings.add(line)
-                      has_block = True
-                  elif not has_block and line.strip():
-                      reject()
-              if not has_block:
+                      section = {"name": match.group(1), "lines": []}
+                      sections.append(section)
+                  elif section is None:
+                      if line.strip():
+                          reject()
+                  else:
+                      section["lines"].append(line)
+              return sections
+
+          def validate_outer(text, nonce):
+              if re.fullmatch(r"[0-9a-f]{64}", nonce) is None:
                   reject()
+              nonce_line = f"<!-- automation-candidate:{nonce} -->"
+              lines = text.split("\n")
+              if len(lines) < 3 or lines[0] != MARKER or lines[1] != nonce_line:
+                  reject()
+              if lines.count(MARKER) != 1:
+                  reject()
+              nonce_markers = [
+                  index for index, line in enumerate(lines)
+                  if line.startswith("<!-- automation-candidate:")
+              ]
+              if nonce_markers != [1]:
+                  reject()
+
+              review = "\n".join(lines[2:]).strip()
+              if not review:
+                  reject()
+              sections = parse_sections(review.split("\n"))
+              names = [item["name"] for item in sections]
+              if not names or names[0] != "New findings":
+                  reject()
+              if names.count("New findings") != 1 or len(set(names)) != len(names):
+                  reject()
+              if any(not "\n".join(item["lines"]).strip() for item in sections):
+                  reject()
+
+              headings = set()
+              for item in sections:
+                  body = "\n".join(item["lines"]).strip()
+                  if item["name"] == "New findings" and body == "None":
+                      continue
+                  if re.match(r"^None(?:\s|$)", body):
+                      reject()
+                  has_block = False
+                  for line in item["lines"]:
+                      if line.startswith("####"):
+                          if BLOCK_HEADING.fullmatch(line) is None or line in headings:
+                              reject()
+                          headings.add(line)
+                          has_block = True
+                      elif not has_block and line.strip():
+                          reject()
+                  if not has_block:
+                      reject()
+
+          def substance_signature(text):
+              lines = text.split("\n")
+              first_section = None
+              for index, line in enumerate(lines):
+                  if not TOP_HEADING.match(line):
+                      continue
+                  if VALID_HEADING.fullmatch(line) is None:
+                      reject()
+                  first_section = index
+                  break
+              if first_section is None:
+                  reject()
+              prefix = lines[:first_section]
+              if any(is_finding_prefix_line(line) for line in prefix):
+                  reject()
+
+              sections = parse_sections(lines[first_section:])
+              groups = {name: [] for name in ALLOWED}
+              new_findings_none = False
+              for item in sections:
+                  body_lines = trim_blank_edges(item["lines"])
+                  if not body_lines:
+                      reject()
+                  if body_lines == ["None"]:
+                      if item["name"] == "New findings":
+                          new_findings_none = True
+                      continue
+                  if re.match(r"^None(?:\s|$)", "\n".join(body_lines)):
+                      reject()
+
+                  blocks = []
+                  block = None
+                  for line in body_lines:
+                      if line.startswith("####"):
+                          if BLOCK_HEADING.fullmatch(line) is None:
+                              reject()
+                          if block is not None:
+                              blocks.append(trim_blank_edges(block))
+                          block = [line]
+                      elif block is None:
+                          if line.strip():
+                              reject()
+                      else:
+                          block.append(line)
+                  if block is not None:
+                      blocks.append(trim_blank_edges(block))
+                  if not blocks or any(not block_lines for block_lines in blocks):
+                      reject()
+                  groups[item["name"]].extend(
+                      "\n".join(block_lines) for block_lines in blocks
+                  )
+
+              if new_findings_none and groups["New findings"]:
+                  reject()
+              if not new_findings_none and not groups["New findings"]:
+                  reject()
+              return {
+                  "blocks": groups,
+                  "new_findings_none": new_findings_none,
+              }
+
+          if len(sys.argv) != 4:
+              reject()
+          mode, candidate_path, candidate_nonce = sys.argv[1:]
+          candidate = read_candidate(candidate_path)
+          if mode == "outer":
+              validate_outer(candidate, candidate_nonce)
+          elif mode == "signature":
+              print(json.dumps(
+                  substance_signature(candidate),
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              ))
+          else:
+              reject()
           PY
+          chmod 0500 "$contract_tool"
+
+          candidate_outer_format_valid() {
+            python3 "$contract_tool" outer "$1" "$CANDIDATE_NONCE"
+          }
+
+          candidate_substance_signature() {
+            python3 "$contract_tool" signature "$1" "$CANDIDATE_NONCE"
           }
 
           initial_prompt="$RUNNER_TEMP/opencode-review-prompt.txt"
@@ -871,6 +990,18 @@ jobs:
               "$RUNNER_TEMP/opencode-format-repair.jsonl" "$candidate_dir/review-repaired.md"
             if ! candidate_outer_format_valid "$candidate_dir/review-repaired.md"; then
               echo "OpenCode format repair still violates the required outer grammar" >&2
+              exit 1
+            fi
+            if ! initial_signature="$(candidate_substance_signature "$candidate_dir/review.md")"; then
+              echo "OpenCode candidate substance cannot be preserved safely" >&2
+              exit 1
+            fi
+            if ! repaired_signature="$(candidate_substance_signature "$candidate_dir/review-repaired.md")"; then
+              echo "OpenCode repaired candidate substance is invalid" >&2
+              exit 1
+            fi
+            if [[ "$initial_signature" != "$repaired_signature" ]]; then
+              echo "OpenCode format repair changed review substance" >&2
               exit 1
             fi
             mv -- "$candidate_dir/review-repaired.md" "$candidate_dir/review.md"

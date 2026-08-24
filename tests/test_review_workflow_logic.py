@@ -3849,6 +3849,21 @@ def _opencode_candidate(body: str = "### New findings\nNone") -> str:
     )
 
 
+OPENCODE_FINDING_BLOCK = (
+    "#### [MEDIUM] Preserve this finding\n"
+    '- Changed anchor: {"path":"app.py","line":1}\n'
+    '- Current line: "reviewed = True"\n'
+    "This exact explanation describes a concrete regression."
+)
+OPENCODE_SECOND_FINDING_BLOCK = (
+    "#### [HIGH] Preserve this second finding\n"
+    '- Changed anchor: {"path":"app.py","line":2}\n'
+    '- Current line: "second = True"\n'
+    "This second explanation describes a separate regression."
+)
+OPENCODE_FINDING_BODY = "### New findings\n" + OPENCODE_FINDING_BLOCK
+
+
 def _run_opencode_model_step(tmp_path: Path, responses: list[str]):
     model = _step(
         _load("opencode-auto-review.yml"), "opencode-review", "Run OpenCode PR review"
@@ -3943,29 +3958,198 @@ def test_opencode_valid_outer_format_does_not_spend_a_repair_call(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "malformed",
+    ("malformed", "repaired"),
     [
-        "I reviewed the diff.\n\n" + _opencode_candidate(),
-        "### New findings\nNone",
-        _opencode_candidate(
-            "### New findings\nNone\n\n### New findings\nNone"
+        (
+            "I reviewed the diff.\n\n" + _opencode_candidate(),
+            _opencode_candidate(),
         ),
-        _opencode_candidate("### New findings\nNone\n\n### Notes\nNone"),
-        _opencode_candidate(
-            "### Still open\n#### Existing\ntext\n\n### New findings\nNone"
+        ("### New findings\nNone", _opencode_candidate()),
+        (
+            _opencode_candidate(
+                "### New findings\nNone\n\n### New findings\nNone"
+            ),
+            _opencode_candidate(),
+        ),
+        (
+            _opencode_candidate(
+                "### Still open\n#### Existing\ntext\n\n### New findings\nNone"
+            ),
+            _opencode_candidate(
+                "### New findings\nNone\n\n### Still open\n#### Existing\ntext"
+            ),
         ),
     ],
 )
 def test_opencode_malformed_outer_format_gets_exactly_one_repair(
-    tmp_path, malformed
+    tmp_path, malformed, repaired
 ):
-    valid = _opencode_candidate()
-
-    result, calls, candidate = _run_opencode_model_step(tmp_path, [malformed, valid])
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
 
     assert result.returncode == 0, result.stderr
     assert len(calls) == 2
-    assert candidate == valid
+    assert candidate == repaired
+
+
+def test_opencode_unknown_section_gets_one_repair_but_remains_fail_closed(tmp_path):
+    malformed = _opencode_candidate("### New findings\nNone\n\n### Notes\nNone")
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate()]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_cannot_drop_finding_like_prefix(tmp_path):
+    malformed = _opencode_candidate(
+        "#### [MEDIUM] Prefix finding must not disappear\n"
+        '- Changed anchor: {"path":"app.py","line":1}\n'
+        '- Current line: "reviewed = True"\n'
+        "This prefix describes a concrete regression.\n\n"
+        "### New findings\nNone"
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate()]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_cannot_drop_indented_finding_heading(tmp_path):
+    malformed = _opencode_candidate(
+        "  #### [MEDIUM] Indented finding must not disappear\n"
+        "This prefix describes a concrete regression.\n\n"
+        "### New findings\nNone"
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate()]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        (
+            "> #### [HIGH] Quoted finding must not disappear\n"
+            '> - Changed anchor: {"path":"app.py","line":1}\n'
+            '> - Current line: "reviewed = True"\n'
+            "> This prefix describes a concrete regression."
+        ),
+        (
+            "- #### [HIGH] Listed finding must not disappear\n"
+            '  - - Changed anchor: {"path":"app.py","line":1}\n'
+            '  - - Current line: "reviewed = True"\n'
+            "  - This prefix describes a concrete regression."
+        ),
+    ],
+    ids=("blockquote", "list"),
+)
+def test_opencode_format_repair_cannot_drop_container_wrapped_finding(
+    tmp_path, prefix
+):
+    malformed = _opencode_candidate(prefix + "\n\n### New findings\nNone")
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate()]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_allows_benign_field_words_in_wrapper(tmp_path):
+    malformed = (
+        "I checked the current line and changed anchor formatting.\n\n"
+        + _opencode_candidate(OPENCODE_FINDING_BODY)
+    )
+    repaired = _opencode_candidate(OPENCODE_FINDING_BODY)
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_preserves_substantive_finding_bytes(tmp_path):
+    malformed = "I reviewed the diff.\n\n" + _opencode_candidate(
+        OPENCODE_FINDING_BODY
+    )
+    repaired = _opencode_candidate(OPENCODE_FINDING_BODY)
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "repaired",
+    [
+        _opencode_candidate(),
+        _opencode_candidate(OPENCODE_FINDING_BODY.replace("[MEDIUM]", "[HIGH]")),
+        _opencode_candidate(
+            OPENCODE_FINDING_BODY.replace("concrete regression", "different claim")
+        ),
+        _opencode_candidate(
+            OPENCODE_FINDING_BODY.replace('"line":1', '"line":2')
+        ),
+        _opencode_candidate(
+            OPENCODE_FINDING_BODY + "\n" + OPENCODE_SECOND_FINDING_BLOCK
+        ),
+        _opencode_candidate(
+            "### New findings\nNone\n\n### Still open\n" + OPENCODE_FINDING_BLOCK
+        ),
+    ],
+    ids=("dropped", "severity", "explanation", "anchor", "added", "reclassified"),
+)
+def test_opencode_format_repair_rejects_substance_changes(tmp_path, repaired):
+    malformed = "I reviewed the diff.\n\n" + _opencode_candidate(
+        OPENCODE_FINDING_BODY
+    )
+
+    result, calls, _ = _run_opencode_model_step(tmp_path, [malformed, repaired])
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_rejects_within_section_finding_movement(tmp_path):
+    initial_body = (
+        OPENCODE_FINDING_BODY + "\n" + OPENCODE_SECOND_FINDING_BLOCK
+    )
+    repaired_body = (
+        "### New findings\n"
+        + OPENCODE_SECOND_FINDING_BLOCK
+        + "\n"
+        + OPENCODE_FINDING_BLOCK
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path,
+        [
+            "I reviewed the diff.\n\n" + _opencode_candidate(initial_body),
+            _opencode_candidate(repaired_body),
+        ],
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
 
 
 def test_opencode_format_repair_treats_candidate_as_data_and_has_no_repo_files(tmp_path):
