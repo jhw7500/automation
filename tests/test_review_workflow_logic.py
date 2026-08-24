@@ -4103,6 +4103,59 @@ def test_opencode_format_repair_allows_matching_outer_markdown_fence(
     assert candidate == repaired
 
 
+@pytest.mark.parametrize(
+    "body",
+    ("### New findings\nNone", OPENCODE_FINDING_BODY),
+    ids=("none", "finding"),
+)
+def test_opencode_format_repair_allows_outer_fence_after_wrapper_prose(
+    tmp_path, body
+):
+    repaired = _opencode_candidate(body)
+    malformed = "I reviewed the diff.\n\n```markdown\n" + repaired + "\n```"
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_allows_three_space_outer_fence(tmp_path):
+    repaired = _opencode_candidate(OPENCODE_FINDING_BODY)
+    malformed = "   ```markdown\n" + repaired + "\n   ```"
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "indented_backticks",
+    ("    ```", "\t```"),
+    ids=("four-spaces", "tab"),
+)
+def test_opencode_format_repair_cannot_drop_indented_terminal_backticks(
+    tmp_path, indented_backticks
+):
+    fenced_body = OPENCODE_FINDING_BODY + "\n" + indented_backticks
+    repaired_body = fenced_body.removesuffix(indented_backticks).rstrip("\n")
+    malformed = "```markdown\n" + _opencode_candidate(fenced_body)
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate(repaired_body)]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
 def test_opencode_format_repair_cannot_drop_fence_inside_finding(tmp_path):
     fenced_body = (
         OPENCODE_FINDING_BODY
@@ -4118,6 +4171,142 @@ def test_opencode_format_repair_cannot_drop_fence_inside_finding(tmp_path):
 
     assert result.returncode != 0
     assert len(calls) == 2
+
+
+def test_opencode_format_repair_cannot_use_inner_close_as_outer_close(tmp_path):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n```python\nraise RuntimeError\n```"
+    )
+    repaired_body = fenced_body.removesuffix("\n```")
+    malformed = (
+        "I reviewed the diff.\n\n```markdown\n"
+        + _opencode_candidate(fenced_body)
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate(repaired_body)]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_allows_balanced_inner_and_outer_fences(tmp_path):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n```python\nraise RuntimeError\n```"
+    )
+    repaired = _opencode_candidate(fenced_body)
+    malformed = (
+        "I reviewed the diff.\n\n```markdown\n" + repaired + "\n```"
+    )
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_format_repair_cannot_use_longer_inner_close_as_outer_close(
+    tmp_path,
+):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n```python\nraise RuntimeError\n````"
+    )
+    repaired_body = fenced_body.removesuffix("\n````")
+    malformed = (
+        "I reviewed the diff.\n\n````markdown\n"
+        + _opencode_candidate(fenced_body)
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate(repaired_body)]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+def test_opencode_format_repair_allows_longer_inner_close_and_outer_fence(
+    tmp_path,
+):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n```python\nraise RuntimeError\n````"
+    )
+    repaired = _opencode_candidate(fenced_body)
+    malformed = (
+        "I reviewed the diff.\n\n````markdown\n" + repaired + "\n````"
+    )
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "indented_backticks",
+    ("    ```", "\t```"),
+    ids=("four-spaces", "tab"),
+)
+def test_opencode_format_repair_cannot_use_close_after_indented_code_as_outer(
+    tmp_path, indented_backticks
+):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n```python\n"
+        + indented_backticks
+        + "\n```"
+    )
+    repaired_body = fenced_body.removesuffix("\n```")
+    malformed = (
+        "I reviewed the diff.\n\n```markdown\n"
+        + _opencode_candidate(fenced_body)
+    )
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, _opencode_candidate(repaired_body)]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "indented_backticks",
+    ("    ```", "\t```"),
+    ids=("four-spaces", "tab"),
+)
+def test_opencode_format_repair_allows_indented_code_with_outer_close(
+    tmp_path, indented_backticks
+):
+    fenced_body = (
+        OPENCODE_FINDING_BODY
+        + "\nReproducer:\n```python\n"
+        + indented_backticks
+        + "\n```"
+    )
+    repaired = _opencode_candidate(fenced_body)
+    malformed = (
+        "I reviewed the diff.\n\n```markdown\n" + repaired + "\n```"
+    )
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
 
 
 def test_opencode_format_repair_preserves_substantive_finding_bytes(tmp_path):
