@@ -4180,6 +4180,10 @@ def test_opencode_format_repair_cannot_drop_indented_finding_heading(tmp_path):
         'Changed&#32;anchor: {"path":"app.py","line":1}',
         'Changed&#X20;anchor: {"path":"app.py","line":1}',
         'Changed&nbsp;anchor: {"path":"app.py","line":1}',
+        'Changed\u2063anchor: {"path":"app.py","line":1}',
+        'Changed&#8291;anchor: {"path":"app.py","line":1}',
+        'Changed&#x2063;anchor: {"path":"app.py","line":1}',
+        'Current\u2062line: "reviewed = True"',
         'Changed&af;anchor: {"path":"app.py","line":1}',
         'Current&ic;line: "reviewed = True"',
         'Current&it;line: "reviewed = True"',
@@ -4220,6 +4224,10 @@ def test_opencode_format_repair_cannot_drop_indented_finding_heading(tmp_path):
         "html-entity-anchor",
         "html-hex-entity-anchor",
         "html-named-entity-anchor",
+        "raw-format-control-anchor",
+        "decimal-format-control-anchor",
+        "hex-format-control-anchor",
+        "raw-format-control-line",
         "html-alias-apply-function-anchor",
         "html-alias-invisible-comma-line",
         "html-alias-invisible-times-line",
@@ -4481,6 +4489,150 @@ def test_opencode_format_repair_cannot_drop_common_finding_heading_in_wrapper(
 
     assert result.returncode != 0
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "## Finding: Authentication bypass remains",
+        "**Bug:** Null guard is missing",
+        "> Issue — Authorization check is missing",
+        "- [ ] `Defect`: Stale state persists",
+        "### Vulnerability #2 - Token disclosure remains",
+        "Regression 3: Prior fix is undone",
+        "[Concern] Race condition remains",
+        "[**Finding**] Authentication bypass remains",
+        "[`Bug`] Null guard is missing",
+        "Risks: Data loss remains",
+        "Error: Cancellation is ignored",
+        "Problem – Cleanup is skipped",
+        "## Finding",
+    ),
+    ids=(
+        "finding-colon-heading",
+        "bug-decorated-colon",
+        "issue-em-dash-quote",
+        "defect-task-code",
+        "numbered-vulnerability-hyphen",
+        "numbered-regression-colon",
+        "bracketed-concern",
+        "bracketed-decorated-finding",
+        "bracketed-code-bug",
+        "plural-risk-colon",
+        "error-colon",
+        "problem-en-dash",
+        "standalone-finding-heading",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_cannot_drop_explicit_defect_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    finding = (
+        heading
+        + "\nThis substantive finding must not be discarded as wrapper prose."
+    )
+    if placement == "prefix":
+        malformed = finding + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + finding
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Bug\u200b: Authentication bypass remains",
+        "Bug&#8203;: Authentication bypass remains",
+        "Bug&#x200B;: Authentication bypass remains",
+        "Issue\u2063: Authorization check is missing",
+        "Risk&#x2060;: Data loss remains",
+    ),
+    ids=(
+        "raw-zero-width-space",
+        "decimal-zero-width-space",
+        "hex-zero-width-space",
+        "raw-invisible-separator",
+        "hex-word-joiner",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_cannot_drop_cf_obfuscated_defect_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    finding = (
+        heading
+        + "\nThis substantive finding must not be discarded as wrapper prose."
+    )
+    if placement == "prefix":
+        malformed = finding + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + finding
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Bugfix: Review complete",
+        "Issues reviewed: Review complete",
+        "Finding aid: Review complete",
+        "Risk assessment: Review complete",
+        "No findings: Review complete",
+        "Concerned: Review complete",
+        "Regression tests: Review complete",
+        "Error handling: Review complete",
+        "Problem statement: Review complete",
+        "Vulnerability scan: Review complete",
+        "Bugfix\u200b: Review complete",
+        "No\u2060findings: Review complete",
+    ),
+    ids=(
+        "bugfix",
+        "issues-reviewed",
+        "finding-aid",
+        "risk-assessment",
+        "no-findings",
+        "concerned",
+        "regression-tests",
+        "error-handling",
+        "problem-statement",
+        "vulnerability-scan",
+        "bugfix-format-control",
+        "no-findings-format-control",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_defect_word_lookalike_wrapper(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    if placement == "prefix":
+        malformed = heading + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + heading
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
 
 
 def test_opencode_format_repair_allows_bold_nonfinding_wrapper(tmp_path):
@@ -7160,6 +7312,10 @@ def test_opencode_rereview_rejects_carryover_without_current_evidence(
         '- Current&#32;line: "unvalidated evidence"',
         '- Current&#X20;line: "unvalidated evidence"',
         '- Current&nbsp;line: "unvalidated evidence"',
+        '- Changed\u2063anchor: {"path":"outside.js","line":999}',
+        '- Changed&#8291;anchor: {"path":"outside.js","line":999}',
+        '- Changed&#x2063;anchor: {"path":"outside.js","line":999}',
+        '- Current\u2062line: "unvalidated evidence"',
         '- Changed&af;anchor: {"path":"outside.js","line":999}',
         '- Current&ic;line: "unvalidated evidence"',
         '- Current&it;line: "unvalidated evidence"',
@@ -7184,6 +7340,10 @@ def test_opencode_rereview_rejects_carryover_without_current_evidence(
         "html-entity-line",
         "html-hex-entity-line",
         "html-named-entity-line",
+        "raw-format-control-anchor",
+        "decimal-format-control-anchor",
+        "hex-format-control-anchor",
+        "raw-format-control-line",
         "html-alias-apply-function-anchor",
         "html-alias-invisible-comma-line",
         "html-alias-invisible-times-line",

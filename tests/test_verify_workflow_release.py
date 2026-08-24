@@ -667,6 +667,18 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
             'if repaired_signature="$(candidate_substance_signature "$candidate_dir/review-repaired.md")"; then',
         ),
         (
+            '          EXPLICIT_DEFECT_LABEL = (\n'
+            '              r"(?:findings?|bugs?|defects?|issues?|"\n'
+            '              r"vulnerabilit(?:y|ies)|regressions?|problems?|"\n'
+            '              r"risks?|concerns?|flaws?|errors?)"\n'
+            '          )',
+            '          EXPLICIT_DEFECT_LABEL = r"(?!)"',
+        ),
+        (
+            '                  " " if unicodedata.category(character) == "Cf" else character',
+            '                  character',
+        ),
+        (
             '                  "blocks": groups,',
             '                  "blocks": {name: [] for name in ALLOWED},',
         ),
@@ -686,6 +698,8 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
         "substance-comparison-polarity",
         "initial-signature-polarity",
         "repaired-signature-polarity",
+        "explicit-defect-label",
+        "format-control-normalization",
         "constant-signature-groups",
         "post-heredoc-contract-rewrite",
     ),
@@ -940,6 +954,11 @@ def test_current_release_rejects_opencode_interpreter_poisoning_before_review(
         ),
         (
             ".github/workflows/opencode-auto-review.yml",
+            "normalized = normalized.replace(/\\p{Cf}/gu, ' ');",
+            "normalized = normalized;",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
             "'diff', '--no-ext-diff', '--no-textconv', '--text', "
             "'--find-renames=50%',",
             "'diff', '--no-ext-diff', '--no-textconv', '--find-renames=50%',",
@@ -1107,6 +1126,7 @@ def test_current_release_rejects_opencode_interpreter_poisoning_before_review(
         "canonical-evidence-entity-normalization",
         "canonical-evidence-link-title-quoting",
         "canonical-evidence-named-entity-whitelist",
+        "canonical-evidence-format-control-normalization",
         "canonical-global-added-text-mode",
         "canonical-global-added-indicator",
         "canonical-global-readd-rejection",

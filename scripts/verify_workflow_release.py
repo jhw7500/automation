@@ -47,10 +47,10 @@ OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
 )
 OPENCODE_REVIEW_RUN_SHA256 = (
-    "e8e880af0f5b597f3e11f7720b67adb1eb81500e49a6e100d09a806cc92fd837"
+    "022f5d58d9e2e934f836a72ccdedcc05c77bb93e250b86ffd53839f00c1dd20f"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
-    "cde632df0947981c4861d3b94ee07a92005c5340b29039e4bec3c16540b3f070"
+    "2cb7aa405d94489cd66f9fde4f39891966c2ed4b4acb4770a2da711481e0ac5d"
 )
 # These immutable annotated v1.45 patch releases predate format repair. Only their
 # exact peeled commits may retain the legacy generic command; no new commit may opt in.
@@ -2287,6 +2287,8 @@ def _verify_commit_content(
             and ").replace(HTML_NAMED_EVIDENCE_ENTITY, (raw, name) =>"
             in canonical_script
             and "NAMED_EVIDENCE_REPLACEMENTS.get(name) ?? raw"
+            in canonical_script
+            and "normalized = normalized.replace(/\\p{Cf}/gu, ' ');"
             in canonical_script
             and "const consumeBalanced = (value, start, opening, closing) => {"
             in canonical_script

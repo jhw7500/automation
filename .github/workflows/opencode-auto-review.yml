@@ -776,8 +776,17 @@ jobs:
           BLOCK_HEADING = re.compile(r"#### \S.*")
           FINDING_PRIORITY = r"p[0-3]"
           FINDING_LEVEL = rf"(?:critical|high|medium|low|{FINDING_PRIORITY})"
+          EXPLICIT_DEFECT_LABEL = (
+              r"(?:findings?|bugs?|defects?|issues?|"
+              r"vulnerabilit(?:y|ies)|regressions?|problems?|"
+              r"risks?|concerns?|flaws?|errors?)"
+          )
           FINDING_DECORATOR = r"[*_~`]+"
           HORIZONTAL_SPACE = r"[ \t\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]"
+          EXPLICIT_DEFECT_ID = (
+              rf"{EXPLICIT_DEFECT_LABEL}"
+              rf"(?:{HORIZONTAL_SPACE}+#?[0-9]+)?"
+          )
           FINDING_FIELD_JOIN = (
               rf"(?:{HORIZONTAL_SPACE}|[*_~`\u200b\u200c\u200d\u2060\ufeff])+"
           )
@@ -796,7 +805,18 @@ jobs:
               rf"|{HORIZONTAL_SPACE}*—{HORIZONTAL_SPACE}*)"
               rf"|{FINDING_PRIORITY}"
               rf"(?:{HORIZONTAL_SPACE}*{FINDING_DECORATOR})?"
-              rf"\.{HORIZONTAL_SPACE}+))"
+              rf"\.{HORIZONTAL_SPACE}+"
+              rf"|\[{HORIZONTAL_SPACE}*"
+              rf"(?:{FINDING_DECORATOR}{HORIZONTAL_SPACE}*)?"
+              rf"{EXPLICIT_DEFECT_ID}"
+              rf"(?:{HORIZONTAL_SPACE}*{FINDING_DECORATOR})?"
+              rf"{HORIZONTAL_SPACE}*\]"
+              rf"|{EXPLICIT_DEFECT_ID}"
+              rf"(?:{HORIZONTAL_SPACE}*{FINDING_DECORATOR})?"
+              rf"(?:{HORIZONTAL_SPACE}*$"
+              rf"|{HORIZONTAL_SPACE}*:"
+              rf"|{HORIZONTAL_SPACE}+[-–]{HORIZONTAL_SPACE}+"
+              rf"|{HORIZONTAL_SPACE}*—{HORIZONTAL_SPACE}*)))"
               rf"|(?:[-+*]\s*)?(?:#{{1,6}}\s+)?"
               rf"(?:{FINDING_DECORATOR}{HORIZONTAL_SPACE}*)?{FINDING_FIELD}"
               rf"(?:{HORIZONTAL_SPACE}*{FINDING_DECORATOR})?"
@@ -891,6 +911,10 @@ jobs:
                       match.group(1), match.group(0)
                   ),
                   normalized,
+              )
+              normalized = "".join(
+                  " " if unicodedata.category(character) == "Cf" else character
+                  for character in normalized
               )
               normalized = HTML_WRAPPER_COMMENT.sub("", normalized)
               return HTML_WRAPPER_TAG.sub("", normalized)
@@ -2092,6 +2116,7 @@ jobs:
                 },
               ).replace(HTML_NAMED_EVIDENCE_ENTITY, (raw, name) =>
                 NAMED_EVIDENCE_REPLACEMENTS.get(name) ?? raw);
+              normalized = normalized.replace(/\p{Cf}/gu, ' ');
               normalized = normalized.replace(HTML_EVIDENCE_COMMENT, '');
               return normalized.replace(HTML_EVIDENCE_TAG, '');
             };

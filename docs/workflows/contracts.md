@@ -222,7 +222,8 @@ HTML tag/comment, and HTML entity wrappers are normalized only for reserved-labe
 Markdown destinations are consumed with balanced delimiters and quoted-title state rather than a
 greedy match. The complete semicolon-terminated HTML5 alias set whose decoded value consists only
 of whitespace, invisible format characters, supported decorators, or a colon is normalized;
-unrelated and unknown named entities remain literal. Wrapper syntax therefore cannot
+raw and numeric-entity Unicode format controls are normalized to spaces on the same detection-only
+path. Unrelated and unknown named entities remain literal. Wrapper syntax therefore cannot
 disguise a second unverified evidence field without turning benign prose into a reserved label. The
 parser then:
 
@@ -365,7 +366,13 @@ hyphenated prose or ranges such as `Medium-term`, `P1-Review`, or `P1–P3`. Emp
 delimiters may close immediately before any separator. An exact `P0`–`P3` marker followed by a
 period and at least one horizontal space is also protected; this intentionally excludes word
 severities followed by a period, `P4`/`P10`, decimals such as `P1.2`, and unspaced forms such as
-`P1.Review`. Separator and field-colon boundaries accept only the closed Unicode horizontal-space
+`P1.Review`. Exact singular/plural defect labels (`Finding`, `Bug`, `Defect`, `Issue`,
+`Vulnerability`, `Regression`, `Problem`, `Risk`, `Concern`, `Flaw`, or `Error`) are protected when
+bracketed with optional emphasis/code decoration, used as a standalone heading, or followed by an
+optional numeric identifier and one of the same colon/dash separators. Longer lookalikes such as
+`Bugfix`, `Finding aid`, `Issues reviewed`,
+`Risk assessment`, and `No findings` remain wrapper text. Separator and field-colon boundaries
+accept only the closed Unicode horizontal-space
 set: ASCII space/tab, no-break and Ogham spaces, U+2000–U+200A spaces, narrow no-break space, medium
 mathematical space, and ideographic space. An exact `Changed anchor` or `Current line` field before
 the first section is also protected, including
