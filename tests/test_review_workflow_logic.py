@@ -4517,6 +4517,87 @@ def test_opencode_format_repair_allows_nonfinding_dash_wrapper(
     assert candidate == repaired
 
 
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "P1. Authentication bypass remains",
+        "**P0**. Data loss remains",
+        "## _P2_. Authorization check is missing",
+        "> P3.\u00a0Quoted substantive finding",
+        "- [ ] `P1`.\u202fNoisy but substantive finding",
+    ),
+    ids=(
+        "plain",
+        "bold",
+        "heading-emphasis",
+        "quoted-nbsp",
+        "task-code-narrow-nbsp",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_cannot_drop_period_delimited_priority_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    finding = (
+        heading
+        + "\nThis substantive finding must not be discarded as wrapper prose."
+    )
+    if placement == "prefix":
+        malformed = finding + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + finding
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "P4. Review complete",
+        "P10. Review complete",
+        "P1.Review complete",
+        "P1.2 release notes",
+        "HIGH. Review complete",
+        "Medium. Review complete",
+        "P1... Review complete",
+        "P1 . Review complete",
+    ),
+    ids=(
+        "p4",
+        "p10",
+        "unspaced-title",
+        "decimal",
+        "high-sentence",
+        "medium-sentence",
+        "ellipsis",
+        "space-before-period",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_nonfinding_period_wrapper(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    if placement == "prefix":
+        malformed = heading + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + heading
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
 def test_opencode_format_repair_cannot_drop_task_list_severity_in_wrapper(
     tmp_path,
 ):
