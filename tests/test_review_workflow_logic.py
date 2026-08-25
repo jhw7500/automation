@@ -383,6 +383,63 @@ def _bot(
     }
 
 
+def _review_run_fixtures(comments: list[dict], reviewer: str) -> list[dict]:
+    workflow = {
+        "claude": "claude-code-review.yml",
+        "gemini": "gemini-auto-review.yml",
+    }[reviewer]
+    runs: list[dict] = []
+    seen: set[tuple[int, int]] = set()
+    for comment in comments:
+        match = re.search(
+            r"^<!-- automation-state:(\{.*\}) -->$", comment.get("body", ""), re.M
+        )
+        if not match:
+            continue
+        try:
+            state = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        run_id = state.get("run_id")
+        run_attempt = state.get("run_attempt")
+        attempt_head = state.get("attempt_head")
+        pr = state.get("pr")
+        if (
+            not isinstance(run_id, int)
+            or not isinstance(run_attempt, int)
+            or not isinstance(attempt_head, str)
+            or not isinstance(pr, int)
+            or (run_id, run_attempt) in seen
+        ):
+            continue
+        seen.add((run_id, run_attempt))
+        runs.append(
+            {
+                "id": run_id,
+                "run_attempt": run_attempt,
+                "status": "completed",
+                "conclusion": (
+                    "success" if state.get("attempt_status") == "success" else "failure"
+                ),
+                "head_sha": attempt_head,
+                "event": "pull_request",
+                "path": ".github/workflows/pr-review.yml",
+                "repository": {"full_name": "example/repo"},
+                "pull_requests": [{"number": pr, "head": {"sha": attempt_head}}],
+                "referenced_workflows": [
+                    {
+                        "path": (
+                            f"jhw7500/automation/.github/workflows/{workflow}@refs/tags/v1.46"
+                        ),
+                        "sha": "46" * 20,
+                        "ref": "refs/tags/v1.46",
+                    }
+                ],
+            }
+        )
+    return runs
+
+
 def _human(login: str, body: str, comment_id: int = 2, created: str = "t") -> dict:
     return {
         "id": comment_id,
@@ -563,21 +620,34 @@ def _run_collect(
     head_sha: str = "",
     pr_files: list[str] | None = None,
     literal_schema: bool = False,
+    workflow_runs: list[dict] | None = None,
 ) -> str | None:
     workflow = _load("claude-code-review.yml")
     run = _step(workflow, "claude-review", "Collect previous review context")["run"]
     if not literal_schema:
         comments = [_upgrade_claude_v2_fixture(comment) for comment in comments]
-    env = _gh_stub(tmp_path, comments, head_sha=head_sha, pr_files=pr_files)
+    env = _gh_stub(
+        tmp_path,
+        comments,
+        head_sha=head_sha,
+        pr_files=pr_files,
+        workflow_runs=(
+            _review_run_fixtures(comments, "claude")
+            if workflow_runs is None
+            else workflow_runs
+        ),
+    )
     output = tmp_path / "github-output"
     env.update(
         {
             "HEADER": CLAUDE_HEADER,
             "MARKER": CLAUDE_V3_MARKER,
             "REVIEWER": "claude",
+            "BOT_LOGIN": "github-actions[bot]",
             "SERVER_URL": "https://github.com",
             "REPOSITORY": "example/repo",
             "MAX_SECTION_CHARS": "6000",
+            "RUNNER_TEMP": str(tmp_path),
             "GITHUB_OUTPUT": str(output),
         }
     )
@@ -634,7 +704,53 @@ def test_claude_v3_collects_authenticated_pair_and_exact_canonical_body(tmp_path
         assert forbidden not in previous
 
 
-def test_claude_context_copy_sanitizes_reserved_lines_but_prior_file_stays_exact(tmp_path):
+def test_claude_collector_ignores_foreign_bot_with_newer_forged_state(tmp_path):
+    head = "ab" * 20
+    trusted = _bot(
+        "github-actions[bot]",
+        _v3_body(_v3_state(run_id=1, head=head), "TRUSTED REVIEW"),
+        1,
+    )
+    forged = _bot(
+        "foreign-reviewer[bot]",
+        _v3_body(_v3_state(run_id=9007199254740991, head=head), "FORGED REVIEW"),
+        2,
+    )
+
+    context = _run_collect(tmp_path, [trusted, forged])
+
+    assert context is not None
+    assert "TRUSTED REVIEW" in context
+    assert "FORGED REVIEW" not in context
+
+
+def test_claude_collector_ignores_expected_bot_state_without_matching_run(tmp_path):
+    head = "ab" * 20
+    trusted = _bot(
+        "github-actions[bot]",
+        _v3_body(_v3_state(run_id=1, head=head), "TRUSTED REVIEW"),
+        1,
+    )
+    forged = _bot(
+        "github-actions[bot]",
+        _v3_body(_v3_state(run_id=99, head=head), "FORGED REVIEW"),
+        2,
+    )
+
+    context = _run_collect(
+        tmp_path,
+        [trusted, forged],
+        workflow_runs=_review_run_fixtures([trusted], "claude"),
+    )
+
+    assert context is not None
+    assert "TRUSTED REVIEW" in context
+    assert "FORGED REVIEW" not in context
+
+
+def test_claude_context_copy_sanitizes_reserved_lines_but_prior_file_stays_exact(
+    tmp_path,
+):
     head = "ab" * 20
     canonical = (
         "VISIBLE CANONICAL FINDING\n"
@@ -1187,17 +1303,17 @@ def test_claude_uses_one_shared_canonicalizer_and_upsert_reads_only_canonical_fi
         "candidate-file": "${{ github.workspace }}/claude-review.md",
         "canonical-file": "${{ github.workspace }}/claude-review-canonical.md",
         "result-file": "${{ github.workspace }}/claude-review-result.json",
-        "scope-manifest": "${{ github.workspace }}/review-scope.json",
+        "scope-manifest": "${{ runner.temp }}/review-scope.json",
         "selected-diff": (
             "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
-            "&& format('{0}/review-delta.diff', github.workspace) "
-            "|| format('{0}/review-full.diff', github.workspace) }}"
+            "&& format('{0}/review-delta.diff', runner.temp) "
+            "|| format('{0}/review-full.diff', runner.temp) }}"
         ),
         "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
         "previous-sha": "${{ steps.prepare-review-input.outputs.previous_sha }}",
         "previous-review-file": (
             "${{ steps.prepare-review-input.outputs.previous_sha != '' "
-            "&& format('{0}/claude-previous-review.md', github.workspace) || '' }}"
+            "&& format('{0}/claude-previous-review.md', runner.temp) || '' }}"
         ),
     }
     assert action["if"] == (
@@ -1233,17 +1349,17 @@ def test_gemini_uses_the_same_canonicalizer_contract_as_claude():
         "candidate-file": "${{ github.workspace }}/gemini_review.md",
         "canonical-file": "${{ github.workspace }}/gemini-review-canonical.md",
         "result-file": "${{ github.workspace }}/gemini-review-result.json",
-        "scope-manifest": "${{ github.workspace }}/review-scope.json",
+        "scope-manifest": "${{ runner.temp }}/review-scope.json",
         "selected-diff": (
             "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
-            "&& format('{0}/review-delta.diff', github.workspace) "
-            "|| format('{0}/review-full.diff', github.workspace) }}"
+            "&& format('{0}/review-delta.diff', runner.temp) "
+            "|| format('{0}/review-full.diff', runner.temp) }}"
         ),
         "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
         "previous-sha": "${{ steps.pr-details.outputs.previous_sha }}",
         "previous-review-file": (
             "${{ steps.pr-details.outputs.previous_sha != '' "
-            "&& format('{0}/gemini-previous-review.md', github.workspace) || '' }}"
+            "&& format('{0}/gemini-previous-review.md', runner.temp) || '' }}"
         ),
     }
     assert action["if"] == (
@@ -1311,7 +1427,7 @@ def test_reviewers_share_one_canonicalizer_each_and_opencode_has_no_shared_actio
         "job_name",
         "canonical_step_name",
         "upload_step_name",
-        "candidate_name",
+        "result_name",
         "artifact_prefix",
     ),
     (
@@ -1319,26 +1435,26 @@ def test_reviewers_share_one_canonicalizer_each_and_opencode_has_no_shared_actio
             "claude-code-review.yml",
             "claude-review",
             "Canonicalize Claude review",
-            "Upload rejected Claude review candidate",
-            "claude-review.md",
-            "claude-review-candidate",
+            "Upload rejected Claude review diagnostic",
+            "claude-review-result.json",
+            "claude-review-diagnostic",
         ),
         (
             "gemini-auto-review.yml",
             "gemini-review",
             "Canonicalize Gemini review",
-            "Upload rejected Gemini review candidate",
-            "gemini_review.md",
-            "gemini-review-candidate",
+            "Upload rejected Gemini review diagnostic",
+            "gemini-review-result.json",
+            "gemini-review-diagnostic",
         ),
     ),
 )
-def test_rejected_canonical_candidates_are_retained_as_bounded_diagnostics(
+def test_rejected_candidates_retain_only_canonicalizer_owned_diagnostics(
     workflow_name,
     job_name,
     canonical_step_name,
     upload_step_name,
-    candidate_name,
+    result_name,
     artifact_prefix,
 ):
     job = _load(workflow_name)["jobs"][job_name]
@@ -1363,12 +1479,14 @@ def test_rejected_canonical_candidates_are_retained_as_bounded_diagnostics(
                 f"{artifact_prefix}-${{{{ github.run_id }}}}-"
                 "${{ github.run_attempt }}"
             ),
-            "path": f"${{{{ github.workspace }}}}/{candidate_name}",
+            "path": f"${{{{ github.workspace }}}}/{result_name}",
             "if-no-files-found": "ignore",
             "retention-days": "1",
             "overwrite": "false",
         },
     }
+    assert "candidate" not in upload["with"]["path"]
+    assert upload["with"]["path"].endswith("-result.json")
 
 
 def test_gemini_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tmp_path):
@@ -1528,6 +1646,7 @@ def test_shared_diff_wiring_is_exact_and_scope_safe():
             "previous-sha": f"${{{{ steps.{_step_id(job, collector_name)}.outputs.previous_sha }}}}",
             "previous-full-hash": f"${{{{ steps.{_step_id(job, collector_name)}.outputs.previous_full_hash }}}}",
             "context-lines": context_lines,
+            "output-directory": "${{ runner.temp }}",
         }
 
         workflow_text = (WORKFLOWS / filename).read_text(encoding="utf-8")
@@ -1576,6 +1695,116 @@ def test_shared_canonicalizer_runs_from_the_prepared_pr_head(
     }
 
 
+def test_workflow_owned_review_inputs_survive_pr_checkout_only_in_runner_temp():
+    claude = _load("claude-code-review.yml")
+    claude_collect = _step(claude, "claude-review", "Collect previous review context")[
+        "run"
+    ]
+    assert 'CONTEXT_FILE="${RUNNER_TEMP:?}/claude-review-context.md"' in claude_collect
+    assert (
+        'PREVIOUS_FILE="${RUNNER_TEMP:?}/claude-previous-review.md"' in claude_collect
+    )
+    claude_model = _step(claude, "claude-review", "Run Claude Code Review")
+    assert (
+        "${{ runner.temp }}/claude-review-context.md" in claude_model["with"]["prompt"]
+    )
+
+    gemini = _load("gemini-auto-review.yml")
+    gemini_collect = _step(gemini, "gemini-review", "Get PR details")["run"]
+    for name in (
+        "pr_title.txt",
+        "pr_body.txt",
+        "pr_number.txt",
+        "pr_comments.json",
+        "gemini-previous-review.md",
+        "prev_review.txt",
+        "human_comments.txt",
+    ):
+        assert f"${{RUNNER_TEMP:?}}/{name}" in gemini_collect
+    gemini_model = _step(gemini, "gemini-review", "Run Gemini Code Review")
+    assert (
+        gemini_model["env"]
+        | {
+            "PR_TITLE_FILE": "${{ runner.temp }}/pr_title.txt",
+            "PR_BODY_FILE": "${{ runner.temp }}/pr_body.txt",
+            "PR_NUMBER_FILE": "${{ runner.temp }}/pr_number.txt",
+            "PREVIOUS_REVIEW_FILE": "${{ runner.temp }}/prev_review.txt",
+            "HUMAN_COMMENTS_FILE": "${{ runner.temp }}/human_comments.txt",
+        }
+        == gemini_model["env"]
+    )
+
+
+def test_review_state_is_bound_to_the_token_publisher_login():
+    claude = _load("claude-code-review.yml")
+    assert (
+        _step(claude, "claude-review", "Collect previous review context")["env"][
+            "BOT_LOGIN"
+        ]
+        == "github-actions[bot]"
+    )
+    assert (
+        _step(claude, "claude-review", "Upsert review comment")["env"]["BOT_LOGIN"]
+        == "github-actions[bot]"
+    )
+
+    gemini = _load("gemini-auto-review.yml")
+    assert (
+        _step(gemini, "gemini-review", "Resolve repository-write token")["uses"]
+        == "$/.github/actions/setup-gemini-auth"
+    )
+    expected = "${{ steps.auth.outputs.bot-login }}"
+    assert (
+        _step(gemini, "gemini-review", "Get PR details")["env"]["BOT_LOGIN"] == expected
+    )
+    assert (
+        _step(gemini, "gemini-review", "Upsert review comment")["env"]["BOT_LOGIN"]
+        == expected
+    )
+
+    auth = yaml.load(
+        (ROOT / ".github/actions/setup-gemini-auth/action.yml").read_text(
+            encoding="utf-8"
+        ),
+        Loader=yaml.BaseLoader,
+    )
+    assert auth["outputs"]["bot-login"] == {
+        "description": "Comment publisher login",
+        "value": "${{ steps.resolve.outputs.bot-login }}",
+    }
+    mint = auth["runs"]["steps"][0]
+    assert "permission-actions" not in mint["with"]
+    resolve = auth["runs"]["steps"][1]
+    assert resolve["env"]["APP_SLUG"] == "${{ steps.mint_token.outputs.app-slug }}"
+    assert "bot-login=%s[bot]" in resolve["run"]
+    assert "bot-login=github-actions[bot]" in resolve["run"]
+
+    gemini_collect = _step(gemini, "gemini-review", "Get PR details")
+    assert gemini_collect["env"]["ACTIONS_TOKEN"] == "${{ github.token }}"
+    assert 'GH_TOKEN="$ACTIONS_TOKEN" gh api' in gemini_collect["run"]
+    gemini_upsert = _step(gemini, "gemini-review", "Upsert review comment")
+    assert gemini_upsert["env"]["ACTIONS_TOKEN"] == "${{ github.token }}"
+    assert "github.request.endpoint" in gemini_upsert["with"]["script"]
+    assert "authorization: `Bearer ${actionsToken}`" in gemini_upsert["with"]["script"]
+
+    for path, job_name in (
+        (ROOT / ".github/workflows/_self-claude-review.yml", "claude-review"),
+        (ROOT / ".github/workflows/_self-gemini-auto-review.yml", "gemini-review"),
+        (
+            ROOT
+            / "examples/baseline-workflows/.github/workflows/claude-code-review.yml",
+            "claude-review",
+        ),
+        (
+            ROOT
+            / "examples/baseline-workflows/.github/workflows/gemini-auto-review.yml",
+            "gemini-review",
+        ),
+    ):
+        caller = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        assert caller["jobs"][job_name]["permissions"]["actions"] == "read"
+
+
 def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     claude = _load("claude-code-review.yml")
     checkout = _step(claude, "claude-review", "Checkout repository")
@@ -1587,7 +1816,8 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     )
     assert claude_model["env"]["REVIEW_DIFF_FILE"] == (
         "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
-        "&& 'review-delta.diff' || 'review-full.diff' }}"
+        "&& format('{0}/review-delta.diff', runner.temp) "
+        "|| format('{0}/review-full.diff', runner.temp) }}"
     )
     assert "exclusive change set" in claude_model["with"]["prompt"]
     assert "Changed anchor" in claude_model["with"]["prompt"]
@@ -1610,7 +1840,8 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     )
     assert gemini_model["env"]["REVIEW_DIFF_FILE"] == (
         "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
-        "&& 'review-delta.diff' || 'review-full.diff' }}"
+        "&& format('{0}/review-delta.diff', runner.temp) "
+        "|| format('{0}/review-full.diff', runner.temp) }}"
     )
     python = _extract_gemini_python()
     assert "open(os.environ['REVIEW_DIFF_FILE'], 'r')" in python
@@ -1815,19 +2046,34 @@ def test_gemini_collection_strips_reserved_lines_from_human_context(tmp_path):
 
 
 def _run_gemini_collection(
-    tmp_path: Path, comments: list[dict], *, literal_schema: bool = False
+    tmp_path: Path,
+    comments: list[dict],
+    *,
+    literal_schema: bool = False,
+    workflow_runs: list[dict] | None = None,
 ) -> str:
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Get PR details")["run"]
     if not literal_schema:
         comments = [_upgrade_gemini_v2_fixture(comment) for comment in comments]
     output = tmp_path / "github-output"
-    env = _gh_stub(tmp_path, comments)
+    env = _gh_stub(
+        tmp_path,
+        comments,
+        workflow_runs=(
+            _review_run_fixtures(comments, "gemini")
+            if workflow_runs is None
+            else workflow_runs
+        ),
+    )
     env.update(
         {
             "SERVER_URL": "https://github.com",
             "REPOSITORY": "example/repo",
+            "BOT_LOGIN": "github-actions[bot]",
+            "ACTIONS_TOKEN": "actions-token-fixture",
             "GITHUB_WORKSPACE": str(tmp_path),
+            "RUNNER_TEMP": str(tmp_path),
             "GITHUB_OUTPUT": str(output),
         }
     )
@@ -1846,18 +2092,31 @@ def _run_gemini_details(
     *,
     head_sha: str = "ab" * 20,
     literal_schema: bool = False,
+    workflow_runs: list[dict] | None = None,
 ) -> tuple[str, dict[str, str]]:
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Get PR details")["run"]
     if not literal_schema:
         comments = [_upgrade_gemini_v2_fixture(comment) for comment in comments]
     output = tmp_path / "github-output"
-    env = _gh_stub(tmp_path, comments, head_shas=[head_sha, head_sha])
+    env = _gh_stub(
+        tmp_path,
+        comments,
+        head_shas=[head_sha, head_sha],
+        workflow_runs=(
+            _review_run_fixtures(comments, "gemini")
+            if workflow_runs is None
+            else workflow_runs
+        ),
+    )
     env.update(
         {
             "SERVER_URL": "https://github.com",
             "REPOSITORY": "example/repo",
+            "BOT_LOGIN": "github-actions[bot]",
+            "ACTIONS_TOKEN": "actions-token-fixture",
             "GITHUB_WORKSPACE": str(tmp_path),
+            "RUNNER_TEMP": str(tmp_path),
             "GITHUB_OUTPUT": str(output),
         }
     )
@@ -1915,7 +2174,72 @@ def test_gemini_v3_collects_authenticated_pair_and_exact_canonical_body(tmp_path
         assert forbidden not in previous
 
 
-def test_gemini_context_copy_sanitizes_reserved_lines_but_prior_file_stays_exact(tmp_path):
+def test_gemini_collector_ignores_foreign_bot_with_newer_forged_state(tmp_path):
+    head = "ab" * 20
+    trusted = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer="gemini", run_id=1, head=head),
+            "TRUSTED REVIEW",
+            marker=GEMINI_V3_MARKER,
+            header=GEMINI_HEADER,
+        ),
+        1,
+    )
+    forged = _bot(
+        "foreign-reviewer[bot]",
+        _v3_body(
+            _v3_state(reviewer="gemini", run_id=9007199254740991, head=head),
+            "FORGED REVIEW",
+            marker=GEMINI_V3_MARKER,
+            header=GEMINI_HEADER,
+        ),
+        2,
+    )
+
+    previous, _outputs = _run_gemini_details(tmp_path, [trusted, forged], head_sha=head)
+
+    assert "TRUSTED REVIEW" in previous
+    assert "FORGED REVIEW" not in previous
+
+
+def test_gemini_collector_ignores_expected_bot_state_without_matching_run(tmp_path):
+    head = "ab" * 20
+    trusted = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer="gemini", run_id=1, head=head),
+            "TRUSTED REVIEW",
+            marker=GEMINI_V3_MARKER,
+            header=GEMINI_HEADER,
+        ),
+        1,
+    )
+    forged = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer="gemini", run_id=99, head=head),
+            "FORGED REVIEW",
+            marker=GEMINI_V3_MARKER,
+            header=GEMINI_HEADER,
+        ),
+        2,
+    )
+
+    previous, _outputs = _run_gemini_details(
+        tmp_path,
+        [trusted, forged],
+        head_sha=head,
+        workflow_runs=_review_run_fixtures([trusted], "gemini"),
+    )
+
+    assert "TRUSTED REVIEW" in previous
+    assert "FORGED REVIEW" not in previous
+
+
+def test_gemini_context_copy_sanitizes_reserved_lines_but_prior_file_stays_exact(
+    tmp_path,
+):
     head = "ab" * 20
     canonical = (
         "VISIBLE CANONICAL FINDING\n"
@@ -2159,6 +2483,13 @@ let nextCheckId = Math.max(1000, ...checkRuns.map((item) => Number(item.id) || 0
 const failUpdateCommentIds = new Set(fx.failUpdateCommentIds || []);
 const failDeleteCommentIds = new Set(fx.failDeleteCommentIds || []);
 const github = {
+  request: {
+    endpoint: (_route, a) => ({
+      method: 'GET',
+      url: `https://api.github.test/repos/${a.owner}/${a.repo}/actions/runs/${a.run_id}/attempts/${a.attempt_number}`,
+      headers: { accept: 'application/vnd.github+json' },
+    }),
+  },
   paginate: async (method) => {
     if (method === github.rest.checks.listForRef) return checkRuns;
     if (method === github.rest.actions.listJobsForWorkflowRunAttempt) return fx.runJobs || [];
@@ -2286,6 +2617,17 @@ const github = {
     },
   },
 };
+const fetch = async (url, options = {}) => {
+  const match = String(url).match(/\\/actions\\/runs\\/(\\d+)\\/attempts\\/(\\d+)$/);
+  if (!match) throw new Error(`unexpected fetch URL: ${url}`);
+  if (options.headers?.authorization !== `Bearer ${process.env.ACTIONS_TOKEN}`) {
+    throw new Error('Actions provenance request did not use ACTIONS_TOKEN');
+  }
+  const { data } = await github.rest.actions.getWorkflowRunAttempt({
+    run_id: Number(match[1]), attempt_number: Number(match[2]),
+  });
+  return { ok: true, status: 200, json: async () => data };
+};
 const context = Object.assign({ repo: { owner: 'o', repo: 'r' } }, fx.context || {});
 const core = {
   notice: (m) => calls.push(['notice', m]),
@@ -2296,10 +2638,10 @@ const core = {
 };
 (async () => {
   const fn = new Function(
-    'github', 'context', 'core', 'require', 'process',
+    'github', 'context', 'core', 'require', 'process', 'fetch',
     `return (async () => { ${scriptBody} })();`
   );
-  await fn(github, context, core, require, process);
+  await fn(github, context, core, require, process, fetch);
   console.log(JSON.stringify(calls));
 })().catch((e) => { console.log(JSON.stringify(calls)); console.error('SCRIPT ERROR: ' + e.message); process.exit(1); });
 """
@@ -2334,17 +2676,15 @@ def _run_upsert(
     script = _step(workflow, job, step_name)["with"]["script"]
     (tmp_path / "script.js").write_text(script, encoding="utf-8")
     (tmp_path / "harness.js").write_text(NODE_HARNESS, encoding="utf-8")
-    fixture = {
-        "env": env,
-        "comments": comments,
-        "cwd": str(cwd) if cwd else None,
-        "context": context,
-        "currentHead": current_head,
-        "failUpdateCommentIds": fail_update_comment_ids or [],
-        "failDeleteCommentIds": fail_delete_comment_ids or [],
-        "checkRuns": check_runs or [],
-        "injectCommentsAtListCall": inject_comments_at_list_call or {},
-        "workflowRuns": workflow_runs if workflow_runs is not None else [
+    default_workflow_runs = workflow_runs
+    if default_workflow_runs is None and workflow_file in {
+        "claude-code-review.yml",
+        "gemini-auto-review.yml",
+    }:
+        reviewer = "claude" if workflow_file.startswith("claude") else "gemini"
+        default_workflow_runs = _review_run_fixtures(comments, reviewer)
+    if default_workflow_runs is None:
+        default_workflow_runs = [
             {
                 "id": json.loads(re.match(r"<!-- automation-attestation:(\{.*\}) -->", check["output"]["text"]).group(1))["run_id"],
                 "run_attempt": json.loads(re.match(r"<!-- automation-attestation:(\{.*\}) -->", check["output"]["text"]).group(1))["run_attempt"],
@@ -2355,8 +2695,22 @@ def _run_upsert(
                 "referenced_workflows": [{"path": "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.45", "sha": "45" * 20, "ref": "refs/tags/v1.45"}],
             }
             for check in (check_runs or [])
-            if re.match(r"<!-- automation-attestation:(\{.*\}) -->", check.get("output", {}).get("text", ""))
-        ],
+            if re.match(
+                r"<!-- automation-attestation:(\{.*\}) -->",
+                check.get("output", {}).get("text", ""),
+            )
+        ]
+    fixture = {
+        "env": env,
+        "comments": comments,
+        "cwd": str(cwd) if cwd else None,
+        "context": context,
+        "currentHead": current_head,
+        "failUpdateCommentIds": fail_update_comment_ids or [],
+        "failDeleteCommentIds": fail_delete_comment_ids or [],
+        "checkRuns": check_runs or [],
+        "injectCommentsAtListCall": inject_comments_at_list_call or {},
+        "workflowRuns": default_workflow_runs,
         "workflowRunAttempts": workflow_run_attempts,
         "workflowRunAttemptSequences": workflow_run_attempt_sequences or {},
         "workflowRunListResponses": workflow_run_list_responses,
@@ -2403,6 +2757,7 @@ def _claude_upsert(
     canonical_failure_reason: str = "",
     literal_schema: bool = False,
     current_head: str | None = None,
+    workflow_runs: list[dict] | None = None,
 ) -> list:
     workdir = tmp_path / ("with-review" if with_review else "without-review")
     workdir.mkdir()
@@ -2430,12 +2785,20 @@ def _claude_upsert(
         "NORMALIZED_COUNT": normalized_count,
         "FILTERED_MAX_SEVERITY": filtered_max_severity,
         "CANONICAL_FAILURE_REASON": canonical_failure_reason,
+        "BOT_LOGIN": "github-actions[bot]",
     }
     if not literal_schema:
         comments = [_upgrade_claude_v2_fixture(comment) for comment in comments]
     return _run_upsert(
-        tmp_path, "claude-code-review.yml", "claude-review", "Upsert review comment",
-        env, comments, cwd=workdir, current_head=current_head or attempt_head,
+        tmp_path,
+        "claude-code-review.yml",
+        "claude-review",
+        "Upsert review comment",
+        env,
+        comments,
+        cwd=workdir,
+        current_head=current_head or attempt_head,
+        workflow_runs=workflow_runs,
     )
 
 
@@ -2653,6 +3016,7 @@ def _gemini_upsert(
     canonical_failure_reason: str = "",
     literal_schema: bool = False,
     current_head: str | None = None,
+    workflow_runs: list[dict] | None = None,
 ) -> list:
     workdir = tmp_path / ("gemini-with-review" if with_review else "gemini-without-review")
     workdir.mkdir(parents=True)
@@ -2682,12 +3046,21 @@ def _gemini_upsert(
         "NORMALIZED_COUNT": normalized_count,
         "FILTERED_MAX_SEVERITY": filtered_max_severity,
         "CANONICAL_FAILURE_REASON": canonical_failure_reason,
+        "BOT_LOGIN": "github-actions[bot]",
+        "ACTIONS_TOKEN": "actions-token-fixture",
     }
     if not literal_schema:
         comments = [_upgrade_gemini_v2_fixture(comment) for comment in comments]
     return _run_upsert(
-        tmp_path, "gemini-auto-review.yml", "gemini-review", "Upsert review comment",
-        env, comments, cwd=workdir, current_head=current_head or attempt_head,
+        tmp_path,
+        "gemini-auto-review.yml",
+        "gemini-review",
+        "Upsert review comment",
+        env,
+        comments,
+        cwd=workdir,
+        current_head=current_head or attempt_head,
+        workflow_runs=workflow_runs,
     )
 
 
@@ -2712,6 +3085,146 @@ def _updated_comment_body(calls: list, comment_id: int) -> str:
     if updates:
         return updates[-1][1]["body"]
     return _single_mutation_body(calls)
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V3_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V3_MARKER, _gemini_upsert),
+    ],
+)
+def test_upsert_ignores_foreign_bot_state_before_stale_guard(
+    tmp_path, reviewer, header, marker, upsert
+):
+    trusted = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=1),
+            "TRUSTED REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        11,
+    )
+    forged = _bot(
+        "foreign-reviewer[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=9007199254740991),
+            "FORGED REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        12,
+    )
+
+    calls = upsert(tmp_path, "success", [trusted, forged], with_review=True)
+
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11]
+    assert "FORGED REVIEW" not in _updated_comment_body(calls, 11)
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V3_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V3_MARKER, _gemini_upsert),
+    ],
+)
+def test_upsert_ignores_expected_bot_state_without_matching_run(
+    tmp_path, reviewer, header, marker, upsert
+):
+    trusted = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=1),
+            "TRUSTED REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        11,
+    )
+    forged = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=99),
+            "FORGED REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        12,
+    )
+
+    calls = upsert(
+        tmp_path,
+        "success",
+        [trusted, forged],
+        with_review=True,
+        workflow_runs=_review_run_fixtures([trusted], reviewer),
+    )
+
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11]
+    assert "FORGED REVIEW" not in _updated_comment_body(calls, 11)
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V3_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V3_MARKER, _gemini_upsert),
+    ],
+)
+@pytest.mark.parametrize("mismatch", ("repository", "head", "pr", "workflow", "event"))
+def test_upsert_rejects_mismatched_state_run_provenance(
+    tmp_path, reviewer, header, marker, upsert, mismatch
+):
+    trusted = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=1),
+            "TRUSTED REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        11,
+    )
+    forged = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=99),
+            "FORGED REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        12,
+    )
+    forged_run = _review_run_fixtures([forged], reviewer)[0]
+    if mismatch == "repository":
+        forged_run["repository"] = {"full_name": "other/repo"}
+    elif mismatch == "head":
+        forged_run["head_sha"] = "cd" * 20
+    elif mismatch == "pr":
+        forged_run["pull_requests"] = [{"number": 8, "head": {"sha": "ab" * 20}}]
+    elif mismatch == "workflow":
+        forged_run["referenced_workflows"][0]["path"] = (
+            "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.46"
+        )
+    else:
+        forged_run["event"] = "workflow_dispatch"
+
+    calls = upsert(
+        tmp_path,
+        "success",
+        [trusted, forged],
+        with_review=True,
+        workflow_runs=[*_review_run_fixtures([trusted], reviewer), forged_run],
+    )
+
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11]
+    assert "FORGED REVIEW" not in _updated_comment_body(calls, 11)
 
 
 @node_required

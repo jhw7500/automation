@@ -14,8 +14,6 @@ inputs:
   context-lines:
     required: false
     default: '3'
-  output-directory:
-    required: true
 outputs:
   diff-ready:
     value: ${{ steps.prepare.outputs.diff_ready }}
@@ -38,7 +36,6 @@ runs:
         PREVIOUS_SHA: ${{ inputs.previous-sha }}
         PREVIOUS_FULL_HASH: ${{ inputs.previous-full-hash }}
         CONTEXT_LINES: ${{ inputs.context-lines }}
-        OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
       run: >-
         python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py"
         --repository "$GITHUB_REPOSITORY"
@@ -46,7 +43,7 @@ runs:
         --previous-sha "$PREVIOUS_SHA"
         --previous-full-hash "$PREVIOUS_FULL_HASH"
         --context-lines "$CONTEXT_LINES"
-        --full-output "$OUTPUT_DIRECTORY/review-full.diff"
-        --delta-output "$OUTPUT_DIRECTORY/review-delta.diff"
-        --manifest-output "$OUTPUT_DIRECTORY/review-scope.json"
+        --full-output "$GITHUB_WORKSPACE/review-full.diff"
+        --delta-output "$GITHUB_WORKSPACE/review-delta.diff"
+        --manifest-output "$GITHUB_WORKSPACE/review-scope.json"
         --github-output "$GITHUB_OUTPUT"

@@ -44,7 +44,18 @@ WORKFLOW_OWNED = re.compile(
     r"^\s*(?:-\s*)?(?:status|run|reviewed|validation)\s*:)", re.IGNORECASE,
 )
 SECTION_NAMES = ("New findings", "Still open", "Resolved", "Retracted")
-VISIBLE_METADATA = re.compile(r"^(?:-\s*)?(?:status|run|reviewed|validation)\s*:", re.IGNORECASE)
+NEW_FINDING_FIELDS = frozenset(
+    {
+        "Changed anchor",
+        "Trigger evidence",
+        "Impact class",
+        "Material impact",
+        "Performance basis",
+    }
+)
+VISIBLE_METADATA = re.compile(
+    r"^(?:-\s*)?(?:status|run|reviewed|validation)\s*:", re.IGNORECASE
+)
 VISIBLE_HEADING = re.compile(r"^#{1,6}(?:\s|$)")
 STICKY_HEADERS = frozenset({"## Claude Code Review (latest)", "## 🔎 Gemini Code Review"})
 
@@ -231,6 +242,8 @@ def _parse_document(text: str) -> dict[str, list[_Block]]:
             section_order.append(active)
         elif active is not None:
             sections[active].append(line)
+        elif line.strip():
+            raise ValueError("ambiguous")
     if "New findings" not in sections:
         raise ValueError("ambiguous")
     parsed: dict[str, list[_Block]] = {name: [] for name in SECTION_NAMES}
@@ -240,7 +253,12 @@ def _parse_document(text: str) -> dict[str, list[_Block]]:
         heading_positions = [position for position, line in enumerate(contents) if line.startswith("####")]
         if not heading_positions:
             meaningful = [line for line in contents if line.strip()]
-            if section == "New findings" and (not meaningful or meaningful[0] != "None"):
+            if section == "New findings" and meaningful not in (
+                ["None"],
+                ["None", "No validated blocking issues found."],
+            ):
+                raise ValueError("ambiguous")
+            if section != "New findings" and meaningful:
                 raise ValueError("ambiguous")
             continue
         if section == "New findings" and any(line.strip() == "None" for line in contents):
@@ -290,8 +308,11 @@ def _validate_new(block: _Block, scope: object) -> tuple[_Finding | None, str | 
         return None, "invalid_impact_class"
     material_values = _field_values(block.lines, "Material impact")
     material = material_values[0].strip() if len(material_values) == 1 else ""
+    structured_prefixes = tuple(f"- {name}: " for name in NEW_FINDING_FIELDS)
     extra_prose = tuple(
-        _canonical_visible_text(line) for line in block.lines if line and not line.startswith("- ")
+        _canonical_visible_text(line)
+        for line in block.lines
+        if line and not line.startswith(structured_prefixes)
     )
     material_text = " ".join((material, *extra_prose)).strip()
     if not material or PROOF_DEFICIT.search(material_text):

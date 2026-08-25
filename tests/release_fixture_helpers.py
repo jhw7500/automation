@@ -26,6 +26,49 @@ V145_REVIEW_WORKFLOWS = (
     "claude-code-review.yml",
     "gemini-auto-review.yml",
 )
+PRE_V146_SETUP_AUTH_FIXTURE = (
+    Path(__file__).parent / "fixtures/setup-gemini-auth-v1.45.2.yml"
+)
+V145_PREPARE_DIFF_FIXTURE = (
+    Path(__file__).parent / "fixtures/prepare-review-diff-v1.45.2.yml"
+)
+
+
+def restore_pre_v146_review_contracts(repo: Path) -> None:
+    """Restore shared auth identity and Claude/Gemini caller ceilings."""
+
+    setup = repo / ".github/actions/setup-gemini-auth/action.yml"
+    setup.parent.mkdir(parents=True, exist_ok=True)
+    setup.write_bytes(PRE_V146_SETUP_AUTH_FIXTURE.read_bytes())
+
+    baseline_root = repo / "examples/baseline-workflows/.github/workflows"
+    for filename in ("claude-code-review.yml", "gemini-auto-review.yml"):
+        path = baseline_root / filename
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        needle = "    permissions:\n      actions: read\n"
+        assert text.count(needle) == 1
+        path.write_text(
+            text.replace(needle, "    permissions:\n", 1),
+            encoding="utf-8",
+        )
+
+    catalog = repo / "scripts/workflow-catalog.json"
+    if catalog.exists():
+        text = catalog.read_text(encoding="utf-8")
+        for caller in ("claude-review", "gemini-review"):
+            needle = (
+                f'          "name": "{caller}",\n'
+                '          "permissions": {\n'
+                '            "actions": "read",\n'
+            )
+            replacement = (
+                f'          "name": "{caller}",\n          "permissions": {{\n'
+            )
+            assert text.count(needle) == 1
+            text = text.replace(needle, replacement, 1)
+        catalog.write_text(text, encoding="utf-8")
 
 
 def restore_historical_automation_ref(repo: Path, historical_ref: str) -> None:
@@ -59,6 +102,8 @@ def restore_historical_review_workflows(
         (repo / relative).write_bytes(
             (HISTORICAL_REVIEW_FIXTURE_ROOT / filename).read_bytes()
         )
+
+    restore_pre_v146_review_contracts(repo)
 
     # v1.44 callers predate the Task 5 Actions/Checks ceiling. Restore those two
     # release-policy files without altering the immutable central workflow fixtures.
@@ -101,3 +146,8 @@ def restore_v145_review_workflows(repo: Path) -> None:
         (repo / relative).write_bytes(
             (V145_REVIEW_FIXTURE_ROOT / filename).read_bytes()
         )
+
+    restore_pre_v146_review_contracts(repo)
+    prepare = repo / ".github/actions/prepare-review-diff/action.yml"
+    prepare.parent.mkdir(parents=True, exist_ok=True)
+    prepare.write_bytes(V145_PREPARE_DIFF_FIXTURE.read_bytes())

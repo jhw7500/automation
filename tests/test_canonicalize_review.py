@@ -106,7 +106,9 @@ class ReviewCase:
             "        return 'invalid'\n"
             "\n"
             "def report(ok):\n"
-            "    return 'success' if ok else 'failure'\n",
+            "    return 'success' if ok else 'failure'\n\n"
+            "def render_verification_status() -> str:\n"
+            "    return 'cannot verify'\n",
             encoding="utf-8",
         )
         head = _commit(base, "review change")
@@ -293,6 +295,12 @@ def review_quality_repo(tmp_path: Path) -> ReviewQualityRepo:
         (b"### New findings\nNone\n\n#### [HIGH] contradictory", "ambiguous_document"),
         (b"### New findings\nNone\n\n### New findings\nNone", "ambiguous_document"),
         (b"### Unknown\nNone", "ambiguous_document"),
+        (b"provider failed\n### New findings\nNone", "ambiguous_document"),
+        (b"### New findings\nNone\nunreviewed tail", "ambiguous_document"),
+        (
+            b"### New findings\nNone\n### Still open\nunreviewed tail",
+            "ambiguous_document",
+        ),
     ),
 )
 def test_hard_document_failures_are_exact_and_write_no_canonical_body(case_factory, payload, reason):
@@ -353,13 +361,46 @@ The caller cannot distinguish invalid input from a supported value.
 @pytest.mark.parametrize(
     ("heading", "fields", "reason"),
     (
-        ("[HIGH] Style without anchor", "- Impact class: style\n- Material impact: cosmetic only.", "invalid_anchor"),
-        ("[LOW] Low category", "- Changed anchor: {\"path\":\"review_cases.py\",\"line\":26}\n- Trigger evidence: {\"path\":\"review_cases.py\",\"line\":25,\"quote\":\"        return int(value)\"}\n- Impact class: runtime\n- Material impact: concrete.", "non_actionable_category"),
-        ("[BOGUS] Invalid severity", "- Changed anchor: {\"path\":\"review_cases.py\",\"line\":26}\n- Trigger evidence: {\"path\":\"review_cases.py\",\"line\":25,\"quote\":\"        return int(value)\"}\n- Impact class: runtime\n- Material impact: concrete.", "invalid_severity"),
-        ("[HIGH] Bad trigger", "- Changed anchor: {\"path\":\"review_cases.py\",\"line\":26}\n- Trigger evidence: {\"path\":\"review_cases.py\",\"line\":25,\"quote\":\"wrong\"}\n- Impact class: runtime\n- Material impact: concrete.", "invalid_trigger_evidence"),
-        ("[HIGH] Bad impact", "- Changed anchor: {\"path\":\"review_cases.py\",\"line\":26}\n- Trigger evidence: {\"path\":\"review_cases.py\",\"line\":25,\"quote\":\"        return int(value)\"}\n- Impact class: invented\n- Material impact: concrete.", "invalid_impact_class"),
-        ("[HIGH] Deficit", "- Changed anchor: {\"path\":\"review_cases.py\",\"line\":26}\n- Trigger evidence: {\"path\":\"review_cases.py\",\"line\":25,\"quote\":\"        return int(value)\"}\n- Impact class: runtime\n- Material impact: Cannot confirm the impact.", "missing_material_impact"),
-        ("[MEDIUM] No performance basis", "- Changed anchor: {\"path\":\"review_cases.py\",\"line\":26}\n- Trigger evidence: {\"path\":\"review_cases.py\",\"line\":25,\"quote\":\"        return int(value)\"}\n- Impact class: performance\n- Material impact: Each request is expensive.", "unsupported_performance_basis"),
+        (
+            "[HIGH] Style without anchor",
+            "- Impact class: style\n- Material impact: cosmetic only.",
+            "invalid_anchor",
+        ),
+        (
+            "[LOW] Low category",
+            '- Changed anchor: {"path":"review_cases.py","line":26}\n- Trigger evidence: {"path":"review_cases.py","line":25,"quote":"        return int(value)"}\n- Impact class: runtime\n- Material impact: concrete.',
+            "non_actionable_category",
+        ),
+        (
+            "[BOGUS] Invalid severity",
+            '- Changed anchor: {"path":"review_cases.py","line":26}\n- Trigger evidence: {"path":"review_cases.py","line":25,"quote":"        return int(value)"}\n- Impact class: runtime\n- Material impact: concrete.',
+            "invalid_severity",
+        ),
+        (
+            "[HIGH] Bad trigger",
+            '- Changed anchor: {"path":"review_cases.py","line":26}\n- Trigger evidence: {"path":"review_cases.py","line":25,"quote":"wrong"}\n- Impact class: runtime\n- Material impact: concrete.',
+            "invalid_trigger_evidence",
+        ),
+        (
+            "[HIGH] Bad impact",
+            '- Changed anchor: {"path":"review_cases.py","line":26}\n- Trigger evidence: {"path":"review_cases.py","line":25,"quote":"        return int(value)"}\n- Impact class: invented\n- Material impact: concrete.',
+            "invalid_impact_class",
+        ),
+        (
+            "[HIGH] Deficit",
+            '- Changed anchor: {"path":"review_cases.py","line":26}\n- Trigger evidence: {"path":"review_cases.py","line":25,"quote":"        return int(value)"}\n- Impact class: runtime\n- Material impact: Cannot confirm the impact.',
+            "missing_material_impact",
+        ),
+        (
+            "[HIGH] Hidden deficit bullet",
+            '- Changed anchor: {"path":"review_cases.py","line":26}\n- Trigger evidence: {"path":"review_cases.py","line":25,"quote":"        return int(value)"}\n- Impact class: runtime\n- Material impact: Invalid input is recorded as a supported value.\n- Caveat: Cannot confirm this path executes.',
+            "missing_material_impact",
+        ),
+        (
+            "[MEDIUM] No performance basis",
+            '- Changed anchor: {"path":"review_cases.py","line":26}\n- Trigger evidence: {"path":"review_cases.py","line":25,"quote":"        return int(value)"}\n- Impact class: performance\n- Material impact: Each request is expensive.',
+            "unsupported_performance_basis",
+        ),
     ),
 )
 def test_soft_filter_reasons_follow_the_closed_validation_order(scoped_case, heading, fields, reason):
@@ -370,6 +411,24 @@ def test_soft_filter_reasons_follow_the_closed_validation_order(scoped_case, hea
     assert result.filtered_count == 1
     assert result.candidate_reasons[0].reason == reason
     assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+def test_proof_deficit_in_exact_source_quote_does_not_filter_material_impact(
+    scoped_case,
+):
+    result, canonical = scoped_case.run('''### New findings
+
+#### [MEDIUM] Completed requests expose the fallback verification status
+- Changed anchor: {"path":"review_cases.py","line":33}
+- Trigger evidence: {"path":"review_cases.py","line":33,"quote":"    return 'cannot verify'"}
+- Impact class: user-visible
+- Material impact: Completed requests return the fallback status to callers instead of their final result.
+''')
+
+    assert result.document_valid is True
+    assert result.accepted_count == 1
+    assert result.filtered_count == 0
+    assert "Completed requests expose the fallback verification status" in canonical
 
 
 def test_clean_declarations_normalize_and_stable_id_is_literal(scoped_case):

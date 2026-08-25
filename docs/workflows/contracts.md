@@ -79,7 +79,13 @@ secrets:
 ```
 
 Both `APP_ID` and `APP_PRIVATE_KEY` must exist. The App is used only for the central
-workflow's declared repository write operations.
+workflow's declared repository write operations. Beginning with `v1.46`, the Gemini auto-review
+workflow resolves the authentication action through `$/`, binding the helper and its outputs to
+the same immutable automation commit as the reusable workflow. The authentication action exposes the
+server-derived publisher login as `<app-slug>[bot]`; review-state collection and publication use
+that exact login rather than trusting an arbitrary comment whose author type is merely `Bot`.
+Actions run provenance is fetched separately with the job-scoped built-in token and
+`actions: read`; the App installation does not need an added Actions permission.
 
 ### Built-in token mode
 
@@ -93,7 +99,7 @@ secrets:
 This mode passes neither `app_id` nor `APP_PRIVATE_KEY`; the reusable workflow uses the
 exact built-in `${{ github.token }}` path within its declared permissions. Ambient
 authentication, OIDC model authentication, and alternate Gemini provider variables are
-not supported.
+not supported. In this mode the publisher login is exactly `github-actions[bot]`.
 
 ## Triggers, inputs, and permissions
 
@@ -111,7 +117,8 @@ untrusted artifact, and only the clean canonicalizer can write a comment or dura
 Central workflows own the pinned OpenCode CLI archive and action versions; consumers do not add
 an installer.
 
-Claude and Gemini callers retain only the catalogued permissions. Repository-specific
+Claude and Gemini callers retain only the catalogued permissions, including `actions: read` for
+authenticating prior sticky-state run attempts. Repository-specific
 trigger or permission changes require an explicit catalog/design change rather than an
 in-place consumer exception.
 
@@ -188,6 +195,13 @@ prepares `review-delta.diff`, and writes `review-scope.json`. Its composite outp
 `unchanged-since-previous`. The hash is SHA-256 over the exact `review-full.diff` bytes. A ready
 manifest has schema `1`, repository, PR number, merge-base SHA, head SHA, and file records with
 `status`, `filename`, and optional `previous_filename`.
+
+`prepare-review-diff` requires an explicit `output-directory`; Claude and Gemini bind it to
+`${{ runner.temp }}`. Their prior canonical body and context files use the same runner-temporary
+boundary. These inputs are therefore outside `${{ github.workspace }}` before the final
+`actions/checkout --force` of the captured PR head and cannot be replaced by a PR-controlled
+tracked file or symlink. Provider output, canonical output, and result JSON remain fixed workspace
+paths, but the workflow unlinks them and creates them only after that final checkout.
 
 The underlying CLI prints one JSON object with `diff_ready`, `diff_mode`, `head_sha`, `base_sha`,
 `full_diff_sha256`, `unchanged_since_previous`, and `warning`. The composite output bridge exposes
@@ -320,6 +334,13 @@ also has exactly one `Performance basis` object whose kind is `measured` or
 `unbounded-amplification` and whose quoted source is validated. `LOW`, style, maintainability, and
 cleanup claims are non-actionable rather than blocking findings.
 
+The document boundary is closed: non-blank prose before the first allowed section, after the last
+section, or in place of a declared carryover section is `ambiguous_document`. A no-finding section
+accepts only the closed workflow-owned no-findings form; `None` cannot terminate parsing and hide a
+later provider error or caveat. Unknown bullets inside a finding are not silently discarded. They
+remain candidate prose and participate in proof-deficit checks, so wording such as “cannot verify”
+cannot evade filtering merely by using an unrecognized field label.
+
 Carryover sections are `### Still open`, `### Resolved`, and `### Retracted`. Every carryover
 heading has the exact form `#### RVW-<12 lowercase hex> [SEVERITY] title` and binds exactly one
 authenticated active prior finding. `Still open` must repeat current changed-anchor, trigger, impact,
@@ -340,9 +361,12 @@ The canonicalizer fails the whole document for exactly these hard reasons: `cand
 `canonicalizer_error`. A hard failure sets `document-valid=false`, makes the provider attempt a
 failed checkpoint, publishes no candidate prose, and cannot advance the successful head or hash.
 After an attempted Claude or Gemini canonicalization that does not produce
-`document-valid=true`, the workflow uploads only the fixed raw candidate path as a uniquely named,
-non-overwriting diagnostic artifact for one day. A missing candidate is ignored. This artifact is
-diagnostic data only: neither the upsert program nor later review state or carryover reads it.
+`document-valid=true`, the workflow uploads only the bounded schema-1
+`<reviewer>-review-result.json` as a uniquely named, non-overwriting diagnostic artifact for one
+day. The untrusted raw candidate is never uploaded: it may contain provider-echoed secrets and a
+workspace path could otherwise expose a checkout-seeded symlink target. A missing result is
+ignored. The diagnostic is not authority: neither the upsert program nor later review state or
+carryover reads it.
 
 Once the document boundary and trusted scope are valid, a bad individual block does not discard
 valid siblings. It is filtered or normalized with exactly one of `invalid_anchor`,
@@ -364,9 +388,14 @@ and schema. Only a bot comment whose first three lines are the reviewer's exact 
 for that reviewer and schema, and one exact `<!-- automation-state:{...} -->` line is a state
 candidate. Claude/Gemini v2 is never accepted as v3, and OpenCode never accepts v3. A marker quoted
 later in prose, a different reviewer or PR, malformed JSON, or an extra, missing, or invalid field
-is not state. The highest lexicographic `(run_id, run_attempt)` candidate wins; comment ordering and
-timestamps do not. Both values are positive safe integers, so a manual rerun of one run is newer
-when its attempt is larger.
+is not state. The author login must also equal the token's exact publisher login. From the newest
+20 syntactically valid records, the workflow queries the claimed Actions run attempt and retains
+only a completed success/failure whose repository, `pull_request` event, PR number, attempt head,
+run ID/attempt, and referenced central reusable-workflow path plus immutable SHA all agree. The
+highest authenticated `(run_id, run_attempt)` then wins; a foreign bot or a forged large run ID is
+ignored rather than poisoning carryover or the stale-generation guard. Comment ordering and
+timestamps do not decide state. Both values are positive safe integers, so a manual rerun of one
+authenticated run is newer when its attempt is larger.
 
 Every envelope has the common fields `schema`, `reviewer`, `pr`, `run_id`, `run_attempt`,
 `attempt_head`, `successful_head`, `attempt_status`, `diff_mode`, and `full_diff_sha256`.

@@ -60,6 +60,7 @@
         {
           "name": "claude-review",
           "permissions": {
+            "actions": "read",
             "contents": "read",
             "id-token": "write",
             "issues": "read",
@@ -92,6 +93,7 @@
         {
           "name": "gemini-review",
           "permissions": {
+            "actions": "read",
             "contents": "read",
             "issues": "write",
             "pull-requests": "write"

@@ -190,6 +190,7 @@ def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() ->
             "previous-sha": {"required": "false", "default": ""},
             "previous-full-hash": {"required": "false", "default": ""},
             "context-lines": {"required": "false", "default": "3"},
+            "output-directory": {"required": "true"},
         },
         "outputs": {
             "diff-ready": {"value": "${{ steps.prepare.outputs.diff_ready }}"},
@@ -214,6 +215,7 @@ def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() ->
                         "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
                         "PREVIOUS_FULL_HASH": "${{ inputs.previous-full-hash }}",
                         "CONTEXT_LINES": "${{ inputs.context-lines }}",
+                        "OUTPUT_DIRECTORY": "${{ inputs.output-directory }}",
                     },
                     "run": (
                         'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" '
@@ -222,9 +224,9 @@ def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() ->
                         '--previous-sha "$PREVIOUS_SHA" '
                         '--previous-full-hash "$PREVIOUS_FULL_HASH" '
                         '--context-lines "$CONTEXT_LINES" '
-                        '--full-output "$GITHUB_WORKSPACE/review-full.diff" '
-                        '--delta-output "$GITHUB_WORKSPACE/review-delta.diff" '
-                        '--manifest-output "$GITHUB_WORKSPACE/review-scope.json" '
+                        '--full-output "$OUTPUT_DIRECTORY/review-full.diff" '
+                        '--delta-output "$OUTPUT_DIRECTORY/review-delta.diff" '
+                        '--manifest-output "$OUTPUT_DIRECTORY/review-scope.json" '
                         '--github-output "$GITHUB_OUTPUT"'
                     ),
                 }
@@ -253,6 +255,8 @@ def test_prepare_review_diff_action_run_passes_quoted_environment_values_to_help
     )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
     github_output = tmp_path / "github-output"
     pr_number = "7; still-one-quoted-value"
     environment = {
@@ -266,6 +270,7 @@ def test_prepare_review_diff_action_run_passes_quoted_environment_values_to_help
         "PREVIOUS_SHA": "a" * 40,
         "PREVIOUS_FULL_HASH": "b" * 64,
         "CONTEXT_LINES": "20",
+        "OUTPUT_DIRECTORY": str(runner_temp),
     }
 
     result = subprocess.run(
@@ -288,11 +293,11 @@ def test_prepare_review_diff_action_run_passes_quoted_environment_values_to_help
         "--context-lines",
         "20",
         "--full-output",
-        str(workspace / "review-full.diff"),
+        str(runner_temp / "review-full.diff"),
         "--delta-output",
-        str(workspace / "review-delta.diff"),
+        str(runner_temp / "review-delta.diff"),
         "--manifest-output",
-        str(workspace / "review-scope.json"),
+        str(runner_temp / "review-scope.json"),
         "--github-output",
         str(github_output),
     ]

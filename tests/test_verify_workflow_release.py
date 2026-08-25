@@ -87,6 +87,7 @@ REVIEWER_WORKFLOW_CONTRACTS = {
     "claude-code-review.yml": {
         "job": "claude-review",
         "provider_step": "Run Claude Code Review",
+        "collector_step": "Collect previous review context",
         "prompt_key": "prompt",
         "raw": "claude-review.md",
         "canonical": "claude-review-canonical.md",
@@ -96,6 +97,7 @@ REVIEWER_WORKFLOW_CONTRACTS = {
     "gemini-auto-review.yml": {
         "job": "gemini-review",
         "provider_step": "Run Gemini Code Review",
+        "collector_step": "Get PR details",
         "prompt_key": "run",
         "raw": "gemini_review.md",
         "canonical": "gemini-review-canonical.md",
@@ -110,7 +112,8 @@ def restore_historical_v140_manual_outputs(repo: Path) -> None:
     # 해시는 workflow-config.json 전체 바이트를 커버하므로, 플릿 구성이 변한 뒤에는
     # automation_ref 치환만으로 역사적 바이트를 재현할 수 없다 — 태그에서 뽑아 둔
     # 스냅샷 픽스처(tests/fixtures/workflow-config-v1.40.json)를 통째로 복원한다.
-    snapshot = Path(__file__).parent / "fixtures" / "workflow-config-v1.40.json"
+    fixture_root = Path(__file__).parent / "fixtures"
+    snapshot = fixture_root / "workflow-config-v1.40.json"
     (repo / "scripts/workflow-config.json").write_bytes(snapshot.read_bytes())
     root = repo / "examples/baseline-workflows/.github/workflows"
     for filename in ("gemini-issue-triage.yml", "gemini-pr-review.yml"):
@@ -1986,6 +1989,24 @@ def test_v146_rejects_nonexact_reviewer_canonicalizer_dependencies(
         release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
+def test_v146_requires_review_auth_helper_from_the_release_commit(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/gemini-auto-review.yml"
+    replace(
+        path,
+        "$/.github/actions/setup-gemini-auth",
+        "jhw7500/automation/.github/actions/setup-gemini-auth@"
+        "2254f13aab44585c78954d20749f4fb677a8c2f1",
+        count=1,
+    )
+    bad_commit = commit(repo, "detach review auth helper from release")
+
+    with pytest.raises(ReleaseVerificationError, match="review action dependency"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
 @pytest.mark.parametrize(
     "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
 )
@@ -2028,6 +2049,27 @@ def test_v146_requires_exact_prepared_head_checkout_before_the_provider(
 
     mutate_yaml(path, drift)
     bad_commit = commit(repo, f"drift {workflow} prepared head checkout")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+def test_v146_requires_review_diff_outputs_outside_the_checkout_workspace(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def move_into_workspace(step: dict) -> None:
+        step["with"]["output-directory"] = "${{ github.workspace }}"
+
+    mutate_named_step(path, contract["job"], "Prepare review diff", move_into_workspace)
+    bad_commit = commit(repo, f"move {workflow} review inputs into checkout workspace")
 
     with pytest.raises(ReleaseVerificationError, match="review publication contract"):
         release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
@@ -2137,6 +2179,88 @@ def test_v146_allows_an_unrelated_nested_workflow_without_shadowing_root_contrac
 @pytest.mark.parametrize(
     "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
 )
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        (
+            'select(.user.type == "Bot" and .user.login == $bot_login)',
+            'select(.user.type == "Bot")',
+        ),
+        (
+            ".referenced_workflows[]?",
+            ".pull_requests[]?",
+        ),
+        (
+            "actions/runs/${candidate_run_id}/attempts/${candidate_attempt}",
+            "actions/runs/${candidate_run_id}",
+        ),
+    ),
+    ids=("exact-bot", "reusable-workflow", "run-attempt"),
+)
+def test_v146_authenticates_collected_review_state_against_its_run(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    old: str,
+    new: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def weaken_provenance(step: dict) -> None:
+        script = step["run"]
+        assert old in script
+        step["run"] = script.replace(old, new, 1)
+
+    mutate_named_step(
+        path, contract["job"], contract["collector_step"], weaken_provenance
+    )
+    bad_commit = commit(repo, f"weaken {workflow} collected state provenance")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("comment.user?.login !== botLogin", "false"),
+        (
+            "attempt_number: record.state.run_attempt",
+            "attempt_number: 1",
+        ),
+        ("run?.referenced_workflows", "run?.pull_requests"),
+    ),
+    ids=("exact-bot", "run-attempt", "reusable-workflow"),
+)
+def test_v146_authenticates_published_review_state_before_stale_guarding(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    old: str,
+    new: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def weaken_provenance(step: dict) -> None:
+        script = step["with"]["script"]
+        assert old in script
+        step["with"]["script"] = script.replace(old, new, 1)
+
+    mutate_named_step(path, contract["job"], "Upsert review comment", weaken_provenance)
+    bad_commit = commit(repo, f"weaken {workflow} published state provenance")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
 @pytest.mark.parametrize("read_style", ("literal", "variable"))
 def test_v146_rejects_reviewer_upsert_reading_the_raw_candidate(
     current_release_repo: tuple[Path, str], workflow: str, read_style: str
@@ -2180,15 +2304,15 @@ def test_v146_rejects_reviewer_upsert_reading_the_raw_candidate(
     (
         (
             "claude-code-review.yml",
-            "Upload rejected Claude review candidate",
+            "Upload rejected Claude review diagnostic",
         ),
         (
             "gemini-auto-review.yml",
-            "Upload rejected Gemini review candidate",
+            "Upload rejected Gemini review diagnostic",
         ),
     ),
 )
-def test_v146_binds_rejected_candidate_diagnostics_to_one_day(
+def test_v146_binds_rejected_review_diagnostics_to_one_day(
     current_release_repo: tuple[Path, str],
     workflow: str,
     upload_step: str,
@@ -2206,12 +2330,44 @@ def test_v146_binds_rejected_candidate_diagnostics_to_one_day(
         upload_step,
         retain_too_long,
     )
-    bad_commit = commit(repo, f"retain rejected {workflow} candidate too long")
+    bad_commit = commit(repo, f"retain rejected {workflow} diagnostic too long")
 
     with pytest.raises(
         ReleaseVerificationError,
         match="review publication contract",
     ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "upload_step"),
+    (
+        (
+            "claude-code-review.yml",
+            "Upload rejected Claude review diagnostic",
+        ),
+        (
+            "gemini-auto-review.yml",
+            "Upload rejected Gemini review diagnostic",
+        ),
+    ),
+)
+def test_v146_never_uploads_a_rejected_raw_review_candidate(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    upload_step: str,
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def expose_raw_candidate(step: dict) -> None:
+        step["with"]["path"] = f"${{{{ github.workspace }}}}/{contract['raw']}"
+
+    mutate_named_step(path, contract["job"], upload_step, expose_raw_candidate)
+    bad_commit = commit(repo, f"upload rejected raw candidate from {workflow}")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
         release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 

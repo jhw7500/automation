@@ -86,6 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: read
       pull-requests: write
       issues: write
@@ -124,7 +125,7 @@ jobs:
 
       - name: Resolve repository-write token
         id: auth
-        uses: jhw7500/automation/.github/actions/setup-gemini-auth@2254f13aab44585c78954d20749f4fb677a8c2f1
+        uses: $/.github/actions/setup-gemini-auth
         with:
           app-id: ${{ inputs.repo_write_auth == 'github_app' && inputs.app_id || '' }}
           private-key: ${{ inputs.repo_write_auth == 'github_app' && secrets.APP_PRIVATE_KEY || '' }}
@@ -137,19 +138,20 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           SERVER_URL: ${{ github.server_url }}
           REPOSITORY: ${{ github.repository }}
+          BOT_LOGIN: ${{ steps.auth.outputs.bot-login }}
+          ACTIONS_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           HEADER='## 🔎 Gemini Code Review'
           MARKER='<!-- automation:gemini-auto-review:v3 -->'
           REVIEWER='gemini'
-          WORKSPACE="${GITHUB_WORKSPACE:?}"
-          TITLE_FILE="$WORKSPACE/pr_title.txt"
-          BODY_FILE="$WORKSPACE/pr_body.txt"
-          NUMBER_FILE="$WORKSPACE/pr_number.txt"
-          COMMENTS_FILE="$WORKSPACE/pr_comments.json"
-          PREVIOUS_FILE="$WORKSPACE/gemini-previous-review.md"
-          CONTEXT_FILE="$WORKSPACE/prev_review.txt"
-          HUMAN_FILE="$WORKSPACE/human_comments.txt"
+          TITLE_FILE="${RUNNER_TEMP:?}/pr_title.txt"
+          BODY_FILE="${RUNNER_TEMP:?}/pr_body.txt"
+          NUMBER_FILE="${RUNNER_TEMP:?}/pr_number.txt"
+          COMMENTS_FILE="${RUNNER_TEMP:?}/pr_comments.json"
+          PREVIOUS_FILE="${RUNNER_TEMP:?}/gemini-previous-review.md"
+          CONTEXT_FILE="${RUNNER_TEMP:?}/prev_review.txt"
+          HUMAN_FILE="${RUNNER_TEMP:?}/human_comments.txt"
 
           # Every workflow-owned redirect destination is unlinked first. This prevents a
           # checkout-seeded symlink from redirecting writes outside the workspace.
@@ -177,10 +179,11 @@ jobs:
           jq -s 'add // []' "$RAW_COMMENTS" > "$COMMENTS_FILE"
           # Exact schema-3 envelopes are the only trusted state. A quoted marker, another
           # reviewer, malformed JSON, or a different PR cannot become re-review context.
-          PREV_RECORD="$(jq -c \
+          PREV_CANDIDATES="$(jq -c \
             --arg header "$HEADER" \
             --arg marker "$MARKER" \
             --arg reviewer "$REVIEWER" \
+            --arg bot_login "$BOT_LOGIN" \
             --arg pr "$PR_NUMBER" \
             --arg server "$SERVER_URL" \
             --arg repo "$REPOSITORY" '
@@ -222,10 +225,10 @@ jobs:
                     and (.filtered_max_severity | max_severity)
                   end)
                 else false end;
-              def parsed_state($header; $marker; $reviewer; $pr; $server; $repo):
+              def parsed_state($header; $marker; $reviewer; $bot_login; $pr; $server; $repo):
                 (.body // "") as $body
                 | ($body | split("\n")) as $lines
-                | select(.user.type == "Bot")
+                | select(.user.type == "Bot" and .user.login == $bot_login)
                 | select($lines[0] == $header and $lines[1] == $marker)
                 | (($lines[2]? // "") | (capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$")? | .json? | fromjson?)) as $s
                 | select(($s | type) == "object")
@@ -257,10 +260,40 @@ jobs:
                 | select($body | startswith($prefix))
                 | {comment: ., state: $s, canonical_body: ($body | .[($prefix | length):])};
 
-              [.[] | parsed_state($header; $marker; $reviewer; $pr; $server; $repo)]
+              [.[] | parsed_state($header; $marker; $reviewer; $bot_login; $pr; $server; $repo)]
               | sort_by(.state.run_id, .state.run_attempt)
-              | last // null
+              | reverse | .[:20]
             ' "$COMMENTS_FILE")"
+          PREV_RECORD='null'
+          while IFS= read -r candidate; do
+            candidate_run_id="$(jq -r '.state.run_id' <<< "$candidate")"
+            candidate_attempt="$(jq -r '.state.run_attempt' <<< "$candidate")"
+            candidate_head="$(jq -r '.state.attempt_head' <<< "$candidate")"
+            run_record="$(GH_TOKEN="$ACTIONS_TOKEN" gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate_run_id}/attempts/${candidate_attempt}" \
+              2>/dev/null || true)"
+            if [ -n "$run_record" ] && jq -e \
+              --argjson run_id "$candidate_run_id" \
+              --argjson run_attempt "$candidate_attempt" \
+              --argjson pr "$PR_NUMBER" \
+              --arg head "$candidate_head" \
+              --arg repo "$REPOSITORY" \
+              --arg workflow_prefix 'jhw7500/automation/.github/workflows/gemini-auto-review.yml@' '
+                .id == $run_id and .run_attempt == $run_attempt
+                and .status == "completed"
+                and (.conclusion == "success" or .conclusion == "failure")
+                and .event == "pull_request" and .head_sha == $head
+                and .repository.full_name == $repo
+                and ([.pull_requests[]? | select(.number == $pr and .head.sha == $head)] | length == 1)
+                and ([.referenced_workflows[]? | select(
+                  (.path | startswith($workflow_prefix))
+                  and (.sha | test("^[0-9a-f]{40}$"))
+                )] | length == 1)
+              ' >/dev/null 2>&1 <<< "$run_record"; then
+              PREV_RECORD="$candidate"
+              break
+            fi
+          done < <(jq -c '.[]' <<< "$PREV_CANDIDATES")
           PREV_STATE="$(printf '%s\n' "$PREV_RECORD" | jq -c '.state // {}')"
           PREV_SHA="$(printf '%s\n' "$PREV_STATE" | jq -r '(.successful_head // "") | if test("^[0-9a-f]{40}$") then . else "" end')"
           PREV_FULL_HASH="$(printf '%s\n' "$PREV_STATE" | jq -r '(.full_diff_sha256 // "") | if test("^[0-9a-f]{64}$") then . else "" end')"
@@ -303,6 +336,7 @@ jobs:
           previous-sha: ${{ steps.pr-details.outputs.previous_sha }}
           previous-full-hash: ${{ steps.pr-details.outputs.previous_full_hash }}
           context-lines: '20'
+          output-directory: ${{ runner.temp }}
 
       - name: Checkout prepared review head
         if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' }}
@@ -335,8 +369,13 @@ jobs:
           GEMINI_THINKING_LEVEL: ${{ vars.GEMINI_THINKING_LEVEL || 'medium' }}
           GEMINI_DIFF_INPUT_CHARS: ${{ vars.GEMINI_DIFF_INPUT_CHARS || '900000' }}
           GEMINI_REVIEW_PROCESS_TIMEOUT: '450'
-          REVIEW_DIFF_FILE: ${{ steps.prepare-diff.outputs.diff-mode == 'delta' && 'review-delta.diff' || 'review-full.diff' }}
+          REVIEW_DIFF_FILE: ${{ steps.prepare-diff.outputs.diff-mode == 'delta' && format('{0}/review-delta.diff', runner.temp) || format('{0}/review-full.diff', runner.temp) }}
           REVIEW_DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode }}
+          PR_TITLE_FILE: ${{ runner.temp }}/pr_title.txt
+          PR_BODY_FILE: ${{ runner.temp }}/pr_body.txt
+          PR_NUMBER_FILE: ${{ runner.temp }}/pr_number.txt
+          PREVIOUS_REVIEW_FILE: ${{ runner.temp }}/prev_review.txt
+          HUMAN_COMMENTS_FILE: ${{ runner.temp }}/human_comments.txt
         run: |
           # Install dependencies
           pip install -q google-genai
@@ -410,11 +449,11 @@ jobs:
                   return legacy_model.generate_content(prompt)
 
           # Read PR details
-          with open('pr_title.txt', 'r') as f:
+          with open(os.environ.get('PR_TITLE_FILE', 'pr_title.txt'), 'r') as f:
               pr_title = f.read().strip()
-          with open('pr_body.txt', 'r') as f:
+          with open(os.environ.get('PR_BODY_FILE', 'pr_body.txt'), 'r') as f:
               pr_body = f.read().strip()
-          with open('pr_number.txt', 'r') as f:
+          with open(os.environ.get('PR_NUMBER_FILE', 'pr_number.txt'), 'r') as f:
               pr_number = f.read().strip()
           with open(os.environ['REVIEW_DIFF_FILE'], 'r') as f:
               pr_diff = f.read()
@@ -451,8 +490,12 @@ jobs:
               return "\n".join(kept).strip()
 
           # Previous-round context prepared by the workflow step (empty on the first round).
-          prev_review = strip_infra_lines(read_optional('prev_review.txt'))
-          human_comments = read_optional('human_comments.txt')
+          prev_review = strip_infra_lines(read_optional(
+              os.environ.get('PREVIOUS_REVIEW_FILE', 'prev_review.txt')
+          ))
+          human_comments = read_optional(
+              os.environ.get('HUMAN_COMMENTS_FILE', 'human_comments.txt')
+          )
 
           incremental_note = ""
           if os.environ.get('REVIEW_DIFF_MODE') == 'delta':
@@ -814,18 +857,18 @@ jobs:
           candidate-file: ${{ github.workspace }}/gemini_review.md
           canonical-file: ${{ github.workspace }}/gemini-review-canonical.md
           result-file: ${{ github.workspace }}/gemini-review-result.json
-          scope-manifest: ${{ github.workspace }}/review-scope.json
-          selected-diff: ${{ steps.prepare-diff.outputs.diff-mode == 'delta' && format('{0}/review-delta.diff', github.workspace) || format('{0}/review-full.diff', github.workspace) }}
+          scope-manifest: ${{ runner.temp }}/review-scope.json
+          selected-diff: ${{ steps.prepare-diff.outputs.diff-mode == 'delta' && format('{0}/review-delta.diff', runner.temp) || format('{0}/review-full.diff', runner.temp) }}
           diff-mode: ${{ steps.prepare-diff.outputs.diff-mode }}
           previous-sha: ${{ steps.pr-details.outputs.previous_sha }}
-          previous-review-file: ${{ steps.pr-details.outputs.previous_sha != '' && format('{0}/gemini-previous-review.md', github.workspace) || '' }}
+          previous-review-file: ${{ steps.pr-details.outputs.previous_sha != '' && format('{0}/gemini-previous-review.md', runner.temp) || '' }}
 
-      - name: Upload rejected Gemini review candidate
+      - name: Upload rejected Gemini review diagnostic
         if: ${{ always() && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.document-valid != 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: gemini-review-candidate-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/gemini_review.md
+          name: gemini-review-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/gemini-review-result.json
           if-no-files-found: ignore
           retention-days: 1
           overwrite: false
@@ -858,6 +901,8 @@ jobs:
           NORMALIZED_COUNT: ${{ steps.canonicalize-review.outputs.normalized-count }}
           FILTERED_MAX_SEVERITY: ${{ steps.canonicalize-review.outputs.filtered-max-severity }}
           CANONICAL_FAILURE_REASON: ${{ steps.canonicalize-review.outputs.failure-reason }}
+          BOT_LOGIN: ${{ steps.auth.outputs.bot-login }}
+          ACTIONS_TOKEN: ${{ github.token }}
         with:
           github-token: ${{ steps.auth.outputs.token }}
           script: |
@@ -870,6 +915,8 @@ jobs:
             const runUrl = process.env.RUN_URL;
             const serverUrl = process.env.SERVER_URL || '';
             const repository = process.env.REPOSITORY || '';
+            const botLogin = process.env.BOT_LOGIN || '';
+            const actionsToken = process.env.ACTIONS_TOKEN || '';
             const ok = (process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success';
             const diffReady = process.env.DIFF_READY === 'true';
             const diffTruncated = process.env.DIFF_TRUNCATED === 'true';
@@ -974,7 +1021,7 @@ jobs:
               ].filter(Boolean).join('\n');
             };
             const parseRecord = (comment) => {
-              if (comment.user?.type !== 'Bot') return null;
+              if (comment.user?.type !== 'Bot' || comment.user?.login !== botLogin) return null;
               const lines = (comment.body || '').split('\n');
               if (lines[0] !== header || lines[1] !== marker) return null;
               const match = (lines[2] || '').match(/^<!-- automation-state:(\{.*\}) -->$/);
@@ -990,19 +1037,66 @@ jobs:
                 return null;
               }
             };
-            const records = comments.map(parseRecord).filter(Boolean).sort((a, b) =>
+            const syntacticRecords = comments.map(parseRecord).filter(Boolean).sort((a, b) =>
+              b.state.run_id - a.state.run_id || b.state.run_attempt - a.state.run_attempt
+            ).slice(0, 20);
+            const workflowPrefix = 'jhw7500/automation/.github/workflows/gemini-auto-review.yml@';
+            const getWorkflowRunAttempt = async (record) => {
+              const request = github.request.endpoint(
+                'GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}',
+                {
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  run_id: record.state.run_id, attempt_number: record.state.run_attempt,
+                },
+              );
+              const response = await fetch(request.url, {
+                method: request.method,
+                headers: {
+                  ...request.headers,
+                  authorization: `Bearer ${actionsToken}`,
+                  'x-github-api-version': '2022-11-28',
+                },
+                signal: AbortSignal.timeout(30000),
+              });
+              if (!response.ok) {
+                throw new Error(`Actions run provenance request failed: ${response.status}`);
+              }
+              return response.json();
+            };
+            const runMatches = (record, run) => run?.id === record.state.run_id
+              && run?.run_attempt === record.state.run_attempt
+              && run?.status === 'completed'
+              && ['success', 'failure'].includes(run?.conclusion)
+              && run?.event === 'pull_request' && run?.head_sha === record.state.attempt_head
+              && run?.repository?.full_name === repository
+              && (run?.pull_requests || []).filter((pr) =>
+                pr?.number === issueNumber && pr?.head?.sha === record.state.attempt_head
+              ).length === 1
+              && (run?.referenced_workflows || []).filter((item) =>
+                (item?.path || '').startsWith(workflowPrefix) && sha1(item?.sha)
+              ).length === 1;
+            const records = [];
+            for (const record of syntacticRecords) {
+              try {
+                const run = await getWorkflowRunAttempt(record);
+                if (runMatches(record, run)) records.push(record);
+              } catch (error) {
+                core.warning(`Ignoring Gemini state without valid run provenance: ${error.message}`);
+              }
+            }
+            records.sort((a, b) =>
               a.state.run_id - b.state.run_id || a.state.run_attempt - b.state.run_attempt
             );
             const existing = records[records.length - 1];
             const exactDisplayTarget = (displayMarker) => [...comments].reverse().find((comment) => {
-              if (comment.user?.type !== 'Bot') return false;
+              if (comment.user?.type !== 'Bot' || comment.user?.login !== botLogin) return false;
               const lines = (comment.body || '').split('\n');
               return lines[0] === header && lines[1] === displayMarker;
             });
             // Historical comments are display locations only. Their state and prose never
             // participate in v3 authentication, carryover, or failure preservation.
             const v2Target = existing ? null : exactDisplayTarget(v2Marker);
-            if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead) || !serverUrl || !repository) {
+            if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead) || !serverUrl || !repository || !botLogin || !actionsToken) {
               core.notice('Gemini review trusted attempt identity is invalid; left the existing sticky state unchanged.');
               return;
             }
