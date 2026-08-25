@@ -2762,6 +2762,7 @@ def _claude_upsert(
     literal_schema: bool = False,
     current_head: str | None = None,
     workflow_runs: list[dict] | None = None,
+    workflow_run_attempt_sequences: dict[str, list[dict]] | None = None,
 ) -> list:
     workdir = tmp_path / ("with-review" if with_review else "without-review")
     workdir.mkdir()
@@ -2803,6 +2804,7 @@ def _claude_upsert(
         cwd=workdir,
         current_head=current_head or attempt_head,
         workflow_runs=workflow_runs,
+        workflow_run_attempt_sequences=workflow_run_attempt_sequences,
     )
 
 
@@ -3021,6 +3023,7 @@ def _gemini_upsert(
     literal_schema: bool = False,
     current_head: str | None = None,
     workflow_runs: list[dict] | None = None,
+    workflow_run_attempt_sequences: dict[str, list[dict]] | None = None,
 ) -> list:
     workdir = tmp_path / ("gemini-with-review" if with_review else "gemini-without-review")
     workdir.mkdir(parents=True)
@@ -3065,6 +3068,7 @@ def _gemini_upsert(
         cwd=workdir,
         current_head=current_head or attempt_head,
         workflow_runs=workflow_runs,
+        workflow_run_attempt_sequences=workflow_run_attempt_sequences,
     )
 
 
@@ -3171,6 +3175,187 @@ def test_upsert_ignores_expected_bot_state_without_matching_run(
 
     assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11]
     assert "FORGED REVIEW" not in _updated_comment_body(calls, 11)
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V3_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V3_MARKER, _gemini_upsert),
+    ],
+)
+@pytest.mark.parametrize("error_status", (None, 403, 429, 500, 503))
+def test_upsert_aborts_publication_when_latest_provenance_lookup_is_uncertain(
+    tmp_path, reviewer, header, marker, upsert, error_status
+):
+    older = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=1, head="ab" * 20),
+            "OLDER REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        11,
+    )
+    latest = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=2, head="bc" * 20),
+            "LATEST REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        12,
+    )
+
+    calls = upsert(
+        tmp_path,
+        "success",
+        [older, latest],
+        with_review=True,
+        workflow_runs=_review_run_fixtures([older, latest], reviewer),
+        workflow_run_attempt_sequences={
+            "2:1": [{"__error_status": error_status}],
+        },
+    )
+
+    assert not any(call[0] in {"create", "update", "delete"} for call in calls)
+    assert any(
+        call[0] == "notice" and "provenance lookup is uncertain" in call[1]
+        for call in calls
+    )
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V3_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V3_MARKER, _gemini_upsert),
+    ],
+)
+def test_upsert_treats_provenance_404_as_definitive_absence(
+    tmp_path, reviewer, header, marker, upsert
+):
+    older = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=1, head="ab" * 20),
+            "OLDER REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        11,
+    )
+    missing = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=2, head="bc" * 20),
+            "MISSING REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        12,
+    )
+
+    calls = upsert(
+        tmp_path,
+        "success",
+        [older, missing],
+        with_review=True,
+        workflow_runs=_review_run_fixtures([older, missing], reviewer),
+        workflow_run_attempt_sequences={"2:1": [{"__error_status": 404}]},
+    )
+
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11]
+    assert not any(
+        call[0] == "notice" and "provenance lookup is uncertain" in call[1]
+        for call in calls
+    )
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V3_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V3_MARKER, _gemini_upsert),
+    ],
+)
+def test_upsert_stops_provenance_queries_after_latest_state_authenticates(
+    tmp_path, reviewer, header, marker, upsert
+):
+    older = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=1, head="ab" * 20),
+            "OLDER REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        11,
+    )
+    latest = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=2, head="bc" * 20),
+            "LATEST REVIEW",
+            marker=marker,
+            header=header,
+        ),
+        12,
+    )
+
+    calls = upsert(
+        tmp_path,
+        "success",
+        [older, latest],
+        with_review=True,
+        workflow_runs=_review_run_fixtures([older, latest], reviewer),
+        workflow_run_attempt_sequences={"1:1": [{"__error_status": 503}]},
+    )
+
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [12]
+    assert not any(
+        call[0] == "get-run-attempt" and call[1]["run_id"] == 1
+        for call in calls
+    )
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("reviewer", "header", "marker", "upsert"),
+    [
+        ("claude", CLAUDE_HEADER, CLAUDE_V3_MARKER, _claude_upsert),
+        ("gemini", GEMINI_HEADER, GEMINI_V3_MARKER, _gemini_upsert),
+    ],
+)
+def test_upsert_prefers_newest_comment_for_duplicate_authenticated_generation(
+    tmp_path, reviewer, header, marker, upsert
+):
+    state = _v3_state(reviewer=reviewer, run_id=2, head="bc" * 20)
+    older_duplicate = _bot(
+        "github-actions[bot]",
+        _v3_body(state, "OLDER DUPLICATE", marker=marker, header=header),
+        11,
+    )
+    latest_duplicate = _bot(
+        "github-actions[bot]",
+        _v3_body(state, "LATEST DUPLICATE", marker=marker, header=header),
+        12,
+    )
+
+    calls = upsert(
+        tmp_path,
+        "success",
+        [older_duplicate, latest_duplicate],
+        with_review=True,
+        workflow_runs=_review_run_fixtures([older_duplicate, latest_duplicate], reviewer),
+    )
+
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [12]
 
 
 @node_required

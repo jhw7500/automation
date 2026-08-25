@@ -1095,6 +1095,7 @@ jobs:
             };
             const syntacticRecords = comments.map(parseRecord).filter(Boolean).sort((a, b) =>
               b.state.run_id - a.state.run_id || b.state.run_attempt - a.state.run_attempt
+                || Number(b.comment.id) - Number(a.comment.id)
             ).slice(0, 20);
             const workflowPrefix = 'jhw7500/automation/.github/workflows/gemini-auto-review.yml@';
             const getWorkflowRunAttempt = async (record) => {
@@ -1115,7 +1116,9 @@ jobs:
                 signal: AbortSignal.timeout(30000),
               });
               if (!response.ok) {
-                throw new Error(`Actions run provenance request failed: ${response.status}`);
+                const error = new Error(`Actions run provenance request failed: ${response.status}`);
+                error.status = response.status;
+                throw error;
               }
               return response.json();
             };
@@ -1131,19 +1134,29 @@ jobs:
               && (run?.referenced_workflows || []).filter((item) =>
                 (item?.path || '').startsWith(workflowPrefix) && sha1(item?.sha)
               ).length === 1;
-            const records = [];
+            let existing;
+            let provenanceLookupUncertain = false;
             for (const record of syntacticRecords) {
               try {
                 const run = await getWorkflowRunAttempt(record);
-                if (runMatches(record, run)) records.push(record);
+                if (runMatches(record, run)) {
+                  existing = record;
+                  break;
+                }
               } catch (error) {
-                core.warning(`Ignoring Gemini state without valid run provenance: ${error.message}`);
+                if (Number(error?.status) === 404) {
+                  core.warning(`Ignoring Gemini state whose Actions run is absent: ${error.message}`);
+                  continue;
+                }
+                provenanceLookupUncertain = true;
+                core.warning(`Gemini state provenance lookup failed; refusing publication: ${error.message}`);
+                break;
               }
             }
-            records.sort((a, b) =>
-              a.state.run_id - b.state.run_id || a.state.run_attempt - b.state.run_attempt
-            );
-            const existing = records[records.length - 1];
+            if (provenanceLookupUncertain) {
+              core.notice('Gemini review state provenance lookup is uncertain; left existing sticky state unchanged.');
+              return;
+            }
             const exactDisplayTarget = (displayMarker) => [...comments].reverse().find((comment) => {
               if (comment.user?.type !== 'Bot' || comment.user?.login !== botLogin) return false;
               const lines = (comment.body || '').split('\n');

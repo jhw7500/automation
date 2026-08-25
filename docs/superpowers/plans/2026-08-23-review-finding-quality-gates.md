@@ -797,6 +797,8 @@ Extend the extracted collector/upsert harness with `CLAUDE_V3_MARKER` and a sche
 - stale v3 failure preserves all four prior values and prior body/head/hash;
 - unchanged v3 success advances the successful head while preserving prior body/hash/counters;
 - a prospective successful sticky over 65,536 UTF-8 bytes becomes a hard `candidate_oversize` attempt and preserves prior success instead of truncating the canonical body;
+- an exact-attempt provenance 404 ignores only that missing record, while timeout, 403, 429, and 5xx abort publication without creating, updating, or deleting a comment;
+- newest-first selection stops after the highest state authenticates, and duplicate authenticated generations prefer the larger comment ID;
 - wrong reviewer, wrong schema, extra/missing key, negative count, or invalid max severity is not authenticated.
 
 - [ ] **Step 3: Change collection to authenticate schema 3 only**

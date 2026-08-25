@@ -370,6 +370,14 @@ review, establishes workflow-assigned finding IDs and quality counters, and repl
 envelope in place. This avoids treating a model-authored historical `Validation` line as trusted and
 prevents an ID-less v2 body from silently losing active findings in a delta round.
 
+Prior-state candidates are checked newest-first, with the larger comment ID breaking a duplicate
+generation tie, and lookup stops after the highest candidate authenticates. HTTP 404 for an exact
+run attempt is definitive absence and may be ignored; every other lookup failure encountered before
+selection (including a timeout, 403, 429, or 5xx) aborts publication before any comment create,
+update, or delete. This prevents a transient lookup failure for the newest state from causing an
+older sticky to be updated or a duplicate sticky to be created without letting an irrelevant older
+record block a known-good latest state.
+
 OpenCode remains on its existing v2 state because it already has a separate strict canonicalizer and
 is outside issues #41 and #42. Shared collectors and documentation must explicitly support Claude and
 Gemini v3 alongside OpenCode v2; neither schema is accepted for the wrong reviewer.

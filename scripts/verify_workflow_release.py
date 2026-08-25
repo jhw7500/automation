@@ -604,7 +604,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
         # Intentional whole-program v1.46 publication boundary. Any Upsert
         # program change requires an explicit verifier contract update.
         "upsert_sha256": (
-            "27fd7d618b2a2ac099280ed9b9ab7243ee1909193486d009f266d69279d25f95"
+            "d2f1d2eab1e974bf05f184406e854cfe0861ab4b863520a4189d987ceccf27cc"
         ),
         "bot_login": "github-actions[bot]",
         "workflow_prefix": (
@@ -629,7 +629,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
         "canonical": "gemini-review-canonical.md",
         "canonical_step": "Canonicalize Gemini review",
         "upsert_sha256": (
-            "2382d41b27439d70c8a5592608f1302382147f6542ab2265e13fda04209d194d"
+            "69b61886af490e4da3924f76446d6f0ab28d55bad675a599427ac97be74feb35"
         ),
         "bot_login": "${{ steps.auth.outputs.bot-login }}",
         "workflow_prefix": (

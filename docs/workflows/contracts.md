@@ -408,6 +408,15 @@ ignored rather than poisoning carryover or the stale-generation guard. Comment o
 timestamps do not decide state. Both values are positive safe integers, so a manual rerun of one
 authenticated run is newer when its attempt is larger.
 
+Candidates are tried newest-first; duplicate authenticated generations prefer the larger comment ID.
+Once the highest candidate authenticates, older records are irrelevant and are not queried. An
+exact-attempt provenance lookup returning HTTP 404 is definitive absence, so that candidate is
+ignored and older authenticated state may still be used. Any other lookup error encountered before
+selection—including timeout, authorization, rate-limit, or server failure—makes prior-state
+selection uncertain. Claude and Gemini then fail closed before publication: they create, update, and
+delete no review comment, and leave the existing sticky state byte-for-byte unchanged for a later
+rerun.
+
 Every envelope has the common fields `schema`, `reviewer`, `pr`, `run_id`, `run_attempt`,
 `attempt_head`, `successful_head`, `attempt_status`, `diff_mode`, and `full_diff_sha256`.
 `attempt_head` is the head this attempt prepared. The successful pair is atomic:
