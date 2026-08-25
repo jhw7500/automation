@@ -47,10 +47,10 @@ OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
 )
 OPENCODE_REVIEW_RUN_SHA256 = (
-    "4794ff29221020dd1ed7d0c67ea51a9b1856fc5ea53dcfd5514e5c2d18ecb24c"
+    "fca63cc2d9f724401f340855379a23b16095220a5c8b9c84c258c16a239b0d81"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
-    "4e2fdc1d58612db9df2f5f406df07b3dbd2b5b3cd00962ef650b3f22675d3aa0"
+    "a12ec7f194f85a317f593cb43758d7a4c4be66ef55ae2b03fa4950e5be3b92fe"
 )
 # These immutable annotated v1.45 patch releases predate format repair. Only their
 # exact peeled commits may retain the legacy generic command; no new commit may opt in.
@@ -1403,16 +1403,32 @@ def verify_opencode_runtime(
         and "def has_unapproved_setext_heading(lines):" in run_script
         and "def parse_setext_containers(line):" in run_script
         and "def strip_setext_containers(line, containers):" in run_script
+        and "def is_commonmark_blank_line(line):" in run_script
+        and 're.fullmatch(r"[ \\t]*", line)' in run_script
         and "def parse_markdown_list_item(line):" in run_script
         and "def html_block_start(line, paragraph_open=False):" in run_script
         and "def classify_link_reference_start(line):" in run_script
         and 'if mode == "needs-destination":' in run_script
         and "and not line_interrupts_setext_paragraph(" in run_script
+        and "SIGNATURE_HEADING = re.compile(" in run_script
+        and "re.IGNORECASE | re.ASCII," in run_script
+        and "def signature_section_name(line):" in run_script
+        and "signature_mode=True" in run_script
+        and "def has_unapproved_markdown_list_item(lines):" in run_script
+        and "def is_benign_wrapper_list_item(content):" in run_script
+        and "def benign_list_item_has_unapproved_continuation(" in run_script
+        and "if benign_list_item_has_unapproved_continuation(" in run_script
+        and "expanded = continuation.expandtabs(4)" in run_script
+        and "if saw_blank:" in run_script
+        and "def list_item_fenced_code_end(" in run_script
+        and "def wrapper_literal_block_end(lines, start_index):" in run_script
+        and "has_unapproved_markdown_list_item(suffix)" in run_script
+        and "has_unapproved_markdown_list_item(prefix)" in run_script
         and 'if re.match(r"^<![A-Z]", content) is not None:' in run_script
         and "MARKDOWN_EMPTY_LIST_ITEM.fullmatch(remainder) is not None" in run_script
         and "line = raw_line.expandtabs(4)" in run_script
-        and "if has_unapproved_setext_heading(suffix) or any(" in run_script
-        and "if has_unapproved_setext_heading(prefix) or any(" in run_script
+        and "has_unapproved_setext_heading(suffix)" in run_script
+        and "has_unapproved_setext_heading(prefix)" in run_script
         and 'remainder = line.strip()' in run_script
         and 'unicodedata.category(character) == "Zs"' in run_script
         and "normalize_finding_field_wrappers(line).strip()" in run_script

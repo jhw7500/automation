@@ -773,6 +773,11 @@ jobs:
           VALID_HEADING = re.compile(
               r"### (New findings|Still open|Resolved|Retracted)"
           )
+          SIGNATURE_HEADING = re.compile(
+              r"### (New findings|Still open|Resolved|Retracted)",
+              re.IGNORECASE | re.ASCII,
+          )
+          ALLOWED_BY_LOWER = {name.lower(): name for name in ALLOWED}
           BLOCK_HEADING = re.compile(r"#### \S.*")
           FINDING_PRIORITY = r"p[0-3]"
           FINDING_LEVEL = rf"(?:critical|high|medium|low|{FINDING_PRIORITY})"
@@ -903,6 +908,19 @@ jobs:
               rf"(?:{HORIZONTAL_SPACE}*{FINDING_DECORATOR})?)$",
               re.IGNORECASE,
           )
+          BENIGN_WRAPPER_LIST_ITEM = re.compile(
+              rf"^(?:review{HORIZONTAL_SPACE}+notes"
+              rf"|generated{HORIZONTAL_SPACE}+by{HORIZONTAL_SPACE}+opencode"
+              rf"(?:{HORIZONTAL_SPACE}+\*)?)$",
+              re.IGNORECASE | re.ASCII,
+          )
+          BENIGN_WRAPPER_LIST_CONTINUATION = re.compile(
+              rf"^(?:i{HORIZONTAL_SPACE}+reviewed{HORIZONTAL_SPACE}+the"
+              rf"{HORIZONTAL_SPACE}+(?:supplied{HORIZONTAL_SPACE}+)?diff\."
+              rf"|generated{HORIZONTAL_SPACE}+wrapper{HORIZONTAL_SPACE}+prose\.)$",
+              re.IGNORECASE | re.ASCII,
+          )
+          MARKDOWN_TASK_ITEM_PREFIX = re.compile(r"^\[[ xX]\][ \t]+")
           FINDING_FIELD_TRAILING = re.compile(FINDING_FIELD_PADDING)
           MARKDOWN_EVIDENCE_LABEL = re.compile(r"!?\[([^\]\r\n]*)\]")
           HTML_NUMERIC_ENTITY = re.compile(
@@ -1175,6 +1193,9 @@ jobs:
           def leading_markdown_spaces(line):
               return len(line) - len(line.lstrip(" "))
 
+          def is_commonmark_blank_line(line):
+              return re.fullmatch(r"[ \t]*", line) is not None
+
           def consume_setext_blockquote(line):
               indentation = leading_markdown_spaces(line)
               if indentation > 3 or line[indentation:indentation + 1] != ">":
@@ -1229,6 +1250,226 @@ jobs:
                       remainder = remainder[indentation:]
               return remainder
 
+          def parse_wrapper_list_item(line):
+              remainder = line.expandtabs(4)
+              quote_containers = []
+              while True:
+                  quoted = consume_setext_blockquote(remainder)
+                  if quoted is None:
+                      break
+                  quote_containers.append(("quote", 0))
+                  remainder = quoted
+
+              list_item = parse_markdown_list_item(remainder)
+              if list_item is not None:
+                  indentation, content, _ = list_item
+                  return tuple(quote_containers), indentation, content
+              if MARKDOWN_EMPTY_LIST_ITEM.fullmatch(remainder) is None:
+                  return None
+              list_item = parse_markdown_list_item(
+                  remainder.rstrip(" ") + " "
+              )
+              if list_item is None:
+                  reject()
+              indentation, _, _ = list_item
+              return tuple(quote_containers), indentation, ""
+
+          def is_benign_wrapper_list_item(content):
+              normalized = normalize_finding_field_wrappers(content).strip()
+              normalized = MARKDOWN_TASK_ITEM_PREFIX.sub(
+                  "", normalized, count=1
+              )
+              return (
+                  BENIGN_WRAPPER_HEADING.fullmatch(normalized) is not None
+                  or BENIGN_WRAPPER_LIST_ITEM.fullmatch(normalized) is not None
+              )
+
+          def is_benign_wrapper_list_continuation(content):
+              normalized = normalize_finding_field_wrappers(content).strip()
+              return (
+                  MARKDOWN_SETEXT_UNDERLINE.fullmatch(normalized) is not None
+                  or is_markdown_thematic_break(normalized)
+                  or is_benign_wrapper_list_item(normalized)
+                  or BENIGN_WRAPPER_LIST_CONTINUATION.fullmatch(normalized)
+                  is not None
+              )
+
+          def benign_list_item_has_unapproved_continuation(
+              lines,
+              start_index,
+              quote_containers,
+              indentation,
+          ):
+              saw_blank = False
+              for continuation in lines[start_index + 1:]:
+                  expanded = continuation.expandtabs(4)
+                  if saw_blank:
+                      local = strip_setext_containers(
+                          expanded, quote_containers
+                      )
+                      if local is None:
+                          return False
+                  else:
+                      local = strip_lazy_setext_containers(
+                          expanded, quote_containers
+                      )
+                  if is_commonmark_blank_line(local):
+                      saw_blank = True
+                      continue
+                  leading = leading_markdown_spaces(local)
+                  if saw_blank and leading < indentation:
+                      return False
+                  if leading >= indentation:
+                      content = local[indentation:]
+                  else:
+                      if line_interrupts_setext_paragraph(local):
+                          return False
+                      content = local
+                  if not is_benign_wrapper_list_continuation(content):
+                      return True
+              return False
+
+          def list_item_fenced_code_end(
+              lines,
+              start_index,
+              quote_containers,
+              indentation,
+              content,
+          ):
+              opening = parse_fence_line(content)
+              if opening is None:
+                  return None
+              open_marker, _ = opening
+              for close_index in range(start_index + 1, len(lines)):
+                  local = strip_setext_containers(
+                      lines[close_index].expandtabs(4), quote_containers
+                  )
+                  if local is None:
+                      return None
+                  if is_commonmark_blank_line(local):
+                      continue
+                  if leading_markdown_spaces(local) < indentation:
+                      return None
+                  item_line = local[indentation:]
+                  fence = parse_fence_line(item_line)
+                  if fence is None or not closes_fence(
+                      open_marker, *fence
+                  ):
+                      continue
+                  for trailing in lines[close_index + 1:]:
+                      trailing_local = strip_setext_containers(
+                          trailing.expandtabs(4), quote_containers
+                      )
+                      if trailing_local is None:
+                          break
+                      if is_commonmark_blank_line(trailing_local):
+                          continue
+                      if (
+                          leading_markdown_spaces(trailing_local)
+                          >= indentation
+                      ):
+                          return None
+                      break
+                  return close_index
+              return None
+
+          def wrapper_literal_block_end(lines, start_index):
+              containers, content = parse_setext_containers(
+                  lines[start_index].expandtabs(4)
+              )
+              if any(kind == "list" for kind, _ in containers):
+                  return None
+
+              opening = parse_fence_line(content)
+              if opening is not None:
+                  open_marker, _ = opening
+                  for end_index in range(start_index + 1, len(lines)):
+                      local = strip_setext_containers(
+                          lines[end_index].expandtabs(4), containers
+                      )
+                      if local is None:
+                          return None
+                      fence = parse_fence_line(local)
+                      if fence is not None and closes_fence(
+                          open_marker, *fence
+                      ):
+                          return end_index
+                  return None
+
+              block_type = html_block_start(content)
+              if block_type is None:
+                  return None
+              if html_block_ends(block_type, content):
+                  return start_index
+              for end_index in range(start_index + 1, len(lines)):
+                  local = strip_setext_containers(
+                      lines[end_index].expandtabs(4), containers
+                  )
+                  if local is None:
+                      return None
+                  if html_block_ends(block_type, local):
+                      return end_index
+              return len(lines) - 1 if block_type in (6, 7) else None
+
+          def has_unapproved_markdown_list_item(lines):
+              index = 0
+              while index < len(lines):
+                  literal_end = wrapper_literal_block_end(lines, index)
+                  if literal_end is not None:
+                      index = literal_end + 1
+                      continue
+
+                  list_item = parse_wrapper_list_item(lines[index])
+                  if list_item is None:
+                      index += 1
+                      continue
+                  quote_containers, indentation, content = list_item
+                  if not is_commonmark_blank_line(content):
+                      if is_benign_wrapper_list_item(content):
+                          if benign_list_item_has_unapproved_continuation(
+                              lines,
+                              index,
+                              quote_containers,
+                              indentation,
+                          ):
+                              return True
+                          index += 1
+                          continue
+                      fenced_end = list_item_fenced_code_end(
+                          lines,
+                          index,
+                          quote_containers,
+                          indentation,
+                          content,
+                      )
+                      if fenced_end is not None:
+                          index = fenced_end + 1
+                          continue
+                      return True
+                  saw_blank = False
+                  for continuation in lines[index + 1:]:
+                      expanded = continuation.expandtabs(4)
+                      if saw_blank:
+                          local = strip_setext_containers(
+                              expanded, quote_containers
+                          )
+                          if local is None:
+                              break
+                      else:
+                          local = strip_lazy_setext_containers(
+                              expanded, quote_containers
+                          )
+                      if is_commonmark_blank_line(local):
+                          saw_blank = True
+                          continue
+                      if (
+                          leading_markdown_spaces(local) >= indentation
+                      ):
+                          return True
+                      break
+                  index += 1
+              return False
+
           def strip_lazy_setext_containers(line, containers):
               remainder = line
               for kind, indentation in containers:
@@ -1278,7 +1519,7 @@ jobs:
                   return ">" in line
               if block_type == 5:
                   return "]]>" in line
-              return not line.strip()
+              return is_commonmark_blank_line(line)
 
           def link_reference_tail(line):
               indentation = leading_markdown_spaces(line)
@@ -1426,7 +1667,7 @@ jobs:
               return parse_link_title(content, 0) is not None
 
           def line_interrupts_setext_paragraph(line):
-              if not line.strip():
+              if is_commonmark_blank_line(line):
                   return True
               indentation = leading_markdown_spaces(line)
               if indentation > 3:
@@ -1467,7 +1708,7 @@ jobs:
               if indentation > 3:
                   return ("ignore",)
               content = remainder[indentation:]
-              if not content.strip():
+              if is_commonmark_blank_line(content):
                   return ("ignore",)
               if (
                   COMMONMARK_ATX_HEADING.fullmatch(content) is not None
@@ -1617,11 +1858,17 @@ jobs:
                       break
               return False
 
+          def signature_section_name(line):
+              match = SIGNATURE_HEADING.fullmatch(line)
+              if match is None:
+                  return None
+              return ALLOWED_BY_LOWER[match.group(1).lower()]
+
           def first_section_index(lines):
               for index, line in enumerate(lines):
                   if not TOP_HEADING.match(line):
                       continue
-                  if VALID_HEADING.fullmatch(line) is not None:
+                  if signature_section_name(line) is not None:
                       return index
               reject()
 
@@ -1669,11 +1916,15 @@ jobs:
                       continue
 
                   suffix = lines[close_index + 1:]
-                  if has_unapproved_setext_heading(suffix) or any(
-                      is_finding_prefix_line(line)
-                      or is_unapproved_wrapper_heading(line)
-                      or VALID_HEADING.fullmatch(line) is not None
-                      for line in suffix
+                  if (
+                      has_unapproved_markdown_list_item(suffix)
+                      or has_unapproved_setext_heading(suffix)
+                      or any(
+                          is_finding_prefix_line(line)
+                          or is_unapproved_wrapper_heading(line)
+                          or VALID_HEADING.fullmatch(line) is not None
+                          for line in suffix
+                      )
                   ):
                       return lines
 
@@ -1684,15 +1935,19 @@ jobs:
                   )
               return lines
 
-          def parse_sections(lines):
+          def parse_sections(lines, signature_mode=False):
               sections = []
               section = None
               for line in lines:
                   if TOP_HEADING.match(line):
-                      match = VALID_HEADING.fullmatch(line)
-                      if match is None:
+                      if signature_mode:
+                          name = signature_section_name(line)
+                      else:
+                          match = VALID_HEADING.fullmatch(line)
+                          name = match.group(1) if match is not None else None
+                      if name is None:
                           reject()
-                      section = {"name": match.group(1), "lines": []}
+                      section = {"name": name, "lines": []}
                       sections.append(section)
                   elif section is None:
                       if line.strip():
@@ -1754,14 +2009,20 @@ jobs:
               lines = strip_enclosing_markdown_fence(lines, first_section)
               first_section = first_section_index(lines)
               prefix = lines[:first_section]
-              if has_unapproved_setext_heading(prefix) or any(
-                  is_finding_prefix_line(line)
-                  or is_unapproved_wrapper_heading(line)
-                  for line in prefix
+              if (
+                  has_unapproved_markdown_list_item(prefix)
+                  or has_unapproved_setext_heading(prefix)
+                  or any(
+                      is_finding_prefix_line(line)
+                      or is_unapproved_wrapper_heading(line)
+                      for line in prefix
+                  )
               ):
                   reject()
 
-              sections = parse_sections(lines[first_section:])
+              sections = parse_sections(
+                  lines[first_section:], signature_mode=True
+              )
               groups = {name: [] for name in ALLOWED}
               new_findings_none = False
               for item in sections:

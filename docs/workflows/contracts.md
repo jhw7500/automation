@@ -354,7 +354,18 @@ blocks grouped by section plus the `New findings: None` meaning. It accepts only
 with the same signature; dropping, adding, moving, reclassifying, rewording, or changing an anchor is
 terminal. Only non-finding-like wrapper text surrounding the signed document, one matching
 enclosing CommonMark fence, required marker/nonce framing, empty carryover sections, and section
-ordering are excluded from that comparison. An enclosing fence may use backticks or tildes with
+ordering are excluded from that comparison. Signature generation canonicalizes ASCII case-only
+variants of the four allowed section headings, while the final outer validator still requires their
+exact spelling. Any CommonMark list item outside the signed document is treated as ambiguous
+substance and cannot be removed by repair unless its title exactly matches the closed benign
+wrapper vocabulary or it contains only a complete fenced code block. Prefix matches with added
+substance remain terminal, including indented and CommonMark lazy continuation lines. The same
+guard covers an empty marker with an indented continuation. After a blank line, a quoted item must
+replay its quote containers; missing markers end the item instead of inheriting root indentation.
+For these block decisions, only an empty line or ASCII spaces/tabs are CommonMark blank; Unicode
+spaces and Python-only control whitespace remain paragraph content. A standalone empty item or
+thematic break remains repairable. An enclosing fence may use
+backticks or tildes with
 any valid info string; its closing run must use the same character and be at least as long as the
 opening run, and only ASCII spaces or tabs may follow a closing run. Empty optional carryover
 sections are equivalent to omission; an empty `New findings` section remains terminal. Fences

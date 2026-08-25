@@ -707,8 +707,8 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
             '              r"^(#{1,6})(?:[ \\t]+(.*)|[ \\t]*)$"',
         ),
         (
-            "              if has_unapproved_setext_heading(prefix) or any(",
-            "              if any(",
+            "                  or has_unapproved_setext_heading(prefix)",
+            "                  or False",
         ),
         (
             "                  line = raw_line.expandtabs(4)",
@@ -729,6 +729,42 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
         (
             "                                      and not line_interrupts_setext_paragraph(",
             "                                      and False and line_interrupts_setext_paragraph(",
+        ),
+        (
+            "              re.IGNORECASE | re.ASCII,",
+            "              re.IGNORECASE,",
+        ),
+        (
+            "                  lines[first_section:], signature_mode=True",
+            "                  lines[first_section:]",
+        ),
+        (
+            "                      has_unapproved_markdown_list_item(suffix)",
+            "                      False",
+        ),
+        (
+            "                  has_unapproved_markdown_list_item(prefix)",
+            "                  False",
+        ),
+        (
+            "                  literal_end = wrapper_literal_block_end(lines, index)",
+            "                  literal_end = None",
+        ),
+        (
+            "                      if is_benign_wrapper_list_item(content):",
+            "                      if False:",
+        ),
+        (
+            "                          if benign_list_item_has_unapproved_continuation(",
+            "                          if False and benign_list_item_has_unapproved_continuation(",
+        ),
+        (
+            "                  if saw_blank:",
+            "                  if False:",
+        ),
+        (
+            '              return re.fullmatch(r"[ \\t]*", line) is not None',
+            "              return not line.strip()",
         ),
         (
             "          def strip_setext_containers(line, containers):",
@@ -793,6 +829,15 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
         "setext-html-block",
         "setext-link-reference",
         "setext-reference-block-precedence",
+        "ascii-case-only-section-heading",
+        "signature-section-canonicalization",
+        "outside-list-suffix-guard",
+        "outside-list-prefix-guard",
+        "outside-list-literal-block-skip",
+        "outside-list-benign-vocabulary",
+        "outside-list-benign-continuation-guard",
+        "outside-list-postblank-container-replay",
+        "commonmark-blank-line-semantics",
         "setext-container-matching",
         "setext-html-declaration-case",
         "setext-empty-list-item",
