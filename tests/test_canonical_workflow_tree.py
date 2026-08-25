@@ -212,6 +212,7 @@ CLAUDE_COMMAND_PERMISSIONS = {
     "pull-requests": "read",
 }
 CLAUDE_REVIEW_PERMISSIONS = {
+    "actions": "read",
     "contents": "read",
     "id-token": "write",
     "issues": "read",
@@ -228,6 +229,10 @@ STANDARD_WRITE_PERMISSIONS = {
     "issues": "write",
     "pull-requests": "write",
 }
+GEMINI_AUTO_REVIEW_PERMISSIONS = {
+    "actions": "read",
+    **STANDARD_WRITE_PERMISSIONS,
+}
 OPENCODE_ATTESTED_PERMISSIONS = {
     "actions": "read",
     "checks": "write",
@@ -238,7 +243,7 @@ EXPECTED_CALLER_PERMISSIONS = {
     "auto-rereview-request.yml": ("rereview", STANDARD_WRITE_PERMISSIONS),
     "claude.yml": ("claude", CLAUDE_COMMAND_PERMISSIONS),
     "claude-code-review.yml": ("claude-review", CLAUDE_REVIEW_PERMISSIONS),
-    "gemini-auto-review.yml": ("gemini-review", STANDARD_WRITE_PERMISSIONS),
+    "gemini-auto-review.yml": ("gemini-review", GEMINI_AUTO_REVIEW_PERMISSIONS),
     "gemini-chat.yml": ("gemini-chat", GEMINI_CHAT_PERMISSIONS),
     "gemini-dispatch.yml": ("dispatch", STANDARD_WRITE_PERMISSIONS),
     "gemini-invoke.yml": ("invoke", STANDARD_WRITE_PERMISSIONS),
@@ -379,6 +384,10 @@ def test_canonical_callers_use_only_the_selected_auth_contract() -> None:
             if entry.auth_family == "gemini":
                 assert job["with"]["repo_write_auth"] == "github_app"
                 assert job["with"]["app_id"] == "${{ vars.APP_ID }}"
+                if entry.central_workflow == "gemini-auto-review.yml":
+                    assert job["with"]["publisher_app_id"] == "${{ vars.APP_ID }}"
+                else:
+                    assert "publisher_app_id" not in job["with"]
                 assert job["secrets"] == {
                     "APP_PRIVATE_KEY": "${{ secrets.APP_PRIVATE_KEY }}",
                     "GEMINI_API_KEY": "${{ secrets.GEMINI_API_KEY }}",

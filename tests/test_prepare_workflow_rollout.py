@@ -178,6 +178,22 @@ def test_app_and_token_profiles_differ_only_by_declared_auth_lines(
     )
     assert token.after(".github/workflows/gemini-review.yml") == token_expected
 
+    auto_template = (CANONICAL / "workflows/gemini-auto-review.yml").read_bytes()
+    auto_app = auto_template.replace(
+        b"@__AUTOMATION_COMMIT__", f"@{COMMIT}".encode()
+    )
+    auto_token = (
+        auto_app.replace(
+            b"repo_write_auth: github_app", b"repo_write_auth: github_token"
+        )
+        .replace(b"      app_id: ${{ vars.APP_ID }}\n", b"")
+        .replace(b"      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}\n", b"")
+    )
+    assert app.after(".github/workflows/gemini-auto-review.yml") == auto_app
+    assert token.after(".github/workflows/gemini-auto-review.yml") == auto_token
+    assert b"      publisher_app_id: ${{ vars.APP_ID }}\n" in auto_app
+    assert b"      publisher_app_id: ${{ vars.APP_ID }}\n" in auto_token
+
 
 def test_config_preserves_every_non_identity_byte(tmp_path: Path) -> None:
     original = b"# keep\nautomation_ref: v1.39 # keep comment\ncustom:\n  value: x\n"

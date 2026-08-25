@@ -8,6 +8,7 @@ jobs:
   gemini-review:
     if: ${{ github.event.pull_request.head.repo.fork == false && github.event.pull_request.head.repo.full_name == github.repository }}
     permissions:
+      actions: read
       contents: read
       issues: write
       pull-requests: write
@@ -16,6 +17,7 @@ jobs:
       pr_number: ${{ github.event.pull_request.number }}
       repo_write_auth: github_app
       app_id: ${{ vars.APP_ID }}
+      publisher_app_id: ${{ vars.APP_ID }}
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

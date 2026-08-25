@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 import difflib
 import errno
@@ -29,10 +31,14 @@ from scripts.workflow_catalog import (
     load_fleet_config,
 )
 from scripts.workflow_release_inventory import (
+    CANONICALIZE_REVIEW_ACTION_ROOT,
+    CANONICALIZE_REVIEW_HELPER_ROOT,
     PREPARE_REVIEW_DIFF_ACTION_ROOT,
+    REVIEW_SCOPE_HELPER_ROOT,
     SETUP_GEMINI_AUTH_ROOT,
     release_paths_for,
     release_roots_for,
+    release_supports_canonicalize_review,
     release_supports_prepare_review_diff,
     validate_release_listing,
 )
@@ -54,7 +60,7 @@ OPENCODE_REVIEW_RUN_SHA256 = (
     "9f1468128086b438cce0ce53fc20a9f0e02a14d581cd12b63f021c8c3a7620c6"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
-    "6b8eac9a738fb44e0b2621e4e461bddee1aee50b3029f230c9704c6e35440d0f"
+    "af209bfc73798a0cdda8d2f024f8392004c26814069cc244b80c298dd46b8d0f"
 )
 # These immutable annotated v1.45 patch releases predate format repair. Only their
 # exact peeled commits may retain the legacy generic command; no new commit may opt in.
@@ -78,6 +84,7 @@ SETUP_GEMINI_AUTH = (
     "jhw7500/automation/.github/actions/setup-gemini-auth@"
     "2254f13aab44585c78954d20749f4fb677a8c2f1"
 )
+SETUP_GEMINI_AUTH_REVIEW = "$/.github/actions/setup-gemini-auth"
 APPROVED_V140_POLICY_FILES = (
     ".github/actions/setup-gemini-auth/action.yml",
     "scripts/workflow-catalog.json",
@@ -108,6 +115,14 @@ EXPECTED_GEMINI_MODE_INPUT = {
 }
 EXPECTED_GEMINI_APP_ID_INPUT = {
     "description": "GitHub App ID; used only when repo_write_auth is github_app",
+    "type": "string",
+    "required": "false",
+    "default": "",
+}
+EXPECTED_GEMINI_PUBLISHER_APP_ID_INPUT = {
+    "description": (
+        "Trusted GitHub App ID for sticky publisher migration in github_token mode"
+    ),
     "type": "string",
     "required": "false",
     "default": "",
@@ -161,6 +176,46 @@ EXPECTED_GEMINI_VALIDATION = {
         "esac\n"
     ),
 }
+EXPECTED_GEMINI_AUTO_VALIDATION = {
+    "name": "Validate repository-write auth",
+    "shell": "bash",
+    "env": {
+        "MODE": "${{ inputs.repo_write_auth }}",
+        "APP_ID": "${{ inputs.app_id }}",
+        "PUBLISHER_APP_ID": "${{ inputs.publisher_app_id }}",
+        "APP_PRIVATE_KEY": "${{ secrets.APP_PRIVATE_KEY }}",
+    },
+    "run": (
+        'if [[ -n "$PUBLISHER_APP_ID" ]] && {\n'
+        '  [[ ! "$PUBLISHER_APP_ID" =~ ^[1-9][0-9]{0,14}$ ]];\n'
+        "}; then\n"
+        "  echo 'publisher_app_id must be a positive decimal App ID of at most 15 digits' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        'case "$MODE" in\n'
+        "  github_app)\n"
+        '    test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {\n'
+        "      echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2\n"
+        "      exit 1\n"
+        "    }\n"
+        '    test -z "$PUBLISHER_APP_ID" || test "$PUBLISHER_APP_ID" = "$APP_ID" || {\n'
+        "      echo 'github_app requires publisher_app_id to be empty or equal app_id' >&2\n"
+        "      exit 1\n"
+        "    }\n"
+        "    ;;\n"
+        "  github_token)\n"
+        '    test -z "$APP_ID" && test -z "$APP_PRIVATE_KEY" || {\n'
+        "      echo 'github_token forbids App credentials' >&2\n"
+        "      exit 1\n"
+        "    }\n"
+        "    ;;\n"
+        "  *)\n"
+        '    echo "invalid repo_write_auth: $MODE" >&2\n'
+        "    exit 1\n"
+        "    ;;\n"
+        "esac\n"
+    ),
+}
 EXPECTED_SETUP_GEMINI_AUTH = {
     "name": "Setup Gemini Auth",
     "description": "Mint GitHub App token for Gemini workflows",
@@ -179,7 +234,11 @@ EXPECTED_SETUP_GEMINI_AUTH = {
         "token": {
             "description": "Generated or fallback token",
             "value": "${{ steps.resolve.outputs.token }}",
-        }
+        },
+        "bot-login": {
+            "description": "Comment publisher login",
+            "value": "${{ steps.resolve.outputs.bot-login }}",
+        },
     },
     "runs": {
         "using": "composite",
@@ -206,14 +265,17 @@ EXPECTED_SETUP_GEMINI_AUTH = {
                 "shell": "bash",
                 "env": {
                     "MINTED": "${{ steps.mint_token.outputs.token }}",
+                    "APP_SLUG": "${{ steps.mint_token.outputs.app-slug }}",
                     "FALLBACK": "${{ inputs.fallback-token }}",
                 },
                 "run": (
                     'if [[ -n "$MINTED" ]]; then\n'
-                    "  printf 'token=%s\\n' \"$MINTED\" >> \"$GITHUB_OUTPUT\"\n"
+                    '  printf \'token=%s\\n\' "$MINTED" >> "$GITHUB_OUTPUT"\n'
+                    '  printf \'bot-login=%s[bot]\\n\' "$APP_SLUG" >> "$GITHUB_OUTPUT"\n'
                     '  echo "::notice::Using GitHub App token"\n'
                     "else\n"
-                    "  printf 'token=%s\\n' \"$FALLBACK\" >> \"$GITHUB_OUTPUT\"\n"
+                    '  printf \'token=%s\\n\' "$FALLBACK" >> "$GITHUB_OUTPUT"\n'
+                    "  printf 'bot-login=github-actions[bot]\\n' >> \"$GITHUB_OUTPUT\"\n"
                     '  echo "::notice::Using fallback token"\n'
                     "fi\n"
                 ),
@@ -221,6 +283,24 @@ EXPECTED_SETUP_GEMINI_AUTH = {
         ],
     },
 }
+# v1.40-v1.45.x authenticated the historical action exactly as it was released.
+# v1.46 adds the publisher identity used by sticky-state provenance checks; those
+# action bytes must never be applied retroactively to historical releases.
+EXPECTED_SETUP_GEMINI_AUTH_V145 = deepcopy(EXPECTED_SETUP_GEMINI_AUTH)
+del EXPECTED_SETUP_GEMINI_AUTH_V145["outputs"]["bot-login"]
+_legacy_setup_steps = EXPECTED_SETUP_GEMINI_AUTH_V145["runs"]["steps"]
+del _legacy_setup_steps[1]["env"]["APP_SLUG"]
+_legacy_setup_steps[1]["run"] = (
+    'if [[ -n "$MINTED" ]]; then\n'
+    '  printf \'token=%s\\n\' "$MINTED" >> "$GITHUB_OUTPUT"\n'
+    '  echo "::notice::Using GitHub App token"\n'
+    "else\n"
+    '  printf \'token=%s\\n\' "$FALLBACK" >> "$GITHUB_OUTPUT"\n'
+    '  echo "::notice::Using fallback token"\n'
+    "fi\n"
+)
+del _legacy_setup_steps
+
 EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
     "name": "Prepare review diff",
     "description": "Prepare a fail-closed full or incremental PR diff",
@@ -230,6 +310,7 @@ EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
         "previous-sha": {"required": "false", "default": ""},
         "previous-full-hash": {"required": "false", "default": ""},
         "context-lines": {"required": "false", "default": "3"},
+        "output-directory": {"required": "true"},
     },
     "outputs": {
         "diff-ready": {"value": "${{ steps.prepare.outputs.diff_ready }}"},
@@ -254,6 +335,7 @@ EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
                     "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
                     "PREVIOUS_FULL_HASH": "${{ inputs.previous-full-hash }}",
                     "CONTEXT_LINES": "${{ inputs.context-lines }}",
+                    "OUTPUT_DIRECTORY": "${{ inputs.output-directory }}",
                 },
                 "run": (
                     'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" '
@@ -262,14 +344,223 @@ EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
                     '--previous-sha "$PREVIOUS_SHA" '
                     '--previous-full-hash "$PREVIOUS_FULL_HASH" '
                     '--context-lines "$CONTEXT_LINES" '
-                    '--full-output "$GITHUB_WORKSPACE/review-full.diff" '
-                    '--delta-output "$GITHUB_WORKSPACE/review-delta.diff" '
-                    '--manifest-output "$GITHUB_WORKSPACE/review-scope.json" '
+                    '--full-output "$OUTPUT_DIRECTORY/review-full.diff" '
+                    '--delta-output "$OUTPUT_DIRECTORY/review-delta.diff" '
+                    '--manifest-output "$OUTPUT_DIRECTORY/review-scope.json" '
                     '--github-output "$GITHUB_OUTPUT"'
                 ),
             }
         ],
     },
+}
+# v1.45.x wrote its prepared files into GITHUB_WORKSPACE. v1.46 introduces the
+# required output-directory input so the final checkout cannot replace them.
+EXPECTED_PREPARE_REVIEW_DIFF_ACTION_V145 = deepcopy(EXPECTED_PREPARE_REVIEW_DIFF_ACTION)
+del EXPECTED_PREPARE_REVIEW_DIFF_ACTION_V145["inputs"]["output-directory"]
+_legacy_prepare_step = EXPECTED_PREPARE_REVIEW_DIFF_ACTION_V145["runs"]["steps"][0]
+del _legacy_prepare_step["env"]["OUTPUT_DIRECTORY"]
+_legacy_prepare_step["run"] = (
+    'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" '
+    '--repository "$GITHUB_REPOSITORY" '
+    '--pr-number "$PR_NUMBER" '
+    '--previous-sha "$PREVIOUS_SHA" '
+    '--previous-full-hash "$PREVIOUS_FULL_HASH" '
+    '--context-lines "$CONTEXT_LINES" '
+    '--full-output "$GITHUB_WORKSPACE/review-full.diff" '
+    '--delta-output "$GITHUB_WORKSPACE/review-delta.diff" '
+    '--manifest-output "$GITHUB_WORKSPACE/review-scope.json" '
+    '--github-output "$GITHUB_OUTPUT"'
+)
+del _legacy_prepare_step
+
+EXPECTED_CANONICALIZE_REVIEW_ACTION = {
+    "name": "Canonicalize review",
+    "description": "Canonicalize evidenced Claude or Gemini review findings",
+    "inputs": {
+        "reviewer": {"required": "true"},
+        "candidate-file": {"required": "true"},
+        "canonical-file": {"required": "true"},
+        "result-file": {"required": "true"},
+        "scope-manifest": {"required": "true"},
+        "selected-diff": {"required": "true"},
+        "diff-mode": {"required": "true"},
+        "previous-sha": {"required": "false", "default": ""},
+        "previous-review-file": {"required": "false", "default": ""},
+    },
+    "outputs": {
+        "document-valid": {
+            "value": "${{ steps.canonicalize.outputs.document_valid }}"
+        },
+        "accepted-count": {
+            "value": "${{ steps.canonicalize.outputs.accepted_count }}"
+        },
+        "filtered-count": {
+            "value": "${{ steps.canonicalize.outputs.filtered_count }}"
+        },
+        "normalized-count": {
+            "value": "${{ steps.canonicalize.outputs.normalized_count }}"
+        },
+        "filtered-max-severity": {
+            "value": "${{ steps.canonicalize.outputs.filtered_max_severity }}"
+        },
+        "failure-reason": {
+            "value": "${{ steps.canonicalize.outputs.failure_reason }}"
+        },
+    },
+    "runs": {
+        "using": "composite",
+        "steps": [
+            {
+                "id": "canonicalize",
+                "shell": "bash",
+                "env": {
+                    "REVIEWER": "${{ inputs.reviewer }}",
+                    "CANDIDATE_FILE": "${{ inputs.candidate-file }}",
+                    "CANONICAL_FILE": "${{ inputs.canonical-file }}",
+                    "RESULT_FILE": "${{ inputs.result-file }}",
+                    "SCOPE_MANIFEST": "${{ inputs.scope-manifest }}",
+                    "SELECTED_DIFF": "${{ inputs.selected-diff }}",
+                    "DIFF_MODE": "${{ inputs.diff-mode }}",
+                    "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
+                    "PREVIOUS_REVIEW_FILE": "${{ inputs.previous-review-file }}",
+                },
+                "run": (
+                    'python3 "$GITHUB_ACTION_PATH/canonicalize_review.py" '
+                    '--reviewer "$REVIEWER" '
+                    '--candidate-file "$CANDIDATE_FILE" '
+                    '--canonical-file "$CANONICAL_FILE" '
+                    '--result-file "$RESULT_FILE" '
+                    '--scope-manifest "$SCOPE_MANIFEST" '
+                    '--selected-diff "$SELECTED_DIFF" '
+                    '--diff-mode "$DIFF_MODE" '
+                    '--previous-sha "$PREVIOUS_SHA" '
+                    '--previous-review-file "$PREVIOUS_REVIEW_FILE" '
+                    '--repository-root "$GITHUB_WORKSPACE" '
+                    '--expected-repository "$GITHUB_REPOSITORY" '
+                    '--github-output "$GITHUB_OUTPUT"'
+                ),
+            }
+        ],
+    },
+}
+EXPECTED_CANONICALIZER_HARD_REASONS = frozenset(
+    {
+        "candidate_missing",
+        "invalid_utf8",
+        "candidate_oversize",
+        "ambiguous_document",
+        "scope_invalid",
+        "canonicalizer_error",
+    }
+)
+EXPECTED_CANONICALIZER_SOFT_REASONS = frozenset(
+    {
+        "invalid_anchor",
+        "invalid_trigger_evidence",
+        "invalid_severity",
+        "invalid_impact_class",
+        "missing_material_impact",
+        "unsupported_performance_basis",
+        "non_actionable_category",
+        "unknown_prior_id",
+        "duplicate_prior_binding",
+        "missing_fix_anchor",
+    }
+)
+EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256 = (
+    "a91991d231b73fb1cb9b95368f58e48f639150f5eb8b1d485095823d22b844bd"
+)
+EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
+    "68779c9038c31aa09a846b643bc0178b147798527e1a34ee5821ab539f10b19a"
+)
+EXPECTED_SCOPE_GIT_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent/automation-review-scope/home",
+    "XDG_CONFIG_HOME": "/nonexistent/automation-review-scope/xdg",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "/bin/false",
+    "SSH_ASKPASS": "/bin/false",
+    "GIT_EXTERNAL_DIFF": "",
+}
+EXPECTED_CANONICALIZER_RECORDS = {
+    "CanonicalizationRequest": (
+        ("reviewer", "Literal['claude', 'gemini']"),
+        ("candidate_file", "Path"),
+        ("canonical_file", "Path"),
+        ("result_file", "Path"),
+        ("scope_manifest", "Path"),
+        ("selected_diff", "Path"),
+        ("repository_root", "Path"),
+        ("diff_mode", "Literal['full', 'delta']"),
+        ("previous_sha", "str"),
+        ("previous_review_file", "Path | None"),
+        ("expected_repository", "str"),
+    ),
+    "CandidateReason": (
+        ("index", "int"),
+        (
+            "section",
+            "Literal['New findings', 'Still open', 'Resolved', 'Retracted']",
+        ),
+        ("outcome", "Literal['filtered', 'normalized']"),
+        ("reason", "str"),
+        ("claimed_severity", "Literal['none', 'MEDIUM', 'HIGH', 'CRITICAL']"),
+    ),
+    "CanonicalizationResult": (
+        ("document_valid", "bool"),
+        ("accepted_count", "int"),
+        ("filtered_count", "int"),
+        ("normalized_count", "int"),
+        ("filtered_max_severity", "Literal['none', 'MEDIUM', 'HIGH', 'CRITICAL']"),
+        ("failure_reason", "str"),
+        ("candidate_reasons", "tuple[CandidateReason, ...]"),
+    ),
+}
+EXPECTED_SCOPE_RECORDS = {
+    "SourceAnchor": (("path", "str"), ("line", "int")),
+    "TriggerEvidence": (
+        ("path", "str"),
+        ("line", "int"),
+        ("quote", "str"),
+    ),
+    "ReviewScope": (
+        ("repository_root", "Path"),
+        ("manifest", "ScopeManifest"),
+        ("diff_mode", "Literal['full', 'delta']"),
+        ("added_lines_by_path", "dict[str, dict[int, str]]"),
+    ),
+}
+EXPECTED_CANONICALIZER_FUNCTIONS = {
+    "stable_finding_id": (
+        "def stable_finding_id(reviewer: str, anchor: SourceAnchor, severity: str, "
+        "title: str) -> str"
+    ),
+    "canonicalize": (
+        "def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult"
+    ),
+}
+EXPECTED_SCOPE_FUNCTIONS = {
+    "load_review_scope": (
+        "def load_review_scope(repository_root: Path, manifest_path: Path, "
+        "selected_diff_path: Path, *, diff_mode: Literal['full', 'delta'], "
+        "previous_sha: str, expected_repository: str) -> ReviewScope"
+    ),
+}
+EXPECTED_REVIEW_SCOPE_METHODS = {
+    "validate_changed_anchor": (
+        "def validate_changed_anchor(self, anchor: SourceAnchor) -> bool"
+    ),
+    "validate_fix_anchor": (
+        "def validate_fix_anchor(self, anchor: SourceAnchor) -> bool"
+    ),
+    "validate_trigger": (
+        "def validate_trigger(self, evidence: TriggerEvidence) -> bool"
+    ),
 }
 class ManualGeminiContract(NamedTuple):
     step_name: str
@@ -305,6 +596,7 @@ MANUAL_GEMINI_FETCH_CONTRACTS = {
     ),
 }
 GEMINI_AUTH_OUTPUT = "${{ steps.auth.outputs.token }}"
+GITHUB_ACTIONS_PROVENANCE_TOKEN = "${{ github.token }}"
 APPROVED_GEMINI_ACTIONS = frozenset(
     {
         CHECKOUT_ACTION,
@@ -317,11 +609,96 @@ APPROVED_GEMINI_ACTIONS = frozenset(
 PREPARE_REVIEW_DIFF_ACTION = (
     f"$/{PREPARE_REVIEW_DIFF_ACTION_ROOT.path.parent.as_posix()}"
 )
+CANONICALIZE_REVIEW_ACTION = (
+    f"$/{CANONICALIZE_REVIEW_ACTION_ROOT.path.parent.as_posix()}"
+)
 REVIEW_DIFF_DEPENDENCY_WORKFLOWS = (
     "claude-code-review.yml",
     "gemini-auto-review.yml",
     "opencode-auto-review.yml",
 )
+CANONICALIZE_REVIEW_WORKFLOWS = frozenset(
+    {"claude-code-review.yml", "gemini-auto-review.yml"}
+)
+QUALITY_STATE_KEYS = (
+    "accepted_count",
+    "attempt_head",
+    "attempt_status",
+    "diff_mode",
+    "filtered_count",
+    "filtered_max_severity",
+    "full_diff_sha256",
+    "normalized_count",
+    "pr",
+    "quality_schema",
+    "reviewer",
+    "run_attempt",
+    "run_id",
+    "schema",
+    "successful_head",
+)
+REVIEW_PUBLICATION_CONTRACTS = {
+    "claude-code-review.yml": {
+        "job": "claude-review",
+        "collector": "Collect previous review context",
+        "collector_id": "prepare-review-input",
+        "provider": "Run Claude Code Review",
+        "prompt_location": "with",
+        "reviewer": "claude",
+        "marker": "<!-- automation:claude-code-review:v3 -->",
+        "v2_marker": "<!-- automation:claude-code-review:v2 -->",
+        "raw": "claude-review.md",
+        "canonical": "claude-review-canonical.md",
+        "canonical_step": "Canonicalize Claude review",
+        # Intentional whole-program v1.46 publication boundary. Any Upsert
+        # program change requires an explicit verifier contract update.
+        "upsert_sha256": (
+            "d2f1d2eab1e974bf05f184406e854cfe0861ab4b863520a4189d987ceccf27cc"
+        ),
+        "bot_login": "github-actions[bot]",
+        "workflow_prefix": (
+            "jhw7500/automation/.github/workflows/claude-code-review.yml@"
+        ),
+        "previous_sha": "${{ steps.prepare-review-input.outputs.previous_sha }}",
+        "upsert_if": (
+            "${{ !cancelled() && steps.prepare-review-input.outcome == 'success' }}"
+        ),
+        "previous_file": (
+            "${{ steps.prepare-review-input.outputs.previous_sha != '' && "
+            "format('{0}/claude-previous-review.md', runner.temp) || '' }}"
+        ),
+        "reset": "reset-claude-artifacts",
+    },
+    "gemini-auto-review.yml": {
+        "job": "gemini-review",
+        "collector": "Get PR details",
+        "collector_id": "pr-details",
+        "provider": "Run Gemini Code Review",
+        "prompt_location": "run",
+        "reviewer": "gemini",
+        "marker": "<!-- automation:gemini-auto-review:v3 -->",
+        "v2_marker": "<!-- automation:gemini-auto-review:v2 -->",
+        "raw": "gemini_review.md",
+        "canonical": "gemini-review-canonical.md",
+        "canonical_step": "Canonicalize Gemini review",
+        "upsert_sha256": (
+            "cc81b9e370c357366a384a059c9d6e1fe02065f085985f30532b92410c49c43d"
+        ),
+        "bot_login": "${{ steps.auth.outputs.bot-login }}",
+        "auth_mode": "${{ inputs.repo_write_auth }}",
+        "publisher_app_id": "${{ inputs.publisher_app_id }}",
+        "workflow_prefix": (
+            "jhw7500/automation/.github/workflows/gemini-auto-review.yml@"
+        ),
+        "previous_sha": "${{ steps.pr-details.outputs.previous_sha }}",
+        "upsert_if": "${{ !cancelled() && steps.pr-details.outcome == 'success' }}",
+        "previous_file": (
+            "${{ steps.pr-details.outputs.previous_sha != '' && "
+            "format('{0}/gemini-previous-review.md', runner.temp) || '' }}"
+        ),
+        "reset": "reset-gemini-artifacts",
+    },
+}
 GIT_EXECUTABLE = "/usr/bin/git"
 CANONICAL_AUTOMATION_REMOTE = "https://github.com/jhw7500/automation.git"
 ACCEPTED_AUTOMATION_REMOTES = frozenset(
@@ -1547,7 +1924,7 @@ def _release_version(ref: str) -> tuple[int, ...]:
     return tuple(int(part) for part in ref.removeprefix("v").split("."))
 
 
-def _verify_setup_gemini_auth(tree: VerifiedCommitTree) -> None:
+def _verify_setup_gemini_auth(tree: VerifiedCommitTree, ref: str) -> None:
     path = SETUP_GEMINI_AUTH_ROOT.path.as_posix()
     try:
         document = yaml.load(
@@ -1557,13 +1934,16 @@ def _verify_setup_gemini_auth(tree: VerifiedCommitTree) -> None:
         raise ReleaseVerificationError(
             "setup-gemini-auth action contract is invalid"
         ) from None
-    if document != EXPECTED_SETUP_GEMINI_AUTH:
-        raise ReleaseVerificationError(
-            "setup-gemini-auth action contract is invalid"
-        )
+    expected = (
+        EXPECTED_SETUP_GEMINI_AUTH
+        if _release_version(ref) >= (1, 46)
+        else EXPECTED_SETUP_GEMINI_AUTH_V145
+    )
+    if document != expected:
+        raise ReleaseVerificationError("setup-gemini-auth action contract is invalid")
 
 
-def _verify_prepare_review_diff_action(tree: VerifiedCommitTree) -> None:
+def _verify_prepare_review_diff_action(tree: VerifiedCommitTree, ref: str) -> None:
     path = PREPARE_REVIEW_DIFF_ACTION_ROOT.path.as_posix()
     try:
         document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
@@ -1571,10 +1951,13 @@ def _verify_prepare_review_diff_action(tree: VerifiedCommitTree) -> None:
         raise ReleaseVerificationError(
             "prepare-review-diff action contract is invalid"
         ) from None
-    if document != EXPECTED_PREPARE_REVIEW_DIFF_ACTION:
-        raise ReleaseVerificationError(
-            "prepare-review-diff action contract is invalid"
-        )
+    expected = (
+        EXPECTED_PREPARE_REVIEW_DIFF_ACTION
+        if _release_version(ref) >= (1, 46)
+        else EXPECTED_PREPARE_REVIEW_DIFF_ACTION_V145
+    )
+    if document != expected:
+        raise ReleaseVerificationError("prepare-review-diff action contract is invalid")
     try:
         helper = tree.read_text(
             ".github/actions/prepare-review-diff/prepare_review_diff.py"
@@ -1609,6 +1992,430 @@ def _verify_prepare_review_diff_action(tree: VerifiedCommitTree) -> None:
         raise ReleaseVerificationError(
             "prepare-review-diff immutable local Git scope contract is invalid"
         )
+
+
+def _bound_target_names(target: ast.AST) -> tuple[str, ...]:
+    if isinstance(target, ast.Name):
+        return (target.id,)
+    if isinstance(target, ast.Starred):
+        return _bound_target_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return tuple(
+            name for item in target.elts for name in _bound_target_names(item)
+        )
+    return ()
+
+
+class _NamedExpressionBindingVisitor(ast.NodeVisitor):
+    """Collect walrus targets evaluated in the surrounding module scope."""
+
+    def __init__(self) -> None:
+        self.names: list[str] = []
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.names.extend(_bound_target_names(node.target))
+        self.visit(node.value)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        # Defaults execute in the surrounding scope when the lambda is created;
+        # its body executes later in the lambda's own local scope.
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+
+def _expression_binding_names(node: ast.AST | None) -> tuple[str, ...]:
+    if node is None:
+        return ()
+    visitor = _NamedExpressionBindingVisitor()
+    visitor.visit(node)
+    return tuple(visitor.names)
+
+
+def _match_binding_names(pattern: ast.AST) -> tuple[str, ...]:
+    names: list[str] = []
+    for node in ast.walk(pattern):
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            names.append(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.append(node.rest)
+    return tuple(names)
+
+
+def _module_scope_binding_counts(
+    module: ast.Module, protected: frozenset[str]
+) -> dict[str, int]:
+    """Count syntactic bindings that execute in the module namespace.
+
+    Function and class bodies own separate namespaces. Their decorators, bases,
+    defaults, and annotations are still evaluated by the surrounding module, and
+    any nested ``global`` declaration for a protected name is rejected by the
+    caller because it can mutate that module binding later.
+    """
+
+    counts = {name: 0 for name in protected}
+    try_statement_types: tuple[type[ast.AST], ...] = (ast.Try,)
+    try_star_type = getattr(ast, "TryStar", None)
+    if try_star_type is not None:
+        try_statement_types += (try_star_type,)
+    type_alias_type = getattr(ast, "TypeAlias", None)
+
+    def record(names: Iterable[str]) -> None:
+        for name in names:
+            if name in counts:
+                counts[name] += 1
+
+    def expression(node: ast.AST | None) -> None:
+        record(_expression_binding_names(node))
+
+    def function_definition(
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
+        record((node.name,))
+        for decorator in node.decorator_list:
+            expression(decorator)
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            expression(default)
+        arguments = (
+            *getattr(node.args, "posonlyargs", ()),
+            *node.args.args,
+            *node.args.kwonlyargs,
+        )
+        for argument in arguments:
+            expression(argument.annotation)
+        if node.args.vararg is not None:
+            expression(node.args.vararg.annotation)
+        if node.args.kwarg is not None:
+            expression(node.args.kwarg.annotation)
+        expression(node.returns)
+        for type_parameter in getattr(node, "type_params", ()):
+            expression(type_parameter)
+
+    def statements(nodes: Iterable[ast.stmt]) -> None:
+        for node in nodes:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    record(_bound_target_names(target))
+                expression(node.value)
+            elif isinstance(node, ast.AnnAssign):
+                record(_bound_target_names(node.target))
+                expression(node.annotation)
+                expression(node.value)
+            elif isinstance(node, ast.AugAssign):
+                record(_bound_target_names(node.target))
+                expression(node.value)
+            elif isinstance(node, ast.Delete):
+                for target in node.targets:
+                    record(_bound_target_names(target))
+            elif isinstance(node, ast.Import):
+                record(
+                    alias.asname or alias.name.partition(".")[0]
+                    for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                if any(alias.name == "*" for alias in node.names):
+                    record(protected)
+                else:
+                    record(alias.asname or alias.name for alias in node.names)
+            elif type_alias_type is not None and isinstance(node, type_alias_type):
+                record(_bound_target_names(node.name))
+                expression(node.value)
+                for type_parameter in getattr(node, "type_params", ()):
+                    expression(type_parameter)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                function_definition(node)
+            elif isinstance(node, ast.ClassDef):
+                record((node.name,))
+                for decorator in node.decorator_list:
+                    expression(decorator)
+                for base in node.bases:
+                    expression(base)
+                for keyword in node.keywords:
+                    expression(keyword.value)
+                for type_parameter in getattr(node, "type_params", ()):
+                    expression(type_parameter)
+            elif isinstance(node, ast.If):
+                expression(node.test)
+                statements(node.body)
+                statements(node.orelse)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                record(_bound_target_names(node.target))
+                expression(node.iter)
+                statements(node.body)
+                statements(node.orelse)
+            elif isinstance(node, ast.While):
+                expression(node.test)
+                statements(node.body)
+                statements(node.orelse)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    expression(item.context_expr)
+                    if item.optional_vars is not None:
+                        record(_bound_target_names(item.optional_vars))
+                statements(node.body)
+            elif isinstance(node, try_statement_types):
+                statements(node.body)
+                for handler in node.handlers:
+                    expression(handler.type)
+                    if handler.name is not None:
+                        record((handler.name,))
+                    statements(handler.body)
+                statements(node.orelse)
+                statements(node.finalbody)
+            elif isinstance(node, ast.Match):
+                expression(node.subject)
+                for case in node.cases:
+                    record(_match_binding_names(case.pattern))
+                    expression(case.guard)
+                    statements(case.body)
+            elif isinstance(node, ast.Expr):
+                expression(node.value)
+            elif isinstance(node, ast.Assert):
+                expression(node.test)
+                expression(node.msg)
+            elif isinstance(node, ast.Raise):
+                expression(node.exc)
+                expression(node.cause)
+
+    statements(module.body)
+    return counts
+
+
+def _require_unique_module_bindings(
+    module: ast.Module, protected: frozenset[str]
+) -> None:
+    for node in ast.walk(module):
+        if isinstance(node, ast.Global) and protected.intersection(node.names):
+            raise ValueError("protected symbol has a nested global binding")
+    counts = _module_scope_binding_counts(module, protected)
+    if any(count != 1 for count in counts.values()):
+        raise ValueError("protected symbol binding is missing or duplicated")
+
+
+def _module_assignment(module: ast.Module, name: str) -> ast.expr:
+    matches: list[ast.expr] = []
+    for node in module.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        ):
+            matches.append(node.value)
+    if len(matches) != 1:
+        raise ValueError("missing or duplicate assignment")
+    return matches[0]
+
+
+def _static_literal(module: ast.Module, name: str) -> object:
+    value = _module_assignment(module, name)
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "frozenset"
+        and len(value.args) == 1
+        and not value.keywords
+    ):
+        return frozenset(ast.literal_eval(value.args[0]))
+    return ast.literal_eval(value)
+
+
+def _class_node(module: ast.Module, name: str) -> ast.ClassDef:
+    matches = [
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == name
+    ]
+    if len(matches) != 1:
+        raise ValueError("missing or duplicate class")
+    return matches[0]
+
+
+def _record_fields(node: ast.ClassDef) -> tuple[tuple[str, str], ...]:
+    if [ast.unparse(item) for item in node.decorator_list] != [
+        "dataclass(frozen=True)"
+    ]:
+        raise ValueError("record is not frozen")
+    fields: list[tuple[str, str]] = []
+    for item in node.body:
+        if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+            if item.value is not None:
+                raise ValueError("record field has a default")
+            fields.append((item.target.id, ast.unparse(item.annotation)))
+    return tuple(fields)
+
+
+def _function_header(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    header, separator, _body = ast.unparse(node).partition(":\n")
+    if separator != ":\n":
+        raise ValueError("function cannot be rendered")
+    return header
+
+
+def _module_function_headers(module: ast.Module) -> dict[str, str]:
+    functions: dict[str, str] = {}
+    for node in module.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in functions:
+                raise ValueError("duplicate function")
+            functions[node.name] = _function_header(node)
+    return functions
+
+
+def _class_function_headers(node: ast.ClassDef) -> dict[str, str]:
+    functions: dict[str, str] = {}
+    for item in node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if item.name in functions:
+                raise ValueError("duplicate method")
+            functions[item.name] = _function_header(item)
+    return functions
+
+
+def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree) -> None:
+    canonical_path = CANONICALIZE_REVIEW_HELPER_ROOT.path.as_posix()
+    scope_path = REVIEW_SCOPE_HELPER_ROOT.path.as_posix()
+    try:
+        canonical_source = tree.read_file(canonical_path)
+        scope_source = tree.read_file(scope_path)
+        if (
+            hashlib.sha256(canonical_source).hexdigest()
+            != EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256
+            or hashlib.sha256(scope_source).hexdigest()
+            != EXPECTED_REVIEW_SCOPE_HELPER_SHA256
+        ):
+            raise ValueError("helper source digest differs")
+        canonical_text = canonical_source.decode("utf-8")
+        scope_text = scope_source.decode("utf-8")
+        # Compilation is a syntax gate only.  Never import or execute release code.
+        compile(canonical_text, canonical_path, "exec", dont_inherit=True)
+        compile(scope_text, scope_path, "exec", dont_inherit=True)
+        canonical_module = ast.parse(canonical_text, filename=canonical_path)
+        scope_module = ast.parse(scope_text, filename=scope_path)
+
+        canonical_literals = {
+            "HARD_REASONS": EXPECTED_CANONICALIZER_HARD_REASONS,
+            "SOFT_REASONS": EXPECTED_CANONICALIZER_SOFT_REASONS,
+            "SEVERITIES": ("CRITICAL", "HIGH", "MEDIUM"),
+            "IMPACT_CLASSES": frozenset(
+                {
+                    "runtime",
+                    "security",
+                    "data-integrity",
+                    "user-visible",
+                    "performance",
+                }
+            ),
+            "MAX_CANDIDATE_BYTES": 60_000,
+            "MAX_CANONICAL_BYTES": 64_000,
+            "MAX_PREVIOUS_CANONICAL_BYTES": 65_536,
+            "MAX_CANDIDATE_BLOCKS": 512,
+        }
+        _require_unique_module_bindings(
+            canonical_module,
+            frozenset(
+                {
+                    *canonical_literals,
+                    "MAX_SAFE_INTEGER",
+                    *EXPECTED_CANONICALIZER_RECORDS,
+                    *EXPECTED_CANONICALIZER_FUNCTIONS,
+                }
+            ),
+        )
+        _require_unique_module_bindings(
+            scope_module,
+            frozenset(
+                {
+                    "GIT_ENV",
+                    "ScopeValidationError",
+                    *EXPECTED_SCOPE_RECORDS,
+                    *EXPECTED_SCOPE_FUNCTIONS,
+                }
+            ),
+        )
+        if any(
+            _static_literal(canonical_module, name) != expected
+            for name, expected in canonical_literals.items()
+        ):
+            raise ValueError("canonical constants differ")
+        expected_safe_integer = ast.parse(
+            "(1 << 53) - 1", mode="eval"
+        ).body
+        if ast.dump(_module_assignment(canonical_module, "MAX_SAFE_INTEGER")) != ast.dump(
+            expected_safe_integer
+        ):
+            raise ValueError("safe integer constant differs")
+        if _static_literal(scope_module, "GIT_ENV") != EXPECTED_SCOPE_GIT_ENV:
+            raise ValueError("scope Git environment differs")
+
+        for name, expected in EXPECTED_CANONICALIZER_RECORDS.items():
+            if _record_fields(_class_node(canonical_module, name)) != expected:
+                raise ValueError("canonical record differs")
+        for name, expected in EXPECTED_SCOPE_RECORDS.items():
+            if _record_fields(_class_node(scope_module, name)) != expected:
+                raise ValueError("scope record differs")
+
+        scope_error = _class_node(scope_module, "ScopeValidationError")
+        if [ast.unparse(base) for base in scope_error.bases] != ["ValueError"]:
+            raise ValueError("scope error base differs")
+        canonical_functions = _module_function_headers(canonical_module)
+        scope_functions = _module_function_headers(scope_module)
+        if any(
+            canonical_functions.get(name) != expected
+            for name, expected in EXPECTED_CANONICALIZER_FUNCTIONS.items()
+        ) or any(
+            scope_functions.get(name) != expected
+            for name, expected in EXPECTED_SCOPE_FUNCTIONS.items()
+        ):
+            raise ValueError("public helper function differs")
+        review_scope_methods = _class_function_headers(
+            _class_node(scope_module, "ReviewScope")
+        )
+        if any(
+            review_scope_methods.get(name) != expected
+            for name, expected in EXPECTED_REVIEW_SCOPE_METHODS.items()
+        ):
+            raise ValueError("public scope method differs")
+    except (
+        ReleaseVerificationError,
+        SyntaxError,
+        TypeError,
+        ValueError,
+    ):
+        raise ReleaseVerificationError(
+            "canonicalize-review helper contract is invalid"
+        ) from None
+
+
+def _verify_canonicalize_review_action(tree: VerifiedCommitTree) -> None:
+    expected_files = {
+        (root.path.as_posix(), "100644", "blob")
+        for root in (
+            CANONICALIZE_REVIEW_ACTION_ROOT,
+            CANONICALIZE_REVIEW_HELPER_ROOT,
+            REVIEW_SCOPE_HELPER_ROOT,
+        )
+    }
+    actual_files = {
+        (entry.path.as_posix(), entry.mode, entry.object_type)
+        for entry in tree.files(CANONICALIZE_REVIEW_ACTION_ROOT.path.parent)
+    }
+    if actual_files != expected_files:
+        raise ReleaseVerificationError(
+            "canonicalize-review inventory is not closed"
+        )
+    path = CANONICALIZE_REVIEW_ACTION_ROOT.path.as_posix()
+    try:
+        document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
+    except (ReleaseVerificationError, yaml.YAMLError):
+        raise ReleaseVerificationError(
+            "canonicalize-review action contract is invalid"
+        ) from None
+    if document != EXPECTED_CANONICALIZE_REVIEW_ACTION:
+        raise ReleaseVerificationError(
+            "canonicalize-review action contract is invalid"
+        )
+    _verify_canonicalize_review_helpers(tree)
 
 
 def _verify_claude_code_action_pin(
@@ -1945,39 +2752,411 @@ def _action_references(value: object) -> list[str]:
     return result
 
 
-def _verify_prepare_review_diff_dependencies(
+def expected_review_actions(ref: str, workflow: str) -> list[str]:
+    """Return the exact ordered release-local action dependencies."""
+
+    actions: list[str] = []
+    if _release_version(ref) >= (1, 46) and workflow == "gemini-auto-review.yml":
+        actions.append(SETUP_GEMINI_AUTH_REVIEW)
+    if release_supports_prepare_review_diff(ref):
+        actions.append(PREPARE_REVIEW_DIFF_ACTION)
+    if (
+        release_supports_canonicalize_review(ref)
+        and workflow in CANONICALIZE_REVIEW_WORKFLOWS
+    ):
+        actions.append(CANONICALIZE_REVIEW_ACTION)
+    return actions
+
+
+def _verify_review_action_dependencies(
     ref: str, documents: dict[str, dict]
 ) -> None:
-    supported = release_supports_prepare_review_diff(ref)
     for name in REVIEW_DIFF_DEPENDENCY_WORKFLOWS:
+        expected = expected_review_actions(ref, name)
         document = documents.get(name)
         if document is None:
-            if supported:
+            if expected:
                 raise ReleaseVerificationError(
-                    f"{name} prepare-review-diff dependency is missing"
+                    f"{name} prepare-review-diff dependency or review action "
+                    "dependency contract is missing"
                 )
             continue
         references = _action_references(document)
         local_references = [
             reference
             for reference in references
-            if reference.startswith(("$/", "./"))
+            if reference.startswith(
+                ("$/.github/actions/", "./.github/actions/")
+            )
         ]
-        if supported:
-            valid = (
-                references.count(PREPARE_REVIEW_DIFF_ACTION) == 1
-                and local_references == [PREPARE_REVIEW_DIFF_ACTION]
-            )
-        else:
-            valid = not local_references
-        if not valid:
+        if local_references != expected:
             raise ReleaseVerificationError(
-                f"{name} prepare-review-diff dependency contract is invalid"
+                f"{name} prepare-review-diff dependency or review action "
+                "dependency contract is invalid"
             )
+        if _release_version(ref) >= (1, 46) and name == "opencode-auto-review.yml":
+            prepare_steps = [
+                step
+                for job in document.get("jobs", {}).values()
+                if isinstance(job, dict)
+                for step in job.get("steps", [])
+                if isinstance(step, dict)
+                and step.get("uses") == PREPARE_REVIEW_DIFF_ACTION
+            ]
+            if len(prepare_steps) != 1 or prepare_steps[0].get("with", {}).get(
+                "output-directory"
+            ) != "${{ github.workspace }}":
+                raise ReleaseVerificationError(
+                    f"{name} prepare-review-diff output directory contract is invalid"
+                )
+
+
+def _named_step(job: object, name: str) -> dict:
+    if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+        raise ValueError("review job has no steps")
+    matches = [
+        step
+        for step in job["steps"]
+        if isinstance(step, dict) and step.get("name") == name
+    ]
+    if len(matches) != 1:
+        raise ValueError("review step is missing or duplicated")
+    return matches[0]
+
+
+def _expected_canonicalize_step(contract: dict[str, str]) -> dict[str, object]:
+    reviewer = contract["reviewer"]
+    reset = contract["reset"]
+    return {
+        "name": contract["canonical_step"],
+        "id": "canonicalize-review",
+        "if": (
+            f"${{{{ always() && steps.{reset}.outcome == 'success' && "
+            "steps.prepare-diff.outputs.diff-ready == 'true' && "
+            "steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        ),
+        "uses": CANONICALIZE_REVIEW_ACTION,
+        "with": {
+            "reviewer": reviewer,
+            "candidate-file": f"${{{{ github.workspace }}}}/{contract['raw']}",
+            "canonical-file": (
+                f"${{{{ github.workspace }}}}/{contract['canonical']}"
+            ),
+            "result-file": (
+                f"${{{{ github.workspace }}}}/{reviewer}-review-result.json"
+            ),
+            "scope-manifest": "${{ runner.temp }}/review-scope.json",
+            "selected-diff": (
+                "${{ steps.prepare-diff.outputs.diff-mode == 'delta' && "
+                "format('{0}/review-delta.diff', runner.temp) || "
+                "format('{0}/review-full.diff', runner.temp) }}"
+            ),
+            "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
+            "previous-sha": contract["previous_sha"],
+            "previous-review-file": contract["previous_file"],
+        },
+    }
+
+
+def _expected_prepared_head_checkout_step() -> dict[str, object]:
+    return {
+        "name": "Checkout prepared review head",
+        "if": "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}",
+        "uses": CHECKOUT_ACTION,
+        "with": {
+            "ref": "${{ steps.prepare-diff.outputs.head-sha }}",
+            "fetch-depth": "0",
+            "clean": "false",
+            "persist-credentials": "false",
+        },
+    }
+
+
+def _expected_rejected_review_diagnostic_upload_step(
+    contract: dict[str, str],
+) -> dict[str, object]:
+    reviewer = contract["reviewer"]
+    return {
+        "name": f"Upload rejected {reviewer.capitalize()} review diagnostic",
+        "if": (
+            "${{ always() && steps.canonicalize-review.outcome != 'skipped' "
+            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+        ),
+        "uses": UPLOAD_ARTIFACT_ACTION,
+        "with": {
+            "name": (
+                f"{reviewer}-review-diagnostic-${{{{ github.run_id }}}}-"
+                "${{ github.run_attempt }}"
+            ),
+            "path": f"${{{{ github.workspace }}}}/{reviewer}-review-result.json",
+            "if-no-files-found": "ignore",
+            "retention-days": "1",
+            "overwrite": "false",
+        },
+    }
+
+
+def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
+    jq_state_keys = json.dumps(list(QUALITY_STATE_KEYS))
+    js_state_keys = ", ".join(repr(key) for key in QUALITY_STATE_KEYS)
+    expected_output_env = {
+        "CANONICAL_OUTCOME": "${{ steps.canonicalize-review.outcome }}",
+        "DOCUMENT_VALID": "${{ steps.canonicalize-review.outputs.document-valid }}",
+        "ACCEPTED_COUNT": "${{ steps.canonicalize-review.outputs.accepted-count }}",
+        "FILTERED_COUNT": "${{ steps.canonicalize-review.outputs.filtered-count }}",
+        "NORMALIZED_COUNT": "${{ steps.canonicalize-review.outputs.normalized-count }}",
+        "FILTERED_MAX_SEVERITY": (
+            "${{ steps.canonicalize-review.outputs.filtered-max-severity }}"
+        ),
+        "CANONICAL_FAILURE_REASON": (
+            "${{ steps.canonicalize-review.outputs.failure-reason }}"
+        ),
+    }
+    prompt_rules = (
+        "Changed anchor:",
+        "Trigger evidence:",
+        "Material impact:",
+        "Performance basis:",
+        "RVW-<12hex>",
+        "Resolved requires a code change; Retracted requires evidence",
+    )
+    try:
+        for name, raw_contract in REVIEW_PUBLICATION_CONTRACTS.items():
+            contract = {
+                key: value
+                for key, value in raw_contract.items()
+                if isinstance(value, str)
+            }
+            document = documents[name]
+            job = document["jobs"][contract["job"]]
+            if job.get("permissions", {}).get("actions") != "read":
+                raise ValueError("review run provenance permission differs")
+            canonical_step = _named_step(job, contract["canonical_step"])
+            if canonical_step != _expected_canonicalize_step(contract):
+                raise ValueError("canonicalizer call differs")
+            rejected_diagnostic_upload = _named_step(
+                job,
+                f"Upload rejected {contract['reviewer'].capitalize()} review diagnostic",
+            )
+            if (
+                rejected_diagnostic_upload
+                != _expected_rejected_review_diagnostic_upload_step(contract)
+            ):
+                raise ValueError("rejected review diagnostic differs")
+            prepared_head_checkout = _named_step(job, "Checkout prepared review head")
+            if prepared_head_checkout != _expected_prepared_head_checkout_step():
+                raise ValueError("prepared review head checkout differs")
+
+            collector = _named_step(job, contract["collector"])
+            collector_script = collector.get("run", "")
+            if not isinstance(collector_script, str):
+                raise ValueError("collector script is unavailable")
+            collector_env = collector.get("env", {})
+            marker = contract["marker"]
+            collector_marker = (
+                collector.get("env", {}).get("MARKER") == marker
+                if contract["reviewer"] == "claude"
+                else f"MARKER='{marker}'" in collector_script
+            )
+            collector_token_contract = contract["reviewer"] == "claude" or (
+                isinstance(collector_env, dict)
+                and collector_env.get("ACTIONS_TOKEN") == "${{ github.token }}"
+                and 'GH_TOKEN="$ACTIONS_TOKEN" gh api' in collector_script
+            )
+            collector_publisher_contract = (
+                contract["reviewer"] == "claude"
+                and 'select(.user.type == "Bot" and .user.login == $bot_login)'
+                in collector_script
+            ) or (
+                contract["reviewer"] == "gemini"
+                and collector_env.get("AUTH_MODE") == contract["auth_mode"]
+                and collector_env.get("PUBLISHER_APP_ID")
+                == contract["publisher_app_id"]
+                and "def publisher_matches(" in collector_script
+                and "performed_via_github_app" in collector_script
+                and 'app_publisher("15368")' in collector_script
+                and "app_publisher($publisher_app_id)" in collector_script
+                and "select(publisher_matches(" in collector_script
+            )
+            collector_contract = (
+                collector_marker
+                and collector_token_contract
+                and collector_publisher_contract
+                and collector.get("id") == contract["collector_id"]
+                and f"== {jq_state_keys}" in collector_script
+                and "$s.schema == 3" in collector_script
+                and "$s.quality_schema == 1" in collector_script
+                and "canonical_body" in collector_script
+                and "@base64" in collector_script
+                and 'base64 --decode > "$PREVIOUS_FILE"' in collector_script
+                and "- Validation: accepted=" in collector_script
+                and isinstance(collector_env, dict)
+                and collector_env.get("BOT_LOGIN") == contract["bot_login"]
+                and '"${RUNNER_TEMP:?}/' in collector_script
+                and '"$GITHUB_WORKSPACE/' not in collector_script
+                and "sort_by(.state.run_id, .state.run_attempt, .comment.id)"
+                in collector_script
+                and "reverse | .[:20]" in collector_script
+                and "gh api --include" in collector_script
+                and "lookup_status\" = '404'" in collector_script
+                and '"$lookup_exit" -ne 0' in collector_script
+                and '"$lookup_status" != \'200\'' in collector_script
+                and "Prior review provenance lookup is uncertain" in collector_script
+                and "Failed to fetch the prior review comment snapshot" in collector_script
+                and "proceeding without re-review context" not in collector_script
+                and ("actions/runs/${candidate_run_id}/attempts/${candidate_attempt}")
+                in collector_script
+                and '.event == "pull_request" and .head_sha == $head'
+                in collector_script
+                and ".repository.full_name == $repo" in collector_script
+                and ".number == $pr" in collector_script
+                and ".head.sha == $head" not in collector_script
+                and ".referenced_workflows[]?" in collector_script
+                and contract["workflow_prefix"] in collector_script
+            )
+            if not collector_contract:
+                raise ValueError("collector state differs")
+
+            provider = _named_step(job, contract["provider"])
+            prepare = _named_step(job, "Prepare review diff")
+            if prepare.get("with", {}).get("output-directory") != "${{ runner.temp }}":
+                raise ValueError("review diff output directory differs")
+            if not (
+                job["steps"].index(prepare)
+                < job["steps"].index(prepared_head_checkout)
+                < job["steps"].index(provider)
+                < job["steps"].index(canonical_step)
+                < job["steps"].index(rejected_diagnostic_upload)
+            ):
+                raise ValueError("prepared review head checkout order differs")
+            prompt = (
+                provider.get("with", {}).get("prompt", "")
+                if contract["prompt_location"] == "with"
+                else provider.get("run", "")
+            )
+            if not isinstance(prompt, str) or any(
+                prompt.count(rule) < 1 for rule in prompt_rules
+            ):
+                raise ValueError("quality prompt differs")
+
+            upsert = _named_step(job, "Upsert review comment")
+            if upsert.get("if") != contract["upsert_if"]:
+                raise ValueError("upsert prior-state guard differs")
+            if not (
+                job["steps"].index(rejected_diagnostic_upload)
+                < job["steps"].index(upsert)
+            ):
+                raise ValueError("rejected review diagnostic order differs")
+            upsert_script = upsert.get("with", {}).get("script", "")
+            if not isinstance(upsert_script, str):
+                raise ValueError("upsert script is unavailable")
+            if (
+                hashlib.sha256(upsert_script.encode("utf-8")).hexdigest()
+                != contract["upsert_sha256"]
+            ):
+                raise ValueError("upsert publication program differs")
+            validation_template = (
+                "`- Validation: accepted=${state.accepted_count}; "
+                "filtered=${state.filtered_count}; "
+                "normalized=${state.normalized_count}; "
+                "filtered_max=${state.filtered_max_severity}`"
+            )
+            upsert_run_lookup_contract = (
+                contract["reviewer"] == "claude"
+                and "github.rest.actions.getWorkflowRunAttempt" in upsert_script
+            ) or (
+                contract["reviewer"] == "gemini"
+                and "github.request.endpoint" in upsert_script
+                and "authorization: `Bearer ${actionsToken}`" in upsert_script
+                and "const response = await fetch(request.url" in upsert_script
+                and "signal: AbortSignal.timeout(30000)" in upsert_script
+            )
+            upsert_publisher_contract = (
+                contract["reviewer"] == "claude"
+                and "comment.user?.login !== botLogin" in upsert_script
+            ) or (
+                contract["reviewer"] == "gemini"
+                and "const publisherMatches = (comment)" in upsert_script
+                and "performed_via_github_app" in upsert_script
+                and "appPublisherMatches(comment, '15368')" in upsert_script
+                and "appPublisherMatches(comment, publisherAppId)" in upsert_script
+                and "if (!publisherMatches(comment)) return null;" in upsert_script
+                and "if (!publisherMatches(comment)) return false;" in upsert_script
+            )
+            upsert_contract = (
+                f"const marker = '{marker}';" in upsert_script
+                and f"const v2Marker = '{contract['v2_marker']}';" in upsert_script
+                and ":v1 -->" not in upsert_script
+                and f"const expectedStateKeys = [{js_state_keys}];" in upsert_script
+                and "state.schema === 3" in upsert_script
+                and "state.quality_schema === 1" in upsert_script
+                and "schema: 3" in upsert_script
+                and "quality_schema: 1" in upsert_script
+                and validation_template in upsert_script
+                and "const v2Target = existing ? null : exactDisplayTarget(v2Marker);"
+                in upsert_script
+                and (
+                    f"fs.readFileSync('{contract['canonical']}', 'utf8')"
+                    in upsert_script
+                )
+                and contract["raw"] not in upsert_script
+                and upsert_publisher_contract
+                and upsert_run_lookup_contract
+                and contract["workflow_prefix"] in upsert_script
+                and "run?.event === 'pull_request'" in upsert_script
+                and "run?.head_sha === record.state.attempt_head" in upsert_script
+                and "run?.repository?.full_name === repository" in upsert_script
+                and "pr?.number === issueNumber" in upsert_script
+                and "pr?.head?.sha" not in upsert_script
+                and "run?.referenced_workflows" in upsert_script
+                and "const successQuality = unchangedInputIsValid ? {" in upsert_script
+                and all(
+                    f"preserveSuccess ? existing.state.{field} : null"
+                    in upsert_script
+                    for field in (
+                        "accepted_count",
+                        "filtered_count",
+                        "normalized_count",
+                        "filtered_max_severity",
+                    )
+                )
+            )
+            if not upsert_contract:
+                raise ValueError("upsert publication differs")
+            upsert_env = upsert.get("env", {})
+            upsert_token_contract = contract["reviewer"] == "claude" or (
+                isinstance(upsert_env, dict)
+                and upsert_env.get("ACTIONS_TOKEN") == "${{ github.token }}"
+            )
+            upsert_publisher_env_contract = contract["reviewer"] == "claude" or (
+                upsert_env.get("AUTH_MODE") == contract["auth_mode"]
+                and upsert_env.get("PUBLISHER_APP_ID")
+                == contract["publisher_app_id"]
+            )
+            if (
+                not isinstance(upsert_env, dict)
+                or any(
+                    upsert_env.get(key) != value
+                    for key, value in expected_output_env.items()
+                )
+                or upsert_env.get("BOT_LOGIN") != contract["bot_login"]
+                or not upsert_token_contract
+                or not upsert_publisher_env_contract
+            ):
+                raise ValueError("canonicalizer output bridge differs")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise ReleaseVerificationError(
+            "review publication contract is invalid"
+        ) from None
 
 
 def _verify_token_mapping(
-    name: str, location: str, mapping: object, *, allow_empty: bool = False
+    name: str,
+    location: str,
+    mapping: object,
+    *,
+    allow_empty: bool = False,
+    allow_actions_provenance: bool = False,
 ) -> int:
     if not isinstance(mapping, dict):
         return 0
@@ -1985,6 +3164,12 @@ def _verify_token_mapping(
     for key, value in mapping.items():
         token_key = str(key).lower().replace("_", "-")
         if token_key == "token" or token_key.endswith("-token"):
+            if token_key == "actions-token" and allow_actions_provenance:
+                if value != GITHUB_ACTIONS_PROVENANCE_TOKEN:
+                    raise ReleaseVerificationError(
+                        f"{name}:{location} Actions provenance token is invalid"
+                    )
+                continue
             if allow_empty:
                 if value in {None, ""}:
                     continue
@@ -2009,13 +3194,25 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
             f"{name} Gemini workflow_call contract is missing"
         ) from exc
     mode = inputs.get("repo_write_auth") if isinstance(inputs, dict) else None
+    supports_publisher_migration = (
+        _release_version(ref) >= (1, 46) and name == "gemini-auto-review.yml"
+    )
+    publisher_input = (
+        inputs.get("publisher_app_id") if isinstance(inputs, dict) else None
+    )
     if (
         set(document.get("on", {})) != {"workflow_call"}
         or mode != EXPECTED_GEMINI_MODE_INPUT
         or inputs.get("app_id") != EXPECTED_GEMINI_APP_ID_INPUT
+        or (
+            supports_publisher_migration
+            and publisher_input != EXPECTED_GEMINI_PUBLISHER_APP_ID_INPUT
+        )
+        or (not supports_publisher_migration and publisher_input is not None)
     ):
         raise ReleaseVerificationError(
-            f"{name} must declare exact repo_write_auth and app_id inputs"
+            f"{name} must declare exact repo_write_auth, app_id, and "
+            "publisher_app_id inputs"
         )
     values = _values(document)
     normalized = "\n".join(values)
@@ -2047,9 +3244,19 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
         raise ReleaseVerificationError(
             f"{name} must not grant workflow-level write permissions"
         )
-    approved_actions = APPROVED_GEMINI_ACTIONS
+    expected_setup_action = (
+        SETUP_GEMINI_AUTH_REVIEW
+        if _release_version(ref) >= (1, 46) and name == "gemini-auto-review.yml"
+        else SETUP_GEMINI_AUTH
+    )
+    approved_actions = APPROVED_GEMINI_ACTIONS | {expected_setup_action}
     if release_supports_prepare_review_diff(ref):
         approved_actions |= {PREPARE_REVIEW_DIFF_ACTION}
+    if release_supports_canonicalize_review(ref):
+        approved_actions |= {
+            CANONICALIZE_REVIEW_ACTION,
+            UPLOAD_ARTIFACT_ACTION,
+        }
     unapproved_actions = sorted(set(_action_references(document)) - approved_actions)
     if unapproved_actions:
         raise ReleaseVerificationError(
@@ -2099,8 +3306,22 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
                 f"{name}:{job_name} contains forbidden github.token outside resolver"
             )
         for step_index, step in enumerate(steps):
-            if step_index not in candidates and "github.token" in "\n".join(
-                _values(step)
+            step_values = "\n".join(_values(step))
+            step_env = step.get("env", {})
+            provenance_step = (
+                _release_version(ref) >= (1, 46)
+                and name == "gemini-auto-review.yml"
+                and job_name == "gemini-review"
+                and step.get("name") in {"Get PR details", "Upsert review comment"}
+                and isinstance(step_env, dict)
+                and step_env.get("ACTIONS_TOKEN")
+                == GITHUB_ACTIONS_PROVENANCE_TOKEN
+                and step_values.count("github.token") == 1
+            )
+            if (
+                step_index not in candidates
+                and "github.token" in step_values
+                and not provenance_step
             ):
                 raise ReleaseVerificationError(
                     f"{name}:{job_name} bypasses the resolved repository-write token"
@@ -2114,14 +3335,19 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
         if resolver != {
             "name": "Resolve repository-write token",
             "id": "auth",
-            "uses": SETUP_GEMINI_AUTH,
+            "uses": expected_setup_action,
             "with": EXPECTED_GEMINI_AUTH_WITH,
         }:
             raise ReleaseVerificationError(
                 f"{name}:{job_name} setup-gemini-auth resolver must use the exact "
-                "pin and mode-controlled inputs"
+                "release-bound action and mode-controlled inputs"
             )
-        if index == 0 or steps[index - 1] != EXPECTED_GEMINI_VALIDATION:
+        expected_validation = (
+            EXPECTED_GEMINI_AUTO_VALIDATION
+            if supports_publisher_migration
+            else EXPECTED_GEMINI_VALIDATION
+        )
+        if index == 0 or steps[index - 1] != expected_validation:
             raise ReleaseVerificationError(
                 f"{name}:{job_name} resolver must be immediately preceded by exact "
                 "repository-write auth validation"
@@ -2133,12 +3359,21 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
         for step_index, step in enumerate(steps):
             if step_index == index:
                 continue
+            provenance_step = (
+                _release_version(ref) >= (1, 46)
+                and name == "gemini-auto-review.yml"
+                and job_name == "gemini-review"
+                and step.get("name") in {"Get PR details", "Upsert review comment"}
+            )
             for mapping_name in ("env", "with"):
                 write_token_sinks += _verify_token_mapping(
                     name,
                     f"{job_name}.steps[{step_index}].{mapping_name}",
                     step.get(mapping_name, {}),
                     allow_empty=step_index < index,
+                    allow_actions_provenance=(
+                        provenance_step and mapping_name == "env"
+                    ),
                 )
         if write_token_sinks == 0:
             raise ReleaseVerificationError(
@@ -2154,9 +3389,11 @@ def _verify_commit_content(
     tree = VerifiedCommitTree.open(repo, revision)
     if _release_version(ref) >= (1, 40):
         _release_inventory(tree, ref)
-        _verify_setup_gemini_auth(tree)
+        _verify_setup_gemini_auth(tree, ref)
     if release_supports_prepare_review_diff(ref):
-        _verify_prepare_review_diff_action(tree)
+        _verify_prepare_review_diff_action(tree, ref)
+    if release_supports_canonicalize_review(ref):
+        _verify_canonicalize_review_action(tree)
     _verify_approved_v140_policy(tree, ref)
     _verify_manual_gemini_output_contract(tree, ref)
     catalog = _verify_tag_catalog(tree, ref)
@@ -2165,6 +3402,14 @@ def _verify_commit_content(
     if not workflows:
         raise ReleaseVerificationError(f"tag {ref} contains no reusable workflows")
 
+    central_workflows = set(REVIEW_DIFF_DEPENDENCY_WORKFLOWS)
+    if catalog is not None:
+        central_workflows.update(
+            entry.central_workflow
+            for entry in catalog.callers
+            if entry.central_workflow is not None
+        )
+    workflow_root = PurePosixPath(".github/workflows")
     documents: dict[str, dict] = {}
     for name in workflows:
         text = tree.read_text(name)
@@ -2177,14 +3422,19 @@ def _verify_commit_content(
                     f"{name} checkout reference is not the approved immutable commit"
                 )
         data = yaml.load(text, Loader=yaml.BaseLoader)
-        workflow_path = PurePosixPath(name)
-        if workflow_path.parent == PurePosixPath(".github/workflows"):
-            documents[workflow_path.name] = (
-                data if isinstance(data, dict) else {}
-            )
+        relative = PurePosixPath(name).relative_to(workflow_root)
+        if len(relative.parts) != 1:
+            if relative.name in central_workflows:
+                raise ReleaseVerificationError(
+                    f"{name} is an unexpected nested central review workflow"
+                )
+            continue
+        documents[relative.name] = data if isinstance(data, dict) else {}
 
     _verify_claude_code_action_pin(ref, documents)
-    _verify_prepare_review_diff_dependencies(ref, documents)
+    _verify_review_action_dependencies(ref, documents)
+    if release_supports_canonicalize_review(ref):
+        _verify_review_publication_contracts(documents)
 
     if catalog is not None:
         gemini_targets = sorted(

@@ -18,6 +18,7 @@ import yaml
 from scripts.verify_workflow_release import ReleaseVerificationError
 import scripts.verify_workflow_release as release_verifier
 import scripts.workflow_release_bundle as release_bundle
+import scripts.workflow_release_inventory as release_inventory
 from scripts.workflow_release_bundle import materialize_release_bundle
 from scripts.workflow_release_inventory import EXACT_RELEASE_ROOTS, RELEASE_PATHS
 
@@ -35,6 +36,145 @@ EXACT_RELEASE_FILES = tuple(
 PREPARE_REVIEW_DIFF_ACTION = (
     ROOT / ".github/actions/prepare-review-diff/action.yml"
 )
+CANONICALIZE_REVIEW_ACTION = (
+    ROOT / ".github/actions/canonicalize-review/action.yml"
+)
+
+
+def test_canonicalize_review_composite_action_has_exact_safe_shell_contract() -> None:
+    """The public action surface must remain a mutation-free helper adapter."""
+    document = yaml.load(
+        CANONICALIZE_REVIEW_ACTION.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+    )
+
+    assert document == {
+        "name": "Canonicalize review",
+        "description": "Canonicalize evidenced Claude or Gemini review findings",
+        "inputs": {
+            "reviewer": {"required": "true"},
+            "candidate-file": {"required": "true"},
+            "canonical-file": {"required": "true"},
+            "result-file": {"required": "true"},
+            "scope-manifest": {"required": "true"},
+            "selected-diff": {"required": "true"},
+            "diff-mode": {"required": "true"},
+            "previous-sha": {"required": "false", "default": ""},
+            "previous-review-file": {"required": "false", "default": ""},
+        },
+        "outputs": {
+            "document-valid": {"value": "${{ steps.canonicalize.outputs.document_valid }}"},
+            "accepted-count": {"value": "${{ steps.canonicalize.outputs.accepted_count }}"},
+            "filtered-count": {"value": "${{ steps.canonicalize.outputs.filtered_count }}"},
+            "normalized-count": {"value": "${{ steps.canonicalize.outputs.normalized_count }}"},
+            "filtered-max-severity": {
+                "value": "${{ steps.canonicalize.outputs.filtered_max_severity }}"
+            },
+            "failure-reason": {"value": "${{ steps.canonicalize.outputs.failure_reason }}"},
+        },
+        "runs": {
+            "using": "composite",
+            "steps": [
+                {
+                    "id": "canonicalize",
+                    "shell": "bash",
+                    "env": {
+                        "REVIEWER": "${{ inputs.reviewer }}",
+                        "CANDIDATE_FILE": "${{ inputs.candidate-file }}",
+                        "CANONICAL_FILE": "${{ inputs.canonical-file }}",
+                        "RESULT_FILE": "${{ inputs.result-file }}",
+                        "SCOPE_MANIFEST": "${{ inputs.scope-manifest }}",
+                        "SELECTED_DIFF": "${{ inputs.selected-diff }}",
+                        "DIFF_MODE": "${{ inputs.diff-mode }}",
+                        "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
+                        "PREVIOUS_REVIEW_FILE": "${{ inputs.previous-review-file }}",
+                    },
+                    "run": (
+                        'python3 "$GITHUB_ACTION_PATH/canonicalize_review.py" '
+                        '--reviewer "$REVIEWER" '
+                        '--candidate-file "$CANDIDATE_FILE" '
+                        '--canonical-file "$CANONICAL_FILE" '
+                        '--result-file "$RESULT_FILE" '
+                        '--scope-manifest "$SCOPE_MANIFEST" '
+                        '--selected-diff "$SELECTED_DIFF" '
+                        '--diff-mode "$DIFF_MODE" '
+                        '--previous-sha "$PREVIOUS_SHA" '
+                        '--previous-review-file "$PREVIOUS_REVIEW_FILE" '
+                        '--repository-root "$GITHUB_WORKSPACE" '
+                        '--expected-repository "$GITHUB_REPOSITORY" '
+                        '--github-output "$GITHUB_OUTPUT"'
+                    ),
+                }
+            ],
+        },
+    }
+
+
+def test_canonicalize_review_action_run_passes_quoted_environment_values_to_helper(
+    tmp_path: Path,
+) -> None:
+    """Every action value is one inert argv entry, even when it resembles shell code."""
+    document = yaml.load(
+        CANONICALIZE_REVIEW_ACTION.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+    )
+    run = document["runs"]["steps"][0]["run"]
+    action_path = tmp_path / "action"
+    action_path.mkdir()
+    captured = tmp_path / "argv.json"
+    marker = tmp_path / "injection-ran"
+    (action_path / "canonicalize_review.py").write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['ARGV_CAPTURE']).write_text(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "-- workspace ; δ"
+    workspace.mkdir()
+    github_output = tmp_path / "-- output ; δ"
+    hostile = f'-- path ; $(touch {marker}) ; λ value'
+    values = {
+        "CANDIDATE_FILE": hostile + " candidate",
+        "CANONICAL_FILE": hostile + " canonical",
+        "RESULT_FILE": hostile + " result",
+        "SCOPE_MANIFEST": hostile + " manifest",
+        "SELECTED_DIFF": hostile + " diff",
+        "PREVIOUS_REVIEW_FILE": hostile + " previous",
+    }
+    environment = {
+        **os.environ,
+        "ARGV_CAPTURE": str(captured),
+        "GITHUB_ACTION_PATH": str(action_path),
+        "GITHUB_REPOSITORY": "owner/repository ; λ",
+        "GITHUB_WORKSPACE": str(workspace),
+        "GITHUB_OUTPUT": str(github_output),
+        "REVIEWER": "claude",
+        "DIFF_MODE": "full",
+        "PREVIOUS_SHA": "-- sha ; λ value",
+        **values,
+    }
+
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", run],
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    assert json.loads(captured.read_text(encoding="utf-8")) == [
+        "--reviewer", "claude",
+        "--candidate-file", values["CANDIDATE_FILE"],
+        "--canonical-file", values["CANONICAL_FILE"],
+        "--result-file", values["RESULT_FILE"],
+        "--scope-manifest", values["SCOPE_MANIFEST"],
+        "--selected-diff", values["SELECTED_DIFF"],
+        "--diff-mode", "full",
+        "--previous-sha", "-- sha ; λ value",
+        "--previous-review-file", values["PREVIOUS_REVIEW_FILE"],
+        "--repository-root", str(workspace),
+        "--expected-repository", "owner/repository ; λ",
+        "--github-output", str(github_output),
+    ]
 
 
 def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() -> None:
@@ -50,6 +190,7 @@ def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() ->
             "previous-sha": {"required": "false", "default": ""},
             "previous-full-hash": {"required": "false", "default": ""},
             "context-lines": {"required": "false", "default": "3"},
+            "output-directory": {"required": "true"},
         },
         "outputs": {
             "diff-ready": {"value": "${{ steps.prepare.outputs.diff_ready }}"},
@@ -74,6 +215,7 @@ def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() ->
                         "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
                         "PREVIOUS_FULL_HASH": "${{ inputs.previous-full-hash }}",
                         "CONTEXT_LINES": "${{ inputs.context-lines }}",
+                        "OUTPUT_DIRECTORY": "${{ inputs.output-directory }}",
                     },
                     "run": (
                         'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" '
@@ -82,9 +224,9 @@ def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() ->
                         '--previous-sha "$PREVIOUS_SHA" '
                         '--previous-full-hash "$PREVIOUS_FULL_HASH" '
                         '--context-lines "$CONTEXT_LINES" '
-                        '--full-output "$GITHUB_WORKSPACE/review-full.diff" '
-                        '--delta-output "$GITHUB_WORKSPACE/review-delta.diff" '
-                        '--manifest-output "$GITHUB_WORKSPACE/review-scope.json" '
+                        '--full-output "$OUTPUT_DIRECTORY/review-full.diff" '
+                        '--delta-output "$OUTPUT_DIRECTORY/review-delta.diff" '
+                        '--manifest-output "$OUTPUT_DIRECTORY/review-scope.json" '
                         '--github-output "$GITHUB_OUTPUT"'
                     ),
                 }
@@ -113,6 +255,8 @@ def test_prepare_review_diff_action_run_passes_quoted_environment_values_to_help
     )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
     github_output = tmp_path / "github-output"
     pr_number = "7; still-one-quoted-value"
     environment = {
@@ -126,6 +270,7 @@ def test_prepare_review_diff_action_run_passes_quoted_environment_values_to_help
         "PREVIOUS_SHA": "a" * 40,
         "PREVIOUS_FULL_HASH": "b" * 64,
         "CONTEXT_LINES": "20",
+        "OUTPUT_DIRECTORY": str(runner_temp),
     }
 
     result = subprocess.run(
@@ -148,11 +293,11 @@ def test_prepare_review_diff_action_run_passes_quoted_environment_values_to_help
         "--context-lines",
         "20",
         "--full-output",
-        str(workspace / "review-full.diff"),
+        str(runner_temp / "review-full.diff"),
         "--delta-output",
-        str(workspace / "review-delta.diff"),
+        str(runner_temp / "review-delta.diff"),
         "--manifest-output",
-        str(workspace / "review-scope.json"),
+        str(runner_temp / "review-scope.json"),
         "--github-output",
         str(github_output),
     ]
@@ -162,6 +307,37 @@ def test_prepare_review_diff_action_is_bundled_as_regular_release_files() -> Non
     """The helper and metadata travel at the same immutable automation commit."""
     assert ".github/actions/prepare-review-diff/action.yml" in EXACT_RELEASE_FILES
     assert ".github/actions/prepare-review-diff/prepare_review_diff.py" in EXACT_RELEASE_FILES
+
+
+def test_canonicalize_review_action_is_bundled_as_regular_release_files() -> None:
+    """The action and both helpers travel at one immutable automation commit."""
+    assert {
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+        ".github/actions/canonicalize-review/review_scope.py",
+    } <= set(EXACT_RELEASE_FILES)
+
+
+def test_canonicalizer_capability_boundary_is_closed() -> None:
+    capability = getattr(
+        release_inventory, "release_supports_canonicalize_review", None
+    )
+    assert callable(capability)
+    assert capability("v1.45.2") is False
+    assert capability("v1.46") is True
+    canonicalizer_paths = {
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+        ".github/actions/canonicalize-review/review_scope.py",
+    }
+    assert canonicalizer_paths <= {
+        root.path.as_posix()
+        for root in release_inventory.release_roots_for("v1.46")
+    }
+    assert canonicalizer_paths.isdisjoint(
+        root.path.as_posix()
+        for root in release_inventory.release_roots_for("v1.45.2")
+    )
 
 
 def git(repo: Path, *args: str) -> str:
@@ -306,6 +482,22 @@ def test_release_archive_uses_only_authenticated_tree_and_blob_reads(
     monkeypatch.setattr(release_verifier.subprocess, "run", authenticated_only)
 
     assert release_bundle._git_archive(repo, release_commit)
+
+
+def test_latest_release_archive_default_includes_v146_canonicalizer_files(
+    release_repo: tuple[Path, str],
+) -> None:
+    repo, release_commit = release_repo
+
+    archive = release_bundle._git_archive(repo, release_commit)
+
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as stream:
+        names = set(stream.getnames())
+    assert {
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+        ".github/actions/canonicalize-review/review_scope.py",
+    } <= names
 
 
 def test_release_archive_rejects_semantically_valid_blob_at_wrong_object_name(
@@ -679,7 +871,7 @@ def test_bundle_binds_content_and_archive_across_aba_tag_movement(
         automation: Path,
         revision: str,
         *,
-        ref: str = "v1.45",
+        ref: str = "v1.46",
         tree: release_verifier.VerifiedCommitTree | None = None,
     ) -> bytes:
         archive_revisions.append(revision)

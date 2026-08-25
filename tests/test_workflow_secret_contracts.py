@@ -41,6 +41,7 @@ SETUP_AUTH = (
     "jhw7500/automation/.github/actions/setup-gemini-auth@"
     "2254f13aab44585c78954d20749f4fb677a8c2f1"
 )
+RELEASE_BOUND_REVIEW_SETUP_AUTH = "$/.github/actions/setup-gemini-auth"
 
 
 def load_workflow(path: Path) -> dict:
@@ -196,7 +197,12 @@ class WorkflowSecretContractsTest(unittest.TestCase):
                 self.assertNotIn("GOOGLE_API_KEY", text)
                 self.assertNotIn("vars.APP_ID", text)
                 self.assertNotIn("id-token:", text)
-                self.assertIn(SETUP_AUTH, text)
+                expected_setup = (
+                    RELEASE_BOUND_REVIEW_SETUP_AUTH
+                    if filename == "gemini-auto-review.yml"
+                    else SETUP_AUTH
+                )
+                self.assertIn(expected_setup, text)
 
                 auth_steps = [
                     step
@@ -205,6 +211,9 @@ class WorkflowSecretContractsTest(unittest.TestCase):
                     if "setup-gemini-auth" in step.get("uses", "")
                 ]
                 self.assertTrue(auth_steps)
+                self.assertEqual(
+                    {expected_setup}, {step["uses"] for step in auth_steps}
+                )
                 for step in auth_steps:
                     self.assertEqual(
                         {

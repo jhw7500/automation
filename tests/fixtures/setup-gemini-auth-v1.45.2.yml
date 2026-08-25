@@ -16,9 +16,6 @@ outputs:
   token:
     description: 'Generated or fallback token'
     value: ${{ steps.resolve.outputs.token }}
-  bot-login:
-    description: 'Comment publisher login'
-    value: ${{ steps.resolve.outputs.bot-login }}
 
 runs:
   using: 'composite'
@@ -41,15 +38,12 @@ runs:
       # GitHub Actions 권장 패턴). printf %s + 따옴표로 안전하게 $GITHUB_OUTPUT에 기록.
       env:
         MINTED: ${{ steps.mint_token.outputs.token }}
-        APP_SLUG: ${{ steps.mint_token.outputs.app-slug }}
         FALLBACK: ${{ inputs.fallback-token }}
       run: |
         if [[ -n "$MINTED" ]]; then
           printf 'token=%s\n' "$MINTED" >> "$GITHUB_OUTPUT"
-          printf 'bot-login=%s[bot]\n' "$APP_SLUG" >> "$GITHUB_OUTPUT"
           echo "::notice::Using GitHub App token"
         else
           printf 'token=%s\n' "$FALLBACK" >> "$GITHUB_OUTPUT"
-          printf 'bot-login=github-actions[bot]\n' >> "$GITHUB_OUTPUT"
           echo "::notice::Using fallback token"
         fi

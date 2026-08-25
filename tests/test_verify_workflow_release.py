@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,7 +23,9 @@ from scripts.verify_workflow_release import ReleaseVerificationError, verify_rel
 from scripts.workflow_release_inventory import RELEASE_PATHS
 from release_fixture_helpers import (
     HISTORICAL_REVIEW_WORKFLOWS,
+    V145_REVIEW_FIXTURE_ROOT,
     restore_historical_review_workflows,
+    restore_v145_review_workflows,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,13 +77,43 @@ LEGACY_MANUAL_OUTPUT_BLOCK = """          echo "title<<EOF" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 """
 
+CANONICALIZE_REVIEW_ACTION = "$/.github/actions/canonicalize-review"
+CANONICALIZER_RELEASE_FILES = (
+    ".github/actions/canonicalize-review/action.yml",
+    ".github/actions/canonicalize-review/canonicalize_review.py",
+    ".github/actions/canonicalize-review/review_scope.py",
+)
+REVIEWER_WORKFLOW_CONTRACTS = {
+    "claude-code-review.yml": {
+        "job": "claude-review",
+        "provider_step": "Run Claude Code Review",
+        "collector_step": "Collect previous review context",
+        "prompt_key": "prompt",
+        "raw": "claude-review.md",
+        "canonical": "claude-review-canonical.md",
+        "marker": "<!-- automation:claude-code-review:v3 -->",
+        "v2_marker": "<!-- automation:claude-code-review:v2 -->",
+    },
+    "gemini-auto-review.yml": {
+        "job": "gemini-review",
+        "provider_step": "Run Gemini Code Review",
+        "collector_step": "Get PR details",
+        "prompt_key": "run",
+        "raw": "gemini_review.md",
+        "canonical": "gemini-review-canonical.md",
+        "marker": "<!-- automation:gemini-auto-review:v3 -->",
+        "v2_marker": "<!-- automation:gemini-auto-review:v2 -->",
+    },
+}
+
 
 def restore_historical_v140_manual_outputs(repo: Path) -> None:
     # v1.40 태그 픽스처는 그 시대의 fleet 상태를 담아야 한다. v1.40 정책 스냅샷
     # 해시는 workflow-config.json 전체 바이트를 커버하므로, 플릿 구성이 변한 뒤에는
     # automation_ref 치환만으로 역사적 바이트를 재현할 수 없다 — 태그에서 뽑아 둔
     # 스냅샷 픽스처(tests/fixtures/workflow-config-v1.40.json)를 통째로 복원한다.
-    snapshot = Path(__file__).parent / "fixtures" / "workflow-config-v1.40.json"
+    fixture_root = Path(__file__).parent / "fixtures"
+    snapshot = fixture_root / "workflow-config-v1.40.json"
     (repo / "scripts/workflow-config.json").write_bytes(snapshot.read_bytes())
     root = repo / "examples/baseline-workflows/.github/workflows"
     for filename in ("gemini-issue-triage.yml", "gemini-pr-review.yml"):
@@ -162,13 +195,13 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
     return repo, commit(repo, "current release")
 
 
-def test_v1453_commit_gate_accepts_pinned_claude_action(
+def test_current_commit_gate_accepts_pinned_claude_action(
     current_release_repo: tuple[Path, str],
 ) -> None:
     repo, current = current_release_repo
 
     assert (
-        release_verifier.verify_commit_content(repo, "v1.45.3", current)
+        release_verifier.verify_commit_content(repo, "v1.46", current)
         == current
     )
 
@@ -176,7 +209,7 @@ def test_v1453_commit_gate_accepts_pinned_claude_action(
 @pytest.mark.parametrize(
     "filename", ("claude-code-review.yml", "claude.yml")
 )
-def test_v1453_commit_gate_rejects_moving_claude_action(
+def test_current_commit_gate_rejects_moving_claude_action(
     current_release_repo: tuple[Path, str],
     filename: str,
 ) -> None:
@@ -191,10 +224,10 @@ def test_v1453_commit_gate_rejects_moving_claude_action(
     bad_commit = commit(repo, "restore moving Claude action tag")
 
     with pytest.raises(ReleaseVerificationError, match="Claude Code action"):
-        release_verifier.verify_commit_content(repo, "v1.45.3", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
-def test_v1453_commit_gate_cannot_be_spoofed_by_nested_workflow_basename(
+def test_current_commit_gate_cannot_be_spoofed_by_nested_workflow_basename(
     current_release_repo: tuple[Path, str],
 ) -> None:
     repo, _ = current_release_repo
@@ -210,8 +243,11 @@ def test_v1453_commit_gate_cannot_be_spoofed_by_nested_workflow_basename(
     )
     bad_commit = commit(repo, "spoof root Claude action pin")
 
-    with pytest.raises(ReleaseVerificationError, match="Claude Code action"):
-        release_verifier.verify_commit_content(repo, "v1.45.3", bad_commit)
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="unexpected nested central review workflow",
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 def replace(path: Path, old: str, new: str, *, count: int = -1) -> None:
@@ -226,6 +262,18 @@ def append_action_reference(path: Path, reference: str) -> None:
         job["steps"].append({"uses": reference})
 
     mutate_yaml(path, append)
+
+
+def mutate_named_step(path: Path, job_name: str, step_name: str, mutate) -> None:
+    def apply(document: dict) -> None:
+        step = next(
+            item
+            for item in document["jobs"][job_name]["steps"]
+            if item.get("name") == step_name
+        )
+        mutate(step)
+
+    mutate_yaml(path, apply)
 
 
 def retag_bad_release(repo: Path, message: str) -> str:
@@ -658,7 +706,7 @@ def test_current_release_commit_only_uses_authenticated_objects(
     repo, current = current_release_repo
 
     assert (
-        release_verifier.verify_commit_content(repo, "v1.45", current)
+        release_verifier.verify_commit_content(repo, "v1.46", current)
         == current
     )
 
@@ -986,7 +1034,7 @@ def test_current_release_rejects_opencode_format_repair_runtime_drift(
     bad_commit = commit(repo, "weaken OpenCode format repair runtime")
 
     with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
-        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 def test_current_release_rejects_full_legacy_opencode_runtime_downgrade(
@@ -1013,7 +1061,7 @@ def test_current_release_rejects_full_legacy_opencode_runtime_downgrade(
     bad_commit = commit(repo, "downgrade OpenCode format runtime")
 
     with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
-        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 def test_current_release_rejects_opencode_custom_shell_preprocessor(
@@ -1034,7 +1082,7 @@ def test_current_release_rejects_opencode_custom_shell_preprocessor(
     bad_commit = commit(repo, "preprocess OpenCode review script with a custom shell")
 
     with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
-        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 @pytest.mark.parametrize("placement", ("install-body", "extra-step"))
@@ -1077,7 +1125,7 @@ def test_current_release_rejects_opencode_interpreter_poisoning_before_review(
     bad_commit = commit(repo, f"poison OpenCode interpreter via {placement}")
 
     with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
-        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1436,7 +1484,7 @@ def test_current_release_rejects_opencode_attestation_boundary_drift(
     bad_commit = commit(repo, "weaken OpenCode attestation boundary")
 
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 def test_prepare_diff_capability_boundary_is_shared_with_release_inventory() -> None:
@@ -1454,6 +1502,1187 @@ def test_prepare_diff_capability_boundary_is_shared_with_release_inventory() -> 
         release_inventory.PREPARE_REVIEW_DIFF_ACTION_ROOT
         in release_inventory.release_roots_for("v1.45")
     )
+
+
+@pytest.mark.parametrize(
+    ("filename", "size", "oid"),
+    (
+        (
+            "claude-code-review.yml",
+            33_206,
+            "4361b51d34dbc9be85652d73f595ebd8f9775e23",
+        ),
+        (
+            "gemini-auto-review.yml",
+            49_844,
+            "4b3d341c0c97714140a3787d83e89eb035408792",
+        ),
+    ),
+)
+def test_v145_review_fixtures_match_the_immutable_release_blobs(
+    filename: str, size: int, oid: str
+) -> None:
+    path = V145_REVIEW_FIXTURE_ROOT / filename
+    payload = path.read_bytes()
+
+    assert len(payload) == size
+    assert hashlib.sha1(
+        f"blob {len(payload)}\0".encode("ascii") + payload
+    ).hexdigest() == oid
+    assert path.stat().st_mode & 0o777 == 0o644
+
+
+def test_v145_review_workflows_restore_without_invoking_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "historical-v145-fixture"
+    workflow_root = repo / ".github/workflows"
+    workflow_root.mkdir(parents=True)
+
+    def reject_git(*args, **kwargs):
+        raise AssertionError("v1.45 fixture restoration invoked subprocess")
+
+    monkeypatch.setattr(subprocess, "run", reject_git)
+    restore_v145_review_workflows(repo)
+
+    for filename in ("claude-code-review.yml", "gemini-auto-review.yml"):
+        assert (workflow_root / filename).read_bytes() == (
+            V145_REVIEW_FIXTURE_ROOT / filename
+        ).read_bytes()
+
+
+def test_v145_inventory_does_not_require_future_canonicalizer_files(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    restore_v145_review_workflows(repo)
+    for relative in (
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+        ".github/actions/canonicalize-review/review_scope.py",
+    ):
+        (repo / relative).unlink(missing_ok=True)
+    historical = commit(repo, "v1.45 historical inventory")
+
+    assert (
+        release_verifier.verify_commit_content(repo, "v1.45", historical)
+        == historical
+    )
+
+
+@pytest.mark.parametrize("relative", CANONICALIZER_RELEASE_FILES)
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "directory", "executable", "symlink"),
+)
+def test_v146_requires_each_canonicalizer_file_as_one_regular_0644_blob(
+    current_release_repo: tuple[Path, str], relative: str, mutation: str
+) -> None:
+    repo, _ = current_release_repo
+    target = repo / relative
+    if mutation == "missing":
+        target.unlink()
+    elif mutation == "directory":
+        target.unlink()
+        target.mkdir()
+        (target / "dummy").write_text("not the release file\n", encoding="utf-8")
+    elif mutation == "executable":
+        target.chmod(0o755)
+    else:
+        target.unlink()
+        target.symlink_to("untrusted-target")
+    bad_commit = commit(repo, f"mutate {relative} as {mutation}")
+
+    with pytest.raises(ReleaseVerificationError, match="release inventory"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+def test_v146_rejects_files_outside_the_closed_canonicalizer_inventory(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    extra = repo / ".github/actions/canonicalize-review/unowned_helper.py"
+    extra.write_text("raise RuntimeError('not release owned')\n", encoding="utf-8")
+    bad_commit = commit(repo, "add unowned canonicalizer helper")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review inventory"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("input", "output", "runner", "environment", "argv"),
+)
+def test_v146_rejects_canonicalizer_composite_action_contract_drift(
+    current_release_repo: tuple[Path, str], mutation: str
+) -> None:
+    repo, _ = current_release_repo
+    action = repo / ".github/actions/canonicalize-review/action.yml"
+
+    def drift(document: dict) -> None:
+        if mutation == "input":
+            document["inputs"]["previous-review-file"]["default"] = "unsafe"
+        elif mutation == "output":
+            document["outputs"]["accepted-count"]["value"] = "0"
+        elif mutation == "runner":
+            document["runs"]["using"] = "docker"
+        elif mutation == "environment":
+            document["runs"]["steps"][0]["env"].pop("PREVIOUS_SHA")
+        else:
+            document["runs"]["steps"][0]["run"] = document["runs"]["steps"][0][
+                "run"
+            ].replace('"$PREVIOUS_REVIEW_FILE"', "$PREVIOUS_REVIEW_FILE")
+
+    mutate_yaml(action, drift)
+    bad_commit = commit(repo, f"drift canonicalizer action {mutation}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review action contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "candidate_missing",
+        "invalid_utf8",
+        "candidate_oversize",
+        "ambiguous_document",
+        "scope_invalid",
+        "canonicalizer_error",
+        "invalid_anchor",
+        "invalid_trigger_evidence",
+        "invalid_severity",
+        "invalid_impact_class",
+        "missing_material_impact",
+        "unsupported_performance_basis",
+        "non_actionable_category",
+        "unknown_prior_id",
+        "duplicate_prior_binding",
+        "missing_fix_anchor",
+    ),
+)
+def test_v146_rejects_any_missing_canonicalizer_reason_literal(
+    current_release_repo: tuple[Path, str], reason: str
+) -> None:
+    repo, _ = current_release_repo
+    helper = repo / ".github/actions/canonicalize-review/canonicalize_review.py"
+    replace(helper, f'"{reason}"', '"not_a_contract_reason"', count=1)
+    bad_commit = commit(repo, f"remove canonicalizer reason {reason}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("relative", "old", "new"),
+    (
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            'SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")',
+            'SEVERITIES = ("CRITICAL", "HIGH")',
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            '"data-integrity"',
+            '"data-loss"',
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "MAX_CANDIDATE_BYTES = 60_000",
+            "MAX_CANDIDATE_BYTES = 60_001",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "MAX_CANONICAL_BYTES = 64_000",
+            "MAX_CANONICAL_BYTES = 64_001",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "MAX_PREVIOUS_CANONICAL_BYTES = 65_536",
+            "MAX_PREVIOUS_CANONICAL_BYTES = 65_535",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "MAX_CANDIDATE_BLOCKS = 512",
+            "MAX_CANDIDATE_BLOCKS = 511",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "MAX_SAFE_INTEGER = (1 << 53) - 1",
+            "MAX_SAFE_INTEGER = (1 << 52) - 1",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            '"GIT_CONFIG_NOSYSTEM": "1"',
+            '"GIT_CONFIG_NOSYSTEM": "0"',
+        ),
+    ),
+)
+def test_v146_rejects_canonicalizer_constant_drift(
+    current_release_repo: tuple[Path, str], relative: str, old: str, new: str
+) -> None:
+    repo, _ = current_release_repo
+    replace(repo / relative, old, new, count=1)
+    bad_commit = commit(repo, f"drift canonicalizer constant {old}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("relative", "rebind"),
+    (
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "HARD_REASONS: object = frozenset({'bypass_reason'})",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "MAX_CANDIDATE_BLOCKS += 1",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "del MAX_CANDIDATE_BYTES",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "import json as MAX_SAFE_INTEGER",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "for MAX_PREVIOUS_CANONICAL_BYTES in [1]:\n    pass",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "with open(__file__, encoding='utf-8') as SEVERITIES:\n    pass",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "try:\n    raise ValueError\nexcept ValueError as IMPACT_CLASSES:\n    pass",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "match object():\n    case SOFT_REASONS:\n        pass",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "if True:\n    HARD_REASONS = frozenset({'nested_bypass'})",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "_sentinel = lambda value=(HARD_REASONS := "
+            "frozenset({'lambda_default'})): value",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "canonicalize = lambda request: None",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "CanonicalizationResult = object",
+        ),
+    ),
+)
+def test_v146_rejects_every_effective_protected_module_rebinding(
+    current_release_repo: tuple[Path, str], relative: str, rebind: str
+) -> None:
+    repo, _ = current_release_repo
+    helper = repo / relative
+    helper.write_text(
+        helper.read_text(encoding="utf-8") + "\n" + rebind + "\n",
+        encoding="utf-8",
+    )
+    bad_commit = commit(repo, "rebind protected canonicalizer symbol")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("relative", "suffix"),
+    (
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "\n",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "\n",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "\n# harmless authenticated-source drift\n",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "\n# harmless authenticated-source drift\n",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "\nglobals().update({})\n",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "\nglobals()[\"unprotected_probe\"] = None\n",
+        ),
+    ),
+    ids=(
+        "canonicalizer-whitespace",
+        "scope-whitespace",
+        "canonicalizer-comment-append",
+        "scope-comment-append",
+        "canonicalizer-globals-update",
+        "scope-globals-subscript",
+    ),
+)
+def test_v146_authenticates_exact_helper_source_bytes(
+    current_release_repo: tuple[Path, str], relative: str, suffix: str
+) -> None:
+    repo, _ = current_release_repo
+    helper = repo / relative
+    helper.write_bytes(helper.read_bytes() + suffix.encode("utf-8"))
+    bad_commit = commit(repo, f"drift authenticated helper bytes in {relative}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("relative", "old", "new"),
+    (
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "class CanonicalizationRequest:",
+            "class BrokenCanonicalizationRequest:",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "class CandidateReason:",
+            "class BrokenCandidateReason:",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "class CanonicalizationResult:",
+            "class BrokenCanonicalizationResult:",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "def stable_finding_id(",
+            "def broken_stable_finding_id(",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
+            "def canonicalize(",
+            "def broken_canonicalize(",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "class SourceAnchor:",
+            "class BrokenSourceAnchor:",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "class TriggerEvidence:",
+            "class BrokenTriggerEvidence:",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "class ScopeValidationError(ValueError):",
+            "class BrokenScopeValidationError(ValueError):",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "class ReviewScope:",
+            "class BrokenReviewScope:",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "    def validate_changed_anchor(",
+            "    def broken_validate_changed_anchor(",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "    def validate_fix_anchor(",
+            "    def broken_validate_fix_anchor(",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "    def validate_trigger(",
+            "    def broken_validate_trigger(",
+        ),
+        (
+            ".github/actions/canonicalize-review/review_scope.py",
+            "def load_review_scope(",
+            "def broken_load_review_scope(",
+        ),
+    ),
+)
+def test_v146_rejects_missing_canonicalizer_public_signatures(
+    current_release_repo: tuple[Path, str], relative: str, old: str, new: str
+) -> None:
+    repo, _ = current_release_repo
+    replace(repo / relative, old, new, count=1)
+    bad_commit = commit(repo, f"remove public helper signature {old}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+def test_v146_helper_verification_compiles_but_never_executes_commit_code(
+    current_release_repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    repo, _ = current_release_repo
+    sentinel = tmp_path / "commit-helper-executed"
+    helper = repo / ".github/actions/canonicalize-review/canonicalize_review.py"
+    helper.write_text(
+        helper.read_text(encoding="utf-8")
+        + f"\n__import__('pathlib').Path({str(sentinel)!r}).write_text('executed')\n",
+        encoding="utf-8",
+    )
+    commit_with_side_effect = commit(repo, "prove helper verifier is static")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract"
+    ):
+        release_verifier.verify_commit_content(
+            repo, "v1.46", commit_with_side_effect
+        )
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize("mutation", ("missing", "duplicate", "near-match"))
+def test_v146_rejects_nonexact_reviewer_canonicalizer_dependencies(
+    current_release_repo: tuple[Path, str], workflow: str, mutation: str
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def drift(document: dict) -> None:
+        steps = document["jobs"][contract["job"]]["steps"]
+        step = next(item for item in steps if item.get("uses") == CANONICALIZE_REVIEW_ACTION)
+        if mutation == "missing":
+            steps.remove(step)
+        elif mutation == "duplicate":
+            steps.append({"uses": CANONICALIZE_REVIEW_ACTION})
+        else:
+            step["uses"] = CANONICALIZE_REVIEW_ACTION + "/action.yml"
+
+    mutate_yaml(path, drift)
+    bad_commit = commit(repo, f"drift {workflow} canonicalizer dependency")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review action dependency contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+def test_v146_requires_review_auth_helper_from_the_release_commit(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/gemini-auto-review.yml"
+    replace(
+        path,
+        "$/.github/actions/setup-gemini-auth",
+        "jhw7500/automation/.github/actions/setup-gemini-auth@"
+        "2254f13aab44585c78954d20749f4fb677a8c2f1",
+        count=1,
+    )
+    bad_commit = commit(repo, "detach review auth helper from release")
+
+    with pytest.raises(ReleaseVerificationError, match="review action dependency"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    "mutation", ("missing", "wrong-ref", "cleaning", "late", "canonicalizer-early")
+)
+def test_v146_requires_exact_prepared_head_checkout_before_the_provider(
+    current_release_repo: tuple[Path, str], workflow: str, mutation: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def drift(document: dict) -> None:
+        steps = document["jobs"][contract["job"]]["steps"]
+        checkout = next(
+            item for item in steps if item.get("name") == "Checkout prepared review head"
+        )
+        if mutation == "missing":
+            steps.remove(checkout)
+        elif mutation == "wrong-ref":
+            checkout["with"]["ref"] = "${{ github.sha }}"
+        elif mutation == "cleaning":
+            checkout["with"]["clean"] = "true"
+        elif mutation == "late":
+            steps.remove(checkout)
+            provider_index = next(
+                index for index, item in enumerate(steps)
+                if item.get("name") == contract["provider_step"]
+            )
+            steps.insert(provider_index + 1, checkout)
+        else:
+            canonicalizer = next(
+                item for item in steps
+                if item.get("uses") == CANONICALIZE_REVIEW_ACTION
+            )
+            steps.remove(canonicalizer)
+            checkout_index = steps.index(checkout)
+            steps.insert(checkout_index, canonicalizer)
+
+    mutate_yaml(path, drift)
+    bad_commit = commit(repo, f"drift {workflow} prepared head checkout")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+def test_v146_requires_review_diff_outputs_outside_the_checkout_workspace(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def move_into_workspace(step: dict) -> None:
+        step["with"]["output-directory"] = "${{ github.workspace }}"
+
+    mutate_named_step(path, contract["job"], "Prepare review diff", move_into_workspace)
+    bad_commit = commit(repo, f"move {workflow} review inputs into checkout workspace")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+def test_v146_requires_explicit_opencode_review_diff_output_directory(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+
+    def remove_output_directory(step: dict) -> None:
+        step["with"].pop("output-directory")
+
+    mutate_named_step(
+        path,
+        "opencode-prepare",
+        "Prepare review diff",
+        remove_output_directory,
+    )
+    bad_commit = commit(repo, "remove OpenCode review diff output directory")
+
+    with pytest.raises(ReleaseVerificationError, match="output directory contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+def test_v146_rejects_an_opencode_canonicalizer_dependency(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    append_action_reference(
+        repo / ".github/workflows/opencode-auto-review.yml",
+        CANONICALIZE_REVIEW_ACTION,
+    )
+    bad_commit = commit(repo, "wire canonicalizer into OpenCode")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review action dependency contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"),
+)
+@pytest.mark.parametrize("action_files_present", (True, False))
+def test_v145_rejects_canonicalizer_dependency_regardless_of_future_files(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    action_files_present: bool,
+) -> None:
+    repo, _ = current_release_repo
+    restore_v145_review_workflows(repo)
+    append_action_reference(
+        repo / ".github/workflows" / workflow,
+        CANONICALIZE_REVIEW_ACTION,
+    )
+    if not action_files_present:
+        for relative in CANONICALIZER_RELEASE_FILES:
+            (repo / relative).unlink()
+    bad_commit = commit(repo, f"add pre-v1.46 canonicalizer dependency to {workflow}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review action dependency contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+def test_v146_binds_review_contract_to_the_exact_root_workflow_path(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    root = repo / ".github/workflows/claude-code-review.yml"
+    nested = repo / ".github/workflows/zz/claude-code-review.yml"
+    nested.parent.mkdir(parents=True)
+    shutil.copy2(root, nested)
+
+    def corrupt_root(step: dict) -> None:
+        step["with"]["script"] = step["with"]["script"].replace(
+            "state.schema === 3", "state.schema === 2", 1
+        )
+
+    mutate_named_step(root, "claude-review", "Upsert review comment", corrupt_root)
+    bad_commit = commit(repo, "shadow malicious root review with nested decoy")
+
+    with pytest.raises(ReleaseVerificationError, match="central review workflow"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+def test_v146_rejects_nested_central_workflow_before_the_root_sort_order(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    root = repo / ".github/workflows/claude-code-review.yml"
+    nested = repo / ".github/workflows/aa/claude-code-review.yml"
+    nested.parent.mkdir(parents=True)
+    shutil.copy2(root, nested)
+    bad_commit = commit(repo, "add early-sorting nested central workflow")
+
+    with pytest.raises(ReleaseVerificationError, match="central review workflow"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+def test_v146_allows_an_unrelated_nested_workflow_without_shadowing_root_contracts(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    nested = repo / ".github/workflows/zz/unrelated.yml"
+    nested.parent.mkdir(parents=True)
+    nested.write_text(
+        "name: Nested fixture\n"
+        "on:\n"
+        "  workflow_call:\n"
+        "jobs: {}\n",
+        encoding="utf-8",
+    )
+    commit_with_nested = commit(repo, "add unrelated nested workflow")
+
+    assert (
+        release_verifier.verify_commit_content(
+            repo, "v1.46", commit_with_nested
+        )
+        == commit_with_nested
+    )
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        (
+            'select(.user.type == "Bot" and .user.login == $bot_login)',
+            'select(.user.type == "Bot")',
+        ),
+        (
+            ".referenced_workflows[]?",
+            ".pull_requests[]?",
+        ),
+        (
+            "actions/runs/${candidate_run_id}/attempts/${candidate_attempt}",
+            "actions/runs/${candidate_run_id}",
+        ),
+    ),
+    ids=("exact-bot", "reusable-workflow", "run-attempt"),
+)
+def test_v146_authenticates_collected_review_state_against_its_run(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    old: str,
+    new: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def weaken_provenance(step: dict) -> None:
+        script = step["run"]
+        target_old, target_new = old, new
+        if workflow == "gemini-auto-review.yml" and old.startswith("select(.user.type"):
+            target_old = (
+                "select(publisher_matches($bot_login; $auth_mode; "
+                "$publisher_app_id))"
+            )
+        assert target_old in script
+        step["run"] = script.replace(target_old, target_new, 1)
+
+    mutate_named_step(
+        path, contract["job"], contract["collector_step"], weaken_provenance
+    )
+    bad_commit = commit(repo, f"weaken {workflow} collected state provenance")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("gh api --include", "gh api"),
+        ("lookup_status\" = '404'", "lookup_status\" = '503'"),
+        (
+            "sort_by(.state.run_id, .state.run_attempt, .comment.id)",
+            "sort_by(.state.run_id, .state.run_attempt)",
+        ),
+        (
+            "Failed to fetch the prior review comment snapshot",
+            "Failed to fetch optional review context",
+        ),
+    ),
+    ids=("http-status", "404-policy", "comment-id-tie", "comment-snapshot"),
+)
+def test_v146_rejects_fail_open_prior_state_collection(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    old: str,
+    new: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def weaken_collection(step: dict) -> None:
+        script = step["run"]
+        assert old in script
+        step["run"] = script.replace(old, new, 1)
+
+    mutate_named_step(
+        path, contract["job"], contract["collector_step"], weaken_collection
+    )
+    bad_commit = commit(repo, f"weaken {workflow} prior-state collection")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+def test_v146_requires_publication_to_skip_after_collection_failure(
+    current_release_repo: tuple[Path, str], workflow: str
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def remove_collection_guard(step: dict) -> None:
+        step["if"] = "${{ !cancelled() }}"
+
+    mutate_named_step(
+        path, contract["job"], "Upsert review comment", remove_collection_guard
+    )
+    bad_commit = commit(repo, f"remove {workflow} prior-state publication guard")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("comment.user?.login !== botLogin", "false"),
+        (
+            "attempt_number: record.state.run_attempt",
+            "attempt_number: 1",
+        ),
+        ("run?.referenced_workflows", "run?.pull_requests"),
+    ),
+    ids=("exact-bot", "run-attempt", "reusable-workflow"),
+)
+def test_v146_authenticates_published_review_state_before_stale_guarding(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    old: str,
+    new: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def weaken_provenance(step: dict) -> None:
+        script = step["with"]["script"]
+        target_old, target_new = old, new
+        if workflow == "gemini-auto-review.yml" and old == "comment.user?.login !== botLogin":
+            target_old = "if (!publisherMatches(comment)) return null;"
+            target_new = "if (false) return null;"
+        assert target_old in script
+        step["with"]["script"] = script.replace(target_old, target_new, 1)
+
+    mutate_named_step(path, contract["job"], "Upsert review comment", weaken_provenance)
+    bad_commit = commit(repo, f"weaken {workflow} published state provenance")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize("read_style", ("literal", "variable"))
+def test_v146_rejects_reviewer_upsert_reading_the_raw_candidate(
+    current_release_repo: tuple[Path, str], workflow: str, read_style: str
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def publish_raw(step: dict) -> None:
+        script = step["with"]["script"]
+        assert contract["canonical"] in script
+        if read_style == "literal":
+            step["with"]["script"] = script.replace(
+                contract["canonical"], contract["raw"], 1
+            )
+            return
+        canonical_read = (
+            f"fs.readFileSync('{contract['canonical']}', 'utf8')"
+        )
+        assert canonical_read in script
+        step["with"]["script"] = (
+            f"const rawCandidate = '{contract['raw']}';\n"
+            + script.replace(
+                canonical_read,
+                "fs.readFileSync(rawCandidate, 'utf8')",
+                1,
+            )
+        )
+
+    mutate_named_step(path, contract["job"], "Upsert review comment", publish_raw)
+    bad_commit = commit(repo, f"publish raw candidate from {workflow}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review publication contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "upload_step"),
+    (
+        (
+            "claude-code-review.yml",
+            "Upload rejected Claude review diagnostic",
+        ),
+        (
+            "gemini-auto-review.yml",
+            "Upload rejected Gemini review diagnostic",
+        ),
+    ),
+)
+def test_v146_binds_rejected_review_diagnostics_to_one_day(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    upload_step: str,
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def retain_too_long(step: dict) -> None:
+        step["with"]["retention-days"] = "90"
+
+    mutate_named_step(
+        path,
+        contract["job"],
+        upload_step,
+        retain_too_long,
+    )
+    bad_commit = commit(repo, f"retain rejected {workflow} diagnostic too long")
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="review publication contract",
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "upload_step"),
+    (
+        (
+            "claude-code-review.yml",
+            "Upload rejected Claude review diagnostic",
+        ),
+        (
+            "gemini-auto-review.yml",
+            "Upload rejected Gemini review diagnostic",
+        ),
+    ),
+)
+def test_v146_never_uploads_a_rejected_raw_review_candidate(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    upload_step: str,
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def expose_raw_candidate(step: dict) -> None:
+        step["with"]["path"] = f"${{{{ github.workspace }}}}/{contract['raw']}"
+
+    mutate_named_step(path, contract["job"], upload_step, expose_raw_candidate)
+    bad_commit = commit(repo, f"upload rejected raw candidate from {workflow}")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    "read_variant", ("concatenated-path", "aliased-reader", "helper-reader")
+)
+def test_v146_rejects_dead_canonical_read_decoys_and_dynamic_raw_reads(
+    current_release_repo: tuple[Path, str], workflow: str, read_variant: str
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def bypass_canonical_read(step: dict) -> None:
+        script = step["with"]["script"]
+        canonical_read = (
+            f"fs.readFileSync('{contract['canonical']}', 'utf8')"
+        )
+        live_statement = f"review = stripValidation({canonical_read});"
+        assert script.count(canonical_read) == 1
+        assert live_statement in script
+
+        separator = "-" if "-" in contract["raw"] else "_"
+        head, tail = contract["raw"].split(separator, 1)
+        dynamic_path = f"'{head}{separator}' + '{tail}'"
+        decoy = f"if (false) {{ stripValidation({canonical_read}); }}\n"
+        if read_variant == "concatenated-path":
+            live_read = f"fs.readFileSync({dynamic_path}, 'utf8')"
+            prefix = ""
+        elif read_variant == "aliased-reader":
+            live_read = f"candidateRead({dynamic_path}, 'utf8')"
+            prefix = "const candidateRead = fs.readFileSync;\n"
+        else:
+            live_read = "readCandidate()"
+            prefix = (
+                "const readCandidate = () => "
+                f"fs.readFileSync([{dynamic_path}].join(''), 'utf8');\n"
+            )
+        step["with"]["script"] = (
+            prefix
+            + decoy
+            + script.replace(
+                live_statement,
+                f"review = stripValidation({live_read});",
+                1,
+            )
+        )
+
+    mutate_named_step(
+        path, contract["job"], "Upsert review comment", bypass_canonical_read
+    )
+    bad_commit = commit(repo, f"bypass canonical read in {workflow}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review publication contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("state.schema === 3", "state.schema === 2"),
+        ("state.quality_schema === 1", "state.quality_schema === 2"),
+        ("- Validation: accepted=", "- Validated: accepted="),
+    ),
+    ids=("schema", "quality-schema", "validation-spelling"),
+)
+def test_v146_rejects_reviewer_v3_publication_state_drift(
+    current_release_repo: tuple[Path, str], workflow: str, old: str, new: str
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def drift(step: dict) -> None:
+        script = step["with"]["script"]
+        assert old in script
+        step["with"]["script"] = script.replace(old, new, 1)
+
+    mutate_named_step(path, contract["job"], "Upsert review comment", drift)
+    bad_commit = commit(repo, f"drift {workflow} v3 publication state")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review publication contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    "quality_key",
+    (
+        "quality_schema",
+        "accepted_count",
+        "filtered_count",
+        "normalized_count",
+        "filtered_max_severity",
+    ),
+)
+def test_v146_rejects_missing_quality_state_keys(
+    current_release_repo: tuple[Path, str], workflow: str, quality_key: str
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def remove_key(step: dict) -> None:
+        script = step["with"]["script"]
+        token = f"'{quality_key}', "
+        assert token in script
+        step["with"]["script"] = script.replace(token, "", 1)
+
+    mutate_named_step(path, contract["job"], "Upsert review comment", remove_key)
+    bad_commit = commit(repo, f"remove {workflow} quality key {quality_key}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review publication contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize("marker_kind", ("v3", "v2"))
+def test_v146_rejects_reviewer_marker_drift(
+    current_release_repo: tuple[Path, str], workflow: str, marker_kind: str
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    marker = contract["marker" if marker_kind == "v3" else "v2_marker"]
+    path = repo / ".github/workflows" / workflow
+
+    def drift(step: dict) -> None:
+        script = step["with"]["script"]
+        assert marker in script
+        step["with"]["script"] = script.replace(marker, marker + "-drift", 1)
+
+    mutate_named_step(path, contract["job"], "Upsert review comment", drift)
+    bad_commit = commit(repo, f"drift {workflow} {marker_kind} marker")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review publication contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+def test_v146_rejects_reviewer_specific_canonicalizer_inputs(
+    current_release_repo: tuple[Path, str], workflow: str
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def drift(step: dict) -> None:
+        step["with"]["reviewer"] = "gemini" if workflow.startswith("claude") else "claude"
+
+    mutate_named_step(path, contract["job"], "Canonicalize " + (
+        "Claude review" if workflow.startswith("claude") else "Gemini review"
+    ), drift)
+    bad_commit = commit(repo, f"cross-wire {workflow} canonicalizer identity")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review publication contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    "field",
+    ("Trigger evidence:", "Material impact:", "Performance basis:", "RVW-<12hex>"),
+)
+def test_v146_requires_quality_prompt_rules_in_both_reviewers(
+    current_release_repo: tuple[Path, str], workflow: str, field: str
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def remove_rule(step: dict) -> None:
+        container = step["with"] if contract["prompt_key"] == "prompt" else step
+        prompt = container[contract["prompt_key"]]
+        assert field in prompt
+        container[contract["prompt_key"]] = prompt.replace(
+            field, "REMOVED QUALITY FIELD:"
+        )
+
+    mutate_named_step(
+        path,
+        contract["job"],
+        contract["provider_step"],
+        remove_rule,
+    )
+    bad_commit = commit(repo, f"remove {field} prompt rule from {workflow}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="review publication contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 def test_historical_review_workflows_restore_without_invoking_git(
@@ -1514,7 +2743,7 @@ def test_commit_gate_rejects_unsafe_manual_gemini_output_writer(
     bad_commit = commit(repo, "weaken manual Gemini output writer")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1555,7 +2784,7 @@ def test_commit_gate_rejects_manual_gemini_outputs_rewired_to_unsafe_step(
     bad_commit = commit(repo, "rewire manual Gemini outputs")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1584,7 +2813,7 @@ def test_commit_gate_rejects_manual_gemini_fetch_without_explicit_bash(
     bad_commit = commit(repo, "remove explicit Bash execution context")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1610,7 +2839,7 @@ def test_commit_gate_rejects_manual_gemini_downstream_output_rewiring(
     bad_commit = commit(repo, "rewire downstream manual Gemini title")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
 def test_release_verifier_preserves_pre_inventory_v139_contract(
@@ -1705,6 +2934,7 @@ def test_v145_rejects_nonexact_local_review_action_dependencies(
     current_release_repo: tuple[Path, str], workflow: str, replacement: str
 ) -> None:
     repo, _ = current_release_repo
+    restore_v145_review_workflows(repo)
     replace(
         repo / ".github/workflows" / workflow,
         "$/.github/actions/prepare-review-diff",
@@ -1733,6 +2963,7 @@ def test_v145_rejects_appended_local_review_action_dependencies(
     current_release_repo: tuple[Path, str], workflow: str, reference: str
 ) -> None:
     repo, _ = current_release_repo
+    restore_v145_review_workflows(repo)
     append_action_reference(repo / ".github/workflows" / workflow, reference)
     bad_commit = commit(repo, f"append invalid {workflow} local action")
 

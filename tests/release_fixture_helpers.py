@@ -19,6 +19,61 @@ HISTORICAL_REVIEW_WORKFLOWS = (
     "gemini-auto-review.yml",
     "opencode-auto-review.yml",
 )
+V145_REVIEW_FIXTURE_ROOT = (
+    Path(__file__).parent / "fixtures/review-workflows-v1.45.2"
+)
+V145_REVIEW_WORKFLOWS = (
+    "claude-code-review.yml",
+    "gemini-auto-review.yml",
+)
+PRE_V146_SETUP_AUTH_FIXTURE = (
+    Path(__file__).parent / "fixtures/setup-gemini-auth-v1.45.2.yml"
+)
+V145_PREPARE_DIFF_FIXTURE = (
+    Path(__file__).parent / "fixtures/prepare-review-diff-v1.45.2.yml"
+)
+
+
+def restore_pre_v146_review_contracts(repo: Path) -> None:
+    """Restore shared auth identity and Claude/Gemini caller ceilings."""
+
+    setup = repo / ".github/actions/setup-gemini-auth/action.yml"
+    setup.parent.mkdir(parents=True, exist_ok=True)
+    setup.write_bytes(PRE_V146_SETUP_AUTH_FIXTURE.read_bytes())
+
+    baseline_root = repo / "examples/baseline-workflows/.github/workflows"
+    for filename in ("claude-code-review.yml", "gemini-auto-review.yml"):
+        path = baseline_root / filename
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        needle = "    permissions:\n      actions: read\n"
+        assert text.count(needle) == 1
+        text = text.replace(needle, "    permissions:\n", 1)
+        if filename == "gemini-auto-review.yml":
+            publisher_input = "      publisher_app_id: ${{ vars.APP_ID }}\n"
+            assert text.count(publisher_input) == 1
+            text = text.replace(publisher_input, "", 1)
+        path.write_text(text, encoding="utf-8")
+
+    catalog = repo / "scripts/workflow-catalog.json"
+    if catalog.exists():
+        text = catalog.read_text(encoding="utf-8")
+        for caller in ("claude-review", "gemini-review"):
+            needle = (
+                f'          "name": "{caller}",\n'
+                '          "permissions": {\n'
+                '            "actions": "read",\n'
+            )
+            replacement = (
+                f'          "name": "{caller}",\n          "permissions": {{\n'
+            )
+            assert text.count(needle) == 1
+            text = text.replace(needle, replacement, 1)
+        publisher_input = '            "publisher_app_id",\n'
+        assert text.count(publisher_input) == 1
+        text = text.replace(publisher_input, "", 1)
+        catalog.write_text(text, encoding="utf-8")
 
 
 def restore_historical_automation_ref(repo: Path, historical_ref: str) -> None:
@@ -53,6 +108,8 @@ def restore_historical_review_workflows(
             (HISTORICAL_REVIEW_FIXTURE_ROOT / filename).read_bytes()
         )
 
+    restore_pre_v146_review_contracts(repo)
+
     # v1.44 callers predate the Task 5 Actions/Checks ceiling. Restore those two
     # release-policy files without altering the immutable central workflow fixtures.
     baseline = repo / "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml"
@@ -79,3 +136,23 @@ def restore_historical_review_workflows(
             1,
         )
         catalog.write_text(text, encoding="utf-8")
+
+
+def restore_v145_review_workflows(repo: Path) -> None:
+    """Restore immutable v1.45.2 Claude/Gemini workflow bytes.
+
+    These fixtures are the exact blobs published by commit
+    abf5e65cf6188277d9984be062d0b069c82cf25f.  Reading only checked-in
+    fixtures keeps historical verification available in shallow repositories.
+    """
+
+    for filename in V145_REVIEW_WORKFLOWS:
+        relative = f".github/workflows/{filename}"
+        (repo / relative).write_bytes(
+            (V145_REVIEW_FIXTURE_ROOT / filename).read_bytes()
+        )
+
+    restore_pre_v146_review_contracts(repo)
+    prepare = repo / ".github/actions/prepare-review-diff/action.yml"
+    prepare.parent.mkdir(parents=True, exist_ok=True)
+    prepare.write_bytes(V145_PREPARE_DIFF_FIXTURE.read_bytes())
