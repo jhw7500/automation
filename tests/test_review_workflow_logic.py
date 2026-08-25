@@ -425,7 +425,9 @@ def _review_run_fixtures(comments: list[dict], reviewer: str) -> list[dict]:
                 "event": "pull_request",
                 "path": ".github/workflows/pr-review.yml",
                 "repository": {"full_name": "example/repo"},
-                "pull_requests": [{"number": pr, "head": {"sha": attempt_head}}],
+                # The Actions API reports the PR association's live head, not the
+                # historical head captured by this run. Only run.head_sha is immutable.
+                "pull_requests": [{"number": pr, "head": {"sha": "cd" * 20}}],
                 "referenced_workflows": [
                     {
                         "path": (

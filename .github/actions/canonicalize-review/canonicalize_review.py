@@ -58,6 +58,21 @@ VISIBLE_METADATA = re.compile(
 )
 VISIBLE_HEADING = re.compile(r"^#{1,6}(?:\s|$)")
 STICKY_HEADERS = frozenset({"## Claude Code Review (latest)", "## 🔎 Gemini Code Review"})
+AMBIGUITY_DIAGNOSTICS = frozenset(
+    {
+        "finding_before_section",
+        "unknown_section",
+        "duplicate_section",
+        "preamble",
+        "missing_new_findings",
+        "invalid_empty_new_findings",
+        "content_without_finding",
+        "none_with_finding",
+        "section_preamble",
+        "invalid_finding_heading",
+        "too_many_blocks",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -230,22 +245,22 @@ def _parse_document(text: str) -> dict[str, list[_Block]]:
     for line in lines:
         if line.startswith("####"):
             if active is None:
-                raise ValueError("ambiguous")
+                raise ValueError("finding_before_section")
             sections[active].append(line)
         elif line.startswith("###"):
             if line not in {f"### {name}" for name in SECTION_NAMES}:
-                raise ValueError("ambiguous")
+                raise ValueError("unknown_section")
             active = line[4:]
             if active in sections:
-                raise ValueError("ambiguous")
+                raise ValueError("duplicate_section")
             sections[active] = []
             section_order.append(active)
         elif active is not None:
             sections[active].append(line)
         elif line.strip():
-            raise ValueError("ambiguous")
+            raise ValueError("preamble")
     if "New findings" not in sections:
-        raise ValueError("ambiguous")
+        raise ValueError("missing_new_findings")
     parsed: dict[str, list[_Block]] = {name: [] for name in SECTION_NAMES}
     index = 0
     for section in section_order:
@@ -257,24 +272,24 @@ def _parse_document(text: str) -> dict[str, list[_Block]]:
                 ["None"],
                 ["None", "No validated blocking issues found."],
             ):
-                raise ValueError("ambiguous")
+                raise ValueError("invalid_empty_new_findings")
             if section != "New findings" and meaningful:
-                raise ValueError("ambiguous")
+                raise ValueError("content_without_finding")
             continue
         if section == "New findings" and any(line.strip() == "None" for line in contents):
-            raise ValueError("ambiguous")
+            raise ValueError("none_with_finding")
         if any(line.strip() for line in contents[:heading_positions[0]]):
-            raise ValueError("ambiguous")
+            raise ValueError("section_preamble")
         for block_number, start in enumerate(heading_positions):
             parsed_heading = _heading(contents[start])
             if parsed_heading is None:
-                raise ValueError("ambiguous")
+                raise ValueError("invalid_finding_heading")
             end = heading_positions[block_number + 1] if block_number + 1 < len(heading_positions) else len(contents)
             finding_id, severity, low_severity, title = parsed_heading
             parsed[section].append(_Block(index, section, finding_id, severity, low_severity, title, tuple(contents[start + 1:end])))
             index += 1
             if index > MAX_CANDIDATE_BLOCKS:
-                raise ValueError("ambiguous")
+                raise ValueError("too_many_blocks")
     return parsed
 
 
@@ -743,7 +758,14 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                     prior_active = _load_prior_active(request)
                 except ScopeValidationError:
                     result = _hard("scope_invalid")
-                except ValueError:
+                except ValueError as error:
+                    diagnostic = str(error)
+                    if diagnostic not in AMBIGUITY_DIAGNOSTICS:
+                        diagnostic = "unclassified"
+                    print(
+                        f"review-canonicalization-diagnostic: {diagnostic}",
+                        file=sys.stderr,
+                    )
                     result = _hard("ambiguous_document")
                 else:
                     accepted: list[tuple[_Block, _Finding]] = []

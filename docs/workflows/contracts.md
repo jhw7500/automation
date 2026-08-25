@@ -369,7 +369,8 @@ After an attempted Claude or Gemini canonicalization that does not produce
 day. The untrusted raw candidate is never uploaded: it may contain provider-echoed secrets and a
 workspace path could otherwise expose a checkout-seeded symlink target. A missing result is
 ignored. The diagnostic is not authority: neither the upsert program nor later review state or
-carryover reads it.
+carryover reads it. For `ambiguous_document`, logs expose only a fixed structural diagnostic code
+such as `preamble` or `invalid_finding_heading`; candidate text is never copied into that message.
 
 Once the document boundary and trusted scope are valid, a bad individual block does not discard
 valid siblings. It is filtered or normalized with exactly one of `invalid_anchor`,
@@ -393,8 +394,10 @@ candidate. Claude/Gemini v2 is never accepted as v3, and OpenCode never accepts 
 later in prose, a different reviewer or PR, malformed JSON, or an extra, missing, or invalid field
 is not state. The author login must also equal the token's exact publisher login. From the newest
 20 syntactically valid records, the workflow queries the claimed Actions run attempt and retains
-only a completed success/failure whose repository, `pull_request` event, PR number, attempt head,
-run ID/attempt, and referenced central reusable-workflow path plus immutable SHA all agree. The
+only a completed success/failure whose repository, `pull_request` event, PR association number,
+immutable run `head_sha`, run ID/attempt, and referenced central reusable-workflow path plus SHA all
+agree. The association's `pull_requests[].head.sha` is deliberately not trusted because GitHub
+updates it to the PR's latest head after the historical run completes. The
 highest authenticated `(run_id, run_attempt)` then wins; a foreign bot or a forged large run ID is
 ignored rather than poisoning carryover or the stale-generation guard. Comment ordering and
 timestamps do not decide state. Both values are positive safe integers, so a manual rerun of one

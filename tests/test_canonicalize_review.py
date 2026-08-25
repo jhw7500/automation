@@ -653,6 +653,25 @@ def test_cli_writes_bounded_schema_result_scalar_outputs_and_metadata_only_logs(
     assert case.canonical.read_text(encoding="utf-8") == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
 
 
+def test_cli_logs_only_a_fixed_ambiguity_code_for_untrusted_preamble(case_factory):
+    secret = "UNTRUSTED-PREAMBLE-SECRET"
+    case = case_factory(
+        f"{secret}\n### New findings\n\nNone\n".encode("utf-8")
+    )
+
+    completed = subprocess.run(
+        _cli_args(case), cwd=ACTION_DIR, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0
+    assert secret not in completed.stdout
+    assert secret not in completed.stderr
+    assert completed.stderr == "review-canonicalization-diagnostic: preamble\n"
+    assert json.loads(case.result.read_text(encoding="utf-8"))["failure_reason"] == (
+        "ambiguous_document"
+    )
+
+
 def test_cli_action_first_round_empty_previous_review_file_writes_runner_outputs(case_factory):
     """The composite action's empty optional value denotes no previous review."""
     case = case_factory(accepted_rejected_plan_review().encode("utf-8"))

@@ -420,7 +420,7 @@ EXPECTED_CANONICALIZER_SOFT_REASONS = frozenset(
     }
 )
 EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256 = (
-    "bfcfe5f5133adcf4bece8a7c01390ec750f4e75194ab63ad13852c663942dec3"
+    "e6baf7097e9d2a1005bc040c25b1dd28ec157821511ea93cb35c6fb210afdff4"
 )
 EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
     "cf170639e9dc76ee361086074cf327d091dc8c002c9a3108baf7eb3b02b875bd"
@@ -604,7 +604,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
         # Intentional whole-program v1.46 publication boundary. Any Upsert
         # program change requires an explicit verifier contract update.
         "upsert_sha256": (
-            "8984edbe8b27860906ad44460e0c1389c504bfc26e87e6305f68d3deb621d8b0"
+            "27fd7d618b2a2ac099280ed9b9ab7243ee1909193486d009f266d69279d25f95"
         ),
         "bot_login": "github-actions[bot]",
         "workflow_prefix": (
@@ -629,7 +629,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
         "canonical": "gemini-review-canonical.md",
         "canonical_step": "Canonicalize Gemini review",
         "upsert_sha256": (
-            "e037b88f292c1b007d4c45c8c089071cf5bf94a96002c2e6a8c845a7ef5050cb"
+            "dc375e9fbd8ad088b8695332bff6b5c4d40b7cbb7ed8f7b6718ab55d7ca82974"
         ),
         "bot_login": "${{ steps.auth.outputs.bot-login }}",
         "workflow_prefix": (
@@ -2928,7 +2928,8 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 and '.event == "pull_request" and .head_sha == $head'
                 in collector_script
                 and ".repository.full_name == $repo" in collector_script
-                and ".number == $pr and .head.sha == $head" in collector_script
+                and ".number == $pr" in collector_script
+                and ".head.sha == $head" not in collector_script
                 and ".referenced_workflows[]?" in collector_script
                 and contract["workflow_prefix"] in collector_script
             )
@@ -3011,6 +3012,7 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 and "run?.head_sha === record.state.attempt_head" in upsert_script
                 and "run?.repository?.full_name === repository" in upsert_script
                 and "pr?.number === issueNumber" in upsert_script
+                and "pr?.head?.sha" not in upsert_script
                 and "run?.referenced_workflows" in upsert_script
                 and "const successQuality = unchangedInputIsValid ? {" in upsert_script
                 and all(

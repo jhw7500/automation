@@ -254,7 +254,7 @@ jobs:
                 and (.conclusion == "success" or .conclusion == "failure")
                 and .event == "pull_request" and .head_sha == $head
                 and .repository.full_name == $repo
-                and ([.pull_requests[]? | select(.number == $pr and .head.sha == $head)] | length == 1)
+                and ([.pull_requests[]? | select(.number == $pr)] | length == 1)
                 and ([.referenced_workflows[]? | select(
                   (.path | startswith($workflow_prefix))
                   and (.sha | test("^[0-9a-f]{40}$"))
@@ -618,7 +618,7 @@ jobs:
               && run?.event === 'pull_request' && run?.head_sha === record.state.attempt_head
               && run?.repository?.full_name === repository
               && (run?.pull_requests || []).filter((pr) =>
-                pr?.number === issueNumber && pr?.head?.sha === record.state.attempt_head
+                pr?.number === issueNumber
               ).length === 1
               && (run?.referenced_workflows || []).filter((item) =>
                 (item?.path || '').startsWith(workflowPrefix) && sha1(item?.sha)
