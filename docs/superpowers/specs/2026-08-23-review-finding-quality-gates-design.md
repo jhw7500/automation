@@ -200,6 +200,12 @@ current head, and previous successful head when applicable. For every candidate 
 4. re-derives zero-context hunks for the full or delta range with literal path arguments; and
 5. accepts only a line consumed by an actual added-side `+` record.
 
+A final head may be tree-equivalent to the merge base after all PR changes are reverted. That is a
+valid clean-review scope only when the mode is `full`, the sealed selected diff is exactly zero
+bytes, `files` is empty, and the immutable full-range Git reconstruction is also empty. Empty delta
+scope, non-empty selected bytes, or hidden reconstructed records fail closed. No changed anchor can
+validate in the accepted empty scope.
+
 This is the same security boundary as the existing OpenCode added-line validator. The reusable
 implementation must share or extract that validator rather than create a weaker path parser.
 

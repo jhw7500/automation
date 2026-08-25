@@ -64,6 +64,8 @@ def _scope_files(root: Path, left: str, head: str) -> list[dict[str, str]]:
         check=True,
         capture_output=True,
     ).stdout
+    if not raw:
+        return []
     fields = raw[:-1].split(b"\0")
     status_names = {
         "A": "added", "B": "changed", "C": "copied", "D": "removed",
@@ -189,6 +191,24 @@ def scope_attack_repo(tmp_path: Path) -> ScopedRepo:
     return ScopedRepo(root, manifest, selected_diff, merge_base, head)
 
 
+@pytest.fixture
+def empty_scope_repo(tmp_path: Path) -> ScopedRepo:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init")
+    (root / "state.txt").write_text("base\n", encoding="utf-8")
+    merge_base = _commit(root, "base")
+    (root / "state.txt").write_text("changed\n", encoding="utf-8")
+    _commit(root, "temporary change")
+    (root / "state.txt").write_text("base\n", encoding="utf-8")
+    head = _commit(root, "restore base tree")
+    assert _scope_files(root, merge_base, head) == []
+    manifest = _manifest(root, merge_base, head, [])
+    selected_diff = root / "review-full.diff"
+    selected_diff.write_bytes(b"")
+    return ScopedRepo(root, manifest, selected_diff, merge_base, head)
+
+
 def test_changed_anchor_requires_exact_manifest_record_and_added_line(scoped_repo: ScopedRepo):
     scope = load_review_scope(
         scoped_repo.root, scoped_repo.manifest, scoped_repo.selected_diff,
@@ -197,6 +217,57 @@ def test_changed_anchor_requires_exact_manifest_record_and_added_line(scoped_rep
     assert scope.validate_changed_anchor(SourceAnchor("src/runner.py", 3))
     assert not scope.validate_changed_anchor(SourceAnchor("src/runner.py", 2))
     assert not scope.validate_changed_anchor(SourceAnchor("src/missing.py", 3))
+
+
+def test_tree_equivalent_empty_full_scope_is_valid_and_has_no_changed_anchors(
+    empty_scope_repo: ScopedRepo,
+):
+    scope = empty_scope_repo.load()
+
+    assert scope.manifest.files == ()
+    assert scope.added_lines_by_path == {}
+    assert not scope.validate_changed_anchor(SourceAnchor("state.txt", 1))
+    assert scope.validate_trigger(TriggerEvidence("state.txt", 1, "base"))
+
+
+@pytest.mark.parametrize(
+    ("diff_mode", "selected_payload"),
+    (("delta", b""), ("full", b"untrusted diff\n")),
+)
+def test_empty_scope_rejects_non_full_mode_or_nonempty_selected_diff(
+    empty_scope_repo: ScopedRepo,
+    diff_mode: str,
+    selected_payload: bytes,
+):
+    empty_scope_repo.selected_diff.write_bytes(selected_payload)
+
+    with pytest.raises(review_scope.ScopeValidationError):
+        load_review_scope(
+            empty_scope_repo.root,
+            empty_scope_repo.manifest,
+            empty_scope_repo.selected_diff,
+            diff_mode=diff_mode,
+            previous_sha=empty_scope_repo.merge_base if diff_mode == "delta" else "",
+            expected_repository="example/repo",
+        )
+
+
+def test_empty_manifest_cannot_hide_a_nonempty_git_range(scoped_repo: ScopedRepo):
+    manifest = _manifest(scoped_repo.root, scoped_repo.merge_base, scoped_repo.head, [])
+    scoped_repo.selected_diff.write_bytes(b"")
+
+    with pytest.raises(
+        review_scope.ScopeValidationError,
+        match="scope manifest cannot be reconstructed",
+    ):
+        load_review_scope(
+            scoped_repo.root,
+            manifest,
+            scoped_repo.selected_diff,
+            diff_mode="full",
+            previous_sha="",
+            expected_repository="example/repo",
+        )
 
 
 def test_delta_anchor_is_not_satisfied_by_an_older_full_range_addition(delta_repo: DeltaRepo):

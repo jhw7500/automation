@@ -211,6 +211,8 @@ prepares `review-delta.diff`, and writes `review-scope.json`. Its composite outp
 `unchanged-since-previous`. The hash is SHA-256 over the exact `review-full.diff` bytes. A ready
 manifest has schema `1`, repository, PR number, merge-base SHA, head SHA, and file records with
 `status`, `filename`, and optional `previous_filename`.
+The file list may be empty only for a tree-equivalent head whose authenticated full diff and local
+full-range name-status reconstruction are both empty.
 
 `prepare-review-diff` requires an explicit `output-directory`; Claude and Gemini bind it to
 `${{ runner.temp }}`. Their prior canonical body and context files use the same runner-temporary
@@ -230,7 +232,7 @@ ready result unavailable. `unchanged_since_previous` is true only in `unchanged`
 
 | Mode | Artifacts and selection | Reviewer/checkpoint behavior |
 | --- | --- | --- |
-| `full` | `diff-ready=true`; the unrestricted local `merge-base..captured-head` full diff and local manifest exist; delta is absent. This covers a first review, an unusable/non-ancestor previous SHA, an empty delta whose full hash changed, or an incremental preparation/argv failure. | Claude and Gemini read the full diff. OpenCode always reads the sealed full diff. A model result can advance only after the ordinary output, head, and generation gates. |
+| `full` | `diff-ready=true`; the unrestricted local `merge-base..captured-head` full diff and local manifest exist; delta is absent. This covers a first review, an unusable/non-ancestor previous SHA, an empty delta whose full hash changed, an incremental preparation/argv failure, or a head whose final tree equals the merge-base tree. The last case has an exact zero-byte full diff and `files: []`. | Claude and Gemini read the full diff. OpenCode always reads the sealed full diff. A model result can advance only after the ordinary output, head, and generation gates. An authenticated empty full scope can produce only a clean canonical result because no changed anchor can validate. |
 | `delta` | `diff-ready=true`; full diff, non-empty ancestor-to-head delta, and manifest all exist. The previous successful SHA is an available ancestor, and the delta is restricted to paths present in the immutable final full-range manifest. | Claude and Gemini read the delta as their exclusive changed set. OpenCode still reads the full diff. The stored hash is always the full-diff hash. |
 | `unchanged` | `diff-ready=true`; full diff and manifest exist, delta is absent, and the full-diff hash equals the validated previous full hash. | No model runs. The prior non-empty body is preserved, and the successful head/hash may advance only when authenticated prior success, exact hash equality, current-head, and run-generation checks all pass. |
 | `unavailable` | `diff-ready=false`; the mode is `unavailable`, the full hash is empty, and staged full/delta/manifest outputs are removed. | No model runs and no `Reviewed` checkpoint advances. A latest-head failure/stale record may be written only through the normal head/generation gate; a head that changed during preparation causes the later head gate to reject comment mutation. |
@@ -324,6 +326,13 @@ parser then:
    its relevant side; once that side is EOF-marked, a later hunk cannot reopen it. Malformed or
    truncated hunk bodies, counters, coordinates, and controls fail closed; diff prelude metadata is
    not treated as hunk-body evidence.
+
+The sole zero-record case is an exact empty full review: the sealed manifest has `files: []`, the
+selected full diff is a zero-byte regular file, and local full-range name-status reconstruction is
+also empty. An empty delta, non-empty selected diff, or non-empty Git reconstruction remains
+`scope_invalid`. The resulting scope has no changed anchors, so only a structurally valid clean
+canonical result can be published; claimed findings are filtered because none can bind a changed
+anchor.
 
 For the `Resolved`-only removed-evidence alternative, the canonicalizer first requires an exact
 path, old line number, and line-content match against the unique authenticated active prior block.

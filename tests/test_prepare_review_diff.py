@@ -247,6 +247,35 @@ def test_first_round_writes_pr_scoped_full_diff_and_manifest(
     assert [call[0] for call in calls] == ["api", "api"]
 
 
+def test_tree_equivalent_head_prepares_an_authenticated_empty_full_scope(
+    gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    repo = tmp_path / "consumer"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.name", "Test User")
+    git(repo, "config", "user.email", "test@example.invalid")
+    (repo / "state.txt").write_text("base\n", encoding="utf-8")
+    base = commit(repo, "base")
+    (repo / "state.txt").write_text("changed\n", encoding="utf-8")
+    commit(repo, "temporary change")
+    (repo / "state.txt").write_text("base\n", encoding="utf-8")
+    head = commit(repo, "restore base tree")
+    configure_gh(gh_fixture, base=base, head=head, files=[])
+    full, delta, manifest = outputs(tmp_path)
+
+    result = run_prepare(repo, gh_fixture, *prepare_args(full, delta, manifest))
+
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert state["diff_ready"] is True
+    assert state["diff_mode"] == "full"
+    assert state["full_diff_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert full.read_bytes() == b""
+    assert not delta.exists()
+    assert json.loads(manifest.read_text(encoding="utf-8"))["files"] == []
+
+
 def test_valid_previous_ancestor_writes_scoped_incremental_diff(
     history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
 ) -> None:

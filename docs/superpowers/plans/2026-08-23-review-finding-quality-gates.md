@@ -182,7 +182,13 @@ def selected_left(manifest: ScopeManifest, diff_mode: str, previous_sha: str) ->
     raise ScopeValidationError("invalid selected range")
 ```
 
-`load_review_scope` must also require a regular, non-symlink selected diff; strict UTF-8; non-empty bytes; `git rev-parse HEAD == manifest.head_sha`; `manifest.repository == expected_repository`; an exact full-range name-status reconstruction; and an ancestor-valid delta left side. For a rename/copy, validate both literal old/current path arguments and accept only the current `filename` as an anchor identity.
+`load_review_scope` must also require a regular, non-symlink selected diff; strict UTF-8; non-empty
+bytes except for an exact tree-equivalent empty full scope; `git rev-parse HEAD ==
+manifest.head_sha`; `manifest.repository == expected_repository`; an exact full-range name-status
+reconstruction; and an ancestor-valid delta left side. The empty exception requires `diff_mode ==
+"full"`, a zero-byte selected diff, `files: []`, and an empty local reconstruction; empty delta or
+any mismatch fails closed and exposes no valid changed anchor. For a rename/copy, validate both
+literal old/current path arguments and accept only the current `filename` as an anchor identity.
 
 - [ ] **Step 5: Write RED tests for current-head evidence and filesystem attacks**
 

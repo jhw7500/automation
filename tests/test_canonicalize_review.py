@@ -52,6 +52,8 @@ def _scope_files(root: Path, left: str, head: str) -> list[dict[str, str]]:
         ["git", "diff", "--name-status", "-z", "--find-renames=50%", f"{left}..{head}"],
         cwd=root, check=True, capture_output=True,
     ).stdout
+    if not raw:
+        return []
     fields = raw[:-1].split(b"\0")
     names = {"A": "added", "B": "changed", "C": "copied", "D": "removed", "M": "modified", "R": "renamed", "T": "changed", "U": "changed", "X": "changed"}
     records: list[dict[str, str]] = []
@@ -437,6 +439,56 @@ def test_clean_declarations_normalize_and_stable_id_is_literal(scoped_case):
     assert result.document_valid is True
     assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
     assert stable_finding_id("claude", SourceAnchor("review_cases.py", 26), "MEDIUM", " Broad   ValueError CATCH hides invalid configuration ") == "RVW-61d4cd9ac260"
+
+
+def test_clean_candidate_accepts_a_tree_equivalent_empty_full_scope(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init")
+    (root / "state.txt").write_text("base\n", encoding="utf-8")
+    merge_base = _commit(root, "base")
+    (root / "state.txt").write_text("changed\n", encoding="utf-8")
+    _commit(root, "temporary change")
+    (root / "state.txt").write_text("base\n", encoding="utf-8")
+    head = _commit(root, "restore base tree")
+    assert _scope_files(root, merge_base, head) == []
+
+    candidate = tmp_path / "candidate.md"
+    candidate.write_text("### New findings\n\nNone\n", encoding="utf-8")
+    manifest = tmp_path / "scope.json"
+    manifest.write_text(json.dumps({
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": merge_base,
+        "head_sha": head,
+        "files": [],
+    }, separators=(",", ":")), encoding="utf-8")
+    selected_diff = tmp_path / "selected.diff"
+    selected_diff.write_bytes(b"")
+    canonical = tmp_path / "canonical.md"
+    result_file = tmp_path / "result.json"
+
+    result = canonicalize(CanonicalizationRequest(
+        reviewer="claude",
+        candidate_file=candidate,
+        canonical_file=canonical,
+        result_file=result_file,
+        scope_manifest=manifest,
+        selected_diff=selected_diff,
+        repository_root=root,
+        diff_mode="full",
+        previous_sha="",
+        previous_review_file=None,
+        expected_repository="example/repo",
+    ))
+
+    assert result == canonicalize_review.CanonicalizationResult(
+        True, 0, 0, 0, "none", "", (),
+    )
+    assert canonical.read_text(encoding="utf-8") == (
+        "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+    )
 
 
 def test_new_findings_discard_model_supplied_ids(scoped_case):

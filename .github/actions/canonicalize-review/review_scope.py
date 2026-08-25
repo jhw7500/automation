@@ -94,7 +94,11 @@ def _read_utf8_file(path: Path, description: str, *, nonempty: bool = False) -> 
 
 def parse_name_status(payload: bytes) -> tuple[ScopeFile, ...]:
     """Parse Git's NUL-delimited name-status output without normalization."""
-    if not isinstance(payload, bytes) or not payload or not payload.endswith(b"\0"):
+    if not isinstance(payload, bytes):
+        raise ScopeValidationError("malformed name-status output")
+    if payload == b"":
+        return ()
+    if not payload.endswith(b"\0"):
         raise ScopeValidationError("malformed name-status output")
     fields = payload[:-1].split(b"\0")
     records: list[ScopeFile] = []
@@ -258,7 +262,7 @@ def _parse_manifest(path: Path) -> ScopeManifest:
         elif previous is not None or "previous_filename" in file:
             raise ScopeValidationError("invalid scope manifest file")
         parsed_files.append(ScopeFile(status, filename, previous))
-    if not parsed_files or len({file.filename for file in parsed_files}) != len(parsed_files):
+    if len({file.filename for file in parsed_files}) != len(parsed_files):
         raise ScopeValidationError("invalid scope manifest file identity")
     return ScopeManifest(repository, pr_number, merge_base_sha, head_sha, tuple(parsed_files))
 
@@ -369,7 +373,9 @@ def load_review_scope(
     if diff_mode not in {"full", "delta"}:
         raise ScopeValidationError("invalid selected range")
     manifest = _parse_manifest(manifest_path)
-    _read_utf8_file(selected_diff_path, "selected diff", nonempty=True)
+    selected_diff = _read_utf8_file(
+        selected_diff_path, "selected diff", nonempty=bool(manifest.files),
+    )
     if manifest.repository != expected_repository:
         raise ScopeValidationError("scope repository does not match")
     try:
@@ -385,6 +391,8 @@ def load_review_scope(
     ))
     if reconstructed != manifest.files:
         raise ScopeValidationError("scope manifest cannot be reconstructed")
+    if not manifest.files and (diff_mode != "full" or selected_diff != ""):
+        raise ScopeValidationError("empty scope is not an exact full review")
     left = selected_left(manifest, diff_mode, previous_sha)
     if diff_mode == "delta" and _git(
         repository_root, "merge-base", "--is-ancestor", left, manifest.head_sha
