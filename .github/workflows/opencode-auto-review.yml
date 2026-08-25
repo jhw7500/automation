@@ -443,6 +443,7 @@ jobs:
           previous-sha: ${{ steps.ctx.outputs.previous_sha }}
           previous-full-hash: ${{ steps.ctx.outputs.previous_full_hash }}
           context-lines: '3'
+          output-directory: ${{ github.workspace }}
 
       - name: Seal review scope manifest
         id: scope-integrity

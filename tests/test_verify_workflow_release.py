@@ -2075,6 +2075,27 @@ def test_v146_requires_review_diff_outputs_outside_the_checkout_workspace(
         release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
+def test_v146_requires_explicit_opencode_review_diff_output_directory(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+
+    def remove_output_directory(step: dict) -> None:
+        step["with"].pop("output-directory")
+
+    mutate_named_step(
+        path,
+        "opencode-prepare",
+        "Prepare review diff",
+        remove_output_directory,
+    )
+    bad_commit = commit(repo, "remove OpenCode review diff output directory")
+
+    with pytest.raises(ReleaseVerificationError, match="output directory contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
 def test_v146_rejects_an_opencode_canonicalizer_dependency(
     current_release_repo: tuple[Path, str],
 ) -> None:

@@ -60,7 +60,7 @@ OPENCODE_REVIEW_RUN_SHA256 = (
     "9f1468128086b438cce0ce53fc20a9f0e02a14d581cd12b63f021c8c3a7620c6"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
-    "6b8eac9a738fb44e0b2621e4e461bddee1aee50b3029f230c9704c6e35440d0f"
+    "af209bfc73798a0cdda8d2f024f8392004c26814069cc244b80c298dd46b8d0f"
 )
 # These immutable annotated v1.45 patch releases predate format repair. Only their
 # exact peeled commits may retain the legacy generic command; no new commit may opt in.
@@ -2737,6 +2737,21 @@ def _verify_review_action_dependencies(
                 f"{name} prepare-review-diff dependency or review action "
                 "dependency contract is invalid"
             )
+        if _release_version(ref) >= (1, 46) and name == "opencode-auto-review.yml":
+            prepare_steps = [
+                step
+                for job in document.get("jobs", {}).values()
+                if isinstance(job, dict)
+                for step in job.get("steps", [])
+                if isinstance(step, dict)
+                and step.get("uses") == PREPARE_REVIEW_DIFF_ACTION
+            ]
+            if len(prepare_steps) != 1 or prepare_steps[0].get("with", {}).get(
+                "output-directory"
+            ) != "${{ github.workspace }}":
+                raise ReleaseVerificationError(
+                    f"{name} prepare-review-diff output directory contract is invalid"
+                )
 
 
 def _named_step(job: object, name: str) -> dict:

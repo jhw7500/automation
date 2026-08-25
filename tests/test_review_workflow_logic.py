@@ -5548,6 +5548,7 @@ def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
         "previous-sha": "${{ steps.ctx.outputs.previous_sha }}",
         "previous-full-hash": "${{ steps.ctx.outputs.previous_full_hash }}",
         "context-lines": "3",
+        "output-directory": "${{ github.workspace }}",
     }
     assert seal["if"] == "steps.prepare-diff.outputs.diff-ready == 'true'"
     assert model["if"] == (

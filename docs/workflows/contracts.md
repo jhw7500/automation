@@ -202,6 +202,9 @@ boundary. These inputs are therefore outside `${{ github.workspace }}` before th
 `actions/checkout --force` of the captured PR head and cannot be replaced by a PR-controlled
 tracked file or symlink. Provider output, canonical output, and result JSON remain fixed workspace
 paths, but the workflow unlinks them and creates them only after that final checkout.
+OpenCode binds the directory explicitly to `${{ github.workspace }}` because its prepare job has no
+later checkout; it immediately copies the atomically replaced regular files into its sealed
+`${{ runner.temp }}` handoff before the no-checkout model job starts.
 
 The underlying CLI prints one JSON object with `diff_ready`, `diff_mode`, `head_sha`, `base_sha`,
 `full_diff_sha256`, `unchanged_since_previous`, and `warning`. The composite output bridge exposes
