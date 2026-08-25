@@ -5400,6 +5400,33 @@ def test_gemini_records_provider_timeout_failure_reason(tmp_path):
     assert (tmp_path / "gemini_failure_reason.txt").read_text() == "provider_timeout"
 
 
+def test_gemini_classifies_google_499_cancelled_as_provider_timeout(tmp_path):
+    """The SDK's deadline cancellation must retain timeout identity."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "def configure(api_key=None): pass\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): pass\n"
+        "    def generate_content(self, prompt):\n"
+        "        raise RuntimeError(\"499 CANCELLED. {'error': {'code': 499, "
+        "'message': 'The operation was cancelled.', 'status': 'CANCELLED'}}\")\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path, env=_gemini_script_env(tmp_path), check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "provider_timeout"
+
+
 # ---------------------------------------------------------------------------
 # auto-rereview-request: reviewer detection (bash + jq)
 # ---------------------------------------------------------------------------

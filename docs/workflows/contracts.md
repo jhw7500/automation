@@ -476,10 +476,10 @@ watchdog is 450 seconds (plus a 15-second hard-kill grace), and the job timeout 
 reserves 135 seconds of the job budget outside the watchdog window for setup overhead, cleanup, and
 sticky publication. The watchdog measures elapsed time and normalizes a hard-kill status (`137`) to
 the timeout status only after the configured process deadline has elapsed; an earlier signal exit
-remains a generic provider failure. An SDK timeout or subprocess deadline records
-`provider_timeout`; the non-cancelled upsert path publishes that reason as a failed/stale attempt
-without advancing `Reviewed`. The job timeout is the last-resort ceiling and remains below the
-12-minute `/jhw:ship` review-round deadline.
+remains a generic provider failure. An SDK timeout, a Google API `499 CANCELLED` deadline response,
+or the subprocess deadline records `provider_timeout`; the non-cancelled upsert path publishes that
+reason as a failed/stale attempt without advancing `Reviewed`. The job timeout is the last-resort
+ceiling and remains below the 12-minute `/jhw:ship` review-round deadline.
 
 Gemini 429 handling separates retry eligibility from the final failure classification. A positive
 provider `RetryInfo`/`Please retry in` delay remains authoritative even when the same response

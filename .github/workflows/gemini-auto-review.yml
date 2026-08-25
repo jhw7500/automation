@@ -757,6 +757,9 @@ jobs:
                   return 'output_truncated'
               if isinstance(err, TimeoutError) or (
                   httpx is not None and isinstance(err, httpx.TimeoutException)
+              ) or (
+                  re.search(r'\b499\b', message)
+                  and ('cancelled' in message or 'canceled' in message)
               ):
                   return 'provider_timeout'
               if is_rate_limited(err):
