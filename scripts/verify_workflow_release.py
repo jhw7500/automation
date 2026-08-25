@@ -47,10 +47,10 @@ OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
 )
 OPENCODE_REVIEW_RUN_SHA256 = (
-    "fca63cc2d9f724401f340855379a23b16095220a5c8b9c84c258c16a239b0d81"
+    "9f1468128086b438cce0ce53fc20a9f0e02a14d581cd12b63f021c8c3a7620c6"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
-    "a12ec7f194f85a317f593cb43758d7a4c4be66ef55ae2b03fa4950e5be3b92fe"
+    "6b8eac9a738fb44e0b2621e4e461bddee1aee50b3029f230c9704c6e35440d0f"
 )
 # These immutable annotated v1.45 patch releases predate format repair. Only their
 # exact peeled commits may retain the legacy generic command; no new commit may opt in.
@@ -1413,7 +1413,32 @@ def verify_opencode_runtime(
         and "SIGNATURE_HEADING = re.compile(" in run_script
         and "re.IGNORECASE | re.ASCII," in run_script
         and "def signature_section_name(line):" in run_script
+        and "def first_section_index(lines, candidate_nonce):" in run_script
+        and run_script.count("first_section_index(lines, candidate_nonce)") == 3
+        and 'nonce_line = f"<!-- automation-candidate:{candidate_nonce} -->"'
+        in run_script
+        and "if len(nonce_bound_candidates) == 1:" in run_script
+        and "if len(fence_candidates) == 1:" in run_script
+        and "substance_signature(candidate, candidate_nonce)" in run_script
         and "signature_mode=True" in run_script
+        and "BENIGN_WRAPPER_PROSE = re.compile(" in run_script
+        and "BENIGN_WRAPPER_DECORATED_PROSE = re.compile(" in run_script
+        and "ALLOWLIST_SIMPLE_HTML_TAG_NAMES = frozenset(" in run_script
+        and (
+            "if normalized_name not in ALLOWLIST_SIMPLE_HTML_TAG_NAMES:"
+            in run_script
+        )
+        and "def wrapper_indented_code_block_end(" in run_script
+        and "def is_benign_wrapper_prose_line(line):" in run_script
+        and "def wrapper_line_closes_setext_paragraph(" in run_script
+        and run_script.count("wrapper_line_closes_setext_paragraph(") == 4
+        and "def wrapper_setext_underline_indices(lines):" in run_script
+        and run_script.count("wrapper_setext_underline_indices(") == 2
+        and "def has_unapproved_plain_wrapper_prose(lines):" in run_script
+        and run_script.count("has_unapproved_plain_wrapper_prose(") == 3
+        and "if not is_benign_wrapper_prose_line(lines[index]):" in run_script
+        and "has_unapproved_plain_wrapper_prose(suffix)" in run_script
+        and "has_unapproved_plain_wrapper_prose(prefix)" in run_script
         and "def has_unapproved_markdown_list_item(lines):" in run_script
         and "def is_benign_wrapper_list_item(content):" in run_script
         and "def benign_list_item_has_unapproved_continuation(" in run_script
@@ -1421,17 +1446,25 @@ def verify_opencode_runtime(
         and "expanded = continuation.expandtabs(4)" in run_script
         and "if saw_blank:" in run_script
         and "def list_item_fenced_code_end(" in run_script
-        and "def wrapper_literal_block_end(lines, start_index):" in run_script
+        and "def wrapper_literal_block_end(" in run_script
+        and "incomplete_html_type in (1, 2, 3, 4, 5)" in run_script
+        and 'incomplete_fence[1].strip(" \\t")' in run_script
+        and 'opening_fence[1].strip(" \\t")' in run_script
+        and "if index in setext_underline_indices:" in run_script
         and "has_unapproved_markdown_list_item(suffix)" in run_script
         and "has_unapproved_markdown_list_item(prefix)" in run_script
         and 'if re.match(r"^<![A-Z]", content) is not None:' in run_script
         and "MARKDOWN_EMPTY_LIST_ITEM.fullmatch(remainder) is not None" in run_script
+        and run_script.count(
+            "or MARKDOWN_EMPTY_LIST_ITEM.fullmatch(remainder) is not None"
+        )
+        == 2
         and "line = raw_line.expandtabs(4)" in run_script
         and "has_unapproved_setext_heading(suffix)" in run_script
         and "has_unapproved_setext_heading(prefix)" in run_script
         and 'remainder = line.strip()' in run_script
         and 'unicodedata.category(character) == "Zs"' in run_script
-        and "normalize_finding_field_wrappers(line).strip()" in run_script
+        and "normalize_wrapper_allowlist_text(" in run_script
         and _opencode_review_run_sha256(run_script) == OPENCODE_REVIEW_RUN_SHA256
         and format_sequence_is_ordered
     )

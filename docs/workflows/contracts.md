@@ -352,28 +352,48 @@ JSON-encoded and explicitly labeled as untrusted data. The repair prompt forbids
 substance. The model job then derives a deterministic signature from each candidate's exact finding
 blocks grouped by section plus the `New findings: None` meaning. It accepts only a repaired candidate
 with the same signature; dropping, adding, moving, reclassifying, rewording, or changing an anchor is
-terminal. Only non-finding-like wrapper text surrounding the signed document, one matching
-enclosing CommonMark fence, required marker/nonce framing, empty carryover sections, and section
-ordering are excluded from that comparison. Signature generation canonicalizes ASCII case-only
+terminal. Outside the signed sections, only complete literal blocks, structural Markdown
+decoration, and exact members of the closed benign wrapper vocabulary may be removed. Any other
+nonblank free-form line is ambiguous substance and makes repair terminal, whether it appears before
+the first section, after an enclosing fence, in a blockquote, through a link/reference or HTML
+entity spelling, or behind an unmatched escaped delimiter. The guard is intentionally independent
+of finding keywords: generic prose can describe a real defect just as readily as a severity-labeled
+heading. Attribute-free inline presentation tags may be removed only from a closed tag-name set;
+arbitrary custom element names remain source text so a finding cannot be hidden in a tag name. One
+matching enclosing CommonMark fence, required marker/nonce framing, empty carryover
+sections, and section ordering are also excluded from the signature comparison. Signature generation canonicalizes ASCII case-only
 variants of the four allowed section headings, while the final outer validator still requires their
 exact spelling. Any CommonMark list item outside the signed document is treated as ambiguous
 substance and cannot be removed by repair unless its title exactly matches the closed benign
 wrapper vocabulary or it contains only a complete fenced code block. Prefix matches with added
 substance remain terminal, including indented and CommonMark lazy continuation lines. The same
-guard covers an empty marker with an indented continuation. After a blank line, a quoted item must
+guard covers an empty marker with an indented continuation. The one exception is a single `-` that
+closes an already-open benign paragraph as a CommonMark Setext underline; a following complete
+indented-code or HTML literal block is wrapper data, not list-item substance. `+`, `*`, and ordered
+empty markers do not receive that exception. A standalone empty marker remains removable but never
+opens a paragraph, so a later `-` cannot manufacture this Setext exception. After a blank line, a quoted item must
 replay its quote containers; missing markers end the item instead of inheriting root indentation.
 For these block decisions, only an empty line or ASCII spaces/tabs are CommonMark blank; Unicode
 spaces and Python-only control whitespace remain paragraph content. A standalone empty item or
-thematic break remains repairable. An enclosing fence may use
+thematic break remains repairable. When more than one root fence contains an allowed section
+heading, the signature parser selects only the unique fence containing this run's exact adjacent
+marker/nonce pair. Multiple nonce-bound fences, or multiple unbound candidate fences, fail closed
+instead of letting an earlier example shadow the actual review. A lone unbound fence remains
+eligible for the one format-only repair. An enclosing fence may use
 backticks or tildes with
 any valid info string; its closing run must use the same character and be at least as long as the
-opening run, and only ASCII spaces or tabs may follow a closing run. Empty optional carryover
-sections are equivalent to omission; an empty `New findings` section remains terminal. Fences
+opening run, and only ASCII spaces or tabs may follow a closing run. An incomplete fence, list
+fence, or HTML block with an
+explicit terminator fails closed on its first scan so maximum-size untrusted candidates remain
+bounded. Empty optional carryover sections are equivalent to omission; an empty `New findings`
+section remains terminal. Fences
 inside a finding remain signed substance. A finding heading with an explicit bracketed or
 colon-delimited `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, or `P0`–`P3` marker remains unsafe to drop.
 The same applies when that exact marker is separated from its title by `-` or `–` with horizontal
-space on both sides, or by `—` with or without surrounding horizontal space. This does not include
-hyphenated prose or ranges such as `Medium-term`, `P1-Review`, or `P1–P3`. Emphasis or code-span
+space on both sides, or by `—` with or without surrounding horizontal space. This recognizer does not
+classify hyphenated prose or ranges such as `Medium-term`, `P1-Review`, or `P1–P3` as severity
+headings; the independent free-prose guard still rejects them unless the complete line is in the
+closed benign vocabulary. Emphasis or code-span
 delimiters may close immediately before any separator. An exact `P0`–`P3` marker followed by a
 period and at least one horizontal space is also protected; this intentionally excludes word
 severities followed by a period, `P4`/`P10`, decimals such as `P1.2`, and unspaced forms such as
@@ -382,7 +402,8 @@ severities followed by a period, `P4`/`P10`, decimals such as `P1.2`, and unspac
 bracketed with optional emphasis/code decoration, used as a standalone heading, or followed by an
 optional numeric identifier and one of the same colon/dash separators. Longer lookalikes such as
 `Bugfix`, `Finding aid`, `Issues reviewed`,
-`Risk assessment`, and `No findings` remain wrapper text. Separator and field-colon boundaries
+`Risk assessment`, and `No findings` are not defect-label matches. They are removable only in an
+exact allowlisted benign form such as the documented `...: Review complete` variants. Separator and field-colon boundaries
 accept only the closed Unicode horizontal-space
 set: ASCII space/tab, no-break and Ogham spaces, U+2000–U+200A spaces, narrow no-break space, medium
 mathematical space, and ideographic space. An exact `Changed anchor` or `Current line` field before
@@ -390,13 +411,14 @@ the first section is also protected, including
 optional H1–H6, emphasis, or code-span decoration and horizontal space before its colon. The field
 may be bare, introduced by `-`, `+`, or `*`, or reached inside nested Markdown quote, ordered-list,
 or task-list containers. Lookalikes such as `Changed anchors:`, `Current lines:`, and
-`Unchanged anchor:`, and generic labels such as `Summary:`, `Medium-term:`, `P4:`, and `P10:`,
-remain wrapper text. Unlabeled ATX headings are not assumed to be harmless: an H1–H6 heading before
+`Unchanged anchor:`, and generic labels such as `Summary:`, `Medium-term:`, `P4:`, and `P10:` are
+not reserved evidence fields, but arbitrary text using those labels is still rejected. Only their
+exact closed benign forms are removable. Unlabeled ATX headings are not assumed to be harmless: an H1–H6 heading before
 the first review section or after an enclosing fence makes repair terminal unless an H1–H3 title
 exactly matches the closed generic wrapper vocabulary (`Review`, an optional automated/OpenCode and
 code/PR/pull-request qualifier, an optional summary/overview/results/report/complete suffix, or the
 standalone `Summary`/`Overview`). The same vocabulary may follow an exact `[Note]`, `[Info]`, or
-`[Context]` tag; the documented plural evidence-field lookalikes remain harmless only in the exact
+`[Context]` tag; the documented plural evidence-field lookalikes are removable only in the exact
 `...: Review complete` title form. Matching is case-insensitive and may carry whole-title
 emphasis/code decoration or an ATX closing sequence, but prefix matches such as
 `Review: Authentication bypass`, `Security review`, and `Summary of failures` remain protected.
@@ -410,10 +432,11 @@ spaces of indentation, source-ordered nesting of blockquotes and list items, laz
 continuation text inside those containers, and an explicitly contained underline. The underline
 itself is never treated as a lazy continuation. A standalone thematic break, an outside-list
 thematic break, an empty list item, an internally spaced underline, fenced or indented code, and a
-CommonMark HTML block are not promoted to a Setext heading. The same exclusion covers a valid
-single-line link-reference definition and its one-line destination or title continuation. Inline
-HTML, autolinks, invalid closing tags, and lowercase `<!...>` lookalikes remain paragraph content
-and therefore do not bypass the guard.
+CommonMark HTML block are not promoted to a Setext heading. A valid single-line link-reference
+definition and its one-line destination or title continuation are likewise not Setext headings,
+but remain ambiguous free prose outside the signed document and therefore make repair terminal.
+Inline HTML, autolinks, invalid closing tags, and lowercase `<!...>` lookalikes remain paragraph
+content and do not bypass either guard.
 The same closed-vocabulary rule applies to a whole wrapper line enclosed by matching Markdown
 emphasis, strong-emphasis, strikethrough, or code-span delimiters: `**Review complete**` remains
 repairable, while an unlabeled title such as `**Authentication bypass**` is protected. This check

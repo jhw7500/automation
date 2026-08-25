@@ -667,6 +667,14 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
             'if repaired_signature="$(candidate_substance_signature "$candidate_dir/review-repaired.md")"; then',
         ),
         (
+            "              if len(nonce_bound_candidates) == 1:",
+            "              if nonce_bound_candidates:",
+        ),
+        (
+            "              if len(fence_candidates) == 1:",
+            "              if fence_candidates:",
+        ),
+        (
             '          EXPLICIT_DEFECT_LABEL = (\n'
             '              r"(?:findings?|bugs?|defects?|issues?|"\n'
             '              r"vulnerabilit(?:y|ies)|regressions?|problems?|"\n'
@@ -739,16 +747,68 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
             "                  lines[first_section:]",
         ),
         (
-            "                      has_unapproved_markdown_list_item(suffix)",
+            "          def has_unapproved_plain_wrapper_prose(lines):",
+            "          def has_unapproved_plain_wrapper_prose_disabled(lines):",
+        ),
+        (
+            "          def wrapper_line_closes_setext_paragraph(",
+            "          def wrapper_line_closes_setext_paragraph_disabled(",
+        ),
+        (
+            "          def wrapper_setext_underline_indices(lines):",
+            "          def wrapper_setext_underline_indices_disabled(lines):",
+        ),
+        (
+            "                      underlines.add(index)",
+            "                      pass",
+        ),
+        (
+            "                      has_unapproved_plain_wrapper_prose(suffix)",
             "                      False",
         ),
         (
-            "                  has_unapproved_markdown_list_item(prefix)",
+            "                  has_unapproved_plain_wrapper_prose(prefix)",
             "                  False",
+        ),
+        (
+            "                  if not is_benign_wrapper_prose_line(lines[index]):",
+            "                  if False:",
+        ),
+        (
+            "                      or BENIGN_WRAPPER_PROSE.fullmatch(remainder) is not None",
+            "                      or True",
+        ),
+        (
+            "                  if normalized_name not in ALLOWLIST_SIMPLE_HTML_TAG_NAMES:",
+            "                  if False:",
+        ),
+        (
+            "                      or has_unapproved_markdown_list_item(suffix)",
+            "                      or False",
+        ),
+        (
+            "                  or has_unapproved_markdown_list_item(prefix)",
+            "                  or False",
+        ),
+        (
+            "                  if index in setext_underline_indices:",
+            "                  if False:",
         ),
         (
             "                  literal_end = wrapper_literal_block_end(lines, index)",
             "                  literal_end = None",
+        ),
+        (
+            "                          or incomplete_html_type in (1, 2, 3, 4, 5)",
+            "                          or False",
+        ),
+        (
+            '                              and incomplete_fence[1].strip(" \\t")',
+            "                              and False",
+        ),
+        (
+            '                          and opening_fence[1].strip(" \\t")',
+            "                          and False",
         ),
         (
             "                      if is_benign_wrapper_list_item(content):",
@@ -787,8 +847,10 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
             '                  or character.isspace()',
         ),
         (
-            "normalize_finding_field_wrappers(line).strip()",
-            "normalize_finding_field_wrappers(line).lstrip()",
+            "                      ).strip()\n"
+            "                      return BENIGN_WRAPPER_HEADING.fullmatch(normalized) is None",
+            "                      ).lstrip()\n"
+            "                      return BENIGN_WRAPPER_HEADING.fullmatch(normalized) is None",
         ),
         (
             '                  " " if unicodedata.category(character) == "Cf" else character',
@@ -814,6 +876,8 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
         "substance-comparison-polarity",
         "initial-signature-polarity",
         "repaired-signature-polarity",
+        "nonce-bound-fence-uniqueness",
+        "unbound-fence-ambiguity",
         "explicit-defect-label",
         "unapproved-wrapper-heading",
         "canonical-finding-heading-depth",
@@ -831,9 +895,22 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
         "setext-reference-block-precedence",
         "ascii-case-only-section-heading",
         "signature-section-canonicalization",
+        "outside-plain-prose-helper",
+        "setext-paragraph-state-helper",
+        "setext-underline-indexer",
+        "setext-underline-index-record",
+        "outside-plain-prose-suffix-guard",
+        "outside-plain-prose-prefix-guard",
+        "outside-plain-prose-rejection",
+        "outside-plain-prose-allowlist",
+        "closed-inline-html-tag-names",
         "outside-list-suffix-guard",
         "outside-list-prefix-guard",
+        "outside-list-setext-underline-skip",
         "outside-list-literal-block-skip",
+        "incomplete-html-fail-fast",
+        "incomplete-root-fence-fail-fast",
+        "incomplete-list-fence-fail-fast",
         "outside-list-benign-vocabulary",
         "outside-list-benign-continuation-guard",
         "outside-list-postblank-container-replay",
