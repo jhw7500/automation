@@ -1305,6 +1305,72 @@ def test_reviewers_share_one_canonicalizer_each_and_opencode_has_no_shared_actio
         assert f"readFileSync('{raw_name}'" not in script
 
 
+@pytest.mark.parametrize(
+    (
+        "workflow_name",
+        "job_name",
+        "canonical_step_name",
+        "upload_step_name",
+        "candidate_name",
+        "artifact_prefix",
+    ),
+    (
+        (
+            "claude-code-review.yml",
+            "claude-review",
+            "Canonicalize Claude review",
+            "Upload rejected Claude review candidate",
+            "claude-review.md",
+            "claude-review-candidate",
+        ),
+        (
+            "gemini-auto-review.yml",
+            "gemini-review",
+            "Canonicalize Gemini review",
+            "Upload rejected Gemini review candidate",
+            "gemini_review.md",
+            "gemini-review-candidate",
+        ),
+    ),
+)
+def test_rejected_canonical_candidates_are_retained_as_bounded_diagnostics(
+    workflow_name,
+    job_name,
+    canonical_step_name,
+    upload_step_name,
+    candidate_name,
+    artifact_prefix,
+):
+    job = _load(workflow_name)["jobs"][job_name]
+    canonical = _step({"jobs": {job_name: job}}, job_name, canonical_step_name)
+    upload = _step({"jobs": {job_name: job}}, job_name, upload_step_name)
+    upsert = _step({"jobs": {job_name: job}}, job_name, "Upsert review comment")
+    steps = job["steps"]
+
+    assert steps.index(canonical) < steps.index(upload) < steps.index(upsert)
+    assert upload == {
+        "name": upload_step_name,
+        "if": (
+            "${{ always() && steps.canonicalize-review.outcome != 'skipped' "
+            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+        ),
+        "uses": (
+            "actions/upload-artifact@"
+            "ea165f8d65b6e75b540449e92b4886f43607fa02"
+        ),
+        "with": {
+            "name": (
+                f"{artifact_prefix}-${{{{ github.run_id }}}}-"
+                "${{ github.run_attempt }}"
+            ),
+            "path": f"${{{{ github.workspace }}}}/{candidate_name}",
+            "if-no-files-found": "ignore",
+            "retention-days": "1",
+            "overwrite": "false",
+        },
+    }
+
+
 def test_gemini_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tmp_path):
     workflow = _load("gemini-auto-review.yml")
     steps = workflow["jobs"]["gemini-review"]["steps"]

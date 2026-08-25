@@ -820,6 +820,16 @@ jobs:
           previous-sha: ${{ steps.pr-details.outputs.previous_sha }}
           previous-review-file: ${{ steps.pr-details.outputs.previous_sha != '' && format('{0}/gemini-previous-review.md', github.workspace) || '' }}
 
+      - name: Upload rejected Gemini review candidate
+        if: ${{ always() && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.document-valid != 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gemini-review-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/gemini_review.md
+          if-no-files-found: ignore
+          retention-days: 1
+          overwrite: false
+
       # 리뷰 게시는 marker 달린 sticky 코멘트 하나로 upsert 한다(라운드마다 새 코멘트가 쌓이지
       # 않음). 실패 시 기존 정상 리뷰는 보존한다(교체 금지).
       # !cancelled(): 취소된 런이 정상 sticky를 에러로 덮어쓰지 않게 한다(always()는 취소에도 true).

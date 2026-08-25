@@ -2176,6 +2176,46 @@ def test_v146_rejects_reviewer_upsert_reading_the_raw_candidate(
 
 
 @pytest.mark.parametrize(
+    ("workflow", "upload_step"),
+    (
+        (
+            "claude-code-review.yml",
+            "Upload rejected Claude review candidate",
+        ),
+        (
+            "gemini-auto-review.yml",
+            "Upload rejected Gemini review candidate",
+        ),
+    ),
+)
+def test_v146_binds_rejected_candidate_diagnostics_to_one_day(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    upload_step: str,
+) -> None:
+    repo, _ = current_release_repo
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+    path = repo / ".github/workflows" / workflow
+
+    def retain_too_long(step: dict) -> None:
+        step["with"]["retention-days"] = "90"
+
+    mutate_named_step(
+        path,
+        contract["job"],
+        upload_step,
+        retain_too_long,
+    )
+    bad_commit = commit(repo, f"retain rejected {workflow} candidate too long")
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="review publication contract",
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
     "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
 )
 @pytest.mark.parametrize(

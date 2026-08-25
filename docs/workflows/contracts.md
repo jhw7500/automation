@@ -339,6 +339,10 @@ The canonicalizer fails the whole document for exactly these hard reasons: `cand
 `invalid_utf8`, `candidate_oversize`, `ambiguous_document`, `scope_invalid`, and
 `canonicalizer_error`. A hard failure sets `document-valid=false`, makes the provider attempt a
 failed checkpoint, publishes no candidate prose, and cannot advance the successful head or hash.
+After an attempted Claude or Gemini canonicalization that does not produce
+`document-valid=true`, the workflow uploads only the fixed raw candidate path as a uniquely named,
+non-overwriting diagnostic artifact for one day. A missing candidate is ignored. This artifact is
+diagnostic data only: neither the upsert program nor later review state or carryover reads it.
 
 Once the document boundary and trusted scope are valid, a bad individual block does not discard
 valid siblings. It is filtered or normalized with exactly one of `invalid_anchor`,

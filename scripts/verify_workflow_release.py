@@ -2738,6 +2738,30 @@ def _expected_prepared_head_checkout_step() -> dict[str, object]:
     }
 
 
+def _expected_rejected_candidate_upload_step(
+    contract: dict[str, str],
+) -> dict[str, object]:
+    reviewer = contract["reviewer"]
+    return {
+        "name": f"Upload rejected {reviewer.capitalize()} review candidate",
+        "if": (
+            "${{ always() && steps.canonicalize-review.outcome != 'skipped' "
+            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+        ),
+        "uses": UPLOAD_ARTIFACT_ACTION,
+        "with": {
+            "name": (
+                f"{reviewer}-review-candidate-${{{{ github.run_id }}}}-"
+                "${{ github.run_attempt }}"
+            ),
+            "path": f"${{{{ github.workspace }}}}/{contract['raw']}",
+            "if-no-files-found": "ignore",
+            "retention-days": "1",
+            "overwrite": "false",
+        },
+    }
+
+
 def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
     jq_state_keys = json.dumps(list(QUALITY_STATE_KEYS))
     js_state_keys = ", ".join(repr(key) for key in QUALITY_STATE_KEYS)
@@ -2774,6 +2798,14 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
             canonical_step = _named_step(job, contract["canonical_step"])
             if canonical_step != _expected_canonicalize_step(contract):
                 raise ValueError("canonicalizer call differs")
+            rejected_candidate_upload = _named_step(
+                job,
+                f"Upload rejected {contract['reviewer'].capitalize()} review candidate",
+            )
+            if rejected_candidate_upload != _expected_rejected_candidate_upload_step(
+                contract
+            ):
+                raise ValueError("rejected candidate diagnostic differs")
             prepared_head_checkout = _named_step(
                 job, "Checkout prepared review head"
             )
@@ -2810,6 +2842,7 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 < job["steps"].index(prepared_head_checkout)
                 < job["steps"].index(provider)
                 < job["steps"].index(canonical_step)
+                < job["steps"].index(rejected_candidate_upload)
             ):
                 raise ValueError("prepared review head checkout order differs")
             prompt = (
@@ -2823,6 +2856,11 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 raise ValueError("quality prompt differs")
 
             upsert = _named_step(job, "Upsert review comment")
+            if not (
+                job["steps"].index(rejected_candidate_upload)
+                < job["steps"].index(upsert)
+            ):
+                raise ValueError("rejected candidate diagnostic order differs")
             upsert_script = upsert.get("with", {}).get("script", "")
             if not isinstance(upsert_script, str):
                 raise ValueError("upsert script is unavailable")
@@ -2956,7 +2994,10 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
     if release_supports_prepare_review_diff(ref):
         approved_actions |= {PREPARE_REVIEW_DIFF_ACTION}
     if release_supports_canonicalize_review(ref):
-        approved_actions |= {CANONICALIZE_REVIEW_ACTION}
+        approved_actions |= {
+            CANONICALIZE_REVIEW_ACTION,
+            UPLOAD_ARTIFACT_ACTION,
+        }
     unapproved_actions = sorted(set(_action_references(document)) - approved_actions)
     if unapproved_actions:
         raise ReleaseVerificationError(
