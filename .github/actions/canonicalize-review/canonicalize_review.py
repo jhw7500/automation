@@ -372,6 +372,7 @@ def _candidate_json_line(value: dict[str, object]) -> str:
 def _json_line(value: dict[str, object]) -> str:
     return _candidate_json_line(value).translate(str.maketrans({
         "<": "\\u003c", ">": "\\u003e", "&": "\\u0026",
+        "\x85": "\\u0085", "\u2028": "\\u2028", "\u2029": "\\u2029",
     }))
 
 

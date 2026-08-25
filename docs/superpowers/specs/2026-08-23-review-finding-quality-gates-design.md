@@ -157,6 +157,8 @@ Rules:
 - severity is exactly `CRITICAL`, `HIGH`, or `MEDIUM`;
 - the changed anchor JSON contains only `path` and positive safe-integer `line`;
 - one or more trigger-evidence lines may appear, each containing only `path`, `line`, and `quote`;
+- canonical JSON escapes every Python `splitlines()` boundary, including U+0085, U+2028, and
+  U+2029, while decoding back to the exact validated path or quotation;
 - impact class is exactly one of `runtime`, `security`, `data-integrity`, `user-visible`, or
   `performance`;
 - material impact is a non-empty single paragraph and cannot use uncertainty phrases as evidence;

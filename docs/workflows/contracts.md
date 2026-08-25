@@ -293,8 +293,12 @@ and `- Removed line: "exact previous source line"`; no other section may use tha
 current and removed pairs cannot be mixed. JSON string escaping makes every UTF-8 path reversible,
 including embedded newlines, backticks, colons, Unicode, and leading dashes. Duplicate keys, extra
 keys, alternate/noncanonical serialization, malformed JSON, empty paths, non-positive or unsafe
-line integers, and evidence-like noncanonical field labels fail closed. Markdown link/image,
-HTML tag/comment, and HTML entity wrappers are normalized only for reserved-label detection.
+line integers, and evidence-like noncanonical field labels fail closed. Canonical JSON rendering
+also escapes every character that Python `splitlines()` recognizes as a
+line boundary, including U+0085, U+2028, and U+2029, so a validated escaped path or quotation cannot
+poison the next round's strict prior-document layout.
+Markdown link/image, HTML tag/comment, and HTML entity wrappers are normalized only for
+reserved-label detection.
 Markdown destinations are consumed with balanced delimiters and quoted-title state rather than a
 greedy match. The complete semicolon-terminated HTML5 alias set whose decoded value consists only
 of whitespace, invisible format characters, supported decorators, or a colon is normalized;

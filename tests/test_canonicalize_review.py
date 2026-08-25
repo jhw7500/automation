@@ -1477,6 +1477,27 @@ def test_json_renderer_escapes_control_bytes_without_changing_decoded_trigger_or
         assert json.loads(encoded)["quote"] == marker
 
 
+@pytest.mark.parametrize(
+    "boundary",
+    ("\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"),
+)
+def test_json_renderer_escapes_every_splitlines_boundary(boundary):
+    """Canonical JSON must remain one Markdown line after decoding candidate escapes."""
+    value = {
+        "path": f"dir/a{boundary}b.py",
+        "line": 1,
+        "quote": f"left{boundary}right",
+    }
+
+    encoded = canonicalize_review._json_line(value)
+
+    assert encoded.splitlines() == [encoded]
+    assert boundary not in encoded
+    if ord(boundary) >= 0x80:
+        assert f"\\u{ord(boundary):04x}" in encoded
+    assert json.loads(encoded) == value
+
+
 def test_current_resolved_fix_anchor_accepts_literal_json_controls_and_authenticates_output(
     review_quality_repo,
 ):

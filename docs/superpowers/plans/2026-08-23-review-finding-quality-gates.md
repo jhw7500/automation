@@ -18,6 +18,8 @@
   and unsupported-location failures do not trigger fallback. Primary retries and fallback share the
   existing three-request ceiling.
 - Keep provider output at a hard 60,000-byte maximum and decode it with fatal UTF-8 handling.
+- Escape every Python `splitlines()` boundary in canonical JSON output, including U+0085, U+2028,
+  and U+2029, while preserving exact JSON decoding for authenticated prior-round reconstruction.
 - Hard reasons are exactly `candidate_missing`, `invalid_utf8`, `candidate_oversize`, `ambiguous_document`, `scope_invalid`, and `canonicalizer_error`.
 - Soft reasons are exactly `invalid_anchor`, `invalid_trigger_evidence`, `invalid_severity`, `invalid_impact_class`, `missing_material_impact`, `unsupported_performance_basis`, `non_actionable_category`, `unknown_prior_id`, `duplicate_prior_binding`, and `missing_fix_anchor`.
 - Allowed severities are exactly `CRITICAL`, `HIGH`, and `MEDIUM`; `LOW` is non-actionable.
