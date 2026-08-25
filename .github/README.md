@@ -49,8 +49,10 @@ Automatically reviews pull requests when opened or updated.
 - Critical issue detection (security, bugs, breaking changes)
 - Code quality suggestions
 - Performance considerations
-- Uses the Gemini model set by the `GEMINI_MODEL` repo/org variable (default: `gemini-3-flash-preview`)
-- Bounds provider waits with a 7-minute SDK timeout, 7.5-minute process watchdog, and 10-minute job ceiling
+- Uses the Gemini model set by the `GEMINI_MODEL` repo/org variable (default: `gemini-3.7-flash`)
+- Tries `GEMINI_FALLBACK_MODEL` once after a retryable provider failure (default: `gemini-3.6-flash`)
+- Shares the existing three-request ceiling across primary retries and fallback
+- Bounds each provider call at 200 seconds, with a 7.5-minute process watchdog and 10-minute job ceiling
 
 **Triggers:** Automatically on PR opened or synchronized (new commits pushed)
 
@@ -214,10 +216,16 @@ pins (`@v1.28` and earlier) ignore the setting.
 
 ### Changing Gemini Model
 
-The Gemini model is read from the `GEMINI_MODEL` repository/organization Actions
-**variable** (not a secret). If unset, it defaults to `gemini-3-flash-preview`.
-A separate `GEMINI_FALLBACK_MODEL` variable (default `gemini-3-flash-preview`) is
-used if the primary model call fails. No workflow file edit is required.
+The automatic review model is read from the `GEMINI_MODEL`
+repository/organization Actions **variable** (not a secret). If unset, it
+defaults to the stable `gemini-3.7-flash` model. A separate
+`GEMINI_FALLBACK_MODEL` variable defaults to stable `gemini-3.6-flash` and is
+tried once after provider, timeout, quota/rate-limit, empty-output, or
+truncated-output failure. Authentication and canonical-format failures do not
+trigger fallback, and equal primary/fallback values never duplicate a call. No
+workflow file edit is required. Primary retries and fallback share a maximum of
+three provider requests, so enabling fallback does not multiply the previous
+request ceiling.
 
 ### Filtering Claude Reviews by Author
 

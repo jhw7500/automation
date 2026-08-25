@@ -69,7 +69,7 @@ claude:
   model: ""
 
 gemini:
-  model: "gemini-3-flash-preview"
+  model: "gemini-3.7-flash"
   max_session_turns: 25
   # Docker image with digest pinning for supply chain security
   # To update: docker pull <image>:<tag> && docker inspect --format='{{index .RepoDigests 0}}' <image>:<tag>

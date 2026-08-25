@@ -58,7 +58,10 @@ therefore express the intended policy but cannot enforce it.
    boundaries, current-head identity, or complete output.
 6. Make filtering visible and authenticated without repeating the rejected claim in the PR
    discussion.
-7. Add no provider/model request and consume no additional daily API quota.
+7. Add no provider/model request from canonicalization. The successful primary path remains one
+   request; a terminal provider, timeout, model-specific limit, empty-output, or truncated-output
+   failure may use one configured fallback model. Primary retries and fallback share the existing
+   three-request ceiling.
 8. Use one implementation and one deterministic corpus for Claude and Gemini.
 
 ## 4. Non-goals
@@ -459,7 +462,9 @@ counts and highest claimed severity without repeating rejected prose.
 ### Add a second model/critic call
 
 Rejected for this iteration because it consumes daily quota, adds provider latency and failure modes,
-and still cannot create a deterministic correctness boundary.
+and still cannot create a deterministic correctness boundary. This does not prohibit the bounded
+availability fallback above: the fallback replaces a failed primary result and is never used as a
+second opinion or after canonical-format rejection.
 
 ## 15. Residual risks
 

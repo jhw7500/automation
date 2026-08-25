@@ -365,7 +365,8 @@ jobs:
         if: ${{ steps.reset-gemini-artifacts.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3-flash-preview' }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.7-flash' }}
+          GEMINI_FALLBACK_MODEL: ${{ vars.GEMINI_FALLBACK_MODEL || 'gemini-3.6-flash' }}
           GEMINI_THINKING_LEVEL: ${{ vars.GEMINI_THINKING_LEVEL || 'medium' }}
           GEMINI_DIFF_INPUT_CHARS: ${{ vars.GEMINI_DIFF_INPUT_CHARS || '900000' }}
           GEMINI_REVIEW_PROCESS_TIMEOUT: '450'
@@ -419,7 +420,9 @@ jobs:
               record_failure_reason('authentication_failed')
               exit(1)
 
-          gemini_model = os.environ.get('GEMINI_MODEL', 'gemini-3-flash-preview')
+          gemini_model = (os.environ.get('GEMINI_MODEL') or 'gemini-3.7-flash').strip()
+          fallback_model = (os.environ.get('GEMINI_FALLBACK_MODEL') or '').strip()
+          provider_request_timeout_ms = 200_000
           thinking_level = os.environ.get('GEMINI_THINKING_LEVEL', 'medium').lower()
           # low/medium/high are shared by the supported Gemini 3 text models. Avoid
           # model-specific values such as minimal when GEMINI_MODEL is overridden.
@@ -431,22 +434,24 @@ jobs:
           if USING_CURRENT_SDK:
               client = google_genai.Client(
                   api_key=api_key,
-                  http_options=genai_types.HttpOptions(timeout=420_000),
+                  http_options=genai_types.HttpOptions(timeout=provider_request_timeout_ms),
               )
               generation_config = genai_types.GenerateContentConfig(
                   thinking_config=genai_types.ThinkingConfig(thinking_level=thinking_level),
               )
 
-              def generate_content(prompt):
+              def generate_content(prompt, model):
                   return client.models.generate_content(
-                      model=gemini_model, contents=prompt, config=generation_config
+                      model=model, contents=prompt, config=generation_config
                   )
           else:
               legacy_genai.configure(api_key=api_key)
-              legacy_model = legacy_genai.GenerativeModel(gemini_model)
+              legacy_models = {}
 
-              def generate_content(prompt):
-                  return legacy_model.generate_content(prompt)
+              def generate_content(prompt, model):
+                  if model not in legacy_models:
+                      legacy_models[model] = legacy_genai.GenerativeModel(model)
+                  return legacy_models[model].generate_content(prompt)
 
           # Read PR details
           with open(os.environ.get('PR_TITLE_FILE', 'pr_title.txt'), 'r') as f:
@@ -770,12 +775,20 @@ jobs:
                   return 'authentication_failed'
               return 'provider_failed'
 
-          try:
-              prompt = build_prompt(pr_diff)
+          FALLBACK_FAILURE_REASONS = {
+              'provider_failed',
+              'provider_timeout',
+              'quota_exhausted',
+              'rate_limited',
+              'empty_output',
+              'output_truncated',
+          }
+
+          def request_review(prompt, model, max_attempts):
               review_text = ''
-              for attempt in range(3):
+              for attempt in range(max_attempts):
                   try:
-                      response = generate_content(prompt)
+                      response = generate_content(prompt, model)
                   except Exception as error:
                       if (
                           is_rate_limited(error)
@@ -787,7 +800,7 @@ jobs:
                               "skipping unrecoverable retries"
                           )
                           raise
-                      if not is_rate_limited(error) or attempt == 2:
+                      if not is_rate_limited(error) or attempt == max_attempts - 1:
                           raise
                       # 서버 대기시간을 절대 줄이지 않으며, 지터는 동시 재시도만 분산한다.
                       delay_floor = max(RETRY_SLEEP * (2 ** attempt), server_retry_delay(error))
@@ -798,7 +811,10 @@ jobs:
                               "Gemini process budget; skipping retry"
                           )
                           raise
-                      print(f"Rate limited (attempt {attempt + 1}/3): {error}; retrying in {delay:.2f}s")
+                      print(
+                          f"Rate limited (attempt {attempt + 1}/{max_attempts}): {error}; "
+                          f"retrying in {delay:.2f}s"
+                      )
                       time.sleep(delay)
                       continue
                   review_text = strip_infra_lines(
@@ -809,14 +825,49 @@ jobs:
                           f"Gemini stopped at MAX_TOKENS: {response_diagnostics(response)}"
                       )
                   if review_text:
-                      break
+                      return review_text
                   print(
-                      f"Empty Gemini response (attempt {attempt + 1}/3): "
+                      f"Empty Gemini response (attempt {attempt + 1}/{max_attempts}): "
                       f"{response_diagnostics(response)}"
                   )
-                  if attempt == 2:
-                      raise EmptyModelResponse('Gemini returned no review text after 3 attempts')
+                  if attempt == max_attempts - 1:
+                      raise EmptyModelResponse(
+                          f'Gemini returned no review text after {max_attempts} attempts'
+                      )
                   time.sleep(max(EMPTY_RETRY_SLEEP, 0) * (2 ** attempt))
+              raise EmptyModelResponse('empty Gemini review')
+
+          try:
+              prompt = build_prompt(pr_diff)
+              models = [gemini_model]
+              if fallback_model and fallback_model != gemini_model:
+                  models.append(fallback_model)
+              review_text = ''
+              for model_index, model in enumerate(models):
+                  try:
+                      # Preserve the pre-fallback three-request ceiling: when a distinct
+                      # fallback exists, reserve its single request from the primary's
+                      # retry allowance instead of multiplying both retry loops.
+                      max_attempts = 2 if model_index == 0 and len(models) == 2 else 1
+                      if len(models) == 1:
+                          max_attempts = 3
+                      review_text = request_review(prompt, model, max_attempts)
+                  except Exception as error:
+                      reason = provider_failure_reason(error)
+                      has_fallback = model_index == 0 and len(models) == 2
+                      fallback_budget = provider_request_timeout_ms / 1000 + RETRY_DEADLINE_MARGIN
+                      if (
+                          has_fallback
+                          and reason in FALLBACK_FAILURE_REASONS
+                          and retry_delay_fits_process_budget(fallback_budget)
+                      ):
+                          print(
+                              f"Gemini primary failed with {reason}; "
+                              "trying configured fallback"
+                          )
+                          continue
+                      raise
+                  break
               if not review_text:
                   raise EmptyModelResponse('empty Gemini review')
 

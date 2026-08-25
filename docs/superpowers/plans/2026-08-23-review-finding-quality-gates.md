@@ -12,7 +12,10 @@
 
 ## Global Constraints
 
-- Add no provider/model call: one Claude or Gemini generation remains one provider request.
+- Add no provider/model call from canonicalization. A successful primary generation remains one
+  provider request; Gemini may use one configured fallback model only after a terminal provider,
+  timeout, model-specific limit, empty-output, or truncated-output failure. Primary retries and
+  fallback share the existing three-request ceiling.
 - Keep provider output at a hard 60,000-byte maximum and decode it with fatal UTF-8 handling.
 - Hard reasons are exactly `candidate_missing`, `invalid_utf8`, `candidate_oversize`, `ambiguous_document`, `scope_invalid`, and `canonicalizer_error`.
 - Soft reasons are exactly `invalid_anchor`, `invalid_trigger_evidence`, `invalid_severity`, `invalid_impact_class`, `missing_material_impact`, `unsupported_performance_basis`, `non_actionable_category`, `unknown_prior_id`, `duplicate_prior_binding`, and `missing_fix_anchor`.
@@ -874,7 +877,9 @@ rtk git commit -m "feat(review): gate Claude findings before publication"
 **Interfaces:**
 - Consumes: `gemini_review.md`, `review-scope.json`, selected prepared diff, and optional authenticated `prev_review.txt` renamed to `gemini-previous-review.md`.
 - Produces: `gemini-review-canonical.md`, `gemini-review-result.json`, and the same schema-3 quality state as Claude.
-- Preserves: 429/daily-quota/provider diagnostics and retries; the canonicalizer adds no request or retry.
+- Preserves: 429/daily-quota/provider diagnostics and retries; the canonicalizer adds no request or
+  retry. The provider driver may make one bounded fallback attempt after an eligible terminal
+  primary failure, but never after authentication or canonical-format failure.
 
 - [ ] **Step 1: Write RED parity and prompt-consistency tests**
 
@@ -1192,7 +1197,8 @@ Expected: plan status `planned` or `reusable`, only managed workflow/config path
 On the rollout PR or a dedicated normal pim-check implementation PR, confirm:
 
 - both collectors ignore any old v2 state and prepare `diff-mode=full`;
-- Claude/Gemini each make one provider request;
+- Claude makes one provider request; Gemini makes one request on primary success or one primary plus
+  one configured fallback after an eligible terminal primary failure;
 - the shared action reports `document-valid=true`;
 - unsupported `plan_global`/basis-free performance candidates do not appear as actionable headings;
 - valid corpus-style findings remain if emitted;

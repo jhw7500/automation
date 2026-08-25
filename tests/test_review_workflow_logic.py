@@ -1854,7 +1854,7 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert "Fail-closed behavior is not a finding" in python
     assert "unauthenticated UI clutter alone is not a security impact" in python
     assert "Never emit a `Cannot verify`" in python
-    assert "for attempt in range(3)" in python
+    assert "for attempt in range(max_attempts)" in python
 
     assert _step(gemini, "gemini-review", "Get PR details")["env"]["PR_NUMBER"] == (
         "${{ inputs.pr_number || github.event.pull_request.number }}"
@@ -2377,7 +2377,9 @@ def test_gemini_review_job_terminates_before_ship_round_deadline():
     process_timeout_seconds = int(review_step["env"]["GEMINI_REVIEW_PROCESS_TIMEOUT"])
 
     assert job_timeout_seconds < 12 * 60
-    assert process_timeout_seconds >= 420 + 30
+    # Two bounded provider calls (primary + one fallback) fit before the process
+    # watchdog, while canonicalization/upsert retain a two-minute job reserve.
+    assert process_timeout_seconds >= (2 * 200) + 30
     assert process_timeout_seconds + 15 <= job_timeout_seconds - 120
 
 
@@ -4924,7 +4926,184 @@ def test_gemini_current_sdk_sets_finite_request_timeout(tmp_path):
         capture_output=True, text=True,
     )
 
-    assert (tmp_path / "request-timeout.txt").read_text() == "420000"
+    assert (tmp_path / "request-timeout.txt").read_text() == "200000"
+
+
+def test_gemini_auto_review_configures_stable_primary_and_fallback_models():
+    """The reusable reviewer owns stable defaults while repos may override either model."""
+    workflow = _load("gemini-auto-review.yml")
+    env = _step(workflow, "gemini-review", "Run Gemini Code Review")["env"]
+
+    assert env["GEMINI_MODEL"] == "${{ vars.GEMINI_MODEL || 'gemini-3.7-flash' }}"
+    assert env["GEMINI_FALLBACK_MODEL"] == (
+        "${{ vars.GEMINI_FALLBACK_MODEL || 'gemini-3.6-flash' }}"
+    )
+
+
+def test_gemini_uses_configured_fallback_after_primary_transport_failure(tmp_path):
+    """A provider transport failure gets one isolated attempt on the fallback model."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    google = tmp_path / "stub" / "google"
+    genai_stub = google / "genai"
+    genai_stub.mkdir(parents=True)
+    (google / "__init__.py").write_text("", encoding="utf-8")
+    (genai_stub / "types.py").write_text(
+        "class HttpOptions:\n"
+        "    def __init__(self, timeout): self.timeout = timeout\n"
+        "class ThinkingConfig:\n"
+        "    def __init__(self, thinking_level): self.thinking_level = thinking_level\n"
+        "class GenerateContentConfig:\n"
+        "    def __init__(self, thinking_config): self.thinking_config = thinking_config\n",
+        encoding="utf-8",
+    )
+    (genai_stub / "__init__.py").write_text(
+        "import pathlib\n"
+        "from . import types\n"
+        "class _R:\n"
+        "    text = 'FALLBACK REVIEW'\n"
+        "    candidates = []\n"
+        "    prompt_feedback = None\n"
+        "    usage_metadata = None\n"
+        "class _Models:\n"
+        "    def generate_content(self, *, model, contents, config):\n"
+        "        path = pathlib.Path('models.txt')\n"
+        "        with path.open('a') as f: f.write(model + '\\n')\n"
+        "        if model == 'primary-model':\n"
+        "            raise RuntimeError('Server disconnected without sending a response')\n"
+        "        return _R()\n"
+        "class Client:\n"
+        "    def __init__(self, api_key=None, http_options=None): self.models = _Models()\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env.update({
+        "GEMINI_MODEL": "primary-model",
+        "GEMINI_FALLBACK_MODEL": "fallback-model",
+    })
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "models.txt").read_text().splitlines() == [
+        "primary-model", "fallback-model",
+    ]
+    assert (tmp_path / "gemini_review.md").read_text() == "FALLBACK REVIEW"
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == ""
+
+
+def test_gemini_does_not_fallback_after_authentication_failure(tmp_path):
+    """A second model cannot repair an invalid credential and must not spend another call."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): self.name = name\n"
+        "    def generate_content(self, prompt):\n"
+        "        path = pathlib.Path('models.txt')\n"
+        "        with path.open('a') as f: f.write(self.name + '\\n')\n"
+        "        raise RuntimeError(\n"
+        "            \"400 INVALID_ARGUMENT: API key not valid. Please pass a valid API key; \"\n"
+        "            \"reason=API_KEY_INVALID\"\n"
+        "        )\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env.update({
+        "GEMINI_MODEL": "primary-model",
+        "GEMINI_FALLBACK_MODEL": "fallback-model",
+    })
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "models.txt").read_text().splitlines() == ["primary-model"]
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "authentication_failed"
+
+
+def test_gemini_skips_duplicate_fallback_model(tmp_path):
+    """Equal primary/fallback variables must never duplicate a failed provider request."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): self.name = name\n"
+        "    def generate_content(self, prompt):\n"
+        "        path = pathlib.Path('models.txt')\n"
+        "        with path.open('a') as f: f.write(self.name + '\\n')\n"
+        "        raise RuntimeError('Server disconnected without sending a response')\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env.update({
+        "GEMINI_MODEL": "same-model",
+        "GEMINI_FALLBACK_MODEL": "same-model",
+    })
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "models.txt").read_text().splitlines() == ["same-model"]
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "provider_failed"
+
+
+def test_gemini_fallback_preserves_three_request_ceiling(tmp_path):
+    """Existing retries and fallback share one request budget instead of multiplying it."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): self.name = name\n"
+        "    def generate_content(self, prompt):\n"
+        "        path = pathlib.Path('models.txt')\n"
+        "        with path.open('a') as f: f.write(self.name + '\\n')\n"
+        "        if self.name == 'primary-model':\n"
+        "            raise RuntimeError('429 rate limited; Please retry in 0s')\n"
+        "        raise RuntimeError('Server disconnected without sending a response')\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env.update({
+        "GEMINI_MODEL": "primary-model",
+        "GEMINI_FALLBACK_MODEL": "fallback-model",
+        "GEMINI_429_RETRY_SLEEP": "0",
+        "GEMINI_429_RETRY_JITTER": "0",
+    })
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "models.txt").read_text().splitlines() == [
+        "primary-model", "primary-model", "fallback-model",
+    ]
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "provider_failed"
 
 
 def test_gemini_rejects_nonempty_max_tokens_response(tmp_path):
