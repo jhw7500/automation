@@ -55,6 +55,7 @@ GEMINI_MARKER = "<!-- automation:gemini-auto-review -->"
 GEMINI_HEADER = "## 🔎 Gemini Code Review"
 GEMINI_V2_MARKER = "<!-- automation:gemini-auto-review:v2 -->"
 GEMINI_V3_MARKER = "<!-- automation:gemini-auto-review:v3 -->"
+GITHUB_ACTIONS_APP_ID = 15368
 
 
 def _state_line(
@@ -381,6 +382,19 @@ def _bot(
         "updated_at": updated if updated is not None else created,
         "body": body,
     }
+
+
+def _app_bot(
+    login: str,
+    body: str,
+    *,
+    app_id: int,
+    app_slug: str,
+    comment_id: int = 1,
+) -> dict:
+    comment = _bot(login, body, comment_id)
+    comment["performed_via_github_app"] = {"id": app_id, "slug": app_slug}
+    return comment
 
 
 def _review_run_fixtures(comments: list[dict], reviewer: str) -> list[dict]:
@@ -2065,6 +2079,9 @@ def _run_gemini_collection(
     workflow_runs: list[dict] | None = None,
     workflow_run_attempt_statuses: dict[str, int | str] | None = None,
     comments_fail: bool = False,
+    bot_login: str = "github-actions[bot]",
+    auth_mode: str = "github_token",
+    publisher_app_id: str = "",
 ) -> str:
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Get PR details")["run"]
@@ -2086,7 +2103,9 @@ def _run_gemini_collection(
         {
             "SERVER_URL": "https://github.com",
             "REPOSITORY": "example/repo",
-            "BOT_LOGIN": "github-actions[bot]",
+            "BOT_LOGIN": bot_login,
+            "AUTH_MODE": auth_mode,
+            "PUBLISHER_APP_ID": publisher_app_id,
             "ACTIONS_TOKEN": "actions-token-fixture",
             "GITHUB_WORKSPACE": str(tmp_path),
             "RUNNER_TEMP": str(tmp_path),
@@ -2111,6 +2130,9 @@ def _run_gemini_details(
     workflow_runs: list[dict] | None = None,
     workflow_run_attempt_statuses: dict[str, int | str] | None = None,
     comments_fail: bool = False,
+    bot_login: str = "github-actions[bot]",
+    auth_mode: str = "github_token",
+    publisher_app_id: str = "",
 ) -> tuple[str, dict[str, str]]:
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Get PR details")["run"]
@@ -2133,7 +2155,9 @@ def _run_gemini_details(
         {
             "SERVER_URL": "https://github.com",
             "REPOSITORY": "example/repo",
-            "BOT_LOGIN": "github-actions[bot]",
+            "BOT_LOGIN": bot_login,
+            "AUTH_MODE": auth_mode,
+            "PUBLISHER_APP_ID": publisher_app_id,
             "ACTIONS_TOKEN": "actions-token-fixture",
             "GITHUB_WORKSPACE": str(tmp_path),
             "RUNNER_TEMP": str(tmp_path),
@@ -2299,6 +2323,164 @@ def test_reviewer_publication_requires_successful_prior_state_collection(
     assert upsert["if"] == (
         f"${{{{ !cancelled() && steps.{collector_id}.outcome == 'success' }}}}"
     )
+
+
+@pytest.mark.parametrize(
+    ("auth_mode", "bot_login", "publisher_app_id", "previous"),
+    [
+        (
+            "github_token",
+            "github-actions[bot]",
+            "4242",
+            ("review-publisher[bot]", 4242, "review-publisher"),
+        ),
+        (
+            "github_app",
+            "review-publisher[bot]",
+            "4242",
+            ("github-actions[bot]", GITHUB_ACTIONS_APP_ID, "github-actions"),
+        ),
+    ],
+    ids=("app-to-token", "token-to-app"),
+)
+def test_gemini_collector_authenticates_supported_publisher_mode_migration(
+    tmp_path, auth_mode, bot_login, publisher_app_id, previous
+):
+    previous_login, previous_app_id, previous_slug = previous
+    head = "ab" * 20
+    sticky = _app_bot(
+        previous_login,
+        _v3_body(
+            _v3_state(reviewer="gemini", head=head),
+            "MIGRATED PRIOR REVIEW",
+            marker=GEMINI_V3_MARKER,
+            header=GEMINI_HEADER,
+        ),
+        app_id=previous_app_id,
+        app_slug=previous_slug,
+        comment_id=11,
+    )
+
+    prior, outputs = _run_gemini_details(
+        tmp_path,
+        [sticky],
+        head_sha=head,
+        bot_login=bot_login,
+        auth_mode=auth_mode,
+        publisher_app_id=publisher_app_id,
+    )
+
+    assert "MIGRATED PRIOR REVIEW" in prior
+    assert outputs == {"previous_sha": head, "previous_full_hash": "12" * 32}
+
+
+@pytest.mark.parametrize(
+    "performed_app",
+    [
+        None,
+        {"id": 4343, "slug": "review-publisher"},
+        {"id": 4242, "slug": "different-publisher"},
+    ],
+    ids=("missing-app-proof", "wrong-app-id", "wrong-app-slug"),
+)
+def test_gemini_collector_rejects_untrusted_previous_publisher(
+    tmp_path, performed_app
+):
+    head = "ab" * 20
+    sticky = _bot(
+        "review-publisher[bot]",
+        _v3_body(
+            _v3_state(reviewer="gemini", head=head),
+            "UNTRUSTED PRIOR REVIEW",
+            marker=GEMINI_V3_MARKER,
+            header=GEMINI_HEADER,
+        ),
+        11,
+    )
+    if performed_app is not None:
+        sticky["performed_via_github_app"] = performed_app
+
+    prior, outputs = _run_gemini_details(
+        tmp_path,
+        [sticky],
+        head_sha=head,
+        bot_login="github-actions[bot]",
+        auth_mode="github_token",
+        publisher_app_id="4242",
+    )
+
+    assert prior == ""
+    assert outputs == {"previous_sha": "", "previous_full_hash": ""}
+
+
+@pytest.mark.parametrize(
+    ("mode", "app_id", "publisher_app_id", "private_key"),
+    [
+        ("github_app", "4242", "4242", "private-key"),
+        ("github_app", "4242", "", "private-key"),
+        ("github_token", "", "4242", ""),
+        ("github_token", "", "", ""),
+    ],
+)
+def test_gemini_auth_validation_accepts_bounded_publisher_migration_hint(
+    mode, app_id, publisher_app_id, private_key
+):
+    step = _step(
+        _load("gemini-auto-review.yml"),
+        "gemini-review",
+        "Validate repository-write auth",
+    )
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", step["run"]],
+        env={
+            **os.environ,
+            "MODE": mode,
+            "APP_ID": app_id,
+            "PUBLISHER_APP_ID": publisher_app_id,
+            "APP_PRIVATE_KEY": private_key,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("mode", "app_id", "publisher_app_id", "private_key"),
+    [
+        ("github_token", "4242", "4242", ""),
+        ("github_token", "", "4242", "private-key"),
+        ("github_app", "4242", "4343", "private-key"),
+        ("github_token", "", "0", ""),
+        ("github_token", "", "not-an-id", ""),
+        ("github_token", "", "1234567890123456", ""),
+    ],
+)
+def test_gemini_auth_validation_rejects_unbounded_publisher_migration_hint(
+    mode, app_id, publisher_app_id, private_key
+):
+    step = _step(
+        _load("gemini-auto-review.yml"),
+        "gemini-review",
+        "Validate repository-write auth",
+    )
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", step["run"]],
+        env={
+            **os.environ,
+            "MODE": mode,
+            "APP_ID": app_id,
+            "PUBLISHER_APP_ID": publisher_app_id,
+            "APP_PRIVATE_KEY": private_key,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
 
 
 def test_gemini_v2_is_display_only_and_cannot_enable_incremental_input(tmp_path):
@@ -3194,6 +3376,9 @@ def _gemini_upsert(
     current_head: str | None = None,
     workflow_runs: list[dict] | None = None,
     workflow_run_attempt_sequences: dict[str, list[dict]] | None = None,
+    bot_login: str = "github-actions[bot]",
+    auth_mode: str = "github_token",
+    publisher_app_id: str = "",
 ) -> list:
     workdir = tmp_path / ("gemini-with-review" if with_review else "gemini-without-review")
     workdir.mkdir(parents=True)
@@ -3223,7 +3408,9 @@ def _gemini_upsert(
         "NORMALIZED_COUNT": normalized_count,
         "FILTERED_MAX_SEVERITY": filtered_max_severity,
         "CANONICAL_FAILURE_REASON": canonical_failure_reason,
-        "BOT_LOGIN": "github-actions[bot]",
+        "BOT_LOGIN": bot_login,
+        "AUTH_MODE": auth_mode,
+        "PUBLISHER_APP_ID": publisher_app_id,
         "ACTIONS_TOKEN": "actions-token-fixture",
     }
     if not literal_schema:
@@ -3263,6 +3450,59 @@ def _updated_comment_body(calls: list, comment_id: int) -> str:
     if updates:
         return updates[-1][1]["body"]
     return _single_mutation_body(calls)
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("auth_mode", "bot_login", "publisher_app_id", "previous"),
+    [
+        (
+            "github_token",
+            "github-actions[bot]",
+            "4242",
+            ("review-publisher[bot]", 4242, "review-publisher"),
+        ),
+        (
+            "github_app",
+            "review-publisher[bot]",
+            "4242",
+            ("github-actions[bot]", GITHUB_ACTIONS_APP_ID, "github-actions"),
+        ),
+    ],
+    ids=("app-to-token", "token-to-app"),
+)
+def test_gemini_upsert_reuses_v3_sticky_across_publisher_mode_migration(
+    tmp_path, auth_mode, bot_login, publisher_app_id, previous
+):
+    previous_login, previous_app_id, previous_slug = previous
+    existing = _app_bot(
+        previous_login,
+        _v3_body(
+            _v3_state(reviewer="gemini", run_id=1),
+            "PRIOR REVIEW",
+            marker=GEMINI_V3_MARKER,
+            header=GEMINI_HEADER,
+        ),
+        app_id=previous_app_id,
+        app_slug=previous_slug,
+        comment_id=11,
+    )
+
+    calls = _gemini_upsert(
+        tmp_path,
+        "success",
+        [existing],
+        with_review=True,
+        bot_login=bot_login,
+        auth_mode=auth_mode,
+        publisher_app_id=publisher_app_id,
+    )
+
+    mutations = [call for call in calls if call[0] in {"create", "update"}]
+    assert len(mutations) == 1
+    assert mutations[0][0] == "update"
+    assert mutations[0][1]["comment_id"] == 11
+    assert "GEMINI REVIEW BODY" in mutations[0][1]["body"]
 
 
 @node_required

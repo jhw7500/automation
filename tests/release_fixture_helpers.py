@@ -49,10 +49,12 @@ def restore_pre_v146_review_contracts(repo: Path) -> None:
         text = path.read_text(encoding="utf-8")
         needle = "    permissions:\n      actions: read\n"
         assert text.count(needle) == 1
-        path.write_text(
-            text.replace(needle, "    permissions:\n", 1),
-            encoding="utf-8",
-        )
+        text = text.replace(needle, "    permissions:\n", 1)
+        if filename == "gemini-auto-review.yml":
+            publisher_input = "      publisher_app_id: ${{ vars.APP_ID }}\n"
+            assert text.count(publisher_input) == 1
+            text = text.replace(publisher_input, "", 1)
+        path.write_text(text, encoding="utf-8")
 
     catalog = repo / "scripts/workflow-catalog.json"
     if catalog.exists():
@@ -68,6 +70,9 @@ def restore_pre_v146_review_contracts(repo: Path) -> None:
             )
             assert text.count(needle) == 1
             text = text.replace(needle, replacement, 1)
+        publisher_input = '            "publisher_app_id",\n'
+        assert text.count(publisher_input) == 1
+        text = text.replace(publisher_input, "", 1)
         catalog.write_text(text, encoding="utf-8")
 
 

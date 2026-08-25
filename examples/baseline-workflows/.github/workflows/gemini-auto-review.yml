@@ -17,6 +17,7 @@ jobs:
       pr_number: ${{ github.event.pull_request.number }}
       repo_write_auth: github_app
       app_id: ${{ vars.APP_ID }}
+      publisher_app_id: ${{ vars.APP_ID }}
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

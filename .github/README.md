@@ -261,6 +261,7 @@ Edit the respective `gemini-*.yml` files to modify:
 - A sticky `Reason: provider_timeout` means the provider request exceeded its finite review deadline; inspect the linked run before rerunning
 - A sticky `Reason: unsupported_location` is a caller-location policy failure; changing the Gemini model or retrying the same runner does not repair it
 - A `Prior review provenance lookup is uncertain` or `Failed to fetch the prior review comment snapshot` Actions-log error means prior state could not be selected safely; model generation and sticky publication were skipped, so rerun after the API or token condition recovers
+- After changing Gemini `repo_write_auth`, keep the repository's non-secret `APP_ID` variable so the canonical caller can pass `publisher_app_id`; this authenticates and reuses the former App-authored sticky without retaining `APP_PRIVATE_KEY` in token mode
 
 ### Workflows don't trigger
 - Check branch protection rules

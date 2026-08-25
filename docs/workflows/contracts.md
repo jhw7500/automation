@@ -73,6 +73,7 @@ authentication is an independent profile axis with exactly two modes.
 with:
   repo_write_auth: github_app
   app_id: ${{ vars.APP_ID }}
+  publisher_app_id: ${{ vars.APP_ID }}
 secrets:
   APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
   GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -84,6 +85,9 @@ workflow resolves the authentication action through `$/`, binding the helper and
 the same immutable automation commit as the reusable workflow. The authentication action exposes the
 server-derived publisher login as `<app-slug>[bot]`; review-state collection and publication use
 that exact login rather than trusting an arbitrary comment whose author type is merely `Bot`.
+`publisher_app_id` is the same non-secret App ID and is retained in canonical callers so a later
+switch to built-in-token mode can authenticate the existing App-authored sticky without retaining
+the private key.
 Actions run provenance is fetched separately with the job-scoped built-in token and
 `actions: read`; the App installation does not need an added Actions permission.
 
@@ -92,14 +96,26 @@ Actions run provenance is fetched separately with the job-scoped built-in token 
 ```yaml
 with:
   repo_write_auth: github_token
+  publisher_app_id: ${{ vars.APP_ID }}
 secrets:
   GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 ```
 
-This mode passes neither `app_id` nor `APP_PRIVATE_KEY`; the reusable workflow uses the
+This mode passes neither the token-minting `app_id` nor `APP_PRIVATE_KEY`; the reusable workflow uses the
 exact built-in `${{ github.token }}` path within its declared permissions. Ambient
 authentication, OIDC model authentication, and alternate Gemini provider variables are
-not supported. In this mode the publisher login is exactly `github-actions[bot]`.
+not supported. In this mode the current publisher login is exactly `github-actions[bot]`.
+`publisher_app_id` is an optional identity-only hint: it is empty for repositories that never used
+App mode, and otherwise names only the former publisher App. It never mints a token or changes
+permissions.
+
+Gemini sticky migration is deliberately narrower than accepting every bot. The current resolved
+publisher always matches exactly. On `github_token → github_app`, only the official GitHub Actions
+App (`id=15368`, slug `github-actions`) is accepted as the former publisher. On
+`github_app → github_token`, only a comment whose `performed_via_github_app.id` equals the explicit
+`publisher_app_id` and whose author login is exactly `<performed slug>[bot]` is accepted. The normal
+schema and Actions-run provenance checks still apply before the comment contributes state or is
+updated in place. An absent, malformed, mismatched, or arbitrary installed App remains untrusted.
 
 ## Triggers, inputs, and permissions
 
@@ -397,7 +413,8 @@ and schema. Only a bot comment whose first three lines are the reviewer's exact 
 for that reviewer and schema, and one exact `<!-- automation-state:{...} -->` line is a state
 candidate. Claude/Gemini v2 is never accepted as v3, and OpenCode never accepts v3. A marker quoted
 later in prose, a different reviewer or PR, malformed JSON, or an extra, missing, or invalid field
-is not state. The author login must also equal the token's exact publisher login. From the newest
+is not state. The author must also match the current exact publisher or the explicitly bounded
+Gemini mode-migration identity above. From the newest
 20 syntactically valid records, the workflow queries the claimed Actions run attempt and retains
 only a completed success/failure whose repository, `pull_request` event, PR association number,
 immutable run `head_sha`, run ID/attempt, and referenced central reusable-workflow path plus SHA all

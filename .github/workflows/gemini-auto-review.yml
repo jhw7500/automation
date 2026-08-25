@@ -12,6 +12,11 @@ on:
         type: string
         required: false
         default: ''
+      publisher_app_id:
+        description: 'Trusted GitHub App ID for sticky publisher migration in github_token mode'
+        type: string
+        required: false
+        default: ''
       pr_number:
         description: 'Pull request number (optional; defaults to event PR number)'
         type: string
@@ -102,12 +107,23 @@ jobs:
         env:
           MODE: ${{ inputs.repo_write_auth }}
           APP_ID: ${{ inputs.app_id }}
+          PUBLISHER_APP_ID: ${{ inputs.publisher_app_id }}
           APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
         run: |
+          if [[ -n "$PUBLISHER_APP_ID" ]] && {
+            [[ ! "$PUBLISHER_APP_ID" =~ ^[1-9][0-9]{0,14}$ ]];
+          }; then
+            echo 'publisher_app_id must be a positive decimal App ID of at most 15 digits' >&2
+            exit 1
+          fi
           case "$MODE" in
             github_app)
               test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {
                 echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2
+                exit 1
+              }
+              test -z "$PUBLISHER_APP_ID" || test "$PUBLISHER_APP_ID" = "$APP_ID" || {
+                echo 'github_app requires publisher_app_id to be empty or equal app_id' >&2
                 exit 1
               }
               ;;
@@ -139,6 +155,8 @@ jobs:
           SERVER_URL: ${{ github.server_url }}
           REPOSITORY: ${{ github.repository }}
           BOT_LOGIN: ${{ steps.auth.outputs.bot-login }}
+          AUTH_MODE: ${{ inputs.repo_write_auth }}
+          PUBLISHER_APP_ID: ${{ inputs.publisher_app_id }}
           ACTIONS_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -184,6 +202,8 @@ jobs:
             --arg marker "$MARKER" \
             --arg reviewer "$REVIEWER" \
             --arg bot_login "$BOT_LOGIN" \
+            --arg auth_mode "$AUTH_MODE" \
+            --arg publisher_app_id "$PUBLISHER_APP_ID" \
             --arg pr "$PR_NUMBER" \
             --arg server "$SERVER_URL" \
             --arg repo "$REPOSITORY" '
@@ -225,10 +245,27 @@ jobs:
                     and (.filtered_max_severity | max_severity)
                   end)
                 else false end;
-              def parsed_state($header; $marker; $reviewer; $bot_login; $pr; $server; $repo):
+              def app_publisher($expected_id):
+                (.performed_via_github_app // null) as $app
+                | ($app | type) == "object"
+                and ($app.id | positive_integer)
+                and ($app.slug | type) == "string"
+                and ($app.slug | test("^[A-Za-z0-9-]+$"))
+                and (.user.login == ($app.slug + "[bot]"))
+                and (($app.id | tostring) == $expected_id);
+              def publisher_matches($bot_login; $auth_mode; $publisher_app_id):
+                .user.type == "Bot"
+                and (
+                  .user.login == $bot_login
+                  or ($auth_mode == "github_app" and app_publisher("15368"))
+                  or ($auth_mode == "github_token"
+                    and ($publisher_app_id | test("^[1-9][0-9]{0,14}$"))
+                    and app_publisher($publisher_app_id))
+                );
+              def parsed_state($header; $marker; $reviewer; $bot_login; $auth_mode; $publisher_app_id; $pr; $server; $repo):
                 (.body // "") as $body
                 | ($body | split("\n")) as $lines
-                | select(.user.type == "Bot" and .user.login == $bot_login)
+                | select(publisher_matches($bot_login; $auth_mode; $publisher_app_id))
                 | select($lines[0] == $header and $lines[1] == $marker)
                 | (($lines[2]? // "") | (capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$")? | .json? | fromjson?)) as $s
                 | select(($s | type) == "object")
@@ -260,7 +297,7 @@ jobs:
                 | select($body | startswith($prefix))
                 | {comment: ., state: $s, canonical_body: ($body | .[($prefix | length):])};
 
-              [.[] | parsed_state($header; $marker; $reviewer; $bot_login; $pr; $server; $repo)]
+              [.[] | parsed_state($header; $marker; $reviewer; $bot_login; $auth_mode; $publisher_app_id; $pr; $server; $repo)]
               | sort_by(.state.run_id, .state.run_attempt, .comment.id)
               | reverse | .[:20]
             ' "$COMMENTS_FILE")"
@@ -986,6 +1023,8 @@ jobs:
           FILTERED_MAX_SEVERITY: ${{ steps.canonicalize-review.outputs.filtered-max-severity }}
           CANONICAL_FAILURE_REASON: ${{ steps.canonicalize-review.outputs.failure-reason }}
           BOT_LOGIN: ${{ steps.auth.outputs.bot-login }}
+          AUTH_MODE: ${{ inputs.repo_write_auth }}
+          PUBLISHER_APP_ID: ${{ inputs.publisher_app_id }}
           ACTIONS_TOKEN: ${{ github.token }}
         with:
           github-token: ${{ steps.auth.outputs.token }}
@@ -1000,7 +1039,26 @@ jobs:
             const serverUrl = process.env.SERVER_URL || '';
             const repository = process.env.REPOSITORY || '';
             const botLogin = process.env.BOT_LOGIN || '';
+            const authMode = process.env.AUTH_MODE || '';
+            const publisherAppId = process.env.PUBLISHER_APP_ID || '';
             const actionsToken = process.env.ACTIONS_TOKEN || '';
+            const publisherAppIdIsValid = publisherAppId === ''
+              || (/^[1-9][0-9]{0,14}$/.test(publisherAppId)
+                && Number.isSafeInteger(Number(publisherAppId)));
+            const appPublisherMatches = (comment, expectedId) => {
+              const app = comment?.performed_via_github_app;
+              return comment?.user?.type === 'Bot'
+                && app && typeof app === 'object'
+                && Number.isSafeInteger(app.id) && app.id > 0
+                && typeof app.slug === 'string' && /^[A-Za-z0-9-]+$/.test(app.slug)
+                && comment.user.login === `${app.slug}[bot]`
+                && String(app.id) === expectedId;
+            };
+            const publisherMatches = (comment) => comment?.user?.type === 'Bot'
+              && (comment.user.login === botLogin
+                || (authMode === 'github_app' && appPublisherMatches(comment, '15368'))
+                || (authMode === 'github_token' && publisherAppIdIsValid
+                  && publisherAppId !== '' && appPublisherMatches(comment, publisherAppId)));
             const ok = (process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success';
             const diffReady = process.env.DIFF_READY === 'true';
             const diffTruncated = process.env.DIFF_TRUNCATED === 'true';
@@ -1105,7 +1163,7 @@ jobs:
               ].filter(Boolean).join('\n');
             };
             const parseRecord = (comment) => {
-              if (comment.user?.type !== 'Bot' || comment.user?.login !== botLogin) return null;
+              if (!publisherMatches(comment)) return null;
               const lines = (comment.body || '').split('\n');
               if (lines[0] !== header || lines[1] !== marker) return null;
               const match = (lines[2] || '').match(/^<!-- automation-state:(\{.*\}) -->$/);
@@ -1186,14 +1244,15 @@ jobs:
               return;
             }
             const exactDisplayTarget = (displayMarker) => [...comments].reverse().find((comment) => {
-              if (comment.user?.type !== 'Bot' || comment.user?.login !== botLogin) return false;
+              if (!publisherMatches(comment)) return false;
               const lines = (comment.body || '').split('\n');
               return lines[0] === header && lines[1] === displayMarker;
             });
             // Historical comments are display locations only. Their state and prose never
             // participate in v3 authentication, carryover, or failure preservation.
             const v2Target = existing ? null : exactDisplayTarget(v2Marker);
-            if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead) || !serverUrl || !repository || !botLogin || !actionsToken) {
+            if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead) || !serverUrl || !repository || !botLogin || !actionsToken
+              || !['github_app', 'github_token'].includes(authMode) || !publisherAppIdIsValid) {
               core.notice('Gemini review trusted attempt identity is invalid; left the existing sticky state unchanged.');
               return;
             }

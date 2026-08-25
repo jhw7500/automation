@@ -101,6 +101,7 @@
           "with": [
             "app_id",
             "pr_number",
+            "publisher_app_id",
             "repo_write_auth"
           ],
           "secrets": [

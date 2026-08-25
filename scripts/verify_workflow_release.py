@@ -119,6 +119,14 @@ EXPECTED_GEMINI_APP_ID_INPUT = {
     "required": "false",
     "default": "",
 }
+EXPECTED_GEMINI_PUBLISHER_APP_ID_INPUT = {
+    "description": (
+        "Trusted GitHub App ID for sticky publisher migration in github_token mode"
+    ),
+    "type": "string",
+    "required": "false",
+    "default": "",
+}
 EXPECTED_GEMINI_SECRETS = {
     "APP_PRIVATE_KEY": {
         "description": "GitHub App private key; used only for github_app mode",
@@ -152,6 +160,46 @@ EXPECTED_GEMINI_VALIDATION = {
         "  github_app)\n"
         '    test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {\n'
         "      echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2\n"
+        "      exit 1\n"
+        "    }\n"
+        "    ;;\n"
+        "  github_token)\n"
+        '    test -z "$APP_ID" && test -z "$APP_PRIVATE_KEY" || {\n'
+        "      echo 'github_token forbids App credentials' >&2\n"
+        "      exit 1\n"
+        "    }\n"
+        "    ;;\n"
+        "  *)\n"
+        '    echo "invalid repo_write_auth: $MODE" >&2\n'
+        "    exit 1\n"
+        "    ;;\n"
+        "esac\n"
+    ),
+}
+EXPECTED_GEMINI_AUTO_VALIDATION = {
+    "name": "Validate repository-write auth",
+    "shell": "bash",
+    "env": {
+        "MODE": "${{ inputs.repo_write_auth }}",
+        "APP_ID": "${{ inputs.app_id }}",
+        "PUBLISHER_APP_ID": "${{ inputs.publisher_app_id }}",
+        "APP_PRIVATE_KEY": "${{ secrets.APP_PRIVATE_KEY }}",
+    },
+    "run": (
+        'if [[ -n "$PUBLISHER_APP_ID" ]] && {\n'
+        '  [[ ! "$PUBLISHER_APP_ID" =~ ^[1-9][0-9]{0,14}$ ]];\n'
+        "}; then\n"
+        "  echo 'publisher_app_id must be a positive decimal App ID of at most 15 digits' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        'case "$MODE" in\n'
+        "  github_app)\n"
+        '    test -n "$APP_ID" && test -n "$APP_PRIVATE_KEY" || {\n'
+        "      echo 'github_app requires app_id and APP_PRIVATE_KEY' >&2\n"
+        "      exit 1\n"
+        "    }\n"
+        '    test -z "$PUBLISHER_APP_ID" || test "$PUBLISHER_APP_ID" = "$APP_ID" || {\n'
+        "      echo 'github_app requires publisher_app_id to be empty or equal app_id' >&2\n"
         "      exit 1\n"
         "    }\n"
         "    ;;\n"
@@ -634,9 +682,11 @@ REVIEW_PUBLICATION_CONTRACTS = {
         "canonical": "gemini-review-canonical.md",
         "canonical_step": "Canonicalize Gemini review",
         "upsert_sha256": (
-            "69b61886af490e4da3924f76446d6f0ab28d55bad675a599427ac97be74feb35"
+            "cc81b9e370c357366a384a059c9d6e1fe02065f085985f30532b92410c49c43d"
         ),
         "bot_login": "${{ steps.auth.outputs.bot-login }}",
+        "auth_mode": "${{ inputs.repo_write_auth }}",
+        "publisher_app_id": "${{ inputs.publisher_app_id }}",
         "workflow_prefix": (
             "jhw7500/automation/.github/workflows/gemini-auto-review.yml@"
         ),
@@ -2912,9 +2962,25 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 and collector_env.get("ACTIONS_TOKEN") == "${{ github.token }}"
                 and 'GH_TOKEN="$ACTIONS_TOKEN" gh api' in collector_script
             )
+            collector_publisher_contract = (
+                contract["reviewer"] == "claude"
+                and 'select(.user.type == "Bot" and .user.login == $bot_login)'
+                in collector_script
+            ) or (
+                contract["reviewer"] == "gemini"
+                and collector_env.get("AUTH_MODE") == contract["auth_mode"]
+                and collector_env.get("PUBLISHER_APP_ID")
+                == contract["publisher_app_id"]
+                and "def publisher_matches(" in collector_script
+                and "performed_via_github_app" in collector_script
+                and 'app_publisher("15368")' in collector_script
+                and "app_publisher($publisher_app_id)" in collector_script
+                and "select(publisher_matches(" in collector_script
+            )
             collector_contract = (
                 collector_marker
                 and collector_token_contract
+                and collector_publisher_contract
                 and collector.get("id") == contract["collector_id"]
                 and f"== {jq_state_keys}" in collector_script
                 and "$s.schema == 3" in collector_script
@@ -2925,8 +2991,6 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 and "- Validation: accepted=" in collector_script
                 and isinstance(collector_env, dict)
                 and collector_env.get("BOT_LOGIN") == contract["bot_login"]
-                and 'select(.user.type == "Bot" and .user.login == $bot_login)'
-                in collector_script
                 and '"${RUNNER_TEMP:?}/' in collector_script
                 and '"$GITHUB_WORKSPACE/' not in collector_script
                 and "sort_by(.state.run_id, .state.run_attempt, .comment.id)"
@@ -3006,6 +3070,18 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 and "const response = await fetch(request.url" in upsert_script
                 and "signal: AbortSignal.timeout(30000)" in upsert_script
             )
+            upsert_publisher_contract = (
+                contract["reviewer"] == "claude"
+                and "comment.user?.login !== botLogin" in upsert_script
+            ) or (
+                contract["reviewer"] == "gemini"
+                and "const publisherMatches = (comment)" in upsert_script
+                and "performed_via_github_app" in upsert_script
+                and "appPublisherMatches(comment, '15368')" in upsert_script
+                and "appPublisherMatches(comment, publisherAppId)" in upsert_script
+                and "if (!publisherMatches(comment)) return null;" in upsert_script
+                and "if (!publisherMatches(comment)) return false;" in upsert_script
+            )
             upsert_contract = (
                 f"const marker = '{marker}';" in upsert_script
                 and f"const v2Marker = '{contract['v2_marker']}';" in upsert_script
@@ -3023,7 +3099,7 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                     in upsert_script
                 )
                 and contract["raw"] not in upsert_script
-                and "comment.user?.login !== botLogin" in upsert_script
+                and upsert_publisher_contract
                 and upsert_run_lookup_contract
                 and contract["workflow_prefix"] in upsert_script
                 and "run?.event === 'pull_request'" in upsert_script
@@ -3051,6 +3127,11 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 isinstance(upsert_env, dict)
                 and upsert_env.get("ACTIONS_TOKEN") == "${{ github.token }}"
             )
+            upsert_publisher_env_contract = contract["reviewer"] == "claude" or (
+                upsert_env.get("AUTH_MODE") == contract["auth_mode"]
+                and upsert_env.get("PUBLISHER_APP_ID")
+                == contract["publisher_app_id"]
+            )
             if (
                 not isinstance(upsert_env, dict)
                 or any(
@@ -3059,6 +3140,7 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 )
                 or upsert_env.get("BOT_LOGIN") != contract["bot_login"]
                 or not upsert_token_contract
+                or not upsert_publisher_env_contract
             ):
                 raise ValueError("canonicalizer output bridge differs")
     except (AttributeError, KeyError, TypeError, ValueError):
@@ -3111,13 +3193,25 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
             f"{name} Gemini workflow_call contract is missing"
         ) from exc
     mode = inputs.get("repo_write_auth") if isinstance(inputs, dict) else None
+    supports_publisher_migration = (
+        _release_version(ref) >= (1, 46) and name == "gemini-auto-review.yml"
+    )
+    publisher_input = (
+        inputs.get("publisher_app_id") if isinstance(inputs, dict) else None
+    )
     if (
         set(document.get("on", {})) != {"workflow_call"}
         or mode != EXPECTED_GEMINI_MODE_INPUT
         or inputs.get("app_id") != EXPECTED_GEMINI_APP_ID_INPUT
+        or (
+            supports_publisher_migration
+            and publisher_input != EXPECTED_GEMINI_PUBLISHER_APP_ID_INPUT
+        )
+        or (not supports_publisher_migration and publisher_input is not None)
     ):
         raise ReleaseVerificationError(
-            f"{name} must declare exact repo_write_auth and app_id inputs"
+            f"{name} must declare exact repo_write_auth, app_id, and "
+            "publisher_app_id inputs"
         )
     values = _values(document)
     normalized = "\n".join(values)
@@ -3247,7 +3341,12 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
                 f"{name}:{job_name} setup-gemini-auth resolver must use the exact "
                 "release-bound action and mode-controlled inputs"
             )
-        if index == 0 or steps[index - 1] != EXPECTED_GEMINI_VALIDATION:
+        expected_validation = (
+            EXPECTED_GEMINI_AUTO_VALIDATION
+            if supports_publisher_migration
+            else EXPECTED_GEMINI_VALIDATION
+        )
+        if index == 0 or steps[index - 1] != expected_validation:
             raise ReleaseVerificationError(
                 f"{name}:{job_name} resolver must be immediately preceded by exact "
                 "repository-write auth validation"

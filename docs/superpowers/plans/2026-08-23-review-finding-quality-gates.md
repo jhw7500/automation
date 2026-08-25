@@ -801,6 +801,8 @@ Extend the extracted collector/upsert harness with `CLAUDE_V3_MARKER` and a sche
 - newest-first selection stops after the highest state authenticates, and duplicate authenticated generations prefer the larger comment ID;
 - the same 404/error and duplicate-generation policy applies while collecting prior context, not only while publishing;
 - an unavailable issue-comment snapshot aborts collection, and the publication step cannot run after that collector failure;
+- Gemini App/token mode migration reuses the former publisher's v3 sticky only when `performed_via_github_app`, explicit App ID, slug, and bot login agree; an unrelated Bot/App remains rejected;
+- canonical Gemini auto-review callers retain a separate non-secret `publisher_app_id` in both profiles while token mode still removes minting `app_id` and `APP_PRIVATE_KEY`;
 - wrong reviewer, wrong schema, extra/missing key, negative count, or invalid max severity is not authenticated.
 
 - [ ] **Step 3: Change collection to authenticate schema 3 only**

@@ -381,6 +381,16 @@ prevents a transient lookup failure for the newest state from dropping or resurr
 updating an older sticky, or creating a duplicate while still allowing a definitive 404 to fall back
 to older authenticated state.
 
+Gemini publisher identity survives supported repository-write mode changes without weakening the
+bot boundary. The current resolver login remains the primary exact identity. A switch from the
+built-in token to App mode may additionally reuse only the official GitHub Actions App identity
+(`id=15368`); a switch from App mode to the built-in token may reuse only the explicit non-secret
+`publisher_app_id`. In both cases `performed_via_github_app.id`, App slug, and bot login must agree,
+and the existing schema/run provenance authentication still applies. Canonical callers retain the
+App ID expression in a separate `publisher_app_id` input even when token minting `app_id` and the
+private key are removed. This lets the workflow update the old sticky in place while rejecting an
+arbitrary Bot or unrelated installed App.
+
 OpenCode remains on its existing v2 state because it already has a separate strict canonicalizer and
 is outside issues #41 and #42. Shared collectors and documentation must explicitly support Claude and
 Gemini v3 alongside OpenCode v2; neither schema is accepted for the wrong reviewer.

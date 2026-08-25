@@ -2230,8 +2230,14 @@ def test_v146_authenticates_collected_review_state_against_its_run(
 
     def weaken_provenance(step: dict) -> None:
         script = step["run"]
-        assert old in script
-        step["run"] = script.replace(old, new, 1)
+        target_old, target_new = old, new
+        if workflow == "gemini-auto-review.yml" and old.startswith("select(.user.type"):
+            target_old = (
+                "select(publisher_matches($bot_login; $auth_mode; "
+                "$publisher_app_id))"
+            )
+        assert target_old in script
+        step["run"] = script.replace(target_old, target_new, 1)
 
     mutate_named_step(
         path, contract["job"], contract["collector_step"], weaken_provenance
@@ -2334,8 +2340,12 @@ def test_v146_authenticates_published_review_state_before_stale_guarding(
 
     def weaken_provenance(step: dict) -> None:
         script = step["with"]["script"]
-        assert old in script
-        step["with"]["script"] = script.replace(old, new, 1)
+        target_old, target_new = old, new
+        if workflow == "gemini-auto-review.yml" and old == "comment.user?.login !== botLogin":
+            target_old = "if (!publisherMatches(comment)) return null;"
+            target_new = "if (false) return null;"
+        assert target_old in script
+        step["with"]["script"] = script.replace(target_old, target_new, 1)
 
     mutate_named_step(path, contract["job"], "Upsert review comment", weaken_provenance)
     bad_commit = commit(repo, f"weaken {workflow} published state provenance")

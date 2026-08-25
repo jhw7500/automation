@@ -384,6 +384,10 @@ def test_canonical_callers_use_only_the_selected_auth_contract() -> None:
             if entry.auth_family == "gemini":
                 assert job["with"]["repo_write_auth"] == "github_app"
                 assert job["with"]["app_id"] == "${{ vars.APP_ID }}"
+                if entry.central_workflow == "gemini-auto-review.yml":
+                    assert job["with"]["publisher_app_id"] == "${{ vars.APP_ID }}"
+                else:
+                    assert "publisher_app_id" not in job["with"]
                 assert job["secrets"] == {
                     "APP_PRIVATE_KEY": "${{ secrets.APP_PRIVATE_KEY }}",
                     "GEMINI_API_KEY": "${{ secrets.GEMINI_API_KEY }}",
