@@ -245,13 +245,30 @@ that anchor. A real current line without PR causality is insufficient; a disprov
 `Retracted`, while `Resolved` requires a code change.
 
 Claude and Gemini enforce this as a prompt contract over their exclusive prepared artifact.
+The Claude command and review model steps use `anthropics/claude-code-action` v1.0.204 at the
+immutable commit `6bcfb8263aca9b0eab0aba20d96dddd74de2875f`. Moving major tags are not accepted:
+the release gate for v1.45.3 and later requires both exact action references so an upstream CLI
+bump cannot change runner behavior between otherwise identical workflow attempts.
 OpenCode additionally enforces it in the clean canonicalizer. A candidate must contain exactly one
-`### New findings` section whose body is exactly `None` or one or more `####` finding blocks. Every
-block needs at least one canonical one-line JSON anchor, exactly
-`- Changed anchor: {"path":"path/to/file","line":1}`. JSON string escaping makes every UTF-8
-path reversible, including embedded newlines, backticks, colons, Unicode, and leading dashes.
-Duplicate keys, extra keys, alternate/noncanonical serialization, malformed JSON, empty paths,
-and non-positive or unsafe line integers fail closed. The parser then:
+`### New findings` section whose body is exactly `None` or one or more `####` finding blocks. Each
+`New findings`, `Still open`, and `Retracted` block needs exactly one canonical one-line JSON anchor,
+`- Changed anchor: {"path":"path/to/file","line":1}`, and exactly one matching JSON source line,
+`- Current line: "exact complete added-side source line"`. A `Resolved` block normally uses that
+same pair. If the exact authenticated prior evidence line was deleted in the current round, a
+`Resolved` block may instead copy it exactly as `- Removed anchor: {"path":"path/to/file","line":1}`
+and `- Removed line: "exact previous source line"`; no other section may use that alternative, and
+current and removed pairs cannot be mixed. JSON string escaping makes every UTF-8 path reversible,
+including embedded newlines, backticks, colons, Unicode, and leading dashes. Duplicate keys, extra
+keys, alternate/noncanonical serialization, malformed JSON, empty paths, non-positive or unsafe
+line integers, and evidence-like noncanonical field labels fail closed. Markdown link/image,
+HTML tag/comment, and HTML entity wrappers are normalized only for reserved-label detection.
+Markdown destinations are consumed with balanced delimiters and quoted-title state rather than a
+greedy match. The complete semicolon-terminated HTML5 alias set whose decoded value consists only
+of whitespace, invisible format characters, supported decorators, or a colon is normalized;
+raw and numeric-entity Unicode format controls are normalized to spaces on the same detection-only
+path. Unrelated and unknown named entities remain literal. Wrapper syntax therefore cannot
+disguise a second unverified evidence field without turning benign prose into a reserved label. The
+parser then:
 
 1. verifies the sealed full diff and manifest hashes and their repository, PR, merge-base, and head
    identity;
@@ -270,6 +287,16 @@ and non-positive or unsafe line integers fail closed. The parser then:
    its relevant side; once that side is EOF-marked, a later hunk cannot reopen it. Malformed or
    truncated hunk bodies, counters, coordinates, and controls fail closed; diff prelude metadata is
    not treated as hunk-body evidence.
+
+For the `Resolved`-only removed-evidence alternative, the canonicalizer first requires an exact
+path, old line number, and line-content match against the unique authenticated active prior block.
+It then requires that prior successful HEAD to be an ancestor of the current attempt HEAD and
+re-derives their literal-path, zero-context diff with the same hardened Git options. The exact old
+line must be consumed by a real `-` record, the prior path must have one non-rename/non-copy status
+record, and the same content must not be re-added anywhere in the authenticated prior-to-current
+diff. This permits deletion-only fixes even when the file disappears from the base-to-current
+manifest, without treating a pure rename as a fix or allowing an unsupported `Resolved` or
+`Retracted` disposition to advance the checkpoint.
 
 Rename preparation consequently transports both old and current identities, but a reportable
 anchor names a changed added-side line in the current filename. A pure 100% rename has no such
@@ -437,8 +464,126 @@ has empty job permissions, no repository checkout, and no `GITHUB_TOKEN`, `GH_TO
 non-repository directory, sends the prompt on stdin, attaches only `review-full.diff` and
 `review-scope.json`, and enables pure/project-config-disabled mode with sharing and all tools
 denied. Every non-empty stdout line must be a JSON object; the last completed text event becomes
-an untrusted `review.md` candidate, while malformed JSONL or no text event fails closed. The
-candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name artifact.
+an untrusted `review.md` candidate, while malformed JSONL or no text event fails closed. Before
+upload, a strict outer-format preflight requires the exact review marker, the handoff-bound nonce
+on the next line, `New findings` as the first and only required section, unique allowed sections,
+and non-empty `None`/finding-block bodies. A valid first candidate incurs no extra model call. If
+only this outer framing is malformed, the model job makes exactly one format-only call in the same
+tokenless, tool-denied environment, with no repository attachments and with the original candidate
+JSON-encoded and explicitly labeled as untrusted data. The repair prompt forbids changing finding
+substance. The model job then derives a deterministic signature from each candidate's exact finding
+blocks grouped by section plus the `New findings: None` meaning. It accepts only a repaired candidate
+with the same signature; dropping, adding, moving, reclassifying, rewording, or changing an anchor is
+terminal. Outside the signed sections, only complete literal blocks, structural Markdown
+decoration, and exact members of the closed benign wrapper vocabulary may be removed. Any other
+nonblank free-form line is ambiguous substance and makes repair terminal, whether it appears before
+the first section, after an enclosing fence, in a blockquote, through a link/reference or HTML
+entity spelling, or behind an unmatched escaped delimiter. The guard is intentionally independent
+of finding keywords: generic prose can describe a real defect just as readily as a severity-labeled
+heading. Attribute-free inline presentation tags may be removed only from a closed tag-name set;
+arbitrary custom element names remain source text so a finding cannot be hidden in a tag name. One
+matching enclosing CommonMark fence, required marker/nonce framing, empty carryover
+sections, and section ordering are also excluded from the signature comparison. Signature generation canonicalizes ASCII case-only
+variants of the four allowed section headings, while the final outer validator still requires their
+exact spelling. Any CommonMark list item outside the signed document is treated as ambiguous
+substance and cannot be removed by repair unless its title exactly matches the closed benign
+wrapper vocabulary or it contains only a complete fenced code block. Prefix matches with added
+substance remain terminal, including indented and CommonMark lazy continuation lines. The same
+guard covers an empty marker with an indented continuation. The one exception is a single `-` that
+closes an already-open benign paragraph as a CommonMark Setext underline; a following complete
+indented-code or HTML literal block is wrapper data, not list-item substance. `+`, `*`, and ordered
+empty markers do not receive that exception. A standalone empty marker remains removable but never
+opens a paragraph, so a later `-` cannot manufacture this Setext exception. After a blank line, a quoted item must
+replay its quote containers; missing markers end the item instead of inheriting root indentation.
+For these block decisions, only an empty line or ASCII spaces/tabs are CommonMark blank; Unicode
+spaces and Python-only control whitespace remain paragraph content. A standalone empty item or
+thematic break remains repairable. When more than one root fence contains an allowed section
+heading, the signature parser selects only the unique fence containing this run's exact adjacent
+marker/nonce pair. Multiple nonce-bound fences, or multiple unbound candidate fences, fail closed
+instead of letting an earlier example shadow the actual review. A lone unbound fence remains
+eligible for the one format-only repair. An enclosing fence may use
+backticks or tildes with
+any valid info string; its closing run must use the same character and be at least as long as the
+opening run, and only ASCII spaces or tabs may follow a closing run. An incomplete fence, list
+fence, or HTML block with an
+explicit terminator fails closed on its first scan so maximum-size untrusted candidates remain
+bounded. Empty optional carryover sections are equivalent to omission; an empty `New findings`
+section remains terminal. Fences
+inside a finding remain signed substance. A finding heading with an explicit bracketed or
+colon-delimited `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, or `P0`–`P3` marker remains unsafe to drop.
+The same applies when that exact marker is separated from its title by `-` or `–` with horizontal
+space on both sides, or by `—` with or without surrounding horizontal space. This recognizer does not
+classify hyphenated prose or ranges such as `Medium-term`, `P1-Review`, or `P1–P3` as severity
+headings; the independent free-prose guard still rejects them unless the complete line is in the
+closed benign vocabulary. Emphasis or code-span
+delimiters may close immediately before any separator. An exact `P0`–`P3` marker followed by a
+period and at least one horizontal space is also protected; this intentionally excludes word
+severities followed by a period, `P4`/`P10`, decimals such as `P1.2`, and unspaced forms such as
+`P1.Review`. Exact singular/plural defect labels (`Finding`, `Bug`, `Defect`, `Issue`,
+`Vulnerability`, `Regression`, `Problem`, `Risk`, `Concern`, `Flaw`, or `Error`) are protected when
+bracketed with optional emphasis/code decoration, used as a standalone heading, or followed by an
+optional numeric identifier and one of the same colon/dash separators. Longer lookalikes such as
+`Bugfix`, `Finding aid`, `Issues reviewed`,
+`Risk assessment`, and `No findings` are not defect-label matches. They are removable only in an
+exact allowlisted benign form such as the documented `...: Review complete` variants. Separator and field-colon boundaries
+accept only the closed Unicode horizontal-space
+set: ASCII space/tab, no-break and Ogham spaces, U+2000–U+200A spaces, narrow no-break space, medium
+mathematical space, and ideographic space. An exact `Changed anchor` or `Current line` field before
+the first section is also protected, including
+optional H1–H6, emphasis, or code-span decoration and horizontal space before its colon. The field
+may be bare, introduced by `-`, `+`, or `*`, or reached inside nested Markdown quote, ordered-list,
+or task-list containers. Lookalikes such as `Changed anchors:`, `Current lines:`, and
+`Unchanged anchor:`, and generic labels such as `Summary:`, `Medium-term:`, `P4:`, and `P10:` are
+not reserved evidence fields, but arbitrary text using those labels is still rejected. Only their
+exact closed benign forms are removable. Unlabeled ATX headings are not assumed to be harmless: an H1–H6 heading before
+the first review section or after an enclosing fence makes repair terminal unless an H1–H3 title
+exactly matches the closed generic wrapper vocabulary (`Review`, an optional automated/OpenCode and
+code/PR/pull-request qualifier, an optional summary/overview/results/report/complete suffix, or the
+standalone `Summary`/`Overview`). The same vocabulary may follow an exact `[Note]`, `[Info]`, or
+`[Context]` tag; the documented plural evidence-field lookalikes are removable only in the exact
+`...: Review complete` title form. Matching is case-insensitive and may carry whole-title
+emphasis/code decoration or an ATX closing sequence, but prefix matches such as
+`Review: Authentication bypass`, `Security review`, and `Summary of failures` remain protected.
+H4–H6 headings always remain finding-like because they overlap the canonical finding-block syntax.
+CommonMark ATX syntax itself requires ASCII space or tab after the opening hashes; the repair guard
+also treats the closed Unicode horizontal-space set in that position as a heading-like adversarial
+lookalike. Exact benign titles remain repairable under that safety superset, while an unknown title
+cannot bypass signing with an Ogham, no-break, or other enumerated space. One-line and multiline
+CommonMark Setext headings receive the same closed-vocabulary treatment, including up to three
+spaces of indentation, source-ordered nesting of blockquotes and list items, lazy paragraph
+continuation text inside those containers, and an explicitly contained underline. The underline
+itself is never treated as a lazy continuation. A standalone thematic break, an outside-list
+thematic break, an empty list item, an internally spaced underline, fenced or indented code, and a
+CommonMark HTML block are not promoted to a Setext heading. A valid single-line link-reference
+definition and its one-line destination or title continuation are likewise not Setext headings,
+but remain ambiguous free prose outside the signed document and therefore make repair terminal.
+Inline HTML, autolinks, invalid closing tags, and lowercase `<!...>` lookalikes remain paragraph
+content and do not bypass either guard.
+The same closed-vocabulary rule applies to a whole wrapper line enclosed by matching Markdown
+emphasis, strong-emphasis, strikethrough, or code-span delimiters: `**Review complete**` remains
+repairable, while an unlabeled title such as `**Authentication bypass**` is protected. This check
+also follows nested blockquote and list containers, ignores trailing normalized whitespace, and applies
+after an enclosing fence. Delimiter runs are paired with bounded linear scans rather than a
+backtracking regular expression. Emphasis and strikethrough runs must have CommonMark-whitespace
+flanking semantics (TAB/LF/FF/CR plus Unicode `Zs`) and an unescaped closer; code spans use their
+matching backtick-run rule. Delimiter-only
+CommonMark thematic breaks and whitespace-flanked delimiter lookalikes remain wrapper syntax. Raw
+Markdown syntax and normalized syntax are evaluated independently and combined conservatively, so
+an HTML entity, Unicode format control, or NFKC-compatible backslash cannot manufacture an escape or
+whitespace edge that makes a source-level decorated title appear harmless after normalization.
+Finding-like content or an allowed review section after an enclosing fence is likewise preserved
+rather than treated as wrapper text. An
+unsafe-to-sign or malformed repair is terminal; there is no third call and no candidate upload. The
+model job reports `model_job_failed` for setup/infrastructure failure, `provider_failed` only when a
+model process fails, and `candidate_contract_failed` when post-response preflight rejects the
+candidate. The candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name
+artifact. This preflight never replaces or relaxes the clean canonicalizer's semantic, scope, and
+provenance checks.
+
+For modern releases, release verification also authenticates the exact Git blob of the complete
+OpenCode auto-review workflow. Changes to installation, step topology, workflow/job environment,
+shell selection, or review execution therefore require an explicit reviewed digest update. The only
+legacy generic-runtime exceptions are the exact approved tag-and-peeled-commit identities.
 
 A clean privileged job downloads that artifact by its exact server-issued ID and verifies the
 reported and REST digest, repository/run identity, exact run-scoped name, one-file inventory,

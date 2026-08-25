@@ -87,8 +87,10 @@ as the reusable workflow. The authoritative full diff and manifest come only fro
 and the 3,000-file API ceiling cannot narrow review scope. Missing authoritative input skips the
 model and cannot advance the review checkpoint. Claude and Gemini consume the selected
 full/incremental artifact. OpenCode consumes the sealed full diff through a tokenless generic run,
-returns an exact-ID/digest untrusted artifact to the clean canonicalizer, and machine-validates
-canonical one-line JSON changed anchors plus authenticated carryover identity.
+performs at most one tokenless format-only retry when its exact marker/nonce/section framing is
+malformed, rejects any repair that changes the section-grouped finding bytes, returns an
+exact-ID/digest untrusted artifact to the clean canonicalizer, and machine-validates canonical
+one-line JSON changed anchors plus authenticated carryover identity.
 
 See [`docs/workflows/contracts.md`](../docs/workflows/contracts.md#deterministic-automated-review-input)
 for exact modes, state transitions, unusual-path handling, and fail-closed behavior.

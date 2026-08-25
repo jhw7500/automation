@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.prepare_workflow_rollout import CHECKOUT_SHA as FLEET_CHECKOUT_SHA
-from scripts.verify_workflow_release import CHECKOUT_ACTION
+from scripts.verify_workflow_release import CHECKOUT_ACTION, CLAUDE_CODE_ACTION
 
 
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -69,6 +69,36 @@ class ActionPinsTest(unittest.TestCase):
                     offenders.append(f"{path.relative_to(ROOT)}:{lineno}")
         self.assertEqual([], offenders)
 
+    def test_all_managed_claude_actions_use_the_approved_commit(self) -> None:
+        references: list[tuple[Path, str, str]] = []
+        for path in workflow_paths():
+            workflow = yaml.load(
+                path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+            )
+            for job in workflow.get("jobs", {}).values():
+                for step in job.get("steps", []):
+                    uses = step.get("uses", "")
+                    if isinstance(uses, str) and uses.lower().startswith(
+                        "anthropics/claude-code-action@"
+                    ):
+                        references.append((path, step.get("name"), uses))
+
+        self.assertEqual(
+            [
+                (
+                    ROOT / ".github/workflows/claude-code-review.yml",
+                    "Run Claude Code Review",
+                    CLAUDE_CODE_ACTION,
+                ),
+                (
+                    ROOT / ".github/workflows/claude.yml",
+                    "Run Claude Code",
+                    CLAUDE_CODE_ACTION,
+                ),
+            ],
+            references,
+        )
+
     def test_opencode_workflows_pin_cli_archive_and_cache_action(self) -> None:
         for filename, job_name, run_name in (
             ("opencode.yml", "opencode", "Run opencode"),
@@ -103,10 +133,17 @@ class ActionPinsTest(unittest.TestCase):
                 if filename == "opencode-auto-review.yml":
                     self.assertNotIn("opencode github run", run_step["run"])
                     self.assertIn(
-                        "opencode run --model zai-coding-plan/glm-4.7 --format json "
+                        'opencode run --model zai-coding-plan/glm-4.7 '
+                        '--format json "$@"',
+                        run_step["run"],
+                    )
+                    self.assertIn(
                         "--file review-full.diff --file review-scope.json",
                         run_step["run"],
                     )
+                    self.assertEqual(2, run_step["run"].count("--file"))
+                    self.assertEqual(1, run_step["run"].count("env -i"))
+                    self.assertEqual(3, run_step["run"].count("run_opencode"))
                     self.assertEqual("true", run_step["env"]["OPENCODE_PURE"])
                     self.assertEqual(
                         "true", run_step["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"]
