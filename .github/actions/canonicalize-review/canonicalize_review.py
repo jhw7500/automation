@@ -61,7 +61,8 @@ STICKY_HEADERS = frozenset({"## Claude Code Review (latest)", "## 🔎 Gemini Co
 AMBIGUITY_DIAGNOSTICS = frozenset(
     {
         "finding_before_section",
-        "unknown_section",
+        "unknown_section_before_document",
+        "unknown_section_after_document",
         "duplicate_section",
         "preamble",
         "missing_new_findings",
@@ -249,7 +250,11 @@ def _parse_document(text: str) -> dict[str, list[_Block]]:
             sections[active].append(line)
         elif line.startswith("###"):
             if line not in {f"### {name}" for name in SECTION_NAMES}:
-                raise ValueError("unknown_section")
+                raise ValueError(
+                    "unknown_section_after_document"
+                    if sections
+                    else "unknown_section_before_document"
+                )
             active = line[4:]
             if active in sections:
                 raise ValueError("duplicate_section")

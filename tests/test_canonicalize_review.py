@@ -672,6 +672,37 @@ def test_cli_logs_only_a_fixed_ambiguity_code_for_untrusted_preamble(case_factor
     )
 
 
+@pytest.mark.parametrize(
+    ("candidate", "diagnostic"),
+    (
+        (
+            "### UNTRUSTED-SECTION-SECRET\n### New findings\n\nNone\n",
+            "unknown_section_before_document",
+        ),
+        (
+            "### New findings\n\nNone\n### UNTRUSTED-SECTION-SECRET\n",
+            "unknown_section_after_document",
+        ),
+    ),
+)
+def test_cli_classifies_unknown_section_position_without_logging_its_heading(
+    case_factory, candidate, diagnostic
+):
+    case = case_factory(candidate.encode("utf-8"))
+
+    completed = subprocess.run(
+        _cli_args(case), cwd=ACTION_DIR, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0
+    assert "UNTRUSTED-SECTION-SECRET" not in completed.stdout
+    assert "UNTRUSTED-SECTION-SECRET" not in completed.stderr
+    assert completed.stderr == f"review-canonicalization-diagnostic: {diagnostic}\n"
+    assert json.loads(case.result.read_text(encoding="utf-8"))["failure_reason"] == (
+        "ambiguous_document"
+    )
+
+
 def test_cli_action_first_round_empty_previous_review_file_writes_runner_outputs(case_factory):
     """The composite action's empty optional value denotes no previous review."""
     case = case_factory(accepted_rejected_plan_review().encode("utf-8"))

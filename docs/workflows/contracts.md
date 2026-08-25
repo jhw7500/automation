@@ -370,7 +370,10 @@ day. The untrusted raw candidate is never uploaded: it may contain provider-echo
 workspace path could otherwise expose a checkout-seeded symlink target. A missing result is
 ignored. The diagnostic is not authority: neither the upsert program nor later review state or
 carryover reads it. For `ambiguous_document`, logs expose only a fixed structural diagnostic code
-such as `preamble` or `invalid_finding_heading`; candidate text is never copied into that message.
+such as `preamble`, `unknown_section_before_document`,
+`unknown_section_after_document`, or `invalid_finding_heading`; candidate text is never copied into
+that message. The two unknown-section codes reveal only whether an allowed section had already
+started, never the untrusted heading text.
 
 Once the document boundary and trusted scope are valid, a bad individual block does not discard
 valid siblings. It is filtered or normalized with exactly one of `invalid_anchor`,
