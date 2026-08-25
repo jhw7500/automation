@@ -1855,6 +1855,8 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert "depends on unverified external service behavior" in claude_model["with"]["prompt"]
     assert "must not appear in Still open" in claude_model["with"]["prompt"]
     assert "Report only findings at MEDIUM or above" in claude_model["with"]["prompt"]
+    assert "For an exception-handler Changed anchor" in claude_model["with"]["prompt"]
+    assert "verify exception inheritance and catch direction" in claude_model["with"]["prompt"]
     assert "Bash(gh pr" not in claude_model["with"]["claude_args"]
 
     gemini = _load("gemini-auto-review.yml")
@@ -1878,6 +1880,8 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert "Fail-closed behavior is not a finding" in python
     assert "unauthenticated UI clutter alone is not a security impact" in python
     assert "Never emit a `Cannot verify`" in python
+    assert "For an exception-handler Changed anchor" in python
+    assert "verify exception inheritance and catch direction" in python
     assert "for attempt in range(max_attempts)" in python
 
     assert _step(gemini, "gemini-review", "Get PR details")["env"]["PR_NUMBER"] == (

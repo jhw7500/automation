@@ -40,6 +40,7 @@ PROOF_DEFICIT = re.compile(
     r"not\s+confirmed|pending\s+confirmation|unverified\s+external)\b",
     re.IGNORECASE,
 )
+PYTHON_EXCEPTION_HANDLER = re.compile(r"^\s*except(?:\s|:)")
 WORKFLOW_OWNED = re.compile(
     r"(?:<!--.*automation:|^#{1,6}\s*(?:status|run|reviewed|validation)\b|"
     r"^\s*(?:-\s*)?(?:status|run|reviewed|validation)\s*:)", re.IGNORECASE,
@@ -318,6 +319,22 @@ def _claim_reason(block: _Block, outcome: Literal["filtered", "normalized"], rea
     return CandidateReason(block.index, block.section, outcome, reason, block.severity)
 
 
+def _exception_handler_has_only_self_evidence(
+    anchor: SourceAnchor,
+    evidence: tuple[TriggerEvidence | None, ...],
+) -> bool:
+    return (
+        all(
+            item is not None and item.path == anchor.path and item.line == anchor.line
+            for item in evidence
+        )
+        and any(
+            item is not None and PYTHON_EXCEPTION_HANDLER.match(item.quote)
+            for item in evidence
+        )
+    )
+
+
 def _validate_new(block: _Block, scope: object) -> tuple[_Finding | None, str | None]:
     if block.severity == "none":
         if block.low_severity:
@@ -330,6 +347,8 @@ def _validate_new(block: _Block, scope: object) -> tuple[_Finding | None, str | 
     trigger_values = _field_values(block.lines, "Trigger evidence")
     evidence = tuple(_trigger(value) for value in trigger_values)
     if not evidence or any(item is None or not scope.validate_trigger(item) for item in evidence):
+        return None, "invalid_trigger_evidence"
+    if _exception_handler_has_only_self_evidence(anchor, evidence):
         return None, "invalid_trigger_evidence"
     impact_values = _field_values(block.lines, "Impact class")
     impact = impact_values[0] if len(impact_values) == 1 else ""

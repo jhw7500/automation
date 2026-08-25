@@ -366,6 +366,12 @@ also has exactly one `Performance basis` object whose kind is `measured` or
 `unbounded-amplification` and whose quoted source is validated. `LOW`, style, maintainability, and
 cleanup claims are non-actionable rather than blocking findings.
 
+When the changed anchor is a Python exception-handler line, at least one trigger-evidence object
+must cite a different throwing or calling line. Repeating only the handler coordinate is
+`invalid_trigger_evidence`: the handler itself cannot prove which exception reaches it. The handler
+may remain as additional evidence when a distinct trigger is also present. Other direct single-line
+findings are unaffected.
+
 The document boundary is closed: non-blank prose before the first allowed section, after the last
 section, or in place of a declared carryover section is `ambiguous_document`. A no-finding section
 accepts only the closed workflow-owned no-findings form; `None` cannot terminate parsing and hide a
