@@ -664,6 +664,423 @@ def test_current_release_commit_only_uses_authenticated_objects(
 
 
 @pytest.mark.parametrize(
+    ("ref", "revision"),
+    (
+        ("v1.45", "9bfe6f4a9991d21ae95472e939d9e6b197174e9f"),
+        ("v1.45.1", "41131bb7843770259246e4125325a2ef4e95731f"),
+        ("v1.45.2", "abf5e65cf6188277d9984be062d0b069c82cf25f"),
+    ),
+)
+def test_approved_legacy_opencode_releases_remain_verifiable(
+    ref: str, revision: str
+) -> None:
+    assert release_verifier.verify_commit_content(ROOT, ref, revision) == revision
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        (
+            "          CANDIDATE_NONCE: ${{ needs.opencode-prepare.outputs.candidate_nonce }}",
+            "          CANDIDATE_NONCE: unbound",
+        ),
+        (
+            "--file review-full.diff --file review-scope.json",
+            "--file review-full.diff",
+        ),
+        (
+            "BEGIN_UNTRUSTED_CANDIDATE_JSON",
+            "BEGIN_INSTRUCTION_CANDIDATE_JSON",
+        ),
+        (
+            'candidate_outer_format_valid "$candidate_dir/review-repaired.md"',
+            "true",
+        ),
+        (
+            'if ! candidate_outer_format_valid "$candidate_dir/review.md"; then',
+            'if candidate_outer_format_valid "$candidate_dir/review.md"; then',
+        ),
+        (
+            'echo "OpenCode format repair still violates the required outer grammar" >&2\n'
+            "              exit 1",
+            'echo "OpenCode format repair still violates the required outer grammar" >&2\n'
+            "              true",
+        ),
+        (
+            'if [[ "$initial_signature" != "$repaired_signature" ]]; then',
+            'if [[ "$initial_signature" == "$repaired_signature" ]]; then',
+        ),
+        (
+            'if ! initial_signature="$(candidate_substance_signature "$candidate_dir/review.md")"; then',
+            'if initial_signature="$(candidate_substance_signature "$candidate_dir/review.md")"; then',
+        ),
+        (
+            'if ! repaired_signature="$(candidate_substance_signature "$candidate_dir/review-repaired.md")"; then',
+            'if repaired_signature="$(candidate_substance_signature "$candidate_dir/review-repaired.md")"; then',
+        ),
+        (
+            "              if len(nonce_bound_candidates) == 1:",
+            "              if nonce_bound_candidates:",
+        ),
+        (
+            "              if len(fence_candidates) == 1:",
+            "              if fence_candidates:",
+        ),
+        (
+            '          EXPLICIT_DEFECT_LABEL = (\n'
+            '              r"(?:findings?|bugs?|defects?|issues?|"\n'
+            '              r"vulnerabilit(?:y|ies)|regressions?|problems?|"\n'
+            '              r"risks?|concerns?|flaws?|errors?)"\n'
+            '          )',
+            '          EXPLICIT_DEFECT_LABEL = r"(?!)"',
+        ),
+        (
+            "                      return BENIGN_WRAPPER_HEADING.fullmatch(title) is None",
+            "                      return False",
+        ),
+        (
+            "                      if len(heading.group(1)) >= 4:",
+            "                      if False:",
+        ),
+        (
+            "                  if has_matching_markdown_title_decoration(remainder):",
+            "                  if False:",
+        ),
+        (
+            "                  or prefix_length * 2 >= len(value)",
+            "                  or True",
+        ),
+        (
+            "              return backslash_count % 2 == 0",
+            "              return True",
+        ),
+        (
+            "                  if is_markdown_thematic_break(remainder):",
+            "                  if False:",
+        ),
+        (
+            "              if raw_decorated_title_is_unapproved(line):",
+            "              if False:",
+        ),
+        (
+            '              rf"^(#{{1,6}})(?:{HORIZONTAL_SPACE}+(.*)|{HORIZONTAL_SPACE}*)$"',
+            '              r"^(#{1,6})(?:[ \\t]+(.*)|[ \\t]*)$"',
+        ),
+        (
+            "                  or has_unapproved_setext_heading(prefix)",
+            "                  or False",
+        ),
+        (
+            "                  line = raw_line.expandtabs(4)",
+            "                  line = raw_line",
+        ),
+        (
+            "          def parse_markdown_list_item(line):",
+            "          def parse_markdown_list_item_disabled(line):",
+        ),
+        (
+            "          def html_block_start(line, paragraph_open=False):",
+            "          def html_block_start_disabled(line, paragraph_open=False):",
+        ),
+        (
+            "          def classify_link_reference_start(line):",
+            "          def classify_link_reference_start_disabled(line):",
+        ),
+        (
+            "                                      and not line_interrupts_setext_paragraph(",
+            "                                      and False and line_interrupts_setext_paragraph(",
+        ),
+        (
+            "              re.IGNORECASE | re.ASCII,",
+            "              re.IGNORECASE,",
+        ),
+        (
+            "                  lines[first_section:], signature_mode=True",
+            "                  lines[first_section:]",
+        ),
+        (
+            "          def has_unapproved_plain_wrapper_prose(lines):",
+            "          def has_unapproved_plain_wrapper_prose_disabled(lines):",
+        ),
+        (
+            "          def wrapper_line_closes_setext_paragraph(",
+            "          def wrapper_line_closes_setext_paragraph_disabled(",
+        ),
+        (
+            "          def wrapper_setext_underline_indices(lines):",
+            "          def wrapper_setext_underline_indices_disabled(lines):",
+        ),
+        (
+            "                      underlines.add(index)",
+            "                      pass",
+        ),
+        (
+            "                      has_unapproved_plain_wrapper_prose(suffix)",
+            "                      False",
+        ),
+        (
+            "                  has_unapproved_plain_wrapper_prose(prefix)",
+            "                  False",
+        ),
+        (
+            "                  if not is_benign_wrapper_prose_line(lines[index]):",
+            "                  if False:",
+        ),
+        (
+            "                      or BENIGN_WRAPPER_PROSE.fullmatch(remainder) is not None",
+            "                      or True",
+        ),
+        (
+            "                  if normalized_name not in ALLOWLIST_SIMPLE_HTML_TAG_NAMES:",
+            "                  if False:",
+        ),
+        (
+            "                      or has_unapproved_markdown_list_item(suffix)",
+            "                      or False",
+        ),
+        (
+            "                  or has_unapproved_markdown_list_item(prefix)",
+            "                  or False",
+        ),
+        (
+            "                  if index in setext_underline_indices:",
+            "                  if False:",
+        ),
+        (
+            "                  literal_end = wrapper_literal_block_end(lines, index)",
+            "                  literal_end = None",
+        ),
+        (
+            "                          or incomplete_html_type in (1, 2, 3, 4, 5)",
+            "                          or False",
+        ),
+        (
+            '                              and incomplete_fence[1].strip(" \\t")',
+            "                              and False",
+        ),
+        (
+            '                          and opening_fence[1].strip(" \\t")',
+            "                          and False",
+        ),
+        (
+            "                      if is_benign_wrapper_list_item(content):",
+            "                      if False:",
+        ),
+        (
+            "                          if benign_list_item_has_unapproved_continuation(",
+            "                          if False and benign_list_item_has_unapproved_continuation(",
+        ),
+        (
+            "                  if saw_blank:",
+            "                  if False:",
+        ),
+        (
+            '              return re.fullmatch(r"[ \\t]*", line) is not None',
+            "              return not line.strip()",
+        ),
+        (
+            "          def strip_setext_containers(line, containers):",
+            "          def strip_setext_containers_disabled(line, containers):",
+        ),
+        (
+            '              if re.match(r"^<![A-Z]", content) is not None:',
+            '              if re.match(r"^<![A-Za-z]", content) is not None:',
+        ),
+        (
+            "                  or MARKDOWN_EMPTY_LIST_ITEM.fullmatch(remainder) is not None",
+            "                  or False",
+        ),
+        (
+            '              remainder = line.strip()',
+            '              remainder = unicodedata.normalize("NFKC", line).strip()',
+        ),
+        (
+            '                  or unicodedata.category(character) == "Zs"',
+            '                  or character.isspace()',
+        ),
+        (
+            "                      ).strip()\n"
+            "                      return BENIGN_WRAPPER_HEADING.fullmatch(normalized) is None",
+            "                      ).lstrip()\n"
+            "                      return BENIGN_WRAPPER_HEADING.fullmatch(normalized) is None",
+        ),
+        (
+            '                  " " if unicodedata.category(character) == "Cf" else character',
+            '                  character',
+        ),
+        (
+            '                  "blocks": groups,',
+            '                  "blocks": {name: [] for name in ALLOWED},',
+        ),
+        (
+            '          chmod 0500 "$contract_tool"',
+            '          chmod 0500 "$contract_tool"\n'
+            "          sed -i 's/\"blocks\": groups/\"blocks\": {name: [] for name in ALLOWED}/' \"$contract_tool\"",
+        ),
+    ),
+    ids=(
+        "nonce",
+        "repair-files",
+        "untrusted-boundary",
+        "repair-preflight",
+        "initial-preflight-polarity",
+        "terminal-exit",
+        "substance-comparison-polarity",
+        "initial-signature-polarity",
+        "repaired-signature-polarity",
+        "nonce-bound-fence-uniqueness",
+        "unbound-fence-ambiguity",
+        "explicit-defect-label",
+        "unapproved-wrapper-heading",
+        "canonical-finding-heading-depth",
+        "unapproved-decorated-title",
+        "nonempty-decorated-title",
+        "escaped-decoration-close",
+        "thematic-break-exclusion",
+        "raw-decoration-signal",
+        "unicode-space-hash-heading-lookalike",
+        "setext-prefix-guard",
+        "setext-tab-expansion",
+        "setext-list-container",
+        "setext-html-block",
+        "setext-link-reference",
+        "setext-reference-block-precedence",
+        "ascii-case-only-section-heading",
+        "signature-section-canonicalization",
+        "outside-plain-prose-helper",
+        "setext-paragraph-state-helper",
+        "setext-underline-indexer",
+        "setext-underline-index-record",
+        "outside-plain-prose-suffix-guard",
+        "outside-plain-prose-prefix-guard",
+        "outside-plain-prose-rejection",
+        "outside-plain-prose-allowlist",
+        "closed-inline-html-tag-names",
+        "outside-list-suffix-guard",
+        "outside-list-prefix-guard",
+        "outside-list-setext-underline-skip",
+        "outside-list-literal-block-skip",
+        "incomplete-html-fail-fast",
+        "incomplete-root-fence-fail-fast",
+        "incomplete-list-fence-fail-fast",
+        "outside-list-benign-vocabulary",
+        "outside-list-benign-continuation-guard",
+        "outside-list-postblank-container-replay",
+        "commonmark-blank-line-semantics",
+        "setext-container-matching",
+        "setext-html-declaration-case",
+        "setext-empty-list-item",
+        "raw-decoration-provenance",
+        "commonmark-whitespace",
+        "decorated-title-trailing-space",
+        "format-control-normalization",
+        "constant-signature-groups",
+        "post-heredoc-contract-rewrite",
+    ),
+)
+def test_current_release_rejects_opencode_format_repair_runtime_drift(
+    current_release_repo: tuple[Path, str], old: str, new: str
+) -> None:
+    repo, _ = current_release_repo
+    replace(repo / ".github/workflows/opencode-auto-review.yml", old, new, count=1)
+    bad_commit = commit(repo, "weaken OpenCode format repair runtime")
+
+    with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+def test_current_release_rejects_full_legacy_opencode_runtime_downgrade(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+
+    def downgrade(document: dict) -> None:
+        job = document["jobs"]["opencode-review"]
+        step = next(
+            item for item in job["steps"]
+            if item.get("name") == "Run OpenCode PR review"
+        )
+        step["env"].pop("CANDIDATE_NONCE")
+        step["run"] = (
+            "opencode run --model zai-coding-plan/glm-4.7 --format json "
+            "--file review-full.diff --file review-scope.json\n"
+            "jq -Rrs 'map(fromjson) | if length == 0 then error(\"empty\") "
+            "else last end' opencode-review.jsonl\n"
+        )
+
+    mutate_yaml(path, downgrade)
+    bad_commit = commit(repo, "downgrade OpenCode format runtime")
+
+    with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+def test_current_release_rejects_opencode_custom_shell_preprocessor(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+
+    def mutate_shell(document: dict) -> None:
+        step = next(
+            item
+            for item in document["jobs"]["opencode-review"]["steps"]
+            if item.get("name") == "Run OpenCode PR review"
+        )
+        step["shell"] = "python3 {0}"
+
+    mutate_yaml(path, mutate_shell)
+    bad_commit = commit(repo, "preprocess OpenCode review script with a custom shell")
+
+    with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+@pytest.mark.parametrize("placement", ("install-body", "extra-step"))
+def test_current_release_rejects_opencode_interpreter_poisoning_before_review(
+    current_release_repo: tuple[Path, str], placement: str
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+    poison = (
+        "printf '%s\\n' '#!/bin/sh' 'printf \"{}\\n\"' "
+        '> "$RUNNER_TEMP/opencode-cli/python3"\n'
+        'chmod 0755 "$RUNNER_TEMP/opencode-cli/python3"'
+    )
+
+    def mutate_runtime(document: dict) -> None:
+        steps = document["jobs"]["opencode-review"]["steps"]
+        run_index = next(
+            index
+            for index, item in enumerate(steps)
+            if item.get("name") == "Run OpenCode PR review"
+        )
+        if placement == "install-body":
+            install = next(
+                item
+                for item in steps
+                if item.get("name") == "Install pinned OpenCode CLI"
+            )
+            install["run"] += "\n" + poison
+        else:
+            steps.insert(
+                run_index,
+                {
+                    "name": "Poison Python before review",
+                    "shell": "bash",
+                    "run": poison,
+                },
+            )
+
+    mutate_yaml(path, mutate_runtime)
+    bad_commit = commit(repo, f"poison OpenCode interpreter via {placement}")
+
+    with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
+        release_verifier.verify_commit_content(repo, "v1.45", bad_commit)
+
+
+@pytest.mark.parametrize(
     ("relative", "old", "new"),
     (
         (
@@ -766,7 +1183,68 @@ def test_current_release_commit_only_uses_authenticated_objects(
         ),
         (
             ".github/workflows/opencode-auto-review.yml",
-            "match[1] !== JSON.stringify({ path: anchor.path, line: anchor.line })",
+            "raw !== JSON.stringify({ path: anchor.path, line: anchor.line })",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "evidence.removedLines[0] !== previous[0].currentLines[0]",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'merge-base', '--is-ancestor', previousHead, attemptHead",
+            "'merge-base', previousHead, attemptHead",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "!['changed', 'modified', 'removed'].includes(identityRecords[0].status)",
+            "!['changed', 'modified', 'removed', 'renamed'].includes(identityRecords[0].status)",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "ranges.removedLines.get(removal.line) !== removal.currentLine",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "hasMarkdownEvidenceField(normalizedEvidenceLine)",
+            "false",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "HTML_NUMERIC_EVIDENCE_ENTITY, (raw, hex, decimal) => {",
+            "HTML_NUMERIC_EVIDENCE_ENTITY, () => {",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "if (quote !== null) {",
+            "if (false) {",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "NAMED_EVIDENCE_REPLACEMENTS.get(name) ?? raw",
+            "' '",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "normalized = normalized.replace(/\\p{Cf}/gu, ' ');",
+            "normalized = normalized;",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'diff', '--no-ext-diff', '--no-textconv', '--text', "
+            "'--find-renames=50%',",
+            "'diff', '--no-ext-diff', '--no-textconv', '--find-renames=50%',",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "'--output-indicator-new=%', `${previousHead}..${attemptHead}`",
+            "'--output-indicator-new=+', `${previousHead}..${attemptHead}`",
+        ),
+        (
+            ".github/workflows/opencode-auto-review.yml",
+            "globallyAddedLines.has(removal.currentLine)",
             "false",
         ),
         (
@@ -914,6 +1392,18 @@ def test_current_release_commit_only_uses_authenticated_objects(
         "prepared-attempt-binding",
         "bounded-marker-cleanup",
         "canonical-json-anchor",
+        "canonical-removed-prior-binding",
+        "canonical-removed-ancestor",
+        "canonical-removed-rename-rejection",
+        "canonical-removed-line-membership",
+        "canonical-evidence-wrapper-normalization",
+        "canonical-evidence-entity-normalization",
+        "canonical-evidence-link-title-quoting",
+        "canonical-evidence-named-entity-whitelist",
+        "canonical-evidence-format-control-normalization",
+        "canonical-global-added-text-mode",
+        "canonical-global-added-indicator",
+        "canonical-global-readd-rejection",
         "canonical-rename-endpoints",
         "canonical-name-status-flags",
         "canonical-hunk-flags",
