@@ -31,6 +31,7 @@ SOFT_REASONS = frozenset({
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
 IMPACT_CLASSES = frozenset({"runtime", "security", "data-integrity", "user-visible", "performance"})
 MAX_CANDIDATE_BYTES = 60_000
+MAX_CANONICAL_BYTES = 64_000
 MAX_PREVIOUS_CANONICAL_BYTES = 65_536
 MAX_CANDIDATE_BLOCKS = 512
 MAX_SAFE_INTEGER = (1 << 53) - 1
@@ -856,13 +857,17 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                         True, len(canonical_new) + len(still_open), filtered, normalized, maximum, "",
                         tuple(sorted(reasons, key=lambda item: item.index)),
                     )
-                    _write_atomic(
-                        request.canonical_file,
-                        _render_document(
-                            canonical_new,
-                            still_open, resolved, retracted,
-                        ).encode("utf-8"),
-                    )
+                    canonical_payload = _render_document(
+                        canonical_new,
+                        still_open, resolved, retracted,
+                    ).encode("utf-8")
+                    if len(canonical_payload) > MAX_CANONICAL_BYTES:
+                        result = _hard("candidate_oversize")
+                    else:
+                        _write_atomic(
+                            request.canonical_file,
+                            canonical_payload,
+                        )
     except (OSError, TypeError, AttributeError):
         result = _hard("canonicalizer_error")
     if not result.document_valid:

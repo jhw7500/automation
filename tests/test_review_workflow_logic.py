@@ -3288,6 +3288,28 @@ def test_claude_unchanged_v3_success_advances_head_and_preserves_body_hash_quali
 
 
 @node_required
+def test_canonical_body_ceiling_fits_claude_and_gemini_envelopes(tmp_path):
+    canonical = "X" * 64_000
+    bodies = [
+        _single_mutation_body(
+            _claude_upsert(
+                tmp_path, "success", [], with_review=True, review=canonical,
+            )
+        ),
+        _single_mutation_body(
+            _gemini_upsert(
+                tmp_path, "success", [], with_review=True, review=canonical,
+            )
+        ),
+    ]
+
+    for body in bodies:
+        assert _posted_state(body)["attempt_status"] == "success"
+        assert canonical in body
+        assert len(body.encode("utf-8")) <= 65_536
+
+
+@node_required
 def test_claude_oversize_success_becomes_candidate_oversize_without_truncation(tmp_path):
     prior_head = "ab" * 20
     prior_body = "### New findings\n\nNone\n"

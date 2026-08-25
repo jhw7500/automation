@@ -468,7 +468,7 @@ EXPECTED_CANONICALIZER_SOFT_REASONS = frozenset(
     }
 )
 EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256 = (
-    "dbf7e792cbea6b631877e5926b916c05655ee6c55dd3d7a0825479128d4928e6"
+    "a91991d231b73fb1cb9b95368f58e48f639150f5eb8b1d485095823d22b844bd"
 )
 EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
     "cf170639e9dc76ee361086074cf327d091dc8c002c9a3108baf7eb3b02b875bd"
@@ -2307,6 +2307,7 @@ def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree) -> None:
                 }
             ),
             "MAX_CANDIDATE_BYTES": 60_000,
+            "MAX_CANONICAL_BYTES": 64_000,
             "MAX_PREVIOUS_CANONICAL_BYTES": 65_536,
             "MAX_CANDIDATE_BLOCKS": 512,
         }

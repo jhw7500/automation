@@ -86,7 +86,8 @@ following occurs:
 - deterministic diff preparation is unavailable;
 - the captured head, full-diff hash, scope manifest, run generation, or current PR head is invalid;
 - the provider step fails, returns empty output, returns invalid UTF-8, or truncates output;
-- the raw review or final wrapped comment exceeds its configured byte limit;
+- the raw review exceeds 60,000 UTF-8 bytes, its escaped canonical rendering exceeds 64,000 UTF-8
+  bytes, or the final wrapped comment exceeds 65,536 UTF-8 bytes;
 - the document has no recognizable clean result and no unambiguous finding-section boundary;
 - duplicate top-level actionable sections make block ownership ambiguous; or
 - the canonicalizer itself fails.
@@ -312,6 +313,11 @@ Outputs:
 
 The JSON result contains the same fields plus per-candidate reason codes for logs and tests. It must
 not contain rejected candidate prose, repository secrets, or arbitrary model text.
+
+Canonical Markdown is emitted only when its final encoded body is at most 64,000 UTF-8 bytes. This
+post-render bound includes JSON and HTML-safe escaping growth and reserves 1,536 bytes for the
+workflow-owned v3 sticky envelope. The publisher retains its independent 65,536-byte preflight over
+the complete comment.
 
 Hard failure reasons are exactly `candidate_missing`, `invalid_utf8`, `candidate_oversize`,
 `ambiguous_document`, `scope_invalid`, and `canonicalizer_error`. Soft filter/normalization reasons

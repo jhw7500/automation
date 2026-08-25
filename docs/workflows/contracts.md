@@ -385,6 +385,10 @@ The canonicalizer fails the whole document for exactly these hard reasons: `cand
 `invalid_utf8`, `candidate_oversize`, `ambiguous_document`, `scope_invalid`, and
 `canonicalizer_error`. A hard failure sets `document-valid=false`, makes the provider attempt a
 failed checkpoint, publishes no candidate prose, and cannot advance the successful head or hash.
+`candidate_oversize` covers both a raw candidate above 60,000 UTF-8 bytes and a rendered canonical
+body above 64,000 UTF-8 bytes. The second bound is checked after canonical JSON and HTML-safe
+escaping, before the canonical file is published, and reserves 1,536 bytes for the authenticated
+v3 sticky envelope under GitHub's 65,536-byte comment limit.
 After an attempted Claude or Gemini canonicalization that does not produce
 `document-valid=true`, the workflow uploads only the bounded schema-1
 `<reviewer>-review-result.json` as a uniquely named, non-overwriting diagnostic artifact for one
@@ -674,10 +678,11 @@ reported and REST digest, repository/run identity, exact run-scoped name, one-fi
 regular-file/no-symlink type, 1..60,000-byte size, and strict UTF-8 decoding before parsing it.
 It separately re-downloads the sealed handoff, checks out the sealed PR head, and uses
 `/usr/bin/git` with a closed provider-free environment for changed-anchor validation. Before any
-comment or Check mutation it computes the complete canonical state and worst-case fully wrapped
-body, then requires at most 65,536 UTF-8 bytes. Oversize failure therefore performs no cleanup,
-comment creation/update/deletion, or Check creation, matching the repository's GitHub
-comment-publication contract.
+comment or Check mutation the shared canonicalizer first limits the fully rendered canonical body
+to 64,000 UTF-8 bytes. The publisher then computes the complete canonical state and worst-case
+fully wrapped body and requires at most 65,536 UTF-8 bytes. Either oversize failure therefore
+performs no cleanup, comment creation/update/deletion, or Check creation, matching the repository's
+GitHub comment-publication contract.
 
 The canonicalizer treats every model-window marker-bearing new or changed comment as untrusted
 cleanup material; none can supply the model result. It restores the newest previously attested

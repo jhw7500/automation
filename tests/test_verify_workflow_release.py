@@ -1699,6 +1699,11 @@ def test_v146_rejects_any_missing_canonicalizer_reason_literal(
         ),
         (
             ".github/actions/canonicalize-review/canonicalize_review.py",
+            "MAX_CANONICAL_BYTES = 64_000",
+            "MAX_CANONICAL_BYTES = 64_001",
+        ),
+        (
+            ".github/actions/canonicalize-review/canonicalize_review.py",
             "MAX_PREVIOUS_CANONICAL_BYTES = 65_536",
             "MAX_PREVIOUS_CANONICAL_BYTES = 65_535",
         ),

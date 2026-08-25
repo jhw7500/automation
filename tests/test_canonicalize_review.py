@@ -1242,8 +1242,42 @@ def test_previous_reader_rejects_one_byte_over_ceiling_after_size_race(tmp_path,
     assert sum(retained) == canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES + 1
 
 
+def test_escape_expansion_over_canonical_ceiling_fails_before_publication(
+    review_quality_repo,
+):
+    quote = "<" * 11_000
+    path = "long.html"
+    _git(review_quality_repo.repository, "checkout", "--quiet", review_quality_repo.review_head)
+    (review_quality_repo.repository / path).write_text(quote + "\n", encoding="utf-8")
+    head = _commit(review_quality_repo.repository, "add long HTML line")
+    anchor = json.dumps({"path": path, "line": 1}, separators=(",", ":"))
+    evidence = json.dumps(
+        {"path": path, "line": 1, "quote": quote}, separators=(",", ":")
+    )
+    candidate = f'''### New findings
+
+#### [MEDIUM] Long HTML line is mishandled
+- Changed anchor: {anchor}
+- Trigger evidence: {evidence}
+- Impact class: runtime
+- Material impact: The changed HTML line produces an incorrect runtime result.
+'''
+    assert len(candidate.encode("utf-8")) < canonicalize_review.MAX_CANDIDATE_BYTES
+
+    result, canonical = review_quality_repo._run(review_quality_repo._request(
+        candidate, reviewer="gemini", head=head,
+    ))
+
+    assert result == canonicalize_review.CanonicalizationResult(
+        False, 0, 0, 0, "none", "candidate_oversize", (),
+    )
+    assert canonical == ""
+    assert not review_quality_repo.canonical.exists()
+
+
 def test_max_candidate_renderer_output_is_valid_authenticated_previous_input(review_quality_repo):
     assert canonicalize_review.MAX_CANDIDATE_BYTES == 60_000
+    assert canonicalize_review.MAX_CANONICAL_BYTES == 64_000
     assert canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES == 65_536
     blocks = []
     for index in range(200):
@@ -1269,7 +1303,8 @@ def test_max_candidate_renderer_output_is_valid_authenticated_previous_input(rev
     assert (
         canonicalize_review.MAX_CANDIDATE_BYTES
         < len(previous_bytes)
-        <= canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES
+        <= canonicalize_review.MAX_CANONICAL_BYTES
+        < canonicalize_review.MAX_PREVIOUS_CANONICAL_BYTES
     )
 
     request = review_quality_repo._request(

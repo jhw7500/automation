@@ -235,7 +235,11 @@ rtk git commit -m "feat(review): extract trusted finding scope validator"
 - Produces: `CandidateReason(index: int, section: Literal["New findings", "Still open", "Resolved", "Retracted"], outcome: Literal["filtered", "normalized"], reason: str, claimed_severity: Literal["none", "MEDIUM", "HIGH", "CRITICAL"])`.
 - Produces: `CanonicalizationResult(document_valid: bool, accepted_count: int, filtered_count: int, normalized_count: int, filtered_max_severity: Literal["none", "MEDIUM", "HIGH", "CRITICAL"], failure_reason: str, candidate_reasons: tuple[CandidateReason, ...])`.
 - Produces: `canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult` and `stable_finding_id(reviewer: str, anchor: SourceAnchor, severity: str, title: str) -> str`.
-- CLI writes canonical Markdown only for a valid document, writes a schema-1 result of at most 131,072 UTF-8 bytes when it can do so safely, and mirrors scalar fields to `--github-output` when supplied.
+- CLI writes canonical Markdown only for a valid document whose fully rendered body is at most
+  64,000 UTF-8 bytes, including post-render JSON and HTML-safe escaping growth; a larger rendering
+  is `candidate_oversize` and writes no canonical file. It writes a schema-1 result of at most
+  131,072 UTF-8 bytes when it can do so safely and mirrors scalar fields to `--github-output` when
+  supplied.
 - Test fixtures: `case_factory(payload: bytes | None)` creates a request over a valid synthetic scope and exposes `run() -> tuple[CanonicalizationResult, str | None]`; `scoped_case.run(text: str)` encodes the same valid scope for mixed-block tests.
 
 - [ ] **Step 1: Write RED tests for document boundaries, hard reasons, and result hygiene**

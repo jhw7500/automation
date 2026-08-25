@@ -263,6 +263,10 @@ Edit the respective `gemini-*.yml` files to modify:
 - A `Prior review provenance lookup is uncertain` or `Failed to fetch the prior review comment snapshot` Actions-log error means prior state could not be selected safely; model generation and sticky publication were skipped, so rerun after the API or token condition recovers
 - After changing Gemini `repo_write_auth`, keep the repository's non-secret `APP_ID` variable so the canonical caller can pass `publisher_app_id`; this authenticates and reuses the former App-authored sticky without retaining `APP_PRIVATE_KEY` in token mode
 
+### Review workflows report `candidate_oversize`
+- Raw provider output is limited to 60,000 UTF-8 bytes, the escaped canonical body to 64,000 bytes, and the complete sticky comment to 65,536 bytes
+- The canonicalizer writes no review body when post-render escaping crosses the 64,000-byte ceiling; reduce the number or size of findings instead of rerunning identical input
+
 ### Workflows don't trigger
 - Check branch protection rules
 - Verify workflow file syntax (YAML formatting)
