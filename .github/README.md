@@ -260,7 +260,7 @@ Edit the respective `gemini-*.yml` files to modify:
 - Every 429 retry is skipped when its computed backoff cannot fit inside the remaining process watchdog, preserving `quota_exhausted` or `rate_limited` instead of timing out during sleep
 - A sticky `Reason: provider_timeout` means the provider request exceeded its finite review deadline; inspect the linked run before rerunning
 - A sticky `Reason: unsupported_location` is a caller-location policy failure; changing the Gemini model or retrying the same runner does not repair it
-- A `review state provenance lookup is uncertain` notice means the Actions API could not authenticate the newest prior sticky; no review comment was changed, so rerun after the API or token condition recovers
+- A `Prior review provenance lookup is uncertain` or `Failed to fetch the prior review comment snapshot` Actions-log error means prior state could not be selected safely; model generation and sticky publication were skipped, so rerun after the API or token condition recovers
 
 ### Workflows don't trigger
 - Check branch protection rules

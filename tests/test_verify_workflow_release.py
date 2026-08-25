@@ -2248,6 +2248,71 @@ def test_v146_authenticates_collected_review_state_against_its_run(
 @pytest.mark.parametrize(
     ("old", "new"),
     (
+        ("gh api --include", "gh api"),
+        ("lookup_status\" = '404'", "lookup_status\" = '503'"),
+        (
+            "sort_by(.state.run_id, .state.run_attempt, .comment.id)",
+            "sort_by(.state.run_id, .state.run_attempt)",
+        ),
+        (
+            "Failed to fetch the prior review comment snapshot",
+            "Failed to fetch optional review context",
+        ),
+    ),
+    ids=("http-status", "404-policy", "comment-id-tie", "comment-snapshot"),
+)
+def test_v146_rejects_fail_open_prior_state_collection(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    old: str,
+    new: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def weaken_collection(step: dict) -> None:
+        script = step["run"]
+        assert old in script
+        step["run"] = script.replace(old, new, 1)
+
+    mutate_named_step(
+        path, contract["job"], contract["collector_step"], weaken_collection
+    )
+    bad_commit = commit(repo, f"weaken {workflow} prior-state collection")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+def test_v146_requires_publication_to_skip_after_collection_failure(
+    current_release_repo: tuple[Path, str], workflow: str
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    contract = REVIEWER_WORKFLOW_CONTRACTS[workflow]
+
+    def remove_collection_guard(step: dict) -> None:
+        step["if"] = "${{ !cancelled() }}"
+
+    mutate_named_step(
+        path, contract["job"], "Upsert review comment", remove_collection_guard
+    )
+    bad_commit = commit(repo, f"remove {workflow} prior-state publication guard")
+
+    with pytest.raises(ReleaseVerificationError, match="review publication contract"):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "workflow", ("claude-code-review.yml", "gemini-auto-review.yml")
+)
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
         ("comment.user?.login !== botLogin", "false"),
         (
             "attempt_number: record.state.run_attempt",

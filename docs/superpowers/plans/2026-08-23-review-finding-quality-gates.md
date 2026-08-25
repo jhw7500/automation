@@ -799,6 +799,8 @@ Extend the extracted collector/upsert harness with `CLAUDE_V3_MARKER` and a sche
 - a prospective successful sticky over 65,536 UTF-8 bytes becomes a hard `candidate_oversize` attempt and preserves prior success instead of truncating the canonical body;
 - an exact-attempt provenance 404 ignores only that missing record, while timeout, 403, 429, and 5xx abort publication without creating, updating, or deleting a comment;
 - newest-first selection stops after the highest state authenticates, and duplicate authenticated generations prefer the larger comment ID;
+- the same 404/error and duplicate-generation policy applies while collecting prior context, not only while publishing;
+- an unavailable issue-comment snapshot aborts collection, and the publication step cannot run after that collector failure;
 - wrong reviewer, wrong schema, extra/missing key, negative count, or invalid max severity is not authenticated.
 
 - [ ] **Step 3: Change collection to authenticate schema 3 only**
@@ -811,7 +813,7 @@ filtered_max_severity, full_diff_sha256, normalized_count, pr, quality_schema,
 reviewer, run_attempt, run_id, schema, successful_head
 ```
 
-Set `MARKER` to `<!-- automation:claude-code-review:v3 -->`. On authenticated prior success, write the sanitized canonical body to `claude-previous-review.md` separately from `claude-review-context.md`; export SHA/hash only from this record. Continue putting bounded human comments in the context file, but never pass them to the canonicalizer.
+Set `MARKER` to `<!-- automation:claude-code-review:v3 -->`. On authenticated prior success, write the sanitized canonical body to `claude-previous-review.md` separately from `claude-review-context.md`; export SHA/hash only from this record. Continue putting bounded human comments in the context file, but never pass them to the canonicalizer. Require a complete issue-comment snapshot, inspect exact-attempt HTTP status, treat only 404 as definitive absence, and fail the collector on every other lookup error. Gate sticky publication on collector success so an uncertain snapshot or run lookup cannot mutate prior state.
 
 - [ ] **Step 4: Replace the Claude prompt shape with the shared grammar**
 

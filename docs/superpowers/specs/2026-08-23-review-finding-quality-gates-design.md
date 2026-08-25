@@ -370,13 +370,16 @@ review, establishes workflow-assigned finding IDs and quality counters, and repl
 envelope in place. This avoids treating a model-authored historical `Validation` line as trusted and
 prevents an ID-less v2 body from silently losing active findings in a delta round.
 
-Prior-state candidates are checked newest-first, with the larger comment ID breaking a duplicate
-generation tie, and lookup stops after the highest candidate authenticates. HTTP 404 for an exact
-run attempt is definitive absence and may be ignored; every other lookup failure encountered before
-selection (including a timeout, 403, 429, or 5xx) aborts publication before any comment create,
-update, or delete. This prevents a transient lookup failure for the newest state from causing an
-older sticky to be updated or a duplicate sticky to be created without letting an irrelevant older
-record block a known-good latest state.
+Prior-state candidates are checked newest-first during both context collection and publication, with
+the larger comment ID breaking a duplicate-generation tie, and lookup stops after the highest
+candidate authenticates. HTTP 404 for an exact run attempt is definitive absence and may be ignored;
+every other lookup failure encountered before selection (including a timeout, 403, 429, or 5xx)
+aborts before model generation and publication. Failure to fetch the issue-comment snapshot is also
+uncertain rather than equivalent to an empty snapshot. The publication step is gated on a successful
+collector outcome, so no comment is created, updated, or deleted after collection failure. This
+prevents a transient lookup failure for the newest state from dropping or resurrecting findings,
+updating an older sticky, or creating a duplicate while still allowing a definitive 404 to fall back
+to older authenticated state.
 
 OpenCode remains on its existing v2 state because it already has a separate strict canonicalizer and
 is outside issues #41 and #42. Shared collectors and documentation must explicitly support Claude and

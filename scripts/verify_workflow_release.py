@@ -593,6 +593,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
     "claude-code-review.yml": {
         "job": "claude-review",
         "collector": "Collect previous review context",
+        "collector_id": "prepare-review-input",
         "provider": "Run Claude Code Review",
         "prompt_location": "with",
         "reviewer": "claude",
@@ -611,6 +612,9 @@ REVIEW_PUBLICATION_CONTRACTS = {
             "jhw7500/automation/.github/workflows/claude-code-review.yml@"
         ),
         "previous_sha": "${{ steps.prepare-review-input.outputs.previous_sha }}",
+        "upsert_if": (
+            "${{ !cancelled() && steps.prepare-review-input.outcome == 'success' }}"
+        ),
         "previous_file": (
             "${{ steps.prepare-review-input.outputs.previous_sha != '' && "
             "format('{0}/claude-previous-review.md', runner.temp) || '' }}"
@@ -620,6 +624,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
     "gemini-auto-review.yml": {
         "job": "gemini-review",
         "collector": "Get PR details",
+        "collector_id": "pr-details",
         "provider": "Run Gemini Code Review",
         "prompt_location": "run",
         "reviewer": "gemini",
@@ -636,6 +641,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
             "jhw7500/automation/.github/workflows/gemini-auto-review.yml@"
         ),
         "previous_sha": "${{ steps.pr-details.outputs.previous_sha }}",
+        "upsert_if": "${{ !cancelled() && steps.pr-details.outcome == 'success' }}",
         "previous_file": (
             "${{ steps.pr-details.outputs.previous_sha != '' && "
             "format('{0}/gemini-previous-review.md', runner.temp) || '' }}"
@@ -2909,6 +2915,7 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
             collector_contract = (
                 collector_marker
                 and collector_token_contract
+                and collector.get("id") == contract["collector_id"]
                 and f"== {jq_state_keys}" in collector_script
                 and "$s.schema == 3" in collector_script
                 and "$s.quality_schema == 1" in collector_script
@@ -2922,7 +2929,16 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 in collector_script
                 and '"${RUNNER_TEMP:?}/' in collector_script
                 and '"$GITHUB_WORKSPACE/' not in collector_script
+                and "sort_by(.state.run_id, .state.run_attempt, .comment.id)"
+                in collector_script
                 and "reverse | .[:20]" in collector_script
+                and "gh api --include" in collector_script
+                and "lookup_status\" = '404'" in collector_script
+                and '"$lookup_exit" -ne 0' in collector_script
+                and '"$lookup_status" != \'200\'' in collector_script
+                and "Prior review provenance lookup is uncertain" in collector_script
+                and "Failed to fetch the prior review comment snapshot" in collector_script
+                and "proceeding without re-review context" not in collector_script
                 and ("actions/runs/${candidate_run_id}/attempts/${candidate_attempt}")
                 in collector_script
                 and '.event == "pull_request" and .head_sha == $head'
@@ -2959,6 +2975,8 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 raise ValueError("quality prompt differs")
 
             upsert = _named_step(job, "Upsert review comment")
+            if upsert.get("if") != contract["upsert_if"]:
+                raise ValueError("upsert prior-state guard differs")
             if not (
                 job["steps"].index(rejected_diagnostic_upload)
                 < job["steps"].index(upsert)

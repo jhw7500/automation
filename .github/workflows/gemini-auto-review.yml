@@ -172,8 +172,8 @@ jobs:
           # marker는 아래 'Upsert review comment' 스텝과 반드시 동일하게 유지.
           RAW_COMMENTS="$(mktemp)"
           if ! gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate > "$RAW_COMMENTS" 2>/dev/null; then
-            echo "::warning::Failed to fetch PR comments; proceeding without re-review context"
-            echo '[]' > "$RAW_COMMENTS"
+            echo "::error::Failed to fetch the prior review comment snapshot; aborting before review generation/publication"
+            exit 1
           fi
           # --paginate 는 페이지별 JSON 배열을 연달아 출력하므로 slurp 후 병합한다.
           jq -s 'add // []' "$RAW_COMMENTS" > "$COMMENTS_FILE"
@@ -261,18 +261,45 @@ jobs:
                 | {comment: ., state: $s, canonical_body: ($body | .[($prefix | length):])};
 
               [.[] | parsed_state($header; $marker; $reviewer; $bot_login; $pr; $server; $repo)]
-              | sort_by(.state.run_id, .state.run_attempt)
+              | sort_by(.state.run_id, .state.run_attempt, .comment.id)
               | reverse | .[:20]
             ' "$COMMENTS_FILE")"
           PREV_RECORD='null'
+          RUN_RESPONSE="$(mktemp)"
+          RUN_ERROR="$(mktemp)"
+          RUN_BODY="$(mktemp)"
           while IFS= read -r candidate; do
             candidate_run_id="$(jq -r '.state.run_id' <<< "$candidate")"
             candidate_attempt="$(jq -r '.state.run_attempt' <<< "$candidate")"
             candidate_head="$(jq -r '.state.attempt_head' <<< "$candidate")"
-            run_record="$(GH_TOKEN="$ACTIONS_TOKEN" gh api \
+            if GH_TOKEN="$ACTIONS_TOKEN" gh api --include \
               "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate_run_id}/attempts/${candidate_attempt}" \
-              2>/dev/null || true)"
-            if [ -n "$run_record" ] && jq -e \
+              > "$RUN_RESPONSE" 2> "$RUN_ERROR"; then
+              lookup_exit=0
+            else
+              lookup_exit=$?
+            fi
+            lookup_status="$(awk 'NR == 1 {
+              sub(/\r$/, "")
+              if ($1 ~ /^HTTP\// && $2 ~ /^[0-9][0-9][0-9]$/) print $2
+            }' "$RUN_RESPONSE")"
+            if [ "$lookup_status" = '404' ]; then
+              continue
+            fi
+            if [ "$lookup_exit" -ne 0 ] || [ "$lookup_status" != '200' ]; then
+              echo "::error::Prior review provenance lookup is uncertain (HTTP ${lookup_status:-unavailable}); aborting before review generation/publication"
+              exit 1
+            fi
+            awk 'BEGIN { headers = 1 }
+              { sub(/\r$/, "") }
+              headers && $0 == "" { headers = 0; next }
+              !headers { print }
+            ' "$RUN_RESPONSE" > "$RUN_BODY"
+            if ! jq -e 'type == "object"' "$RUN_BODY" >/dev/null 2>&1; then
+              echo "::error::Prior review provenance response is invalid; aborting before review generation/publication"
+              exit 1
+            fi
+            if jq -e \
               --argjson run_id "$candidate_run_id" \
               --argjson run_attempt "$candidate_attempt" \
               --argjson pr "$PR_NUMBER" \
@@ -289,11 +316,12 @@ jobs:
                   (.path | startswith($workflow_prefix))
                   and (.sha | test("^[0-9a-f]{40}$"))
                 )] | length == 1)
-              ' >/dev/null 2>&1 <<< "$run_record"; then
+              ' "$RUN_BODY" >/dev/null 2>&1; then
               PREV_RECORD="$candidate"
               break
             fi
           done < <(jq -c '.[]' <<< "$PREV_CANDIDATES")
+          rm -f "$RUN_RESPONSE" "$RUN_ERROR" "$RUN_BODY"
           PREV_STATE="$(printf '%s\n' "$PREV_RECORD" | jq -c '.state // {}')"
           PREV_SHA="$(printf '%s\n' "$PREV_STATE" | jq -r '(.successful_head // "") | if test("^[0-9a-f]{40}$") then . else "" end')"
           PREV_FULL_HASH="$(printf '%s\n' "$PREV_STATE" | jq -r '(.full_diff_sha256 // "") | if test("^[0-9a-f]{64}$") then . else "" end')"
@@ -933,7 +961,7 @@ jobs:
       # 않음). 실패 시 기존 정상 리뷰는 보존한다(교체 금지).
       # !cancelled(): 취소된 런이 정상 sticky를 에러로 덮어쓰지 않게 한다(always()는 취소에도 true).
       - name: Upsert review comment
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.pr-details.outcome == 'success' }}
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}

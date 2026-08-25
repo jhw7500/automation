@@ -514,6 +514,7 @@ def _gh_stub(
     run_jobs: list[dict] | None = None,
     workflow_runs: list[dict] | None = None,
     workflow_run_attempts: list[dict] | None = None,
+    workflow_run_attempt_statuses: dict[str, int | str] | None = None,
     run_jobs_by_attempt: dict[str, list[dict]] | None = None,
 ) -> dict:
     """PATH-shimmed gh that serves the REST comments and GraphQL reviews fixtures."""
@@ -549,6 +550,9 @@ def _gh_stub(
         json.dumps(workflow_run_attempts if workflow_run_attempts is not None else runs),
         encoding="utf-8",
     )
+    (tmp_path / "run-attempt-statuses.json").write_text(
+        json.dumps(workflow_run_attempt_statuses or {}), encoding="utf-8"
+    )
     (tmp_path / "run-jobs-by-attempt.json").write_text(
         json.dumps(run_jobs_by_attempt or {}), encoding="utf-8"
     )
@@ -574,7 +578,7 @@ def _gh_stub(
         f"  *'/actions/runs --method GET'*) jq '{{total_count:length,workflow_runs:.}}' '{tmp_path}/runs.json' ;;\n"
         f"  *'/commits/'*'/check-runs --method GET'*) ref=$(printf '%s' \"$*\" | sed -n 's#.*commits/\\([^/ ]*\\)/check-runs.*#\\1#p'); jq --arg ref \"$ref\" '{{total_count:([.check_runs[] | select(.head_sha == $ref)] | length),check_runs:[.check_runs[] | select(.head_sha == $ref)]}}' '{tmp_path}/check-runs.json' ;;\n"
         f"  *'/attempts/'*'/jobs'*) run=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\)/jobs.*#\\1#p'); attempt=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\)/jobs.*#\\2#p'); key=\"${{run}}:${{attempt}}\"; jq -e --arg key \"$key\" 'has($key)' '{tmp_path}/run-jobs-by-attempt.json' >/dev/null && jq --arg key \"$key\" '{{total_count:(.[$key]|length),jobs:.[$key]}}' '{tmp_path}/run-jobs-by-attempt.json' || cat '{tmp_path}/run-jobs.json' ;;\n"
-        f"  *'/actions/runs/'*'/attempts/'*) run=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\).*#\\1#p'); attempt=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\).*#\\2#p'); jq --argjson run \"$run\" --argjson attempt \"$attempt\" '.[] | select(.id == $run and .run_attempt == $attempt)' '{tmp_path}/run-attempts.json' ;;\n"
+        f"  *'/actions/runs/'*'/attempts/'*) run=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\).*#\\1#p'); attempt=$(printf '%s' \"$*\" | sed -n 's#.*actions/runs/\\([0-9]*\\)/attempts/\\([0-9]*\\).*#\\2#p'); key=\"${{run}}:${{attempt}}\"; record=$(jq -c --argjson run \"$run\" --argjson attempt \"$attempt\" '.[] | select(.id == $run and .run_attempt == $attempt)' '{tmp_path}/run-attempts.json'); [ -n \"$record\" ] && default_status=200 || default_status=404; status=$(jq -r --arg key \"$key\" --arg default_status \"$default_status\" '.[$key] // $default_status' '{tmp_path}/run-attempt-statuses.json'); [ \"$status\" = transport ] && {{ echo 'stub transport failure' >&2; exit 1; }}; [[ \"$*\" == *'--include'* ]] && printf 'HTTP/2.0 %s Stub\\r\\nContent-Type: application/json\\r\\n\\r\\n' \"$status\"; [ \"$status\" = 200 ] && {{ printf '%s\\n' \"$record\"; exit 0; }}; printf '{{\"message\":\"stub\",\"status\":\"%s\"}}\\n' \"$status\"; echo \"gh: stub (HTTP $status)\" >&2; exit 1 ;;\n"
         f"  *'/check-runs/'*) id=$(printf '%s' \"$*\" | sed -n 's#.*check-runs/\\([0-9]*\\).*#\\1#p'); jq --argjson id \"$id\" '.check_runs[] | select(.id == $id)' '{tmp_path}/check-runs.json' ;;\n"
         f"  *'/comments --paginate'*) [ \"${{GH_STUB_COMMENTS_FAIL:-false}}\" = true ] && exit 1; cat '{tmp_path}/comments.json' ;;\n"
         "  *'--json headRefOid'*)\n"
@@ -623,6 +627,8 @@ def _run_collect(
     pr_files: list[str] | None = None,
     literal_schema: bool = False,
     workflow_runs: list[dict] | None = None,
+    workflow_run_attempt_statuses: dict[str, int | str] | None = None,
+    comments_fail: bool = False,
 ) -> str | None:
     workflow = _load("claude-code-review.yml")
     run = _step(workflow, "claude-review", "Collect previous review context")["run"]
@@ -638,6 +644,8 @@ def _run_collect(
             if workflow_runs is None
             else workflow_runs
         ),
+        workflow_run_attempt_statuses=workflow_run_attempt_statuses,
+        comments_fail=comments_fail,
     )
     output = tmp_path / "github-output"
     env.update(
@@ -1208,7 +1216,7 @@ def test_claude_prompt_pins_diff_source():
     assert "never broaden the reviewed change set or prepare another diff" in prompt
 
 
-def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure():
+def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure_after_collection():
     workflow = _load("claude-code-review.yml")
     model = _step(workflow, "claude-review", "Run Claude Code Review")
     upsert = _step(workflow, "claude-review", "Upsert review comment")
@@ -1217,7 +1225,9 @@ def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure()
         "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
         "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
     )
-    assert upsert["if"] == "${{ !cancelled() }}"
+    assert upsert["if"] == (
+        "${{ !cancelled() && steps.prepare-review-input.outcome == 'success' }}"
+    )
 
 
 def test_claude_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tmp_path):
@@ -2053,6 +2063,8 @@ def _run_gemini_collection(
     *,
     literal_schema: bool = False,
     workflow_runs: list[dict] | None = None,
+    workflow_run_attempt_statuses: dict[str, int | str] | None = None,
+    comments_fail: bool = False,
 ) -> str:
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Get PR details")["run"]
@@ -2067,6 +2079,8 @@ def _run_gemini_collection(
             if workflow_runs is None
             else workflow_runs
         ),
+        workflow_run_attempt_statuses=workflow_run_attempt_statuses,
+        comments_fail=comments_fail,
     )
     env.update(
         {
@@ -2095,6 +2109,8 @@ def _run_gemini_details(
     head_sha: str = "ab" * 20,
     literal_schema: bool = False,
     workflow_runs: list[dict] | None = None,
+    workflow_run_attempt_statuses: dict[str, int | str] | None = None,
+    comments_fail: bool = False,
 ) -> tuple[str, dict[str, str]]:
     workflow = _load("gemini-auto-review.yml")
     run = _step(workflow, "gemini-review", "Get PR details")["run"]
@@ -2110,6 +2126,8 @@ def _run_gemini_details(
             if workflow_runs is None
             else workflow_runs
         ),
+        workflow_run_attempt_statuses=workflow_run_attempt_statuses,
+        comments_fail=comments_fail,
     )
     env.update(
         {
@@ -2128,6 +2146,158 @@ def _run_gemini_details(
     return (
         (tmp_path / "prev_review.txt").read_text(encoding="utf-8"),
         _github_outputs(output),
+    )
+
+
+def _collector_comment(
+    reviewer: str,
+    *,
+    run_id: int,
+    text: str,
+    comment_id: int,
+    head: str,
+) -> dict:
+    marker, header = {
+        "claude": (CLAUDE_V3_MARKER, CLAUDE_HEADER),
+        "gemini": (GEMINI_V3_MARKER, GEMINI_HEADER),
+    }[reviewer]
+    return _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(reviewer=reviewer, run_id=run_id, head=head),
+            text,
+            marker=marker,
+            header=header,
+        ),
+        comment_id,
+    )
+
+
+def _run_reviewer_collector(
+    tmp_path: Path,
+    reviewer: str,
+    comments: list[dict],
+    *,
+    workflow_runs: list[dict] | None = None,
+    workflow_run_attempt_statuses: dict[str, int | str] | None = None,
+    comments_fail: bool = False,
+) -> str | None:
+    if reviewer == "claude":
+        return _run_collect(
+            tmp_path,
+            comments,
+            workflow_runs=workflow_runs,
+            workflow_run_attempt_statuses=workflow_run_attempt_statuses,
+            comments_fail=comments_fail,
+        )
+    previous, _outputs = _run_gemini_details(
+        tmp_path,
+        comments,
+        workflow_runs=workflow_runs,
+        workflow_run_attempt_statuses=workflow_run_attempt_statuses,
+        comments_fail=comments_fail,
+    )
+    return previous
+
+
+@pytest.mark.parametrize("reviewer", ["claude", "gemini"])
+@pytest.mark.parametrize("status", ["transport", 403, 429, 500, 503])
+def test_reviewer_collector_fails_closed_on_uncertain_newest_provenance(
+    tmp_path, reviewer, status
+):
+    old = _collector_comment(
+        reviewer, run_id=10, text="OLDER AUTHENTICATED", comment_id=10, head="aa" * 20
+    )
+    newest = _collector_comment(
+        reviewer, run_id=20, text="NEWEST UNCERTAIN", comment_id=20, head="bb" * 20
+    )
+    comments = [old, newest]
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_reviewer_collector(
+            tmp_path,
+            reviewer,
+            comments,
+            workflow_runs=_review_run_fixtures(comments, reviewer),
+            workflow_run_attempt_statuses={"20:1": status},
+        )
+
+    prior_file = tmp_path / f"{reviewer}-previous-review.md"
+    assert not prior_file.exists()
+    calls = (tmp_path / "gh-calls.log").read_text(encoding="utf-8")
+    assert "/actions/runs/20/attempts/1" in calls
+    assert "/actions/runs/10/attempts/1" not in calls
+
+
+@pytest.mark.parametrize("reviewer", ["claude", "gemini"])
+def test_reviewer_collector_treats_exact_attempt_404_as_absent(tmp_path, reviewer):
+    old = _collector_comment(
+        reviewer, run_id=10, text="OLDER AUTHENTICATED", comment_id=10, head="aa" * 20
+    )
+    newest = _collector_comment(
+        reviewer, run_id=20, text="MISSING NEWEST", comment_id=20, head="bb" * 20
+    )
+    comments = [old, newest]
+
+    previous = _run_reviewer_collector(
+        tmp_path,
+        reviewer,
+        comments,
+        workflow_runs=_review_run_fixtures(comments, reviewer),
+        workflow_run_attempt_statuses={"20:1": 404},
+    )
+
+    assert previous is not None
+    assert "OLDER AUTHENTICATED" in previous
+    assert "MISSING NEWEST" not in previous
+
+
+@pytest.mark.parametrize("reviewer", ["claude", "gemini"])
+def test_reviewer_collector_fails_closed_when_comment_snapshot_is_unavailable(
+    tmp_path, reviewer
+):
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_reviewer_collector(tmp_path, reviewer, [], comments_fail=True)
+
+
+@pytest.mark.parametrize("reviewer", ["claude", "gemini"])
+def test_reviewer_collector_duplicate_generation_prefers_larger_comment_id(
+    tmp_path, reviewer
+):
+    higher_id = _collector_comment(
+        reviewer, run_id=20, text="HIGHER COMMENT ID", comment_id=22, head="bb" * 20
+    )
+    lower_id = _collector_comment(
+        reviewer, run_id=20, text="LOWER COMMENT ID", comment_id=11, head="bb" * 20
+    )
+    comments = [higher_id, lower_id]
+
+    previous = _run_reviewer_collector(
+        tmp_path,
+        reviewer,
+        comments,
+        workflow_runs=_review_run_fixtures(comments, reviewer),
+    )
+
+    assert previous is not None
+    assert "HIGHER COMMENT ID" in previous
+    assert "LOWER COMMENT ID" not in previous
+
+
+@pytest.mark.parametrize(
+    ("workflow_name", "job_name", "collector_id"),
+    [
+        ("claude-code-review.yml", "claude-review", "prepare-review-input"),
+        ("gemini-auto-review.yml", "gemini-review", "pr-details"),
+    ],
+)
+def test_reviewer_publication_requires_successful_prior_state_collection(
+    workflow_name, job_name, collector_id
+):
+    upsert = _step(_load(workflow_name), job_name, "Upsert review comment")
+
+    assert upsert["if"] == (
+        f"${{{{ !cancelled() && steps.{collector_id}.outcome == 'success' }}}}"
     )
 
 
@@ -2359,7 +2529,7 @@ def test_gemini_canonical_v2_collection_and_shared_action_contract(tmp_path):
     action = _step(workflow, "gemini-review", "Prepare review diff")
 
     assert "<!-- automation:gemini-auto-review:v3 -->" in details
-    assert "sort_by(.state.run_id, .state.run_attempt)" in details
+    assert "sort_by(.state.run_id, .state.run_attempt, .comment.id)" in details
     assert "gh pr diff" not in details
     assert action["uses"] == "$/.github/actions/prepare-review-diff"
     assert action["with"]["context-lines"] == "20"
