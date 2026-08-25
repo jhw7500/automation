@@ -303,6 +303,16 @@ def _field_values(lines: tuple[str, ...], name: str) -> list[str]:
     return [line[len(prefix):] for line in lines if line.startswith(prefix)]
 
 
+def _finding_prose(lines: tuple[str, ...]) -> tuple[str, ...]:
+    """Return visible prose while excluding only the canonical structured fields."""
+    structured_prefixes = tuple(f"- {name}: " for name in NEW_FINDING_FIELDS)
+    return tuple(
+        _canonical_visible_text(line)
+        for line in lines
+        if line and not line.startswith(structured_prefixes)
+    )
+
+
 def _claim_reason(block: _Block, outcome: Literal["filtered", "normalized"], reason: str) -> CandidateReason:
     return CandidateReason(block.index, block.section, outcome, reason, block.severity)
 
@@ -328,12 +338,7 @@ def _validate_new(block: _Block, scope: object) -> tuple[_Finding | None, str | 
         return None, "invalid_impact_class"
     material_values = _field_values(block.lines, "Material impact")
     material = material_values[0].strip() if len(material_values) == 1 else ""
-    structured_prefixes = tuple(f"- {name}: " for name in NEW_FINDING_FIELDS)
-    extra_prose = tuple(
-        _canonical_visible_text(line)
-        for line in block.lines
-        if line and not line.startswith(structured_prefixes)
-    )
+    extra_prose = _finding_prose(block.lines)
     material_text = " ".join((material, *extra_prose)).strip()
     if not material or PROOF_DEFICIT.search(material_text):
         return None, "missing_material_impact"
@@ -501,7 +506,7 @@ def _parse_prior_active(block: _Block, reviewer: str) -> _PriorFinding:
         ))
     elif bases:
         raise ScopeValidationError("previous canonical finding is invalid")
-    prose = tuple(line for line in block.lines if line and not line.startswith("- "))
+    prose = _finding_prose(block.lines)
     if any(WORKFLOW_OWNED.search(line) for line in prose):
         raise ScopeValidationError("previous canonical prose is workflow-owned")
     finding = _Finding(block.severity, block.title, anchor, tuple(evidence), impact, material, prose, basis)

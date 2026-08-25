@@ -1575,6 +1575,45 @@ None
     assert followup_canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
 
 
+def test_bulleted_supplemental_prose_round_trips_as_authenticated_prior(
+    review_quality_repo,
+):
+    """A canonical finding must preserve non-structured bullets across delta rounds."""
+    title = "Bulleted detail remains authenticated"
+    detail = "- Detail: Invalid input reaches the persisted result."
+    initial = _new_free_text_candidate(
+        title,
+        "Invalid input is persisted as a supported result.",
+        detail,
+    )
+    prior_result, previous = review_quality_repo._run(review_quality_repo._request(
+        initial,
+        reviewer="gemini",
+        head=review_quality_repo.review_head,
+    ))
+    expected_id = stable_finding_id(
+        "gemini", SourceAnchor("review_cases.py", 26), "HIGH", title,
+    )
+    assert prior_result == canonicalize_review.CanonicalizationResult(
+        True, 1, 0, 0, "none", "", (),
+    )
+    assert detail in previous
+
+    request = review_quality_repo._request(
+        "### New findings\n\nNone\n",
+        reviewer="gemini",
+        head=review_quality_repo.review_head,
+        previous_sha=review_quality_repo.review_head,
+        previous_review=previous,
+    )
+    loaded = canonicalize_review._load_prior_active(request)
+
+    assert loaded[expected_id].finding.prose == (detail,)
+    assert previous == canonicalize_review._render_document(
+        [loaded[expected_id]], [], [], [],
+    )
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     (

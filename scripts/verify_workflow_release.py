@@ -420,7 +420,7 @@ EXPECTED_CANONICALIZER_SOFT_REASONS = frozenset(
     }
 )
 EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256 = (
-    "6ee54e4de9ed915a9b879ce1404eb364f2aefa558cf0249a60f1674df861c43e"
+    "c748822e1a7d56604f4837215e6e0fb9601b77b9a59fd3fb0b4f481aa29b3ac9"
 )
 EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
     "cf170639e9dc76ee361086074cf327d091dc8c002c9a3108baf7eb3b02b875bd"
@@ -629,7 +629,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
         "canonical": "gemini-review-canonical.md",
         "canonical_step": "Canonicalize Gemini review",
         "upsert_sha256": (
-            "dc375e9fbd8ad088b8695332bff6b5c4d40b7cbb7ed8f7b6718ab55d7ca82974"
+            "2382d41b27439d70c8a5592608f1302382147f6542ab2265e13fda04209d194d"
         ),
         "bot_login": "${{ steps.auth.outputs.bot-login }}",
         "workflow_prefix": (

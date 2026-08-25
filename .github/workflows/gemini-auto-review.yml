@@ -760,6 +760,8 @@ jobs:
                   return 'empty_output'
               if isinstance(err, TruncatedModelResponse):
                   return 'output_truncated'
+              if 'user location is not supported' in message:
+                  return 'unsupported_location'
               if isinstance(err, TimeoutError) or (
                   httpx is not None and isinstance(err, httpx.TimeoutException)
               ) or (
@@ -991,7 +993,7 @@ jobs:
             const reportedFailureReason = process.env.FAILURE_REASON || '';
             const allowedFailureReasons = new Set([
               'provider_failed', 'quota_exhausted', 'rate_limited', 'authentication_failed',
-              'provider_timeout',
+              'provider_timeout', 'unsupported_location',
               'coverage_input_too_large', 'invalid_input_budget', 'invalid_thinking_level',
               'empty_output', 'output_truncated',
             ]);

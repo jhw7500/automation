@@ -220,12 +220,13 @@ The automatic review model is read from the `GEMINI_MODEL`
 repository/organization Actions **variable** (not a secret). If unset, it
 defaults to the stable `gemini-3.7-flash` model. A separate
 `GEMINI_FALLBACK_MODEL` variable defaults to stable `gemini-3.6-flash` and is
-tried once after provider, timeout, quota/rate-limit, empty-output, or
-truncated-output failure. Authentication and canonical-format failures do not
-trigger fallback, and equal primary/fallback values never duplicate a call. No
-workflow file edit is required. Primary retries and fallback share a maximum of
-three provider requests, so enabling fallback does not multiply the previous
-request ceiling.
+tried once after an eligible provider, timeout, quota/rate-limit, empty-output,
+or truncated-output failure. Authentication, unsupported-location, and
+canonical-format failures do not trigger fallback because changing models
+cannot repair them. Equal primary/fallback values never duplicate a call. No
+workflow file edit is required. Primary retries and fallback share a maximum
+of three provider requests, so enabling fallback does not multiply the
+previous request ceiling.
 
 ### Filtering Claude Reviews by Author
 
@@ -257,8 +258,8 @@ Edit the respective `gemini-*.yml` files to modify:
 - Check API quota limits at https://aistudio.google.com
 - A quota response with positive provider retry guidance (seconds or milliseconds) receives bounded backoff; a final `Reason: quota_exhausted` means all allowed attempts failed or guidance was absent
 - Every 429 retry is skipped when its computed backoff cannot fit inside the remaining process watchdog, preserving `quota_exhausted` or `rate_limited` instead of timing out during sleep
-- Ensure GCP credentials are correct (if using Vertex AI)
 - A sticky `Reason: provider_timeout` means the provider request exceeded its finite review deadline; inspect the linked run before rerunning
+- A sticky `Reason: unsupported_location` is a caller-location policy failure; changing the Gemini model or retrying the same runner does not repair it
 
 ### Workflows don't trigger
 - Check branch protection rules

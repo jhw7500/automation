@@ -3665,6 +3665,22 @@ def test_gemini_provider_timeout_failure_keeps_specific_reason(tmp_path):
 
 
 @node_required
+def test_gemini_unsupported_location_failure_keeps_specific_reason(tmp_path):
+    calls = _gemini_upsert(
+        tmp_path,
+        "failure",
+        [],
+        with_review=True,
+        review="⚠️ Failed to generate Gemini review",
+        failure_reason="unsupported_location",
+    )
+    assert "Reason: unsupported_location" in _single_mutation_body(calls)
+    assert [call for call in calls if call[0] == "failed"] == [
+        ["failed", "Gemini review checkpoint failed: unsupported_location"]
+    ]
+
+
+@node_required
 def test_gemini_failure_after_success_preserves_body_and_hash_as_stale(tmp_path):
     old_head = "ab" * 20
     old_body = _v2_body(
@@ -4940,8 +4956,22 @@ def test_gemini_auto_review_configures_stable_primary_and_fallback_models():
     )
 
 
-def test_gemini_uses_configured_fallback_after_primary_transport_failure(tmp_path):
-    """A provider transport failure gets one isolated attempt on the fallback model."""
+@pytest.mark.parametrize(
+    "primary_error",
+    (
+        "Server disconnected without sending a response",
+        (
+            "503 UNAVAILABLE. {'error': {'code': 503, 'message': "
+            "'This model is currently experiencing high demand. Please try again later.', "
+            "'status': 'UNAVAILABLE'}}"
+        ),
+    ),
+    ids=("transport", "high-demand"),
+)
+def test_gemini_uses_configured_fallback_after_eligible_provider_failure(
+    tmp_path, primary_error,
+):
+    """An eligible provider failure gets one isolated attempt on the fallback model."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
     google = tmp_path / "stub" / "google"
     genai_stub = google / "genai"
@@ -4969,7 +4999,7 @@ def test_gemini_uses_configured_fallback_after_primary_transport_failure(tmp_pat
         "        path = pathlib.Path('models.txt')\n"
         "        with path.open('a') as f: f.write(model + '\\n')\n"
         "        if model == 'primary-model':\n"
-        "            raise RuntimeError('Server disconnected without sending a response')\n"
+        f"            raise RuntimeError({primary_error!r})\n"
         "        return _R()\n"
         "class Client:\n"
         "    def __init__(self, api_key=None, http_options=None): self.models = _Models()\n",
@@ -5030,6 +5060,55 @@ def test_gemini_does_not_fallback_after_authentication_failure(tmp_path):
     assert result.returncode != 0
     assert (tmp_path / "models.txt").read_text().splitlines() == ["primary-model"]
     assert (tmp_path / "gemini_failure_reason.txt").read_text() == "authentication_failed"
+
+
+def test_gemini_does_not_fallback_when_api_location_is_unsupported(tmp_path):
+    """Changing models cannot repair a provider policy restriction on the caller's location."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    google = tmp_path / "stub" / "google"
+    genai_stub = google / "genai"
+    genai_stub.mkdir(parents=True)
+    (google / "__init__.py").write_text("", encoding="utf-8")
+    (genai_stub / "types.py").write_text(
+        "class HttpOptions:\n"
+        "    def __init__(self, timeout): self.timeout = timeout\n"
+        "class ThinkingConfig:\n"
+        "    def __init__(self, thinking_level): self.thinking_level = thinking_level\n"
+        "class GenerateContentConfig:\n"
+        "    def __init__(self, thinking_config): self.thinking_config = thinking_config\n",
+        encoding="utf-8",
+    )
+    (genai_stub / "__init__.py").write_text(
+        "import pathlib\n"
+        "from . import types\n"
+        "class _Models:\n"
+        "    def generate_content(self, *, model, contents, config):\n"
+        "        path = pathlib.Path('models.txt')\n"
+        "        with path.open('a') as f: f.write(model + '\\n')\n"
+        "        raise RuntimeError(\n"
+        "            \"400 FAILED_PRECONDITION. {'error': {'code': 400, 'message': \"\n"
+        "            \"'User location is not supported for the API use.', \"\n"
+        "            \"'status': 'FAILED_PRECONDITION'}}\"\n"
+        "        )\n"
+        "class Client:\n"
+        "    def __init__(self, api_key=None, http_options=None): self.models = _Models()\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env.update({
+        "GEMINI_MODEL": "primary-model",
+        "GEMINI_FALLBACK_MODEL": "fallback-model",
+    })
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "models.txt").read_text().splitlines() == ["primary-model"]
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "unsupported_location"
 
 
 def test_gemini_skips_duplicate_fallback_model(tmp_path):

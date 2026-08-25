@@ -59,9 +59,10 @@ therefore express the intended policy but cannot enforce it.
 6. Make filtering visible and authenticated without repeating the rejected claim in the PR
    discussion.
 7. Add no provider/model request from canonicalization. The successful primary path remains one
-   request; a terminal provider, timeout, model-specific limit, empty-output, or truncated-output
-   failure may use one configured fallback model. Primary retries and fallback share the existing
-   three-request ceiling.
+   request; an eligible terminal provider, timeout, model-specific limit, empty-output, or
+   truncated-output failure may use one configured fallback model. Authentication and
+   unsupported-location failures do not trigger fallback. Primary retries and fallback share the
+   existing three-request ceiling.
 8. Use one implementation and one deterministic corpus for Claude and Gemini.
 
 ## 4. Non-goals

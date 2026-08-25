@@ -342,7 +342,9 @@ section, or in place of a declared carryover section is `ambiguous_document`. A 
 accepts only the closed workflow-owned no-findings form; `None` cannot terminate parsing and hide a
 later provider error or caveat. Unknown bullets inside a finding are not silently discarded. They
 remain candidate prose and participate in proof-deficit checks, so wording such as “cannot verify”
-cannot evade filtering merely by using an unrecognized field label.
+cannot evade filtering merely by using an unrecognized field label. Accepted supplemental bullets
+remain byte-stable canonical prose when the next delta round authenticates and reconstructs the
+prior finding; only the closed set of structured field prefixes is excluded from prose.
 
 Carryover sections are `### Still open`, `### Resolved`, and `### Retracted`. Every carryover
 heading has the exact form `#### RVW-<12 lowercase hex> [SEVERITY] title` and binds exactly one
@@ -471,7 +473,7 @@ checkpoint and null quality values. A stale run, missing/invalid input, empty ca
 invalid prior state cannot advance coverage; an invalid prior state falls back to a full review.
 
 Gemini auto-review has nested finite deadlines so a provider or transport stall cannot occupy a
-review round indefinitely: the current SDK request timeout is 420,000 ms, the review subprocess
+review round indefinitely: the current SDK request timeout is 200,000 ms, the review subprocess
 watchdog is 450 seconds (plus a 15-second hard-kill grace), and the job timeout is 10 minutes. This
 reserves 135 seconds of the job budget outside the watchdog window for setup overhead, cleanup, and
 sticky publication. The watchdog measures elapsed time and normalizes a hard-kill status (`137`) to
@@ -480,6 +482,14 @@ remains a generic provider failure. An SDK timeout, a Google API `499 CANCELLED`
 or the subprocess deadline records `provider_timeout`; the non-cancelled upsert path publishes that
 reason as a failed/stale attempt without advancing `Reviewed`. The job timeout is the last-resort
 ceiling and remains below the 12-minute `/jhw:ship` review-round deadline.
+
+The successful Gemini path makes one provider request. After an eligible terminal provider,
+timeout, quota/rate-limit, empty-output, or truncated-output failure, it may try one configured
+fallback model. Primary retries and fallback share the existing three-request ceiling. An
+authentication failure, an unsupported caller location, or a canonical-format failure never
+triggers the model fallback because changing models cannot repair that failure class. An
+unsupported caller location is published as `unsupported_location` rather than collapsed into
+`provider_failed`.
 
 Gemini 429 handling separates retry eligibility from the final failure classification. A positive
 provider `RetryInfo`/`Please retry in` delay remains authoritative even when the same response
