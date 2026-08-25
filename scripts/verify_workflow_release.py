@@ -47,10 +47,10 @@ OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
 )
 OPENCODE_REVIEW_RUN_SHA256 = (
-    "d646ab36ea1c30febae4910db61c3b385c89032ed6160ae4eaa3995b65d2caf3"
+    "4794ff29221020dd1ed7d0c67ea51a9b1856fc5ea53dcfd5514e5c2d18ecb24c"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
-    "9e160882f47980dfbfc02e261b4d547eaa3453b4547cea55e24d41b47d4bdb97"
+    "4e2fdc1d58612db9df2f5f406df07b3dbd2b5b3cd00962ef650b3f22675d3aa0"
 )
 # These immutable annotated v1.45 patch releases predate format repair. Only their
 # exact peeled commits may retain the legacy generic command; no new commit may opt in.
@@ -1399,6 +1399,20 @@ def verify_opencode_runtime(
         and "return backslash_count % 2 == 0" in run_script
         and "if is_markdown_thematic_break(remainder):" in run_script
         and "if raw_decorated_title_is_unapproved(line):" in run_script
+        and 'rf"^(#{{1,6}})(?:{HORIZONTAL_SPACE}+' in run_script
+        and "def has_unapproved_setext_heading(lines):" in run_script
+        and "def parse_setext_containers(line):" in run_script
+        and "def strip_setext_containers(line, containers):" in run_script
+        and "def parse_markdown_list_item(line):" in run_script
+        and "def html_block_start(line, paragraph_open=False):" in run_script
+        and "def classify_link_reference_start(line):" in run_script
+        and 'if mode == "needs-destination":' in run_script
+        and "and not line_interrupts_setext_paragraph(" in run_script
+        and 'if re.match(r"^<![A-Z]", content) is not None:' in run_script
+        and "MARKDOWN_EMPTY_LIST_ITEM.fullmatch(remainder) is not None" in run_script
+        and "line = raw_line.expandtabs(4)" in run_script
+        and "if has_unapproved_setext_heading(suffix) or any(" in run_script
+        and "if has_unapproved_setext_heading(prefix) or any(" in run_script
         and 'remainder = line.strip()' in run_script
         and 'unicodedata.category(character) == "Zs"' in run_script
         and "normalize_finding_field_wrappers(line).strip()" in run_script

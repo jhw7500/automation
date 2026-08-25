@@ -703,6 +703,46 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
             "              if False:",
         ),
         (
+            '              rf"^(#{{1,6}})(?:{HORIZONTAL_SPACE}+(.*)|{HORIZONTAL_SPACE}*)$"',
+            '              r"^(#{1,6})(?:[ \\t]+(.*)|[ \\t]*)$"',
+        ),
+        (
+            "              if has_unapproved_setext_heading(prefix) or any(",
+            "              if any(",
+        ),
+        (
+            "                  line = raw_line.expandtabs(4)",
+            "                  line = raw_line",
+        ),
+        (
+            "          def parse_markdown_list_item(line):",
+            "          def parse_markdown_list_item_disabled(line):",
+        ),
+        (
+            "          def html_block_start(line, paragraph_open=False):",
+            "          def html_block_start_disabled(line, paragraph_open=False):",
+        ),
+        (
+            "          def classify_link_reference_start(line):",
+            "          def classify_link_reference_start_disabled(line):",
+        ),
+        (
+            "                                      and not line_interrupts_setext_paragraph(",
+            "                                      and False and line_interrupts_setext_paragraph(",
+        ),
+        (
+            "          def strip_setext_containers(line, containers):",
+            "          def strip_setext_containers_disabled(line, containers):",
+        ),
+        (
+            '              if re.match(r"^<![A-Z]", content) is not None:',
+            '              if re.match(r"^<![A-Za-z]", content) is not None:',
+        ),
+        (
+            "                  or MARKDOWN_EMPTY_LIST_ITEM.fullmatch(remainder) is not None",
+            "                  or False",
+        ),
+        (
             '              remainder = line.strip()',
             '              remainder = unicodedata.normalize("NFKC", line).strip()',
         ),
@@ -746,6 +786,16 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
         "escaped-decoration-close",
         "thematic-break-exclusion",
         "raw-decoration-signal",
+        "unicode-space-hash-heading-lookalike",
+        "setext-prefix-guard",
+        "setext-tab-expansion",
+        "setext-list-container",
+        "setext-html-block",
+        "setext-link-reference",
+        "setext-reference-block-precedence",
+        "setext-container-matching",
+        "setext-html-declaration-case",
+        "setext-empty-list-item",
         "raw-decoration-provenance",
         "commonmark-whitespace",
         "decorated-title-trailing-space",

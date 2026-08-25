@@ -4520,6 +4520,394 @@ def test_opencode_format_repair_cannot_drop_unapproved_wrapper_heading(
 
 
 @pytest.mark.parametrize(
+    "heading",
+    (
+        "Authentication bypass remains\n=",
+        "Authorization check is missing\n---",
+        "Authentication\nbypass remains\n====",
+        "   Token disclosure remains\n   =====\t",
+    ),
+    ids=("h1", "h2", "multiline", "three-space-indented"),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_cannot_drop_unapproved_setext_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    finding = (
+        heading
+        + "\nThis substantive finding must not be discarded as wrapper prose."
+    )
+    if placement == "prefix":
+        malformed = finding + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + finding
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Review summary\n=",
+        "Summary\n---",
+        "Code review\nsummary\n===",
+    ),
+    ids=("review-summary", "summary", "multiline-code-review-summary"),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_exact_benign_setext_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    wrapper = heading + "\nI reviewed the supplied diff."
+    if placement == "prefix":
+        malformed = wrapper + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + wrapper
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "> Authentication bypass remains\n> ====",
+        "> Authorization check\n> is missing\n> ---",
+        "> > Token disclosure remains\n> > =",
+    ),
+    ids=("blockquote", "multiline-blockquote", "nested-blockquote"),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_cannot_drop_blockquoted_setext_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    finding = heading + "\n> This substantive finding must not be discarded."
+    if placement == "prefix":
+        malformed = finding + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + finding
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "> Review summary\n> ====",
+        "> Code review\n> summary\n> ---",
+        "> > Overview\n> > =",
+    ),
+    ids=("blockquote", "multiline-blockquote", "nested-blockquote"),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_benign_blockquoted_setext_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    wrapper = heading + "\n> I reviewed the supplied diff."
+    if placement == "prefix":
+        malformed = wrapper + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + wrapper
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "> Authentication\nbypass remains\n> ---",
+        "- Authentication bypass remains\n  ---",
+        "1. Authorization check is missing\n   ===",
+        "- Authentication\nbypass remains\n  ---",
+        "<span>Token disclosure remains</span>\n---",
+        "<https://example.com/security>\n---",
+        "> Authentication bypass remains\n> \t---",
+        "> \tAuthorization check is missing\n> \t===",
+        "- > Authentication bypass remains\n  > ---",
+        "- > - Token disclosure remains\n  >   ---",
+        "> - > Authorization check is missing\n>   > ===",
+        "<!authentication bypass>\n---",
+        "</span foo>\n---",
+        '[review]: a\\ "Authentication bypass"\n---',
+        "[ ]: /url\n---",
+        "[Authentication bypass]:\n---",
+        "[Authorization check is missing]:\n-",
+    ),
+    ids=(
+        "lazy-blockquote",
+        "bullet-list",
+        "ordered-list",
+        "lazy-list-continuation",
+        "inline-html",
+        "autolink",
+        "blockquote-tab-underline",
+        "blockquote-tab-title-and-underline",
+        "list-blockquote",
+        "list-blockquote-list",
+        "blockquote-list-blockquote",
+        "lowercase-html-declaration",
+        "invalid-html-closing-tag",
+        "unfinished-reference-destination-escape",
+        "whitespace-only-reference-label",
+        "incomplete-reference-before-dash-run",
+        "incomplete-reference-before-single-dash",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_cannot_drop_container_setext_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    finding = heading + "\nThis substantive finding must not be discarded."
+    if placement == "prefix":
+        malformed = finding + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + finding
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "> Review\nsummary\n> ---",
+        "- Review summary\n  ---",
+        "1. Code review results\n   ===",
+        "- Code review\nsummary\n  ---",
+        "<span>Review summary</span>\n---",
+        "> Review summary\n> \t---",
+    ),
+    ids=(
+        "lazy-blockquote",
+        "bullet-list",
+        "ordered-list",
+        "lazy-list-continuation",
+        "inline-html",
+        "blockquote-tab-underline",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_benign_container_setext_heading(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    wrapper = heading + "\nI reviewed the supplied diff."
+    if placement == "prefix":
+        malformed = wrapper + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + wrapper
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "lookalike",
+    (
+        "~~~text\nAuthentication bypass remains\n---\n~~~",
+        "<div>\nAuthentication bypass remains\n---\n</div>",
+        "[docs]: https://example.com\n---",
+        " \tAuthentication bypass remains\n---",
+        "  \tAuthorization check is missing\n===",
+        "-\n===",
+        "+\n===",
+        "*\n===",
+        "1.\n===",
+        "[docs]:\n  /url\n---",
+        "[docs]:\n--",
+        "[docs]:\n===",
+        '[docs]: /url\n  "title"\n---',
+        "> ```text\n> > Authentication bypass remains\n> > ---\n> ```",
+        "> <div>\n> > Authentication bypass remains\n> > ---\n> </div>\n>",
+        "- ```text\n  > Authentication bypass remains\n  > ---\n  ```",
+        "<!Authentication bypass>\n---",
+        "<span>\nAuthentication bypass remains\n---\n</span>",
+    ),
+    ids=(
+        "fenced-code",
+        "html-block",
+        "link-reference-and-thematic-break",
+        "space-tab-indented-code",
+        "two-spaces-tab-indented-code",
+        "empty-dash-list-item",
+        "empty-plus-list-item",
+        "empty-star-list-item",
+        "empty-ordered-list-item",
+        "multiline-reference-destination",
+        "multiline-reference-two-dash-destination",
+        "multiline-reference-equals-destination",
+        "multiline-reference-title",
+        "quoted-fenced-code-extra-marker",
+        "quoted-html-block-extra-marker",
+        "list-fenced-code-extra-marker",
+        "uppercase-html-declaration",
+        "standalone-inline-tag-html-block",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_nonparagraph_setext_lookalike(
+    tmp_path, lookalike, placement
+):
+    repaired = _opencode_candidate()
+    if placement == "prefix":
+        malformed = lookalike + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + lookalike
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "lookalike",
+    (
+        "Review notes\n= =",
+        "Review notes\n    ====",
+        "Review notes\n--- -",
+        "> Review notes\n---",
+        "- Review notes\n---",
+    ),
+    ids=(
+        "internally-spaced",
+        "four-space-indented",
+        "mixed-dash-content",
+        "lazy-blockquote-underline",
+        "list-followed-by-thematic-break",
+    ),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_non_setext_lookalike(
+    tmp_path, lookalike, placement
+):
+    repaired = _opencode_candidate()
+    wrapper = lookalike + "\nI reviewed the supplied diff."
+    if placement == "prefix":
+        malformed = wrapper + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + wrapper
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+def test_opencode_setext_scan_is_bounded_on_maximum_candidate(tmp_path):
+    repaired = _opencode_candidate()
+    malformed = ("= =\n" * 14000) + repaired
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired], timeout=5
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "##\u00a0Authentication bypass remains",
+        "##\u1680Authorization check is missing",
+        "###\u2003Token disclosure remains",
+    ),
+    ids=("nbsp", "ogham-space", "em-space"),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_cannot_drop_unicode_space_hash_heading_lookalike(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    finding = (
+        heading
+        + "\nThis substantive finding must not be discarded as wrapper prose."
+    )
+    if placement == "prefix":
+        malformed = finding + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + finding
+
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "##\u00a0Review summary",
+        "###\u1680Code review results",
+    ),
+    ids=("nbsp", "ogham-space"),
+)
+@pytest.mark.parametrize("placement", ("prefix", "suffix"))
+def test_opencode_format_repair_allows_benign_unicode_space_hash_heading_lookalike(
+    tmp_path, heading, placement
+):
+    repaired = _opencode_candidate()
+    wrapper = heading + "\nI reviewed the supplied diff."
+    if placement == "prefix":
+        malformed = wrapper + "\n\n" + repaired
+    else:
+        malformed = "```markdown\n" + repaired + "\n```\n" + wrapper
+
+    result, calls, candidate = _run_opencode_model_step(
+        tmp_path, [malformed, repaired]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert candidate == repaired
+
+
+@pytest.mark.parametrize(
     "title",
     (
         "**Authentication bypass remains**",

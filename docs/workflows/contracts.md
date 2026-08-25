@@ -390,6 +390,19 @@ standalone `Summary`/`Overview`). The same vocabulary may follow an exact `[Note
 emphasis/code decoration or an ATX closing sequence, but prefix matches such as
 `Review: Authentication bypass`, `Security review`, and `Summary of failures` remain protected.
 H4–H6 headings always remain finding-like because they overlap the canonical finding-block syntax.
+CommonMark ATX syntax itself requires ASCII space or tab after the opening hashes; the repair guard
+also treats the closed Unicode horizontal-space set in that position as a heading-like adversarial
+lookalike. Exact benign titles remain repairable under that safety superset, while an unknown title
+cannot bypass signing with an Ogham, no-break, or other enumerated space. One-line and multiline
+CommonMark Setext headings receive the same closed-vocabulary treatment, including up to three
+spaces of indentation, source-ordered nesting of blockquotes and list items, lazy paragraph
+continuation text inside those containers, and an explicitly contained underline. The underline
+itself is never treated as a lazy continuation. A standalone thematic break, an outside-list
+thematic break, an empty list item, an internally spaced underline, fenced or indented code, and a
+CommonMark HTML block are not promoted to a Setext heading. The same exclusion covers a valid
+single-line link-reference definition and its one-line destination or title continuation. Inline
+HTML, autolinks, invalid closing tags, and lowercase `<!...>` lookalikes remain paragraph content
+and therefore do not bypass the guard.
 The same closed-vocabulary rule applies to a whole wrapper line enclosed by matching Markdown
 emphasis, strong-emphasis, strikethrough, or code-span delimiters: `**Review complete**` remains
 repairable, while an unlabeled title such as `**Authentication bypass**` is protected. This check

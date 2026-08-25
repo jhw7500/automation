@@ -838,8 +838,44 @@ jobs:
               rf"^\s*(?:#{{1,6}}\s+)?"
               rf"(?:{FINDING_DECORATOR}{HORIZONTAL_SPACE}*)?$"
           )
-          MARKDOWN_ATX_HEADING = re.compile(r"^(#{1,6})(?:[ \t]+(.*)|[ \t]*)$")
-          MARKDOWN_ATX_CLOSING = re.compile(r"[ \t]+#+[ \t]*$")
+          MARKDOWN_ATX_HEADING = re.compile(
+              rf"^(#{{1,6}})(?:{HORIZONTAL_SPACE}+(.*)|{HORIZONTAL_SPACE}*)$"
+          )
+          MARKDOWN_ATX_CLOSING = re.compile(
+              rf"{HORIZONTAL_SPACE}+#+{HORIZONTAL_SPACE}*$"
+          )
+          COMMONMARK_ATX_HEADING = re.compile(
+              r"^(#{1,6})(?:[ \t]+(.*)|[ \t]*)$"
+          )
+          MARKDOWN_SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+) *$")
+          MARKDOWN_LIST_ITEM = re.compile(
+              r"^( {0,3})([-+*]|([0-9]{1,9})[.)])( +)(.*)$"
+          )
+          MARKDOWN_EMPTY_LIST_ITEM = re.compile(
+              r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)]) *$"
+          )
+          HTML_BLOCK_TAGS = (
+              "address|article|aside|base|basefont|blockquote|body|caption|"
+              "center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|"
+              "figcaption|figure|footer|form|frame|frameset|h[1-6]|head|"
+              "header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|"
+              "noframes|ol|optgroup|option|p|param|search|section|summary|"
+              "table|tbody|td|tfoot|th|thead|title|tr|track|ul"
+          )
+          HTML_BLOCK_TYPE_1 = re.compile(
+              r"^ {0,3}<(?:pre|script|style|textarea)(?= |>|$)",
+              re.IGNORECASE,
+          )
+          HTML_BLOCK_TYPE_6 = re.compile(
+              rf"^ {{0,3}}</?(?:{HTML_BLOCK_TAGS})(?= |/?>|$)",
+              re.IGNORECASE,
+          )
+          HTML_BLOCK_TYPE_7 = re.compile(
+              r"^ {0,3}(?:<[A-Za-z][A-Za-z0-9-]*"
+              r"(?: +[A-Za-z_:][A-Za-z0-9_.:-]*"
+              r"(?: *= *(?:[^ \"'=<>`]+|'[^']*'|\"[^\"]*\"))?)*"
+              r" */?>|</[A-Za-z][A-Za-z0-9-]* *>) *$"
+          )
           GENERIC_WRAPPER_TITLE = (
               rf"(?:(?:(?:automated|opencode){HORIZONTAL_SPACE}+)?"
               rf"(?:(?:code|pr|pull{HORIZONTAL_SPACE}+request)"
@@ -1136,6 +1172,451 @@ jobs:
                   and re.fullmatch(r"[ \t]*", info) is not None
               )
 
+          def leading_markdown_spaces(line):
+              return len(line) - len(line.lstrip(" "))
+
+          def consume_setext_blockquote(line):
+              indentation = leading_markdown_spaces(line)
+              if indentation > 3 or line[indentation:indentation + 1] != ">":
+                  return None
+              remainder = line[indentation + 1:]
+              return remainder[1:] if remainder.startswith(" ") else remainder
+
+          def parse_markdown_list_item(line):
+              if is_markdown_thematic_break(line):
+                  return None
+              match = MARKDOWN_LIST_ITEM.fullmatch(line)
+              if match is None:
+                  return None
+              indentation, marker, number, spacing, content = match.groups()
+              if len(spacing) > 4:
+                  content = spacing[1:] + content
+                  padding = 1
+              else:
+                  padding = len(spacing)
+              return (
+                  len(indentation) + len(marker) + padding,
+                  content,
+                  int(number) if number is not None else None,
+              )
+
+          def parse_setext_containers(line):
+              containers = []
+              remainder = line
+              while True:
+                  quoted = consume_setext_blockquote(remainder)
+                  if quoted is not None:
+                      containers.append(("quote", 0))
+                      remainder = quoted
+                      continue
+                  list_item = parse_markdown_list_item(remainder)
+                  if list_item is None:
+                      break
+                  indentation, remainder, _ = list_item
+                  containers.append(("list", indentation))
+              return tuple(containers), remainder
+
+          def strip_setext_containers(line, containers):
+              remainder = line
+              for kind, indentation in containers:
+                  if kind == "quote":
+                      remainder = consume_setext_blockquote(remainder)
+                      if remainder is None:
+                          return None
+                  else:
+                      if leading_markdown_spaces(remainder) < indentation:
+                          return None
+                      remainder = remainder[indentation:]
+              return remainder
+
+          def strip_lazy_setext_containers(line, containers):
+              remainder = line
+              for kind, indentation in containers:
+                  if kind == "quote":
+                      consumed = consume_setext_blockquote(remainder)
+                      if consumed is None:
+                          break
+                      remainder = consumed
+                  else:
+                      if leading_markdown_spaces(remainder) < indentation:
+                          break
+                      remainder = remainder[indentation:]
+              return remainder
+
+          def html_block_start(line, paragraph_open=False):
+              indentation = leading_markdown_spaces(line)
+              if indentation > 3:
+                  return None
+              content = line[indentation:]
+              if HTML_BLOCK_TYPE_1.match(line) is not None:
+                  return 1
+              if content.startswith("<!--"):
+                  return 2
+              if content.startswith("<?"):
+                  return 3
+              if re.match(r"^<![A-Z]", content) is not None:
+                  return 4
+              if content.startswith("<![CDATA["):
+                  return 5
+              if HTML_BLOCK_TYPE_6.match(line) is not None:
+                  return 6
+              if not paragraph_open and HTML_BLOCK_TYPE_7.fullmatch(line) is not None:
+                  return 7
+              return None
+
+          def html_block_ends(block_type, line):
+              lowered = line.lower()
+              if block_type == 1:
+                  return re.search(
+                      r"</(?:pre|script|style|textarea)>", lowered
+                  ) is not None
+              if block_type == 2:
+                  return "-->" in line
+              if block_type == 3:
+                  return "?>" in line
+              if block_type == 4:
+                  return ">" in line
+              if block_type == 5:
+                  return "]]>" in line
+              return not line.strip()
+
+          def link_reference_tail(line):
+              indentation = leading_markdown_spaces(line)
+              if indentation > 3:
+                  return None
+              value = line[indentation:]
+              if not value.startswith("["):
+                  return None
+              cursor = 1
+              escaped = False
+              label_length = 0
+              label_has_content = False
+              while cursor < len(value):
+                  character = value[cursor]
+                  if escaped:
+                      escaped = False
+                  elif character == "\\":
+                      escaped = True
+                  elif character == "[":
+                      return None
+                  elif character == "]":
+                      break
+                  label_length += 1
+                  label_has_content = (
+                      label_has_content or not character.isspace()
+                  )
+                  if label_length > 999:
+                      return None
+                  cursor += 1
+              if (
+                  cursor >= len(value)
+                  or label_length == 0
+                  or not label_has_content
+                  or value[cursor:cursor + 2] != "]:"
+              ):
+                  return None
+              return value[cursor + 2:]
+
+          def parse_link_destination(value):
+              cursor = 0
+              while cursor < len(value) and value[cursor] == " ":
+                  cursor += 1
+              if cursor >= len(value):
+                  return None
+
+              if value[cursor] == "<":
+                  cursor += 1
+                  escaped = False
+                  while cursor < len(value):
+                      character = value[cursor]
+                      if escaped:
+                          escaped = False
+                      elif character == "\\":
+                          escaped = True
+                      elif character == "<":
+                          return None
+                      elif character == ">":
+                          cursor += 1
+                          break
+                      cursor += 1
+                  else:
+                      return None
+              else:
+                  destination_start = cursor
+                  depth = 0
+                  escaped = False
+                  while cursor < len(value) and value[cursor] != " ":
+                      character = value[cursor]
+                      if escaped:
+                          escaped = False
+                      elif character == "\\":
+                          escaped = True
+                      elif character == "(":
+                          depth += 1
+                          if depth > 32:
+                              return None
+                      elif character == ")":
+                          depth -= 1
+                          if depth < 0:
+                              return None
+                      elif ord(character) < 0x20:
+                          return None
+                      cursor += 1
+                  if (
+                      cursor == destination_start
+                      or depth != 0
+                      or escaped
+                  ):
+                      return None
+              return cursor
+
+          def parse_link_title(value, cursor):
+              if cursor >= len(value) or value[cursor] not in "\"'(":
+                  return None
+              opening = value[cursor]
+              closing = ")" if opening == "(" else opening
+              cursor += 1
+              escaped = False
+              while cursor < len(value):
+                  character = value[cursor]
+                  if escaped:
+                      escaped = False
+                  elif character == "\\":
+                      escaped = True
+                  elif character == closing:
+                      cursor += 1
+                      break
+                  cursor += 1
+              else:
+                  return None
+              return cursor if not value[cursor:].strip(" ") else None
+
+          def classify_link_reference_tail(value):
+              if not value.strip(" "):
+                  return "needs-destination"
+              destination_end = parse_link_destination(value)
+              if destination_end is None:
+                  return None
+              title_start = destination_end
+              while title_start < len(value) and value[title_start] == " ":
+                  title_start += 1
+              if title_start == len(value):
+                  return "complete-no-title"
+              if title_start == destination_end:
+                  return None
+              if parse_link_title(value, title_start) is None:
+                  return None
+              return "complete"
+
+          def classify_link_reference_start(line):
+              tail = link_reference_tail(line)
+              return None if tail is None else classify_link_reference_tail(tail)
+
+          def classify_link_reference_destination(line):
+              indentation = leading_markdown_spaces(line)
+              if indentation > 3:
+                  return None
+              return classify_link_reference_tail(line[indentation:])
+
+          def is_link_reference_title_line(line):
+              indentation = leading_markdown_spaces(line)
+              if indentation > 3:
+                  return False
+              content = line[indentation:]
+              return parse_link_title(content, 0) is not None
+
+          def line_interrupts_setext_paragraph(line):
+              if not line.strip():
+                  return True
+              indentation = leading_markdown_spaces(line)
+              if indentation > 3:
+                  return False
+              content = line[indentation:]
+              if (
+                  parse_fence_line(line) is not None
+                  or COMMONMARK_ATX_HEADING.fullmatch(content) is not None
+                  or is_markdown_thematic_break(line)
+                  or consume_setext_blockquote(line) is not None
+                  or html_block_start(line, paragraph_open=True) is not None
+              ):
+                  return True
+              list_item = parse_markdown_list_item(line)
+              empty_marker = line.strip(" ")
+              return (
+                  list_item is not None
+                  and (list_item[2] is None or list_item[2] == 1)
+              ) or (
+                  MARKDOWN_EMPTY_LIST_ITEM.fullmatch(line) is not None
+                  and empty_marker in ("-", "+", "*", "1.", "1)")
+              )
+
+          def classify_setext_start(line):
+              containers, remainder = parse_setext_containers(line)
+
+              fence = parse_fence_line(remainder)
+              if fence is not None:
+                  return ("fence", containers, fence[0])
+              block_type = html_block_start(remainder)
+              if block_type is not None:
+                  return ("html", containers, block_type)
+              reference = classify_link_reference_start(remainder)
+              if reference is not None:
+                  return ("reference", containers, reference, remainder)
+
+              indentation = leading_markdown_spaces(remainder)
+              if indentation > 3:
+                  return ("ignore",)
+              content = remainder[indentation:]
+              if not content.strip():
+                  return ("ignore",)
+              if (
+                  COMMONMARK_ATX_HEADING.fullmatch(content) is not None
+                  or is_markdown_thematic_break(remainder)
+                  or consume_setext_blockquote(remainder) is not None
+                  or parse_markdown_list_item(remainder) is not None
+                  or MARKDOWN_EMPTY_LIST_ITEM.fullmatch(remainder) is not None
+              ):
+                  return ("ignore",)
+              return (
+                  "paragraph",
+                  containers,
+                  content.strip(" "),
+              )
+
+          def setext_title_is_unapproved(title_lines):
+              title = " ".join(title_lines)
+              normalized = normalize_finding_field_wrappers(title).strip()
+              return (
+                  raw_decorated_title_is_unapproved(title)
+                  or BENIGN_WRAPPER_HEADING.fullmatch(normalized) is None
+              )
+
+          def has_unapproved_setext_heading(lines):
+              title_lines = []
+              title_containers = ()
+              active_fence = None
+              active_html = None
+              pending_reference = None
+
+              for raw_line in lines:
+                  # Tabs expand to four-column stops only for block structure.
+                  # Using the expanded view avoids treating ` \ttext` as a
+                  # three-space-indented paragraph when it is indented code.
+                  line = raw_line.expandtabs(4)
+                  while True:
+                      if active_fence is not None:
+                          containers, open_marker = active_fence
+                          local = strip_setext_containers(line, containers)
+                          if local is None:
+                              active_fence = None
+                              continue
+                          fence = parse_fence_line(local)
+                          if fence is not None and closes_fence(
+                              open_marker, *fence
+                          ):
+                              active_fence = None
+                          break
+
+                      if active_html is not None:
+                          containers, block_type = active_html
+                          local = strip_setext_containers(line, containers)
+                          if local is None:
+                              active_html = None
+                              continue
+                          if html_block_ends(block_type, local):
+                              active_html = None
+                          break
+
+                      if pending_reference is not None:
+                          mode, containers, fallback = pending_reference
+                          local = strip_setext_containers(line, containers)
+                          if mode == "needs-destination":
+                              status = (
+                                  classify_link_reference_destination(local)
+                                  if (
+                                      local is not None
+                                      and not line_interrupts_setext_paragraph(
+                                          local
+                                      )
+                                  )
+                                  else None
+                              )
+                              if status in ("complete", "complete-no-title"):
+                                  pending_reference = (
+                                      ("optional-title", containers, "")
+                                      if status == "complete-no-title"
+                                      else None
+                                  )
+                                  break
+                              pending_reference = None
+                              title_lines = [fallback]
+                              title_containers = containers
+                              continue
+                          if (
+                              local is not None
+                              and is_link_reference_title_line(local)
+                          ):
+                              pending_reference = None
+                              break
+                          pending_reference = None
+                          continue
+
+                      if title_lines:
+                          local = strip_setext_containers(
+                              line, title_containers
+                          )
+                          if local is not None:
+                              if MARKDOWN_SETEXT_UNDERLINE.fullmatch(local):
+                                  if setext_title_is_unapproved(title_lines):
+                                      return True
+                                  title_lines = []
+                                  title_containers = ()
+                                  break
+                              if not line_interrupts_setext_paragraph(local):
+                                  title_lines.append(local.strip(" "))
+                                  break
+                          else:
+                              lazy_local = strip_lazy_setext_containers(
+                                  line, title_containers
+                              )
+                              if not line_interrupts_setext_paragraph(
+                                  lazy_local
+                              ):
+                                  title_lines.append(lazy_local.strip(" "))
+                                  break
+                          title_lines = []
+                          title_containers = ()
+                          continue
+
+                      start = classify_setext_start(line)
+                      if start[0] == "paragraph":
+                          _, title_containers, title = start
+                          title_lines = [title]
+                      elif start[0] == "fence":
+                          _, containers, marker = start
+                          active_fence = (containers, marker)
+                      elif start[0] == "html":
+                          _, containers, block_type = start
+                          local = strip_setext_containers(line, containers)
+                          if not html_block_ends(block_type, local):
+                              active_html = (containers, block_type)
+                      elif start[0] == "reference":
+                          _, containers, status, fallback = start
+                          if status == "needs-destination":
+                              pending_reference = (
+                                  "needs-destination",
+                                  containers,
+                                  fallback,
+                              )
+                          elif status == "complete-no-title":
+                              pending_reference = (
+                                  "optional-title",
+                                  containers,
+                                  "",
+                              )
+                      break
+              return False
+
           def first_section_index(lines):
               for index, line in enumerate(lines):
                   if not TOP_HEADING.match(line):
@@ -1173,32 +1654,35 @@ jobs:
                       close_indices.append(index)
               if not close_indices:
                   return lines
-              close_index = close_indices[-1]
-
-              inner_fence = None
-              for line in lines[first_section:close_index]:
-                  fence = parse_fence_line(line)
-                  if fence is None:
+              for close_index in close_indices:
+                  inner_fence = None
+                  for line in lines[first_section:close_index]:
+                      fence = parse_fence_line(line)
+                      if fence is None:
+                          continue
+                      marker, info = fence
+                      if inner_fence is None:
+                          inner_fence = marker
+                      elif closes_fence(inner_fence, marker, info):
+                          inner_fence = None
+                  if inner_fence is not None:
                       continue
-                  marker, info = fence
-                  if inner_fence is None:
-                      inner_fence = marker
-                  elif closes_fence(inner_fence, marker, info):
-                      inner_fence = None
-              if inner_fence is not None:
-                  return lines
 
-              suffix = lines[close_index + 1:]
-              if any(
-                  is_finding_prefix_line(line)
-                  or is_unapproved_wrapper_heading(line)
-                  or VALID_HEADING.fullmatch(line) is not None
-                  for line in suffix
-              ):
-                  return lines
+                  suffix = lines[close_index + 1:]
+                  if has_unapproved_setext_heading(suffix) or any(
+                      is_finding_prefix_line(line)
+                      or is_unapproved_wrapper_heading(line)
+                      or VALID_HEADING.fullmatch(line) is not None
+                      for line in suffix
+                  ):
+                      return lines
 
-              open_index = active_fence[0]
-              return lines[:open_index] + lines[open_index + 1:close_index]
+                  open_index = active_fence[0]
+                  return (
+                      lines[:open_index]
+                      + lines[open_index + 1:close_index]
+                  )
+              return lines
 
           def parse_sections(lines):
               sections = []
@@ -1270,7 +1754,7 @@ jobs:
               lines = strip_enclosing_markdown_fence(lines, first_section)
               first_section = first_section_index(lines)
               prefix = lines[:first_section]
-              if any(
+              if has_unapproved_setext_heading(prefix) or any(
                   is_finding_prefix_line(line)
                   or is_unapproved_wrapper_heading(line)
                   for line in prefix
