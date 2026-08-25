@@ -268,7 +268,7 @@ jobs:
       - name: Run Claude Code Review
         id: claude-review
         if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@6bcfb8263aca9b0eab0aba20d96dddd74de2875f # ratchet:anthropics/claude-code-action@v1.0.204
         env:
           REVIEW_DIFF_FILE: ${{ steps.prepare-diff.outputs.diff-mode == 'delta' && 'review-delta.diff' || 'review-full.diff' }}
         with:
@@ -360,7 +360,7 @@ jobs:
 
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          # model은 claude_args 로 전달 (claude-code-action@v1 에서 'model' input 미지원)
+          # model은 claude_args 로 전달 (claude-code-action v1.0.204 에서 'model' input 미지원)
           # Read + 단일 파일 Write(claude-review.md)만 허용: 모델은 리뷰 본문을 claude-review.md에
           # 쓰기만 하고, 게시는 아래 'Upsert review comment' 스텝이 sticky 코멘트 제자리 갱신으로
           # 수행한다(라운드마다 새 코멘트가 쌓이지 않음). 모델의 직접 게시(gh pr review)를 제거해

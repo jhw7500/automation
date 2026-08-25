@@ -162,6 +162,58 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
     return repo, commit(repo, "current release")
 
 
+def test_v1453_commit_gate_accepts_pinned_claude_action(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, current = current_release_repo
+
+    assert (
+        release_verifier.verify_commit_content(repo, "v1.45.3", current)
+        == current
+    )
+
+
+@pytest.mark.parametrize(
+    "filename", ("claude-code-review.yml", "claude.yml")
+)
+def test_v1453_commit_gate_rejects_moving_claude_action(
+    current_release_repo: tuple[Path, str],
+    filename: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / filename
+    replace(
+        path,
+        "anthropics/claude-code-action@6bcfb8263aca9b0eab0aba20d96dddd74de2875f",
+        "anthropics/claude-code-action@v1",
+        count=1,
+    )
+    bad_commit = commit(repo, "restore moving Claude action tag")
+
+    with pytest.raises(ReleaseVerificationError, match="Claude Code action"):
+        release_verifier.verify_commit_content(repo, "v1.45.3", bad_commit)
+
+
+def test_v1453_commit_gate_cannot_be_spoofed_by_nested_workflow_basename(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    root_workflow = repo / ".github/workflows/claude-code-review.yml"
+    nested_workflow = repo / ".github/workflows/zz/claude-code-review.yml"
+    nested_workflow.parent.mkdir(parents=True)
+    shutil.copy2(root_workflow, nested_workflow)
+    replace(
+        root_workflow,
+        "anthropics/claude-code-action@6bcfb8263aca9b0eab0aba20d96dddd74de2875f",
+        "anthropics/claude-code-action@v1",
+        count=1,
+    )
+    bad_commit = commit(repo, "spoof root Claude action pin")
+
+    with pytest.raises(ReleaseVerificationError, match="Claude Code action"):
+        release_verifier.verify_commit_content(repo, "v1.45.3", bad_commit)
+
+
 def replace(path: Path, old: str, new: str, *, count: int = -1) -> None:
     text = path.read_text(encoding="utf-8")
     assert old in text

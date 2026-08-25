@@ -206,6 +206,10 @@ that anchor. A real current line without PR causality is insufficient; a disprov
 `Retracted`, while `Resolved` requires a code change.
 
 Claude and Gemini enforce this as a prompt contract over their exclusive prepared artifact.
+The Claude command and review model steps use `anthropics/claude-code-action` v1.0.204 at the
+immutable commit `6bcfb8263aca9b0eab0aba20d96dddd74de2875f`. Moving major tags are not accepted:
+the release gate for v1.45.3 and later requires both exact action references so an upstream CLI
+bump cannot change runner behavior between otherwise identical workflow attempts.
 OpenCode additionally enforces it in the clean canonicalizer. A candidate must contain exactly one
 `### New findings` section whose body is exactly `None` or one or more `####` finding blocks. Each
 `New findings`, `Still open`, and `Retracted` block needs exactly one canonical one-line JSON anchor,

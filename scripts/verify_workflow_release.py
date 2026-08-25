@@ -39,6 +39,10 @@ from scripts.workflow_release_inventory import (
 
 
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+CLAUDE_CODE_ACTION = (
+    "anthropics/claude-code-action@"
+    "6bcfb8263aca9b0eab0aba20d96dddd74de2875f"
+)
 CACHE_ACTION = "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
 UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
 DOWNLOAD_ARTIFACT_ACTION = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
@@ -1607,6 +1611,35 @@ def _verify_prepare_review_diff_action(tree: VerifiedCommitTree) -> None:
         )
 
 
+def _verify_claude_code_action_pin(
+    ref: str, documents: dict[str, dict]
+) -> None:
+    if _release_version(ref) < (1, 45, 3):
+        return
+    expected_by_workflow = {
+        "claude-code-review.yml": [
+            ("claude-review", "Run Claude Code Review", CLAUDE_CODE_ACTION)
+        ],
+        "claude.yml": [
+            ("claude", "Run Claude Code", CLAUDE_CODE_ACTION)
+        ],
+    }
+    for filename, expected in expected_by_workflow.items():
+        workflow = documents.get(filename, {})
+        references = []
+        for job_name, job in workflow.get("jobs", {}).items():
+            for step in job.get("steps", []):
+                uses = step.get("uses", "")
+                if isinstance(uses, str) and uses.lower().startswith(
+                    "anthropics/claude-code-action@"
+                ):
+                    references.append((job_name, step.get("name"), uses))
+        if references != expected:
+            raise ReleaseVerificationError(
+                "Claude Code action is not the approved immutable commit"
+            )
+
+
 def _verify_tag_catalog(
     tree: VerifiedCommitTree, ref: str
 ) -> WorkflowCatalog | None:
@@ -2144,8 +2177,13 @@ def _verify_commit_content(
                     f"{name} checkout reference is not the approved immutable commit"
                 )
         data = yaml.load(text, Loader=yaml.BaseLoader)
-        documents[Path(name).name] = data if isinstance(data, dict) else {}
+        workflow_path = PurePosixPath(name)
+        if workflow_path.parent == PurePosixPath(".github/workflows"):
+            documents[workflow_path.name] = (
+                data if isinstance(data, dict) else {}
+            )
 
+    _verify_claude_code_action_pin(ref, documents)
     _verify_prepare_review_diff_dependencies(ref, documents)
 
     if catalog is not None:
