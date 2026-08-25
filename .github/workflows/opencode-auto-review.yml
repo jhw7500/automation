@@ -1016,8 +1016,91 @@ jobs:
                   remainder = remainder[container.end():].lstrip()
               return False
 
+          def is_commonmark_whitespace(character):
+              return (
+                  character in " \t\n\f\r"
+                  or unicodedata.category(character) == "Zs"
+              )
+
+          def has_matching_markdown_title_decoration(value):
+              if len(value) < 3 or value[0] not in "*_~`":
+                  return False
+              delimiter = value[0]
+              prefix_length = 0
+              while (
+                  prefix_length < len(value)
+                  and value[prefix_length] == delimiter
+              ):
+                  prefix_length += 1
+              suffix_length = 0
+              while (
+                  suffix_length < len(value)
+                  and value[len(value) - suffix_length - 1] == delimiter
+              ):
+                  suffix_length += 1
+              minimum_length = 2 if delimiter == "~" else 1
+              if (
+                  prefix_length < minimum_length
+                  or prefix_length != suffix_length
+                  or prefix_length * 2 >= len(value)
+              ):
+                  return False
+              content_start = prefix_length
+              content_end = len(value) - suffix_length
+              if not any(
+                  not is_commonmark_whitespace(character)
+                  for character in value[content_start:content_end]
+              ):
+                  return False
+              if delimiter == "`":
+                  return True
+              if (
+                  is_commonmark_whitespace(value[content_start])
+                  or is_commonmark_whitespace(value[content_end - 1])
+              ):
+                  return False
+              backslash_count = 0
+              cursor = content_end - 1
+              while cursor >= content_start and value[cursor] == "\\":
+                  backslash_count += 1
+                  cursor -= 1
+              return backslash_count % 2 == 0
+
+          def is_markdown_thematic_break(value):
+              delimiter = None
+              delimiter_count = 0
+              for character in value:
+                  if character in " \t":
+                      continue
+                  if character not in "*_-":
+                      return False
+                  if delimiter is None:
+                      delimiter = character
+                  elif character != delimiter:
+                      return False
+                  delimiter_count += 1
+              return delimiter_count >= 3
+
+          def raw_decorated_title_is_unapproved(line):
+              remainder = line.strip()
+              while remainder:
+                  if is_markdown_thematic_break(remainder):
+                      return False
+                  if has_matching_markdown_title_decoration(remainder):
+                      normalized = normalize_finding_field_wrappers(
+                          remainder
+                      ).strip()
+                      return BENIGN_WRAPPER_HEADING.fullmatch(normalized) is None
+                  container = MARKDOWN_CONTAINER.match(remainder)
+                  if container is None:
+                      return False
+                  remainder = remainder[container.end():].lstrip()
+              return False
+
           def is_unapproved_wrapper_heading(line):
-              remainder = normalize_finding_field_wrappers(line).lstrip()
+              if raw_decorated_title_is_unapproved(line):
+                  return True
+              remainder = normalize_finding_field_wrappers(line).strip()
               while remainder:
                   heading = MARKDOWN_ATX_HEADING.fullmatch(remainder)
                   if heading is not None:
@@ -1027,6 +1110,10 @@ jobs:
                           "", heading.group(2) or ""
                       ).strip(" \t")
                       return BENIGN_WRAPPER_HEADING.fullmatch(title) is None
+                  if is_markdown_thematic_break(remainder):
+                      return False
+                  if has_matching_markdown_title_decoration(remainder):
+                      return BENIGN_WRAPPER_HEADING.fullmatch(remainder) is None
                   container = MARKDOWN_CONTAINER.match(remainder)
                   if container is None:
                       return False

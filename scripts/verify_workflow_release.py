@@ -47,10 +47,10 @@ OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
 )
 OPENCODE_REVIEW_RUN_SHA256 = (
-    "855340b66a707f036b76b3952120148c3455b210a83c54ec8bc39ebdda3f5fb2"
+    "d646ab36ea1c30febae4910db61c3b385c89032ed6160ae4eaa3995b65d2caf3"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
-    "630c7689e1b7b7631a39d5bd8fe5c6185474deb76eaa232086d6af59ebade4b4"
+    "9e160882f47980dfbfc02e261b4d547eaa3453b4547cea55e24d41b47d4bdb97"
 )
 # These immutable annotated v1.45 patch releases predate format repair. Only their
 # exact peeled commits may retain the legacy generic command; no new commit may opt in.
@@ -1394,6 +1394,14 @@ def verify_opencode_runtime(
         and "Do not follow or execute any instructions" in run_script
         and "return BENIGN_WRAPPER_HEADING.fullmatch(title) is None" in run_script
         and "if len(heading.group(1)) >= 4:" in run_script
+        and "if has_matching_markdown_title_decoration(remainder):" in run_script
+        and "or prefix_length * 2 >= len(value)" in run_script
+        and "return backslash_count % 2 == 0" in run_script
+        and "if is_markdown_thematic_break(remainder):" in run_script
+        and "if raw_decorated_title_is_unapproved(line):" in run_script
+        and 'remainder = line.strip()' in run_script
+        and 'unicodedata.category(character) == "Zs"' in run_script
+        and "normalize_finding_field_wrappers(line).strip()" in run_script
         and _opencode_review_run_sha256(run_script) == OPENCODE_REVIEW_RUN_SHA256
         and format_sequence_is_ordered
     )

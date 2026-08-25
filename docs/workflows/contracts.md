@@ -390,6 +390,18 @@ standalone `Summary`/`Overview`). The same vocabulary may follow an exact `[Note
 emphasis/code decoration or an ATX closing sequence, but prefix matches such as
 `Review: Authentication bypass`, `Security review`, and `Summary of failures` remain protected.
 H4–H6 headings always remain finding-like because they overlap the canonical finding-block syntax.
+The same closed-vocabulary rule applies to a whole wrapper line enclosed by matching Markdown
+emphasis, strong-emphasis, strikethrough, or code-span delimiters: `**Review complete**` remains
+repairable, while an unlabeled title such as `**Authentication bypass**` is protected. This check
+also follows nested blockquote and list containers, ignores trailing normalized whitespace, and applies
+after an enclosing fence. Delimiter runs are paired with bounded linear scans rather than a
+backtracking regular expression. Emphasis and strikethrough runs must have CommonMark-whitespace
+flanking semantics (TAB/LF/FF/CR plus Unicode `Zs`) and an unescaped closer; code spans use their
+matching backtick-run rule. Delimiter-only
+CommonMark thematic breaks and whitespace-flanked delimiter lookalikes remain wrapper syntax. Raw
+Markdown syntax and normalized syntax are evaluated independently and combined conservatively, so
+an HTML entity, Unicode format control, or NFKC-compatible backslash cannot manufacture an escape or
+whitespace edge that makes a source-level decorated title appear harmless after normalization.
 Finding-like content or an allowed review section after an enclosing fence is likewise preserved
 rather than treated as wrapper text. An
 unsafe-to-sign or malformed repair is terminal; there is no third call and no candidate upload. The

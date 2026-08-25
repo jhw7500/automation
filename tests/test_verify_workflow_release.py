@@ -683,6 +683,38 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
             "                      if False:",
         ),
         (
+            "                  if has_matching_markdown_title_decoration(remainder):",
+            "                  if False:",
+        ),
+        (
+            "                  or prefix_length * 2 >= len(value)",
+            "                  or True",
+        ),
+        (
+            "              return backslash_count % 2 == 0",
+            "              return True",
+        ),
+        (
+            "                  if is_markdown_thematic_break(remainder):",
+            "                  if False:",
+        ),
+        (
+            "              if raw_decorated_title_is_unapproved(line):",
+            "              if False:",
+        ),
+        (
+            '              remainder = line.strip()',
+            '              remainder = unicodedata.normalize("NFKC", line).strip()',
+        ),
+        (
+            '                  or unicodedata.category(character) == "Zs"',
+            '                  or character.isspace()',
+        ),
+        (
+            "normalize_finding_field_wrappers(line).strip()",
+            "normalize_finding_field_wrappers(line).lstrip()",
+        ),
+        (
             '                  " " if unicodedata.category(character) == "Cf" else character',
             '                  character',
         ),
@@ -709,6 +741,14 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
         "explicit-defect-label",
         "unapproved-wrapper-heading",
         "canonical-finding-heading-depth",
+        "unapproved-decorated-title",
+        "nonempty-decorated-title",
+        "escaped-decoration-close",
+        "thematic-break-exclusion",
+        "raw-decoration-signal",
+        "raw-decoration-provenance",
+        "commonmark-whitespace",
+        "decorated-title-trailing-space",
         "format-control-normalization",
         "constant-signature-groups",
         "post-heredoc-contract-rewrite",
