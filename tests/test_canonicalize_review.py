@@ -252,8 +252,8 @@ class ReviewQualityRepo:
             head=self.review_head,
         ))
 
-    def run_text(self, text: str) -> tuple[object, str]:
-        return self._run(self._request(text, reviewer="claude", head=self.review_head))
+    def run_text(self, text: str, reviewer: str = "claude") -> tuple[object, str]:
+        return self._run(self._request(text, reviewer=reviewer, head=self.review_head))
 
     def run_delta(self, previous_review: str, candidate: str) -> tuple[object, str]:
         return self._run(self._request(
@@ -925,20 +925,46 @@ None
 
 
 @pytest.mark.parametrize(
-    ("fixture", "reason", "accepted"),
+    ("fixture", "expected_counts", "expected_reasons"),
     (
-        ("plan-global.md", "invalid_trigger_evidence", 0),
-        ("duplicate-yaml.md", "unsupported_performance_basis", 0),
-        ("value-error.md", "", 1),
-        ("rejected-plan.md", "", 1),
+        (
+            "plan-global.md",
+            (0, 1, 0, "HIGH"),
+            (CandidateReason(
+                0, "New findings", "filtered", "invalid_trigger_evidence", "HIGH",
+            ),),
+        ),
+        (
+            "duplicate-yaml.md",
+            (0, 1, 0, "MEDIUM"),
+            (CandidateReason(
+                0, "New findings", "filtered", "unsupported_performance_basis", "MEDIUM",
+            ),),
+        ),
+        ("value-error.md", (1, 0, 0, "none"), ()),
+        ("rejected-plan.md", (1, 0, 0, "none"), ()),
     ),
 )
-def test_pr101_quality_corpus(review_quality_repo, fixture, reason, accepted):
-    result, canonical = review_quality_repo.run_fixture(fixture)
-    assert result.accepted_count == accepted
-    assert result.document_valid is True
-    assert [item.reason for item in result.candidate_reasons] == ([reason] if reason else [])
-    assert ("No validated blocking issues found." in canonical) is (accepted == 0)
+def test_pr101_quality_corpus_is_provider_independent(
+    review_quality_repo, fixture, expected_counts, expected_reasons,
+):
+    outcomes = {}
+    for reviewer in ("claude", "gemini"):
+        result, canonical = review_quality_repo.run_fixture(fixture, reviewer=reviewer)
+        outcomes[reviewer] = (
+            result.document_valid,
+            result.accepted_count,
+            result.filtered_count,
+            result.normalized_count,
+            result.filtered_max_severity,
+            result.candidate_reasons,
+        )
+        assert outcomes[reviewer] == (True, *expected_counts, expected_reasons)
+        assert ("No validated blocking issues found." in canonical) is (
+            expected_counts[0] == 0
+        )
+
+    assert outcomes["claude"] == outcomes["gemini"]
 
 
 def test_corpus_stable_ids_are_literal(review_quality_repo):
@@ -998,10 +1024,18 @@ def test_new_finding_cannot_duplicate_a_carried_active_id(review_quality_repo):
     assert "### Still open" in canonical
 
 
-def test_first_round_resolved_is_normalized_not_a_hard_failure(review_quality_repo):
-    result, canonical = review_quality_repo.run_text(first_round_false_resolved())
+@pytest.mark.parametrize("reviewer", ("claude", "gemini"))
+def test_first_round_resolved_is_normalized_not_a_hard_failure(
+    review_quality_repo, reviewer,
+):
+    result, canonical = review_quality_repo.run_text(
+        first_round_false_resolved(), reviewer=reviewer,
+    )
     assert result.document_valid is True
+    assert result.accepted_count == 0
+    assert result.filtered_count == 0
     assert result.normalized_count == 1
+    assert result.filtered_max_severity == "none"
     assert result.candidate_reasons[0].reason == "unknown_prior_id"
     assert "### Resolved" not in canonical
     assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
