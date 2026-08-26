@@ -118,3 +118,15 @@ Ruling: Task 7 keeps the immutable v1.40–v1.46.2 capability inventories and v1
 Task 7: self-review complete (exact BaseLoader action bytes/surface, helper compile + strict signatures/constants/AST/source gates, reviewer claim/provider/finalize ordering and guards, timeout/counter/artifact/OpenCode handoff/no-fallback contracts, historical digest branches, exhaustion-not-approval docs, and no Task 1–6/config/tag/rollout changes verified)
 
 Task 7: complete (implementation commit abc3cefd203014ed2295cac9efdb11f02ff1e84f; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md; blockers: none)
+
+Task 7: fix round 1/5 RED complete (finding 2/4 focus 1 failed + 11 passed; authenticated helper semantics 4 failed; original-text workflow semantics 10 failed + 3 passed; failures directly demonstrated incomplete full-action equality and missing schema/AST/cap/RVW/provider/order/artifact/OpenCode-handoff semantic gates)
+
+Ruling: Task 7 historical review mutation coverage uses the exact three workflow blobs from immutable commit `d42c28ddd827554e6e46a2ab49dfe34c838c0425`, guarded by fixed SHA-256 constants, and verifies those synthetic commits as `v1.46.2`; v1.47 current-source tests remain distinct. This avoids using mutable candidate bytes as historical fixtures while staying within the Task 7 test-file boundary — if wrong, the same authenticated blobs can be materialized as checked-in fixture files in a separately approved file-scope expansion.
+
+Ruling: Invocation-budget semantic validation runs before a distinct exact-byte authentication pass so mutation tests prove each parser/AST/order/artifact gate rather than only digest rejection. Both passes consume only `VerifiedCommitTree` bytes from the same authenticated commit object; full BaseLoader action equality and final raw digests remain mandatory — if wrong, the verifier would need a diagnostic-only semantic entry point while retaining the same commit-tree caller ordering.
+
+Task 7: fix round 1/5 GREEN complete (semantic/inventory focus 29 passed; immutable v1.46 suite 166 passed; final release suite 566 passed in 270.50s; full unfiltered 2656 passed + 48 subtests in 813.70s; py_compile and diff-check green)
+
+Task 7: fix round 1/5 self-review complete (all four Important findings closed; immutable v1.46.2 direct coverage, exact complete BaseLoader action equality, separate semantic/authentication gates, strict helper and reviewer workflow relationships, full new-root kind mutations, no Task 1–6/config/tag/release/rollout/external-state changes; blockers and remaining concerns: none)
+
+Task 7: fix round 1/5 complete (implementation fix commit 0fb3a1d3b43bd03f125dbf1ae2e24970bec4024b; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md)
