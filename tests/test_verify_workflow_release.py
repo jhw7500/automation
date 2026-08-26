@@ -1790,6 +1790,87 @@ def test_v147_budget_helper_semantics_reject_authenticated_mutations(
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    (
+        "schema-annotation",
+        "record-shape",
+        "claim-gate-dead-body",
+        "final-cap-dead-decoy",
+        "rvw-bound-dead-decoy",
+        "provenance-dead-decoy",
+    ),
+)
+def test_v147_budget_helper_semantics_bind_live_ast_relationships(
+    mutation: str,
+) -> None:
+    source = (
+        ROOT
+        / ".github/actions/review-invocation-budget/review_invocation_budget.py"
+    ).read_text(encoding="utf-8")
+
+    def substitute(old: str, new: str, *, count: int = 1) -> None:
+        nonlocal source
+        assert source.count(old) == count
+        source = source.replace(old, new, count)
+
+    if mutation == "schema-annotation":
+        substitute(
+            "    call_count: int\n    estimated_input_tokens: int\n",
+            "    call_count: str\n    estimated_input_tokens: int\n",
+        )
+    elif mutation == "record-shape":
+        substitute(
+            "@dataclass(frozen=True)\nclass LedgerState:\n",
+            "@dataclass\nclass LedgerState:\n",
+        )
+    elif mutation == "claim-gate-dead-body":
+        substitute(
+            "    if any(item.head_sha == request.head_sha "
+            "for item in validated.invocations):\n"
+            "        return refuse(validated, request, \"duplicate_head\")\n",
+            "    if False:\n"
+            "        return refuse(validated, request, \"duplicate_head\")\n",
+        )
+    elif mutation == "final-cap-dead-decoy":
+        substitute(
+            "    if request.call_count > state.budgets.max_calls_per_round:\n"
+            "        outcome, stop_reason = \"checkpoint_failure\", "
+            "\"call_budget_exhausted\"\n",
+            "    if False:\n"
+            "        if request.call_count > state.budgets.max_calls_per_round:\n"
+            "            outcome, stop_reason = \"checkpoint_failure\", "
+            "\"call_budget_exhausted\"\n"
+            "    if request.call_count > state.budgets.max_calls_per_round + 1:\n"
+            "        outcome, stop_reason = \"provider_failure\", "
+            "\"provider_failure\"\n",
+        )
+    elif mutation == "rvw-bound-dead-decoy":
+        count = source.count("len(findings) > 8")
+        assert count > 1
+        source = source.replace("len(findings) > 8", "len(findings) > 80")
+        source += (
+            "\n\ndef _dead_rvw_bound_decoy(findings):\n"
+            "    if False:\n"
+            "        return len(findings) > 8\n"
+        )
+    else:
+        substitute(
+            '(not current and provenance.status != "completed")',
+            "(not current and False)",
+        )
+        source += (
+            "\n\ndef _dead_provenance_decoy(current, provenance):\n"
+            "    if False:\n"
+            '        return not current and provenance.status != "completed"\n'
+        )
+
+    with pytest.raises(
+        ReleaseVerificationError, match="invocation-budget helper contract"
+    ):
+        release_verifier.require_budget_helper_contract(source)
+
+
+@pytest.mark.parametrize(
     ("workflow", "job", "mutation"),
     (
         ("claude-code-review.yml", "claude-review", "claim-after-provider"),
@@ -1978,6 +2059,63 @@ def test_v147_budget_workflow_semantics_reject_authenticated_mutations(
         reviewer,
         hashlib.sha256(payload).hexdigest(),
     )
+    tree = release_verifier.VerifiedCommitTree.open(repo, bad_commit)
+
+    with pytest.raises(
+        ReleaseVerificationError, match="invocation-budget workflow contract"
+    ):
+        release_verifier.require_budget_workflow_contract(tree, workflow, reviewer)
+
+
+@pytest.mark.parametrize(
+    ("reviewer", "workflow"),
+    (
+        ("claude", "claude-code-review.yml"),
+        ("gemini", "gemini-auto-review.yml"),
+        ("opencode", "opencode-auto-review.yml"),
+    ),
+)
+def test_v147_budget_workflow_semantics_bind_live_reviewer_call_caps(
+    current_release_repo: tuple[Path, str],
+    reviewer: str,
+    workflow: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows" / workflow
+    if reviewer == "claude":
+        mutate_named_step_text(
+            path,
+            "Start Claude review metrics",
+            "printf 'call_count=1\\n' >> \"$GITHUB_OUTPUT\"",
+            "printf 'call_count=2\\n' >> \"$GITHUB_OUTPUT\"\n"
+            "          : 'call_count=1'",
+        )
+    elif reviewer == "gemini":
+        mutate_named_step_text(
+            path,
+            "Run Gemini Code Review",
+            "if count >= 3:\n"
+            "                  raise ProviderFailure('call_budget_exhausted')",
+            "if count >= 4:\n"
+            "                  raise ProviderFailure('call_budget_exhausted')\n"
+            "              if False:\n"
+            "                  _call_cap_decoy = 'if count >= 3:'",
+        )
+    else:
+        mutate_named_step_text(
+            path,
+            "Run OpenCode PR review",
+            "(( count < 2 )) || {\n"
+            "              review_failure_reason=call_budget_exhausted\n"
+            "              return 1\n"
+            "            }",
+            "(( count < 3 )) || {\n"
+            "              review_failure_reason=call_budget_exhausted\n"
+            "              return 1\n"
+            "            }\n"
+            "            : '(( count < 2 )) || {'",
+        )
+    bad_commit = commit(repo, f"weaken live {reviewer} reviewer call cap")
     tree = release_verifier.VerifiedCommitTree.open(repo, bad_commit)
 
     with pytest.raises(

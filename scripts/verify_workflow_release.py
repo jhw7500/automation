@@ -3110,11 +3110,159 @@ def _function_node(module: ast.Module | ast.ClassDef, name: str) -> ast.Function
     return matches[0]
 
 
-def _annotated_fields(node: ast.ClassDef) -> tuple[str, ...]:
+def _ast_expression_matches(node: ast.AST, expression: str) -> bool:
+    expected = ast.parse(expression, mode="eval").body
+    return ast.dump(node, include_attributes=False) == ast.dump(
+        expected, include_attributes=False
+    )
+
+
+def _ast_statement_matches(node: ast.AST, statement: str) -> bool:
+    expected = ast.parse(statement).body
+    return len(expected) == 1 and ast.dump(
+        node, include_attributes=False
+    ) == ast.dump(expected[0], include_attributes=False)
+
+
+def _record_shape(
+    node: ast.ClassDef,
+) -> tuple[tuple[str, str, str | None], ...]:
+    if (
+        len(node.decorator_list) != 1
+        or not _ast_expression_matches(
+            node.decorator_list[0], "dataclass(frozen=True)"
+        )
+    ):
+        raise ValueError(f"record {node.name} decorator differs")
     return tuple(
-        item.target.id
+        (
+            item.target.id,
+            ast.dump(item.annotation, include_attributes=False),
+            None
+            if item.value is None
+            else ast.dump(item.value, include_attributes=False),
+        )
         for item in node.body
         if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+    )
+
+
+def _expected_record_shape(
+    fields: tuple[tuple[str, str, str | None], ...],
+) -> tuple[tuple[str, str, str | None], ...]:
+    return tuple(
+        (
+            name,
+            ast.dump(ast.parse(annotation, mode="eval").body, include_attributes=False),
+            None
+            if default is None
+            else ast.dump(ast.parse(default, mode="eval").body, include_attributes=False),
+        )
+        for name, annotation, default in fields
+    )
+
+
+def _raise_reason(statement: ast.stmt, exception: str, reason: str) -> bool:
+    if not isinstance(statement, ast.Raise) or not isinstance(statement.exc, ast.Call):
+        return False
+    call = statement.exc
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id == exception
+        and len(call.args) == 1
+        and isinstance(call.args[0], ast.Constant)
+        and call.args[0].value == reason
+        and not call.keywords
+    )
+
+
+def _refusal_return(statement: ast.stmt, state: str, reason: str) -> bool:
+    if not isinstance(statement, ast.Return) or not isinstance(statement.value, ast.Call):
+        return False
+    call = statement.value
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "refuse"
+        and len(call.args) == 3
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == state
+        and isinstance(call.args[1], ast.Name)
+        and call.args[1].id == "request"
+        and isinstance(call.args[2], ast.Constant)
+        and call.args[2].value == reason
+        and not call.keywords
+    )
+
+
+def _direct_guard(
+    statements: list[ast.stmt], expression: str, exception: str, reason: str
+) -> ast.If:
+    matches = [
+        statement
+        for statement in statements
+        if isinstance(statement, ast.If)
+        and _ast_expression_matches(statement.test, expression)
+    ]
+    if (
+        len(matches) != 1
+        or len(matches[0].body) != 1
+        or matches[0].orelse
+        or not _raise_reason(matches[0].body[0], exception, reason)
+    ):
+        raise ValueError(f"live guard {reason} differs")
+    return matches[0]
+
+
+def _heredoc_python(script: str, declaration: str, terminator: str) -> ast.Module:
+    lines = script.splitlines()
+    starts = [index for index, line in enumerate(lines) if line == declaration]
+    if len(starts) != 1:
+        raise ValueError("embedded Python declaration differs")
+    endings = [
+        index
+        for index in range(starts[0] + 1, len(lines))
+        if lines[index] == terminator
+    ]
+    if len(endings) != 1:
+        raise ValueError("embedded Python terminator differs")
+    return ast.parse("\n".join(lines[starts[0] + 1 : endings[0]]) + "\n")
+
+
+def _contains_contiguous_lines(
+    script: str, expected: tuple[str, ...]
+) -> bool:
+    lines = tuple(line.strip() for line in script.splitlines())
+    width = len(expected)
+    return sum(
+        lines[index : index + width] == expected
+        for index in range(len(lines) - width + 1)
+    ) == 1
+
+
+def _shell_function_body(script: str, name: str) -> str:
+    lines = script.splitlines()
+    declaration = f"{name}() {{"
+    starts = [index for index, line in enumerate(lines) if line == declaration]
+    if len(starts) != 1:
+        raise ValueError(f"shell function {name} differs")
+    endings = [
+        index
+        for index in range(starts[0] + 1, len(lines))
+        if lines[index] == "}"
+    ]
+    if not endings:
+        raise ValueError(f"shell function {name} is unterminated")
+    return "\n".join(lines[starts[0] + 1 : endings[0]])
+
+
+def _lines_after_unique_anchor(
+    script: str, anchor: str, expected: tuple[str, ...]
+) -> bool:
+    lines = tuple(line.strip() for line in script.splitlines())
+    positions = [index for index, line in enumerate(lines) if line == anchor]
+    return (
+        len(positions) == 1
+        and lines[positions[0] : positions[0] + len(expected)] == expected
     )
 
 
@@ -3157,6 +3305,11 @@ def require_budget_helper_contract(source: str) -> None:
                 "gemini": ".github/workflows/gemini-auto-review.yml",
                 "opencode": ".github/workflows/opencode-auto-review.yml",
             },
+            "_BOT_LOGIN": "github-actions[bot]",
+            "_OUTCOMES": {
+                "success", "provider_failure", "quality_filtered",
+                "checkpoint_failure", "wall_time_exhausted",
+            },
             "_CALL_UNITS": {
                 "claude": "claude-code-action review session",
                 "gemini": "generate_content request",
@@ -3188,6 +3341,32 @@ def require_budget_helper_contract(source: str) -> None:
             for name, expected in expected_literals.items()
         ):
             raise ValueError("helper constants differ")
+        expected_type_aliases = {
+            "Outcome": (
+                'Literal["success", "provider_failure", "quality_filtered", '
+                '"checkpoint_failure", "wall_time_exhausted"]'
+            ),
+            "Decision": (
+                'Literal["claimed", "finalized", "state_invalid", '
+                '"diff_unavailable", "authenticated_reuse", "duplicate_head", '
+                '"duplicate_effective_diff", "input_budget_exhausted", '
+                '"round_budget_exhausted", "total_usage_budget_exhausted"]'
+            ),
+        }
+        for name, expression in expected_type_aliases.items():
+            bindings = [
+                item.value
+                for item in module.body
+                if isinstance(item, ast.Assign)
+                and len(item.targets) == 1
+                and isinstance(item.targets[0], ast.Name)
+                and item.targets[0].id == name
+            ]
+            if (
+                len(bindings) != 1
+                or not _ast_expression_matches(bindings[0], expression)
+            ):
+                raise ValueError(f"helper {name} type differs")
         policy = _class_node(module, "BudgetPolicy")
         policy_defaults = {
             item.target.id: ast.literal_eval(item.value)
@@ -3205,41 +3384,82 @@ def require_budget_helper_contract(source: str) -> None:
             "max_estimated_tokens_total": 400_000,
         }:
             raise ValueError("budget defaults differ")
-        expected_fields = {
+        expected_records = {
             "BudgetPolicy": (
-                "max_rounds", "max_override_rounds", "max_calls_per_round",
-                "max_wall_seconds_per_round", "max_estimated_tokens_per_round",
-                "max_estimated_tokens_total",
+                ("max_rounds", "int", "2"),
+                ("max_override_rounds", "int", "1"),
+                ("max_calls_per_round", "int", "1"),
+                ("max_wall_seconds_per_round", "int", "600"),
+                ("max_estimated_tokens_per_round", "int", "200_000"),
+                ("max_estimated_tokens_total", "int", "400_000"),
             ),
             "Invocation": (
-                "run_id", "run_attempt", "head_sha", "full_diff_sha256",
-                "round_number", "override_event_id", "model_route", "effort",
-                "call_unit", "call_count", "estimated_input_tokens",
-                "elapsed_seconds", "status", "outcome", "stop_reason",
-                "remaining_finding_ids",
+                ("run_id", "int", None),
+                ("run_attempt", "int", None),
+                ("head_sha", "str", None),
+                ("full_diff_sha256", "str", None),
+                ("round_number", "int", None),
+                ("override_event_id", "int | None", None),
+                ("model_route", "tuple[str, ...]", None),
+                ("effort", "str", None),
+                ("call_unit", "str", None),
+                ("call_count", "int", None),
+                ("estimated_input_tokens", "int", None),
+                ("elapsed_seconds", "int", None),
+                ("status", "str", None),
+                ("outcome", "Outcome | None", None),
+                ("stop_reason", "str", None),
+                ("remaining_finding_ids", "tuple[str, ...]", None),
             ),
             "DecisionRecord": (
-                "decision", "stop_reason", "run_id", "run_attempt",
+                ("decision", "str | None", "None"),
+                ("stop_reason", "str | None", "None"),
+                ("run_id", "int | None", "None"),
+                ("run_attempt", "int | None", "None"),
             ),
             "Handoff": (
-                "repository", "pr", "reviewer", "current_head_sha",
-                "current_full_diff_sha256", "current_run_id",
-                "current_run_attempt", "automatic_rounds", "override_rounds",
-                "round_usage", "decision", "outcome", "stop_reason",
-                "authenticated_review_head_sha",
-                "authenticated_review_full_diff_sha256",
-                "remaining_finding_ids",
+                ("repository", "str | None", "None"),
+                ("pr", "int | None", "None"),
+                ("reviewer", "Reviewer | None", "None"),
+                ("current_head_sha", "str | None", "None"),
+                ("current_full_diff_sha256", "str | None", "None"),
+                ("current_run_id", "int | None", "None"),
+                ("current_run_attempt", "int | None", "None"),
+                ("automatic_rounds", "int | None", "None"),
+                ("override_rounds", "int | None", "None"),
+                ("round_usage", "tuple[tuple[int, int, int, int], ...]", "()"),
+                ("decision", "str | None", "None"),
+                ("outcome", "Outcome | None", "None"),
+                ("stop_reason", "str | None", "None"),
+                ("authenticated_review_head_sha", "str | None", "None"),
+                (
+                    "authenticated_review_full_diff_sha256",
+                    "str | None",
+                    "None",
+                ),
+                ("remaining_finding_ids", "tuple[str, ...]", "()"),
             ),
             "LedgerState": (
-                "repository", "pr", "reviewer", "budgets", "invocations",
-                "consumed_override_event_ids", "last_decision", "handoff",
+                ("repository", "str", None),
+                ("pr", "int", None),
+                ("reviewer", "Reviewer", None),
+                ("budgets", "BudgetPolicy", None),
+                ("invocations", "tuple[Invocation, ...]", "()"),
+                ("consumed_override_event_ids", "tuple[int, ...]", "()"),
+                (
+                    "last_decision",
+                    "DecisionRecord",
+                    "field(default_factory=DecisionRecord)",
+                ),
+                ("handoff", "Handoff", "field(default_factory=Handoff)"),
             ),
         }
         if any(
-            _annotated_fields(_class_node(module, name)) != fields
-            for name, fields in expected_fields.items()
+            _record_shape(_class_node(module, name))
+            != _expected_record_shape(fields)
+            for name, fields in expected_records.items()
         ):
-            raise ValueError("helper schema fields differ")
+            raise ValueError("helper record schema differs")
         schema_keys = {
             "Invocation": {
                 "run_id", "run_attempt", "head_sha", "full_diff_sha256",
@@ -3268,13 +3488,75 @@ def require_budget_helper_contract(source: str) -> None:
             for name, keys in schema_keys.items()
         ):
             raise ValueError("helper serialized schema differs")
+        decision_from_dict = _function_node(
+            _class_node(module, "DecisionRecord"), "from_dict"
+        )
+        _direct_guard(
+            decision_from_dict.body,
+            "decision not in {"
+            "'claimed', 'finalized', 'state_invalid', 'diff_unavailable', "
+            "'authenticated_reuse', 'duplicate_head', "
+            "'duplicate_effective_diff', 'input_budget_exhausted', "
+            "'round_budget_exhausted', 'total_usage_budget_exhausted'}",
+            "BudgetStateError",
+            "decision_invalid",
+        )
+        bounded_finding_guards = (
+            (
+                _function_node(_class_node(module, "Invocation"), "from_dict"),
+                "not isinstance(findings, list) or len(findings) > 8 or "
+                "len(findings) != len(set(findings))",
+                "remaining_finding_ids_invalid",
+            ),
+            (
+                _function_node(_class_node(module, "Handoff"), "from_dict"),
+                "not isinstance(findings, list) or len(findings) > 8 or "
+                "len(findings) != len(set(findings)) or not all("
+                "isinstance(item, str) and _FINDING.fullmatch(item) "
+                "for item in findings)",
+                "handoff_invalid",
+            ),
+            (
+                _function_node(module, "_validate_request"),
+                "len(review.remaining_finding_ids) > 8 or "
+                "len(review.remaining_finding_ids) != "
+                "len(set(review.remaining_finding_ids)) or not all("
+                "isinstance(item, str) and _FINDING.fullmatch(item) "
+                "for item in review.remaining_finding_ids)",
+                "authenticated_review_invalid",
+            ),
+            (
+                _function_node(module, "_validate_finalize_request"),
+                "not isinstance(findings, tuple) or len(findings) > 8 or "
+                "len(findings) != len(set(findings)) or not all("
+                "isinstance(item, str) and _FINDING.fullmatch(item) "
+                "for item in findings)",
+                "remaining_finding_ids_invalid",
+            ),
+        )
+        for function, expression, reason in bounded_finding_guards:
+            _direct_guard(
+                function.body, expression, "BudgetStateError", reason
+            )
         reviewer_policy = _function_node(policy, "for_reviewer")
-        reviewer_caps = [
-            ast.literal_eval(item.value)
-            for item in ast.walk(reviewer_policy)
-            if isinstance(item, ast.Subscript) and isinstance(item.value, ast.Dict)
-        ]
-        if reviewer_caps != [{"claude": 1, "gemini": 3, "opencode": 2}]:
+        if (
+            len(reviewer_policy.body) != 2
+            or not isinstance(reviewer_policy.body[0], ast.If)
+            or not _ast_expression_matches(
+                reviewer_policy.body[0].test, "reviewer not in MARKERS"
+            )
+            or len(reviewer_policy.body[0].body) != 1
+            or not _raise_reason(
+                reviewer_policy.body[0].body[0],
+                "BudgetStateError",
+                "reviewer_invalid",
+            )
+            or not _ast_statement_matches(
+                reviewer_policy.body[1],
+                "return cls(max_calls_per_round={"
+                "'claude': 1, 'gemini': 3, 'opencode': 2}[reviewer])",
+            )
+        ):
             raise ValueError("reviewer call caps differ")
         finding_bindings = [
             item.value
@@ -3328,81 +3610,276 @@ def require_budget_helper_contract(source: str) -> None:
         ):
             raise ValueError("public helper function differs")
         claim_function = _function_node(module, "claim")
-        claim_source = ast.get_source_segment(source, claim_function)
-        if not isinstance(claim_source, str):
-            raise ValueError("claim source unavailable")
-        ordered_claim_gates = (
-            "authenticated_reuse",
-            "duplicate_head",
-            "duplicate_effective_diff",
-            "input_budget_exhausted",
-            "round_budget_exhausted",
-            "total_usage_budget_exhausted",
-        )
-        claim_decisions = [
-            node.value.args[2].value
-            for node in ast.walk(claim_function)
-            if isinstance(node, ast.Return)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "refuse"
-            and len(node.value.args) == 3
-            and isinstance(node.value.args[2], ast.Constant)
-            and node.value.args[2].value in ordered_claim_gates
-        ]
-        claim_decisions.sort(
-            key=lambda decision: next(
-                node.lineno
-                for node in ast.walk(claim_function)
-                if isinstance(node, ast.Return)
-                and isinstance(node.value, ast.Call)
-                and len(node.value.args) == 3
-                and isinstance(node.value.args[2], ast.Constant)
-                and node.value.args[2].value == decision
-            )
-        )
-        if tuple(claim_decisions) != ordered_claim_gates:
-            raise ValueError("claim gate order differs")
-        finalize_source = ast.unparse(_function_node(module, "finalize"))
-        required_finalize = (
-            "request.call_count > state.budgets.max_calls_per_round",
-            "(outcome, stop_reason) = ('checkpoint_failure', 'call_budget_exhausted')",
-            "request.elapsed_seconds > state.budgets.max_wall_seconds_per_round",
-            "(outcome, stop_reason) = ('wall_time_exhausted', 'wall_time_exhausted')",
-        )
-        if not all(fragment in finalize_source for fragment in required_finalize):
-            raise ValueError("final cap relationship differs")
-        required_source = (
-            "github-actions[bot]",
-            "review-budget-override",
-            "event.event_id not in state.consumed_override_event_ids",
-            "not current and provenance.status != \"completed\"",
-            "current and provenance.status not in {\"in_progress\", \"completed\"}",
-            "call_budget_exhausted",
-            "wall_time_exhausted",
-            "len(findings) > 8",
-            "compare_and_swap_failed",
-            "payload != render_checkpoint(state)",
-        )
-        policy_occurrences = {
-            "duplicate_head": 5,
-            "duplicate_effective_diff": 5,
-            "round_budget_exhausted": 5,
-            "input_budget_exhausted": 5,
-            "total_usage_budget_exhausted": 7,
-            "call_budget_exhausted": 3,
-            "wall_time_exhausted": 7,
-            "provenance_mismatch": 5,
-            "compare_and_swap_failed": 1,
+        claim_body = claim_function.body
+        claim_tests = {
+            2: (
+                "same_run and any((item.head_sha, item.full_diff_sha256) != "
+                "(request.head_sha, request.full_diff_sha256) "
+                "for item in same_run)"
+            ),
+            3: "request.diff_mode == 'unchanged'",
+            4: (
+                "any(item.head_sha == request.head_sha "
+                "for item in validated.invocations)"
+            ),
+            5: (
+                "any(item.full_diff_sha256 == request.full_diff_sha256 "
+                "for item in validated.invocations)"
+            ),
+            6: (
+                "request.estimated_input_tokens > "
+                "validated.budgets.max_estimated_tokens_per_round"
+            ),
+            8: (
+                "automatic_rounds(validated) >= "
+                "validated.budgets.max_rounds"
+            ),
+            10: (
+                "estimated_total(validated) + request.estimated_input_tokens "
+                "> total_limit"
+            ),
         }
         if (
-            not all(fragment in source for fragment in required_source)
-            or any(
-                source.count(fragment) != expected
-                for fragment, expected in policy_occurrences.items()
+            len(claim_body) != 12
+            or not all(
+                isinstance(claim_body[index], ast.If)
+                and _ast_expression_matches(claim_body[index].test, expression)
+                for index, expression in claim_tests.items()
+            )
+            or not _ast_statement_matches(
+                claim_body[1],
+                "same_run = [item for item in validated.invocations "
+                "if (item.run_id, item.run_attempt) == "
+                "(request.run_id, request.run_attempt)]",
+            )
+            or not _ast_statement_matches(claim_body[7], "override = None")
+            or not _ast_statement_matches(
+                claim_body[9],
+                "total_limit = 600_000 if override is not None else 400_000",
+            )
+            or not _ast_statement_matches(
+                claim_body[11],
+                "return append_claim(validated, request, override)",
             )
         ):
-            raise ValueError("helper policy source differs")
+            raise ValueError("claim live control flow differs")
+        if (
+            len(claim_body[2].body) != 1
+            or not _ast_statement_matches(
+                claim_body[2].body[0],
+                'return _invalid_transition(validated, request, '
+                '"duplicate_run_identity")',
+            )
+            or len(claim_body[3].body) != 2
+            or not isinstance(claim_body[3].body[0], ast.If)
+            or not _ast_expression_matches(
+                claim_body[3].body[0].test,
+                "not request.authenticated_review.covers_hash("
+                "request.full_diff_sha256)",
+            )
+            or len(claim_body[3].body[0].body) != 1
+            or not _ast_statement_matches(
+                claim_body[3].body[0].body[0],
+                'return _invalid_transition(validated, request, '
+                '"unchanged_without_authenticated_review")',
+            )
+            or not _refusal_return(
+                claim_body[3].body[1], "validated", "authenticated_reuse"
+            )
+            or len(claim_body[4].body) != 1
+            or not _refusal_return(
+                claim_body[4].body[0], "validated", "duplicate_head"
+            )
+            or len(claim_body[5].body) != 1
+            or not _refusal_return(
+                claim_body[5].body[0], "validated", "duplicate_effective_diff"
+            )
+            or len(claim_body[6].body) != 1
+            or not _refusal_return(
+                claim_body[6].body[0], "validated", "input_budget_exhausted"
+            )
+            or len(claim_body[8].body) != 2
+            or not _ast_statement_matches(
+                claim_body[8].body[0],
+                "override = choose_override(validated, request.override_events)",
+            )
+            or not isinstance(claim_body[8].body[1], ast.If)
+            or not _ast_expression_matches(
+                claim_body[8].body[1].test, "override is None"
+            )
+            or len(claim_body[8].body[1].body) != 1
+            or not _refusal_return(
+                claim_body[8].body[1].body[0],
+                "validated",
+                "round_budget_exhausted",
+            )
+            or len(claim_body[10].body) != 1
+            or not _refusal_return(
+                claim_body[10].body[0],
+                "validated",
+                "total_usage_budget_exhausted",
+            )
+        ):
+            raise ValueError("claim gate relationship differs")
+
+        finalize_function = _function_node(module, "finalize")
+        if (
+            len(finalize_function.body) != 17
+            or not _ast_statement_matches(
+                finalize_function.body[9],
+                "if request.call_count > "
+                "state.budgets.max_calls_per_round:\n"
+                "    outcome, stop_reason = "
+                "'checkpoint_failure', 'call_budget_exhausted'\n"
+                "elif request.elapsed_seconds > "
+                "state.budgets.max_wall_seconds_per_round:\n"
+                "    outcome, stop_reason = "
+                "'wall_time_exhausted', 'wall_time_exhausted'",
+            )
+        ):
+            raise ValueError("final live cap relationship differs")
+
+        state_shape = _function_node(module, "_validate_state_shape")
+        invocation_loops = [
+            statement
+            for statement in state_shape.body
+            if isinstance(statement, ast.For)
+            and _ast_expression_matches(statement.iter, "state.invocations")
+        ]
+        expected_invocation_loop = ast.parse(
+            "for item in state.invocations:\n"
+            "    Invocation.from_dict(item.to_dict())\n"
+            "    call_failure = (item.status == 'finalized' and "
+            "item.outcome == 'checkpoint_failure' and "
+            "item.stop_reason == 'call_budget_exhausted')\n"
+            "    wall_failure = (item.status == 'finalized' and "
+            "item.outcome == 'wall_time_exhausted' and "
+            "item.stop_reason == 'wall_time_exhausted')\n"
+            "    if item.call_count > state.budgets.max_calls_per_round "
+            "and not call_failure:\n"
+            "        raise BudgetStateError('call_budget_exhausted')\n"
+            "    if item.estimated_input_tokens > "
+            "state.budgets.max_estimated_tokens_per_round:\n"
+            "        raise BudgetStateError('input_budget_exhausted')\n"
+            "    call_first_dual_failure = call_failure and "
+            "item.call_count > state.budgets.max_calls_per_round\n"
+            "    if item.elapsed_seconds > "
+            "state.budgets.max_wall_seconds_per_round and "
+            "not (wall_failure or call_first_dual_failure):\n"
+            "        raise BudgetStateError('wall_time_exhausted')"
+        ).body[0]
+        if (
+            len(invocation_loops) != 1
+            or ast.dump(invocation_loops[0], include_attributes=False)
+            != ast.dump(expected_invocation_loop, include_attributes=False)
+        ):
+            raise ValueError("stored cap policy differs")
+        for expression, reason in (
+            (
+                "len({item.head_sha for item in state.invocations}) "
+                "!= len(state.invocations)",
+                "duplicate_head",
+            ),
+            (
+                "len({item.full_diff_sha256 for item in state.invocations}) "
+                "!= len(state.invocations)",
+                "duplicate_effective_diff",
+            ),
+            (
+                "len(automatic) > state.budgets.max_rounds or "
+                "len(overrides) > state.budgets.max_override_rounds",
+                "rounds_invalid",
+            ),
+            (
+                "automatic_total > total_limit",
+                "total_usage_budget_exhausted",
+            ),
+            (
+                "sum(item.estimated_input_tokens "
+                "for item in state.invocations) > total_limit",
+                "total_usage_budget_exhausted",
+            ),
+        ):
+            _direct_guard(
+                state_shape.body, expression, "BudgetStateError", reason
+            )
+
+        provenance = _function_node(module, "_validate_provenance")
+        expected_provenance = ast.parse(
+            "for item in state.invocations:\n"
+            "    provenance = provenances.get((item.run_id, item.run_attempt))\n"
+            "    if not isinstance(provenance, RunProvenance):\n"
+            "        raise BudgetStateError('provenance_mismatch')\n"
+            "    current = (item.run_id, item.run_attempt) == "
+            "(request.run_id, request.run_attempt)\n"
+            "    if (provenance.repository != state.repository "
+            "or provenance.pr != state.pr "
+            "or provenance.head_sha != item.head_sha "
+            "or provenance.workflow_path != WORKFLOWS[state.reviewer] "
+            "or provenance.run_id != item.run_id "
+            "or provenance.run_attempt != item.run_attempt "
+            "or (not current and provenance.status != 'completed') "
+            "or (current and provenance.status not in "
+            "{'in_progress', 'completed'})):\n"
+            "        raise BudgetStateError('provenance_mismatch')"
+        ).body[0]
+        if (
+            len(provenance.body) != 1
+            or ast.dump(provenance.body[0], include_attributes=False)
+            != ast.dump(expected_provenance, include_attributes=False)
+        ):
+            raise ValueError("provenance policy differs")
+
+        choose_override = _function_node(module, "choose_override")
+        if (
+            len(choose_override.body) != 4
+            or not isinstance(choose_override.body[2], ast.For)
+            or not _ast_expression_matches(
+                choose_override.body[2].iter, "events"
+            )
+            or len(choose_override.body[2].body) != 1
+            or not isinstance(choose_override.body[2].body[0], ast.If)
+            or not _ast_expression_matches(
+                choose_override.body[2].body[0].test,
+                "isinstance(event, OverrideEvent) "
+                "and isinstance(event.event_id, int) "
+                "and not isinstance(event.event_id, bool) "
+                "and event.event_id > 0 "
+                "and event.event == 'labeled' "
+                "and event.label == 'review-budget-override' "
+                "and event.actor_permission in {'admin', 'maintain', 'write'} "
+                "and event.event_id not in "
+                "state.consumed_override_event_ids",
+            )
+            or not _ast_statement_matches(
+                choose_override.body[2].body[0].body[0],
+                "eligible.append(event)",
+            )
+            or not _ast_statement_matches(
+                choose_override.body[3],
+                "return max(eligible, key=lambda item: item.event_id, "
+                "default=None)",
+            )
+        ):
+            raise ValueError("override policy differs")
+
+        load_checkpoint = _function_node(module, "load_checkpoint")
+        _direct_guard(
+            load_checkpoint.body,
+            "payload != render_checkpoint(state)",
+            "BudgetStateError",
+            "checkpoint_json_noncanonical",
+        )
+        cas_failed = _function_node(module, "_cas_failed")
+        if (
+            len(cas_failed.body) != 12
+            or not _ast_statement_matches(
+                cas_failed.body[6],
+                "transition = _recorded_refusal("
+                "prior_state, request_object, 'compare_and_swap_failed')",
+            )
+        ):
+            raise ValueError("compare-and-swap refusal differs")
     except (StopIteration, SyntaxError, TypeError, ValueError):
         raise ReleaseVerificationError(
             "invocation-budget helper contract is invalid"
@@ -3672,20 +4149,79 @@ def require_budget_workflow_contract(
             ):
                 raise ValueError("OpenCode sealed handoff validation differs")
 
-        rendered = payload.decode("utf-8")
-        required_fragments = {
-            "claude": ("call_count=1",),
-            "gemini": ("GEMINI_CALL_COUNT_FILE", "if count >= 3:"),
-            "opencode": ("(( count < 2 )) || {",),
-        }[reviewer]
-        if not all(fragment in rendered for fragment in required_fragments):
-            raise ValueError("workflow reviewer call cap differs")
+        if reviewer == "claude":
+            metrics_step = _named_step(
+                claim_job, "Start Claude review metrics"
+            )
+            if metrics_step != {
+                "name": "Start Claude review metrics",
+                "id": "claude-budget-metrics",
+                "if": (
+                    "${{ steps.review-budget-claim.outputs."
+                    "allow-invocation == 'true' }}"
+                ),
+                "shell": "bash",
+                "run": (
+                    "set -euo pipefail\n"
+                    "printf 'call_count=1\\n' >> \"$GITHUB_OUTPUT\"\n"
+                    "printf 'started_at=%s\\n' \"$(date +%s)\" "
+                    ">> \"$GITHUB_OUTPUT\"\n"
+                ),
+            }:
+                raise ValueError("Claude live call accounting differs")
+        elif reviewer == "gemini":
+            if provider.get("env", {}).get("GEMINI_CALL_COUNT_FILE") != (
+                "${{ runner.temp }}/gemini_call_count.txt"
+            ):
+                raise ValueError("Gemini counter input differs")
+            embedded = _heredoc_python(
+                provider.get("run", ""),
+                "cat > gemini_review.py << 'PYTHON_EOF'",
+                "PYTHON_EOF",
+            )
+            counted = _function_node(embedded, "counted_generate_content")
+            expected_counted = ast.parse(
+                "def counted_generate_content(prompt, model):\n"
+                "    count = read_call_count()\n"
+                "    if count >= 3:\n"
+                "        raise ProviderFailure('call_budget_exhausted')\n"
+                "    write_call_count(count + 1)\n"
+                "    append_model_route(model)\n"
+                "    return generate_content(prompt, model)\n"
+            ).body[0]
+            if ast.dump(counted, include_attributes=False) != ast.dump(
+                expected_counted, include_attributes=False
+            ):
+                raise ValueError("Gemini live call accounting differs")
+        else:
+            run_opencode = _shell_function_body(
+                provider.get("run", ""), "run_opencode"
+            )
+            call_sequence = (
+                'count="$(cat "$call_count_file")"',
+                '[[ "$count" =~ ^[0-9]+$ ]]',
+                "(( count < 2 )) || {",
+                "review_failure_reason=call_budget_exhausted",
+                "return 1",
+                "}",
+                'python3 - "$call_count_file" "$((count + 1))" <<\'PY\'',
+            )
+            if not _lines_after_unique_anchor(
+                run_opencode, call_sequence[0], call_sequence
+            ):
+                raise ValueError("OpenCode live call accounting differs")
         forbidden_reviewers = {
             "claude": ("Fallback to Gemini reviewer", "Fallback to OpenCode reviewer"),
             "gemini": ("Fallback to Claude reviewer", "Fallback to OpenCode reviewer"),
             "opencode": ("Fallback to Claude reviewer", "Fallback to Gemini reviewer"),
         }[reviewer]
-        if any(fragment in rendered for fragment in forbidden_reviewers):
+        step_names = {
+            step.get("name")
+            for job in jobs.values()
+            for step in job.get("steps", [])
+            if isinstance(step, dict)
+        }
+        if any(name in step_names for name in forbidden_reviewers):
             raise ValueError("cross-reviewer fallback")
     except (
         KeyError,
