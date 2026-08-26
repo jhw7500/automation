@@ -7585,6 +7585,7 @@ def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
     }
     assert seal["if"] == "steps.prepare-diff.outputs.diff-ready == 'true'"
     assert model["if"] == (
+        "needs.opencode-prepare.outputs.allow_invocation == 'true' && "
         "needs.opencode-prepare.outputs.diff_ready == 'true' && "
         "needs.opencode-prepare.outputs.diff_mode != 'unchanged'"
     )
@@ -7595,6 +7596,238 @@ def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
         "Install pinned OpenCode CLI",
     ):
         assert _step(workflow, "opencode-review", step_name)["if"] == model["if"]
+
+
+def test_opencode_budget_claim_is_sealed_before_tokenless_model_job():
+    workflow = _load("opencode-auto-review.yml")
+    prepare = workflow["jobs"]["opencode-prepare"]
+    review = workflow["jobs"]["opencode-review"]
+    claim = _step(workflow, "opencode-prepare", "Claim OpenCode review budget")
+    prepare_diff = _step(workflow, "opencode-prepare", "Prepare review diff")
+
+    assert prepare["permissions"] == {
+        "actions": "read",
+        "checks": "read",
+        "contents": "read",
+        "pull-requests": "read",
+        "issues": "write",
+    }
+    assert prepare["steps"].index(prepare_diff) < prepare["steps"].index(claim)
+    assert prepare["outputs"]["allow_invocation"] == (
+        "${{ steps.review-budget-claim.outputs.allow-invocation }}"
+    )
+    assert prepare["outputs"]["budget_decision"] == (
+        "${{ steps.review-budget-claim.outputs.decision }}"
+    )
+    assert prepare["outputs"]["budget_checkpoint_sha256"] == (
+        "${{ steps.review-budget-claim.outputs.checkpoint-sha256 }}"
+    )
+    assert prepare["outputs"]["attempt_head"] == (
+        "${{ steps.prepare-diff.outputs.head-sha }}"
+    )
+    assert claim["uses"] == "$/.github/actions/review-invocation-budget"
+    assert claim["if"] == "${{ always() && steps.ctx.outcome == 'success' }}"
+    assert claim["with"] == {
+        "github-token": "${{ github.token }}",
+        "mode": "claim",
+        "reviewer": "opencode",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
+        "expected-head-sha": "${{ steps.prepare-diff.outputs.head-sha }}",
+        "full-diff-sha256": "${{ steps.prepare-diff.outputs.full-diff-sha256 }}",
+        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
+        "input-files-json": "${{ format('[\"{0}/review-full.diff\",\"{0}/review-scope.json\"]', github.workspace) }}",
+        "authenticated-review-json": "${{ steps.ctx.outputs.authenticated_review_json }}",
+        "model-route-json": '["zai-coding-plan/glm-4.7"]',
+        "effort": "final-review/default",
+        "checkpoint-file": "${{ runner.temp }}/opencode-review-budget-claim.json",
+    }
+    assert review["permissions"] == {}
+    assert review["timeout-minutes"] == "10"
+    assert "needs.opencode-prepare.outputs.allow_invocation == 'true'" in review["if"]
+
+
+def test_opencode_budget_handoff_seals_exact_claim_checkpoint_identity():
+    workflow = _load("opencode-auto-review.yml")
+    build = _step(
+        workflow, "opencode-prepare", "Build sealed canonicalization handoff"
+    )["run"]
+    validate_model = _step(
+        workflow, "opencode-review", "Validate sealed review handoff"
+    )["run"]
+    canonicalize = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )
+
+    assert 'cp -- "$BUDGET_CHECKPOINT_PATH" "$handoff/review-budget-claim.json"' in build
+    assert '"review-budget-claim.json":$budget_checkpoint' in build
+    assert "allow_invocation" in build
+    assert "budget_decision" in build
+    assert "budget_checkpoint_sha256" in build
+    expected_inventory = (
+        "handoff.json\\nopencode-attestations-before.json\\n"
+        "opencode-comments-before.json\\nreview-budget-claim.json\\n"
+        "review-full.diff\\nreview-scope.json"
+    )
+    assert expected_inventory in validate_model
+    assert "review-budget-claim.json" in canonicalize["env"]["BUDGET_CLAIM_PATH"]
+    assert canonicalize["env"]["BUDGET_CHECKPOINT_SHA256"] == (
+        "${{ needs.opencode-prepare.outputs.budget_checkpoint_sha256 }}"
+    )
+
+
+def test_opencode_invocation_budget_guards_every_model_dependency_and_counts_before_cli():
+    workflow = _load("opencode-auto-review.yml")
+    review_job = workflow["jobs"]["opencode-review"]
+    model = _step(workflow, "opencode-review", "Run OpenCode PR review")
+    initialize = _step(
+        workflow, "opencode-review", "Initialize OpenCode review metrics"
+    )
+    materialize = _step(
+        workflow, "opencode-review", "Materialize sealed OpenCode candidate"
+    )
+    allow = "needs.opencode-prepare.outputs.allow_invocation == 'true'"
+
+    assert review_job["permissions"] == {}
+    assert review_job["timeout-minutes"] == "10"
+    assert allow in review_job["if"]
+    assert review_job["steps"].index(initialize) < review_job["steps"].index(
+        _step(workflow, "opencode-review", "Cache pinned OpenCode CLI archive")
+    )
+    for name in (
+        "Cache pinned OpenCode CLI archive",
+        "Install pinned OpenCode CLI",
+        "Run OpenCode PR review",
+    ):
+        assert allow in _step(workflow, "opencode-review", name)["if"]
+    command = model["run"]
+    wrapper = command[command.index("run_opencode()") : command.index("extract_candidate()")]
+    assert 'count="$(cat "$call_count_file")"' in wrapper
+    assert "(( count < 2 ))" in wrapper
+    assert 'review_failure_reason=call_budget_exhausted' in wrapper
+    for durability_gate in ("os.O_EXCL", "os.O_NOFOLLOW", "os.fsync", "os.replace", "os.O_DIRECTORY"):
+        assert durability_gate in wrapper
+    assert wrapper.index("os.replace(temporary, destination)") < wrapper.index(
+        "opencode run --model zai-coding-plan/glm-4.7"
+    )
+    assert command.count("run_opencode ") == 2
+    assert materialize["if"] == (
+        "${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}"
+    )
+    assert review_job["outputs"]["review_call_count"] == (
+        "${{ steps.materialize-candidate.outputs.review_call_count }}"
+    )
+    assert review_job["outputs"]["review_elapsed_seconds"] == (
+        "${{ steps.materialize-candidate.outputs.review_elapsed_seconds }}"
+    )
+
+
+def test_opencode_budget_candidate_envelope_is_exact_and_mode_aware():
+    workflow = _load("opencode-auto-review.yml")
+    materialize = _step(
+        workflow, "opencode-review", "Materialize sealed OpenCode candidate"
+    )["run"]
+    upload = _step(
+        workflow, "opencode-review", "Upload untrusted OpenCode candidate"
+    )
+    canonicalize = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )["with"]["script"]
+
+    for field in (
+        "schema", "repository", "pr", "run_id", "run_attempt", "head_sha",
+        "full_diff_sha256", "diff_mode", "claim_checkpoint_sha256",
+        "call_count", "elapsed_seconds", "model_route", "outcome",
+        "failure_reason", "review_sha256",
+    ):
+        assert f'"{field}"' in materialize
+    assert "lstat" in materialize and "S_ISREG" in materialize
+    assert "0o600" in materialize
+    assert 'model_route != ["zai-coding-plan/glm-4.7"]' in materialize
+    assert upload["if"] == (
+        "${{ always() && steps.materialize-candidate.outcome == 'success' && "
+        "needs.opencode-prepare.outputs.allow_invocation == 'true' }}"
+    )
+    assert upload["with"]["path"] == "${{ runner.temp }}/opencode-candidate"
+    assert "candidate.json" in canonicalize
+    assert "candidate artifact inventory is not exact" in canonicalize
+    assert "candidate claim identity mismatch" in canonicalize
+    assert "candidate metrics mismatch" in canonicalize
+
+
+def test_opencode_budget_finalize_uses_only_attested_publication_outcome():
+    workflow = _load("opencode-auto-review.yml")
+    job = workflow["jobs"]["opencode-canonicalize"]
+    canonicalize = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )
+    outcome = _step(
+        workflow, "opencode-canonicalize", "Resolve OpenCode budget outcome"
+    )
+    finalize = _step(
+        workflow, "opencode-canonicalize", "Finalize OpenCode review budget"
+    )
+
+    assert "needs.opencode-prepare.outputs.allow_invocation == 'true'" in canonicalize["if"]
+    assert canonicalize["with"]["script"].index("checks.update") < canonicalize[
+        "with"
+    ]["script"].rindex("core.setOutput('publication_succeeded', 'true')")
+    assert outcome["if"] == (
+        "${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}"
+    )
+    for value in (
+        "success", "quality_filtered", "provider_failure",
+        "checkpoint_failure", "wall_time_exhausted",
+    ):
+        assert value in outcome["run"]
+    assert "RVW-[0-9a-f]{12}" in outcome["run"]
+    assert "length) <= 8" in outcome["run"]
+    assert finalize["if"] == (
+        "${{ always() && !cancelled() && "
+        "needs.opencode-prepare.outputs.allow_invocation == 'true' }}"
+    )
+    assert finalize["uses"] == "$/.github/actions/review-invocation-budget"
+    assert finalize["with"] == {
+        "github-token": "${{ github.token }}",
+        "mode": "finalize",
+        "reviewer": "opencode",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
+        "expected-head-sha": "${{ needs.opencode-prepare.outputs.attempt_head }}",
+        "full-diff-sha256": "${{ needs.opencode-prepare.outputs.full_diff_sha256 }}",
+        "diff-mode": "${{ needs.opencode-prepare.outputs.diff_mode }}",
+        "input-files-json": "[]",
+        "authenticated-review-json": "${{ steps.opencode-budget-outcome.outputs.authenticated_review_json }}",
+        "model-route-json": '["zai-coding-plan/glm-4.7"]',
+        "effort": "final-review/default",
+        "actual-call-count": "${{ needs.opencode-review.outputs.review_call_count || '0' }}",
+        "elapsed-seconds": "${{ needs.opencode-review.outputs.review_elapsed_seconds || '0' }}",
+        "outcome": "${{ steps.opencode-budget-outcome.outputs.outcome }}",
+        "stop-reason": "${{ steps.opencode-budget-outcome.outputs.stop_reason }}",
+        "remaining-finding-ids-json": "${{ steps.opencode-budget-outcome.outputs.remaining_finding_ids_json }}",
+        "checkpoint-file": "${{ runner.temp }}/opencode-review-budget-final.json",
+    }
+    assert any(step.get("name") == "Upload OpenCode review budget final checkpoint" for step in job["steps"])
+
+
+def test_opencode_budget_refusal_skips_model_and_schema2_publication_but_uploads_claim():
+    workflow = _load("opencode-auto-review.yml")
+    prepare_upload = _step(
+        workflow, "opencode-prepare", "Upload OpenCode review budget claim checkpoint"
+    )
+    canonical_job = workflow["jobs"]["opencode-canonicalize"]
+    canonicalize = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )
+
+    assert prepare_upload["if"] == (
+        "${{ always() && steps.review-budget-claim.outcome == 'success' }}"
+    )
+    assert prepare_upload["with"]["path"] == (
+        "${{ runner.temp }}/opencode-review-budget-claim.json"
+    )
+    assert "needs.opencode-prepare.outputs.allow_invocation == 'true'" in canonical_job["if"]
+    assert "needs.opencode-prepare.outputs.budget_decision == 'authenticated_reuse'" in canonical_job["if"]
+    assert "needs.opencode-prepare.outputs.allow_invocation == 'true'" in canonicalize["if"]
+    assert "authenticated_reuse" in canonicalize["if"]
 
 
 def test_opencode_model_and_privileged_canonicalization_have_separate_token_boundaries():
@@ -7613,7 +7846,7 @@ def test_opencode_model_and_privileged_canonicalization_have_separate_token_boun
         "checks": "read",
         "contents": "read",
         "pull-requests": "read",
-        "issues": "read",
+        "issues": "write",
     }
     assert model_job["permissions"] == {}
     assert "actions" not in model_job["permissions"]
@@ -7688,7 +7921,7 @@ def test_opencode_model_is_tokenless_generic_run_with_exact_candidate_artifact()
         "opencode-candidate-${{ github.run_id }}-${{ github.run_attempt }}"
     )
     assert candidate_upload["with"]["path"] == (
-        "${{ runner.temp }}/opencode-candidate/review.md"
+        "${{ runner.temp }}/opencode-candidate"
     )
     assert candidate_download["with"]["artifact-ids"] == (
         "${{ needs.opencode-review.outputs.candidate_artifact_id }}"
@@ -7733,6 +7966,11 @@ def _run_opencode_model_step(
 ):
     model = _step(
         _load("opencode-auto-review.yml"), "opencode-review", "Run OpenCode PR review"
+    )
+    initialize = _step(
+        _load("opencode-auto-review.yml"),
+        "opencode-review",
+        "Initialize OpenCode review metrics",
     )
     runner_temp = tmp_path / "runner"
     handoff = tmp_path / "handoff"
@@ -7796,6 +8034,14 @@ def _run_opencode_model_step(
         "OPENCODE_CONFIG_CONTENT": model["env"]["OPENCODE_CONFIG_CONTENT"],
         "GITHUB_OUTPUT": str(github_output),
     }
+    subprocess.run(
+        ["bash", "-c", initialize["run"]],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
     result = subprocess.run(
         ["bash", "-c", model["run"]],
         cwd=tmp_path,
@@ -7816,6 +8062,16 @@ def _run_opencode_model_step(
         else None
     )
     return result, calls, candidate
+
+
+def test_opencode_invocation_budget_persists_count_before_raised_cli(tmp_path):
+    result, calls, _ = _run_opencode_model_step(tmp_path, [])
+
+    assert result.returncode != 0
+    assert len(calls) == 1, result.stderr
+    call_count = tmp_path / "runner" / "opencode-review-metrics" / "call-count"
+    assert call_count.read_text(encoding="ascii") == "1\n"
+    assert call_count.stat().st_mode & 0o777 == 0o600
 
 
 def test_opencode_valid_outer_format_does_not_spend_a_repair_call(tmp_path):
@@ -11073,6 +11329,9 @@ def test_opencode_unavailable_handoff_builds_exact_conditional_inventory(tmp_pat
     evidence = tmp_path / "attestations.json"
     snapshot.write_text("[]", encoding="utf-8")
     evidence.write_text('{"check_runs":[],"workflow_runs":[]}', encoding="utf-8")
+    budget_checkpoint = tmp_path / "budget-checkpoint.json"
+    budget_checkpoint.write_text('{"schema":1}\n', encoding="ascii")
+    budget_checkpoint_sha256 = hashlib.sha256(budget_checkpoint.read_bytes()).hexdigest()
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     gh = bin_dir / "gh"
@@ -11104,6 +11363,10 @@ def test_opencode_unavailable_handoff_builds_exact_conditional_inventory(tmp_pat
         "FULL_DIFF_SHA256": "",
         "SNAPSHOT_PATH": str(snapshot),
         "ATTESTATIONS_PATH": str(evidence),
+        "BUDGET_CHECKPOINT_PATH": str(budget_checkpoint),
+        "BUDGET_CHECKPOINT_SHA256": budget_checkpoint_sha256,
+        "BUDGET_DECISION": "diff_unavailable",
+        "ALLOW_INVOCATION": "false",
         "SERVER_URL": "https://github.com",
         "GH_TOKEN": "test-only",
     }
@@ -11113,13 +11376,18 @@ def test_opencode_unavailable_handoff_builds_exact_conditional_inventory(tmp_pat
     handoff_dir = runner_temp / "opencode-handoff"
     assert sorted(path.name for path in handoff_dir.iterdir()) == [
         "handoff.json", "opencode-attestations-before.json", "opencode-comments-before.json",
+        "review-budget-claim.json",
     ]
     handoff = json.loads((handoff_dir / "handoff.json").read_text(encoding="utf-8"))
     assert handoff["diff_ready"] is False
     assert handoff["merge_base_sha"] is None
     assert sorted(handoff["files"]) == [
         "opencode-attestations-before.json", "opencode-comments-before.json",
+        "review-budget-claim.json",
     ]
+    assert handoff["allow_invocation"] is False
+    assert handoff["budget_decision"] == "diff_unavailable"
+    assert handoff["budget_checkpoint_sha256"] == budget_checkpoint_sha256
 
 
 def test_opencode_reusable_caller_grants_attestation_ceiling_but_model_is_downgraded():
@@ -12034,6 +12302,7 @@ def test_opencode_snapshot_fetch_failure_fails_before_cli_or_canonicalization(tm
     assert "refusing to run OpenCode without a state snapshot" in collect
     assert "exit 1" in collect
     assert cli["if"] == (
+        "needs.opencode-prepare.outputs.allow_invocation == 'true' && "
         "needs.opencode-prepare.outputs.diff_ready == 'true' && "
         "needs.opencode-prepare.outputs.diff_mode != 'unchanged'"
     )
@@ -12206,6 +12475,7 @@ def _run_opencode_canonicalize(
     candidate_artifact_case: str = "valid",
     candidate_review: str | None = None,
     failure_reason: str = "",
+    candidate_envelope_changes: dict | None = None,
     node_preload: Path | None = None,
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
@@ -12350,10 +12620,68 @@ def _run_opencode_canonicalize(
         })
     attestations = handoff_dir / "opencode-attestations-before.json"
     attestations.write_text(json.dumps({"check_runs": effective_checks, "workflow_runs": sealed_workflow_runs}), encoding="utf-8")
+    budget_allow_invocation = (
+        diff_ready == "true" and diff_mode in {"full", "delta"}
+    )
+    budget_decision = (
+        "claimed"
+        if budget_allow_invocation
+        else "authenticated_reuse"
+        if diff_mode == "unchanged"
+        else "diff_unavailable"
+    )
+    budget_handoff = {
+        "current_run_id": int(run_id),
+        "current_run_attempt": int(sealed_run_attempt or run_attempt),
+        "current_head_sha": attempt_head,
+        "current_full_diff_sha256": full_diff_sha256,
+        "decision": budget_decision,
+        "stop_reason": budget_decision,
+    }
+    budget_invocations = []
+    if budget_allow_invocation:
+        budget_invocations.append(
+            {
+                "run_id": int(run_id),
+                "run_attempt": int(sealed_run_attempt or run_attempt),
+                "head_sha": attempt_head,
+                "full_diff_sha256": full_diff_sha256,
+                "model_route": ["zai-coding-plan/glm-4.7"],
+                "effort": "final-review/default",
+                "call_count": 0,
+                "elapsed_seconds": 0,
+                "status": "claimed",
+                "outcome": None,
+                "stop_reason": "claimed",
+            }
+        )
+    budget_checkpoint = handoff_dir / "review-budget-claim.json"
+    budget_checkpoint.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "ledger": {
+                    "schema": 1,
+                    "repository": "example/repo",
+                    "pr": 7,
+                    "reviewer": "opencode",
+                    "invocations": budget_invocations,
+                    "handoff": budget_handoff,
+                },
+                "handoff": budget_handoff,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    budget_checkpoint_sha256 = hashlib.sha256(budget_checkpoint.read_bytes()).hexdigest()
     handoff = handoff_dir / "handoff.json"
     sealed_files = {
         "opencode-attestations-before.json": hashlib.sha256(attestations.read_bytes()).hexdigest(),
         "opencode-comments-before.json": snapshot_sha256,
+        "review-budget-claim.json": budget_checkpoint_sha256,
     }
     if diff_ready == "true":
         sealed_files.update({
@@ -12374,6 +12702,9 @@ def _run_opencode_canonicalize(
         "diff_ready": diff_ready == "true", "diff_mode": diff_mode,
         "unchanged_since_previous": unchanged_since_previous == "true",
         "full_diff_sha256": full_diff_sha256,
+        "allow_invocation": budget_allow_invocation,
+        "budget_decision": budget_decision,
+        "budget_checkpoint_sha256": budget_checkpoint_sha256,
         "files": sealed_files,
     }
     handoff.write_text(json.dumps(handoff_document), encoding="utf-8")
@@ -12412,13 +12743,52 @@ def _run_opencode_canonicalize(
     candidate_dir = workdir / "candidate"
     candidate_dir.mkdir()
     candidate_path = candidate_dir / "review.md"
+    candidate_envelope_path = candidate_dir / "candidate.json"
+    candidate_succeeded = outcome == "success"
+    candidate_has_review = candidate_review is not None or len(raw_candidates) == 1
     candidate_available = (
-        candidate_review is not None or len(raw_candidates) == 1
-    ) and candidate_artifact_case != "absent"
+        budget_allow_invocation
+        and (not candidate_succeeded or candidate_has_review)
+        and candidate_artifact_case != "absent"
+    )
+    candidate_call_count = 0 if failure_reason == "model_job_failed" else 1
+    candidate_elapsed_seconds = 1
     if candidate_available:
-        candidate_path.write_text(
-            candidate_review if candidate_review is not None else raw_candidates[0]["body"],
-            encoding="utf-8",
+        review_sha256 = None
+        if candidate_succeeded:
+            candidate_path.write_text(
+                candidate_review if candidate_review is not None else raw_candidates[0]["body"],
+                encoding="utf-8",
+            )
+            review_sha256 = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+        envelope = {
+            "schema": 1,
+            "repository": "example/repo",
+            "pr": 7,
+            "run_id": int(run_id),
+            "run_attempt": int(run_attempt),
+            "head_sha": attempt_head,
+            "full_diff_sha256": full_diff_sha256,
+            "diff_mode": diff_mode,
+            "claim_checkpoint_sha256": budget_checkpoint_sha256,
+            "call_count": candidate_call_count,
+            "elapsed_seconds": candidate_elapsed_seconds,
+            "model_route": ["zai-coding-plan/glm-4.7"],
+            "outcome": "success" if candidate_succeeded else "failure",
+            "failure_reason": "none" if candidate_succeeded else (
+                failure_reason
+                if failure_reason in {
+                    "model_job_failed", "provider_failed", "candidate_contract_failed",
+                    "call_budget_exhausted",
+                }
+                else "provider_failed"
+            ),
+            "review_sha256": review_sha256,
+        }
+        envelope.update(candidate_envelope_changes or {})
+        candidate_envelope_path.write_text(
+            json.dumps(envelope, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="ascii",
         )
         if candidate_artifact_case == "extra":
             (candidate_dir / "extra.txt").write_text("extra", encoding="utf-8")
@@ -12452,10 +12822,18 @@ def _run_opencode_canonicalize(
             else f"opencode-candidate-{run_id}-{run_attempt}"
         ),
         "CANDIDATE_PATH": str(candidate_path),
+        "CANDIDATE_ENVELOPE_PATH": str(candidate_envelope_path),
         "CANDIDATE_DOWNLOAD_OUTCOME": "success" if candidate_available else "skipped",
         "HANDOFF_PATH": str(handoff),
+        "BUDGET_CLAIM_PATH": str(budget_checkpoint),
+        "BUDGET_ALLOW_INVOCATION": "true" if budget_allow_invocation else "false",
+        "BUDGET_DECISION": budget_decision,
+        "BUDGET_CHECKPOINT_SHA256": budget_checkpoint_sha256,
         "REVIEW_OUTCOME": outcome,
         "REVIEW_FAILURE_REASON": failure_reason,
+        "REVIEW_CALL_COUNT": str(candidate_call_count) if candidate_available else "",
+        "REVIEW_ELAPSED_SECONDS": str(candidate_elapsed_seconds) if candidate_available else "",
+        "REVIEW_MODEL_ROUTE_JSON": '["zai-coding-plan/glm-4.7"]' if candidate_available else "",
         "SNAPSHOT_PATH": str(snapshot_override or snapshot),
         "ATTESTATIONS_PATH": str(attestations),
         "REVIEW_DIFF_PATH": str(full_diff),
@@ -13243,6 +13621,50 @@ def test_opencode_candidate_artifact_failures_publish_no_success(
         and "Reviewed:" in body
         for call in calls
     )
+
+
+@node_required
+@pytest.mark.parametrize(
+    "candidate_envelope_changes",
+    [
+        {"call_count": "1"},
+        {"elapsed_seconds": -1},
+        {"model_route": ["other-provider/model"]},
+        {"claim_checkpoint_sha256": "00" * 32},
+        {"diff_mode": "unchanged"},
+        {"unexpected": True},
+    ],
+    ids=(
+        "call-count-type",
+        "negative-elapsed",
+        "route-mismatch",
+        "claim-mismatch",
+        "mode-mismatch",
+        "extra-key",
+    ),
+)
+def test_opencode_candidate_metrics_and_claim_identity_fail_closed(
+    tmp_path, candidate_envelope_changes
+):
+    candidate = _bot(
+        "github-actions[bot]", _opencode_review("real finding"), 10, updated="u2"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [candidate],
+        candidate_envelope_changes=candidate_envelope_changes,
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+    review_outputs = [
+        call[2] for call in calls
+        if call[0] == "output" and call[1] == "review_succeeded"
+    ]
+    assert review_outputs and set(review_outputs) == {"false"}
 
 
 @node_required
@@ -15389,7 +15811,7 @@ def test_opencode_failure_preserves_prior_success_as_stale(tmp_path):
     body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert "LAST GOOD OPENCODE REVIEW" in body
-    assert "Reason: model_job_failed" in body
+    assert "Reason: provider_failed" in body
     assert "- Status: stale" in body
     assert state["attempt_status"] == "failure"
     assert state["successful_head"] == old_head
@@ -15519,7 +15941,7 @@ def test_opencode_unchanged_obeys_head_and_generation_gates(tmp_path, gate):
 
 
 @node_required
-def test_opencode_unavailable_preserves_prior_success_as_stale_without_artifacts(tmp_path):
+def test_opencode_unavailable_budget_refusal_skips_publication_without_artifacts(tmp_path):
     old = _bot(
         "github-actions[bot]",
         _opencode_v2_body(
@@ -15539,12 +15961,14 @@ def test_opencode_unavailable_preserves_prior_success_as_stale_without_artifacts
         attempt_head="cd" * 20,
         remove_prepared_artifacts=True,
     )
-    body = _single_mutation_body(calls)
-    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
-    assert "LAST GOOD OPENCODE REVIEW" in body
-    assert state["attempt_status"] == "failure"
-    assert state["successful_head"] == "ab" * 20
-    assert state["diff_mode"] == "unavailable"
+    assert not any(
+        call[0] in {"create", "update", "delete", "create-check", "update-check"}
+        for call in calls
+    )
+    assert [
+        call for call in calls
+        if call[0] == "output" and call[1] == "publication_succeeded"
+    ] == [["output", "publication_succeeded", "false"]]
 
 
 @node_required

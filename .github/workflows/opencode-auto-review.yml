@@ -93,7 +93,7 @@ jobs:
       checks: read
       contents: read
       pull-requests: read
-      issues: read
+      issues: write
     outputs:
       prev_context: ${{ steps.ctx.outputs.prev_context }}
       diff_ready: ${{ steps.prepare-diff.outputs.diff-ready }}
@@ -101,6 +101,11 @@ jobs:
       unchanged_since_previous: ${{ steps.prepare-diff.outputs.unchanged-since-previous }}
       head_sha: ${{ steps.prepare-diff.outputs.head-sha }}
       full_diff_sha256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
+      attempt_head: ${{ steps.prepare-diff.outputs.head-sha }}
+      allow_invocation: ${{ steps.review-budget-claim.outputs.allow-invocation }}
+      budget_decision: ${{ steps.review-budget-claim.outputs.decision }}
+      budget_checkpoint_sha256: ${{ steps.review-budget-claim.outputs.checkpoint-sha256 }}
+      authenticated_review_json: ${{ steps.ctx.outputs.authenticated_review_json }}
       candidate_nonce: ${{ steps.build-handoff.outputs.candidate_nonce }}
       workflow_head_sha: ${{ steps.build-handoff.outputs.workflow_head_sha }}
       handoff_artifact_id: ${{ steps.upload-handoff.outputs.artifact-id }}
@@ -429,6 +434,29 @@ jobs:
           {
             printf 'previous_sha=%s\n' "$PREV_SUCCESSFUL_HEAD"
             printf 'previous_full_hash=%s\n' "$PREV_FULL_HASH"
+            printf 'authenticated_review_json=%s\n' "$(
+              jq -Rsc --arg head "$PREV_SUCCESSFUL_HEAD" --arg full_hash "$PREV_FULL_HASH" '
+                def active_finding_ids:
+                  reduce (split("\n")[]) as $line
+                    ({active:false,ids:[]};
+                      if $line == "### New findings" or $line == "### Still open" then
+                        .active = true
+                      elif ($line | test("^### ")) then
+                        .active = false
+                      elif .active then
+                        (([$line | capture("^#### (?<id>RVW-[0-9a-f]{12}) \\[(CRITICAL|HIGH|MEDIUM)\\] .+$")? | .id] | first) // null) as $id
+                        | if $id != null and (.ids | index($id) == null) and (.ids | length < 8)
+                          then .ids += [$id] else . end
+                      else . end)
+                  | .ids;
+                if $head == "" or $full_hash == "" then
+                  {success:false,head_sha:null,full_diff_sha256:null,remaining_finding_ids:[]}
+                else
+                  {success:true,head_sha:$head,full_diff_sha256:$full_hash,
+                   remaining_finding_ids:active_finding_ids}
+                end
+              ' <<< "$PREV_REVIEW"
+            )"
             printf 'snapshot_path=%s\n' "$COMMENTS"
             printf 'snapshot_sha256=%s\n' "$SNAPSHOT_SHA256"
             printf 'attestations_path=%s\n' "$ATTESTATIONS"
@@ -444,6 +472,24 @@ jobs:
           previous-full-hash: ${{ steps.ctx.outputs.previous_full_hash }}
           context-lines: '3'
           output-directory: ${{ github.workspace }}
+
+      - name: Claim OpenCode review budget
+        id: review-budget-claim
+        if: ${{ always() && steps.ctx.outcome == 'success' }}
+        uses: $/.github/actions/review-invocation-budget
+        with:
+          github-token: ${{ github.token }}
+          mode: claim
+          reviewer: opencode
+          pr-number: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+          expected-head-sha: ${{ steps.prepare-diff.outputs.head-sha }}
+          full-diff-sha256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
+          diff-mode: ${{ steps.prepare-diff.outputs.diff-mode }}
+          input-files-json: ${{ format('["{0}/review-full.diff","{0}/review-scope.json"]', github.workspace) }}
+          authenticated-review-json: ${{ steps.ctx.outputs.authenticated_review_json }}
+          model-route-json: '["zai-coding-plan/glm-4.7"]'
+          effort: final-review/default
+          checkpoint-file: ${{ runner.temp }}/opencode-review-budget-claim.json
 
       - name: Seal review scope manifest
         id: scope-integrity
@@ -467,6 +513,10 @@ jobs:
           FULL_DIFF_SHA256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
           SNAPSHOT_PATH: ${{ steps.ctx.outputs.snapshot_path }}
           ATTESTATIONS_PATH: ${{ steps.ctx.outputs.attestations_path }}
+          BUDGET_CHECKPOINT_PATH: ${{ runner.temp }}/opencode-review-budget-claim.json
+          BUDGET_CHECKPOINT_SHA256: ${{ steps.review-budget-claim.outputs.checkpoint-sha256 }}
+          BUDGET_DECISION: ${{ steps.review-budget-claim.outputs.decision }}
+          ALLOW_INVOCATION: ${{ steps.review-budget-claim.outputs.allow-invocation }}
           SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
@@ -474,8 +524,11 @@ jobs:
           mkdir -m 0700 "$handoff"
           cp -- "$SNAPSHOT_PATH" "$handoff/opencode-comments-before.json"
           cp -- "$ATTESTATIONS_PATH" "$handoff/opencode-attestations-before.json"
+          cp -- "$BUDGET_CHECKPOINT_PATH" "$handoff/review-budget-claim.json"
           snapshot_hash="$(sha256sum "$handoff/opencode-comments-before.json" | cut -d' ' -f1)"
           attestations_hash="$(sha256sum "$handoff/opencode-attestations-before.json" | cut -d' ' -f1)"
+          budget_checkpoint="$(sha256sum "$handoff/review-budget-claim.json" | cut -d' ' -f1)"
+          [[ "$budget_checkpoint" == "$BUDGET_CHECKPOINT_SHA256" ]]
           candidate_nonce="$(openssl rand -hex 32)"
           printf 'candidate_nonce=%s\n' "$candidate_nonce" >> "$GITHUB_OUTPUT"
           run_record="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
@@ -487,7 +540,9 @@ jobs:
           central_path="$(jq -r '.path' <<< "$central_ref")"
           central_sha="$(jq -er '.sha | select(test("^[0-9a-f]{40}$"))' <<< "$central_ref")"
           files="$(jq -nc --arg snapshot "$snapshot_hash" --arg attestations "$attestations_hash" \
-            '{"opencode-attestations-before.json":$attestations,"opencode-comments-before.json":$snapshot}')"
+            --arg budget_checkpoint "$budget_checkpoint" \
+            '{"opencode-attestations-before.json":$attestations,"opencode-comments-before.json":$snapshot,
+              "review-budget-claim.json":$budget_checkpoint}')"
           merge_base=null
           if [[ "$DIFF_READY" == true ]]; then
             cp -- review-full.diff "$handoff/review-full.diff"
@@ -509,6 +564,8 @@ jobs:
             --arg diff_ready "$DIFF_READY" \
             --arg diff_mode "$DIFF_MODE" --arg unchanged "$UNCHANGED_SINCE_PREVIOUS" \
             --arg full_hash "$FULL_DIFF_SHA256" \
+            --arg allow_invocation "$ALLOW_INVOCATION" --arg budget_decision "$BUDGET_DECISION" \
+            --arg budget_checkpoint_sha256 "$budget_checkpoint" \
             --argjson files "$files" \
             '{schema:1,repository:$repository,server_url:$server_url,workflow:$workflow,
               caller_workflow_path:$caller_path,caller_event:$caller_event,candidate_nonce:$candidate_nonce,
@@ -517,6 +574,8 @@ jobs:
               pr:$pr,run_id:$run_id,run_attempt:$run_attempt,attempt_head:$attempt_head,
               merge_base_sha:$merge_base,diff_ready:($diff_ready=="true"),diff_mode:$diff_mode,
               unchanged_since_previous:($unchanged=="true"),full_diff_sha256:$full_hash,
+              allow_invocation:($allow_invocation=="true"),budget_decision:$budget_decision,
+              budget_checkpoint_sha256:$budget_checkpoint_sha256,
               files:$files}' > "$handoff/handoff.json"
           find "$handoff" -type f -exec chmod 0444 {} +
 
@@ -531,14 +590,26 @@ jobs:
           include-hidden-files: false
           retention-days: 1
 
+      - name: Upload OpenCode review budget claim checkpoint
+        if: ${{ always() && steps.review-budget-claim.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/opencode-review-budget-claim.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
+
   opencode-review:
     needs: [check-enabled, opencode-prepare]
     if: >-
       needs.check-enabled.outputs.enabled == 'true' &&
       needs.check-enabled.outputs.auto_enabled == 'true' &&
       needs.check-enabled.outputs.safe_pr == 'true' &&
-      needs.opencode-prepare.result == 'success'
+      needs.opencode-prepare.result == 'success' &&
+      needs.opencode-prepare.outputs.allow_invocation == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions: {}
     env:
       OPENCODE_VERSION: '1.18.17'
@@ -546,9 +617,27 @@ jobs:
     outputs:
       review_outcome: ${{ steps.opencode-review.outcome }}
       review_failure_reason: ${{ steps.opencode-review.outputs.failure_reason }}
+      review_call_count: ${{ steps.materialize-candidate.outputs.review_call_count }}
+      review_elapsed_seconds: ${{ steps.materialize-candidate.outputs.review_elapsed_seconds }}
+      review_model_route_json: ${{ steps.materialize-candidate.outputs.review_model_route_json }}
       candidate_artifact_id: ${{ steps.upload-candidate.outputs.artifact-id }}
       candidate_artifact_digest: ${{ steps.upload-candidate.outputs.artifact-digest }}
     steps:
+      - name: Initialize OpenCode review metrics
+        id: initialize-review-metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          metrics="$RUNNER_TEMP/opencode-review-metrics"
+          candidate="$RUNNER_TEMP/opencode-candidate"
+          mkdir -m 0700 "$metrics" "$candidate"
+          printf '0\n' > "$metrics/call-count"
+          date +%s > "$metrics/started-at"
+          printf '0\n' > "$metrics/elapsed-seconds"
+          printf '["zai-coding-plan/glm-4.7"]\n' > "$metrics/model-route.json"
+          chmod 0600 "$metrics"/*
+
       - name: Download sealed review handoff
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -562,25 +651,84 @@ jobs:
         env:
           HANDOFF_ARTIFACT_DIGEST: ${{ needs.opencode-prepare.outputs.handoff_artifact_digest }}
           MODEL_HANDOFF: ${{ runner.temp }}/opencode-model-handoff
+          EXPECTED_HEAD_SHA: ${{ needs.opencode-prepare.outputs.attempt_head }}
+          EXPECTED_FULL_DIFF_SHA256: ${{ needs.opencode-prepare.outputs.full_diff_sha256 }}
+          EXPECTED_DIFF_MODE: ${{ needs.opencode-prepare.outputs.diff_mode }}
+          EXPECTED_BUDGET_CHECKPOINT_SHA256: ${{ needs.opencode-prepare.outputs.budget_checkpoint_sha256 }}
         run: |
           set -euo pipefail
           [[ "$HANDOFF_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
           test "$(find "$MODEL_HANDOFF" -maxdepth 1 -type l -print -quit)" = ''
-          test "$(find "$MODEL_HANDOFF" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = $'handoff.json\nopencode-attestations-before.json\nopencode-comments-before.json\nreview-full.diff\nreview-scope.json'
-          for file in opencode-comments-before.json opencode-attestations-before.json review-full.diff review-scope.json; do
+          test "$(find "$MODEL_HANDOFF" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = $'handoff.json\nopencode-attestations-before.json\nopencode-comments-before.json\nreview-budget-claim.json\nreview-full.diff\nreview-scope.json'
+          for file in opencode-comments-before.json opencode-attestations-before.json review-budget-claim.json review-full.diff review-scope.json; do
             expected="$(jq -er --arg file "$file" '.files[$file]' "$MODEL_HANDOFF/handoff.json")"
             echo "${expected}  ${MODEL_HANDOFF}/${file}" | sha256sum --check -
           done
+          python3 - "$MODEL_HANDOFF/handoff.json" "$MODEL_HANDOFF/review-budget-claim.json" <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          handoff_path, checkpoint_path = map(Path, sys.argv[1:])
+          for path in (handoff_path, checkpoint_path):
+              details = path.lstat()
+              if not stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode):
+                  raise SystemExit("non-regular sealed handoff input")
+          handoff = json.loads(handoff_path.read_text(encoding="ascii"))
+          checkpoint = json.loads(checkpoint_path.read_text(encoding="ascii"))
+          expected_hash = os.environ["EXPECTED_BUDGET_CHECKPOINT_SHA256"]
+          if (
+              handoff.get("allow_invocation") is not True
+              or handoff.get("budget_decision") != "claimed"
+              or handoff.get("budget_checkpoint_sha256") != expected_hash
+              or handoff.get("attempt_head") != os.environ["EXPECTED_HEAD_SHA"]
+              or handoff.get("full_diff_sha256") != os.environ["EXPECTED_FULL_DIFF_SHA256"]
+              or handoff.get("diff_mode") != os.environ["EXPECTED_DIFF_MODE"]
+              or handoff.get("files", {}).get("review-budget-claim.json") != expected_hash
+              or set(checkpoint) != {"schema", "ledger", "handoff"}
+              or checkpoint.get("schema") != 1
+              or checkpoint.get("handoff") != checkpoint.get("ledger", {}).get("handoff")
+          ):
+              raise SystemExit("sealed claim identity mismatch")
+          ledger = checkpoint["ledger"]
+          invocations = ledger.get("invocations")
+          if (
+              ledger.get("schema") != 1
+              or ledger.get("repository") != os.environ["GITHUB_REPOSITORY"]
+              or ledger.get("reviewer") != "opencode"
+              or not isinstance(invocations, list)
+              or len(invocations) < 1
+          ):
+              raise SystemExit("invalid sealed claim checkpoint")
+          claim = invocations[-1]
+          if (
+              claim.get("run_id") != int(os.environ["GITHUB_RUN_ID"])
+              or claim.get("run_attempt") != int(os.environ["GITHUB_RUN_ATTEMPT"])
+              or claim.get("head_sha") != handoff["attempt_head"]
+              or claim.get("full_diff_sha256") != handoff["full_diff_sha256"]
+              or claim.get("model_route") != ["zai-coding-plan/glm-4.7"]
+              or claim.get("effort") != "final-review/default"
+              or claim.get("call_count") != 0
+              or claim.get("elapsed_seconds") != 0
+              or claim.get("status") != "claimed"
+              or claim.get("outcome") is not None
+              or claim.get("stop_reason") != "claimed"
+          ):
+              raise SystemExit("invalid sealed claim invocation")
+          PY
 
       - name: Cache pinned OpenCode CLI archive
-        if: needs.opencode-prepare.outputs.diff_ready == 'true' && needs.opencode-prepare.outputs.diff_mode != 'unchanged'
+        if: needs.opencode-prepare.outputs.allow_invocation == 'true' && needs.opencode-prepare.outputs.diff_ready == 'true' && needs.opencode-prepare.outputs.diff_mode != 'unchanged'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/opencode/opencode-linux-x64-${{ env.OPENCODE_VERSION }}.tar.gz
           key: opencode-cli-linux-x64-${{ env.OPENCODE_VERSION }}-${{ env.OPENCODE_ARCHIVE_SHA256 }}
 
       - name: Install pinned OpenCode CLI
-        if: needs.opencode-prepare.outputs.diff_ready == 'true' && needs.opencode-prepare.outputs.diff_mode != 'unchanged'
+        if: needs.opencode-prepare.outputs.allow_invocation == 'true' && needs.opencode-prepare.outputs.diff_ready == 'true' && needs.opencode-prepare.outputs.diff_mode != 'unchanged'
         shell: bash
         run: |
           set -euo pipefail
@@ -600,7 +748,7 @@ jobs:
 
       - name: Run OpenCode PR review
         id: opencode-review
-        if: needs.opencode-prepare.outputs.diff_ready == 'true' && needs.opencode-prepare.outputs.diff_mode != 'unchanged'
+        if: needs.opencode-prepare.outputs.allow_invocation == 'true' && needs.opencode-prepare.outputs.diff_ready == 'true' && needs.opencode-prepare.outputs.diff_mode != 'unchanged'
         continue-on-error: true
         shell: bash
         env:
@@ -728,9 +876,13 @@ jobs:
           trap write_review_failure_reason EXIT
           sandbox="$RUNNER_TEMP/opencode-model-sandbox"
           candidate_dir="$RUNNER_TEMP/opencode-candidate"
+          metrics_dir="$RUNNER_TEMP/opencode-review-metrics"
+          call_count_file="$metrics_dir/call-count"
           isolated_home="$RUNNER_TEMP/opencode-model-home"
           isolated_xdg="$RUNNER_TEMP/opencode-model-xdg"
-          mkdir -m 0700 "$sandbox" "$candidate_dir" "$isolated_home" "$isolated_xdg"
+          mkdir -m 0700 "$sandbox" "$isolated_home" "$isolated_xdg"
+          test -d "$candidate_dir" && test ! -L "$candidate_dir"
+          test -d "$metrics_dir" && test ! -L "$metrics_dir"
           cp -- "$MODEL_HANDOFF/review-full.diff" "$sandbox/review-full.diff"
           cp -- "$MODEL_HANDOFF/review-scope.json" "$sandbox/review-scope.json"
           chmod 0400 "$sandbox/review-full.diff" "$sandbox/review-scope.json"
@@ -741,6 +893,47 @@ jobs:
             local prompt_path="$1"
             local output_path="$2"
             shift 2
+            local count
+            [[ -f "$call_count_file" && ! -L "$call_count_file" ]]
+            [[ "$(stat -c '%a' "$call_count_file")" == 600 ]]
+            count="$(cat "$call_count_file")"
+            [[ "$count" =~ ^[0-9]+$ ]]
+            (( count < 2 )) || {
+              review_failure_reason=call_budget_exhausted
+              return 1
+            }
+            python3 - "$call_count_file" "$((count + 1))" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          destination = Path(sys.argv[1])
+          payload = f"{int(sys.argv[2])}\n".encode("ascii")
+          temporary = destination.with_name(
+              f".{destination.name}.{os.getpid()}.new"
+          )
+          descriptor = None
+          try:
+              descriptor = os.open(
+                  temporary,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                  0o600,
+              )
+              os.write(descriptor, payload)
+              os.fsync(descriptor)
+              os.close(descriptor)
+              descriptor = None
+              os.replace(temporary, destination)
+              directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+              try:
+                  os.fsync(directory)
+              finally:
+                  os.close(directory)
+          finally:
+              if descriptor is not None:
+                  os.close(descriptor)
+              temporary.unlink(missing_ok=True)
+          PY
             env -i \
               PATH="$PATH" HOME="$isolated_home" XDG_CONFIG_HOME="$isolated_xdg" \
               XDG_DATA_HOME="$isolated_xdg/data" XDG_CACHE_HOME="$isolated_xdg/cache" \
@@ -2671,13 +2864,177 @@ jobs:
           chmod 0400 "$candidate_dir/review.md"
           review_failure_reason=none
 
+      - name: Materialize sealed OpenCode candidate
+        id: materialize-candidate
+        if: ${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}
+        shell: bash
+        env:
+          MODEL_OUTCOME: ${{ steps.opencode-review.outcome }}
+          MODEL_FAILURE_REASON: ${{ steps.opencode-review.outputs.failure_reason }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+          ATTEMPT_HEAD: ${{ needs.opencode-prepare.outputs.attempt_head }}
+          FULL_DIFF_SHA256: ${{ needs.opencode-prepare.outputs.full_diff_sha256 }}
+          DIFF_MODE: ${{ needs.opencode-prepare.outputs.diff_mode }}
+          CLAIM_CHECKPOINT_SHA256: ${{ needs.opencode-prepare.outputs.budget_checkpoint_sha256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import time
+          from pathlib import Path
+
+          metrics = Path(os.environ["RUNNER_TEMP"]) / "opencode-review-metrics"
+          candidate_dir = Path(os.environ["RUNNER_TEMP"]) / "opencode-candidate"
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+
+          def private_regular(path: Path) -> bool:
+              try:
+                  details = path.lstat()
+              except OSError:
+                  return False
+              return (
+                  stat.S_ISREG(details.st_mode)
+                  and not stat.S_ISLNK(details.st_mode)
+                  and stat.S_IMODE(details.st_mode) == 0o600
+              )
+
+          def decimal(path: Path) -> int:
+              if not private_regular(path):
+                  raise SystemExit(f"invalid private metric: {path.name}")
+              try:
+                  raw = path.read_text(encoding="ascii").strip()
+              except (OSError, UnicodeDecodeError) as error:
+                  raise SystemExit(f"invalid metric encoding: {path.name}") from error
+              if re.fullmatch(r"0|[1-9][0-9]*", raw) is None:
+                  raise SystemExit(f"invalid metric value: {path.name}")
+              return int(raw)
+
+          if candidate_dir.is_symlink() or not candidate_dir.is_dir():
+              raise SystemExit("invalid candidate directory")
+          call_count = decimal(metrics / "call-count")
+          started_at = decimal(metrics / "started-at")
+          elapsed_path = metrics / "elapsed-seconds"
+          prior_elapsed = decimal(elapsed_path)
+          elapsed_seconds = max(prior_elapsed, int(time.time()) - started_at, 0)
+          elapsed_path.write_text(f"{elapsed_seconds}\n", encoding="ascii")
+          elapsed_path.chmod(0o600)
+          route_path = metrics / "model-route.json"
+          if not private_regular(route_path):
+              raise SystemExit("invalid private metric: model-route.json")
+          try:
+              model_route = json.loads(route_path.read_text(encoding="ascii"))
+          except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+              raise SystemExit("invalid model route") from error
+          if model_route != ["zai-coding-plan/glm-4.7"]:
+              raise SystemExit("invalid model route")
+          if call_count > 2:
+              raise SystemExit("OpenCode call counter exceeded hard cap")
+
+          identity = {
+              "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+              "pr": os.environ["PR_NUMBER"],
+              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+              "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+              "head_sha": os.environ["ATTEMPT_HEAD"],
+              "full_diff_sha256": os.environ["FULL_DIFF_SHA256"],
+              "diff_mode": os.environ["DIFF_MODE"],
+              "claim_checkpoint_sha256": os.environ["CLAIM_CHECKPOINT_SHA256"],
+          }
+          if (
+              re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", identity["repository"])
+              is None
+              or re.fullmatch(r"[1-9][0-9]*", identity["pr"]) is None
+              or re.fullmatch(r"[1-9][0-9]*", identity["run_id"]) is None
+              or re.fullmatch(r"[1-9][0-9]*", identity["run_attempt"]) is None
+              or re.fullmatch(r"[0-9a-f]{40}", identity["head_sha"]) is None
+              or re.fullmatch(r"[0-9a-f]{64}", identity["full_diff_sha256"])
+              is None
+              or identity["diff_mode"] not in {"full", "delta"}
+              or re.fullmatch(
+                  r"[0-9a-f]{64}", identity["claim_checkpoint_sha256"]
+              )
+              is None
+          ):
+              raise SystemExit("invalid candidate identity")
+
+          allowed_reasons = {
+              "none",
+              "model_job_failed",
+              "provider_failed",
+              "candidate_contract_failed",
+              "call_budget_exhausted",
+          }
+          model_outcome = os.environ.get("MODEL_OUTCOME", "")
+          failure_reason = os.environ.get("MODEL_FAILURE_REASON", "")
+          review_path = candidate_dir / "review.md"
+          succeeded = model_outcome == "success"
+          review_sha256 = None
+          if succeeded:
+              try:
+                  details = review_path.lstat()
+              except OSError as error:
+                  raise SystemExit("successful review candidate missing") from error
+              if (
+                  not stat.S_ISREG(details.st_mode)
+                  or stat.S_ISLNK(details.st_mode)
+                  or details.st_size < 1
+                  or details.st_size > 60_000
+              ):
+                  raise SystemExit("successful review candidate invalid")
+              review_sha256 = hashlib.sha256(review_path.read_bytes()).hexdigest()
+              review_path.chmod(0o600)
+              failure_reason = "none"
+          else:
+              review_path.unlink(missing_ok=True)
+              if failure_reason not in allowed_reasons - {"none"}:
+                  failure_reason = "model_job_failed"
+
+          envelope = {
+              "schema": 1,
+              "repository": identity["repository"],
+              "pr": int(identity["pr"]),
+              "run_id": int(identity["run_id"]),
+              "run_attempt": int(identity["run_attempt"]),
+              "head_sha": identity["head_sha"],
+              "full_diff_sha256": identity["full_diff_sha256"],
+              "diff_mode": identity["diff_mode"],
+              "claim_checkpoint_sha256": identity["claim_checkpoint_sha256"],
+              "call_count": call_count,
+              "elapsed_seconds": elapsed_seconds,
+              "model_route": model_route,
+              "outcome": "success" if succeeded else "failure",
+              "failure_reason": failure_reason,
+              "review_sha256": review_sha256,
+          }
+          candidate_json = candidate_dir / "candidate.json"
+          candidate_json.write_text(
+              json.dumps(envelope, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+              + "\n",
+              encoding="ascii",
+          )
+          candidate_json.chmod(0o600)
+          with output_path.open("a", encoding="utf-8") as output:
+              output.write(f"review_call_count={call_count}\n")
+              output.write(f"review_elapsed_seconds={elapsed_seconds}\n")
+              output.write(
+                  "review_model_route_json="
+                  + json.dumps(model_route, separators=(",", ":"))
+                  + "\n"
+              )
+          PY
+
       - name: Upload untrusted OpenCode candidate
         id: upload-candidate
-        if: steps.opencode-review.outcome == 'success'
+        if: ${{ always() && steps.materialize-candidate.outcome == 'success' && needs.opencode-prepare.outputs.allow_invocation == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: opencode-candidate-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/opencode-candidate/review.md
+          path: ${{ runner.temp }}/opencode-candidate
           if-no-files-found: error
           overwrite: false
           include-hidden-files: false
@@ -2691,7 +3048,9 @@ jobs:
       needs.check-enabled.outputs.enabled == 'true' &&
       needs.check-enabled.outputs.auto_enabled == 'true' &&
       needs.check-enabled.outputs.safe_pr == 'true' &&
-      needs.opencode-prepare.result == 'success'
+      needs.opencode-prepare.result == 'success' &&
+      (needs.opencode-prepare.outputs.allow_invocation == 'true' ||
+      needs.opencode-prepare.outputs.budget_decision == 'authenticated_reuse')
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -2728,7 +3087,8 @@ jobs:
           merge-multiple: true
 
       - name: Canonicalize OpenCode review
-        if: ${{ always() }}
+        id: canonicalize-opencode-review
+        if: ${{ always() && (needs.opencode-prepare.outputs.allow_invocation == 'true' || needs.opencode-prepare.outputs.budget_decision == 'authenticated_reuse') }}
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
@@ -2747,7 +3107,12 @@ jobs:
           CANDIDATE_ARTIFACT_DIGEST: ${{ needs.opencode-review.outputs.candidate_artifact_digest }}
           CANDIDATE_ARTIFACT_NAME: opencode-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           CANDIDATE_PATH: ${{ runner.temp }}/opencode-candidate/review.md
+          CANDIDATE_ENVELOPE_PATH: ${{ runner.temp }}/opencode-candidate/candidate.json
           HANDOFF_PATH: ${{ runner.temp }}/opencode-handoff/handoff.json
+          BUDGET_CLAIM_PATH: ${{ runner.temp }}/opencode-handoff/review-budget-claim.json
+          BUDGET_ALLOW_INVOCATION: ${{ needs.opencode-prepare.outputs.allow_invocation }}
+          BUDGET_DECISION: ${{ needs.opencode-prepare.outputs.budget_decision }}
+          BUDGET_CHECKPOINT_SHA256: ${{ needs.opencode-prepare.outputs.budget_checkpoint_sha256 }}
           SNAPSHOT_PATH: ${{ runner.temp }}/opencode-handoff/opencode-comments-before.json
           ATTESTATIONS_PATH: ${{ runner.temp }}/opencode-handoff/opencode-attestations-before.json
           REVIEW_DIFF_PATH: ${{ runner.temp }}/opencode-handoff/review-full.diff
@@ -2758,6 +3123,9 @@ jobs:
           WORKFLOW_NAME: '.github/workflows/opencode-auto-review.yml'
           REVIEW_OUTCOME: ${{ needs.opencode-review.outputs.review_outcome }}
           REVIEW_FAILURE_REASON: ${{ needs.opencode-review.outputs.review_failure_reason }}
+          REVIEW_CALL_COUNT: ${{ needs.opencode-review.outputs.review_call_count }}
+          REVIEW_ELAPSED_SECONDS: ${{ needs.opencode-review.outputs.review_elapsed_seconds }}
+          REVIEW_MODEL_ROUTE_JSON: ${{ needs.opencode-review.outputs.review_model_route_json }}
           MODEL_JOB_RESULT: ${{ needs.opencode-review.result }}
           ARTIFACT_DOWNLOAD_OUTCOME: ${{ steps.download-handoff.outcome }}
           CANDIDATE_DOWNLOAD_OUTCOME: ${{ steps.download-candidate.outcome }}
@@ -2783,6 +3151,8 @@ jobs:
             const reviewDiffPath = process.env.REVIEW_DIFF_PATH || '';
             const reviewScopePath = process.env.REVIEW_SCOPE_PATH || '';
             const candidatePath = process.env.CANDIDATE_PATH || '';
+            const candidateEnvelopePath = process.env.CANDIDATE_ENVELOPE_PATH || '';
+            const budgetClaimPath = process.env.BUDGET_CLAIM_PATH || '';
             const trustedWorkspace = process.env.TRUSTED_WORKSPACE || '';
             const serverUrl = process.env.SERVER_URL || '';
             const repository = process.env.REPOSITORY || '';
@@ -2790,6 +3160,16 @@ jobs:
             const diffReady = process.env.DIFF_READY === 'true';
             const diffMode = process.env.DIFF_MODE || '';
             const unchangedSincePrevious = process.env.UNCHANGED_SINCE_PREVIOUS === 'true';
+            const budgetAllowInvocation = process.env.BUDGET_ALLOW_INVOCATION === 'true';
+            const budgetDecision = process.env.BUDGET_DECISION || '';
+            core.setOutput('publication_succeeded', 'false');
+            core.setOutput('review_succeeded', 'false');
+            core.setOutput('quality_filtered', 'false');
+            core.setOutput('authenticated_review_json', JSON.stringify({
+              success: false, head_sha: null, full_diff_sha256: null,
+              remaining_finding_ids: [],
+            }));
+            core.setOutput('remaining_finding_ids_json', '[]');
             const safeInteger = (raw) => /^[1-9][0-9]*$/.test(raw) && Number.isSafeInteger(Number(raw));
             if (!Number.isInteger(issueNumber) || issueNumber <= 0
               || !safeInteger(runIdRaw) || !safeInteger(runAttemptRaw)
@@ -2825,8 +3205,9 @@ jobs:
               handoff = JSON.parse(fs.readFileSync(handoffPath, 'utf8'));
               const payloadFiles = handoff.diff_ready
                 ? ['opencode-attestations-before.json', 'opencode-comments-before.json',
-                    'review-full.diff', 'review-scope.json']
-                : ['opencode-attestations-before.json', 'opencode-comments-before.json'];
+                    'review-budget-claim.json', 'review-full.diff', 'review-scope.json']
+                : ['opencode-attestations-before.json', 'opencode-comments-before.json',
+                    'review-budget-claim.json'];
               const expectedFiles = ['handoff.json', ...payloadFiles];
               const entries = fs.readdirSync(handoffDir, { withFileTypes: true });
               if (JSON.stringify(entries.map((entry) => entry.name).sort()) !== JSON.stringify(expectedFiles)
@@ -2836,7 +3217,8 @@ jobs:
               const handoffKeys = ['attempt_head','diff_mode','diff_ready','files','full_diff_sha256',
                 'merge_base_sha','pr','repository','run_attempt','run_id','schema','server_url',
                 'unchanged_since_previous','workflow','caller_event','caller_workflow_path',
-                'candidate_nonce','referenced_workflow_path','referenced_workflow_sha','workflow_head'];
+                'candidate_nonce','referenced_workflow_path','referenced_workflow_sha','workflow_head',
+                'allow_invocation','budget_checkpoint_sha256','budget_decision'];
               const fileKeys = payloadFiles;
               if (JSON.stringify(Object.keys(handoff).sort()) !== JSON.stringify(handoffKeys.sort())
                 || JSON.stringify(Object.keys(handoff.files || {}).sort()) !== JSON.stringify(fileKeys)
@@ -2854,6 +3236,10 @@ jobs:
                 || handoff.diff_ready !== diffReady || handoff.diff_mode !== diffMode
                 || handoff.unchanged_since_previous !== unchangedSincePrevious
                 || handoff.full_diff_sha256 !== fullDiffSha256
+                || handoff.allow_invocation !== budgetAllowInvocation
+                || handoff.budget_decision !== budgetDecision
+                || handoff.budget_checkpoint_sha256 !== process.env.BUDGET_CHECKPOINT_SHA256
+                || handoff.files['review-budget-claim.json'] !== handoff.budget_checkpoint_sha256
                 || (handoff.diff_ready
                   ? !/^[0-9a-f]{40}$/.test(handoff.merge_base_sha || '')
                   : handoff.merge_base_sha !== null)
@@ -2883,6 +3269,44 @@ jobs:
                   throw new Error(`handoff ${name} SHA-256 mismatch`);
                 }
               }
+              const claimCheckpoint = JSON.parse(fs.readFileSync(budgetClaimPath, 'ascii'));
+              if (JSON.stringify(Object.keys(claimCheckpoint).sort())
+                    !== JSON.stringify(['handoff','ledger','schema'])
+                || claimCheckpoint.schema !== 1
+                || !claimCheckpoint.ledger || typeof claimCheckpoint.ledger !== 'object'
+                || Array.isArray(claimCheckpoint.ledger)
+                || JSON.stringify(claimCheckpoint.handoff)
+                    !== JSON.stringify(claimCheckpoint.ledger.handoff)
+                || claimCheckpoint.ledger.schema !== 1
+                || claimCheckpoint.ledger.repository !== repository
+                || claimCheckpoint.ledger.pr !== issueNumber
+                || claimCheckpoint.ledger.reviewer !== reviewer
+                || claimCheckpoint.handoff.current_run_id !== runId
+                || claimCheckpoint.handoff.current_run_attempt !== handoff.run_attempt
+                || claimCheckpoint.handoff.current_head_sha !== attemptHead
+                || claimCheckpoint.handoff.current_full_diff_sha256 !== fullDiffSha256
+                || claimCheckpoint.handoff.decision !== budgetDecision
+                || claimCheckpoint.handoff.stop_reason !== budgetDecision) {
+                throw new Error('sealed budget claim checkpoint identity mismatch');
+              }
+              const exactClaims = Array.isArray(claimCheckpoint.ledger.invocations)
+                ? claimCheckpoint.ledger.invocations.filter((item) => item.run_id === runId
+                  && item.run_attempt === handoff.run_attempt
+                  && item.head_sha === attemptHead
+                  && item.full_diff_sha256 === fullDiffSha256) : [];
+              if (budgetAllowInvocation) {
+                if (budgetDecision !== 'claimed' || exactClaims.length !== 1
+                  || exactClaims[0].status !== 'claimed' || exactClaims[0].outcome !== null
+                  || exactClaims[0].stop_reason !== 'claimed'
+                  || exactClaims[0].call_count !== 0 || exactClaims[0].elapsed_seconds !== 0
+                  || JSON.stringify(exactClaims[0].model_route)
+                    !== JSON.stringify(['zai-coding-plan/glm-4.7'])
+                  || exactClaims[0].effort !== 'final-review/default') {
+                  throw new Error('sealed allowed claim identity mismatch');
+                }
+              } else if (budgetDecision !== 'authenticated_reuse') {
+                throw new Error('denied budget claim cannot publish schema-2 state');
+              }
               const checkout = spawnSync('/usr/bin/git', ['rev-parse', 'HEAD'], {
                 encoding: 'utf8', cwd: trustedWorkspace, env: gitEnv,
               });
@@ -2902,8 +3326,10 @@ jobs:
               return;
             }
             let candidateArtifactValid = false;
+            let candidateEnvelopeValid = false;
+            let candidateEnvelope = null;
             let candidateReview = '';
-            if ((process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success') {
+            if (budgetAllowInvocation) {
               try {
                 const candidateIdRaw = process.env.CANDIDATE_ARTIFACT_ID || '';
                 const candidateDigest = process.env.CANDIDATE_ARTIFACT_DIGEST || '';
@@ -2925,20 +3351,85 @@ jobs:
                   throw new Error('candidate artifact API identity/digest mismatch');
                 }
                 const path = require('path');
-                const candidateDir = fs.realpathSync(path.dirname(candidatePath));
+                const candidateDir = fs.realpathSync(path.dirname(candidateEnvelopePath));
+                if (candidateDir !== fs.realpathSync(path.dirname(candidatePath))) {
+                  throw new Error('candidate artifact path mismatch');
+                }
+                const envelopeStat = fs.lstatSync(candidateEnvelopePath);
+                if (!envelopeStat.isFile() || envelopeStat.isSymbolicLink()
+                  || envelopeStat.size < 1 || envelopeStat.size > 4096) {
+                  throw new Error('candidate envelope is not a bounded regular file');
+                }
+                candidateEnvelope = JSON.parse(
+                  new TextDecoder('utf-8', { fatal: true })
+                    .decode(fs.readFileSync(candidateEnvelopePath)));
+                const candidateKeys = ['call_count','claim_checkpoint_sha256','diff_mode',
+                  'elapsed_seconds','failure_reason','full_diff_sha256','head_sha','model_route',
+                  'outcome','pr','repository','review_sha256','run_attempt','run_id','schema'];
+                const nonnegativeInteger = (value) => Number.isSafeInteger(value) && value >= 0;
+                if (!candidateEnvelope || typeof candidateEnvelope !== 'object'
+                  || Array.isArray(candidateEnvelope)
+                  || JSON.stringify(Object.keys(candidateEnvelope).sort())
+                    !== JSON.stringify(candidateKeys)
+                  || candidateEnvelope.schema !== 1
+                  || candidateEnvelope.repository !== repository
+                  || candidateEnvelope.pr !== issueNumber
+                  || candidateEnvelope.run_id !== runId
+                  || candidateEnvelope.run_attempt !== runAttempt
+                  || candidateEnvelope.head_sha !== attemptHead
+                  || candidateEnvelope.full_diff_sha256 !== fullDiffSha256
+                  || candidateEnvelope.diff_mode !== diffMode
+                  || candidateEnvelope.claim_checkpoint_sha256
+                    !== handoff.budget_checkpoint_sha256) {
+                  throw new Error('candidate claim identity mismatch');
+                }
+                if (!nonnegativeInteger(candidateEnvelope.call_count)
+                  || candidateEnvelope.call_count > 2
+                  || !nonnegativeInteger(candidateEnvelope.elapsed_seconds)
+                  || JSON.stringify(candidateEnvelope.model_route)
+                    !== JSON.stringify(['zai-coding-plan/glm-4.7'])
+                  || !['success', 'failure'].includes(candidateEnvelope.outcome)
+                  || !new Set(['none', 'model_job_failed', 'provider_failed',
+                    'candidate_contract_failed', 'call_budget_exhausted'])
+                    .has(candidateEnvelope.failure_reason)) {
+                  throw new Error('candidate metrics invalid');
+                }
+                let reportedRoute;
+                try { reportedRoute = JSON.parse(process.env.REVIEW_MODEL_ROUTE_JSON || ''); }
+                catch { reportedRoute = null; }
+                if (process.env.REVIEW_CALL_COUNT !== String(candidateEnvelope.call_count)
+                  || process.env.REVIEW_ELAPSED_SECONDS !== String(candidateEnvelope.elapsed_seconds)
+                  || JSON.stringify(reportedRoute) !== JSON.stringify(candidateEnvelope.model_route)) {
+                  throw new Error('candidate metrics mismatch');
+                }
                 const entries = fs.readdirSync(candidateDir, { withFileTypes: true });
-                if (entries.length !== 1 || entries[0].name !== 'review.md'
-                  || !entries[0].isFile() || entries[0].isSymbolicLink()) {
+                const expectedCandidateFiles = candidateEnvelope.outcome === 'success'
+                  ? ['candidate.json', 'review.md'] : ['candidate.json'];
+                if (JSON.stringify(entries.map((entry) => entry.name).sort())
+                    !== JSON.stringify(expectedCandidateFiles)
+                  || entries.some((entry) => !entry.isFile() || entry.isSymbolicLink())) {
                   throw new Error('candidate artifact inventory is not exact');
                 }
-                const candidateStat = fs.lstatSync(candidatePath);
-                if (!candidateStat.isFile() || candidateStat.isSymbolicLink()
-                  || candidateStat.size < 1 || candidateStat.size > 60000) {
-                  throw new Error('candidate artifact file is not a bounded regular file');
+                if (candidateEnvelope.outcome === 'success') {
+                  if (candidateEnvelope.failure_reason !== 'none'
+                    || !/^[0-9a-f]{64}$/.test(candidateEnvelope.review_sha256 || '')) {
+                    throw new Error('successful candidate mode invalid');
+                  }
+                  const candidateStat = fs.lstatSync(candidatePath);
+                  if (!candidateStat.isFile() || candidateStat.isSymbolicLink()
+                    || candidateStat.size < 1 || candidateStat.size > 60000
+                    || sha256(fs.readFileSync(candidatePath))
+                      !== candidateEnvelope.review_sha256) {
+                    throw new Error('candidate artifact file is not a bounded regular file');
+                  }
+                  candidateReview = new TextDecoder('utf-8', { fatal: true })
+                    .decode(fs.readFileSync(candidatePath));
+                  candidateArtifactValid = true;
+                } else if (candidateEnvelope.failure_reason === 'none'
+                  || candidateEnvelope.review_sha256 !== null) {
+                  throw new Error('failed candidate mode invalid');
                 }
-                candidateReview = new TextDecoder('utf-8', { fatal: true })
-                  .decode(fs.readFileSync(candidatePath));
-                candidateArtifactValid = true;
+                candidateEnvelopeValid = true;
               } catch (error) {
                 core.warning(`Untrusted OpenCode candidate artifact rejected: ${error.message}`);
               }
@@ -2946,10 +3437,12 @@ jobs:
             const after = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber, per_page: 100,
             });
-            const modelOk = (process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success';
-            const reportedReviewFailure = process.env.REVIEW_FAILURE_REASON || '';
+            const modelOk = candidateEnvelopeValid && candidateEnvelope.outcome === 'success';
+            const reportedReviewFailure = candidateEnvelopeValid
+              ? candidateEnvelope.failure_reason : (process.env.REVIEW_FAILURE_REASON || '');
             const modelFailureReason = new Set([
               'model_job_failed', 'provider_failed', 'candidate_contract_failed',
+              'call_budget_exhausted',
             ]).has(reportedReviewFailure) ? reportedReviewFailure : 'model_job_failed';
             const parseRecord = (comment) => {
               const lines = (comment.body || '').split('\n');
@@ -4044,6 +4537,11 @@ jobs:
             const validationSummary = modelSucceeded && filteredNewFindings.length > 0
               ? `\n- Validation: filtered_invalid_new_findings=${filteredNewFindings.length}; reasons=${filteredReasons}`
               : '';
+            const retainedNewFindingCount = parsedReview
+              ? parsedReview.blocks.filter((entry) => entry.section === 'New findings'
+                && !filteredEntries.has(entry)).length : 0;
+            const qualityFiltered = modelSucceeded && filteredNewFindings.length > 0
+              && retainedNewFindingCount === 0;
             const bodyFor = (attestationId) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${attestationId}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${validationSummary}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})\n- Reason: ${failureReason}` : ''}\n\n${displayBody}`;
             if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536) {
               throw new Error('canonical OpenCode comment exceeds 65,536-byte publication limit');
@@ -4200,6 +4698,30 @@ jobs:
               await discardCreated();
               throw new Error('canonical comment changed after attestation publication');
             }
+            const remainingFindingIds = [];
+            let activeFindingSection = false;
+            for (const line of displayBody.split('\n')) {
+              if (line === '### New findings' || line === '### Still open') {
+                activeFindingSection = true;
+              } else if (/^### /.test(line)) {
+                activeFindingSection = false;
+              } else if (activeFindingSection) {
+                const match = line.match(/^#### (RVW-[0-9a-f]{12}) \[(?:CRITICAL|HIGH|MEDIUM)\] .+$/);
+                if (match && !remainingFindingIds.includes(match[1])
+                  && remainingFindingIds.length < 8) remainingFindingIds.push(match[1]);
+              }
+            }
+            const authenticatedReview = state.successful_head === null
+              ? { success: false, head_sha: null, full_diff_sha256: null,
+                  remaining_finding_ids: [] }
+              : { success: true, head_sha: state.successful_head,
+                  full_diff_sha256: state.full_diff_sha256,
+                  remaining_finding_ids: remainingFindingIds };
+            core.setOutput('publication_succeeded', 'true');
+            core.setOutput('review_succeeded', succeeded ? 'true' : 'false');
+            core.setOutput('quality_filtered', qualityFiltered ? 'true' : 'false');
+            core.setOutput('authenticated_review_json', JSON.stringify(authenticatedReview));
+            core.setOutput('remaining_finding_ids_json', JSON.stringify(remainingFindingIds));
             // Publication uses a fresh comment so its immutable id can be bound into the
             // attestation. Retire the previous canonical only after the replacement is fully
             // attested; otherwise every successful round leaves two "latest" sticky comments.
@@ -4240,6 +4762,129 @@ jobs:
             if (!succeeded) {
               core.setFailed(`OpenCode review checkpoint failed: ${failureReason}`);
             }
+
+      - name: Resolve OpenCode budget outcome
+        id: opencode-budget-outcome
+        if: ${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}
+        shell: bash
+        env:
+          PROVIDER_OUTCOME: ${{ needs.opencode-review.outputs.review_outcome }}
+          PROVIDER_FAILURE_REASON: ${{ needs.opencode-review.outputs.review_failure_reason }}
+          CALL_COUNT: ${{ needs.opencode-review.outputs.review_call_count }}
+          ELAPSED_SECONDS: ${{ needs.opencode-review.outputs.review_elapsed_seconds }}
+          PUBLICATION_SUCCEEDED: ${{ steps.canonicalize-opencode-review.outputs.publication_succeeded }}
+          REVIEW_SUCCEEDED: ${{ steps.canonicalize-opencode-review.outputs.review_succeeded }}
+          QUALITY_FILTERED: ${{ steps.canonicalize-opencode-review.outputs.quality_filtered }}
+          PUBLISHED_AUTHENTICATED_REVIEW_JSON: ${{ steps.canonicalize-opencode-review.outputs.authenticated_review_json }}
+          PUBLISHED_REMAINING_FINDING_IDS_JSON: ${{ steps.canonicalize-opencode-review.outputs.remaining_finding_ids_json }}
+          PREVIOUS_AUTHENTICATED_REVIEW_JSON: ${{ needs.opencode-prepare.outputs.authenticated_review_json }}
+        run: |
+          set -euo pipefail
+          outcome='checkpoint_failure'
+          stop_reason='checkpoint_failure'
+          authenticated_review_json="$PREVIOUS_AUTHENTICATED_REVIEW_JSON"
+          remaining_finding_ids_json="$(
+            jq -ce '.remaining_finding_ids' <<< "$authenticated_review_json"
+          )"
+          jq -e '
+            type == "object"
+            and (keys | sort) == ["full_diff_sha256","head_sha","remaining_finding_ids","success"]
+            and (.success | type) == "boolean"
+            and (.remaining_finding_ids | type) == "array"
+            and (.remaining_finding_ids | length) <= 8
+            and (.remaining_finding_ids | length) == (.remaining_finding_ids | unique | length)
+            and all(.remaining_finding_ids[]; test("^RVW-[0-9a-f]{12}$"))
+          ' >/dev/null <<< "$authenticated_review_json"
+
+          if [[ "$PUBLICATION_SUCCEEDED" == 'true' ]]; then
+            authenticated_review_json="$PUBLISHED_AUTHENTICATED_REVIEW_JSON"
+            remaining_finding_ids_json="$PUBLISHED_REMAINING_FINDING_IDS_JSON"
+          fi
+          if ! jq -e --argjson remaining "$remaining_finding_ids_json" '
+              type == "object"
+              and (keys | sort) == ["full_diff_sha256","head_sha","remaining_finding_ids","success"]
+              and (.success | type) == "boolean"
+              and (.remaining_finding_ids == $remaining)
+              and ($remaining | type) == "array" and ($remaining | length) <= 8
+              and ($remaining | length) == ($remaining | unique | length)
+              and all($remaining[]; test("^RVW-[0-9a-f]{12}$"))
+              and (if .success then
+                (.head_sha | test("^[0-9a-f]{40}$"))
+                and (.full_diff_sha256 | test("^[0-9a-f]{64}$"))
+              else .head_sha == null and .full_diff_sha256 == null end)
+            ' >/dev/null <<< "$authenticated_review_json"; then
+            authenticated_review_json='{"success":false,"head_sha":null,"full_diff_sha256":null,"remaining_finding_ids":[]}'
+            remaining_finding_ids_json='[]'
+          elif [[ ! "$CALL_COUNT" =~ ^[0-9]+$ ]]; then
+            :
+          elif (( CALL_COUNT > 2 )) || [[ "$PROVIDER_FAILURE_REASON" == 'call_budget_exhausted' ]]; then
+            stop_reason='call_budget_exhausted'
+          elif [[ ! "$ELAPSED_SECONDS" =~ ^[0-9]+$ ]]; then
+            :
+          elif (( ELAPSED_SECONDS > 600 )); then
+            outcome='wall_time_exhausted'
+            stop_reason='wall_time_exhausted'
+          elif [[ "$PUBLICATION_SUCCEEDED" != 'true' ]]; then
+            :
+          elif [[ "$REVIEW_SUCCEEDED" == 'true' ]]; then
+            if [[ "$QUALITY_FILTERED" == 'true' ]]; then
+              outcome='quality_filtered'
+              stop_reason='quality_filtered'
+            else
+              outcome='success'
+              stop_reason='success'
+            fi
+          elif [[ "$PROVIDER_OUTCOME" == 'failure' ]]; then
+            outcome='provider_failure'
+            case "$PROVIDER_FAILURE_REASON" in
+              model_job_failed|provider_failed|candidate_contract_failed)
+                stop_reason="$PROVIDER_FAILURE_REASON"
+                ;;
+              *)
+                stop_reason='provider_failure'
+                ;;
+            esac
+          fi
+
+          {
+            printf 'outcome=%s\n' "$outcome"
+            printf 'stop_reason=%s\n' "$stop_reason"
+            printf 'authenticated_review_json=%s\n' "$authenticated_review_json"
+            printf 'remaining_finding_ids_json=%s\n' "$remaining_finding_ids_json"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Finalize OpenCode review budget
+        id: review-budget-finalize
+        if: ${{ always() && !cancelled() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}
+        uses: $/.github/actions/review-invocation-budget
+        with:
+          github-token: ${{ github.token }}
+          mode: finalize
+          reviewer: opencode
+          pr-number: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+          expected-head-sha: ${{ needs.opencode-prepare.outputs.attempt_head }}
+          full-diff-sha256: ${{ needs.opencode-prepare.outputs.full_diff_sha256 }}
+          diff-mode: ${{ needs.opencode-prepare.outputs.diff_mode }}
+          input-files-json: '[]'
+          authenticated-review-json: ${{ steps.opencode-budget-outcome.outputs.authenticated_review_json }}
+          model-route-json: '["zai-coding-plan/glm-4.7"]'
+          effort: final-review/default
+          actual-call-count: ${{ needs.opencode-review.outputs.review_call_count || '0' }}
+          elapsed-seconds: ${{ needs.opencode-review.outputs.review_elapsed_seconds || '0' }}
+          outcome: ${{ steps.opencode-budget-outcome.outputs.outcome }}
+          stop-reason: ${{ steps.opencode-budget-outcome.outputs.stop_reason }}
+          remaining-finding-ids-json: ${{ steps.opencode-budget-outcome.outputs.remaining_finding_ids_json }}
+          checkpoint-file: ${{ runner.temp }}/opencode-review-budget-final.json
+
+      - name: Upload OpenCode review budget final checkpoint
+        if: ${{ always() && !cancelled() && steps.review-budget-finalize.outcome != 'skipped' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/opencode-review-budget-final.json
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: false
 
   skipped:
     name: Workflow Skipped

@@ -17,3 +17,4 @@ paths:
   .github/workflows/opencode-auto-review.yml:
     ignore:
       - 'specifying action "\$/\.github/actions/prepare-review-diff" in invalid format because ref is missing'
+      - 'specifying action "\$/\.github/actions/review-invocation-budget" in invalid format because ref is missing'
