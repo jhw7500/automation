@@ -327,6 +327,16 @@ parser then:
    truncated hunk bodies, counters, coordinates, and controls fail closed; diff prelude metadata is
    not treated as hunk-body evidence.
 
+After the document grammar and evidence fields validate, OpenCode checks each `New findings` block
+independently. A block whose path is absent or removed, whose line is not an actual added-side line,
+or whose quoted current line does not match is omitted without failing an otherwise valid review.
+Valid blocks—including `[HIGH]` blocks—remain unchanged. If every new block is omitted, the
+canonical section becomes exactly `### New findings` followed by `None`; the successful attested
+comment reports `filtered_invalid_new_findings=N` and `reasons=anchor_out_of_scope` on its visible
+validation line. Git invocation or parsing failures, sealed manifest inconsistencies, malformed
+document/evidence grammar, and invalid carryover or disposition evidence still fail the checkpoint
+without advancing `successful_head`.
+
 The sole zero-record case is an exact empty full review: the sealed manifest has `files: []`, the
 selected full diff is a zero-byte regular file, and local full-range name-status reconstruction is
 also empty. An empty delta, non-empty selected diff, or non-empty Git reconstruction remains

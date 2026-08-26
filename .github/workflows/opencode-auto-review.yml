@@ -392,7 +392,7 @@ jobs:
           PREV_SUCCESSFUL_HEAD="$(printf '%s\n' "$PREV_RECORD" | jq -r '.state.successful_head // ""')"
           PREV_FULL_HASH="$(printf '%s\n' "$PREV_RECORD" | jq -r '.state.full_diff_sha256 // ""')"
           # Reserved workflow-owned text is never model input, even from a validated record.
-          PREV_REVIEW="$(printf '%s\n' "$PREV_REVIEW" | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Last attempt: )' || true)"
+          PREV_REVIEW="$(printf '%s\n' "$PREV_REVIEW" | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Last attempt: )' || true)"
           # A first failure has no checkpoint and must not become re-review context. A stale
           # failure is useful only when it retained a validated successful checkpoint/body.
           if ! [[ "$PREV_SUCCESSFUL_HEAD" =~ ^[0-9a-f]{40}$ ]] \
@@ -408,7 +408,7 @@ jobs:
             '[.[] | select((.user.type // "") != "Bot")] | .[-10:]
              | map("@" + (.user.login // "ghost") + " (" + (.created_at // "") + "):\n" + ((.body // "") | .[0:1500]))
              | join("\n\n---\n\n")' "$COMMENTS" \
-            | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Last attempt: )' || true)"
+            | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Last attempt: )' || true)"
 
           clip() {
             local text="$1"
@@ -3357,7 +3357,7 @@ jobs:
               }
               return true;
             };
-            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Last attempt: failure \(https?:\/\/\S+\)$|- Reason: [a-z_]+$)/;
+            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Validation: filtered_invalid_new_findings=[1-9][0-9]*; reasons=[a-z_,]+$|- Last attempt: failure \(https?:\/\/\S+\)$|- Reason: [a-z_]+$)/;
             const clean = (body) => {
               const rawLines = (body || '').split('\n');
               // OpenCode can include tool/thinking traces in the final text event. Only an exact
@@ -3646,13 +3646,12 @@ jobs:
               if (!sections) return null;
               const carryover = sections.filter((item) => item.name !== 'New findings');
               if (carryover.length && !priorSuccess) return null;
-              const anchors = [];
-              const removals = [];
+              const parsedBlocks = [];
               const currentHeadings = new Set();
-              for (const section of sections) {
-                const blocks = sectionBlocks(section);
-                if (blocks === null) return null;
-                for (const block of blocks) {
+              for (const [sectionIndex, section] of sections.entries()) {
+                const sectionFindingBlocks = sectionBlocks(section);
+                if (sectionFindingBlocks === null) return null;
+                for (const block of sectionFindingBlocks) {
                   if (currentHeadings.has(block.heading)) return null;
                   currentHeadings.add(block.heading);
                   const priorMatches = priorActiveHeadings.get(block.heading) || 0;
@@ -3669,8 +3668,10 @@ jobs:
                   const noRemovedPair = evidence.removedAnchors.length === 0
                     && evidence.removedLines.length === 0;
                   if (currentPair && noRemovedPair) {
-                    anchors.push({ ...evidence.changedAnchors[0],
-                      currentLine: evidence.currentLines[0] });
+                    const anchor = { ...evidence.changedAnchors[0],
+                      currentLine: evidence.currentLines[0] };
+                    parsedBlocks.push({ sectionIndex, section: section.name, block,
+                      evidence: { anchors: [anchor], removals: [] } });
                     continue;
                   }
                   if (section.name !== 'Resolved' || !removedPair || !noCurrentPair) return null;
@@ -3685,16 +3686,19 @@ jobs:
                   if (removedAnchor.path !== priorAnchor.path
                     || removedAnchor.line !== priorAnchor.line
                     || evidence.removedLines[0] !== previous[0].currentLines[0]) return null;
-                  removals.push({ ...removedAnchor,
-                    currentLine: evidence.removedLines[0] });
+                  const removal = { ...removedAnchor,
+                    currentLine: evidence.removedLines[0] };
+                  parsedBlocks.push({ sectionIndex, section: section.name, block,
+                    evidence: { anchors: [], removals: [removal] } });
                 }
               }
-              return { anchors, removals };
+              return { blocks: parsedBlocks, sections };
             };
 
-            const anchorsAreChanged = (evidence) => {
+            const changedPathValidation = new Map();
+            const validateAnchorEvidence = (evidence) => {
               if (!artifactsValid || !manifest || !evidence
-                || !Array.isArray(evidence.anchors) || !Array.isArray(evidence.removals)) return false;
+                || !Array.isArray(evidence.anchors) || !Array.isArray(evidence.removals)) return 'error';
               const locations = evidence.anchors;
               const files = new Map(manifest.files.map((file) => [file.filename, file]));
               const statusNames = new Map([
@@ -3840,18 +3844,23 @@ jobs:
               for (const location of locations) {
                 if (!location || typeof location.path !== 'string'
                   || !Number.isSafeInteger(location.line) || location.line <= 0
-                  || typeof location.currentLine !== 'string') return false;
+                  || typeof location.currentLine !== 'string') return 'error';
                 const file = files.get(location.path);
-                if (!file || file.status === 'removed') return false;
+                if (!file) return 'invalid';
                 anchors.push({ path: location.path, line: location.line,
                   currentLine: location.currentLine });
               }
               const rangesByPath = new Map();
               for (const path of new Set(anchors.map((anchor) => anchor.path))) {
+                const cached = changedPathValidation.get(path);
+                if (cached) {
+                  rangesByPath.set(path, cached);
+                  continue;
+                }
                 const file = files.get(path);
                 const renamedOrCopied = ['renamed', 'copied'].includes(file.status);
                 if (renamedOrCopied && (typeof file.previous_filename !== 'string'
-                  || file.previous_filename.length === 0)) return false;
+                  || file.previous_filename.length === 0)) return 'error';
                 const pathspecs = renamedOrCopied
                   ? [file.previous_filename, file.filename] : [file.filename];
                 const nameStatus = spawnSync('/usr/bin/git', [
@@ -3862,12 +3871,12 @@ jobs:
                 ], {
                   cwd: trustedWorkspace, env: gitEnv,
                 });
-                const records = nameStatus.error || nameStatus.status !== 0
-                  ? null : parseNameStatus(nameStatus.stdout);
+                if (nameStatus.error || nameStatus.status !== 0) return 'error';
+                const records = parseNameStatus(nameStatus.stdout);
                 if (!records || records.length !== 1 || records[0].status !== file.status
                   || records[0].filename !== file.filename
                   || (records[0].previous_filename || null) !== (file.previous_filename || null)) {
-                  return false;
+                  return 'error';
                 }
                 const result = spawnSync('/usr/bin/git', [
                   '--no-replace-objects', '--literal-pathspecs', '-c', 'diff.external=',
@@ -3878,9 +3887,11 @@ jobs:
                   encoding: 'utf8', cwd: trustedWorkspace,
                   env: gitEnv,
                 });
-                if (result.error || result.status !== 0 || typeof result.stdout !== 'string') return false;
+                if (result.error || result.status !== 0
+                  || typeof result.stdout !== 'string') return 'error';
                 const ranges = parseAddedRanges(result.stdout);
-                if (!ranges || !ranges.length || !(ranges.addedLines instanceof Map)) return false;
+                if (!ranges || !(ranges.addedLines instanceof Map)) return 'error';
+                changedPathValidation.set(path, ranges);
                 rangesByPath.set(path, ranges);
               }
               const currentEvidenceValid = anchors.every((anchor) => {
@@ -3888,25 +3899,25 @@ jobs:
                 return ranges.some(([start, end]) => anchor.line >= start && anchor.line <= end)
                   && ranges.addedLines.get(anchor.line) === anchor.currentLine;
               });
-              if (!currentEvidenceValid) return false;
+              if (!currentEvidenceValid) return 'invalid';
 
               const removals = evidence.removals;
-              if (!removals.length) return true;
+              if (!removals.length) return 'valid';
               const previousHead = priorSuccess ? existing.state.successful_head : '';
-              if (!/^[0-9a-f]{40}$/.test(previousHead)) return false;
+              if (!/^[0-9a-f]{40}$/.test(previousHead)) return 'error';
               const ancestor = spawnSync('/usr/bin/git', [
                 '--no-replace-objects', 'merge-base', '--is-ancestor', previousHead, attemptHead,
               ], { cwd: trustedWorkspace, env: gitEnv });
-              if (ancestor.error || ancestor.status !== 0) return false;
+              if (ancestor.error || ancestor.status !== 0) return 'error';
               const previousNameStatus = spawnSync('/usr/bin/git', [
                 '--no-replace-objects', '--literal-pathspecs', '-c', 'diff.external=',
                 'diff', '--no-ext-diff', '--no-textconv', '--name-status', '-z',
                 '--find-renames=50%', '--ignore-submodules=none',
                 `${previousHead}..${attemptHead}`,
               ], { cwd: trustedWorkspace, env: gitEnv });
-              const previousRecords = previousNameStatus.error || previousNameStatus.status !== 0
-                ? null : parseNameStatus(previousNameStatus.stdout);
-              if (!previousRecords) return false;
+              if (previousNameStatus.error || previousNameStatus.status !== 0) return 'error';
+              const previousRecords = parseNameStatus(previousNameStatus.stdout);
+              if (!previousRecords) return 'error';
               const previousContentDiff = spawnSync('/usr/bin/git', [
                 '--no-replace-objects', '--literal-pathspecs', '-c', 'diff.external=',
                 'diff', '--no-ext-diff', '--no-textconv', '--text', '--find-renames=50%',
@@ -3917,19 +3928,19 @@ jobs:
                 env: gitEnv,
               });
               if (previousContentDiff.error || previousContentDiff.status !== 0
-                || typeof previousContentDiff.stdout !== 'string') return false;
+                || typeof previousContentDiff.stdout !== 'string') return 'error';
               const globallyAddedLines = new Set(previousContentDiff.stdout.split('\n')
                 .filter((line) => line.startsWith('%')).map((line) => line.slice(1)));
 
               for (const removal of removals) {
                 if (!removal || typeof removal.path !== 'string'
                   || !Number.isSafeInteger(removal.line) || removal.line <= 0
-                  || typeof removal.currentLine !== 'string') return false;
+                  || typeof removal.currentLine !== 'string') return 'error';
                 const identityRecords = previousRecords.filter((record) =>
                   record.filename === removal.path || record.previous_filename === removal.path);
                 if (identityRecords.length !== 1
                   || identityRecords[0].filename !== removal.path
-                  || !['changed', 'modified', 'removed'].includes(identityRecords[0].status)) return false;
+                  || !['changed', 'modified', 'removed'].includes(identityRecords[0].status)) return 'invalid';
                 const result = spawnSync('/usr/bin/git', [
                   '--no-replace-objects', '--literal-pathspecs', '-c', 'diff.external=',
                   'diff', '--no-ext-diff', '--no-textconv', '--find-renames=50%',
@@ -3939,20 +3950,60 @@ jobs:
                   encoding: 'utf8', cwd: trustedWorkspace,
                   env: gitEnv,
                 });
-                if (result.error || result.status !== 0 || typeof result.stdout !== 'string') return false;
+                if (result.error || result.status !== 0
+                  || typeof result.stdout !== 'string') return 'error';
                 const ranges = parseAddedRanges(result.stdout);
                 if (!ranges || !(ranges.addedLines instanceof Map)
-                  || !(ranges.removedLines instanceof Map)
-                  || ranges.removedLines.get(removal.line) !== removal.currentLine
-                  || globallyAddedLines.has(removal.currentLine)) return false;
+                  || !(ranges.removedLines instanceof Map)) return 'error';
+                if (ranges.removedLines.get(removal.line) !== removal.currentLine
+                  || globallyAddedLines.has(removal.currentLine)) return 'invalid';
               }
-              return true;
+              return 'valid';
             };
 
             const candidate = candidateArtifactValid ? { body: candidateReview } : null;
             const review = candidate ? clean(candidate.body) : '';
             const parsedReview = review ? parseReview(review) : null;
-            const anchorsCovered = parsedReview !== null && anchorsAreChanged(parsedReview);
+            const filteredNewFindings = [];
+            let anchorValidationFailed = false;
+            if (parsedReview) {
+              const newFindings = parsedReview.blocks.filter((entry) =>
+                entry.section === 'New findings');
+              for (const entry of newFindings) {
+                const result = validateAnchorEvidence(entry.evidence);
+                if (result === 'valid') continue;
+                if (result === 'invalid') {
+                  filteredNewFindings.push({ entry, reason: 'anchor_out_of_scope' });
+                } else {
+                  anchorValidationFailed = true;
+                  break;
+                }
+              }
+              const carryover = parsedReview.blocks.filter((entry) =>
+                entry.section !== 'New findings');
+              if (!anchorValidationFailed && carryover.length > 0) {
+                const carryoverEvidence = {
+                  anchors: carryover.flatMap((entry) => entry.evidence.anchors),
+                  removals: carryover.flatMap((entry) => entry.evidence.removals),
+                };
+                if (validateAnchorEvidence(carryoverEvidence) !== 'valid') {
+                  anchorValidationFailed = true;
+                }
+              }
+            }
+            const filteredEntries = new Set(filteredNewFindings.map((item) => item.entry));
+            const canonicalReview = parsedReview && filteredEntries.size > 0
+              ? parsedReview.sections.map((section, sectionIndex) => {
+                  const retained = parsedReview.blocks.filter((entry) =>
+                    entry.sectionIndex === sectionIndex && !filteredEntries.has(entry));
+                  const sectionBody = section.name === 'New findings' && retained.length === 0
+                    ? 'None'
+                    : retained.map((entry) => [entry.block.heading, ...entry.block.lines]
+                      .join('\n').trim()).join('\n\n');
+                  return `### ${section.name}\n${sectionBody}`;
+                }).join('\n\n')
+              : review;
+            const anchorsCovered = parsedReview !== null && !anchorValidationFailed;
             const modelSucceeded = diffReady && ['full', 'delta'].includes(diffMode)
               && !unchangedSincePrevious && artifactsValid && modelOk
               && candidateArtifactValid && parsedReview !== null
@@ -3963,7 +4014,7 @@ jobs:
             const succeeded = modelSucceeded || unchangedSucceeded;
             const recordedMode = ['full', 'delta', 'unchanged', 'unavailable'].includes(diffMode)
               ? diffMode : 'unavailable';
-            const successBody = unchangedSucceeded ? previousBody : review;
+            const successBody = unchangedSucceeded ? previousBody : canonicalReview;
             const failureReason = !diffReady ? 'diff_unavailable'
               : !artifactsValid ? 'prepared_artifact_invalid'
               : !modelOk ? modelFailureReason
@@ -3988,7 +4039,12 @@ jobs:
                 };
             const status = succeeded ? 'success' : (priorSuccess ? 'stale' : 'failure');
             const displayBody = succeeded ? successBody : failureBody;
-            const bodyFor = (attestationId) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${attestationId}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})\n- Reason: ${failureReason}` : ''}\n\n${displayBody}`;
+            const filteredReasons = [...new Set(filteredNewFindings.map((item) => item.reason))]
+              .sort().join(',');
+            const validationSummary = modelSucceeded && filteredNewFindings.length > 0
+              ? `\n- Validation: filtered_invalid_new_findings=${filteredNewFindings.length}; reasons=${filteredReasons}`
+              : '';
+            const bodyFor = (attestationId) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${attestationId}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${validationSummary}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})\n- Reason: ${failureReason}` : ''}\n\n${displayBody}`;
             if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536) {
               throw new Error('canonical OpenCode comment exceeds 65,536-byte publication limit');
             }
