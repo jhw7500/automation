@@ -108,3 +108,13 @@ Ruling: OpenCode budget metrics become privileged only inside canonicalization a
 Task 6: fix round 1/5 (1 addressed, 0 open — RED 6 failed/8 passed, GREEN 14 focused and 5 dynamic canonical metric cases; 1197 OpenCode/actionlint, 1534 workflow-logic, 2090 + 48 subtests non-Task7 full; digest-verified actionlint 1.7.12, YAML, changed-line Ruff, and diff-check green; base commit fbefb66)
 
 Task 6: complete (commits 7e8cd82..042cf6e, independent re-review clean after fix round 1/5; Critical/Important 0; accepted intermediate red remains only Task 7 release inventory)
+
+Task 7: RED complete (`tests/test_workflow_release_bundle.py` + `tests/test_verify_workflow_release.py`: 168 failed, 373 passed in 249.82s; failures proved the absent v1.47 inventory/verifier boundary and the approved Task 4–6 unknown-dependency gap)
+
+Task 7: GREEN complete (v1.47 focused 26 passed; release/bundle 542 passed in 266.42s; full unfiltered 2632 passed + 48 subtests in 814.96s; py_compile and diff-check green)
+
+Ruling: Task 7 keeps the immutable v1.40–v1.46.2 capability inventories and v1.46.2 fleet default unchanged, while current live workflow mutation tests verify the v1.47 capability. The verifier first preserves established reviewer-specific diagnostics and then authenticates the exact complete v1.47 budget workflow bytes, so historical contracts remain inspectable without weakening the new closed boundary — if wrong, dedicated immutable v1.46 workflow fixtures must replace the current-source tests before a later release.
+
+Task 7: self-review complete (exact BaseLoader action bytes/surface, helper compile + strict signatures/constants/AST/source gates, reviewer claim/provider/finalize ordering and guards, timeout/counter/artifact/OpenCode handoff/no-fallback contracts, historical digest branches, exhaustion-not-approval docs, and no Task 1–6/config/tag/rollout changes verified)
+
+Task 7: complete (implementation commit abc3cefd203014ed2295cac9efdb11f02ff1e84f; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md; blockers: none)
