@@ -46,14 +46,19 @@ def request(*, head=HEAD_A, full_hash=HASH_1, run_id=700, run_attempt=1, **chang
 
 
 def invocation(*, head=HEAD_A, full_hash=HASH_1, run_id=501, run_attempt=1,
-               round_number=1, outcome="success", status="finalized", override_event_id=None):
+               round_number=1, outcome="success", status="finalized", override_event_id=None,
+               call_count=None, estimated_input_tokens=50_000, elapsed_seconds=None):
+    if call_count is None:
+        call_count = 1 if status == "finalized" else 0
+    if elapsed_seconds is None:
+        elapsed_seconds = 10 if status == "finalized" else 0
     return budget.Invocation(
         run_id=run_id, run_attempt=run_attempt, head_sha=head,
         full_diff_sha256=full_hash, round_number=round_number,
         override_event_id=override_event_id, model_route=("claude-code-action-default",),
         effort="final-review/default", call_unit="claude-code-action review session",
-        call_count=1 if status == "finalized" else 0, estimated_input_tokens=50_000,
-        elapsed_seconds=10 if status == "finalized" else 0, status=status,
+        call_count=call_count, estimated_input_tokens=estimated_input_tokens,
+        elapsed_seconds=elapsed_seconds, status=status,
         outcome=outcome if status == "finalized" else None,
         stop_reason=outcome if status == "finalized" else "claimed", remaining_finding_ids=(),
     )
@@ -79,6 +84,20 @@ def valid_provenances(state):
         )
         for entry in state.invocations
     }
+
+
+def ledger_body(state):
+    payload = json.dumps(state.to_dict(), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return f"{budget.MARKERS[state.reviewer]}\n{budget.STATE_PREFIX}{payload}{budget.STATE_SUFFIX}"
+
+
+def assert_stored_state_rejected(state, reason):
+    with pytest.raises(budget.BudgetStateError, match=reason):
+        budget.serialize_ledger(state)
+    with pytest.raises(budget.BudgetStateError, match=reason):
+        budget.parse_ledger(
+            ledger_body(state), repository=state.repository, pr=state.pr, reviewer=state.reviewer,
+        )
 
 
 @pytest.fixture
@@ -258,3 +277,81 @@ def test_serializer_rejects_boolean_reviewer_budget():
     malformed = replace(state, budgets=replace(state.budgets, max_calls_per_round=True))
     with pytest.raises(budget.BudgetStateError, match="max_calls_per_round_invalid"):
         budget.serialize_ledger(malformed)
+
+
+@pytest.mark.parametrize("reviewer,max_calls", [("claude", 1), ("gemini", 3), ("opencode", 2)])
+def test_stored_call_count_enforces_each_reviewer_boundary(reviewer, max_calls):
+    at_limit = budget.LedgerState.initial(
+        REPOSITORY, PR, reviewer, invocations=(invocation(call_count=max_calls),),
+    )
+    payload = budget.serialize_ledger(at_limit)
+    assert budget.parse_ledger(
+        f"{budget.MARKERS[reviewer]}\n{budget.STATE_PREFIX}{payload}{budget.STATE_SUFFIX}",
+        repository=REPOSITORY, pr=PR, reviewer=reviewer,
+    ) == at_limit
+
+    above_limit = replace(
+        at_limit, invocations=(replace(at_limit.invocations[0], call_count=max_calls + 1),),
+    )
+    assert_stored_state_rejected(above_limit, "call_budget_exhausted")
+
+
+def test_stored_elapsed_seconds_enforces_round_boundary():
+    at_limit = budget.LedgerState.initial(
+        REPOSITORY, PR, "claude", invocations=(invocation(elapsed_seconds=600),),
+    )
+    assert budget.parse_ledger(
+        ledger_body(at_limit), repository=REPOSITORY, pr=PR, reviewer="claude",
+    ) == at_limit
+    above_limit = replace(
+        at_limit, invocations=(replace(at_limit.invocations[0], elapsed_seconds=601),),
+    )
+    assert_stored_state_rejected(above_limit, "wall_time_exhausted")
+
+
+def test_stored_estimated_input_enforces_round_boundary():
+    at_limit = budget.LedgerState.initial(
+        REPOSITORY, PR, "claude", invocations=(invocation(estimated_input_tokens=200_000),),
+    )
+    assert budget.parse_ledger(
+        ledger_body(at_limit), repository=REPOSITORY, pr=PR, reviewer="claude",
+    ) == at_limit
+    above_limit = replace(
+        at_limit,
+        invocations=(replace(at_limit.invocations[0], estimated_input_tokens=200_001),),
+    )
+    assert_stored_state_rejected(above_limit, "input_budget_exhausted")
+
+
+def test_stored_automatic_and_override_aggregate_boundaries():
+    first = invocation(estimated_input_tokens=200_000)
+    second = invocation(
+        head=HEAD_B, full_hash=HASH_2, run_id=502, round_number=2,
+        estimated_input_tokens=200_000,
+    )
+    automatic_limit = budget.LedgerState.initial(
+        REPOSITORY, PR, "claude", invocations=(first, second),
+    )
+    assert budget.parse_ledger(
+        ledger_body(automatic_limit), repository=REPOSITORY, pr=PR, reviewer="claude",
+    ) == automatic_limit
+
+    third = invocation(
+        head=HEAD_C, full_hash=HASH_3, run_id=503, round_number=3,
+        override_event_id=9001, estimated_input_tokens=200_000,
+    )
+    override_limit = budget.LedgerState.initial(
+        REPOSITORY, PR, "claude", invocations=(first, second, third),
+        consumed_override_event_ids=(9001,),
+    )
+    assert budget.parse_ledger(
+        ledger_body(override_limit), repository=REPOSITORY, pr=PR, reviewer="claude",
+    ) == override_limit
+
+    above_override_limit = replace(
+        override_limit,
+        invocations=override_limit.invocations[:2] + (
+            replace(override_limit.invocations[2], estimated_input_tokens=200_001),
+        ),
+    )
+    assert_stored_state_rejected(above_override_limit, "input_budget_exhausted")

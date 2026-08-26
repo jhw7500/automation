@@ -361,6 +361,14 @@ def _validate_state_shape(state: LedgerState) -> None:
         raise BudgetStateError("ledger_invalid")
     if any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in state.consumed_override_event_ids):
         raise BudgetStateError("consumed_override_event_ids_invalid")
+    for item in state.invocations:
+        Invocation.from_dict(item.to_dict())
+        if item.call_count > state.budgets.max_calls_per_round:
+            raise BudgetStateError("call_budget_exhausted")
+        if item.estimated_input_tokens > state.budgets.max_estimated_tokens_per_round:
+            raise BudgetStateError("input_budget_exhausted")
+        if item.elapsed_seconds > state.budgets.max_wall_seconds_per_round:
+            raise BudgetStateError("wall_time_exhausted")
     run_keys = {(item.run_id, item.run_attempt) for item in state.invocations}
     if len(run_keys) != len(state.invocations):
         raise BudgetStateError("duplicate_run_identity")
@@ -382,8 +390,14 @@ def _validate_state_shape(state: LedgerState) -> None:
             raise BudgetStateError("override_invalid")
     if len(state.consumed_override_event_ids) != len(overrides):
         raise BudgetStateError("override_invalid")
-    for item in state.invocations:
-        Invocation.from_dict(item.to_dict())
+    automatic_total = sum(item.estimated_input_tokens for item in automatic)
+    total_limit = state.budgets.max_estimated_tokens_total
+    if automatic_total > total_limit:
+        raise BudgetStateError("total_usage_budget_exhausted")
+    if overrides:
+        total_limit += state.budgets.max_estimated_tokens_per_round
+    if sum(item.estimated_input_tokens for item in state.invocations) > total_limit:
+        raise BudgetStateError("total_usage_budget_exhausted")
     DecisionRecord.from_dict(state.last_decision.to_dict())
     Handoff.from_dict(state.handoff.to_dict())
 
