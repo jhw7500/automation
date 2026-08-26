@@ -130,3 +130,15 @@ Task 7: fix round 1/5 GREEN complete (semantic/inventory focus 29 passed; immuta
 Task 7: fix round 1/5 self-review complete (all four Important findings closed; immutable v1.46.2 direct coverage, exact complete BaseLoader action equality, separate semantic/authentication gates, strict helper and reviewer workflow relationships, full new-root kind mutations, no Task 1–6/config/tag/release/rollout/external-state changes; blockers and remaining concerns: none)
 
 Task 7: fix round 1/5 complete (implementation fix commit 0fb3a1d3b43bd03f125dbf1ae2e24970bec4024b; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md)
+
+Task 7: fix round 2/5 RED complete (9 failed: schema annotation, frozen record shape, dead claim refusal, dead final-cap relation, dead RVW/provenance decoys, and three reviewer live call-cap decoys all escaped the prior semantic checks)
+
+Ruling: Helper semantic verification is an exact live-AST contract, not a source-fragment approximation. Record decorators/annotations/defaults, type aliases, direct claim statement order and predicate-to-refusal bodies, final/stored caps, provenance, override, RVW bounds, checkpoint canonicality, and CAS refusal are bound to their executable AST locations before exact-byte authentication — if wrong, a future schema version must introduce a separately versioned AST contract instead of weakening these v1.47 relationships.
+
+Ruling: Reviewer call accounting is bound to the named provider/metrics step and its live program: exact Claude metrics step mapping, Gemini embedded Python AST, and the unique anchored OpenCode shell counter/refusal/increment sequence. Workflow-wide raw fragment presence is not evidence of a live cap — if wrong, the embedded scripts should be extracted into separately authenticated helpers in a future release boundary.
+
+Task 7: fix round 2/5 GREEN complete (structural focus 9 passed; combined findings 1-4 focus 48 passed; release suite 575 passed in 226.40s; full unfiltered 2665 passed + 48 subtests in 790.25s; py_compile and diff-check green)
+
+Task 7: fix round 2/5 self-review complete (all Finding 3 decoy classes structurally rejected; authentication remains after semantics over the same VerifiedCommitTree bytes; findings 1/2/4 preserved; no Task 1-6/config/tag/release/rollout/external-state changes; blockers and remaining concerns: none)
+
+Task 7: fix round 2/5 complete (implementation fix commit 074626e10e64e9ebda17d8fd3a7688733bddeb8c; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md)

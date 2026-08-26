@@ -138,3 +138,76 @@ PASS: v1.47 commit content is secure at 0fb3a1d3b43bd03f125dbf1ae2e24970bec4024b
 - Changed production/test scope is exactly the Task 7 verifier and two release test
   files. No inventory default, workflow, action, helper, config, tag, release, rollout,
   GitHub, or Notion state changed. No blockers or remaining concerns were found.
+
+## Independent-review fix round 2/5
+
+Implementation fix commit: `074626e10e64e9ebda17d8fd3a7688733bddeb8c`
+
+The remaining Finding 3 was closed structurally. Helper verification now compares
+exact frozen-dataclass record shapes including field order, annotations, and defaults;
+authenticates the Decision and Outcome type aliases; binds each claim predicate to its
+ordered direct statement and refusal body; binds live finalization, stored-ledger cap,
+provenance, override, bounded-finding, checkpoint, and CAS relationships to their AST
+nodes; and rejects dead-code decoys. Reviewer workflow call caps are now verified in
+the named live step: exact Claude metrics step mapping, parsed Gemini embedded-Python
+function AST, and the anchored OpenCode `run_opencode` shell sequence. Raw helper
+fragment/occurrence-count gates and workflow-wide call-cap fragment searches were
+removed. Exact digest authentication remains after semantic validation and all inputs
+continue to come from `VerifiedCommitTree`.
+
+### Fix-round 2 RED evidence
+
+- Command:
+  `rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_budget_helper_semantics_bind_live_ast_relationships tests/test_verify_workflow_release.py::test_v147_budget_workflow_semantics_bind_live_reviewer_call_caps -q --tb=short`
+- Result: `9 failed in 0.89s`.
+- All nine mutations escaped the prior semantic verifier: schema annotation drift,
+  loss of the frozen record shape, a dead duplicate-head guard retaining its refusal,
+  a weakened live final cap with the exact relation copied into dead code, weakened
+  live RVW and provenance bounds with dead decoys, and Claude/Gemini/OpenCode live
+  call-cap weakening while the former raw fragments remained elsewhere.
+
+### Fix-round 2 GREEN and regression evidence
+
+- The same nine structural mutations: `9 passed in 0.63s`; touched verifier/test
+  `py_compile` passed in the same command.
+- Existing structural/digest and findings 1/2/4 focus:
+  `rtk python3 -m pytest tests/test_workflow_release_bundle.py::test_review_invocation_budget_action_has_exact_safe_contract tests/test_workflow_release_bundle.py::test_review_invocation_budget_capability_boundary_is_closed tests/test_verify_workflow_release.py::test_v147_requires_each_budget_file_as_one_regular_0644_blob tests/test_verify_workflow_release.py::test_v147_rejects_budget_helper_gate_removal tests/test_verify_workflow_release.py::test_v147_budget_helper_semantics_reject_authenticated_mutations tests/test_verify_workflow_release.py::test_v147_budget_helper_semantics_bind_live_ast_relationships tests/test_verify_workflow_release.py::test_v147_budget_workflow_semantics_reject_authenticated_mutations tests/test_verify_workflow_release.py::test_v147_budget_workflow_semantics_bind_live_reviewer_call_caps tests/test_verify_workflow_release.py::test_v147_accepts_current_budget_release_contract -q --tb=short`
+  → `48 passed in 11.25s`.
+- Release suite:
+  `rtk python3 -m pytest tests/test_workflow_release_bundle.py tests/test_verify_workflow_release.py -q --tb=short`
+  → `575 passed in 226.40s`.
+- Full unfiltered suite: `rtk python3 -m pytest -q --tb=short`
+  → `2665 passed, 48 subtests passed in 790.25s`.
+- Static checks:
+  `rtk git diff --check` and `rtk python3 -m py_compile scripts/workflow_release_inventory.py scripts/verify_workflow_release.py tests/test_workflow_release_bundle.py tests/test_verify_workflow_release.py`
+  → exit 0. The implementation diff contains only the Task 7 verifier and verifier
+  test module.
+
+### Fix-round 2 committed-byte verification
+
+After committing the implementation fix, no tag was created:
+
+```text
+rtk python3 -m scripts.verify_workflow_release --automation . --ref v1.47 --expected-commit "$(rtk git rev-parse HEAD)" --commit-only
+PASS: v1.47 commit content is secure at 074626e10e64e9ebda17d8fd3a7688733bddeb8c
+```
+
+### Fix-round 2 self-review
+
+- A copied expression or refusal in nested/dead code cannot satisfy claim validation:
+  the verifier requires the exact 12-statement direct claim body, exact predicate
+  positions, and matching direct/nested refusal bodies.
+- Finalization requires the exact live call-first `if`/wall-time `elif` AST at its
+  direct statement position; stored ledger cap exceptions are checked as one exact
+  live loop rather than independent strings.
+- Record checks include `@dataclass(frozen=True)`, exact ordered annotations, and
+  required/default expressions, closing same-name/wrong-type and mutable-record drift.
+- Bounded RVW checks bind list/tuple type, maximum eight, uniqueness, and the exact
+  `_FINDING.fullmatch` relation in the live deserializers and request validators.
+- Gemini caps bind the parsed `counted_generate_content` body; Claude binds the exact
+  live metrics step; OpenCode binds the unique counter-read anchor and following
+  refusal/increment sequence inside `run_opencode`. Decoys elsewhere cannot satisfy
+  these checks.
+- Findings 1, 2, and 4 remain covered and unchanged. No Task 1–6 action/helper/workflow
+  bytes, inventory default, config, tag, release, rollout, GitHub, or Notion state was
+  changed. No blockers or remaining concerns were found.
