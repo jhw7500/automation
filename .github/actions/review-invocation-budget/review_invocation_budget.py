@@ -240,18 +240,126 @@ class DecisionRecord:
 
 @dataclass(frozen=True)
 class Handoff:
-    values: tuple[tuple[str, object], ...] = ()
+    repository: str | None = None
+    pr: int | None = None
+    reviewer: Reviewer | None = None
+    current_head_sha: str | None = None
+    current_full_diff_sha256: str | None = None
+    current_run_id: int | None = None
+    current_run_attempt: int | None = None
+    automatic_rounds: int | None = None
+    override_rounds: int | None = None
+    round_usage: tuple[tuple[int, int, int, int], ...] = ()
+    decision: str | None = None
+    outcome: Outcome | None = None
+    stop_reason: str | None = None
+    authenticated_review_head_sha: str | None = None
+    authenticated_review_full_diff_sha256: str | None = None
+    remaining_finding_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
-        return dict(self.values)
+        if self.repository is None:
+            return {}
+        return {
+            "authenticated_review_full_diff_sha256": self.authenticated_review_full_diff_sha256,
+            "authenticated_review_head_sha": self.authenticated_review_head_sha,
+            "automatic_rounds": self.automatic_rounds,
+            "current_full_diff_sha256": self.current_full_diff_sha256,
+            "current_head_sha": self.current_head_sha,
+            "current_run_attempt": self.current_run_attempt,
+            "current_run_id": self.current_run_id,
+            "decision": self.decision,
+            "outcome": self.outcome,
+            "override_rounds": self.override_rounds,
+            "pr": self.pr,
+            "remaining_finding_ids": list(self.remaining_finding_ids),
+            "repository": self.repository,
+            "reviewer": self.reviewer,
+            "round_usage": [
+                {
+                    "call_count": call_count,
+                    "elapsed_seconds": elapsed_seconds,
+                    "estimated_input_tokens": estimated_input_tokens,
+                    "round_number": round_number,
+                }
+                for round_number, call_count, estimated_input_tokens, elapsed_seconds in self.round_usage
+            ],
+            "stop_reason": self.stop_reason,
+        }
 
     @classmethod
     def from_dict(cls, value: object) -> "Handoff":
         if not isinstance(value, dict):
             raise BudgetStateError("handoff_invalid")
-        if value:
+        if not value:
+            return cls()
+        keys = {
+            "authenticated_review_full_diff_sha256", "authenticated_review_head_sha",
+            "automatic_rounds", "current_full_diff_sha256", "current_head_sha",
+            "current_run_attempt", "current_run_id", "decision", "outcome",
+            "override_rounds", "pr", "remaining_finding_ids", "repository", "reviewer",
+            "round_usage", "stop_reason",
+        }
+        value = _exact_keys(value, keys, "handoff")
+        reviewer = _string(value["reviewer"], "reviewer")
+        if reviewer not in MARKERS:
             raise BudgetStateError("handoff_invalid")
-        return cls()
+        outcome = value["outcome"]
+        if outcome is not None and (not isinstance(outcome, str) or outcome not in _OUTCOMES):
+            raise BudgetStateError("handoff_invalid")
+        authenticated_head = value["authenticated_review_head_sha"]
+        authenticated_hash = value["authenticated_review_full_diff_sha256"]
+        if (authenticated_head is None) != (authenticated_hash is None):
+            raise BudgetStateError("handoff_invalid")
+        if authenticated_head is not None:
+            authenticated_head = _hash(authenticated_head, _HEAD, "authenticated_review_head_sha")
+            authenticated_hash = _hash(authenticated_hash, _HASH, "authenticated_review_full_diff_sha256")
+        findings = value["remaining_finding_ids"]
+        if (not isinstance(findings, list) or len(findings) > 8 or len(findings) != len(set(findings)) or
+                not all(isinstance(item, str) and _FINDING.fullmatch(item) for item in findings)):
+            raise BudgetStateError("handoff_invalid")
+        usage = value["round_usage"]
+        if not isinstance(usage, list) or len(usage) > 3:
+            raise BudgetStateError("handoff_invalid")
+        parsed_usage: list[tuple[int, int, int, int]] = []
+        for item in usage:
+            item = _exact_keys(
+                item,
+                {"round_number", "call_count", "estimated_input_tokens", "elapsed_seconds"},
+                "handoff_round_usage",
+            )
+            parsed_usage.append((
+                _integer(item["round_number"], "round_number", positive=True),
+                _integer(item["call_count"], "call_count", minimum=0),
+                _integer(item["estimated_input_tokens"], "estimated_input_tokens", minimum=0),
+                _integer(item["elapsed_seconds"], "elapsed_seconds", minimum=0),
+            ))
+        decision = _string(value["decision"], "decision")
+        if decision not in {
+            "claimed", "finalized", "state_invalid", "diff_unavailable", "authenticated_reuse",
+            "duplicate_head", "duplicate_effective_diff", "input_budget_exhausted",
+            "round_budget_exhausted", "total_usage_budget_exhausted",
+        }:
+            raise BudgetStateError("handoff_invalid")
+        return cls(
+            repository=_string(value["repository"], "repository"),
+            pr=_integer(value["pr"], "pr", positive=True), reviewer=reviewer,
+            current_head_sha=_hash(value["current_head_sha"], _HEAD, "current_head_sha"),
+            current_full_diff_sha256=_hash(
+                value["current_full_diff_sha256"], _HASH, "current_full_diff_sha256",
+            ),
+            current_run_id=_integer(value["current_run_id"], "current_run_id", positive=True),
+            current_run_attempt=_integer(
+                value["current_run_attempt"], "current_run_attempt", positive=True,
+            ),
+            automatic_rounds=_integer(value["automatic_rounds"], "automatic_rounds", minimum=0),
+            override_rounds=_integer(value["override_rounds"], "override_rounds", minimum=0),
+            round_usage=tuple(parsed_usage), decision=decision, outcome=outcome,
+            stop_reason=_string(value["stop_reason"], "stop_reason"),
+            authenticated_review_head_sha=authenticated_head,
+            authenticated_review_full_diff_sha256=authenticated_hash,
+            remaining_finding_ids=tuple(findings),
+        )
 
 
 @dataclass(frozen=True)
@@ -363,11 +471,21 @@ def _validate_state_shape(state: LedgerState) -> None:
         raise BudgetStateError("consumed_override_event_ids_invalid")
     for item in state.invocations:
         Invocation.from_dict(item.to_dict())
-        if item.call_count > state.budgets.max_calls_per_round:
+        call_failure = (
+            item.status == "finalized" and item.outcome == "checkpoint_failure" and
+            item.stop_reason == "call_budget_exhausted"
+        )
+        wall_failure = (
+            item.status == "finalized" and item.outcome == "wall_time_exhausted" and
+            item.stop_reason == "wall_time_exhausted"
+        )
+        if item.call_count > state.budgets.max_calls_per_round and not call_failure:
             raise BudgetStateError("call_budget_exhausted")
         if item.estimated_input_tokens > state.budgets.max_estimated_tokens_per_round:
             raise BudgetStateError("input_budget_exhausted")
-        if item.elapsed_seconds > state.budgets.max_wall_seconds_per_round:
+        call_first_dual_failure = call_failure and item.call_count > state.budgets.max_calls_per_round
+        if (item.elapsed_seconds > state.budgets.max_wall_seconds_per_round and
+                not (wall_failure or call_first_dual_failure)):
             raise BudgetStateError("wall_time_exhausted")
     run_keys = {(item.run_id, item.run_attempt) for item in state.invocations}
     if len(run_keys) != len(state.invocations):
@@ -399,7 +517,31 @@ def _validate_state_shape(state: LedgerState) -> None:
     if sum(item.estimated_input_tokens for item in state.invocations) > total_limit:
         raise BudgetStateError("total_usage_budget_exhausted")
     DecisionRecord.from_dict(state.last_decision.to_dict())
-    Handoff.from_dict(state.handoff.to_dict())
+    handoff = Handoff.from_dict(state.handoff.to_dict())
+    if handoff.repository is not None:
+        expected_usage = tuple(
+            (item.round_number, item.call_count, item.estimated_input_tokens, item.elapsed_seconds)
+            for item in state.invocations
+        )
+        matching_inputs = [
+            item for item in state.invocations
+            if (item.head_sha == handoff.current_head_sha or
+                item.full_diff_sha256 == handoff.current_full_diff_sha256)
+        ]
+        expected_outcome = matching_inputs[-1].outcome if matching_inputs else None
+        if (
+            (handoff.repository, handoff.pr, handoff.reviewer) !=
+            (state.repository, state.pr, state.reviewer) or
+            handoff.automatic_rounds != len(automatic) or
+            handoff.override_rounds != len(overrides) or
+            handoff.round_usage != expected_usage or
+            handoff.decision != state.last_decision.decision or
+            handoff.stop_reason != state.last_decision.stop_reason or
+            handoff.current_run_id != state.last_decision.run_id or
+            handoff.current_run_attempt != state.last_decision.run_attempt or
+            handoff.outcome != expected_outcome
+        ):
+            raise BudgetStateError("handoff_mismatch")
 
 
 def serialize_ledger(state: LedgerState) -> str:
@@ -477,7 +619,9 @@ def _validate_request(request: ClaimRequest) -> None:
     _string(request.call_unit, "call_unit")
 
 
-def _validate_provenance(state: LedgerState, request: ClaimRequest, provenances: Mapping[tuple[int, int], RunProvenance]) -> None:
+def _validate_provenance(
+        state: LedgerState, request: ClaimRequest | FinalizeRequest,
+        provenances: Mapping[tuple[int, int], RunProvenance]) -> None:
     for item in state.invocations:
         provenance = provenances.get((item.run_id, item.run_attempt))
         if not isinstance(provenance, RunProvenance):
@@ -510,6 +654,49 @@ def estimated_total(state: LedgerState) -> int:
     return sum(item.estimated_input_tokens for item in state.invocations)
 
 
+def _handoff_outcome(state: LedgerState, request: ClaimRequest) -> Outcome | None:
+    for item in reversed(state.invocations):
+        if item.head_sha == request.head_sha or item.full_diff_sha256 == request.full_diff_sha256:
+            return item.outcome
+    return None
+
+
+def _build_handoff(
+        state: LedgerState, request: ClaimRequest | FinalizeRequest, *, outcome: Outcome | None = None,
+        remaining_finding_ids: tuple[str, ...] | None = None) -> Handoff:
+    prior = state.handoff
+    review = request.authenticated_review
+    if outcome in {"success", "quality_filtered"}:
+        authenticated_head = request.head_sha
+        authenticated_hash = request.full_diff_sha256
+    elif review.success:
+        authenticated_head = review.head_sha
+        authenticated_hash = review.full_diff_sha256
+    else:
+        authenticated_head = prior.authenticated_review_head_sha
+        authenticated_hash = prior.authenticated_review_full_diff_sha256
+    if remaining_finding_ids is None:
+        if review.success:
+            remaining_finding_ids = review.remaining_finding_ids
+        else:
+            remaining_finding_ids = prior.remaining_finding_ids
+    return Handoff(
+        repository=state.repository, pr=state.pr, reviewer=state.reviewer,
+        current_head_sha=request.head_sha, current_full_diff_sha256=request.full_diff_sha256,
+        current_run_id=request.run_id, current_run_attempt=request.run_attempt,
+        automatic_rounds=automatic_rounds(state),
+        override_rounds=sum(item.override_event_id is not None for item in state.invocations),
+        round_usage=tuple(
+            (item.round_number, item.call_count, item.estimated_input_tokens, item.elapsed_seconds)
+            for item in state.invocations
+        ),
+        decision=state.last_decision.decision, outcome=outcome, stop_reason=state.last_decision.stop_reason,
+        authenticated_review_head_sha=authenticated_head,
+        authenticated_review_full_diff_sha256=authenticated_hash,
+        remaining_finding_ids=remaining_finding_ids,
+    )
+
+
 def choose_override(state: LedgerState, events: Sequence[OverrideEvent]) -> OverrideEvent | None:
     if any(item.override_event_id is not None for item in state.invocations):
         return None
@@ -523,7 +710,8 @@ def choose_override(state: LedgerState, events: Sequence[OverrideEvent]) -> Over
 
 
 def _decision_state(state: LedgerState, request: ClaimRequest, decision: str, stop_reason: str) -> LedgerState:
-    return replace(state, last_decision=DecisionRecord(decision, stop_reason, request.run_id, request.run_attempt))
+    updated = replace(state, last_decision=DecisionRecord(decision, stop_reason, request.run_id, request.run_attempt))
+    return replace(updated, handoff=_build_handoff(updated, request, outcome=_handoff_outcome(updated, request)))
 
 
 def refuse(state: LedgerState, request: ClaimRequest, decision: str) -> Transition:
@@ -547,7 +735,8 @@ def append_claim(state: LedgerState, request: ClaimRequest, override: OverrideEv
     return Transition(updated, True, "claimed", "claimed", round_number, f"{request.run_id}:{request.run_attempt}", True)
 
 
-def _invalid_transition(state: LedgerState | None, request: ClaimRequest, reason: str) -> Transition:
+def _invalid_transition(
+        state: LedgerState | None, request: ClaimRequest | FinalizeRequest, reason: str) -> Transition:
     if state is None:
         try:
             state = LedgerState.initial(request.repository, request.pr, request.reviewer)
@@ -584,3 +773,183 @@ def claim(state: LedgerState | None, request: ClaimRequest,
     if estimated_total(validated) + request.estimated_input_tokens > total_limit:
         return refuse(validated, request, "total_usage_budget_exhausted")
     return append_claim(validated, request, override)
+
+
+def _validate_finalize_request(request: FinalizeRequest) -> None:
+    if request.reviewer not in MARKERS or not isinstance(request.repository, str) or not request.repository:
+        raise BudgetStateError("identity_invalid")
+    _integer(request.pr, "pr", positive=True)
+    _integer(request.run_id, "run_id", positive=True)
+    _integer(request.run_attempt, "run_attempt", positive=True)
+    _hash(request.head_sha, _HEAD, "head_sha")
+    _hash(request.full_diff_sha256, _HASH, "full_diff_sha256")
+    _integer(request.call_count, "call_count", minimum=0)
+    _integer(request.elapsed_seconds, "elapsed_seconds", minimum=0)
+    if (not isinstance(request.model_route, tuple) or not request.model_route or
+            not all(isinstance(item, str) and item for item in request.model_route)):
+        raise BudgetStateError("model_route_invalid")
+    _string(request.effort, "effort")
+    if not isinstance(request.outcome, str) or request.outcome not in _OUTCOMES:
+        raise BudgetStateError("outcome_invalid")
+    if not isinstance(request.stop_reason, str) or not request.stop_reason:
+        raise BudgetStateError("stop_reason_invalid")
+    if not isinstance(request.authenticated_review, AuthenticatedReview):
+        raise BudgetStateError("authenticated_review_invalid")
+    review = request.authenticated_review
+    if not isinstance(review.success, bool):
+        raise BudgetStateError("authenticated_review_invalid")
+    if review.success:
+        if review.head_sha is None or review.full_diff_sha256 is None:
+            raise BudgetStateError("authenticated_review_invalid")
+        _hash(review.head_sha, _HEAD, "authenticated_head_sha")
+        _hash(review.full_diff_sha256, _HASH, "authenticated_full_diff_sha256")
+    elif review.head_sha is not None or review.full_diff_sha256 is not None:
+        raise BudgetStateError("authenticated_review_invalid")
+    if (len(review.remaining_finding_ids) > 8 or
+            len(review.remaining_finding_ids) != len(set(review.remaining_finding_ids)) or
+            not all(isinstance(item, str) and _FINDING.fullmatch(item) for item in review.remaining_finding_ids)):
+        raise BudgetStateError("authenticated_review_invalid")
+    findings = request.remaining_finding_ids
+    if (not isinstance(findings, tuple) or len(findings) > 8 or len(findings) != len(set(findings)) or
+            not all(isinstance(item, str) and _FINDING.fullmatch(item) for item in findings)):
+        raise BudgetStateError("remaining_finding_ids_invalid")
+
+
+def _finalize_remaining_ids(state: LedgerState, request: FinalizeRequest) -> tuple[str, ...]:
+    if request.remaining_finding_ids:
+        return request.remaining_finding_ids
+    if request.authenticated_review.success:
+        return tuple(request.authenticated_review.remaining_finding_ids)
+    if request.outcome == "provider_failure":
+        if state.handoff.repository is not None:
+            return state.handoff.remaining_finding_ids
+        for item in reversed(state.invocations):
+            if item.status == "finalized" and item.remaining_finding_ids:
+                return item.remaining_finding_ids
+    return ()
+
+
+def finalize(
+        state: LedgerState, request: FinalizeRequest,
+        provenances: Mapping[tuple[int, int], RunProvenance]) -> Transition:
+    try:
+        _validate_finalize_request(request)
+        _validate_state_shape(state)
+        if (state.repository, state.pr, state.reviewer) != (
+                request.repository, request.pr, request.reviewer):
+            raise BudgetStateError("identity_mismatch")
+        _validate_provenance(state, request, provenances)
+    except BudgetStateError as exc:
+        return _invalid_transition(state, request, str(exc))
+
+    exact = [
+        (index, item) for index, item in enumerate(state.invocations)
+        if (item.run_id, item.run_attempt, item.head_sha, item.full_diff_sha256) == (
+            request.run_id, request.run_attempt, request.head_sha, request.full_diff_sha256,
+        )
+    ]
+    if len(exact) != 1:
+        same_run = any(
+            (item.run_id, item.run_attempt) == (request.run_id, request.run_attempt)
+            for item in state.invocations
+        )
+        return _invalid_transition(
+            state, request, "finalization_identity_mismatch" if same_run else "invocation_not_claimed",
+        )
+    index, entry = exact[0]
+    if entry.status != "claimed":
+        return _invalid_transition(state, request, "invocation_not_claimed")
+    if request.model_route[0] != entry.model_route[0]:
+        return _invalid_transition(state, request, "model_route_unknown")
+    outcome = request.outcome
+    stop_reason = request.stop_reason
+    if request.call_count > state.budgets.max_calls_per_round:
+        outcome, stop_reason = "checkpoint_failure", "call_budget_exhausted"
+    elif request.elapsed_seconds > state.budgets.max_wall_seconds_per_round:
+        outcome, stop_reason = "wall_time_exhausted", "wall_time_exhausted"
+    remaining = _finalize_remaining_ids(state, request)
+    completed = replace(
+        entry, status="finalized", outcome=outcome, stop_reason=stop_reason,
+        call_count=request.call_count, elapsed_seconds=request.elapsed_seconds,
+        model_route=request.model_route, effort=request.effort, remaining_finding_ids=remaining,
+    )
+    invocations = state.invocations[:index] + (completed,) + state.invocations[index + 1:]
+    updated = replace(
+        state, invocations=invocations,
+        last_decision=DecisionRecord("finalized", stop_reason, request.run_id, request.run_attempt),
+    )
+    updated = replace(
+        updated,
+        handoff=_build_handoff(updated, request, outcome=outcome, remaining_finding_ids=remaining),
+    )
+    try:
+        _validate_state_shape(updated)
+    except BudgetStateError as exc:
+        return _invalid_transition(state, request, str(exc))
+    return Transition(
+        updated, False, "finalized", stop_reason, completed.round_number,
+        f"{request.run_id}:{request.run_attempt}", True,
+    )
+
+
+_REVIEWER_TITLES = {"claude": "Claude", "gemini": "Gemini", "opencode": "OpenCode"}
+
+
+def _summary(state: LedgerState, *, server_url: str) -> str:
+    _validate_state_shape(state)
+    handoff = state.handoff
+    if handoff.repository is None:
+        raise BudgetStateError("handoff_missing")
+    if not isinstance(server_url, str) or not server_url or "\n" in server_url or "\r" in server_url:
+        raise BudgetStateError("server_url_invalid")
+    run_url = f"{server_url.rstrip('/')}/{state.repository}/actions/runs/{handoff.current_run_id}"
+    return (
+        f"## {_REVIEWER_TITLES[state.reviewer]} review invocation budget\n"
+        f"- Decision: {handoff.decision}\n"
+        f"- Automatic rounds: {handoff.automatic_rounds}/{state.budgets.max_rounds}\n"
+        f"- Override rounds: {handoff.override_rounds}/{state.budgets.max_override_rounds}\n"
+        f"- Current run: {run_url}\n"
+        f"- Stop reason: {handoff.stop_reason}\n\n"
+        "Budget exhaustion is not review approval. Use the authenticated review checkpoint and "
+        "remaining finding IDs before merge."
+    )
+
+
+def render_summary(state: LedgerState) -> str:
+    return _summary(state, server_url="https://github.com")
+
+
+def render_comment(state: LedgerState, *, server_url: str) -> str:
+    state_lines = (
+        f"{MARKERS[state.reviewer]}\n"
+        f"{STATE_PREFIX}{serialize_ledger(state)}{STATE_SUFFIX}"
+    )
+    return f"{state_lines}\n\n{_summary(state, server_url=server_url)}"
+
+
+def render_checkpoint(state: LedgerState) -> bytes:
+    _validate_state_shape(state)
+    payload = {"schema": SCHEMA, "ledger": state.to_dict(), "handoff": state.handoff.to_dict()}
+    return (
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii") + b"\n"
+    )
+
+
+def load_checkpoint(payload: bytes) -> LedgerState:
+    if not isinstance(payload, bytes):
+        raise BudgetStateError("checkpoint_invalid")
+    try:
+        text = payload.decode("ascii")
+        raw = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+        raise BudgetStateError("checkpoint_json_invalid") from exc
+    raw = _exact_keys(raw, {"schema", "ledger", "handoff"}, "checkpoint")
+    if _integer(raw["schema"], "schema", positive=True) != SCHEMA:
+        raise BudgetStateError("checkpoint_schema_invalid")
+    state = LedgerState.from_dict(raw["ledger"])
+    handoff = Handoff.from_dict(raw["handoff"])
+    if handoff != state.handoff:
+        raise BudgetStateError("checkpoint_handoff_mismatch")
+    if payload != render_checkpoint(state):
+        raise BudgetStateError("checkpoint_json_noncanonical")
+    return state

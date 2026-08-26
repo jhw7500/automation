@@ -22,13 +22,27 @@ HEAD_C = "c" * 40
 HASH_1 = "1" * 64
 HASH_2 = "2" * 64
 HASH_3 = "3" * 64
+FINDING_1 = "RVW-111111111111"
+FINDING_2 = "RVW-222222222222"
+
+ROUTES = {
+    "claude": ("claude-code-action-default",),
+    "gemini": ("gemini-3.7-flash",),
+    "opencode": ("zai-coding-plan/glm-4.7",),
+}
+EFFORTS = {"claude": "final-review/default", "gemini": "medium", "opencode": "final-review/default"}
+CALL_UNITS = {
+    "claude": "claude-code-action review session",
+    "gemini": "generate_content request",
+    "opencode": "opencode run session",
+}
 
 
-def request(*, head=HEAD_A, full_hash=HASH_1, run_id=700, run_attempt=1, **changes):
+def request(*, reviewer="claude", head=HEAD_A, full_hash=HASH_1, run_id=700, run_attempt=1, **changes):
     values = {
         "repository": REPOSITORY,
         "pr": PR,
-        "reviewer": "claude",
+        "reviewer": reviewer,
         "run_id": run_id,
         "run_attempt": run_attempt,
         "head_sha": head,
@@ -37,12 +51,36 @@ def request(*, head=HEAD_A, full_hash=HASH_1, run_id=700, run_attempt=1, **chang
         "diff_mode": "changed",
         "authenticated_review": budget.AuthenticatedReview(False, None, None),
         "override_events": (),
-        "model_route": ("claude-code-action-default",),
-        "effort": "final-review/default",
-        "call_unit": "claude-code-action review session",
+        "model_route": ROUTES[reviewer],
+        "effort": EFFORTS[reviewer],
+        "call_unit": CALL_UNITS[reviewer],
     }
     values.update(changes)
     return budget.ClaimRequest(**values)
+
+
+def finalize_request(*, reviewer="claude", head=HEAD_A, full_hash=HASH_1, run_id=700,
+                     run_attempt=1, calls=1, elapsed=10, outcome="success", stop_reason=None,
+                     authenticated_review=None, remaining=(), model_route=None, **changes):
+    values = {
+        "repository": REPOSITORY,
+        "pr": PR,
+        "reviewer": reviewer,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": head,
+        "full_diff_sha256": full_hash,
+        "model_route": ROUTES[reviewer] if model_route is None else model_route,
+        "effort": EFFORTS[reviewer],
+        "call_count": calls,
+        "elapsed_seconds": elapsed,
+        "outcome": outcome,
+        "stop_reason": outcome if stop_reason is None else stop_reason,
+        "authenticated_review": authenticated_review or budget.AuthenticatedReview(False, None, None),
+        "remaining_finding_ids": remaining,
+    }
+    values.update(changes)
+    return budget.FinalizeRequest(**values)
 
 
 def invocation(*, head=HEAD_A, full_hash=HASH_1, run_id=501, run_attempt=1,
@@ -79,11 +117,24 @@ def valid_provenances(state):
     return {
         (entry.run_id, entry.run_attempt): budget.RunProvenance(
             repository=REPOSITORY, pr=PR, head_sha=entry.head_sha,
-            workflow_path=budget.WORKFLOWS["claude"], run_id=entry.run_id,
+            workflow_path=budget.WORKFLOWS[state.reviewer], run_id=entry.run_id,
             run_attempt=entry.run_attempt, status="completed", conclusion="cancelled",
         )
         for entry in state.invocations
     }
+
+
+def current_provenances(state, *, conclusion=None):
+    current = state.invocations[-1]
+    provenances = valid_provenances(state)
+    provenances[(current.run_id, current.run_attempt)] = replace(
+        provenances[(current.run_id, current.run_attempt)], status="in_progress", conclusion=conclusion,
+    )
+    return provenances
+
+
+def claimed_state(reviewer="claude"):
+    return budget.claim(None, request(reviewer=reviewer), {}).state
 
 
 def ledger_body(state):
@@ -122,7 +173,7 @@ def unchanged_request():
 
 def test_fixed_claim_vectors():
     vectors = json.loads((Path(__file__).parent / "fixtures/review-invocation-budget/cases.json").read_text())
-    for vector in vectors:
+    for vector in (item for item in vectors if item.get("kind", "claim") == "claim"):
         events = ()
         if "override_event" in vector:
             events = (budget.OverrideEvent(vector["override_event"], "labeled", "review-budget-override", "write"),)
@@ -140,6 +191,230 @@ def test_fixed_claim_vectors():
             assert result.round_number == (3 if vector["prior"] == "two-successes" else 1)
         if "override_event" in vector:
             assert result.state.consumed_override_event_ids == (vector["override_event"],)
+
+
+def test_fixed_finalize_vectors():
+    vectors = json.loads((Path(__file__).parent / "fixtures/review-invocation-budget/cases.json").read_text())
+    for vector in (item for item in vectors if item.get("kind") == "finalize"):
+        reviewer = vector["reviewer"]
+        state = claimed_state(reviewer)
+        result = budget.finalize(
+            state,
+            finalize_request(
+                reviewer=reviewer,
+                calls=vector.get("calls", 1),
+                elapsed=vector.get("elapsed", 10),
+                outcome=vector.get("outcome", "success"),
+                remaining=tuple(vector.get("remaining", ())),
+            ),
+            current_provenances(state),
+        )
+        completed = result.state.invocations[-1]
+        assert result.decision == "finalized", vector["name"]
+        assert completed.outcome == vector["expected_outcome"], vector["name"]
+        assert completed.call_count == vector.get("calls", 1), vector["name"]
+        assert completed.elapsed_seconds == vector.get("elapsed", 10), vector["name"]
+        assert completed.remaining_finding_ids == tuple(vector.get("remaining", ())), vector["name"]
+        assert completed.stop_reason, vector["name"]
+
+
+def test_gemini_primary_retry_and_fallback_share_one_three_request_cap():
+    state = claimed_state("gemini")
+    allowed = budget.finalize(
+        state, finalize_request(reviewer="gemini", calls=3), current_provenances(state),
+    )
+    refused = budget.finalize(
+        state, finalize_request(reviewer="gemini", calls=4), current_provenances(state),
+    )
+    assert allowed.state.invocations[-1].outcome == "success"
+    assert refused.state.invocations[-1].outcome == "checkpoint_failure"
+    assert refused.state.invocations[-1].stop_reason == "call_budget_exhausted"
+
+
+def test_call_overage_wins_when_call_and_wall_caps_are_both_exceeded():
+    state = claimed_state()
+    result = budget.finalize(
+        state,
+        finalize_request(calls=2, elapsed=601),
+        current_provenances(state),
+    )
+    completed = result.state.invocations[-1]
+    assert result.decision == "finalized"
+    assert completed.call_count == 2
+    assert completed.elapsed_seconds == 601
+    assert completed.outcome == "checkpoint_failure"
+    assert completed.stop_reason == "call_budget_exhausted"
+    assert budget.load_checkpoint(budget.render_checkpoint(result.state)) == result.state
+
+
+def test_quality_filtered_is_terminal_and_duplicate_input_stays_blocked():
+    state = claimed_state()
+    done = budget.finalize(
+        state, finalize_request(outcome="quality_filtered"), current_provenances(state),
+    )
+    again = budget.claim(done.state, request(), valid_provenances(done.state))
+    assert again.decision == "duplicate_head"
+    assert not again.allow_invocation
+
+
+def test_finalization_matches_one_claim_and_rejects_identity_or_status_drift():
+    state = claimed_state()
+    finalized = budget.finalize(state, finalize_request(), current_provenances(state))
+    second = budget.finalize(finalized.state, finalize_request(), valid_provenances(finalized.state))
+    drift = budget.finalize(
+        state, replace(finalize_request(), full_diff_sha256=HASH_2), current_provenances(state),
+    )
+    assert second.decision == "state_invalid"
+    assert second.stop_reason == "invocation_not_claimed"
+    assert drift.decision == "state_invalid"
+    assert drift.stop_reason == "finalization_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"call_count": -1}, "call_count_invalid"),
+        ({"call_count": True}, "call_count_invalid"),
+        ({"elapsed_seconds": -1}, "elapsed_seconds_invalid"),
+        ({"elapsed_seconds": False}, "elapsed_seconds_invalid"),
+        ({"model_route": ("unknown-model",)}, "model_route_unknown"),
+        ({"remaining_finding_ids": (FINDING_1,) * 2}, "remaining_finding_ids_invalid"),
+        ({"remaining_finding_ids": tuple(f"RVW-{index:012x}" for index in range(9))}, "remaining_finding_ids_invalid"),
+    ],
+)
+def test_finalization_rejects_invalid_metrics_route_and_findings(changes, reason):
+    state = claimed_state()
+    result = budget.finalize(state, replace(finalize_request(), **changes), current_provenances(state))
+    assert result.decision == "state_invalid"
+    assert result.stop_reason == reason
+
+
+def test_finalization_requires_current_run_provenance():
+    state = claimed_state()
+    result = budget.finalize(state, finalize_request(), {})
+    assert result.decision == "state_invalid"
+    assert result.stop_reason == "provenance_mismatch"
+
+
+def test_provider_failure_preserves_prior_authenticated_findings_without_newer_list():
+    first_claim = claimed_state()
+    first = budget.finalize(
+        first_claim,
+        finalize_request(outcome="success", remaining=(FINDING_1, FINDING_2)),
+        current_provenances(first_claim),
+    ).state
+    second_claim = budget.claim(
+        first,
+        request(head=HEAD_B, full_hash=HASH_2, run_id=701),
+        valid_provenances(first),
+    ).state
+    failed = budget.finalize(
+        second_claim,
+        finalize_request(
+            head=HEAD_B, full_hash=HASH_2, run_id=701, outcome="provider_failure", remaining=(),
+        ),
+        current_provenances(second_claim),
+    ).state
+    assert failed.invocations[-1].remaining_finding_ids == (FINDING_1, FINDING_2)
+    assert failed.handoff.remaining_finding_ids == (FINDING_1, FINDING_2)
+    assert failed.handoff.authenticated_review_head_sha == HEAD_A
+    assert failed.handoff.authenticated_review_full_diff_sha256 == HASH_1
+
+
+def test_comment_summary_and_handoff_are_exact_and_workflow_owned():
+    state = claimed_state()
+    finalized = budget.finalize(
+        state,
+        finalize_request(outcome="success", remaining=(FINDING_1,)),
+        current_provenances(state),
+    ).state
+    duplicate = budget.claim(finalized, request(), valid_provenances(finalized)).state
+    visible = (
+        "## Claude review invocation budget\n"
+        "- Decision: duplicate_head\n"
+        "- Automatic rounds: 1/2\n"
+        "- Override rounds: 0/1\n"
+        "- Current run: https://github.com/example/repo/actions/runs/700\n"
+        "- Stop reason: duplicate_head\n\n"
+        "Budget exhaustion is not review approval. Use the authenticated review checkpoint and remaining finding IDs before merge."
+    )
+    state_lines = (
+        f"{budget.MARKERS['claude']}\n"
+        f"{budget.STATE_PREFIX}{budget.serialize_ledger(duplicate)}{budget.STATE_SUFFIX}"
+    )
+    assert budget.render_summary(duplicate) == visible
+    assert budget.render_comment(duplicate, server_url="https://github.com") == f"{state_lines}\n\n{visible}"
+    assert duplicate.handoff.to_dict() == {
+        "repository": REPOSITORY,
+        "pr": PR,
+        "reviewer": "claude",
+        "current_head_sha": HEAD_A,
+        "current_full_diff_sha256": HASH_1,
+        "current_run_id": 700,
+        "current_run_attempt": 1,
+        "automatic_rounds": 1,
+        "override_rounds": 0,
+        "round_usage": [{
+            "round_number": 1,
+            "call_count": 1,
+            "estimated_input_tokens": 50_000,
+            "elapsed_seconds": 10,
+        }],
+        "decision": "duplicate_head",
+        "outcome": "success",
+        "stop_reason": "duplicate_head",
+        "authenticated_review_head_sha": HEAD_A,
+        "authenticated_review_full_diff_sha256": HASH_1,
+        "remaining_finding_ids": [FINDING_1],
+    }
+
+
+def test_checkpoint_is_canonical_and_round_trips_without_external_context():
+    state = claimed_state()
+    finalized = budget.finalize(state, finalize_request(), current_provenances(state)).state
+    payload = budget.render_checkpoint(finalized)
+    expected = json.dumps(
+        {"schema": 1, "ledger": finalized.to_dict(), "handoff": finalized.handoff.to_dict()},
+        ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+    ).encode("ascii") + b"\n"
+    assert payload == expected
+    assert budget.load_checkpoint(payload) == finalized
+    with pytest.raises(budget.BudgetStateError, match="checkpoint_json_noncanonical"):
+        budget.load_checkpoint(json.dumps(json.loads(payload)).encode() + b"\n")
+    mismatched = json.loads(payload)
+    mismatched["handoff"]["stop_reason"] = "tampered"
+    tampered = json.dumps(mismatched, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+    with pytest.raises(budget.BudgetStateError, match="checkpoint_handoff_mismatch"):
+        budget.load_checkpoint(tampered)
+
+
+def test_ledger_rejects_handoff_outcome_drift():
+    state = claimed_state()
+    finalized = budget.finalize(state, finalize_request(), current_provenances(state)).state
+    tampered = replace(
+        finalized, handoff=replace(finalized.handoff, outcome="provider_failure"),
+    )
+    assert_stored_state_rejected(tampered, "handoff_mismatch")
+
+
+def test_checkpoint_alone_reconstructs_next_session(tmp_path):
+    claimed = claimed_state()
+    provider_failed = budget.finalize(
+        claimed,
+        finalize_request(outcome="provider_failure"),
+        current_provenances(claimed),
+    ).state
+    checkpoint = tmp_path / "budget.json"
+    checkpoint.write_bytes(budget.render_checkpoint(provider_failed))
+    restored = budget.load_checkpoint(checkpoint.read_bytes())
+    same = budget.claim(restored, request(run_id=701), valid_provenances(restored))
+    second = budget.claim(
+        restored,
+        request(head=HEAD_B, full_hash=HASH_2, run_id=701),
+        valid_provenances(restored),
+    )
+    assert same.decision == "duplicate_head"
+    assert second.allow_invocation
 
 
 def test_parser_requires_exact_schema_and_serializes_deterministically():
@@ -295,6 +570,24 @@ def test_stored_call_count_enforces_each_reviewer_boundary(reviewer, max_calls):
     )
     assert_stored_state_rejected(above_limit, "call_budget_exhausted")
 
+    normalized_failure = replace(
+        above_limit,
+        invocations=(replace(
+            above_limit.invocations[0],
+            outcome="checkpoint_failure",
+            stop_reason="call_budget_exhausted",
+        ),),
+    )
+    assert budget.parse_ledger(
+        ledger_body(normalized_failure), repository=REPOSITORY, pr=PR, reviewer=reviewer,
+    ) == normalized_failure
+    assert_stored_state_rejected(
+        replace(normalized_failure, invocations=(replace(
+            normalized_failure.invocations[0], stop_reason="wrong",
+        ),)),
+        "call_budget_exhausted",
+    )
+
 
 def test_stored_elapsed_seconds_enforces_round_boundary():
     at_limit = budget.LedgerState.initial(
@@ -307,6 +600,24 @@ def test_stored_elapsed_seconds_enforces_round_boundary():
         at_limit, invocations=(replace(at_limit.invocations[0], elapsed_seconds=601),),
     )
     assert_stored_state_rejected(above_limit, "wall_time_exhausted")
+
+    normalized_failure = replace(
+        above_limit,
+        invocations=(replace(
+            above_limit.invocations[0],
+            outcome="wall_time_exhausted",
+            stop_reason="wall_time_exhausted",
+        ),),
+    )
+    assert budget.parse_ledger(
+        ledger_body(normalized_failure), repository=REPOSITORY, pr=PR, reviewer="claude",
+    ) == normalized_failure
+    assert_stored_state_rejected(
+        replace(normalized_failure, invocations=(replace(
+            normalized_failure.invocations[0], outcome="checkpoint_failure",
+        ),)),
+        "wall_time_exhausted",
+    )
 
 
 def test_stored_estimated_input_enforces_round_boundary():
