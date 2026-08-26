@@ -2238,6 +2238,166 @@ def test_v147_opencode_call_cap_rejects_dead_canonical_function_decoy(
 
 
 @pytest.mark.parametrize(
+    "compact_redefinition",
+    (
+        (
+            "function run_opencode { local prompt_path=\"$1\"; "
+            "local output_path=\"$2\"; shift 2; "
+            "opencode run --model zai-coding-plan/glm-4.7 \"$@\" "
+            "< \"$prompt_path\" > \"$output_path\"; }"
+        ),
+        (
+            "run_opencode(){ local prompt_path=\"$1\"; "
+            "local output_path=\"$2\"; shift 2; "
+            "opencode run --model zai-coding-plan/glm-4.7 \"$@\" "
+            "< \"$prompt_path\" > \"$output_path\"; }"
+        ),
+    ),
+    ids=("bash-function-form", "posix-name-form"),
+)
+def test_v147_opencode_call_cap_rejects_compact_function_redefinition(
+    current_release_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    compact_redefinition: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+    syntax = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-n", "-c", compact_redefinition],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+    source = path.read_text(encoding="utf-8")
+    function_start = source.index("          run_opencode() {\n")
+    function_end = source.index(
+        "\n\n          extract_candidate() {", function_start
+    )
+    canonical_function = source[function_start:function_end]
+    mutate_named_step_text(
+        path,
+        "Run OpenCode PR review",
+        canonical_function,
+        f"{canonical_function}\n\n          {compact_redefinition}",
+    )
+    bad_commit = commit(repo, "add compact unbounded OpenCode redefinition")
+    payload = path.read_bytes()
+    monkeypatch.setitem(
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256,
+        "opencode",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    tree = release_verifier.VerifiedCommitTree.open(repo, bad_commit)
+    assert hashlib.sha256(
+        tree.read_file(".github/workflows/opencode-auto-review.yml")
+    ).hexdigest() == (
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256[
+            "opencode"
+        ]
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError, match="invocation-budget workflow contract"
+    ):
+        release_verifier.require_budget_workflow_contract(
+            tree, "opencode-auto-review.yml", "opencode"
+        )
+
+
+@pytest.mark.parametrize(
+    "target_affecting_statement",
+    (
+        (
+            "if true; then function run_opencode { "
+            "opencode run --model zai-coding-plan/glm-4.7 \"$@\"; }; fi"
+        ),
+        (
+            "eval 'run_opencode(){ opencode run --model "
+            "zai-coding-plan/glm-4.7 \"$@\"; }'"
+        ),
+        (
+            "command builtin eval 'run_opencode(){ opencode run --model "
+            "zai-coding-plan/glm-4.7 \"$@\"; }'"
+        ),
+        (
+            "target_name=run_open; target_name+=code; "
+            "LC_ALL=C eval \"${target_name}(){ opencode run --model "
+            "zai-coding-plan/glm-4.7 \\\"\\$@\\\"; }\""
+        ),
+        (
+            "if true; then run_opencode \"$initial_prompt\" "
+            "\"$RUNNER_TEMP/unmetered-opencode.jsonl\"; fi"
+        ),
+    ),
+    ids=(
+        "conditional-definition",
+        "dynamic-redefinition",
+        "wrapped-dynamic-redefinition",
+        "assignment-prefixed-dynamic-redefinition",
+        "hidden-call",
+    ),
+)
+def test_v147_opencode_call_cap_rejects_unparsed_target_affecting_syntax(
+    current_release_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    target_affecting_statement: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+    syntax = subprocess.run(
+        [
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-n",
+            "-c",
+            target_affecting_statement,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+    source = path.read_text(encoding="utf-8")
+    function_start = source.index("          run_opencode() {\n")
+    function_end = source.index(
+        "\n\n          extract_candidate() {", function_start
+    )
+    canonical_function = source[function_start:function_end]
+    mutate_named_step_text(
+        path,
+        "Run OpenCode PR review",
+        canonical_function,
+        f"{canonical_function}\n\n          {target_affecting_statement}",
+    )
+    bad_commit = commit(repo, "add unparsed OpenCode target-affecting syntax")
+    payload = path.read_bytes()
+    monkeypatch.setitem(
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256,
+        "opencode",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    tree = release_verifier.VerifiedCommitTree.open(repo, bad_commit)
+    assert hashlib.sha256(
+        tree.read_file(".github/workflows/opencode-auto-review.yml")
+    ).hexdigest() == (
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256[
+            "opencode"
+        ]
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError, match="invocation-budget workflow contract"
+    ):
+        release_verifier.require_budget_workflow_contract(
+            tree, "opencode-auto-review.yml", "opencode"
+        )
+
+
+@pytest.mark.parametrize(
     "mutation",
     (
         "conditional-definition",

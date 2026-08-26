@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -3290,22 +3291,187 @@ def _shell_logical_lines(script: str) -> tuple[str, ...]:
     return tuple(logical)
 
 
+_SHELL_DECLARATION_PATTERN = re.compile(
+    r"(?:(?P<canonical>[A-Za-z_][A-Za-z0-9_]*)"
+    r"[ \t]*\([ \t]*\)|"
+    r"function[ \t]+(?P<alternate>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:[ \t]*\([ \t]*\))?)[ \t]*\{\Z"
+)
+_SHELL_DECLARATION_HEAD_PATTERN = re.compile(
+    r"(?:(?P<canonical>[A-Za-z_][A-Za-z0-9_]*)"
+    r"[ \t]*\([ \t]*\)|"
+    r"function[ \t]+(?P<alternate>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:[ \t]*\([ \t]*\))?)\Z"
+)
+_SHELL_DECLARATION_PREFIX_PATTERN = re.compile(
+    r"(?:(?P<canonical>[A-Za-z_][A-Za-z0-9_]*)"
+    r"[ \t]*\([ \t]*\)|"
+    r"function[ \t]+(?P<alternate>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:[ \t]*\([ \t]*\))?)[ \t]*\{"
+)
+_SHELL_ASSIGNMENT_WORD_PATTERN = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\+?=).*\Z"
+)
+
+
+def _shell_semicolon_statements(line: str) -> tuple[str, ...]:
+    """Split executable semicolon lists without splitting quoted shell data."""
+
+    statements: list[str] = []
+    start = 0
+    index = 0
+    quote: str | None = None
+    escaped = False
+    command_substitution_depth = 0
+    parameter_expansion_depth = 0
+    while index < len(line):
+        character = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote == "'":
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == "`":
+            if character == "`":
+                quote = None
+            index += 1
+            continue
+        if character == "`" and quote is None:
+            quote = "`"
+            index += 1
+            continue
+        if character == "'" and quote is None:
+            quote = "'"
+            index += 1
+            continue
+        if character == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if character == "$" and index + 1 < len(line):
+            following = line[index + 1]
+            if following == "(":
+                command_substitution_depth += 1
+                index += 2
+                continue
+            if following == "{":
+                parameter_expansion_depth += 1
+                index += 2
+                continue
+        if command_substitution_depth and character == ")":
+            command_substitution_depth -= 1
+            index += 1
+            continue
+        if parameter_expansion_depth and character == "}":
+            parameter_expansion_depth -= 1
+            index += 1
+            continue
+        if (
+            character != ";"
+            or quote is not None
+            or command_substitution_depth
+            or parameter_expansion_depth
+        ):
+            index += 1
+            continue
+
+        statement = line[start:index].strip()
+        lookahead = index + 1
+        while lookahead < len(line) and line[lookahead].isspace():
+            lookahead += 1
+        control_keyword = None
+        for keyword in ("then", "do"):
+            end = lookahead + len(keyword)
+            if (
+                line[lookahead:end] == keyword
+                and (end == len(line) or line[end].isspace())
+            ):
+                control_keyword = keyword
+                lookahead = end
+                break
+        if control_keyword is not None:
+            statements.append(f"{statement}; {control_keyword}")
+            while lookahead < len(line) and line[lookahead].isspace():
+                lookahead += 1
+            start = lookahead
+            index = lookahead
+            continue
+        if statement:
+            statements.append(statement)
+        start = index + 1
+        index += 1
+
+    if quote is not None or command_substitution_depth or parameter_expansion_depth:
+        raise ValueError("shell statement has unterminated lexical context")
+    remainder = line[start:].strip()
+    if remainder:
+        statements.append(remainder)
+    return tuple(statements)
+
+
+def _expand_shell_declaration(statement: str) -> tuple[str, ...]:
+    """Separate a declaration's opening brace from its compact first command."""
+
+    declaration = _SHELL_DECLARATION_PREFIX_PATTERN.match(statement)
+    if declaration is None:
+        return (statement,)
+    head = statement[: declaration.end()].strip()
+    remainder = statement[declaration.end() :].strip()
+    if not remainder:
+        return (head,)
+    return (head, *_expand_shell_declaration(remainder))
+
+
+def _shell_statements(script: str) -> tuple[str, ...]:
+    """Tokenize executable statements, including compact function bodies."""
+
+    statements: list[str] = []
+    for line in _shell_logical_lines(script):
+        for statement in _shell_semicolon_statements(line):
+            statements.extend(_expand_shell_declaration(statement))
+    return tuple(statements)
+
+
+def _shell_identifier_tokens(words: Iterable[str]) -> tuple[str, ...]:
+    """Return identifier tokens from already parsed shell words."""
+
+    identifiers: list[str] = []
+    for word in words:
+        index = 0
+        while index < len(word):
+            character = word[index]
+            if character.isalpha() or character == "_":
+                end = index + 1
+                while end < len(word) and (
+                    word[end].isalnum() or word[end] == "_"
+                ):
+                    end += 1
+                identifiers.append(word[index:end])
+                index = end
+                continue
+            index += 1
+    return tuple(identifiers)
+
+
+def _shell_command_words(statement: str) -> tuple[str, ...]:
+    lexer = shlex.shlex(statement, posix=True)
+    lexer.commenters = ""
+    lexer.whitespace_split = True
+    return tuple(lexer)
+
+
 def _shell_function_analysis(script: str, name: str) -> _ShellFunctionAnalysis:
     """Parse a whole shell program and bind one top-level function to later calls."""
 
-    lines = _shell_logical_lines(script)
-    declaration_pattern = re.compile(
-        r"(?:(?P<canonical>[A-Za-z_][A-Za-z0-9_]*)"
-        r"[ \t]*\([ \t]*\)|"
-        r"function[ \t]+(?P<alternate>[A-Za-z_][A-Za-z0-9_]*)"
-        r"(?:[ \t]*\([ \t]*\))?)[ \t]*\{\Z"
-    )
-    declaration_head_pattern = re.compile(
-        r"(?:(?P<canonical>[A-Za-z_][A-Za-z0-9_]*)"
-        r"[ \t]*\([ \t]*\)|"
-        r"function[ \t]+(?P<alternate>[A-Za-z_][A-Za-z0-9_]*)"
-        r"(?:[ \t]*\([ \t]*\))?)\Z"
-    )
+    lines = _shell_statements(script)
     command_pattern = re.compile(rf"{re.escape(name)}(?:[ \t]+|\Z)")
     stack: list[_ShellFrame] = []
     definitions: list[_ShellFunctionDefinition] = []
@@ -3324,10 +3490,10 @@ def _shell_function_analysis(script: str, name: str) -> _ShellFunctionAnalysis:
     for index, line in enumerate(lines):
         if index == consumed_declaration_opening:
             continue
-        declaration = declaration_pattern.fullmatch(line)
+        declaration = _SHELL_DECLARATION_PATTERN.fullmatch(line)
         declaration_text = line
         if declaration is None:
-            declaration_head = declaration_head_pattern.fullmatch(line)
+            declaration_head = _SHELL_DECLARATION_HEAD_PATTERN.fullmatch(line)
             if (
                 declaration_head is not None
                 and index + 1 < len(lines)
@@ -3408,6 +3574,27 @@ def _shell_function_analysis(script: str, name: str) -> _ShellFunctionAnalysis:
                     _ShellCommand(line, tuple(frame.label for frame in stack)),
                 )
             )
+        else:
+            words = _shell_command_words(line)
+            unwrapped_words = list(words)
+            while unwrapped_words and _SHELL_ASSIGNMENT_WORD_PATTERN.fullmatch(
+                unwrapped_words[0]
+            ):
+                unwrapped_words.pop(0)
+            while unwrapped_words and unwrapped_words[0] in {"builtin", "command"}:
+                unwrapped_words.pop(0)
+                while unwrapped_words and (
+                    unwrapped_words[0] == "--"
+                    or unwrapped_words[0].startswith("-")
+                ):
+                    unwrapped_words.pop(0)
+            dynamic_command = unwrapped_words[0] if unwrapped_words else ""
+            if dynamic_command in {".", "eval", "source"}:
+                raise ValueError("shell program contains dynamic namespace syntax")
+            if name in _shell_identifier_tokens(words):
+                raise ValueError(
+                    f"shell program contains unrecognized {name} syntax"
+                )
 
         if line.startswith("if ") and line.endswith("; then"):
             stack.append(_ShellFrame("if", f"if:{line}"))
