@@ -368,11 +368,13 @@ def test_review_invocation_budget_capability_boundary_is_closed() -> None:
         root.path.as_posix()
         for root in release_inventory.release_roots_for("v1.46.2")
     )
-    assert {
-        root.mode
+    budget_roots = tuple(
+        root
         for root in release_inventory.release_roots_for("v1.47")
         if root.path.as_posix() in REVIEW_INVOCATION_BUDGET_RELEASE_FILES
-    } == {"100644"}
+    )
+    assert {root.mode for root in budget_roots} == {"100644"}
+    assert {root.kind for root in budget_roots} == {"file"}
 
 
 def test_review_invocation_budget_action_has_exact_safe_contract() -> None:
@@ -382,52 +384,7 @@ def test_review_invocation_budget_action_has_exact_safe_contract() -> None:
     assert hashlib.sha256(payload).hexdigest() == (
         "42462dad335073794bd5c46e1993e02e4dc9824113d1b36fd5c6b89dc0583a9c"
     )
-    assert document["name"] == "Review invocation budget"
-    assert document["description"] == (
-        "Claim and finalize a durable fail-closed review invocation budget"
-    )
-    assert document["inputs"] == {
-        "github-token": {"required": "true"},
-        "mode": {"required": "true"},
-        "reviewer": {"required": "true"},
-        "pr-number": {"required": "true"},
-        "expected-head-sha": {"required": "true"},
-        "full-diff-sha256": {"required": "true"},
-        "diff-mode": {"required": "true"},
-        "input-files-json": {"required": "true"},
-        "authenticated-review-json": {"required": "true"},
-        "model-route-json": {"required": "true"},
-        "effort": {"required": "true"},
-        "checkpoint-file": {"required": "true"},
-        "actual-call-count": {"required": "false", "default": "0"},
-        "elapsed-seconds": {"required": "false", "default": "0"},
-        "outcome": {"required": "false", "default": "checkpoint_failure"},
-        "stop-reason": {"required": "false", "default": ""},
-        "remaining-finding-ids-json": {"required": "false", "default": "[]"},
-    }
-    assert document["outputs"] == {
-        name: {"value": f"${{{{ steps.budget.outputs.{name} }}}}"}
-        for name in (
-            "allow-invocation",
-            "decision",
-            "round",
-            "invocation-key",
-            "checkpoint-sha256",
-            "comment-id",
-        )
-    }
-    assert document["runs"]["using"] == "composite"
-    assert len(document["runs"]["steps"]) == 1
-    step = document["runs"]["steps"][0]
-    assert step["id"] == "budget"
-    assert step["shell"] == "bash"
-    assert set(step) == {"id", "shell", "env", "run"}
-    assert all(
-        value.startswith("${{ inputs.") and value.endswith(" }}")
-        for value in step["env"].values()
-    )
-    assert 'python3 "$GITHUB_ACTION_PATH/review_invocation_budget.py"' in step["run"]
-    assert '"$GITHUB_ACTION_PATH/review_invocation_budget.py"' in step["run"]
+    assert document == release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION
 
 
 def git(repo: Path, *args: str) -> str:

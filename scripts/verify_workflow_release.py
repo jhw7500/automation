@@ -637,36 +637,318 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "gemini": "ef258906d3a8c8310253e4dccbb64a45100562ca5f14a10c7f5a4994fdfdc0ea",
     "opencode": "067738b4e9d1316e9e1f6a88de8ef2c3607440c479c7b5f46995e7d9c4e79c63",
 }
-EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION = {
-    "name": "Review invocation budget",
-    "description": "Claim and finalize a durable fail-closed review invocation budget",
-    "inputs": {
-        "github-token": {"required": "true"},
-        "mode": {"required": "true"},
-        "reviewer": {"required": "true"},
-        "pr-number": {"required": "true"},
-        "expected-head-sha": {"required": "true"},
-        "full-diff-sha256": {"required": "true"},
-        "diff-mode": {"required": "true"},
-        "input-files-json": {"required": "true"},
-        "authenticated-review-json": {"required": "true"},
-        "model-route-json": {"required": "true"},
-        "effort": {"required": "true"},
-        "checkpoint-file": {"required": "true"},
-        "actual-call-count": {"required": "false", "default": "0"},
-        "elapsed-seconds": {"required": "false", "default": "0"},
-        "outcome": {"required": "false", "default": "checkpoint_failure"},
-        "stop-reason": {"required": "false", "default": ""},
-        "remaining-finding-ids-json": {"required": "false", "default": "[]"},
-    },
-    "outputs": {
-        name: {"value": f"${{{{ steps.budget.outputs.{name} }}}}"}
-        for name in (
-            "allow-invocation", "decision", "round", "invocation-key",
-            "checkpoint-sha256", "comment-id",
+EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION = yaml.load(
+    r"""name: Review invocation budget
+description: Claim and finalize a durable fail-closed review invocation budget
+inputs:
+  github-token:
+    required: true
+  mode:
+    required: true
+  reviewer:
+    required: true
+  pr-number:
+    required: true
+  expected-head-sha:
+    required: true
+  full-diff-sha256:
+    required: true
+  diff-mode:
+    required: true
+  input-files-json:
+    required: true
+  authenticated-review-json:
+    required: true
+  model-route-json:
+    required: true
+  effort:
+    required: true
+  checkpoint-file:
+    required: true
+  actual-call-count:
+    required: false
+    default: '0'
+  elapsed-seconds:
+    required: false
+    default: '0'
+  outcome:
+    required: false
+    default: checkpoint_failure
+  stop-reason:
+    required: false
+    default: ''
+  remaining-finding-ids-json:
+    required: false
+    default: '[]'
+outputs:
+  allow-invocation:
+    value: ${{ steps.budget.outputs.allow-invocation }}
+  decision:
+    value: ${{ steps.budget.outputs.decision }}
+  round:
+    value: ${{ steps.budget.outputs.round }}
+  invocation-key:
+    value: ${{ steps.budget.outputs.invocation-key }}
+  checkpoint-sha256:
+    value: ${{ steps.budget.outputs.checkpoint-sha256 }}
+  comment-id:
+    value: ${{ steps.budget.outputs.comment-id }}
+runs:
+  using: composite
+  steps:
+    - id: budget
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        BUDGET_MODE: ${{ inputs.mode }}
+        REVIEWER: ${{ inputs.reviewer }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+        FULL_DIFF_SHA256: ${{ inputs.full-diff-sha256 }}
+        DIFF_MODE: ${{ inputs.diff-mode }}
+        INPUT_FILES_JSON: ${{ inputs.input-files-json }}
+        AUTHENTICATED_REVIEW_JSON: ${{ inputs.authenticated-review-json }}
+        MODEL_ROUTE_JSON: ${{ inputs.model-route-json }}
+        EFFORT: ${{ inputs.effort }}
+        ACTUAL_CALL_COUNT: ${{ inputs.actual-call-count }}
+        ELAPSED_SECONDS: ${{ inputs.elapsed-seconds }}
+        REVIEW_OUTCOME: ${{ inputs.outcome }}
+        STOP_REASON: ${{ inputs.stop-reason }}
+        REMAINING_FINDING_IDS_JSON: ${{ inputs.remaining-finding-ids-json }}
+        CHECKPOINT_FILE: ${{ inputs.checkpoint-file }}
+      run: |
+        set -euo pipefail
+        umask 077
+        budget_dir="$(mktemp -d "$RUNNER_TEMP/review-budget.XXXXXX")"
+        chmod 0700 "$budget_dir"
+        trap 'rm -rf -- "$budget_dir"' EXIT
+
+        publish_outputs() {
+          local mutation_response="${1:-}"
+          cat -- "$budget_dir/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 - "$budget_dir/output.json" "$mutation_response" "$GITHUB_OUTPUT" <<'PY'
+        import json
+        import re
+        import sys
+        from pathlib import Path
+
+        output = json.loads(Path(sys.argv[1]).read_text())
+        comment_id = output["comment-id"]
+        if sys.argv[2]:
+            mutation = json.loads(Path(sys.argv[2]).read_text())
+            value = mutation.get("id")
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise SystemExit("invalid mutation comment id")
+            comment_id = str(value)
+        values = {
+            "allow-invocation": output["allow-invocation"],
+            "decision": output["decision"],
+            "round": output["round"],
+            "invocation-key": output["invocation-key"],
+            "checkpoint-sha256": output["checkpoint-sha256"],
+            "comment-id": comment_id,
+        }
+        patterns = {
+            "allow-invocation": r"(?:true|false)",
+            "decision": r"[a-z_]+",
+            "round": r"[0-9]*",
+            "invocation-key": r"[0-9:]*",
+            "checkpoint-sha256": r"[0-9a-f]{64}",
+            "comment-id": r"[0-9]*",
+        }
+        with Path(sys.argv[3]).open("a", encoding="utf-8") as stream:
+            for key, value in values.items():
+                if not isinstance(value, str) or re.fullmatch(patterns[key], value) is None:
+                    raise SystemExit(f"invalid output: {key}")
+                stream.write(f"{key}={value}\n")
+        PY
+        }
+
+        python3 - "$budget_dir/request.json" \
+          "$BUDGET_MODE" "$GITHUB_REPOSITORY" "$PR_NUMBER" "$REVIEWER" \
+          "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$EXPECTED_HEAD_SHA" \
+          "$FULL_DIFF_SHA256" "$DIFF_MODE" "$INPUT_FILES_JSON" \
+          "$AUTHENTICATED_REVIEW_JSON" "$MODEL_ROUTE_JSON" "$EFFORT" \
+          "$ACTUAL_CALL_COUNT" "$ELAPSED_SECONDS" "$REVIEW_OUTCOME" \
+          "$STOP_REASON" "$REMAINING_FINDING_IDS_JSON" "$CHECKPOINT_FILE" \
+          "$GITHUB_WORKSPACE" "$GITHUB_SERVER_URL" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        names = (
+            "operation", "repository", "pr", "reviewer", "run_id", "run_attempt",
+            "head_sha", "full_diff_sha256", "diff_mode", "input_files_json",
+            "authenticated_review_json", "model_route_json", "effort", "actual_call_count",
+            "elapsed_seconds", "outcome", "stop_reason", "remaining_finding_ids_json",
+            "checkpoint_file", "github_workspace", "server_url",
         )
-    },
-}
+        destination = Path(sys.argv[1])
+        payload = dict(zip(names, sys.argv[2:], strict=True))
+        destination.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
+        destination.chmod(0o600)
+        PY
+
+        python3 "$GITHUB_ACTION_PATH/review_invocation_budget.py" preflight \
+          --request-file "$budget_dir/request.json" \
+          --comments-file "$budget_dir/comments.json" \
+          --output-directory "$budget_dir"
+        transport_ready="$(python3 - "$budget_dir/preflight.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        print("true" if json.loads(Path(sys.argv[1]).read_text())["continue"] else "false")
+        PY
+        )"
+        if [[ "$transport_ready" != "true" ]]; then
+          publish_outputs ""
+          exit 0
+        fi
+
+        gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$budget_dir/pr.json"
+        gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > "$budget_dir/comments.json"
+        gh api --paginate -H 'Accept: application/vnd.github+json' "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/timeline?per_page=100" > "$budget_dir/timeline.json"
+
+        python3 "$GITHUB_ACTION_PATH/review_invocation_budget.py" list-run-identities \
+          --request-file "$budget_dir/request.json" \
+          --comments-file "$budget_dir/comments.json" \
+          --output-directory "$budget_dir"
+
+        while IFS=$'\t' read -r run_id run_attempt; do
+          [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || exit 2
+          [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]] || exit 2
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}" \
+            > "$budget_dir/run-${run_id}-${run_attempt}.json"
+        done < <(python3 - "$budget_dir/run-identities.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        payload = json.loads(Path(sys.argv[1]).read_text())
+        for item in payload["runs"]:
+            print(f'{item["run_id"]}\t{item["run_attempt"]}')
+        PY
+        )
+
+        while IFS=$'\t' read -r actor_index encoded_actor; do
+          [[ "$actor_index" =~ ^[0-9]+$ ]] || exit 2
+          [[ "$encoded_actor" =~ ^[A-Za-z0-9._~%+-]+$ ]] || exit 2
+          gh api "repos/${GITHUB_REPOSITORY}/collaborators/${encoded_actor}/permission" \
+            > "$budget_dir/permission-${actor_index}.json"
+        done < <(python3 - "$budget_dir/run-identities.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        payload = json.loads(Path(sys.argv[1]).read_text())
+        for item in payload["permission_actors"]:
+            print(f'{item["index"]}\t{item["encoded_login"]}')
+        PY
+        )
+
+        python3 "$GITHUB_ACTION_PATH/review_invocation_budget.py" "$BUDGET_MODE" \
+          --request-file "$budget_dir/request.json" \
+          --comments-file "$budget_dir/comments.json" \
+          --output-directory "$budget_dir"
+
+        readarray -t budget_fields < <(python3 - "$budget_dir/output.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        payload = json.loads(Path(sys.argv[1]).read_text())
+        print(payload["mutation"])
+        print(payload["prior-comment-id"])
+        PY
+        )
+        mutation="${budget_fields[0]}"
+        prior_comment_id="${budget_fields[1]}"
+        mutation_response=""
+
+        if [[ "$mutation" != "none" ]]; then
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$budget_dir/cas-pr.json"
+          if [[ "$mutation" == "patch" ]]; then
+            [[ "$prior_comment_id" =~ ^[1-9][0-9]*$ ]] || exit 2
+            gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${prior_comment_id}" \
+              > "$budget_dir/cas-comment.json"
+          elif [[ "$mutation" == "create" ]]; then
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+              > "$budget_dir/cas-comments.json"
+          else
+            exit 2
+          fi
+
+          if ! python3 - "$budget_dir/output.json" "$budget_dir/cas-pr.json" \
+              "$budget_dir/cas-comment.json" "$budget_dir/cas-comments.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        def pages(path):
+            text = path.read_text()
+            decoder = json.JSONDecoder()
+            cursor = 0
+            decoded_pages = 0
+            values = []
+            while cursor < len(text):
+                while cursor < len(text) and text[cursor].isspace():
+                    cursor += 1
+                if cursor == len(text):
+                    break
+                page, cursor = decoder.raw_decode(text, cursor)
+                if not isinstance(page, list):
+                    raise SystemExit(1)
+                decoded_pages += 1
+                values.extend(page)
+            if decoded_pages == 0:
+                raise SystemExit(1)
+            return values
+
+        expected = json.loads(Path(sys.argv[1]).read_text())
+        pull = json.loads(Path(sys.argv[2]).read_text())
+        if pull.get("head", {}).get("sha") != expected["expected-head-sha"]:
+            raise SystemExit(1)
+        if expected["mutation"] == "patch":
+            current = json.loads(Path(sys.argv[3]).read_text())
+            if (
+                current.get("id") != int(expected["prior-comment-id"])
+                or current.get("body") != expected["prior-comment-body"]
+                or current.get("user", {}).get("login") != "github-actions[bot]"
+            ):
+                raise SystemExit(1)
+        else:
+            marker = expected["marker"]
+            if any(
+                isinstance(item, dict) and isinstance(item.get("body"), str)
+                and (item["body"] == marker or item["body"].startswith(marker + "\n"))
+                for item in pages(Path(sys.argv[4]))
+            ):
+                raise SystemExit(1)
+        PY
+          then
+            python3 "$GITHUB_ACTION_PATH/review_invocation_budget.py" cas-failed \
+              --request-file "$budget_dir/request.json" \
+              --comments-file "$budget_dir/comments.json" \
+              --output-directory "$budget_dir"
+            mutation="none"
+          fi
+        fi
+
+        if [[ "$mutation" == "create" ]]; then
+          mutation_response="$budget_dir/mutation.json"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --input "$budget_dir/comment-payload.json" > "$mutation_response"
+        elif [[ "$mutation" == "patch" ]]; then
+          mutation_response="$budget_dir/mutation.json"
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${prior_comment_id}" \
+            --input "$budget_dir/comment-payload.json" > "$mutation_response"
+        fi
+
+        publish_outputs "$mutation_response"
+""",
+    Loader=yaml.BaseLoader,
+)
 REVIEW_DIFF_DEPENDENCY_WORKFLOWS = (
     "claude-code-review.yml",
     "gemini-auto-review.yml",
@@ -2817,15 +3099,43 @@ def _action_references(value: object) -> list[str]:
     return result
 
 
+def _function_node(module: ast.Module | ast.ClassDef, name: str) -> ast.FunctionDef:
+    matches = [
+        item
+        for item in module.body
+        if isinstance(item, ast.FunctionDef) and item.name == name
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"function {name} differs")
+    return matches[0]
+
+
+def _annotated_fields(node: ast.ClassDef) -> tuple[str, ...]:
+    return tuple(
+        item.target.id
+        for item in node.body
+        if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+    )
+
+
+def _local_literal(function: ast.FunctionDef, name: str) -> object:
+    matches = [
+        item.value
+        for item in ast.walk(function)
+        if isinstance(item, ast.Assign)
+        and len(item.targets) == 1
+        and isinstance(item.targets[0], ast.Name)
+        and item.targets[0].id == name
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"local literal {name} differs")
+    return ast.literal_eval(matches[0])
+
+
 def require_budget_helper_contract(source: str) -> None:
     """Require the authenticated schema-1 helper and every fixed policy gate."""
 
     try:
-        if (
-            hashlib.sha256(source.encode("utf-8")).hexdigest()
-            != EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256
-        ):
-            raise ValueError("helper source digest differs")
         compile(
             source,
             "review_invocation_budget.py",
@@ -2895,6 +3205,94 @@ def require_budget_helper_contract(source: str) -> None:
             "max_estimated_tokens_total": 400_000,
         }:
             raise ValueError("budget defaults differ")
+        expected_fields = {
+            "BudgetPolicy": (
+                "max_rounds", "max_override_rounds", "max_calls_per_round",
+                "max_wall_seconds_per_round", "max_estimated_tokens_per_round",
+                "max_estimated_tokens_total",
+            ),
+            "Invocation": (
+                "run_id", "run_attempt", "head_sha", "full_diff_sha256",
+                "round_number", "override_event_id", "model_route", "effort",
+                "call_unit", "call_count", "estimated_input_tokens",
+                "elapsed_seconds", "status", "outcome", "stop_reason",
+                "remaining_finding_ids",
+            ),
+            "DecisionRecord": (
+                "decision", "stop_reason", "run_id", "run_attempt",
+            ),
+            "Handoff": (
+                "repository", "pr", "reviewer", "current_head_sha",
+                "current_full_diff_sha256", "current_run_id",
+                "current_run_attempt", "automatic_rounds", "override_rounds",
+                "round_usage", "decision", "outcome", "stop_reason",
+                "authenticated_review_head_sha",
+                "authenticated_review_full_diff_sha256",
+                "remaining_finding_ids",
+            ),
+            "LedgerState": (
+                "repository", "pr", "reviewer", "budgets", "invocations",
+                "consumed_override_event_ids", "last_decision", "handoff",
+            ),
+        }
+        if any(
+            _annotated_fields(_class_node(module, name)) != fields
+            for name, fields in expected_fields.items()
+        ):
+            raise ValueError("helper schema fields differ")
+        schema_keys = {
+            "Invocation": {
+                "run_id", "run_attempt", "head_sha", "full_diff_sha256",
+                "round_number", "override_event_id", "model_route", "effort",
+                "call_unit", "call_count", "estimated_input_tokens",
+                "elapsed_seconds", "status", "outcome", "stop_reason",
+                "remaining_finding_ids",
+            },
+            "Handoff": {
+                "authenticated_review_full_diff_sha256",
+                "authenticated_review_head_sha", "automatic_rounds",
+                "current_full_diff_sha256", "current_head_sha",
+                "current_run_attempt", "current_run_id", "decision", "outcome",
+                "override_rounds", "pr", "remaining_finding_ids", "repository",
+                "reviewer", "round_usage", "stop_reason",
+            },
+            "LedgerState": {
+                "schema", "repository", "pr", "reviewer", "budgets",
+                "invocations", "consumed_override_event_ids", "last_decision",
+                "handoff",
+            },
+        }
+        if any(
+            _local_literal(_function_node(_class_node(module, name), "from_dict"), "keys")
+            != keys
+            for name, keys in schema_keys.items()
+        ):
+            raise ValueError("helper serialized schema differs")
+        reviewer_policy = _function_node(policy, "for_reviewer")
+        reviewer_caps = [
+            ast.literal_eval(item.value)
+            for item in ast.walk(reviewer_policy)
+            if isinstance(item, ast.Subscript) and isinstance(item.value, ast.Dict)
+        ]
+        if reviewer_caps != [{"claude": 1, "gemini": 3, "opencode": 2}]:
+            raise ValueError("reviewer call caps differ")
+        finding_bindings = [
+            item.value
+            for item in module.body
+            if isinstance(item, ast.Assign)
+            and len(item.targets) == 1
+            and isinstance(item.targets[0], ast.Name)
+            and item.targets[0].id == "_FINDING"
+        ]
+        if (
+            len(finding_bindings) != 1
+            or ast.dump(finding_bindings[0], include_attributes=False)
+            != ast.dump(
+                ast.parse('re.compile(r"RVW-[0-9a-f]{12}\\Z")', mode="eval").body,
+                include_attributes=False,
+            )
+        ):
+            raise ValueError("finding identity differs")
         functions = _module_function_headers(module)
         required_functions = {
             "serialize_ledger": "def serialize_ledger(state: LedgerState) -> str",
@@ -2929,14 +3327,8 @@ def require_budget_helper_contract(source: str) -> None:
             for name, header in required_functions.items()
         ):
             raise ValueError("public helper function differs")
-        claim_source = ast.get_source_segment(
-            source,
-            next(
-                item
-                for item in module.body
-                if isinstance(item, ast.FunctionDef) and item.name == "claim"
-            ),
-        )
+        claim_function = _function_node(module, "claim")
+        claim_source = ast.get_source_segment(source, claim_function)
         if not isinstance(claim_source, str):
             raise ValueError("claim source unavailable")
         ordered_claim_gates = (
@@ -2947,11 +3339,39 @@ def require_budget_helper_contract(source: str) -> None:
             "round_budget_exhausted",
             "total_usage_budget_exhausted",
         )
-        cursor = -1
-        for gate in ordered_claim_gates:
-            cursor = claim_source.find(gate, cursor + 1)
-            if cursor < 0:
-                raise ValueError("claim gate order differs")
+        claim_decisions = [
+            node.value.args[2].value
+            for node in ast.walk(claim_function)
+            if isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "refuse"
+            and len(node.value.args) == 3
+            and isinstance(node.value.args[2], ast.Constant)
+            and node.value.args[2].value in ordered_claim_gates
+        ]
+        claim_decisions.sort(
+            key=lambda decision: next(
+                node.lineno
+                for node in ast.walk(claim_function)
+                if isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Call)
+                and len(node.value.args) == 3
+                and isinstance(node.value.args[2], ast.Constant)
+                and node.value.args[2].value == decision
+            )
+        )
+        if tuple(claim_decisions) != ordered_claim_gates:
+            raise ValueError("claim gate order differs")
+        finalize_source = ast.unparse(_function_node(module, "finalize"))
+        required_finalize = (
+            "request.call_count > state.budgets.max_calls_per_round",
+            "(outcome, stop_reason) = ('checkpoint_failure', 'call_budget_exhausted')",
+            "request.elapsed_seconds > state.budgets.max_wall_seconds_per_round",
+            "(outcome, stop_reason) = ('wall_time_exhausted', 'wall_time_exhausted')",
+        )
+        if not all(fragment in finalize_source for fragment in required_finalize):
+            raise ValueError("final cap relationship differs")
         required_source = (
             "github-actions[bot]",
             "review-budget-override",
@@ -2964,7 +3384,24 @@ def require_budget_helper_contract(source: str) -> None:
             "compare_and_swap_failed",
             "payload != render_checkpoint(state)",
         )
-        if not all(fragment in source for fragment in required_source):
+        policy_occurrences = {
+            "duplicate_head": 5,
+            "duplicate_effective_diff": 5,
+            "round_budget_exhausted": 5,
+            "input_budget_exhausted": 5,
+            "total_usage_budget_exhausted": 7,
+            "call_budget_exhausted": 3,
+            "wall_time_exhausted": 7,
+            "provenance_mismatch": 5,
+            "compare_and_swap_failed": 1,
+        }
+        if (
+            not all(fragment in source for fragment in required_source)
+            or any(
+                source.count(fragment) != expected
+                for fragment, expected in policy_occurrences.items()
+            )
+        ):
             raise ValueError("helper policy source differs")
     except (StopIteration, SyntaxError, TypeError, ValueError):
         raise ReleaseVerificationError(
@@ -2975,19 +3412,15 @@ def require_budget_helper_contract(source: str) -> None:
 def require_budget_workflow_contract(
     tree: VerifiedCommitTree, workflow: str, reviewer: str
 ) -> None:
-    """Require one reviewer-specific claim/finalize boundary from commit bytes."""
+    """Require reviewer semantics from authenticated commit-tree workflow bytes."""
 
     try:
         if REVIEWER_WORKFLOWS.get(reviewer) != workflow:
             raise ValueError("reviewer workflow mismatch")
-        path = f".github/workflows/{workflow}"
-        payload = tree.read_file(path)
-        if (
-            hashlib.sha256(payload).hexdigest()
-            != EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256[reviewer]
-        ):
-            raise ValueError("workflow source digest differs")
+        payload = tree.read_file(f".github/workflows/{workflow}")
         document = yaml.load(payload, Loader=yaml.BaseLoader)
+        if not isinstance(document, dict) or not isinstance(document.get("jobs"), dict):
+            raise ValueError("workflow document differs")
         jobs = document["jobs"]
         locations = {
             "claude": ("claude-review", "claude-review"),
@@ -3013,17 +3446,34 @@ def require_budget_workflow_contract(
             raise ValueError("claim/finalize pair differs")
         claim_step = claim_steps[0]
         finalize_step = finalize_steps[0]
-        allow_token = "allow_invocation" if reviewer == "opencode" else "allow-invocation"
+        expected_finalize_guards = {
+            "claude": (
+                "${{ always() && !cancelled() && "
+                "steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+            ),
+            "gemini": (
+                "${{ always() && !cancelled() && "
+                "steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+            ),
+            "opencode": (
+                "${{ always() && !cancelled() && "
+                "needs.opencode-prepare.outputs.allow_invocation == 'true' && "
+                "steps.canonicalize-opencode-review.outputs.budget_metrics_valid == 'true' }}"
+            ),
+        }
         if (
             claim_step.get("id") != "review-budget-claim"
             or finalize_step.get("id") != "review-budget-finalize"
             or claim_step.get("with", {}).get("reviewer") != reviewer
             or finalize_step.get("with", {}).get("reviewer") != reviewer
-            or f"{allow_token} == 'true'" not in finalize_step.get("if", "")
-            or "always()" not in finalize_step.get("if", "")
-            or "!cancelled()" not in finalize_step.get("if", "")
+            or claim_step.get("with", {}).get("checkpoint-file")
+            != f"${{{{ runner.temp }}}}/{reviewer}-review-budget-claim.json"
+            or finalize_step.get("with", {}).get("checkpoint-file")
+            != f"${{{{ runner.temp }}}}/{reviewer}-review-budget-final.json"
+            or finalize_step.get("if") != expected_finalize_guards[reviewer]
         ):
-            raise ValueError("claim/finalize guards differ")
+            raise ValueError("claim/finalize contract differs")
+
         provider_names = {
             "claude": "Run Claude Code Review",
             "gemini": "Run Gemini Code Review",
@@ -3033,44 +3483,209 @@ def require_budget_workflow_contract(
             claim_job_name if reviewer != "opencode" else "opencode-review"
         ]
         provider = _named_step(provider_job, provider_names[reviewer])
-        provider_guard = provider.get("if", provider_job.get("if", ""))
-        if allow_token not in provider_guard:
-            raise ValueError("provider allow guard differs")
-        if reviewer != "opencode" and claim_job["steps"].index(claim_step) >= claim_job["steps"].index(provider):
-            raise ValueError("claim/provider order differs")
-        if reviewer == "opencode" and provider_job.get("timeout-minutes") != "10":
-            raise ValueError("OpenCode timeout differs")
-        if reviewer != "opencode" and claim_job.get("timeout-minutes") != "10":
-            raise ValueError("review timeout differs")
-        rendered = payload.decode("utf-8")
-        required_fragments = {
+        expected_provider_guards = {
             "claude": (
-                "call_count=1",
-                "claude-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}",
-                "claude-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
+                "${{ steps.prepare-diff.outputs.diff-ready == 'true' && "
+                "steps.prepare-diff.outputs.diff-mode != 'unchanged' && "
+                "steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
             ),
             "gemini": (
-                "GEMINI_CALL_COUNT_FILE",
-                "if count >= 3:",
-                "gemini-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}",
-                "gemini-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
+                "${{ steps.reset-gemini-artifacts.outcome == 'success' && "
+                "steps.prepare-diff.outputs.diff-ready == 'true' && "
+                "steps.prepare-diff.outputs.diff-mode != 'unchanged' && "
+                "steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
             ),
             "opencode": (
-                "(( count < 2 )) || {",
-                "budget_checkpoint_sha256",
-                "review-budget-claim.json",
-                "opencode-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}",
-                "opencode-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
+                "needs.opencode-prepare.outputs.allow_invocation == 'true' && "
+                "needs.opencode-prepare.outputs.diff_ready == 'true' && "
+                "needs.opencode-prepare.outputs.diff_mode != 'unchanged'"
             ),
+        }
+        if provider.get("if") != expected_provider_guards[reviewer]:
+            raise ValueError("provider allow predicate differs")
+        if provider_job.get("timeout-minutes") != "10":
+            raise ValueError("review timeout differs")
+
+        claim_names = {
+            "claude": "Upload Claude review budget claim checkpoint",
+            "gemini": "Upload Gemini review budget claim checkpoint",
+            "opencode": "Upload OpenCode review budget claim checkpoint",
+        }
+        final_names = {
+            "claude": "Upload Claude review budget final checkpoint",
+            "gemini": "Upload Gemini review budget final checkpoint",
+            "opencode": "Upload OpenCode review budget final checkpoint",
+        }
+        claim_upload = _named_step(claim_job, claim_names[reviewer])
+        final_upload = _named_step(finalize_job, final_names[reviewer])
+        expected_claim_if = (
+            "${{ always() && steps.review-budget-claim.outcome == 'success' }}"
+            if reviewer == "opencode"
+            else "${{ always() && !cancelled() }}"
+        )
+        expected_claim_missing = "error" if reviewer == "opencode" else "ignore"
+        expected_claim_upload = {
+            "name": claim_names[reviewer],
+            "if": expected_claim_if,
+            "uses": UPLOAD_ARTIFACT_ACTION,
+            "with": {
+                "name": (
+                    f"{reviewer}-review-budget-claim-"
+                    "${{ github.run_id }}-${{ github.run_attempt }}"
+                ),
+                "path": f"${{{{ runner.temp }}}}/{reviewer}-review-budget-claim.json",
+                "if-no-files-found": expected_claim_missing,
+                "retention-days": "7",
+                "overwrite": "false",
+            },
+        }
+        expected_final_upload = {
+            "name": final_names[reviewer],
+            "if": (
+                "${{ always() && !cancelled() && "
+                "steps.review-budget-finalize.outcome != 'skipped' }}"
+            ),
+            "uses": UPLOAD_ARTIFACT_ACTION,
+            "with": {
+                "name": (
+                    f"{reviewer}-review-budget-final-"
+                    "${{ github.run_id }}-${{ github.run_attempt }}"
+                ),
+                "path": f"${{{{ runner.temp }}}}/{reviewer}-review-budget-final.json",
+                "if-no-files-found": "ignore",
+                "retention-days": "7",
+                "overwrite": "false",
+            },
+        }
+        if claim_upload != expected_claim_upload or final_upload != expected_final_upload:
+            raise ValueError("budget checkpoint artifact differs")
+
+        claim_index = claim_job["steps"].index(claim_step)
+        claim_upload_index = claim_job["steps"].index(claim_upload)
+        final_index = finalize_job["steps"].index(finalize_step)
+        final_upload_index = finalize_job["steps"].index(final_upload)
+        if not final_index < final_upload_index:
+            raise ValueError("final checkpoint publication order differs")
+        if reviewer != "opencode":
+            canonical = _named_step(
+                claim_job,
+                {
+                    "claude": "Canonicalize Claude review",
+                    "gemini": "Canonicalize Gemini review",
+                }[reviewer],
+            )
+            upsert = _named_step(claim_job, "Upsert review comment")
+            if not (
+                claim_index
+                < claim_upload_index
+                < claim_job["steps"].index(provider)
+                < claim_job["steps"].index(canonical)
+                < claim_job["steps"].index(upsert)
+                < final_index
+                < final_upload_index
+            ):
+                raise ValueError("review publication order differs")
+        else:
+            build_handoff = _named_step(
+                claim_job, "Build sealed canonicalization handoff"
+            )
+            upload_handoff = _named_step(
+                claim_job, "Upload sealed canonicalization handoff"
+            )
+            canonical = _named_step(
+                finalize_job, "Canonicalize OpenCode review"
+            )
+            if not (
+                claim_index
+                < claim_job["steps"].index(build_handoff)
+                < claim_job["steps"].index(upload_handoff)
+                < claim_upload_index
+            ):
+                raise ValueError("OpenCode claim handoff order differs")
+            if not (
+                finalize_job["steps"].index(canonical)
+                < final_index
+                < final_upload_index
+            ):
+                raise ValueError("OpenCode publication order differs")
+            if provider_job.get("needs") != ["check-enabled", "opencode-prepare"]:
+                raise ValueError("OpenCode provider dependencies differ")
+            provider_job_if = " ".join(provider_job.get("if", "").split())
+            expected_job_if = (
+                "needs.check-enabled.outputs.enabled == 'true' && "
+                "needs.check-enabled.outputs.auto_enabled == 'true' && "
+                "needs.check-enabled.outputs.safe_pr == 'true' && "
+                "needs.opencode-prepare.result == 'success' && "
+                "needs.opencode-prepare.outputs.allow_invocation == 'true'"
+            )
+            if provider_job_if != expected_job_if:
+                raise ValueError("OpenCode cross-job allow predicate differs")
+            if claim_job.get("outputs", {}).get("allow_invocation") != (
+                "${{ steps.review-budget-claim.outputs.allow-invocation }}"
+            ):
+                raise ValueError("OpenCode claim output differs")
+            build_env = build_handoff.get("env", {})
+            if {
+                "BUDGET_CHECKPOINT_PATH": build_env.get("BUDGET_CHECKPOINT_PATH"),
+                "BUDGET_CHECKPOINT_SHA256": build_env.get("BUDGET_CHECKPOINT_SHA256"),
+                "BUDGET_DECISION": build_env.get("BUDGET_DECISION"),
+                "ALLOW_INVOCATION": build_env.get("ALLOW_INVOCATION"),
+            } != {
+                "BUDGET_CHECKPOINT_PATH": (
+                    "${{ runner.temp }}/opencode-review-budget-claim.json"
+                ),
+                "BUDGET_CHECKPOINT_SHA256": (
+                    "${{ steps.review-budget-claim.outputs.checkpoint-sha256 }}"
+                ),
+                "BUDGET_DECISION": (
+                    "${{ steps.review-budget-claim.outputs.decision }}"
+                ),
+                "ALLOW_INVOCATION": (
+                    "${{ steps.review-budget-claim.outputs.allow-invocation }}"
+                ),
+            }:
+                raise ValueError("OpenCode sealed handoff inputs differ")
+            build_source = build_handoff.get("run", "")
+            canonical_source = canonical.get("with", {}).get("script", "")
+            required_handoff = (
+                'cp -- "$BUDGET_CHECKPOINT_PATH" "$handoff/review-budget-claim.json"',
+                '[[ "$budget_checkpoint" == "$BUDGET_CHECKPOINT_SHA256" ]]',
+                '"review-budget-claim.json":$budget_checkpoint',
+                "budget_checkpoint_sha256:$budget_checkpoint_sha256",
+            )
+            required_validation = (
+                "handoff.budget_checkpoint_sha256 !== process.env.BUDGET_CHECKPOINT_SHA256",
+                "handoff.files['review-budget-claim.json'] !== handoff.budget_checkpoint_sha256",
+                "validated_call_count",
+                "validated_elapsed_seconds",
+                "validated_model_route_json",
+            )
+            if (
+                not all(fragment in build_source for fragment in required_handoff)
+                or not all(
+                    fragment in canonical_source for fragment in required_validation
+                )
+                or finalize_step.get("with", {}).get("actual-call-count")
+                != "${{ steps.canonicalize-opencode-review.outputs.validated_call_count }}"
+                or finalize_step.get("with", {}).get("elapsed-seconds")
+                != "${{ steps.canonicalize-opencode-review.outputs.validated_elapsed_seconds }}"
+            ):
+                raise ValueError("OpenCode sealed handoff validation differs")
+
+        rendered = payload.decode("utf-8")
+        required_fragments = {
+            "claude": ("call_count=1",),
+            "gemini": ("GEMINI_CALL_COUNT_FILE", "if count >= 3:"),
+            "opencode": ("(( count < 2 )) || {",),
         }[reviewer]
         if not all(fragment in rendered for fragment in required_fragments):
-            raise ValueError("workflow budget source differs")
-        forbidden = {
-            "claude": "Fallback to Gemini reviewer",
-            "gemini": "Fallback to Claude reviewer",
-            "opencode": "Fallback to Claude reviewer",
+            raise ValueError("workflow reviewer call cap differs")
+        forbidden_reviewers = {
+            "claude": ("Fallback to Gemini reviewer", "Fallback to OpenCode reviewer"),
+            "gemini": ("Fallback to Claude reviewer", "Fallback to OpenCode reviewer"),
+            "opencode": ("Fallback to Claude reviewer", "Fallback to Gemini reviewer"),
         }[reviewer]
-        if forbidden in rendered:
+        if any(fragment in rendered for fragment in forbidden_reviewers):
             raise ValueError("cross-reviewer fallback")
     except (
         KeyError,
@@ -3083,7 +3698,6 @@ def require_budget_workflow_contract(
         raise ReleaseVerificationError(
             "invocation-budget workflow contract is invalid"
         ) from None
-
 
 def _verify_review_invocation_budget(
     tree: VerifiedCommitTree, ref: str
@@ -3104,27 +3718,47 @@ def _verify_review_invocation_budget(
         )
     action_path = REVIEW_INVOCATION_BUDGET_ACTION_ROOT.path.as_posix()
     try:
-        payload = tree.read_file(action_path)
-        action = yaml.load(payload, Loader=yaml.BaseLoader)
-        expected_surface = {
-            key: action.get(key) for key in ("name", "description", "inputs", "outputs")
-        }
-        if (
-            hashlib.sha256(payload).hexdigest()
-            != EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256
-            or expected_surface != EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION
-            or action.get("runs", {}).get("using") != "composite"
-            or len(action.get("runs", {}).get("steps", [])) != 1
-        ):
+        action_payload = tree.read_file(action_path)
+        action = yaml.load(action_payload, Loader=yaml.BaseLoader)
+        if action != EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION:
             raise ValueError("action differs")
     except (AttributeError, ReleaseVerificationError, TypeError, ValueError, yaml.YAMLError):
         raise ReleaseVerificationError(
             "invocation-budget action contract is invalid"
         ) from None
-    helper = tree.read_text(REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path)
+    helper_payload = tree.read_file(REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path)
+    try:
+        helper = helper_payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ReleaseVerificationError(
+            "invocation-budget helper contract is invalid"
+        ) from None
     require_budget_helper_contract(helper)
     for reviewer, workflow in REVIEWER_WORKFLOWS.items():
         require_budget_workflow_contract(tree, workflow, reviewer)
+    authenticated_digests = {
+        action_path: (
+            action_payload,
+            EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256,
+        ),
+        REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix(): (
+            helper_payload,
+            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256,
+        ),
+    }
+    for reviewer, workflow in REVIEWER_WORKFLOWS.items():
+        path = f".github/workflows/{workflow}"
+        authenticated_digests[path] = (
+            tree.read_file(path),
+            EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256[reviewer],
+        )
+    if any(
+        hashlib.sha256(payload).hexdigest() != expected
+        for payload, expected in authenticated_digests.values()
+    ):
+        raise ReleaseVerificationError(
+            "invocation-budget authenticated source digest differs"
+        )
 
 
 def expected_review_actions(ref: str, workflow: str) -> list[str]:
