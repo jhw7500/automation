@@ -211,3 +211,74 @@ PASS: v1.47 commit content is secure at 074626e10e64e9ebda17d8fd3a7688733bddeb8c
 - Findings 1, 2, and 4 remain covered and unchanged. No Task 1–6 action/helper/workflow
   bytes, inventory default, config, tag, release, rollout, GitHub, or Notion state was
   changed. No blockers or remaining concerns were found.
+
+## Independent-review fix round 3/5
+
+Implementation fix commit: `1bc6f7924b987f3b944966cf011e2caa486bbefb`
+
+The remaining OpenCode reachability finding was closed by replacing normalized-line
+matching and occurrence counting with an authenticated shell command/control parser.
+The parser joins logical commands, excludes heredoc payloads, records executable
+control nesting, and requires the complete `run_opencode` command sequence exactly.
+The live top-level counter read, numeric validation, two-call refusal group, durable
+increment, and sole OpenCode CLI invocation must therefore occur in their required
+order and control context; a complete copy below `if false` cannot satisfy the
+contract. Semantic validation still precedes exact digest authentication, and both
+operate only on bytes read from `VerifiedCommitTree`.
+
+### Fix-round 3 RED evidence
+
+- Added
+  `test_v147_opencode_call_cap_rejects_complete_unreachable_sequence_decoy`, which
+  replaces the live counter read with `count="$(printf 0)"`, moves the complete prior
+  seven-line counter/cap/increment sequence below `if false; then`, commits the
+  mutation, authenticates the mutated workflow SHA-256 in the expected digest map,
+  and asserts that the semantic contract rejects the same verified tree bytes.
+- Command:
+  `rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_complete_unreachable_sequence_decoy -q --tb=short`
+- Result before the production fix: `1 failed in 0.26s` with `DID NOT RAISE`; the
+  explicit tree-byte digest assertion passed, proving that the prior semantic gate
+  accepted the authenticated unreachable-sequence bypass.
+
+### Fix-round 3 GREEN and regression evidence
+
+- Authentic workflow plus the exact bypass mutation, with touched-file `py_compile`:
+  `rtk python3 -m py_compile scripts/verify_workflow_release.py tests/test_verify_workflow_release.py && rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_accepts_current_budget_release_contract tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_complete_unreachable_sequence_decoy -q --tb=short`
+  → `2 passed in 0.76s`.
+- The prior 48 finding-regression cases plus the new bypass mutation:
+  `rtk python3 -m pytest tests/test_workflow_release_bundle.py::test_review_invocation_budget_action_has_exact_safe_contract tests/test_workflow_release_bundle.py::test_review_invocation_budget_capability_boundary_is_closed tests/test_verify_workflow_release.py::test_v147_requires_each_budget_file_as_one_regular_0644_blob tests/test_verify_workflow_release.py::test_v147_rejects_budget_helper_gate_removal tests/test_verify_workflow_release.py::test_v147_budget_helper_semantics_reject_authenticated_mutations tests/test_verify_workflow_release.py::test_v147_budget_helper_semantics_bind_live_ast_relationships tests/test_verify_workflow_release.py::test_v147_budget_workflow_semantics_reject_authenticated_mutations tests/test_verify_workflow_release.py::test_v147_budget_workflow_semantics_bind_live_reviewer_call_caps tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_complete_unreachable_sequence_decoy tests/test_verify_workflow_release.py::test_v147_accepts_current_budget_release_contract -q --tb=short`
+  → `49 passed in 12.16s`.
+- Release suite:
+  `rtk python3 -m pytest tests/test_workflow_release_bundle.py tests/test_verify_workflow_release.py -q --tb=short`
+  → `576 passed in 259.90s (0:04:19)`.
+- Full unfiltered suite: `rtk python3 -m pytest -q --tb=short`
+  → `2666 passed, 48 subtests passed in 818.79s (0:13:38)`.
+- Static checks:
+  `rtk git diff --check` and
+  `rtk python3 -m py_compile scripts/workflow_release_inventory.py scripts/verify_workflow_release.py tests/test_workflow_release_bundle.py tests/test_verify_workflow_release.py`
+  → exit 0. The implementation diff contained only the Task 7 verifier and verifier
+  test module.
+
+### Fix-round 3 committed-byte verification
+
+After committing the implementation fix, no tag was created:
+
+```text
+rtk python3 -m scripts.verify_workflow_release --automation . --ref v1.47 --expected-commit "$(rtk git rev-parse HEAD)" --commit-only
+PASS: v1.47 commit content is secure at 1bc6f7924b987f3b944966cf011e2caa486bbefb
+```
+
+### Fix-round 3 self-review
+
+- OpenCode call accounting is now an exact ordered tuple of parsed shell commands
+  and their control paths, not a raw fragment, normalized-line slice, or occurrence
+  count. The counter/cap/increment commands and the only provider invocation must be
+  top-level in `run_opencode`; the refusal statements must be nested only beneath the
+  exact two-call cap group.
+- Heredoc bodies are excluded from executable commands, unsupported conditional/loop
+  forms inside the authenticated function fail closed, and extra or ambiguous command
+  sequences fail exact equality. The authentic current workflow remains accepted.
+- Findings 1, 2, and 4 and the broader round-2 structural gates remain covered by the
+  49-case focused regression and complete release/full suites. No Task 1–6
+  action/helper/workflow bytes, inventory default, config, tag, release, rollout,
+  GitHub, or Notion state changed. No blockers or remaining concerns were found.

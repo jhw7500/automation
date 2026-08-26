@@ -142,3 +142,13 @@ Task 7: fix round 2/5 GREEN complete (structural focus 9 passed; combined findin
 Task 7: fix round 2/5 self-review complete (all Finding 3 decoy classes structurally rejected; authentication remains after semantics over the same VerifiedCommitTree bytes; findings 1/2/4 preserved; no Task 1-6/config/tag/release/rollout/external-state changes; blockers and remaining concerns: none)
 
 Task 7: fix round 2/5 complete (implementation fix commit 074626e10e64e9ebda17d8fd3a7688733bddeb8c; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md)
+
+Task 7: fix round 3/5 RED complete (the exact authenticated OpenCode bypass moved the complete seven-line counter/cap/durable-increment sequence below `if false`, weakened the live counter read, and escaped the prior normalized-line semantic gate: 1 failed with DID NOT RAISE in 0.26s)
+
+Ruling: OpenCode live call accounting is an exact structural shell-function contract over logical commands and executable control nesting. The unique top-level counter read, numeric guard, two-call refusal group, durable increment, and sole CLI invocation must appear in exact order inside `run_opencode`; heredoc payloads, unreachable or conditional copies, alternate reads, and ambiguous extra sequences cannot authenticate live behavior — if wrong, the embedded shell should be extracted into a separately authenticated helper in a future release boundary rather than reverting to raw text/count checks.
+
+Task 7: fix round 3/5 GREEN complete (authentic-plus-bypass focus 2 passed; prior 48 plus residual regression 49 passed; release suite 576 passed in 259.90s; full unfiltered 2666 passed + 48 subtests in 818.79s; py_compile and diff-check green)
+
+Task 7: fix round 3/5 self-review complete (exact parsed command/control equality replaces OpenCode normalized fragments and occurrence counts; semantic-before-digest and VerifiedCommitTree-only bytes preserved; findings 1/2/4 and round-2 relationships retained; no Task 1–6/config/tag/release/rollout/external-state changes; blockers and remaining concerns: none)
+
+Task 7: fix round 3/5 complete (implementation fix commit 1bc6f7924b987f3b944966cf011e2caa486bbefb; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md)
