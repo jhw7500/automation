@@ -172,3 +172,9 @@ Task 7: fix round 5/5 GREEN complete (new/positive focus 8 passed; unchanged rou
 Task 7: fix round 5/5 self-review complete (compact POSIX/Bash declarations and semicolon bodies parsed structurally; duplicate/conditional/dead/dynamic/hidden binding ambiguity rejected; exact later invocation binding and heredoc/control preservation retained; semantic-before-digest and VerifiedCommitTree-only bytes preserved; analyzer admits only the authenticated shell subset and refuses computed namespace execution; no Task 1–6/inventory/contracts/config/tag/release/rollout/external-state changes; blockers and remaining known concerns: none)
 
 Task 7: fix round 5/5 complete (implementation fix commit a9ccc1fa9eec4c91a53f1cdf33f5125e80b98995; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md)
+
+Task 7: breaker adjudication (1 load-bearing Important remains after round 5/5 — the shell lexer can mistake quoted here-document-like data for a real here-document and can miss a dynamically assembled namespace executor, allowing a compact live `run_opencode` redefinition to escape semantic inventory)
+
+Ruling: The round-5 residual is real and load-bearing, not parked as harmless: Task 8 explicitly permits corrections demonstrated by validated review findings, so Task 8 must add authenticated RED cases for false-heredoc hiding and a computed executor name, then make executable shell tokenization and target-bearing dynamic execution fail closed before any PR is opened. Task 8 stops without push/PR/merge if either bypass remains or if the exact tested head changes — if wrong, the proposed v1.47 verifier could authenticate a weakened live OpenCode budget path, so merge is prohibited rather than accepting this risk.
+
+Task 7: complete (commits 0b59828..c802c60, breaker reached after fix round 5/5; findings 1/2/4 addressed; 1 real load-bearing verifier finding carried into Task 8 by ruling)
