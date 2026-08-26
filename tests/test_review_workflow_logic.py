@@ -7772,7 +7772,20 @@ def test_opencode_budget_finalize_uses_only_attested_publication_outcome():
         "with"
     ]["script"].rindex("core.setOutput('publication_succeeded', 'true')")
     assert outcome["if"] == (
-        "${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}"
+        "${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' && "
+        "steps.canonicalize-opencode-review.outputs.budget_metrics_valid == 'true' }}"
+    )
+    assert outcome["env"]["PROVIDER_OUTCOME"] == (
+        "${{ steps.canonicalize-opencode-review.outputs.validated_candidate_outcome }}"
+    )
+    assert outcome["env"]["PROVIDER_FAILURE_REASON"] == (
+        "${{ steps.canonicalize-opencode-review.outputs.validated_failure_reason }}"
+    )
+    assert outcome["env"]["CALL_COUNT"] == (
+        "${{ steps.canonicalize-opencode-review.outputs.validated_call_count }}"
+    )
+    assert outcome["env"]["ELAPSED_SECONDS"] == (
+        "${{ steps.canonicalize-opencode-review.outputs.validated_elapsed_seconds }}"
     )
     for value in (
         "success", "quality_filtered", "provider_failure",
@@ -7783,7 +7796,8 @@ def test_opencode_budget_finalize_uses_only_attested_publication_outcome():
     assert "length) <= 8" in outcome["run"]
     assert finalize["if"] == (
         "${{ always() && !cancelled() && "
-        "needs.opencode-prepare.outputs.allow_invocation == 'true' }}"
+        "needs.opencode-prepare.outputs.allow_invocation == 'true' && "
+        "steps.canonicalize-opencode-review.outputs.budget_metrics_valid == 'true' }}"
     )
     assert finalize["uses"] == "$/.github/actions/review-invocation-budget"
     assert finalize["with"] == {
@@ -7796,10 +7810,10 @@ def test_opencode_budget_finalize_uses_only_attested_publication_outcome():
         "diff-mode": "${{ needs.opencode-prepare.outputs.diff_mode }}",
         "input-files-json": "[]",
         "authenticated-review-json": "${{ steps.opencode-budget-outcome.outputs.authenticated_review_json }}",
-        "model-route-json": '["zai-coding-plan/glm-4.7"]',
+        "model-route-json": "${{ steps.canonicalize-opencode-review.outputs.validated_model_route_json }}",
         "effort": "final-review/default",
-        "actual-call-count": "${{ needs.opencode-review.outputs.review_call_count || '0' }}",
-        "elapsed-seconds": "${{ needs.opencode-review.outputs.review_elapsed_seconds || '0' }}",
+        "actual-call-count": "${{ steps.canonicalize-opencode-review.outputs.validated_call_count }}",
+        "elapsed-seconds": "${{ steps.canonicalize-opencode-review.outputs.validated_elapsed_seconds }}",
         "outcome": "${{ steps.opencode-budget-outcome.outputs.outcome }}",
         "stop-reason": "${{ steps.opencode-budget-outcome.outputs.stop_reason }}",
         "remaining-finding-ids-json": "${{ steps.opencode-budget-outcome.outputs.remaining_finding_ids_json }}",
@@ -13665,6 +13679,86 @@ def test_opencode_candidate_metrics_and_claim_identity_fail_closed(
         if call[0] == "output" and call[1] == "review_succeeded"
     ]
     assert review_outputs and set(review_outputs) == {"false"}
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("outcome", "failure_reason", "after", "expected_count", "expected_reason"),
+    [
+        (
+            "success",
+            "",
+            [_bot("github-actions[bot]", _opencode_review("real finding"), 10, updated="u2")],
+            "1",
+            "none",
+        ),
+        ("failure", "provider_failed", [], "1", "provider_failed"),
+        ("failure", "model_job_failed", [], "0", "model_job_failed"),
+    ],
+    ids=("success", "provider-failure", "zero-call-dependency-failure"),
+)
+def test_opencode_budget_canonicalizer_exports_validated_candidate_metrics(
+    tmp_path, outcome, failure_reason, after, expected_count, expected_reason
+):
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        after,
+        outcome=outcome,
+        failure_reason=failure_reason,
+    )
+
+    outputs = {
+        name: [call[2] for call in calls if call[0] == "output" and call[1] == name]
+        for name in (
+            "budget_metrics_valid",
+            "validated_call_count",
+            "validated_elapsed_seconds",
+            "validated_model_route_json",
+            "validated_candidate_outcome",
+            "validated_failure_reason",
+        )
+    }
+    assert outputs["budget_metrics_valid"][-1] == "true"
+    assert outputs["validated_call_count"] == [expected_count]
+    assert outputs["validated_elapsed_seconds"] == ["1"]
+    assert outputs["validated_model_route_json"] == ['["zai-coding-plan/glm-4.7"]']
+    assert outputs["validated_candidate_outcome"] == [outcome]
+    assert outputs["validated_failure_reason"] == [expected_reason]
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("candidate_artifact_case", "candidate_envelope_changes"),
+    [
+        ("absent", None),
+        ("valid", {"call_count": "1"}),
+    ],
+    ids=("missing", "malformed"),
+)
+def test_opencode_budget_invalid_candidate_metrics_cannot_enable_finalization(
+    tmp_path, candidate_artifact_case, candidate_envelope_changes
+):
+    candidate = _bot(
+        "github-actions[bot]", _opencode_review("real finding"), 10, updated="u2"
+    )
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [candidate],
+        candidate_artifact_case=candidate_artifact_case,
+        candidate_envelope_changes=candidate_envelope_changes,
+    )
+
+    metrics_valid = [
+        call[2] for call in calls
+        if call[0] == "output" and call[1] == "budget_metrics_valid"
+    ]
+    assert metrics_valid == ["false"]
+    assert not any(
+        call[0] == "output" and call[1].startswith("validated_")
+        for call in calls
+    )
 
 
 @node_required

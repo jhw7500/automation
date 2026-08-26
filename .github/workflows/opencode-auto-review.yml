@@ -3162,6 +3162,7 @@ jobs:
             const unchangedSincePrevious = process.env.UNCHANGED_SINCE_PREVIOUS === 'true';
             const budgetAllowInvocation = process.env.BUDGET_ALLOW_INVOCATION === 'true';
             const budgetDecision = process.env.BUDGET_DECISION || '';
+            core.setOutput('budget_metrics_valid', 'false');
             core.setOutput('publication_succeeded', 'false');
             core.setOutput('review_succeeded', 'false');
             core.setOutput('quality_filtered', 'false');
@@ -3430,6 +3431,13 @@ jobs:
                   throw new Error('failed candidate mode invalid');
                 }
                 candidateEnvelopeValid = true;
+                core.setOutput('budget_metrics_valid', 'true');
+                core.setOutput('validated_call_count', String(candidateEnvelope.call_count));
+                core.setOutput('validated_elapsed_seconds', String(candidateEnvelope.elapsed_seconds));
+                core.setOutput('validated_model_route_json',
+                  JSON.stringify(candidateEnvelope.model_route));
+                core.setOutput('validated_candidate_outcome', candidateEnvelope.outcome);
+                core.setOutput('validated_failure_reason', candidateEnvelope.failure_reason);
               } catch (error) {
                 core.warning(`Untrusted OpenCode candidate artifact rejected: ${error.message}`);
               }
@@ -4765,13 +4773,13 @@ jobs:
 
       - name: Resolve OpenCode budget outcome
         id: opencode-budget-outcome
-        if: ${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}
+        if: ${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' && steps.canonicalize-opencode-review.outputs.budget_metrics_valid == 'true' }}
         shell: bash
         env:
-          PROVIDER_OUTCOME: ${{ needs.opencode-review.outputs.review_outcome }}
-          PROVIDER_FAILURE_REASON: ${{ needs.opencode-review.outputs.review_failure_reason }}
-          CALL_COUNT: ${{ needs.opencode-review.outputs.review_call_count }}
-          ELAPSED_SECONDS: ${{ needs.opencode-review.outputs.review_elapsed_seconds }}
+          PROVIDER_OUTCOME: ${{ steps.canonicalize-opencode-review.outputs.validated_candidate_outcome }}
+          PROVIDER_FAILURE_REASON: ${{ steps.canonicalize-opencode-review.outputs.validated_failure_reason }}
+          CALL_COUNT: ${{ steps.canonicalize-opencode-review.outputs.validated_call_count }}
+          ELAPSED_SECONDS: ${{ steps.canonicalize-opencode-review.outputs.validated_elapsed_seconds }}
           PUBLICATION_SUCCEEDED: ${{ steps.canonicalize-opencode-review.outputs.publication_succeeded }}
           REVIEW_SUCCEEDED: ${{ steps.canonicalize-opencode-review.outputs.review_succeeded }}
           QUALITY_FILTERED: ${{ steps.canonicalize-opencode-review.outputs.quality_filtered }}
@@ -4855,7 +4863,7 @@ jobs:
 
       - name: Finalize OpenCode review budget
         id: review-budget-finalize
-        if: ${{ always() && !cancelled() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}
+        if: ${{ always() && !cancelled() && needs.opencode-prepare.outputs.allow_invocation == 'true' && steps.canonicalize-opencode-review.outputs.budget_metrics_valid == 'true' }}
         uses: $/.github/actions/review-invocation-budget
         with:
           github-token: ${{ github.token }}
@@ -4867,10 +4875,10 @@ jobs:
           diff-mode: ${{ needs.opencode-prepare.outputs.diff_mode }}
           input-files-json: '[]'
           authenticated-review-json: ${{ steps.opencode-budget-outcome.outputs.authenticated_review_json }}
-          model-route-json: '["zai-coding-plan/glm-4.7"]'
+          model-route-json: ${{ steps.canonicalize-opencode-review.outputs.validated_model_route_json }}
           effort: final-review/default
-          actual-call-count: ${{ needs.opencode-review.outputs.review_call_count || '0' }}
-          elapsed-seconds: ${{ needs.opencode-review.outputs.review_elapsed_seconds || '0' }}
+          actual-call-count: ${{ steps.canonicalize-opencode-review.outputs.validated_call_count }}
+          elapsed-seconds: ${{ steps.canonicalize-opencode-review.outputs.validated_elapsed_seconds }}
           outcome: ${{ steps.opencode-budget-outcome.outputs.outcome }}
           stop-reason: ${{ steps.opencode-budget-outcome.outputs.stop_reason }}
           remaining-finding-ids-json: ${{ steps.opencode-budget-outcome.outputs.remaining_finding_ids_json }}

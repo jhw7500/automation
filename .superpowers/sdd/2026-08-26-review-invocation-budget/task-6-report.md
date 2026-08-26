@@ -71,3 +71,32 @@ This executes sanitized success, provider failure with prior-state preservation,
 - Scope: no release inventory, verifier, tag, fleet default, contracts documentation, Task 7 scripts, or Task 7 tests changed.
 
 Concerns: none. The eight whole-file Ruff findings predate Task 6; all changed lines are clean.
+
+## Fix round 1
+
+Independent review found that finalization still consumed raw `opencode-review` count/elapsed outputs with `|| '0'`. A 10-minute timeout or materialization/upload/candidate-validation failure after one or two durably counted CLI sessions could therefore finalize the claim falsely as zero-call.
+
+The privileged canonicalizer now initializes only `budget_metrics_valid=false`. It emits validated count, elapsed seconds, fixed model route, candidate outcome, and failure reason only after the candidate artifact passes API ID/digest verification, exact mode-aware regular-file inventory, sealed claim identity, exact envelope keys/types, bounded metrics/route and job-output cross-checks, and success/failure review hash/null validation. Outcome resolution and finalization require `budget_metrics_valid=true` and consume only those canonical outputs; all zero fallbacks were removed. Missing/malformed artifacts, upload/materializer loss, and hard timeout leave the durable claim unfinalized, while valid zero-call dependency failures and counted provider/contract failures finalize truthfully. Valid metrics with a schema-2 publication failure still resolve to `checkpoint_failure`.
+
+RED:
+
+```text
+rtk python3 -m pytest tests/test_review_workflow_logic.py -q -k 'opencode and (budget or invocation or timeout or handoff)'
+6 failed, 8 passed, 1520 deselected in 3.25s
+```
+
+GREEN and regressions:
+
+- Focused Task 6: `14 passed, 1520 deselected in 2.23s`.
+- Dynamic canonical metric cases: `5 passed, 1529 deselected in 1.14s` for valid success, provider failure, zero-call dependency failure, missing artifact, and malformed envelope.
+- OpenCode/actionlint: `1197 passed, 337 deselected in 450.46s`.
+- Full workflow logic: `1534 passed in 498.53s`.
+- Exact non-Task7 full suite: `2090 passed, 48 subtests passed in 531.50s`.
+- Digest-verified actionlint 1.7.12: pinned archive SHA-256 verified; full CI workflow lint produced no diagnostics.
+- YAML: all 16 workflow files parsed.
+- Ruff: zero diagnostics on 99 changed Python lines; the same eight pre-existing whole-file diagnostics remain outside changed lines.
+- `git diff --check`: exited 0.
+
+Fix self-review confirmed that no finalization input reads the raw model-job metrics or uses a zero fallback, valid failure envelopes do not require review success to authenticate usage, and missing metrics cannot enable either outcome resolution or finalization. Scope remains limited to Task 6 workflow/tests/progress/report; no Task 7 file changed.
+
+Fix-round concerns: none.
