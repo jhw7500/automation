@@ -83,6 +83,10 @@ CANONICALIZER_RELEASE_FILES = (
     ".github/actions/canonicalize-review/canonicalize_review.py",
     ".github/actions/canonicalize-review/review_scope.py",
 )
+REVIEW_INVOCATION_BUDGET_RELEASE_FILES = (
+    ".github/actions/review-invocation-budget/action.yml",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py",
+)
 REVIEWER_WORKFLOW_CONTRACTS = {
     "claude-code-review.yml": {
         "job": "claude-review",
@@ -195,13 +199,32 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
     return repo, commit(repo, "current release")
 
 
+def prepare_v147(repo: Path) -> str:
+    action_root = repo / ".github/actions/review-invocation-budget"
+    if not action_root.exists():
+        shutil.copytree(
+            ROOT / ".github/actions/review-invocation-budget",
+            action_root,
+        )
+    return (
+        commit(repo, "v1.47 candidate")
+        if git(repo, "status", "--porcelain")
+        else git(repo, "rev-parse", "HEAD")
+    )
+
+
+def verify_v147(repo: Path, message: str) -> str:
+    candidate = commit(repo, message)
+    return release_verifier.verify_commit_content(repo, "v1.47", candidate)
+
+
 def test_current_commit_gate_accepts_pinned_claude_action(
     current_release_repo: tuple[Path, str],
 ) -> None:
     repo, current = current_release_repo
 
     assert (
-        release_verifier.verify_commit_content(repo, "v1.46", current)
+        release_verifier.verify_commit_content(repo, "v1.47", current)
         == current
     )
 
@@ -224,7 +247,7 @@ def test_current_commit_gate_rejects_moving_claude_action(
     bad_commit = commit(repo, "restore moving Claude action tag")
 
     with pytest.raises(ReleaseVerificationError, match="Claude Code action"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_current_commit_gate_cannot_be_spoofed_by_nested_workflow_basename(
@@ -247,7 +270,7 @@ def test_current_commit_gate_cannot_be_spoofed_by_nested_workflow_basename(
         ReleaseVerificationError,
         match="unexpected nested central review workflow",
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def replace(path: Path, old: str, new: str, *, count: int = -1) -> None:
@@ -706,7 +729,7 @@ def test_current_release_commit_only_uses_authenticated_objects(
     repo, current = current_release_repo
 
     assert (
-        release_verifier.verify_commit_content(repo, "v1.46", current)
+        release_verifier.verify_commit_content(repo, "v1.47", current)
         == current
     )
 
@@ -1034,7 +1057,7 @@ def test_current_release_rejects_opencode_format_repair_runtime_drift(
     bad_commit = commit(repo, "weaken OpenCode format repair runtime")
 
     with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_current_release_rejects_full_legacy_opencode_runtime_downgrade(
@@ -1061,7 +1084,7 @@ def test_current_release_rejects_full_legacy_opencode_runtime_downgrade(
     bad_commit = commit(repo, "downgrade OpenCode format runtime")
 
     with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_current_release_rejects_opencode_custom_shell_preprocessor(
@@ -1082,7 +1105,7 @@ def test_current_release_rejects_opencode_custom_shell_preprocessor(
     bad_commit = commit(repo, "preprocess OpenCode review script with a custom shell")
 
     with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize("placement", ("install-body", "extra-step"))
@@ -1125,7 +1148,7 @@ def test_current_release_rejects_opencode_interpreter_poisoning_before_review(
     bad_commit = commit(repo, f"poison OpenCode interpreter via {placement}")
 
     with pytest.raises(ReleaseVerificationError, match="OpenCode CLI runtime"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1484,7 +1507,7 @@ def test_current_release_rejects_opencode_attestation_boundary_drift(
     bad_commit = commit(repo, "weaken OpenCode attestation boundary")
 
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_prepare_diff_capability_boundary_is_shared_with_release_inventory() -> None:
@@ -1502,6 +1525,172 @@ def test_prepare_diff_capability_boundary_is_shared_with_release_inventory() -> 
         release_inventory.PREPARE_REVIEW_DIFF_ACTION_ROOT
         in release_inventory.release_roots_for("v1.45")
     )
+
+
+def test_v147_budget_capability_boundary_is_shared_with_release_inventory() -> None:
+    capability = getattr(
+        release_inventory, "release_supports_review_invocation_budget", None
+    )
+    assert callable(capability)
+    assert capability("v1.46.2") is False
+    assert capability("v1.47") is True
+
+
+def test_v147_accepts_current_budget_release_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v147(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.47", candidate) == candidate
+
+
+@pytest.mark.parametrize("relative", REVIEW_INVOCATION_BUDGET_RELEASE_FILES)
+@pytest.mark.parametrize("mutation", ("missing", "executable"))
+def test_v147_requires_each_budget_file_as_one_regular_0644_blob(
+    current_release_repo: tuple[Path, str], relative: str, mutation: str
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v147(repo)
+    target = repo / relative
+    if mutation == "missing":
+        target.unlink()
+    else:
+        target.chmod(0o755)
+    bad_commit = commit(repo, f"mutate v1.47 budget file {relative}")
+
+    with pytest.raises(ReleaseVerificationError, match="release inventory"):
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
+
+
+def test_v147_rejects_files_outside_the_closed_budget_action_inventory(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v147(repo)
+    extra = repo / ".github/actions/review-invocation-budget/unowned_helper.py"
+    extra.write_text("raise RuntimeError('not release owned')\n", encoding="utf-8")
+    bad_commit = commit(repo, "add unowned invocation-budget helper")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="invocation-budget inventory"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
+
+
+@pytest.mark.parametrize(
+    "needle",
+    (
+        "duplicate_head",
+        "duplicate_effective_diff",
+        "round_budget_exhausted",
+        "input_budget_exhausted",
+        "total_usage_budget_exhausted",
+        "call_budget_exhausted",
+        "wall_time_exhausted",
+        "provenance_mismatch",
+        "compare_and_swap_failed",
+    ),
+)
+def test_v147_rejects_budget_helper_gate_removal(
+    current_release_repo: tuple[Path, str], needle: str
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v147(repo)
+    helper = repo / REVIEW_INVOCATION_BUDGET_RELEASE_FILES[1]
+    replace(helper, needle, "weakened", count=1)
+    bad_commit = commit(repo, f"remove invocation-budget gate {needle}")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="invocation-budget helper contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "job", "mutation"),
+    (
+        ("claude-code-review.yml", "claude-review", "claim-after-provider"),
+        ("claude-code-review.yml", "claude-review", "remove-allow"),
+        ("claude-code-review.yml", "claude-review", "raise-timeout"),
+        ("gemini-auto-review.yml", "gemini-review", "omit-finalize"),
+        ("gemini-auto-review.yml", "gemini-review", "omit-artifact"),
+        ("opencode-auto-review.yml", "opencode-prepare", "break-handoff-hash"),
+        ("opencode-auto-review.yml", "opencode-review", "raise-call-cap"),
+        ("claude-code-review.yml", "claude-review", "cross-reviewer-fallback"),
+    ),
+)
+def test_v147_rejects_budget_workflow_safety_gate_mutations(
+    current_release_repo: tuple[Path, str],
+    workflow: str,
+    job: str,
+    mutation: str,
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v147(repo)
+    path = repo / ".github/workflows" / workflow
+
+    def weaken(document: dict) -> None:
+        target_job = document["jobs"][job]
+        steps = target_job["steps"]
+        if mutation == "claim-after-provider":
+            claim_step = next(
+                item for item in steps if item.get("id") == "review-budget-claim"
+            )
+            provider = next(
+                item for item in steps if item.get("name") == "Run Claude Code Review"
+            )
+            steps.remove(claim_step)
+            steps.insert(steps.index(provider) + 1, claim_step)
+        elif mutation == "remove-allow":
+            provider = next(
+                item for item in steps if item.get("name") == "Run Claude Code Review"
+            )
+            provider["if"] = "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}"
+        elif mutation == "raise-timeout":
+            target_job["timeout-minutes"] = "11"
+        elif mutation == "omit-finalize":
+            steps.remove(
+                next(item for item in steps if item.get("name") == "Finalize Gemini review budget")
+            )
+        elif mutation == "omit-artifact":
+            steps.remove(
+                next(
+                    item
+                    for item in steps
+                    if item.get("name") == "Upload Gemini review budget claim checkpoint"
+                )
+            )
+        elif mutation == "break-handoff-hash":
+            build = next(
+                item
+                for item in steps
+                if item.get("name") == "Build sealed canonicalization handoff"
+            )
+            build["run"] = build["run"].replace(
+                "budget_checkpoint_sha256", "unsealed_budget_checkpoint_sha256", 1
+            )
+        elif mutation == "raise-call-cap":
+            provider = next(
+                item for item in steps if item.get("name") == "Run OpenCode PR review"
+            )
+            provider["run"] = provider["run"].replace(
+                '(( count < 2 )) || {', '(( count < 3 )) || {', 1
+            )
+        else:
+            steps.append(
+                {
+                    "name": "Fallback to Gemini reviewer",
+                    "if": "${{ failure() }}",
+                    "run": "echo dispatch gemini-auto-review",
+                }
+            )
+
+    mutate_yaml(path, weaken)
+    bad_commit = commit(repo, f"weaken {workflow} budget contract: {mutation}")
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1564,9 +1753,10 @@ def test_v145_inventory_does_not_require_future_canonicalizer_files(
         (repo / relative).unlink(missing_ok=True)
     historical = commit(repo, "v1.45 historical inventory")
 
+    tree = release_verifier.VerifiedCommitTree.open(repo, historical)
     assert (
-        release_verifier.verify_commit_content(repo, "v1.45", historical)
-        == historical
+        release_verifier._release_inventory(tree, "v1.45")
+        is None
     )
 
 
@@ -1594,7 +1784,7 @@ def test_v146_requires_each_canonicalizer_file_as_one_regular_0644_blob(
     bad_commit = commit(repo, f"mutate {relative} as {mutation}")
 
     with pytest.raises(ReleaseVerificationError, match="release inventory"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_v146_rejects_files_outside_the_closed_canonicalizer_inventory(
@@ -1608,7 +1798,7 @@ def test_v146_rejects_files_outside_the_closed_canonicalizer_inventory(
     with pytest.raises(
         ReleaseVerificationError, match="canonicalize-review inventory"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1641,7 +1831,7 @@ def test_v146_rejects_canonicalizer_composite_action_contract_drift(
     with pytest.raises(
         ReleaseVerificationError, match="canonicalize-review action contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1676,7 +1866,7 @@ def test_v146_rejects_any_missing_canonicalizer_reason_literal(
     with pytest.raises(
         ReleaseVerificationError, match="canonicalize-review helper contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1734,7 +1924,7 @@ def test_v146_rejects_canonicalizer_constant_drift(
     with pytest.raises(
         ReleaseVerificationError, match="canonicalize-review helper contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_v146_rejects_review_quality_behavior_drift(
@@ -1753,7 +1943,7 @@ def test_v146_rejects_review_quality_behavior_drift(
     with pytest.raises(
         ReleaseVerificationError, match="canonicalize-review helper contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1824,7 +2014,7 @@ def test_v146_rejects_every_effective_protected_module_rebinding(
     with pytest.raises(
         ReleaseVerificationError, match="canonicalize-review helper contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1875,7 +2065,7 @@ def test_v146_authenticates_exact_helper_source_bytes(
     with pytest.raises(
         ReleaseVerificationError, match="canonicalize-review helper contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -1958,7 +2148,7 @@ def test_v146_rejects_missing_canonicalizer_public_signatures(
     with pytest.raises(
         ReleaseVerificationError, match="canonicalize-review helper contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_v146_helper_verification_compiles_but_never_executes_commit_code(
@@ -2010,7 +2200,7 @@ def test_v146_rejects_nonexact_reviewer_canonicalizer_dependencies(
     with pytest.raises(
         ReleaseVerificationError, match="review action dependency contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_v146_requires_review_auth_helper_from_the_release_commit(
@@ -2028,7 +2218,7 @@ def test_v146_requires_review_auth_helper_from_the_release_commit(
     bad_commit = commit(repo, "detach review auth helper from release")
 
     with pytest.raises(ReleaseVerificationError, match="review action dependency"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2075,7 +2265,7 @@ def test_v146_requires_exact_prepared_head_checkout_before_the_provider(
     bad_commit = commit(repo, f"drift {workflow} prepared head checkout")
 
     with pytest.raises(ReleaseVerificationError, match="review publication contract"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2096,7 +2286,7 @@ def test_v146_requires_review_diff_outputs_outside_the_checkout_workspace(
     bad_commit = commit(repo, f"move {workflow} review inputs into checkout workspace")
 
     with pytest.raises(ReleaseVerificationError, match="review publication contract"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_v146_requires_explicit_opencode_review_diff_output_directory(
@@ -2117,7 +2307,7 @@ def test_v146_requires_explicit_opencode_review_diff_output_directory(
     bad_commit = commit(repo, "remove OpenCode review diff output directory")
 
     with pytest.raises(ReleaseVerificationError, match="output directory contract"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_v146_rejects_an_opencode_canonicalizer_dependency(
@@ -2133,7 +2323,7 @@ def test_v146_rejects_an_opencode_canonicalizer_dependency(
     with pytest.raises(
         ReleaseVerificationError, match="review action dependency contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2181,7 +2371,7 @@ def test_v146_binds_review_contract_to_the_exact_root_workflow_path(
     bad_commit = commit(repo, "shadow malicious root review with nested decoy")
 
     with pytest.raises(ReleaseVerificationError, match="central review workflow"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_v146_rejects_nested_central_workflow_before_the_root_sort_order(
@@ -2195,7 +2385,7 @@ def test_v146_rejects_nested_central_workflow_before_the_root_sort_order(
     bad_commit = commit(repo, "add early-sorting nested central workflow")
 
     with pytest.raises(ReleaseVerificationError, match="central review workflow"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_v146_allows_an_unrelated_nested_workflow_without_shadowing_root_contracts(
@@ -2215,7 +2405,7 @@ def test_v146_allows_an_unrelated_nested_workflow_without_shadowing_root_contrac
 
     assert (
         release_verifier.verify_commit_content(
-            repo, "v1.46", commit_with_nested
+            repo, "v1.47", commit_with_nested
         )
         == commit_with_nested
     )
@@ -2269,7 +2459,7 @@ def test_v146_authenticates_collected_review_state_against_its_run(
     bad_commit = commit(repo, f"weaken {workflow} collected state provenance")
 
     with pytest.raises(ReleaseVerificationError, match="review publication contract"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2312,7 +2502,7 @@ def test_v146_rejects_fail_open_prior_state_collection(
     bad_commit = commit(repo, f"weaken {workflow} prior-state collection")
 
     with pytest.raises(ReleaseVerificationError, match="review publication contract"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2334,7 +2524,7 @@ def test_v146_requires_publication_to_skip_after_collection_failure(
     bad_commit = commit(repo, f"remove {workflow} prior-state publication guard")
 
     with pytest.raises(ReleaseVerificationError, match="review publication contract"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2375,7 +2565,7 @@ def test_v146_authenticates_published_review_state_before_stale_guarding(
     bad_commit = commit(repo, f"weaken {workflow} published state provenance")
 
     with pytest.raises(ReleaseVerificationError, match="review publication contract"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2416,7 +2606,7 @@ def test_v146_rejects_reviewer_upsert_reading_the_raw_candidate(
     with pytest.raises(
         ReleaseVerificationError, match="review publication contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2456,7 +2646,7 @@ def test_v146_binds_rejected_review_diagnostics_to_one_day(
         ReleaseVerificationError,
         match="review publication contract",
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2488,7 +2678,7 @@ def test_v146_never_uploads_a_rejected_raw_review_candidate(
     bad_commit = commit(repo, f"upload rejected raw candidate from {workflow}")
 
     with pytest.raises(ReleaseVerificationError, match="review publication contract"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2547,7 +2737,7 @@ def test_v146_rejects_dead_canonical_read_decoys_and_dynamic_raw_reads(
     with pytest.raises(
         ReleaseVerificationError, match="review publication contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2580,7 +2770,7 @@ def test_v146_rejects_reviewer_v3_publication_state_drift(
     with pytest.raises(
         ReleaseVerificationError, match="review publication contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2615,7 +2805,7 @@ def test_v146_rejects_missing_quality_state_keys(
     with pytest.raises(
         ReleaseVerificationError, match="review publication contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2641,7 +2831,7 @@ def test_v146_rejects_reviewer_marker_drift(
     with pytest.raises(
         ReleaseVerificationError, match="review publication contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2665,7 +2855,7 @@ def test_v146_rejects_reviewer_specific_canonicalizer_inputs(
     with pytest.raises(
         ReleaseVerificationError, match="review publication contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2701,7 +2891,7 @@ def test_v146_requires_quality_prompt_rules_in_both_reviewers(
     with pytest.raises(
         ReleaseVerificationError, match="review publication contract"
     ):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_historical_review_workflows_restore_without_invoking_git(
@@ -2762,7 +2952,7 @@ def test_commit_gate_rejects_unsafe_manual_gemini_output_writer(
     bad_commit = commit(repo, "weaken manual Gemini output writer")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2803,7 +2993,7 @@ def test_commit_gate_rejects_manual_gemini_outputs_rewired_to_unsafe_step(
     bad_commit = commit(repo, "rewire manual Gemini outputs")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2832,7 +3022,7 @@ def test_commit_gate_rejects_manual_gemini_fetch_without_explicit_bash(
     bad_commit = commit(repo, "remove explicit Bash execution context")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 @pytest.mark.parametrize(
@@ -2858,7 +3048,7 @@ def test_commit_gate_rejects_manual_gemini_downstream_output_rewiring(
     bad_commit = commit(repo, "rewire downstream manual Gemini title")
 
     with pytest.raises(ReleaseVerificationError, match="manual Gemini output"):
-        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
 def test_release_verifier_preserves_pre_inventory_v139_contract(

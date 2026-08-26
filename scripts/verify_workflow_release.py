@@ -34,12 +34,15 @@ from scripts.workflow_release_inventory import (
     CANONICALIZE_REVIEW_ACTION_ROOT,
     CANONICALIZE_REVIEW_HELPER_ROOT,
     PREPARE_REVIEW_DIFF_ACTION_ROOT,
+    REVIEW_INVOCATION_BUDGET_ACTION_ROOT,
+    REVIEW_INVOCATION_BUDGET_HELPER_ROOT,
     REVIEW_SCOPE_HELPER_ROOT,
     SETUP_GEMINI_AUTH_ROOT,
     release_paths_for,
     release_roots_for,
     release_supports_canonicalize_review,
     release_supports_prepare_review_diff,
+    release_supports_review_invocation_budget,
     validate_release_listing,
 )
 
@@ -58,6 +61,9 @@ OPENCODE_ARCHIVE_SHA256 = (
 )
 OPENCODE_REVIEW_RUN_SHA256 = (
     "9f1468128086b438cce0ce53fc20a9f0e02a14d581cd12b63f021c8c3a7620c6"
+)
+OPENCODE_REVIEW_RUN_V147_SHA256 = (
+    "d5b3cd5349d5bfd0d78aab2a925891a5e1e2c9f0d44cd86c1876c5cc28ea4b70"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
     "a38218bc27e672f7f7bde1873b9fa3de811057490f3fab7dc91c74d03d80ba97"
@@ -612,6 +618,55 @@ PREPARE_REVIEW_DIFF_ACTION = (
 CANONICALIZE_REVIEW_ACTION = (
     f"$/{CANONICALIZE_REVIEW_ACTION_ROOT.path.parent.as_posix()}"
 )
+REVIEW_INVOCATION_BUDGET_ACTION = (
+    f"$/{REVIEW_INVOCATION_BUDGET_ACTION_ROOT.path.parent.as_posix()}"
+)
+REVIEWER_WORKFLOWS = {
+    "claude": "claude-code-review.yml",
+    "gemini": "gemini-auto-review.yml",
+    "opencode": "opencode-auto-review.yml",
+}
+EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256 = (
+    "42462dad335073794bd5c46e1993e02e4dc9824113d1b36fd5c6b89dc0583a9c"
+)
+EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
+    "5a5b76d2369cb6bd7396f8939f7a810ea3a8f532ca33d805411ceb809c6a3566"
+)
+EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
+    "claude": "a1765c207d32bfc663ec377968f1937a93e0d4b10556f155757652a15ac30b2d",
+    "gemini": "ef258906d3a8c8310253e4dccbb64a45100562ca5f14a10c7f5a4994fdfdc0ea",
+    "opencode": "067738b4e9d1316e9e1f6a88de8ef2c3607440c479c7b5f46995e7d9c4e79c63",
+}
+EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION = {
+    "name": "Review invocation budget",
+    "description": "Claim and finalize a durable fail-closed review invocation budget",
+    "inputs": {
+        "github-token": {"required": "true"},
+        "mode": {"required": "true"},
+        "reviewer": {"required": "true"},
+        "pr-number": {"required": "true"},
+        "expected-head-sha": {"required": "true"},
+        "full-diff-sha256": {"required": "true"},
+        "diff-mode": {"required": "true"},
+        "input-files-json": {"required": "true"},
+        "authenticated-review-json": {"required": "true"},
+        "model-route-json": {"required": "true"},
+        "effort": {"required": "true"},
+        "checkpoint-file": {"required": "true"},
+        "actual-call-count": {"required": "false", "default": "0"},
+        "elapsed-seconds": {"required": "false", "default": "0"},
+        "outcome": {"required": "false", "default": "checkpoint_failure"},
+        "stop-reason": {"required": "false", "default": ""},
+        "remaining-finding-ids-json": {"required": "false", "default": "[]"},
+    },
+    "outputs": {
+        name: {"value": f"${{{{ steps.budget.outputs.{name} }}}}"}
+        for name in (
+            "allow-invocation", "decision", "round", "invocation-key",
+            "checkpoint-sha256", "comment-id",
+        )
+    },
+}
 REVIEW_DIFF_DEPENDENCY_WORKFLOWS = (
     "claude-code-review.yml",
     "gemini-auto-review.yml",
@@ -655,6 +710,9 @@ REVIEW_PUBLICATION_CONTRACTS = {
         "upsert_sha256": (
             "d2f1d2eab1e974bf05f184406e854cfe0861ab4b863520a4189d987ceccf27cc"
         ),
+        "upsert_sha256_v147": (
+            "250893bab0d29e25706b7512a9cddb5f7aca687292a9c66de27cf9a1cc323842"
+        ),
         "bot_login": "github-actions[bot]",
         "workflow_prefix": (
             "jhw7500/automation/.github/workflows/claude-code-review.yml@"
@@ -683,6 +741,9 @@ REVIEW_PUBLICATION_CONTRACTS = {
         "canonical_step": "Canonicalize Gemini review",
         "upsert_sha256": (
             "cc81b9e370c357366a384a059c9d6e1fe02065f085985f30532b92410c49c43d"
+        ),
+        "upsert_sha256_v147": (
+            "1eb58f53bd3af4dc3db2e580e02078df961b9ecb52c9b75af233db2475e45635"
         ),
         "bot_login": "${{ steps.auth.outputs.bot-login }}",
         "auth_mode": "${{ inputs.repo_write_auth }}",
@@ -1757,7 +1818,10 @@ def verify_opencode_runtime(
             format_sequence_is_ordered = False
             break
     format_repair_contract = (
-        workflow_sha256 == OPENCODE_AUTO_REVIEW_SHA256
+        workflow_sha256 in {
+            OPENCODE_AUTO_REVIEW_SHA256,
+            EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256["opencode"],
+        }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
         == "${{ needs.opencode-prepare.outputs.candidate_nonce }}"
@@ -1846,7 +1910,8 @@ def verify_opencode_runtime(
         and 'remainder = line.strip()' in run_script
         and 'unicodedata.category(character) == "Zs"' in run_script
         and "normalize_wrapper_allowlist_text(" in run_script
-        and _opencode_review_run_sha256(run_script) == OPENCODE_REVIEW_RUN_SHA256
+        and _opencode_review_run_sha256(run_script)
+        in {OPENCODE_REVIEW_RUN_SHA256, OPENCODE_REVIEW_RUN_V147_SHA256}
         and format_sequence_is_ordered
     )
     selected_generic_contract = format_repair_contract or (
@@ -2752,6 +2817,316 @@ def _action_references(value: object) -> list[str]:
     return result
 
 
+def require_budget_helper_contract(source: str) -> None:
+    """Require the authenticated schema-1 helper and every fixed policy gate."""
+
+    try:
+        if (
+            hashlib.sha256(source.encode("utf-8")).hexdigest()
+            != EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256
+        ):
+            raise ValueError("helper source digest differs")
+        compile(
+            source,
+            "review_invocation_budget.py",
+            "exec",
+            dont_inherit=True,
+        )
+        module = ast.parse(source, filename="review_invocation_budget.py")
+        expected_literals = {
+            "SCHEMA": 1,
+            "STATE_PREFIX": "<!-- automation-budget-state:",
+            "STATE_SUFFIX": " -->",
+            "MARKERS": {
+                "claude": "<!-- automation:review-invocation-budget:claude:v1 -->",
+                "gemini": "<!-- automation:review-invocation-budget:gemini:v1 -->",
+                "opencode": "<!-- automation:review-invocation-budget:opencode:v1 -->",
+            },
+            "WORKFLOWS": {
+                "claude": ".github/workflows/claude-code-review.yml",
+                "gemini": ".github/workflows/gemini-auto-review.yml",
+                "opencode": ".github/workflows/opencode-auto-review.yml",
+            },
+            "_CALL_UNITS": {
+                "claude": "claude-code-action review session",
+                "gemini": "generate_content request",
+                "opencode": "opencode run session",
+            },
+        }
+        _require_unique_module_bindings(
+            module,
+            frozenset(
+                {
+                    *expected_literals,
+                    "BudgetPolicy",
+                    "LedgerState",
+                    "ClaimRequest",
+                    "FinalizeRequest",
+                    "serialize_ledger",
+                    "parse_ledger",
+                    "estimate_input_tokens",
+                    "choose_override",
+                    "claim",
+                    "finalize",
+                    "render_checkpoint",
+                    "load_checkpoint",
+                }
+            ),
+        )
+        if any(
+            _static_literal(module, name) != expected
+            for name, expected in expected_literals.items()
+        ):
+            raise ValueError("helper constants differ")
+        policy = _class_node(module, "BudgetPolicy")
+        policy_defaults = {
+            item.target.id: ast.literal_eval(item.value)
+            for item in policy.body
+            if isinstance(item, ast.AnnAssign)
+            and isinstance(item.target, ast.Name)
+            and item.value is not None
+        }
+        if policy_defaults != {
+            "max_rounds": 2,
+            "max_override_rounds": 1,
+            "max_calls_per_round": 1,
+            "max_wall_seconds_per_round": 600,
+            "max_estimated_tokens_per_round": 200_000,
+            "max_estimated_tokens_total": 400_000,
+        }:
+            raise ValueError("budget defaults differ")
+        functions = _module_function_headers(module)
+        required_functions = {
+            "serialize_ledger": "def serialize_ledger(state: LedgerState) -> str",
+            "parse_ledger": (
+                "def parse_ledger(body: str | None, *, repository: str, pr: int, "
+                "reviewer: Reviewer) -> LedgerState | None"
+            ),
+            "estimate_input_tokens": (
+                "def estimate_input_tokens(paths: Sequence[Path]) -> int"
+            ),
+            "choose_override": (
+                "def choose_override(state: LedgerState, "
+                "events: Sequence[OverrideEvent]) -> OverrideEvent | None"
+            ),
+            "claim": (
+                "def claim(state: LedgerState | None, request: ClaimRequest, "
+                "provenances: Mapping[tuple[int, int], RunProvenance]) -> Transition"
+            ),
+            "finalize": (
+                "def finalize(state: LedgerState, request: FinalizeRequest, "
+                "provenances: Mapping[tuple[int, int], RunProvenance]) -> Transition"
+            ),
+            "render_checkpoint": (
+                "def render_checkpoint(state: LedgerState) -> bytes"
+            ),
+            "load_checkpoint": (
+                "def load_checkpoint(payload: bytes) -> LedgerState"
+            ),
+        }
+        if any(
+            functions.get(name) != header
+            for name, header in required_functions.items()
+        ):
+            raise ValueError("public helper function differs")
+        claim_source = ast.get_source_segment(
+            source,
+            next(
+                item
+                for item in module.body
+                if isinstance(item, ast.FunctionDef) and item.name == "claim"
+            ),
+        )
+        if not isinstance(claim_source, str):
+            raise ValueError("claim source unavailable")
+        ordered_claim_gates = (
+            "authenticated_reuse",
+            "duplicate_head",
+            "duplicate_effective_diff",
+            "input_budget_exhausted",
+            "round_budget_exhausted",
+            "total_usage_budget_exhausted",
+        )
+        cursor = -1
+        for gate in ordered_claim_gates:
+            cursor = claim_source.find(gate, cursor + 1)
+            if cursor < 0:
+                raise ValueError("claim gate order differs")
+        required_source = (
+            "github-actions[bot]",
+            "review-budget-override",
+            "event.event_id not in state.consumed_override_event_ids",
+            "not current and provenance.status != \"completed\"",
+            "current and provenance.status not in {\"in_progress\", \"completed\"}",
+            "call_budget_exhausted",
+            "wall_time_exhausted",
+            "len(findings) > 8",
+            "compare_and_swap_failed",
+            "payload != render_checkpoint(state)",
+        )
+        if not all(fragment in source for fragment in required_source):
+            raise ValueError("helper policy source differs")
+    except (StopIteration, SyntaxError, TypeError, ValueError):
+        raise ReleaseVerificationError(
+            "invocation-budget helper contract is invalid"
+        ) from None
+
+
+def require_budget_workflow_contract(
+    tree: VerifiedCommitTree, workflow: str, reviewer: str
+) -> None:
+    """Require one reviewer-specific claim/finalize boundary from commit bytes."""
+
+    try:
+        if REVIEWER_WORKFLOWS.get(reviewer) != workflow:
+            raise ValueError("reviewer workflow mismatch")
+        path = f".github/workflows/{workflow}"
+        payload = tree.read_file(path)
+        if (
+            hashlib.sha256(payload).hexdigest()
+            != EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256[reviewer]
+        ):
+            raise ValueError("workflow source digest differs")
+        document = yaml.load(payload, Loader=yaml.BaseLoader)
+        jobs = document["jobs"]
+        locations = {
+            "claude": ("claude-review", "claude-review"),
+            "gemini": ("gemini-review", "gemini-review"),
+            "opencode": ("opencode-prepare", "opencode-canonicalize"),
+        }
+        claim_job_name, finalize_job_name = locations[reviewer]
+        claim_job = jobs[claim_job_name]
+        finalize_job = jobs[finalize_job_name]
+        claim_steps = [
+            step
+            for step in claim_job["steps"]
+            if step.get("uses") == REVIEW_INVOCATION_BUDGET_ACTION
+            and step.get("with", {}).get("mode") == "claim"
+        ]
+        finalize_steps = [
+            step
+            for step in finalize_job["steps"]
+            if step.get("uses") == REVIEW_INVOCATION_BUDGET_ACTION
+            and step.get("with", {}).get("mode") == "finalize"
+        ]
+        if len(claim_steps) != 1 or len(finalize_steps) != 1:
+            raise ValueError("claim/finalize pair differs")
+        claim_step = claim_steps[0]
+        finalize_step = finalize_steps[0]
+        allow_token = "allow_invocation" if reviewer == "opencode" else "allow-invocation"
+        if (
+            claim_step.get("id") != "review-budget-claim"
+            or finalize_step.get("id") != "review-budget-finalize"
+            or claim_step.get("with", {}).get("reviewer") != reviewer
+            or finalize_step.get("with", {}).get("reviewer") != reviewer
+            or f"{allow_token} == 'true'" not in finalize_step.get("if", "")
+            or "always()" not in finalize_step.get("if", "")
+            or "!cancelled()" not in finalize_step.get("if", "")
+        ):
+            raise ValueError("claim/finalize guards differ")
+        provider_names = {
+            "claude": "Run Claude Code Review",
+            "gemini": "Run Gemini Code Review",
+            "opencode": "Run OpenCode PR review",
+        }
+        provider_job = jobs[
+            claim_job_name if reviewer != "opencode" else "opencode-review"
+        ]
+        provider = _named_step(provider_job, provider_names[reviewer])
+        provider_guard = provider.get("if", provider_job.get("if", ""))
+        if allow_token not in provider_guard:
+            raise ValueError("provider allow guard differs")
+        if reviewer != "opencode" and claim_job["steps"].index(claim_step) >= claim_job["steps"].index(provider):
+            raise ValueError("claim/provider order differs")
+        if reviewer == "opencode" and provider_job.get("timeout-minutes") != "10":
+            raise ValueError("OpenCode timeout differs")
+        if reviewer != "opencode" and claim_job.get("timeout-minutes") != "10":
+            raise ValueError("review timeout differs")
+        rendered = payload.decode("utf-8")
+        required_fragments = {
+            "claude": (
+                "call_count=1",
+                "claude-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}",
+                "claude-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
+            ),
+            "gemini": (
+                "GEMINI_CALL_COUNT_FILE",
+                "if count >= 3:",
+                "gemini-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}",
+                "gemini-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
+            ),
+            "opencode": (
+                "(( count < 2 )) || {",
+                "budget_checkpoint_sha256",
+                "review-budget-claim.json",
+                "opencode-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}",
+                "opencode-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
+            ),
+        }[reviewer]
+        if not all(fragment in rendered for fragment in required_fragments):
+            raise ValueError("workflow budget source differs")
+        forbidden = {
+            "claude": "Fallback to Gemini reviewer",
+            "gemini": "Fallback to Claude reviewer",
+            "opencode": "Fallback to Claude reviewer",
+        }[reviewer]
+        if forbidden in rendered:
+            raise ValueError("cross-reviewer fallback")
+    except (
+        KeyError,
+        ReleaseVerificationError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        yaml.YAMLError,
+    ):
+        raise ReleaseVerificationError(
+            "invocation-budget workflow contract is invalid"
+        ) from None
+
+
+def _verify_review_invocation_budget(
+    tree: VerifiedCommitTree, ref: str
+) -> None:
+    if not release_supports_review_invocation_budget(ref):
+        return
+    expected_files = {
+        (REVIEW_INVOCATION_BUDGET_ACTION_ROOT.path.as_posix(), "100644", "blob"),
+        (REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix(), "100644", "blob"),
+    }
+    actual_files = {
+        (entry.path.as_posix(), entry.mode, entry.object_type)
+        for entry in tree.files(REVIEW_INVOCATION_BUDGET_ACTION_ROOT.path.parent)
+    }
+    if actual_files != expected_files:
+        raise ReleaseVerificationError(
+            "invocation-budget inventory is not closed"
+        )
+    action_path = REVIEW_INVOCATION_BUDGET_ACTION_ROOT.path.as_posix()
+    try:
+        payload = tree.read_file(action_path)
+        action = yaml.load(payload, Loader=yaml.BaseLoader)
+        expected_surface = {
+            key: action.get(key) for key in ("name", "description", "inputs", "outputs")
+        }
+        if (
+            hashlib.sha256(payload).hexdigest()
+            != EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256
+            or expected_surface != EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION
+            or action.get("runs", {}).get("using") != "composite"
+            or len(action.get("runs", {}).get("steps", [])) != 1
+        ):
+            raise ValueError("action differs")
+    except (AttributeError, ReleaseVerificationError, TypeError, ValueError, yaml.YAMLError):
+        raise ReleaseVerificationError(
+            "invocation-budget action contract is invalid"
+        ) from None
+    helper = tree.read_text(REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path)
+    require_budget_helper_contract(helper)
+    for reviewer, workflow in REVIEWER_WORKFLOWS.items():
+        require_budget_workflow_contract(tree, workflow, reviewer)
+
+
 def expected_review_actions(ref: str, workflow: str) -> list[str]:
     """Return the exact ordered release-local action dependencies."""
 
@@ -2760,11 +3135,15 @@ def expected_review_actions(ref: str, workflow: str) -> list[str]:
         actions.append(SETUP_GEMINI_AUTH_REVIEW)
     if release_supports_prepare_review_diff(ref):
         actions.append(PREPARE_REVIEW_DIFF_ACTION)
+    if release_supports_review_invocation_budget(ref):
+        actions.append(REVIEW_INVOCATION_BUDGET_ACTION)
     if (
         release_supports_canonicalize_review(ref)
         and workflow in CANONICALIZE_REVIEW_WORKFLOWS
     ):
         actions.append(CANONICALIZE_REVIEW_ACTION)
+    if release_supports_review_invocation_budget(ref):
+        actions.append(REVIEW_INVOCATION_BUDGET_ACTION)
     return actions
 
 
@@ -2824,7 +3203,9 @@ def _named_step(job: object, name: str) -> dict:
     return matches[0]
 
 
-def _expected_canonicalize_step(contract: dict[str, str]) -> dict[str, object]:
+def _expected_canonicalize_step(
+    contract: dict[str, str], *, budget: bool = False
+) -> dict[str, object]:
     reviewer = contract["reviewer"]
     reset = contract["reset"]
     return {
@@ -2833,7 +3214,12 @@ def _expected_canonicalize_step(contract: dict[str, str]) -> dict[str, object]:
         "if": (
             f"${{{{ always() && steps.{reset}.outcome == 'success' && "
             "steps.prepare-diff.outputs.diff-ready == 'true' && "
-            "steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+            "steps.prepare-diff.outputs.diff-mode != 'unchanged'"
+            + (
+                " && steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+                if budget
+                else " }}"
+            )
         ),
         "uses": CANONICALIZE_REVIEW_ACTION,
         "with": {
@@ -2858,10 +3244,16 @@ def _expected_canonicalize_step(contract: dict[str, str]) -> dict[str, object]:
     }
 
 
-def _expected_prepared_head_checkout_step() -> dict[str, object]:
+def _expected_prepared_head_checkout_step(*, budget: bool = False) -> dict[str, object]:
     return {
         "name": "Checkout prepared review head",
-        "if": "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}",
+        "if": (
+            "${{ steps.prepare-diff.outputs.diff-ready == 'true' && "
+            "steps.prepare-diff.outputs.diff-mode != 'unchanged' && "
+            "steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+            if budget
+            else "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}"
+        ),
         "uses": CHECKOUT_ACTION,
         "with": {
             "ref": "${{ steps.prepare-diff.outputs.head-sha }}",
@@ -2874,12 +3266,20 @@ def _expected_prepared_head_checkout_step() -> dict[str, object]:
 
 def _expected_rejected_review_diagnostic_upload_step(
     contract: dict[str, str],
+    *,
+    budget: bool = False,
 ) -> dict[str, object]:
     reviewer = contract["reviewer"]
     return {
         "name": f"Upload rejected {reviewer.capitalize()} review diagnostic",
         "if": (
-            "${{ always() && steps.canonicalize-review.outcome != 'skipped' "
+            "${{ always() && "
+            + (
+                "steps.review-budget-claim.outputs.allow-invocation == 'true' && "
+                if budget
+                else ""
+            )
+            + "steps.canonicalize-review.outcome != 'skipped' "
             "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
         ),
         "uses": UPLOAD_ARTIFACT_ACTION,
@@ -2896,7 +3296,10 @@ def _expected_rejected_review_diagnostic_upload_step(
     }
 
 
-def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
+def _verify_review_publication_contracts(
+    documents: dict[str, dict], ref: str
+) -> None:
+    budget = release_supports_review_invocation_budget(ref)
     jq_state_keys = json.dumps(list(QUALITY_STATE_KEYS))
     js_state_keys = ", ".join(repr(key) for key in QUALITY_STATE_KEYS)
     expected_output_env = {
@@ -2932,7 +3335,7 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
             if job.get("permissions", {}).get("actions") != "read":
                 raise ValueError("review run provenance permission differs")
             canonical_step = _named_step(job, contract["canonical_step"])
-            if canonical_step != _expected_canonicalize_step(contract):
+            if canonical_step != _expected_canonicalize_step(contract, budget=budget):
                 raise ValueError("canonicalizer call differs")
             rejected_diagnostic_upload = _named_step(
                 job,
@@ -2940,11 +3343,15 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
             )
             if (
                 rejected_diagnostic_upload
-                != _expected_rejected_review_diagnostic_upload_step(contract)
+                != _expected_rejected_review_diagnostic_upload_step(
+                    contract, budget=budget
+                )
             ):
                 raise ValueError("rejected review diagnostic differs")
             prepared_head_checkout = _named_step(job, "Checkout prepared review head")
-            if prepared_head_checkout != _expected_prepared_head_checkout_step():
+            if prepared_head_checkout != _expected_prepared_head_checkout_step(
+                budget=budget
+            ):
                 raise ValueError("prepared review head checkout differs")
 
             collector = _named_step(job, contract["collector"])
@@ -3040,7 +3447,16 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 raise ValueError("quality prompt differs")
 
             upsert = _named_step(job, "Upsert review comment")
-            if upsert.get("if") != contract["upsert_if"]:
+            expected_upsert_if = contract["upsert_if"]
+            if budget:
+                collector_id = contract["collector_id"]
+                expected_upsert_if = (
+                    f"${{{{ !cancelled() && steps.{collector_id}.outcome == 'success' && "
+                    + "(steps.prepare-diff.outputs.diff-ready != 'true' || "
+                    "steps.prepare-diff.outputs.diff-mode == 'unchanged' || "
+                    "steps.review-budget-claim.outputs.allow-invocation == 'true') }}"
+                )
+            if upsert.get("if") != expected_upsert_if:
                 raise ValueError("upsert prior-state guard differs")
             if not (
                 job["steps"].index(rejected_diagnostic_upload)
@@ -3052,7 +3468,9 @@ def _verify_review_publication_contracts(documents: dict[str, dict]) -> None:
                 raise ValueError("upsert script is unavailable")
             if (
                 hashlib.sha256(upsert_script.encode("utf-8")).hexdigest()
-                != contract["upsert_sha256"]
+                != contract[
+                    "upsert_sha256_v147" if budget else "upsert_sha256"
+                ]
             ):
                 raise ValueError("upsert publication program differs")
             validation_template = (
@@ -3157,6 +3575,7 @@ def _verify_token_mapping(
     *,
     allow_empty: bool = False,
     allow_actions_provenance: bool = False,
+    allow_budget_state: bool = False,
 ) -> int:
     if not isinstance(mapping, dict):
         return 0
@@ -3164,6 +3583,12 @@ def _verify_token_mapping(
     for key, value in mapping.items():
         token_key = str(key).lower().replace("_", "-")
         if token_key == "token" or token_key.endswith("-token"):
+            if token_key == "github-token" and allow_budget_state:
+                if value != GITHUB_ACTIONS_PROVENANCE_TOKEN:
+                    raise ReleaseVerificationError(
+                        f"{name}:{location} budget-state token is invalid"
+                    )
+                continue
             if token_key == "actions-token" and allow_actions_provenance:
                 if value != GITHUB_ACTIONS_PROVENANCE_TOKEN:
                     raise ReleaseVerificationError(
@@ -3257,6 +3682,8 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
             CANONICALIZE_REVIEW_ACTION,
             UPLOAD_ARTIFACT_ACTION,
         }
+    if release_supports_review_invocation_budget(ref):
+        approved_actions |= {REVIEW_INVOCATION_BUDGET_ACTION}
     unapproved_actions = sorted(set(_action_references(document)) - approved_actions)
     if unapproved_actions:
         raise ReleaseVerificationError(
@@ -3318,10 +3745,17 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
                 == GITHUB_ACTIONS_PROVENANCE_TOKEN
                 and step_values.count("github.token") == 1
             )
+            budget_state_step = (
+                release_supports_review_invocation_budget(ref)
+                and name == "gemini-auto-review.yml"
+                and job_name == "gemini-review"
+                and step.get("uses") == REVIEW_INVOCATION_BUDGET_ACTION
+                and step_values.count("github.token") == 1
+            )
             if (
                 step_index not in candidates
                 and "github.token" in step_values
-                and not provenance_step
+                and not (provenance_step or budget_state_step)
             ):
                 raise ReleaseVerificationError(
                     f"{name}:{job_name} bypasses the resolved repository-write token"
@@ -3365,6 +3799,12 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
                 and job_name == "gemini-review"
                 and step.get("name") in {"Get PR details", "Upsert review comment"}
             )
+            budget_state_step = (
+                release_supports_review_invocation_budget(ref)
+                and name == "gemini-auto-review.yml"
+                and job_name == "gemini-review"
+                and step.get("uses") == REVIEW_INVOCATION_BUDGET_ACTION
+            )
             for mapping_name in ("env", "with"):
                 write_token_sinks += _verify_token_mapping(
                     name,
@@ -3373,6 +3813,9 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
                     allow_empty=step_index < index,
                     allow_actions_provenance=(
                         provenance_step and mapping_name == "env"
+                    ),
+                    allow_budget_state=(
+                        budget_state_step and mapping_name == "with"
                     ),
                 )
         if write_token_sinks == 0:
@@ -3434,7 +3877,7 @@ def _verify_commit_content(
     _verify_claude_code_action_pin(ref, documents)
     _verify_review_action_dependencies(ref, documents)
     if release_supports_canonicalize_review(ref):
-        _verify_review_publication_contracts(documents)
+        _verify_review_publication_contracts(documents, ref)
 
     if catalog is not None:
         gemini_targets = sorted(
@@ -3532,7 +3975,14 @@ def _verify_commit_content(
             canonical_checkout = next(item for item in canonical["steps"] if item.get("name") == "Checkout trusted repository")
         except (KeyError, TypeError, StopIteration) as exc:
             raise ReleaseVerificationError("OpenCode three-job attestation boundary is missing") from exc
-        expected_prepare = {"actions": "read", "checks": "read", "contents": "read", "pull-requests": "read", "issues": "read"}
+        budget_release = release_supports_review_invocation_budget(ref)
+        expected_prepare = {
+            "actions": "read",
+            "checks": "read",
+            "contents": "read",
+            "pull-requests": "read",
+            "issues": "write" if budget_release else "read",
+        }
         expected_canonical = {"actions": "read", "checks": "write", "contents": "read", "pull-requests": "write", "issues": "write"}
         canonical_script = canonical_step.get("with", {}).get("script", "")
         prepare_script = prepare_collect.get("run", "")
@@ -3730,7 +4180,17 @@ def _verify_commit_content(
             and upload.get("with", {}).get("overwrite") == "false"
             and candidate_upload.get("uses") == UPLOAD_ARTIFACT_ACTION
             and candidate_upload.get("with", {}).get("name") == "opencode-candidate-${{ github.run_id }}-${{ github.run_attempt }}"
-            and candidate_upload.get("with", {}).get("path") == "${{ runner.temp }}/opencode-candidate/review.md"
+            and candidate_upload.get("with", {}).get("path")
+            == (
+                "${{ runner.temp }}/opencode-candidate"
+                if budget_release
+                else "${{ runner.temp }}/opencode-candidate/review.md"
+            )
+            and (
+                candidate_upload.get("with", {}).get("if-no-files-found") == "error"
+                if budget_release
+                else True
+            )
             and candidate_upload.get("with", {}).get("overwrite") == "false"
             and all(item.get("uses") == DOWNLOAD_ARTIFACT_ACTION for item in (model_download, canonical_download, candidate_download))
             and all(item.get("with", {}).get("artifact-ids") == "${{ needs.opencode-prepare.outputs.handoff_artifact_id }}" for item in (model_download, canonical_download))
@@ -3746,7 +4206,21 @@ def _verify_commit_content(
             and 'candidateArtifact.digest !== `sha256:${candidateDigest}`' in canonical_script
             and 'candidateArtifact.name !== candidateName' in canonical_script
             and 'candidateArtifact.workflow_run?.id !== runId' in canonical_script
-            and "entries.length !== 1 || entries[0].name !== 'review.md'" in canonical_script
+            and (
+                all(
+                    fragment in canonical_script
+                    for fragment in (
+                        "const expectedCandidateFiles = candidateEnvelope.outcome === 'success'",
+                        "? ['candidate.json', 'review.md'] : ['candidate.json']",
+                        "JSON.stringify(entries.map((entry) => entry.name).sort())",
+                        "!== JSON.stringify(expectedCandidateFiles)",
+                        "entries.some((entry) => !entry.isFile() || entry.isSymbolicLink())",
+                    )
+                )
+                if budget_release
+                else "entries.length !== 1 || entries[0].name !== 'review.md'"
+                in canonical_script
+            )
             and "candidateStat.size > 60000" in canonical_script
             and "Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536" in canonical_script
             and (
@@ -3912,6 +4386,8 @@ def _verify_commit_content(
         raise ReleaseVerificationError(
             "opencode.yml security contract permits unsafe PR or App-token access"
         )
+    if release_supports_review_invocation_budget(ref):
+        _verify_review_invocation_budget(tree, ref)
     return tree
 
 

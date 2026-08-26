@@ -80,6 +80,18 @@ REVIEW_SCOPE_HELPER_ROOT = ReleaseRoot(
     "file",
     "100644",
 )
+REVIEW_INVOCATION_BUDGET_ACTION_ROOT = ReleaseRoot(
+    PurePosixPath(".github/actions/review-invocation-budget/action.yml"),
+    "file",
+    "100644",
+)
+REVIEW_INVOCATION_BUDGET_HELPER_ROOT = ReleaseRoot(
+    PurePosixPath(
+        ".github/actions/review-invocation-budget/review_invocation_budget.py"
+    ),
+    "file",
+    "100644",
+)
 
 HISTORICAL_RELEASE_ROOTS = (
     CENTRAL_WORKFLOW_ROOT,
@@ -97,10 +109,15 @@ CANONICALIZE_REVIEW_ROOTS = (
     CANONICALIZE_REVIEW_HELPER_ROOT,
     REVIEW_SCOPE_HELPER_ROOT,
 )
+REVIEW_INVOCATION_BUDGET_ROOTS = (
+    REVIEW_INVOCATION_BUDGET_ACTION_ROOT,
+    REVIEW_INVOCATION_BUDGET_HELPER_ROOT,
+)
 RELEASE_ROOTS = (
     HISTORICAL_RELEASE_ROOTS
     + PREPARE_REVIEW_DIFF_ROOTS
     + CANONICALIZE_REVIEW_ROOTS
+    + REVIEW_INVOCATION_BUDGET_ROOTS
 )
 RELEASE_PATHS = tuple(root.path.as_posix() for root in RELEASE_ROOTS)
 EXACT_RELEASE_ROOTS = tuple(root for root in RELEASE_ROOTS if root.kind == "file")
@@ -111,6 +128,7 @@ _TREE_FILE_MODES = frozenset({"100644", "100755"})
 _RELEASE_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
 PREPARE_REVIEW_DIFF_RELEASE = (1, 45)
 CANONICALIZE_REVIEW_RELEASE = (1, 46)
+REVIEW_INVOCATION_BUDGET_RELEASE = (1, 47)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -131,6 +149,12 @@ def release_supports_canonicalize_review(ref: str) -> bool:
     return _release_version(ref) >= CANONICALIZE_REVIEW_RELEASE
 
 
+def release_supports_review_invocation_budget(ref: str) -> bool:
+    """Return whether ``ref`` owns the review invocation-budget action."""
+
+    return _release_version(ref) >= REVIEW_INVOCATION_BUDGET_RELEASE
+
+
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:
     """Select the authenticated inventory that existed at ``ref``'s release line."""
     roots = HISTORICAL_RELEASE_ROOTS
@@ -138,6 +162,8 @@ def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:
         roots += PREPARE_REVIEW_DIFF_ROOTS
     if release_supports_canonicalize_review(ref):
         roots += CANONICALIZE_REVIEW_ROOTS
+    if release_supports_review_invocation_budget(ref):
+        roots += REVIEW_INVOCATION_BUDGET_ROOTS
     return roots
 
 

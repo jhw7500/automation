@@ -765,6 +765,68 @@ ceiling, not a universal signature against an unrelated workflow independently g
 actions are not GHES-compatible, and the pinned upstream OpenCode command is itself tied to
 github.com.
 
+## Review invocation budget and handoff
+
+Claude, Gemini, and OpenCode each own one schema-1 budget ledger comment. Its
+reviewer-specific marker must begin at byte zero and must be followed immediately by
+one compact `<!-- automation-budget-state:{...} -->` JSON marker:
+
+```text
+<!-- automation:review-invocation-budget:claude:v1 -->
+<!-- automation:review-invocation-budget:gemini:v1 -->
+<!-- automation:review-invocation-budget:opencode:v1 -->
+```
+
+Only a comment authored by exactly `github-actions[bot]` is eligible, and exactly one
+comment may match a reviewer marker. Invalid, duplicate, or provenance-unverifiable
+state fails closed. The effective-diff identity is the SHA-256 of the immutable
+`review-full.diff`, including when a provider consumes a delta. A prior invocation by
+the same reviewer with the same head SHA or full-diff hash is an absolute zero-call
+gate and cannot be overridden.
+
+A round is one distinct effective diff claimed by one reviewer. Each reviewer has two
+automatic rounds. One `review-budget-override` label timeline-event ID can authorize
+one additional round for that PR/reviewer and is consumed exactly once. Estimated
+input is `ceil(sum(input_file_bytes) / 4) + 20_000`, capped at 200,000 tokens per
+round, 400,000 across automatic rounds, and 600,000 only after the override. Every
+round has a 600-second provider wall-time cap. Call units and caps are one Claude
+action session, three Gemini `generate_content` requests across primary, retries, and
+configured same-reviewer fallback, and two OpenCode `opencode run` sessions including
+format repair.
+
+Claim decisions are applied in this order: invalid state/provenance/head/diff;
+authenticated unchanged reuse; duplicate head; duplicate effective diff; per-round
+input exhaustion; automatic-round exhaustion and eligible override consumption;
+aggregate usage exhaustion; then `claimed` with `allow-invocation=true`. The claim is
+persisted before provider execution. Cancelled, timed-out, provider-failed,
+quality-filtered, and unfinalized claims remain consumed. Immediately before ledger
+mutation, the action refetches both PR head and prior comment; any mismatch returns
+`state_invalid` with `compare_and_swap_failed`, performs no mutation, and permits no
+provider call.
+
+Finalization runs after canonical publication under `always() && !cancelled()` and
+records the actual model route, effort, call unit/count, elapsed seconds, outcome,
+stop reason, and at most eight active `RVW-<12hex>` IDs. Claude records its
+configured/default model with `final-review/default`; Gemini records every attempted
+primary/fallback model and its configured thinking level; OpenCode records
+`zai-coding-plan/glm-4.7` with `final-review/default`. Provider failure never falls
+back to a different reviewer.
+
+Every claim/refusal and finalization writes a deterministic checkpoint. Artifact names
+are `claude-review-budget-{claim|final}-${run_id}-${run_attempt}`,
+`gemini-review-budget-{claim|final}-${run_id}-${run_attempt}`, and
+`opencode-review-budget-{claim|final}-${run_id}-${run_attempt}`, each containing the
+corresponding `*-review-budget-{claim|final}.json`. The handoff records repository,
+PR, reviewer, head and full-diff hash, run ID/attempt, automatic and override rounds,
+per-round calls/input/wall usage, current decision/outcome/stop reason, the last
+authenticated successful review head/hash, and remaining authenticated finding IDs.
+OpenCode additionally seals the claim checkpoint hash and decision into its prepared
+handoff and validates them before model execution and canonical finalization.
+
+Budget exhaustion is not approval: the ledger cannot publish findings, report CLEAN,
+or authorize merge. `/jhw:ship` polls existing review comments and CI signals
+deterministically and does not parse this budget ledger as review evidence.
+
 ## Adoption and recovery
 
 Use `scripts/rollout_workflow_fleet.py` to plan and open managed PRs; do not copy the
