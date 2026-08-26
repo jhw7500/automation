@@ -184,3 +184,86 @@ hash.
   rejects fail closed.
 - No remaining implementation concern. A missing or unwritable `checkpoint-file` remains
   the unavoidable configuration-fatal case permitted by the controller ruling.
+
+## Fix round 2: malformed request decode boundary
+
+### Changed contract
+
+- `main()` now catches request-file decoding and top-level-shape failures before attempting
+  `_transport_request`.
+- Malformed JSON, non-object JSON, and undecodable request bytes return success from the
+  local helper after writing `checkpoint.json`, `summary.md`, `output.json`, and
+  `preflight.json` in the explicit output directory.
+- The diagnostic checkpoint is compact sorted-ASCII JSON with one trailing newline,
+  `schema=1`, `ledger=null`, `decision=state_invalid`, and every unavailable identity field
+  set to null.
+- Because malformed bytes cannot safely provide a `checkpoint_file`, this branch does not
+  invent or write an external checkpoint path. Safely decoded dictionaries retain the
+  round-1 requirement that their configured external checkpoint be written, with a missing
+  or unwritable path remaining configuration-fatal.
+- Strict valid ledger transitions and `load_checkpoint` behavior are unchanged.
+
+### TDD evidence
+
+RED before the helper boundary fix:
+
+```text
+rtk python3 -m pytest tests/test_review_invocation_budget_action.py -q
+3 failed, 30 passed in 7.43s
+```
+
+All three new cases raised `request_invalid` from `_raw_request` before writing artifacts:
+malformed JSON, a JSON array instead of an object, and undecodable bytes.
+
+GREEN action gate:
+
+```text
+rtk python3 -m pytest tests/test_review_invocation_budget_action.py -q
+33 passed in 7.36s
+```
+
+GREEN focused Tasks 1-3 gate:
+
+```text
+rtk python3 -m pytest tests/test_review_invocation_budget.py tests/test_review_invocation_budget_action.py -q
+81 passed in 7.29s
+```
+
+GREEN full repository gate, run once on the final code:
+
+```text
+rtk python3 -m pytest -q
+2550 passed, 48 subtests passed in 528.57s (0:08:48)
+```
+
+Static and serialization gates:
+
+```text
+rtk python3 -m py_compile .github/actions/review-invocation-budget/review_invocation_budget.py tests/test_review_invocation_budget_action.py
+# exit 0, no output
+
+rtk ruff check .github/actions/review-invocation-budget/review_invocation_budget.py tests/test_review_invocation_budget_action.py
+[]
+
+rtk python3 -c 'from pathlib import Path; import yaml; path=Path(".github/actions/review-invocation-budget/action.yml"); data=yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader); assert isinstance(data, dict); print("PASS action yaml")'
+PASS action yaml
+
+rtk git diff --check
+# exit 0, no output
+```
+
+### Fix-round files changed
+
+- `.github/actions/review-invocation-budget/review_invocation_budget.py`
+- `tests/test_review_invocation_budget_action.py`
+- `.superpowers/sdd/2026-08-26-review-invocation-budget/task-3-report.md`
+- `.superpowers/sdd/2026-08-26-review-invocation-budget/progress.md`
+
+### Self-review and concerns
+
+- The new optional external-write flag is used only when the request dictionary itself
+  could not be recovered; all decoded-dictionary refusals keep the prior external
+  checkpoint behavior.
+- The malformed branch supplies an empty mapping to the bounded diagnostic renderer, so it
+  cannot invent repository, reviewer, PR, run, head, or diff identities.
+- No remaining concern.

@@ -497,6 +497,54 @@ def test_direct_main_invalid_request_writes_canonical_refusal(tmp_path, monkeypa
     assert json.loads((tmp_path / "output.json").read_text())["decision"] == "state_invalid"
 
 
+@pytest.mark.parametrize("request_bytes", [b"{", b"[]", b"\xff"])
+def test_direct_main_malformed_request_writes_local_refusal_only(
+    tmp_path, monkeypatch, request_bytes,
+):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "example/repo")
+    request_file = tmp_path / "request.json"
+    comments_file = tmp_path / "comments.json"
+    output_directory = tmp_path / "outputs"
+    request_file.write_bytes(request_bytes)
+    comments_file.write_text("[]")
+
+    assert budget.main([
+        "claim", "--request-file", str(request_file), "--comments-file", str(comments_file),
+        "--output-directory", str(output_directory),
+    ]) == 0
+    assert {path.name for path in output_directory.iterdir()} == {
+        "checkpoint.json", "output.json", "preflight.json", "summary.md",
+    }
+    checkpoint = (output_directory / "checkpoint.json").read_bytes()
+    assert checkpoint == json.dumps(
+        json.loads(checkpoint), ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+    ).encode("ascii") + b"\n"
+    assert json.loads(checkpoint) == {
+        "handoff": {
+            "current_full_diff_sha256": None,
+            "current_head_sha": None,
+            "current_run_attempt": None,
+            "current_run_id": None,
+            "decision": "state_invalid",
+            "outcome": "checkpoint_failure",
+            "pr": None,
+            "repository": None,
+            "reviewer": None,
+            "stop_reason": "request_invalid",
+        },
+        "ledger": None,
+        "schema": 1,
+    }
+    assert json.loads((output_directory / "output.json").read_text())[
+        "allow-invocation"
+    ] == "false"
+    assert json.loads((output_directory / "output.json").read_text())["decision"] == "state_invalid"
+    assert json.loads((output_directory / "preflight.json").read_text()) == {"continue": False}
+    assert "No provider or GitHub API action was attempted." in (
+        output_directory / "summary.md"
+    ).read_text()
+
+
 @pytest.mark.parametrize("contents", ["", " \n\t"])
 def test_paginated_reader_rejects_missing_json_array(tmp_path, contents):
     pages = tmp_path / "pages.json"

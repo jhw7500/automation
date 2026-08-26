@@ -1241,7 +1241,7 @@ def _diagnostic_handoff(
 
 def _write_diagnostic(
         output_directory: Path, raw_request: Mapping[str, object], decision: str,
-        stop_reason: str,
+        stop_reason: str, *, write_external_checkpoint: bool = True,
 ) -> None:
     if decision not in {"state_invalid", "diff_unavailable"}:
         raise TransportError("diagnostic_decision_invalid")
@@ -1266,14 +1266,15 @@ def _write_diagnostic(
         "mutation": "none",
         "round": "",
     }
-    checkpoint_file = raw_request.get("checkpoint_file")
-    if not isinstance(checkpoint_file, str) or not checkpoint_file:
-        raise TransportError("checkpoint_file_invalid")
     write_private(output_directory / "checkpoint.json", checkpoint)
     write_private(output_directory / "summary.md", summary)
     write_private(output_directory / "output.json", _json_bytes(output))
     write_private(output_directory / "preflight.json", _json_bytes({"continue": False}))
-    write_private(Path(checkpoint_file), checkpoint)
+    if write_external_checkpoint:
+        checkpoint_file = raw_request.get("checkpoint_file")
+        if not isinstance(checkpoint_file, str) or not checkpoint_file:
+            raise TransportError("checkpoint_file_invalid")
+        write_private(Path(checkpoint_file), checkpoint)
 
 
 def _preflight_request(request: Mapping[str, object]) -> bool:
@@ -1614,7 +1615,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
-    raw_request = _raw_request(arguments.request_file)
+    try:
+        raw_request = _raw_request(arguments.request_file)
+    except (BudgetStateError, TypeError) as exc:
+        _write_diagnostic(
+            arguments.output_directory, {}, "state_invalid", str(exc),
+            write_external_checkpoint=False,
+        )
+        return 0
     try:
         request = _transport_request(arguments.request_file)
         if arguments.operation not in {

@@ -60,3 +60,7 @@ Ruling: Task 3's public transport accepts exactly `full|delta|unchanged|unavaila
 Task 3: fix round 1/5 (5 open — prepare-review-diff vocabulary, local transport refusal checkpoint, nonempty paginated evidence, summary/output ordering, regression coverage; base commit 1862945)
 
 Task 3: fix round 1/5 (5 addressed, 0 open — exact producer diff vocabulary, canonical zero-API local refusals, nonempty pagination/CAS evidence, summary-before-output ordering, regression coverage; base commit 1862945)
+
+Task 3: fix round 2/5 (1 open — malformed request JSON raises before the local diagnostic boundary; write output-directory refusal artifacts with all unavailable identities null and write the requested external checkpoint only when its path was safely decoded; base commit 0cef9fc)
+
+Task 3: fix round 2/5 (1 addressed, 0 open — malformed, non-object, and undecodable requests now write canonical output-directory refusals with null identities and no invented external checkpoint path; base commit 0cef9fc)
