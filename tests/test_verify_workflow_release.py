@@ -2181,6 +2181,145 @@ def test_v147_opencode_call_cap_rejects_complete_unreachable_sequence_decoy(
         )
 
 
+def test_v147_opencode_call_cap_rejects_dead_canonical_function_decoy(
+    current_release_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+    source = path.read_text(encoding="utf-8")
+    function_start = source.index("          run_opencode() {\n")
+    function_end = source.index(
+        "\n\n          extract_candidate() {", function_start
+    )
+    canonical_function = source[function_start:function_end]
+    assert canonical_function.count("          run_opencode() {\n") == 1
+    assert canonical_function.count("(( count < 2 )) || {") == 1
+    weakened_live_function = canonical_function.replace(
+        "          run_opencode() {\n",
+        "          function run_opencode {\n",
+        1,
+    ).replace("(( count < 2 )) || {", "(( count < 3 )) || {", 1)
+    dead_canonical_function = (
+        "          if false; then\n"
+        f"{canonical_function}\n"
+        "          fi"
+    )
+    mutate_named_step_text(
+        path,
+        "Run OpenCode PR review",
+        canonical_function,
+        f"{dead_canonical_function}\n\n{weakened_live_function}",
+    )
+    bad_commit = commit(
+        repo, "hide canonical OpenCode function below top-level if false"
+    )
+    payload = path.read_bytes()
+    monkeypatch.setitem(
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256,
+        "opencode",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    tree = release_verifier.VerifiedCommitTree.open(repo, bad_commit)
+    assert hashlib.sha256(
+        tree.read_file(".github/workflows/opencode-auto-review.yml")
+    ).hexdigest() == (
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256[
+            "opencode"
+        ]
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError, match="invocation-budget workflow contract"
+    ):
+        release_verifier.require_budget_workflow_contract(
+            tree, "opencode-auto-review.yml", "opencode"
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "conditional-definition",
+        "alternate-redefinition",
+        "spaced-posix-redefinition",
+        "multiline-alternate-redefinition",
+        "predefinition-invocation",
+    ),
+)
+def test_v147_opencode_call_cap_rejects_ambiguous_function_binding(
+    current_release_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+    source = path.read_text(encoding="utf-8")
+    function_start = source.index("          run_opencode() {\n")
+    function_end = source.index(
+        "\n\n          extract_candidate() {", function_start
+    )
+    canonical_function = source[function_start:function_end]
+    if mutation == "conditional-definition":
+        replacement = (
+            "          if true; then\n"
+            f"{canonical_function}\n"
+            "          fi"
+        )
+    elif mutation in {
+        "alternate-redefinition",
+        "spaced-posix-redefinition",
+        "multiline-alternate-redefinition",
+    }:
+        alternate_declaration = {
+            "alternate-redefinition": "          function run_opencode {\n",
+            "spaced-posix-redefinition": "          run_opencode () {\n",
+            "multiline-alternate-redefinition": (
+                "          function run_opencode\n          {\n"
+            ),
+        }[mutation]
+        weakened_alternate = canonical_function.replace(
+            "          run_opencode() {\n",
+            alternate_declaration,
+            1,
+        ).replace("(( count < 2 )) || {", "(( count < 3 )) || {", 1)
+        replacement = f"{canonical_function}\n\n{weakened_alternate}"
+    else:
+        replacement = (
+            "          run_opencode \"$initial_prompt\" "
+            "\"$RUNNER_TEMP/opencode-review.jsonl\"\n\n"
+            f"{canonical_function}"
+        )
+    mutate_named_step_text(
+        path,
+        "Run OpenCode PR review",
+        canonical_function,
+        replacement,
+    )
+    bad_commit = commit(repo, f"make OpenCode function binding {mutation}")
+    payload = path.read_bytes()
+    monkeypatch.setitem(
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256,
+        "opencode",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    tree = release_verifier.VerifiedCommitTree.open(repo, bad_commit)
+    assert hashlib.sha256(
+        tree.read_file(".github/workflows/opencode-auto-review.yml")
+    ).hexdigest() == (
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256[
+            "opencode"
+        ]
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError, match="invocation-budget workflow contract"
+    ):
+        release_verifier.require_budget_workflow_contract(
+            tree, "opencode-auto-review.yml", "opencode"
+        )
+
+
 @pytest.mark.parametrize(
     ("filename", "size", "oid"),
     (

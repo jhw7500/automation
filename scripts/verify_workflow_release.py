@@ -3233,6 +3233,26 @@ class _ShellCommand(NamedTuple):
     controls: tuple[str, ...]
 
 
+class _ShellFunctionDefinition(NamedTuple):
+    name: str
+    declaration: str
+    controls: tuple[str, ...]
+    commands: list[_ShellCommand]
+    start: int
+    end: int | None
+
+
+class _ShellFrame(NamedTuple):
+    kind: str
+    label: str
+    function_index: int | None = None
+
+
+class _ShellFunctionAnalysis(NamedTuple):
+    commands: tuple[_ShellCommand, ...]
+    invocations: tuple[_ShellCommand, ...]
+
+
 def _shell_logical_lines(script: str) -> tuple[str, ...]:
     """Tokenize shell commands while excluding authenticated heredoc data."""
 
@@ -3270,41 +3290,156 @@ def _shell_logical_lines(script: str) -> tuple[str, ...]:
     return tuple(logical)
 
 
-def _shell_function_commands(script: str, name: str) -> tuple[_ShellCommand, ...]:
-    """Parse one shell function into commands and executable control nesting."""
+def _shell_function_analysis(script: str, name: str) -> _ShellFunctionAnalysis:
+    """Parse a whole shell program and bind one top-level function to later calls."""
 
     lines = _shell_logical_lines(script)
-    declaration = f"{name}() {{"
-    starts = [index for index, line in enumerate(lines) if line == declaration]
-    if len(starts) != 1:
-        raise ValueError(f"shell function {name} differs")
-    controls: list[str] = []
-    commands: list[_ShellCommand] = []
-    for line in lines[starts[0] + 1 :]:
-        if line == "fi":
-            if not controls or not controls[-1].startswith("if:"):
-                raise ValueError(f"shell function {name} has unmatched fi")
-            controls.pop()
-            continue
-        if line == "}":
-            if controls:
-                if not controls[-1].startswith("group:"):
-                    raise ValueError(
-                        f"shell function {name} closes the wrong control"
-                    )
-                controls.pop()
+    declaration_pattern = re.compile(
+        r"(?:(?P<canonical>[A-Za-z_][A-Za-z0-9_]*)"
+        r"[ \t]*\([ \t]*\)|"
+        r"function[ \t]+(?P<alternate>[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:[ \t]*\([ \t]*\))?)[ \t]*\{\Z"
+    )
+    declaration_head_pattern = re.compile(
+        r"(?:(?P<canonical>[A-Za-z_][A-Za-z0-9_]*)"
+        r"[ \t]*\([ \t]*\)|"
+        r"function[ \t]+(?P<alternate>[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:[ \t]*\([ \t]*\))?)\Z"
+    )
+    command_pattern = re.compile(rf"{re.escape(name)}(?:[ \t]+|\Z)")
+    stack: list[_ShellFrame] = []
+    definitions: list[_ShellFunctionDefinition] = []
+    invocation_records: list[tuple[int, _ShellCommand]] = []
+
+    def active_target() -> tuple[int, int] | None:
+        for stack_index in range(len(stack) - 1, -1, -1):
+            frame = stack[stack_index]
+            if frame.kind != "function" or frame.function_index is None:
                 continue
-            return tuple(commands)
-        if line in {"else", "do", "done", "esac"} or line.startswith(
-            ("elif ", "for ", "while ", "until ", "case ")
-        ):
-            raise ValueError(f"shell function {name} has unsupported control flow")
-        commands.append(_ShellCommand(line, tuple(controls)))
+            if definitions[frame.function_index].name == name:
+                return stack_index, frame.function_index
+        return None
+
+    consumed_declaration_opening: int | None = None
+    for index, line in enumerate(lines):
+        if index == consumed_declaration_opening:
+            continue
+        declaration = declaration_pattern.fullmatch(line)
+        declaration_text = line
+        if declaration is None:
+            declaration_head = declaration_head_pattern.fullmatch(line)
+            if (
+                declaration_head is not None
+                and index + 1 < len(lines)
+                and lines[index + 1] == "{"
+            ):
+                declaration = declaration_head
+                declaration_text = f"{line}\n{{"
+                consumed_declaration_opening = index + 1
+        if declaration is not None:
+            function_name = declaration.group("canonical") or declaration.group(
+                "alternate"
+            )
+            function_index = len(definitions)
+            definitions.append(
+                _ShellFunctionDefinition(
+                    function_name,
+                    declaration_text,
+                    tuple(frame.label for frame in stack),
+                    [],
+                    index,
+                    None,
+                )
+            )
+            stack.append(
+                _ShellFrame(
+                    "function", f"function:{function_name}", function_index
+                )
+            )
+            continue
+
+        if line == "fi":
+            if not stack or stack[-1].kind != "if":
+                raise ValueError("shell program has unmatched fi")
+            stack.pop()
+            continue
+        if line in {"else"} or line.startswith("elif "):
+            if not stack or stack[-1].kind != "if":
+                raise ValueError("shell program has unmatched conditional branch")
+            if line.startswith("elif ") and not line.endswith("; then"):
+                raise ValueError("shell program has malformed elif")
+            opened = stack[-1].label.split(":", 1)[-1]
+            stack[-1] = _ShellFrame("if", f"branch:{opened}:{line}")
+            continue
+        if line == "done":
+            if not stack or stack[-1].kind != "loop":
+                raise ValueError("shell program has unmatched done")
+            stack.pop()
+            continue
+        if line == "esac":
+            if not stack or stack[-1].kind != "case":
+                raise ValueError("shell program has unmatched esac")
+            stack.pop()
+            continue
+        if line == "}" or line.startswith("} "):
+            if not stack or stack[-1].kind not in {"function", "group"}:
+                raise ValueError("shell program closes the wrong control")
+            frame = stack.pop()
+            if frame.kind == "function":
+                if line != "}" or frame.function_index is None:
+                    raise ValueError("shell function closure differs")
+                definition = definitions[frame.function_index]
+                definitions[frame.function_index] = definition._replace(end=index)
+            continue
+
+        target = active_target()
+        if target is not None:
+            stack_index, function_index = target
+            definitions[function_index].commands.append(
+                _ShellCommand(
+                    line,
+                    tuple(frame.label for frame in stack[stack_index + 1 :]),
+                )
+            )
+        if command_pattern.match(line):
+            invocation_records.append(
+                (
+                    index,
+                    _ShellCommand(line, tuple(frame.label for frame in stack)),
+                )
+            )
+
         if line.startswith("if ") and line.endswith("; then"):
-            controls.append(f"if:{line}")
-        elif line.endswith("|| {"):
-            controls.append(f"group:{line}")
-    raise ValueError(f"shell function {name} is unterminated")
+            stack.append(_ShellFrame("if", f"if:{line}"))
+        elif line == "{" or line.endswith("|| {"):
+            stack.append(_ShellFrame("group", f"group:{line}"))
+        elif line.startswith(("for ", "while ", "until ")) and line.endswith(
+            "; do"
+        ):
+            stack.append(_ShellFrame("loop", f"loop:{line}"))
+        elif line.startswith("case ") and line.endswith(" in"):
+            stack.append(_ShellFrame("case", f"case:{line}"))
+        elif line in {"do"}:
+            raise ValueError("shell program has unsupported detached do")
+
+    if stack:
+        raise ValueError("shell program has unterminated control flow")
+    matches = [definition for definition in definitions if definition.name == name]
+    if len(matches) != 1:
+        raise ValueError(f"shell function {name} is ambiguous")
+    function = matches[0]
+    if (
+        function.declaration != f"{name}() {{"
+        or function.controls
+        or function.end is None
+    ):
+        raise ValueError(f"shell function {name} is not one live top-level definition")
+    if any(index <= function.end for index, _ in invocation_records):
+        raise ValueError(f"shell function {name} is invoked before its definition")
+    return _ShellFunctionAnalysis(
+        tuple(function.commands),
+        tuple(command for _, command in invocation_records),
+    )
 
 
 def _local_literal(function: ast.FunctionDef, name: str) -> object:
@@ -4277,9 +4412,29 @@ def require_budget_workflow_contract(
                     (),
                 ),
             )
-            if _shell_function_commands(
+            expected_invocations = (
+                _ShellCommand(
+                    'run_opencode "$initial_prompt" '
+                    '"$RUNNER_TEMP/opencode-review.jsonl" '
+                    "--file review-full.diff --file review-scope.json",
+                    (),
+                ),
+                _ShellCommand(
+                    'run_opencode "$repair_prompt" '
+                    '"$RUNNER_TEMP/opencode-format-repair.jsonl"',
+                    (
+                        "if:if ! candidate_outer_format_valid "
+                        '"$candidate_dir/review.md"; then',
+                    ),
+                ),
+            )
+            function = _shell_function_analysis(
                 provider.get("run", ""), "run_opencode"
-            ) != expected_commands:
+            )
+            if (
+                function.commands != expected_commands
+                or function.invocations != expected_invocations
+            ):
                 raise ValueError("OpenCode live call accounting differs")
         forbidden_reviewers = {
             "claude": ("Fallback to Gemini reviewer", "Fallback to OpenCode reviewer"),
