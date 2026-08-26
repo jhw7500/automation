@@ -162,3 +162,13 @@ Task 7: fix round 4/5 GREEN complete (exact bypass 1 passed; authentic/prior-dec
 Task 7: fix round 4/5 self-review complete (whole-program control nesting, both declaration syntaxes and split forms, single canonical top-level definition, exact later invocation binding, exact body cap/increment/CLI structure, heredoc exclusion, semantic-before-digest and VerifiedCommitTree-only bytes preserved; no Task 1–6/inventory/docs-contract/config/tag/release/rollout/external-state changes; blockers and remaining concerns: none)
 
 Task 7: fix round 4/5 complete (implementation fix commit 2391487b764226630a0a47f3a1851a531e8bb87d; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md)
+
+Task 7: fix round 5/5 RED complete (both legal compact `function run_opencode { …; }` and `run_opencode(){ …; }` authenticated redefinitions escaped with `DID NOT RAISE`: 2 failed; inline conditional/dynamic/hidden target syntax and wrapped/assignment-prefixed eval adjacency also escaped before their structural fixes)
+
+Ruling: OpenCode whole-program verification tokenizes executable semicolon lists and compact/split brace declarations before control analysis, inventories every recognized target definition, and permits only one exact canonical reachable top-level binding before the two exact later calls. Target-bearing unrecognized shell words plus direct, wrapper-mediated, or assignment-prefixed dynamic namespace commands fail closed; quoted/substitution/control/heredoc data boundaries remain preserved, and no raw substring/count gate is evidence — if wrong, the embedded provider must move to a separately authenticated helper rather than widening the accepted shell grammar.
+
+Task 7: fix round 5/5 GREEN complete (new/positive focus 8 passed; unchanged round-4 focus 8 passed; unchanged prior regression 49 passed; final release suites 589 passed in 277.11s; full unfiltered 2679 passed + 48 subtests in 814.39s; four-file py_compile and diff-check green)
+
+Task 7: fix round 5/5 self-review complete (compact POSIX/Bash declarations and semicolon bodies parsed structurally; duplicate/conditional/dead/dynamic/hidden binding ambiguity rejected; exact later invocation binding and heredoc/control preservation retained; semantic-before-digest and VerifiedCommitTree-only bytes preserved; analyzer admits only the authenticated shell subset and refuses computed namespace execution; no Task 1–6/inventory/contracts/config/tag/release/rollout/external-state changes; blockers and remaining known concerns: none)
+
+Task 7: fix round 5/5 complete (implementation fix commit a9ccc1fa9eec4c91a53f1cdf33f5125e80b98995; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md)

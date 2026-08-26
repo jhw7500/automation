@@ -369,3 +369,87 @@ PASS: v1.47 commit content is secure at 2391487b764226630a0a47f3a1851a531e8bb87d
   VerifiedCommitTree bytes. No Task 1–6 action/helper/workflow bytes, inventory/docs
   contract, fleet default, config, tag, release, rollout, GitHub, or Notion state was
   changed. No blockers or remaining concerns were found.
+
+## Independent-review fix round 5/5
+
+Implementation fix commit: `a9ccc1fa9eec4c91a53f1cdf33f5125e80b98995`
+
+The final compact-declaration bypass is closed structurally. The whole-program shell
+analyzer now tokenizes unquoted semicolon lists while preserving quoted content,
+command/parameter substitutions, continuations, control openers, and authenticated
+heredoc payload boundaries. It separates a function declaration's opening brace from
+same-line commands, recognizes POSIX `name()` and Bash `function name` forms with
+compact or split braces, inventories every parsed `run_opencode` definition, and
+requires exactly one canonical live top-level definition before the two exact bound
+calls. Target-bearing syntax outside the declaration/invocation grammar and dynamic
+namespace execution through direct, wrapped, or assignment-prefixed `eval`, `source`,
+or `.` commands fail closed. No raw substring or occurrence-count gate was added.
+
+### Fix-round 5 RED evidence
+
+- Added authenticated compact redefinitions after the accepted canonical function;
+  both retained the later production calls, replaced the live binding with an
+  unbounded usable body, and passed `bash -n`:
+  `function run_opencode { ...; }` and `run_opencode(){ ...; }`.
+- Exact command:
+  `rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_compact_function_redefinition -q --tb=short`
+- Result before the production fix: `2 failed in 0.48s`, both with
+  `DID NOT RAISE ReleaseVerificationError`. Each explicit SHA-256 assertion proved
+  the verifier consumed the same authenticated mutated workflow bytes.
+- Adjacent authenticated ambiguity probes for an inline conditional declaration,
+  direct dynamic redefinition, and a hidden conditional call initially produced
+  `3 failed in 0.67s`, all with `DID NOT RAISE`. Self-review then added wrapped
+  `command builtin eval` and computed-name, assignment-prefixed `eval` probes; each
+  independently failed with `DID NOT RAISE` before its structural fix (`0.28s` and
+  `0.34s`, respectively).
+
+### Fix-round 5 GREEN and regression evidence
+
+- Final new/positive focus with touched-file compilation:
+  `rtk python3 -m py_compile scripts/verify_workflow_release.py tests/test_verify_workflow_release.py && rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_compact_function_redefinition tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_unparsed_target_affecting_syntax tests/test_verify_workflow_release.py::test_v147_accepts_current_budget_release_contract -q --tb=short`
+  → `8 passed in 1.59s`.
+- Unchanged round-4 authentic/prior-decoy/dead-canonical/five-ambiguity focus:
+  `8 passed in 1.93s`.
+- Unchanged prior 49-case focused regression command from fix round 3:
+  `49 passed in 11.61s`.
+- Final release suites on the implementation commit:
+  `rtk python3 -m pytest tests/test_workflow_release_bundle.py tests/test_verify_workflow_release.py -q --tb=short`
+  → `589 passed in 277.11s (0:04:37)`.
+- Full unfiltered suite on the final implementation:
+  `rtk python3 -m pytest -q --tb=short`
+  → `2679 passed, 48 subtests passed in 814.39s (0:13:34)`.
+- Static checks:
+  `rtk python3 -m py_compile scripts/workflow_release_inventory.py scripts/verify_workflow_release.py tests/test_workflow_release_bundle.py tests/test_verify_workflow_release.py`
+  and `rtk git diff --check` → exit 0. The implementation diff contains only the
+  Task 7 verifier and verifier test module.
+
+### Fix-round 5 committed-byte verification
+
+After committing the implementation fix, no tag was created:
+
+```text
+rtk python3 -m scripts.verify_workflow_release --automation . --ref v1.47 --expected-commit "$(rtk git rev-parse HEAD)" --commit-only
+PASS: v1.47 commit content is secure at a9ccc1fa9eec4c91a53f1cdf33f5125e80b98995
+```
+
+### Fix-round 5 self-review
+
+- Both legal compact brace declaration spellings are tokenized into a declaration,
+  ordered body commands, and an exact closure rather than being accepted as opaque
+  top-level text. Spacing, split-opening-brace, compact-body, duplicate, conditional,
+  dead, alternate, and pre-invocation variants share one definition inventory.
+- Semicolons in quoted data, substitutions, control `; then`/`; do` openers, and
+  authenticated heredoc bodies are not mistaken for executable top-level boundaries;
+  the authentic provider program and all prior reachability cases remain green.
+- Later calls are recorded only as parsed `run_opencode` command statements and retain
+  their exact program order/control paths. A target identifier in any other parsed
+  shell word is rejected, and dynamic namespace commands are structurally unwrapped
+  across assignment prefixes plus `command`/`builtin` wrappers before rejection.
+- The analyzer intentionally accepts only the authenticated provider's shell subset;
+  it is not claimed to be a general Bash AST. Computed shell code is refused at the
+  namespace-execution boundary rather than interpreted, so no unproved alternate
+  declaration grammar is admitted into the accepted contract.
+- Semantic validation still precedes exact SHA-256 authentication over the same
+  `VerifiedCommitTree` bytes. No Task 1–6 production byte, inventory/contracts/config
+  default, tag, release, rollout, GitHub, Notion, or other external state changed.
+  No blockers or remaining known concerns were found.
