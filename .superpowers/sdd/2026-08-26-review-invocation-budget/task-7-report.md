@@ -282,3 +282,90 @@ PASS: v1.47 commit content is secure at 1bc6f7924b987f3b944966cf011e2caa486bbefb
   49-case focused regression and complete release/full suites. No Task 1–6
   action/helper/workflow bytes, inventory default, config, tag, release, rollout,
   GitHub, or Notion state changed. No blockers or remaining concerns were found.
+
+## Independent-review fix round 4/5
+
+Implementation fix commit: `2391487b764226630a0a47f3a1851a531e8bb87d`
+
+The residual declaration-binding bypass is closed structurally. The shell analyzer
+now parses the complete authenticated provider program from its first logical command,
+tracks conditional/group/loop/case/function nesting across every declaration, and
+recognizes both POSIX and Bash `function` declaration forms, including whitespace and
+split-opening-brace variants. It requires exactly one canonical, reachable, top-level
+`run_opencode() {` definition, rejects conditional/alternate/duplicate definitions,
+compares the accepted function's exact live cap/durable-increment/CLI body, and binds
+the two exact later invocation commands and their control paths to that definition.
+Heredoc payload exclusion, semantic-before-digest ordering, and VerifiedCommitTree-only
+input bytes remain unchanged.
+
+### Fix-round 4 RED evidence
+
+- Added
+  `test_v147_opencode_call_cap_rejects_dead_canonical_function_decoy`, which
+  authenticates mutated workflow bytes containing a weakened live
+  `function run_opencode { ... }` definition while placing the complete expected
+  `run_opencode() { ... }` body beneath a top-level `if false; then`. The later real
+  invocations therefore bind to the weakened alternate definition.
+- Exact command:
+  `rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_dead_canonical_function_decoy -q --tb=short`
+- Result before the production fix: `1 failed in 0.36s` with
+  `Failed: DID NOT RAISE ReleaseVerificationError`; the explicit SHA-256 assertion
+  proved that the verifier consumed the same authenticated mutated tree bytes.
+- Adjacent ambiguity command:
+  `rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_ambiguous_function_binding -q --tb=short`
+  initially produced `3 failed in 0.68s`, each with `DID NOT RAISE`, for a conditional
+  definition, later alternate redefinition, and pre-definition invocation. A second
+  TDD edge added spaced POSIX and split-line Bash declarations; the split-line Bash
+  case failed with `DID NOT RAISE` while the already recognized spaced form passed.
+
+### Fix-round 4 GREEN and regression evidence
+
+- Exact GREEN command:
+  `rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_dead_canonical_function_decoy -q --tb=short`
+  → `1 passed in 0.22s`.
+- Authentic workflow, prior unreachable-sequence decoy, exact bypass, and all five
+  adjacent binding mutations:
+  `rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_accepts_current_budget_release_contract tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_complete_unreachable_sequence_decoy tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_dead_canonical_function_decoy tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_ambiguous_function_binding -q --tb=short`
+  → `8 passed in 2.04s`.
+- The unchanged prior 49-case focused regression command from fix round 3
+  (exact action/boundary, root kinds, helper gates/live AST, workflow semantics/live
+  caps, unreachable-sequence decoy, and positive v1.47 candidate)
+  → `49 passed in 12.16s`.
+- Both release suites:
+  `rtk python3 -m pytest tests/test_workflow_release_bundle.py tests/test_verify_workflow_release.py -q --tb=short`
+  → `582 passed in 270.94s (0:04:30)`.
+- Full unfiltered suite: `rtk python3 -m pytest -q --tb=short`
+  → `2672 passed, 48 subtests passed in 804.09s (0:13:24)`.
+- Static checks:
+  `rtk git diff --check` and
+  `rtk python3 -m py_compile scripts/workflow_release_inventory.py scripts/verify_workflow_release.py tests/test_workflow_release_bundle.py tests/test_verify_workflow_release.py`
+  → exit 0. The implementation diff contains only the Task 7 verifier and verifier
+  test module.
+
+### Fix-round 4 committed-byte verification
+
+After committing the implementation fix, no tag was created:
+
+```text
+rtk python3 -m scripts.verify_workflow_release --automation . --ref v1.47 --expected-commit "$(rtk git rev-parse HEAD)" --commit-only
+PASS: v1.47 commit content is secure at 2391487b764226630a0a47f3a1851a531e8bb87d
+```
+
+### Fix-round 4 self-review
+
+- Whole-program nesting is established before a target declaration is evaluated;
+  a canonical body inside `if false`, `if true`, a group, another function, or any
+  duplicate declaration cannot be treated as the live top-level implementation.
+- Both `name() {`/spaced POSIX and `function name {`/optional-parentheses Bash forms,
+  including a following-line opening brace, enter the same structural definition
+  inventory. Only the one exact canonical production declaration is accepted.
+- The exact two normalized invocations must follow the accepted definition and retain
+  their expected top-level/format-repair conditional paths; an earlier invocation or
+  redefinition cannot borrow the accepted body's proof.
+- The accepted body still requires the exact counter file/mode/read, numeric guard,
+  two-call refusal group, fsync-backed increment heredoc command, and sole CLI command.
+  Heredoc contents remain data rather than executable parser input.
+- Semantic checks still precede exact workflow SHA-256 authentication over the same
+  VerifiedCommitTree bytes. No Task 1–6 action/helper/workflow bytes, inventory/docs
+  contract, fleet default, config, tag, release, rollout, GitHub, or Notion state was
+  changed. No blockers or remaining concerns were found.

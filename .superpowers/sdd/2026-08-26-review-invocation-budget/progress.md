@@ -152,3 +152,13 @@ Task 7: fix round 3/5 GREEN complete (authentic-plus-bypass focus 2 passed; prio
 Task 7: fix round 3/5 self-review complete (exact parsed command/control equality replaces OpenCode normalized fragments and occurrence counts; semantic-before-digest and VerifiedCommitTree-only bytes preserved; findings 1/2/4 and round-2 relationships retained; no Task 1–6/config/tag/release/rollout/external-state changes; blockers and remaining concerns: none)
 
 Task 7: fix round 3/5 complete (implementation fix commit 1bc6f7924b987f3b944966cf011e2caa486bbefb; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md)
+
+Task 7: fix round 4/5 RED complete (the exact authenticated bypass placed the complete canonical `run_opencode() { ... }` under top-level `if false`, installed a weakened live `function run_opencode { ... }`, and escaped the prior declaration-anchored parser: 1 failed with DID NOT RAISE in 0.36s; conditional/duplicate/predefinition adjacency also escaped)
+
+Ruling: OpenCode function verification parses the complete authenticated shell program before evaluating declarations, recognizes POSIX and Bash function forms including whitespace/split braces, and requires exactly one exact canonical reachable top-level definition whose exact two invocation sites occur later with the approved control paths. Conditional, alternate, duplicate, or pre-invocation bindings fail structurally before exact digest authentication — if wrong, the embedded shell must move into a separately authenticated helper rather than selecting a declaration by textual spelling.
+
+Task 7: fix round 4/5 GREEN complete (exact bypass 1 passed; authentic/prior-decoy/exact/adjacent focus 8 passed; unchanged prior regression 49 passed; release suites 582 passed in 270.94s; full unfiltered 2672 passed + 48 subtests in 804.09s; four-file py_compile and diff-check green)
+
+Task 7: fix round 4/5 self-review complete (whole-program control nesting, both declaration syntaxes and split forms, single canonical top-level definition, exact later invocation binding, exact body cap/increment/CLI structure, heredoc exclusion, semantic-before-digest and VerifiedCommitTree-only bytes preserved; no Task 1–6/inventory/docs-contract/config/tag/release/rollout/external-state changes; blockers and remaining concerns: none)
+
+Task 7: fix round 4/5 complete (implementation fix commit 2391487b764226630a0a47f3a1851a531e8bb87d; post-commit `v1.47 --commit-only` PASS against the same authenticated HEAD; report: task-7-report.md)
