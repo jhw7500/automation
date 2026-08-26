@@ -78,3 +78,5 @@ Task 4: implementer complete (RED 6 expected failures; GREEN 15 focused, 133 Cla
 Task 4: fix round 1/5 (1 open — graceful `diff-mode=unavailable` preserves a producer head SHA; normalize both canonical head/hash claim inputs to empty while retaining exact identities for full/delta/unchanged; base commit 26f8afe)
 
 Task 4: fix round 1/5 (1 addressed, 0 open — unavailable producer identities are normalized empty before the Task 3 claim; RED 4 failed/12 passed, GREEN 16 focused, 134 Claude/actionlint, and 2050 + 48 subtests non-Task7 full; base commit 26f8afe)
+
+Task 4: complete (commits 8e98272..d0aeedb, review clean; accepted intermediate red remains only Task 7 release inventory)
