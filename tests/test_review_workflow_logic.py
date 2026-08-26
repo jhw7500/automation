@@ -1656,6 +1656,387 @@ def test_claude_budget_outcome_mapping_and_remaining_ids_are_reproducible(
     assert json.loads(outputs["remaining_finding_ids_json"]) == expected_remaining
 
 
+def test_gemini_budget_authenticated_review_uses_only_bounded_active_canonical_ids(
+    tmp_path,
+):
+    head = "ab" * 20
+    active_ids = [f"RVW-{index:012x}" for index in range(10)]
+    canonical = (
+        "### New findings\n\n"
+        + "\n".join(
+            f"#### {finding_id} [HIGH] Finding {index}"
+            for index, finding_id in enumerate(active_ids)
+        )
+        + f"\n#### {active_ids[0]} [HIGH] Duplicate\n"
+        + "\n### Resolved\n\n#### RVW-ffffffffffff [HIGH] Fixed\n"
+    )
+    sticky = _v3_body(
+        _v3_state(reviewer="gemini", head=head),
+        canonical,
+        marker=GEMINI_V3_MARKER,
+        header=GEMINI_HEADER,
+    )
+
+    _previous, outputs = _run_gemini_details(
+        tmp_path, [_bot("github-actions[bot]", sticky)], head_sha=head
+    )
+
+    assert json.loads(outputs["authenticated_review_json"]) == {
+        "success": True,
+        "head_sha": head,
+        "full_diff_sha256": "12" * 32,
+        "remaining_finding_ids": active_ids[:8],
+    }
+
+
+def test_gemini_budget_claim_precedes_provider_and_guards_every_new_diff_path():
+    workflow = _load("gemini-auto-review.yml")
+    job = workflow["jobs"]["gemini-review"]
+    steps = job["steps"]
+    names = [step.get("name") for step in steps]
+    allow = "steps.review-budget-claim.outputs.allow-invocation == 'true'"
+
+    assert names.index("Prepare review diff") < names.index("Claim Gemini review budget")
+    assert names.index("Claim Gemini review budget") < names.index(
+        "Checkout prepared review head"
+    )
+    assert names.index("Claim Gemini review budget") < names.index(
+        "Run Gemini Code Review"
+    )
+    assert names.index("Start Gemini review metrics") < names.index(
+        "Run Gemini Code Review"
+    )
+    for step_name in (
+        "Checkout prepared review head",
+        "Reset Gemini review artifacts",
+        "Start Gemini review metrics",
+        "Run Gemini Code Review",
+        "Canonicalize Gemini review",
+        "Upload rejected Gemini review diagnostic",
+    ):
+        assert allow in _step(workflow, "gemini-review", step_name)["if"]
+    upsert = _step(workflow, "gemini-review", "Upsert review comment")
+    assert "diff-mode == 'unchanged'" in upsert["if"]
+    assert allow in upsert["if"]
+    assert "BUDGET_ALLOW_INVOCATION" in upsert["env"]
+    assert "invocationAllowed && ok" in upsert["with"]["script"]
+    assert "core.setOutput('published', 'false')" in upsert["with"]["script"]
+    assert "core.setOutput('published', 'true')" in upsert["with"]["script"]
+    assert job["timeout-minutes"] == "10"
+
+    claim = _step(workflow, "gemini-review", "Claim Gemini review budget")
+    assert claim["if"] == "${{ always() && steps.pr-details.outcome == 'success' }}"
+    assert claim["with"] == {
+        "github-token": "${{ github.token }}",
+        "mode": "claim",
+        "reviewer": "gemini",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number }}",
+        "expected-head-sha": (
+            "${{ steps.stage-gemini-budget-input.outputs.expected_head_sha }}"
+        ),
+        "full-diff-sha256": (
+            "${{ steps.stage-gemini-budget-input.outputs.full_diff_sha256 }}"
+        ),
+        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}",
+        "input-files-json": (
+            "${{ steps.stage-gemini-budget-input.outputs.input_files_json }}"
+        ),
+        "authenticated-review-json": (
+            "${{ steps.pr-details.outputs.authenticated_review_json }}"
+        ),
+        "model-route-json": (
+            "${{ steps.gemini-budget-config.outputs.model_route_json }}"
+        ),
+        "effort": "${{ steps.gemini-budget-config.outputs.effort }}",
+        "checkpoint-file": "${{ runner.temp }}/gemini-review-budget-claim.json",
+    }
+
+
+def test_gemini_budget_metadata_is_inert_valid_json_and_bounded_effort(tmp_path):
+    step = _step(
+        _load("gemini-auto-review.yml"),
+        "gemini-review",
+        "Resolve Gemini budget metadata",
+    )
+    output = tmp_path / "github-output"
+    configured = 'gemini-"quoted"; $(touch must-not-exist)'
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PRIMARY_MODEL": configured,
+            "THINKING_LEVEL": "high",
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(_github_outputs(output)["model_route_json"]) == [configured]
+    assert _github_outputs(output)["effort"] == "high"
+    assert not (tmp_path / "must-not-exist").exists()
+    assert "jq -cn --arg model" in step["run"]
+
+
+@pytest.mark.parametrize("diff_mode", ("full", "delta"))
+def test_gemini_budget_staged_input_is_byte_exact_private_and_removed(
+    tmp_path, diff_mode,
+):
+    workflow = _load("gemini-auto-review.yml")
+    stage = _step(workflow, "gemini-review", "Stage Gemini budget input")
+    cleanup = _step(workflow, "gemini-review", "Clean Gemini budget input")
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    source = runner_temp / f"review-{diff_mode}.diff"
+    source.write_bytes(b"binary\x00diff\nbytes\xff")
+    output = tmp_path / "github-output"
+
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "DIFF_MODE": diff_mode,
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = _github_outputs(output)
+    staged = Path(json.loads(outputs["input_files_json"])[0])
+    staging_directory = Path(outputs["staging_directory"])
+    assert staged.read_bytes() == source.read_bytes()
+    assert staging_directory.parent == workspace
+    assert staging_directory.stat().st_mode & 0o777 == 0o700
+    assert staged.stat().st_mode & 0o777 == 0o600
+
+    clean_result = subprocess.run(
+        ["bash", "-c", cleanup["run"]],
+        env={
+            **os.environ,
+            "GITHUB_WORKSPACE": str(workspace),
+            "STAGING_DIRECTORY": str(staging_directory),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert clean_result.returncode == 0, clean_result.stderr
+    assert not staging_directory.exists()
+
+
+@pytest.mark.parametrize(
+    ("diff_mode", "expected_head", "expected_hash"),
+    (("unchanged", "ab" * 20, "12" * 32), ("unavailable", "", "")),
+)
+def test_gemini_budget_non_provider_modes_normalize_identity_without_staging(
+    tmp_path, diff_mode, expected_head, expected_hash,
+):
+    stage = _step(
+        _load("gemini-auto-review.yml"), "gemini-review", "Stage Gemini budget input"
+    )
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    output = tmp_path / "github-output"
+
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "DIFF_MODE": diff_mode,
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _github_outputs(output) == {
+        "input_files_json": "[]",
+        "staging_directory": "",
+        "expected_head_sha": expected_head,
+        "full_diff_sha256": expected_hash,
+    }
+    assert list(workspace.iterdir()) == []
+
+
+def test_gemini_budget_finalizes_after_upsert_with_actual_metrics_and_artifacts():
+    workflow = _load("gemini-auto-review.yml")
+    steps = workflow["jobs"]["gemini-review"]["steps"]
+    names = [step.get("name") for step in steps]
+    finalize = _step(workflow, "gemini-review", "Finalize Gemini review budget")
+
+    assert names.index("Upsert review comment") < names.index(
+        "Finalize Gemini review budget"
+    )
+    assert finalize["if"] == (
+        "${{ always() && !cancelled() "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+    )
+    assert finalize["uses"] == "$/.github/actions/review-invocation-budget"
+    assert finalize["with"]["actual-call-count"] == (
+        "${{ steps.gemini-budget-metrics.outputs.call_count }}"
+    )
+    assert finalize["with"]["elapsed-seconds"] == (
+        "${{ steps.gemini-budget-metrics.outputs.elapsed_seconds }}"
+    )
+    assert finalize["with"]["model-route-json"] == (
+        "${{ steps.gemini-budget-metrics.outputs.model_route_json }}"
+    )
+    assert finalize["with"]["outcome"] == (
+        "${{ steps.review-budget-outcome.outputs.outcome }}"
+    )
+    assert finalize["with"]["remaining-finding-ids-json"] == (
+        "${{ steps.review-budget-outcome.outputs.remaining_finding_ids_json }}"
+    )
+
+    uploads = [
+        step for step in steps
+        if step.get("uses")
+        == "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        and "review-budget" in step.get("with", {}).get("name", "")
+    ]
+    assert {step["with"]["name"] for step in uploads} == {
+        "gemini-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}",
+        "gemini-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
+    }
+    assert all("!cancelled()" in step["if"] for step in uploads)
+
+
+def test_gemini_budget_zero_call_metrics_retain_claimed_primary_route(tmp_path):
+    workflow = _load("gemini-auto-review.yml")
+    start = _step(workflow, "gemini-review", "Start Gemini review metrics")
+    read = _step(workflow, "gemini-review", "Read Gemini review metrics")
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    paths = {
+        "CALL_COUNT_FILE": runner_temp / "gemini_call_count.txt",
+        "STARTED_AT_FILE": runner_temp / "gemini_started_at.txt",
+        "ELAPSED_SECONDS_FILE": runner_temp / "gemini_elapsed_seconds.txt",
+        "MODEL_ROUTE_FILE": runner_temp / "gemini_model_route.json",
+    }
+    start_result = subprocess.run(
+        ["bash", "-c", start["run"]],
+        env={**os.environ, **{key: str(value) for key, value in paths.items()}},
+        check=False, capture_output=True, text=True,
+    )
+    assert start_result.returncode == 0, start_result.stderr
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in paths.values())
+
+    output = tmp_path / "github-output"
+    read_result = subprocess.run(
+        ["bash", "-c", read["run"]],
+        env={
+            **os.environ,
+            **{key: str(value) for key, value in paths.items()},
+            "CONFIGURED_MODEL_ROUTE_JSON": '["gemini-3.7-flash"]',
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False, capture_output=True, text=True,
+    )
+    assert read_result.returncode == 0, read_result.stderr
+    metrics = _github_outputs(output)
+    assert metrics["call_count"] == "0"
+    assert re.fullmatch(r"0|[1-9][0-9]*", metrics["elapsed_seconds"])
+    assert json.loads(metrics["model_route_json"]) == ["gemini-3.7-flash"]
+    assert metrics["metrics_valid"] == "true"
+
+
+@pytest.mark.parametrize(
+    (
+        "provider_outcome", "provider_reason", "canonical_outcome",
+        "document_valid", "accepted_count", "filtered_count", "published",
+        "call_count", "elapsed_seconds", "metrics_valid", "expected_outcome",
+        "expected_stop",
+    ),
+    (
+        ("success", "", "success", "true", "1", "0", "true", "1", "5", "true", "success", "success"),
+        ("success", "", "success", "true", "0", "2", "true", "1", "5", "true", "quality_filtered", "quality_filtered"),
+        ("failure", "provider_timeout", "failure", "false", "", "", "true", "1", "5", "true", "provider_failure", "provider_timeout"),
+        ("success", "", "success", "true", "1", "0", "false", "1", "5", "true", "checkpoint_failure", "checkpoint_failure"),
+        ("failure", "call_budget_exhausted", "failure", "false", "", "", "true", "3", "5", "true", "checkpoint_failure", "call_budget_exhausted"),
+        ("failure", "provider_timeout", "failure", "false", "", "", "true", "1", "601", "true", "wall_time_exhausted", "wall_time_exhausted"),
+        ("failure", "provider_failed", "failure", "false", "", "", "true", "0", "0", "false", "checkpoint_failure", "checkpoint_failure"),
+    ),
+)
+def test_gemini_budget_outcome_mapping_is_deterministic(
+    tmp_path,
+    provider_outcome,
+    provider_reason,
+    canonical_outcome,
+    document_valid,
+    accepted_count,
+    filtered_count,
+    published,
+    call_count,
+    elapsed_seconds,
+    metrics_valid,
+    expected_outcome,
+    expected_stop,
+):
+    step = _step(
+        _load("gemini-auto-review.yml"), "gemini-review", "Resolve Gemini budget outcome"
+    )
+    canonical = tmp_path / "gemini-review-canonical.md"
+    canonical.write_text(
+        "### New findings\n\n#### RVW-111111111111 [HIGH] Current\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={
+            **os.environ,
+            "PROVIDER_OUTCOME": provider_outcome,
+            "PROVIDER_FAILURE_REASON": provider_reason,
+            "CANONICAL_OUTCOME": canonical_outcome,
+            "DOCUMENT_VALID": document_valid,
+            "ACCEPTED_COUNT": accepted_count,
+            "FILTERED_COUNT": filtered_count,
+            "UPSERT_OUTCOME": "success" if published == "true" else "failure",
+            "REVIEW_PUBLISHED": published,
+            "CALL_COUNT": call_count,
+            "ELAPSED_SECONDS": elapsed_seconds,
+            "METRICS_VALID": metrics_valid,
+            "AUTHENTICATED_REVIEW_JSON": (
+                '{"success":true,"head_sha":"' + "ab" * 20
+                + '","full_diff_sha256":"' + "12" * 32
+                + '","remaining_finding_ids":["RVW-aaaaaaaaaaaa"]}'
+            ),
+            "CANONICAL_FILE": str(canonical),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    values = _github_outputs(output)
+    assert values["outcome"] == expected_outcome
+    assert values["stop_reason"] == expected_stop
+    expected_remaining = (
+        ["RVW-111111111111"]
+        if expected_outcome in {"success", "quality_filtered"}
+        else ["RVW-aaaaaaaaaaaa"]
+    )
+    assert json.loads(values["remaining_finding_ids_json"]) == expected_remaining
+
+
 def test_claude_prompt_pins_diff_source():
     workflow = _load("claude-code-review.yml")
     step = _step(workflow, "claude-review", "Run Claude Code Review")
@@ -1838,7 +2219,8 @@ def test_gemini_uses_the_same_canonicalizer_contract_as_claude():
     assert action["if"] == (
         "${{ always() && steps.reset-gemini-artifacts.outcome == 'success' "
         "&& steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
 
     python = _extract_gemini_python()
@@ -1941,7 +2323,7 @@ def test_rejected_candidates_retain_only_canonicalizer_owned_diagnostics(
         "${{ always() && steps.canonicalize-review.outcome != 'skipped' "
         "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
     )
-    if workflow_name == "claude-code-review.yml":
+    if workflow_name in {"claude-code-review.yml", "gemini-auto-review.yml"}:
         upload_condition = (
             "${{ always() "
             "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
@@ -1980,10 +2362,12 @@ def test_gemini_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tm
         (step for step in steps if step.get("name") == "Reset Gemini review artifacts"), None
     )
     assert cleanup is not None
-    assert steps.index(cleanup) == model_index - 1
+    metrics = _step(workflow, "gemini-review", "Start Gemini review metrics")
+    assert steps.index(cleanup) < steps.index(metrics) < model_index
     expected_ready = (
         "steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged'"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true'"
     )
     assert cleanup["if"] == "${{ " + expected_ready + " }}"
     assert steps[model_index]["if"] == (
@@ -2061,7 +2445,7 @@ def test_gemini_collector_unlinks_seeded_destinations_before_redirection(tmp_pat
     )
 
     assert previous == ""
-    assert outputs == {"previous_sha": "", "previous_full_hash": ""}
+    assert outputs == _gemini_details_outputs()
     for index, destination in enumerate(destinations):
         assert targets[destination].read_text(encoding="utf-8") == f"sentinel-{index}"
     assert not (tmp_path / "gemini-previous-review.md").exists()
@@ -2164,7 +2548,7 @@ def test_shared_canonicalizer_runs_from_the_prepared_pr_head(
         < steps.index(canonicalizer)
     )
     checkout_condition = "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}"
-    if filename == "claude-code-review.yml":
+    if filename in {"claude-code-review.yml", "gemini-auto-review.yml"}:
         checkout_condition = (
             "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
             "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
@@ -2327,7 +2711,8 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert gemini_model["if"] == (
         "${{ steps.reset-gemini-artifacts.outcome == 'success' "
         "&& steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
     assert gemini_model["env"]["REVIEW_DIFF_FILE"] == (
         "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
@@ -2674,6 +3059,24 @@ def _run_gemini_details(
     )
 
 
+def _gemini_details_outputs(
+    head: str = "", full_hash: str = "", remaining: list[str] | None = None,
+) -> dict[str, str]:
+    authenticated = {
+        "success": bool(head and full_hash),
+        "head_sha": head or None,
+        "full_diff_sha256": full_hash or None,
+        "remaining_finding_ids": remaining or [],
+    }
+    return {
+        "previous_sha": head,
+        "previous_full_hash": full_hash,
+        "authenticated_review_json": json.dumps(
+            authenticated, separators=(",", ":")
+        ),
+    }
+
+
 def _collector_comment(
     reviewer: str,
     *,
@@ -2877,7 +3280,7 @@ def test_gemini_collector_authenticates_supported_publisher_mode_migration(
     )
 
     assert "MIGRATED PRIOR REVIEW" in prior
-    assert outputs == {"previous_sha": head, "previous_full_hash": "12" * 32}
+    assert outputs == _gemini_details_outputs(head, "12" * 32)
 
 
 @pytest.mark.parametrize(
@@ -2916,7 +3319,7 @@ def test_gemini_collector_rejects_untrusted_previous_publisher(
     )
 
     assert prior == ""
-    assert outputs == {"previous_sha": "", "previous_full_hash": ""}
+    assert outputs == _gemini_details_outputs()
 
 
 @pytest.mark.parametrize(
@@ -3006,7 +3409,7 @@ def test_gemini_v2_is_display_only_and_cannot_enable_incremental_input(tmp_path)
     )
 
     assert previous == ""
-    assert outputs == {"previous_sha": "", "previous_full_hash": ""}
+    assert outputs == _gemini_details_outputs()
     assert not (tmp_path / "gemini-previous-review.md").exists()
 
 
@@ -3024,7 +3427,7 @@ def test_gemini_v3_collects_authenticated_pair_and_exact_canonical_body(tmp_path
         tmp_path, [_bot("github-actions[bot]", sticky)], head_sha=head
     )
 
-    assert outputs == {"previous_sha": head, "previous_full_hash": "12" * 32}
+    assert outputs == _gemini_details_outputs(head, "12" * 32)
     assert (tmp_path / "gemini-previous-review.md").read_bytes() == canonical.encode()
     assert "### New findings" in previous
     for forbidden in (
@@ -3210,7 +3613,7 @@ def test_gemini_canonical_v2_collection_and_shared_action_contract(tmp_path):
     assert "BAD" not in previous
     assert "FOREIGN REVIEWER" not in previous
     assert "MISMATCHED PR" not in previous
-    assert outputs == {"previous_sha": head, "previous_full_hash": "12" * 32}
+    assert outputs == _gemini_details_outputs(head, "12" * 32)
     workflow = _load("gemini-auto-review.yml")
     job = workflow["jobs"]["gemini-review"]
     details = _step(workflow, "gemini-review", "Get PR details")["run"]
@@ -3916,6 +4319,7 @@ def _gemini_upsert(
     bot_login: str = "github-actions[bot]",
     auth_mode: str = "github_token",
     publisher_app_id: str = "",
+    budget_allow_invocation: str = "true",
 ) -> list:
     workdir = tmp_path / ("gemini-with-review" if with_review else "gemini-without-review")
     workdir.mkdir(parents=True)
@@ -3949,6 +4353,7 @@ def _gemini_upsert(
         "AUTH_MODE": auth_mode,
         "PUBLISHER_APP_ID": publisher_app_id,
         "ACTIONS_TOKEN": "actions-token-fixture",
+        "BUDGET_ALLOW_INVOCATION": budget_allow_invocation,
     }
     if not literal_schema:
         comments = [_upgrade_gemini_v2_fixture(comment) for comment in comments]
@@ -4966,6 +5371,60 @@ def test_gemini_soft_filtered_candidate_is_success_with_quality_metadata(tmp_pat
 
 
 @node_required
+def test_gemini_budget_denied_new_diff_cannot_publish_success(tmp_path):
+    calls = _gemini_upsert(
+        tmp_path,
+        "success",
+        [],
+        with_review=True,
+        review="### New findings\n\nNone",
+        budget_allow_invocation="false",
+    )
+    state = _posted_state(_single_mutation_body(calls))
+
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] is None
+
+
+@node_required
+def test_gemini_budget_authenticated_unchanged_reuse_succeeds_with_zero_calls(
+    tmp_path,
+):
+    prior_head = "ab" * 20
+    full_hash = "34" * 32
+    previous = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(
+                reviewer="gemini",
+                run_id=1,
+                head=prior_head,
+                full_diff_sha256=full_hash,
+            ),
+            "### New findings\n\nNone",
+            marker=GEMINI_V3_MARKER,
+            header=GEMINI_HEADER,
+        ),
+        11,
+    )
+    calls = _gemini_upsert(
+        tmp_path,
+        "skipped",
+        [previous],
+        with_review=False,
+        diff_mode="unchanged",
+        unchanged_since_previous="true",
+        full_diff_sha256=full_hash,
+        budget_allow_invocation="false",
+    )
+    state = _posted_state(_single_mutation_body(calls))
+
+    assert state["attempt_status"] == "success"
+    assert state["successful_head"] == "cd" * 20
+    assert state["full_diff_sha256"] == full_hash
+
+
+@node_required
 def test_gemini_unchanged_v3_success_advances_head_and_preserves_body_hash_quality(tmp_path):
     prior_head = "ab" * 20
     current_head = "cd" * 20
@@ -5738,6 +6197,161 @@ def _gemini_script_env(tmp_path):
         "REVIEW_DIFF_MODE": "full",
     })
     return env
+
+
+def _write_legacy_gemini_request_stub(tmp_path: Path, body: str) -> None:
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class _R:\n"
+        "    text = 'COUNTED REVIEW'\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): self.name = name\n"
+        "    def generate_content(self, prompt):\n"
+        "        calls = pathlib.Path('sdk-calls.txt')\n"
+        "        with calls.open('a') as stream: stream.write(self.name + '\\n')\n"
+        f"{body}",
+        encoding="utf-8",
+    )
+
+
+def test_gemini_request_count_wraps_every_sdk_request_before_the_api_call():
+    source = _extract_gemini_python()
+    assert "def counted_generate_content(prompt, model):" in source
+    assert "response = counted_generate_content(prompt, model)" in source
+    assert "response = generate_content(prompt, model)" not in source
+    assert source.index("write_call_count(count + 1)") < source.index(
+        "return generate_content(prompt, model)"
+    )
+    assert source.index("append_model_route(model)") < source.index(
+        "return generate_content(prompt, model)"
+    )
+
+
+def test_gemini_request_count_primary_success_records_one_durable_attempt(tmp_path):
+    (tmp_path / "gemini_review.py").write_text(
+        _extract_gemini_python(), encoding="utf-8"
+    )
+    _write_legacy_gemini_request_stub(tmp_path, "        return _R()\n")
+    _write_gemini_script_inputs(tmp_path)
+    call_count = tmp_path / "gemini_call_count.txt"
+    model_route = tmp_path / "gemini_model_route.json"
+    call_count.write_text("0\n", encoding="ascii")
+    model_route.write_text("[]\n", encoding="utf-8")
+    call_count.chmod(0o600)
+    model_route.chmod(0o600)
+    env = _gemini_script_env(tmp_path)
+    env.update(
+        {
+            "GEMINI_MODEL": "primary-model",
+            "GEMINI_FALLBACK_MODEL": "fallback-model",
+            "GEMINI_CALL_COUNT_FILE": str(call_count),
+            "GEMINI_MODEL_ROUTE_FILE": str(model_route),
+        }
+    )
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert call_count.read_text(encoding="ascii") == "1\n"
+    assert json.loads(model_route.read_text(encoding="utf-8")) == ["primary-model"]
+    assert (tmp_path / "sdk-calls.txt").read_text().splitlines() == ["primary-model"]
+
+
+def test_gemini_request_count_primary_retries_and_fallback_share_three_calls(
+    tmp_path,
+):
+    (tmp_path / "gemini_review.py").write_text(
+        _extract_gemini_python(), encoding="utf-8"
+    )
+    _write_legacy_gemini_request_stub(
+        tmp_path,
+        "        if self.name == 'primary-model':\n"
+        "            raise RuntimeError('429 rate limited; Please retry in 0s')\n"
+        "        return _R()\n",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    call_count = tmp_path / "gemini_call_count.txt"
+    model_route = tmp_path / "gemini_model_route.json"
+    call_count.write_text("0\n", encoding="ascii")
+    model_route.write_text("[]\n", encoding="utf-8")
+    call_count.chmod(0o600)
+    model_route.chmod(0o600)
+    env = _gemini_script_env(tmp_path)
+    env.update(
+        {
+            "GEMINI_MODEL": "primary-model",
+            "GEMINI_FALLBACK_MODEL": "fallback-model",
+            "GEMINI_429_RETRY_SLEEP": "0",
+            "GEMINI_429_RETRY_JITTER": "0",
+            "GEMINI_CALL_COUNT_FILE": str(call_count),
+            "GEMINI_MODEL_ROUTE_FILE": str(model_route),
+        }
+    )
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert call_count.read_text(encoding="ascii") == "3\n"
+    assert json.loads(model_route.read_text(encoding="utf-8")) == [
+        "primary-model", "fallback-model",
+    ]
+    assert (tmp_path / "sdk-calls.txt").read_text().splitlines() == [
+        "primary-model", "primary-model", "fallback-model",
+    ]
+
+
+def test_gemini_request_count_rejects_fourth_before_sdk_and_persists_raised_calls(
+    tmp_path,
+):
+    source = _extract_gemini_python().replace("max_attempts = 3", "max_attempts = 4", 1)
+    assert source != _extract_gemini_python()
+    (tmp_path / "gemini_review.py").write_text(source, encoding="utf-8")
+    _write_legacy_gemini_request_stub(
+        tmp_path, "        raise RuntimeError('429 rate limited; Please retry in 0s')\n"
+    )
+    _write_gemini_script_inputs(tmp_path)
+    call_count = tmp_path / "gemini_call_count.txt"
+    model_route = tmp_path / "gemini_model_route.json"
+    call_count.write_text("0\n", encoding="ascii")
+    model_route.write_text("[]\n", encoding="utf-8")
+    call_count.chmod(0o600)
+    model_route.chmod(0o600)
+    env = _gemini_script_env(tmp_path)
+    env.update(
+        {
+            "GEMINI_MODEL": "primary-model",
+            "GEMINI_FALLBACK_MODEL": "primary-model",
+            "GEMINI_429_RETRY_SLEEP": "0",
+            "GEMINI_429_RETRY_JITTER": "0",
+            "GEMINI_CALL_COUNT_FILE": str(call_count),
+            "GEMINI_MODEL_ROUTE_FILE": str(model_route),
+        }
+    )
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert call_count.read_text(encoding="ascii") == "3\n"
+    assert json.loads(model_route.read_text(encoding="utf-8")) == ["primary-model"]
+    assert (tmp_path / "sdk-calls.txt").read_text().splitlines() == [
+        "primary-model", "primary-model", "primary-model",
+    ]
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == (
+        "call_budget_exhausted"
+    )
 
 
 def test_gemini_process_watchdog_records_provider_timeout(tmp_path):

@@ -80,3 +80,11 @@ Task 4: fix round 1/5 (1 open — graceful `diff-mode=unavailable` preserves a p
 Task 4: fix round 1/5 (1 addressed, 0 open — unavailable producer identities are normalized empty before the Task 3 claim; RED 4 failed/12 passed, GREEN 16 focused, 134 Claude/actionlint, and 2050 + 48 subtests non-Task7 full; base commit 26f8afe)
 
 Task 4: complete (commits 8e98272..d0aeedb, review clean; accepted intermediate red remains only Task 7 release inventory)
+
+Ruling: Task 5 preserves Gemini's exact schema-3 review-state authority and emits Task 3's exact four-key authenticated-review payload. It reuses Task 4's reviewed workspace-private selected-diff staging, immediate cleanup, and empty unavailable head/hash normalization instead of widening the shared action's path boundary — this keeps all reviewers on one transport/security contract — if wrong, Tasks 3-5 require a coordinated payload or filesystem boundary revision.
+
+Ruling: A Gemini claim can fail before its first SDK request (dependency/auth/config failure), leaving truthful `call_count=0` and an empty attempted-route file, but Task 2 requires a nonempty final route whose first item matches the claimed route. In that zero-call case only, finalization retains the configured primary route already persisted by the claim; once any request is counted, finalization uses the actual attempted model route and keeps every primary retry/fallback under the shared three-call counter — this preserves truthful usage while allowing deterministic failure finalization — if wrong, the ledger schema needs a nullable attempted-route field separate from the required configured route.
+
+Task 5: implementer complete (RED 12 expected failures/4 passes; GREEN 26 focused, 165 Gemini/actionlint, 1514 workflow-logic, and 2070 + 48 subtests non-Task7 full; digest-verified actionlint 1.7.12, YAML, changed-line Ruff, and diff-check green; report: task-5-report.md)
+
+Task 5: self-review complete (schema-3 authority/exact four-key payload, workspace-private staging and immediate cleanup, GitHub `if` failure semantics, zero-call claimed route, shared three-call crash persistence, deterministic upsert/finalize outcomes, and no reviewer fallback verified)
