@@ -158,6 +158,9 @@ Rules:
 - severity is exactly `CRITICAL`, `HIGH`, or `MEDIUM`;
 - the changed anchor JSON contains only `path` and positive safe-integer `line`;
 - one or more trigger-evidence lines may appear, each containing only `path`, `line`, and `quote`;
+- when the changed anchor is a Python exception-handler line, at least one trigger-evidence item
+  must identify a different throwing or calling line; repeating only the handler cannot establish
+  which exception reaches it and is filtered as `invalid_trigger_evidence`;
 - canonical JSON escapes every Python `splitlines()` boundary, including U+0085, U+2028, and
   U+2029, while decoding back to the exact validated path or quotation;
 - impact class is exactly one of `runtime`, `security`, `data-integrity`, `user-visible`, or
@@ -219,12 +222,18 @@ anchored PR change. Each evidence record must:
 - refer to a regular UTF-8 file without following a symlink; and
 - match the complete current source line after removing only the line terminator.
 
+For a Python exception-handler changed anchor, the handler line may be included as evidence but
+cannot be the only evidence coordinate. At least one distinct throwing or calling line is required,
+and both provider prompts require checking exception inheritance and catch direction before making
+the claim. This closes the exact self-corroborating failure observed in the `pim-check` v1.46 live
+canary without rejecting direct single-line findings that are not exception handlers.
+
 Whitespace inside the quoted line remains significant. Evidence paths and quotes are transported as
 JSON strings so Unicode, spaces, colons, and backticks are not reinterpreted by a shell.
 
 This check would reject the `plan_global` HIGH candidate from PR #101 unless the model could cite an
-actual supported non-None caller. It cannot determine whether a real quoted line is semantically
-relevant; that residual semantic risk is explicit.
+actual supported non-None caller. It still cannot determine whether distinct real quoted lines are
+semantically relevant; that residual semantic risk is explicit.
 
 ### 7.3 Materiality
 

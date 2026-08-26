@@ -417,6 +417,9 @@ jobs:
             complete exact current source line. Performance candidates additionally require one
             `- Performance basis:` JSON object with kind `measured` or `unbounded-amplification`
             plus path, line, and exact quote.
+            For an exception-handler Changed anchor, at least one Trigger evidence item must cite
+            a different throwing or calling line; verify exception inheritance and catch direction
+            before reporting.
 
             Every carryover heading has the exact form `#### RVW-<12hex> [SEVERITY] title` and must
             name exactly one authenticated workflow-owned prior ID. Still open also provides current

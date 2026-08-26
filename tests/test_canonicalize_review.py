@@ -360,6 +360,43 @@ The caller cannot distinguish invalid input from a supported value.
     assert "RVW-61d4cd9ac260 [MEDIUM] Broad ValueError catch" in canonical
 
 
+def test_exception_handler_cannot_repeat_changed_anchor_as_its_only_trigger(scoped_case):
+    """pim-check #120: an except line alone cannot prove which exception reaches it."""
+    result, canonical = scoped_case.run('''### New findings
+
+#### [HIGH] ValueError handler misses the plan-specific exception
+- Changed anchor: {"path":"review_cases.py","line":26}
+- Trigger evidence: {"path":"review_cases.py","line":26,"quote":"    except ValueError:"}
+- Impact class: runtime
+- Material impact: The plan-specific exception is not caught and aborts the command.
+''')
+
+    assert result.document_valid is True
+    assert (result.accepted_count, result.filtered_count, result.normalized_count) == (0, 1, 0)
+    assert result.filtered_max_severity == "HIGH"
+    assert result.candidate_reasons == (
+        CandidateReason(0, "New findings", "filtered", "invalid_trigger_evidence", "HIGH"),
+    )
+    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+def test_exception_handler_accepts_a_distinct_trigger_line(scoped_case):
+    result, canonical = scoped_case.run('''### New findings
+
+#### [MEDIUM] Broad ValueError catch hides invalid configuration
+- Changed anchor: {"path":"review_cases.py","line":26}
+- Trigger evidence: {"path":"review_cases.py","line":26,"quote":"    except ValueError:"}
+- Trigger evidence: {"path":"review_cases.py","line":25,"quote":"        return int(value)"}
+- Impact class: runtime
+- Material impact: Invalid numeric configuration is converted into a normal result.
+''')
+
+    assert result.document_valid is True
+    assert (result.accepted_count, result.filtered_count, result.normalized_count) == (1, 0, 0)
+    assert result.candidate_reasons == ()
+    assert "Broad ValueError catch hides invalid configuration" in canonical
+
+
 @pytest.mark.parametrize(
     ("heading", "fields", "reason"),
     (
