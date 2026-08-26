@@ -1,0 +1,9 @@
+[
+  {"name":"first-claim","prior":"empty","head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","full_hash":"1111111111111111111111111111111111111111111111111111111111111111","expected":"claimed","allow":true},
+  {"name":"same-head-success","prior":"one-success","head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","full_hash":"1111111111111111111111111111111111111111111111111111111111111111","expected":"duplicate_head","allow":false},
+  {"name":"same-head-provider-failure","prior":"one-provider-failure","head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","full_hash":"1111111111111111111111111111111111111111111111111111111111111111","expected":"duplicate_head","allow":false},
+  {"name":"same-head-unfinalized","prior":"one-claimed","head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","full_hash":"1111111111111111111111111111111111111111111111111111111111111111","expected":"duplicate_head","allow":false},
+  {"name":"new-head-same-diff","prior":"one-success","head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","full_hash":"1111111111111111111111111111111111111111111111111111111111111111","expected":"duplicate_effective_diff","allow":false},
+  {"name":"third-diff-no-override","prior":"two-successes","head":"cccccccccccccccccccccccccccccccccccccccc","full_hash":"3333333333333333333333333333333333333333333333333333333333333333","expected":"round_budget_exhausted","allow":false},
+  {"name":"third-diff-one-override","prior":"two-successes","head":"cccccccccccccccccccccccccccccccccccccccc","full_hash":"3333333333333333333333333333333333333333333333333333333333333333","override_event":9001,"expected":"claimed","allow":true}
+]
