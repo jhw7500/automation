@@ -3031,6 +3031,7 @@ def _run_upsert(
     run_jobs_by_attempt: dict[str, list[dict]] | None = None,
     current_workflow_run: dict | None = None,
     inject_comments_at_list_call: dict[int, list[dict]] | None = None,
+    node_preload: Path | None = None,
 ) -> list:
     workflow = _load(workflow_file)
     script = _step(workflow, job, step_name)["with"]["script"]
@@ -3080,11 +3081,16 @@ def _run_upsert(
         "runJobsByAttempt": run_jobs_by_attempt or {},
     }
     (tmp_path / "fixture.json").write_text(json.dumps(fixture), encoding="utf-8")
+    node_env = None
+    if node_preload is not None:
+        node_env = os.environ.copy()
+        node_env["NODE_OPTIONS"] = f"--require={node_preload}"
     result = subprocess.run(
         ["node", str(tmp_path / "harness.js"), str(tmp_path / "script.js"), str(tmp_path / "fixture.json")],
         check=False,
         capture_output=True,
         text=True,
+        env=node_env,
     )
     if expect_error:
         assert result.returncode != 0
@@ -11081,6 +11087,7 @@ def _run_opencode_canonicalize(
     candidate_artifact_case: str = "valid",
     candidate_review: str | None = None,
     failure_reason: str = "",
+    node_preload: Path | None = None,
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
     script = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")["with"]["script"]
@@ -11357,6 +11364,7 @@ def _run_opencode_canonicalize(
         run_jobs_by_attempt=run_jobs_by_attempt,
         current_workflow_run=current_workflow_run,
         inject_comments_at_list_call=inject_comments_at_list_call,
+        node_preload=node_preload,
     )
 
 
@@ -12187,6 +12195,92 @@ def test_opencode_changed_anchor_scope_accepts_none_or_anchored_findings(tmp_pat
 
 
 @node_required
+def test_opencode_filters_out_of_scope_new_finding_but_keeps_valid_high(tmp_path):
+    valid_anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    invalid_anchor = json.dumps(
+        {"path": ".github/workflows/gemini-auto-review.yml", "line": 74},
+        separators=(",", ":"),
+    )
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        f"#### [HIGH] Real regression\n- Changed anchor: {valid_anchor}\n"
+        '- Current line: "added line 1"\nConcrete, blocking impact.\n\n'
+        f"#### [MEDIUM] Potential parameter duplication typo\n"
+        f"- Changed anchor: {invalid_anchor}\n"
+        '- Current line: "      publisher_app_id: ${{ vars.APP_ID }}"\n'
+        "This appears duplicated; verify whether it is intentional."
+    )
+    candidate = _bot("github-actions[bot]", review, 10, updated="u2")
+
+    calls = _run_opencode_canonicalize(tmp_path, [], [candidate])
+    body = _single_mutation_body(calls)
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+
+    assert state["attempt_status"] == "success"
+    assert "#### [HIGH] Real regression" in body
+    assert "Concrete, blocking impact." in body
+    assert "Potential parameter duplication typo" not in body
+    assert (
+        "- Validation: filtered_invalid_new_findings=1; "
+        "reasons=anchor_out_of_scope"
+    ) in body
+
+@node_required
+def test_opencode_all_out_of_scope_new_findings_becomes_clean_success(tmp_path):
+    invalid_anchor = json.dumps(
+        {"path": ".github/workflows/gemini-auto-review.yml", "line": 74},
+        separators=(",", ":"),
+    )
+    wrong_line_anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        f"#### [MEDIUM] Potential parameter duplication typo\n"
+        f"- Changed anchor: {invalid_anchor}\n"
+        '- Current line: "      publisher_app_id: ${{ vars.APP_ID }}"\n'
+        "This appears duplicated; verify whether it is intentional.\n\n"
+        f"#### [MEDIUM] Misquoted current source\n"
+        f"- Changed anchor: {wrong_line_anchor}\n"
+        '- Current line: "not the current added line"\n'
+        "The quoted source does not match the prepared diff."
+    )
+    candidate = _bot("github-actions[bot]", review, 10, updated="u2")
+
+    calls = _run_opencode_canonicalize(tmp_path, [], [candidate])
+    body = _single_mutation_body(calls)
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+
+    assert state["attempt_status"] == "success"
+    assert "### New findings\nNone" in body
+    assert "Potential parameter duplication typo" not in body
+    assert "Misquoted current source" not in body
+    assert (
+        "- Validation: filtered_invalid_new_findings=2; "
+        "reasons=anchor_out_of_scope"
+    ) in body
+
+    canonical, receipt = _opencode_published_from_calls(calls)
+    next_round = tmp_path / "next-round"
+    next_round.mkdir()
+    context = _run_opencode_ctx(
+        next_round, [canonical], check_runs=[receipt]
+    )
+    assert "### New findings\nNone" in context
+    assert "filtered_invalid_new_findings" not in context
+
+
+@node_required
 def test_opencode_canonicalization_quarantines_new_v2_forgery_and_uses_only_raw_candidate(tmp_path):
     old_head = "ab" * 20
     before = _bot(
@@ -12878,11 +12972,7 @@ def test_opencode_changed_anchor_scope_rejects_invalid_output_grammar(tmp_path, 
 
 
 @node_required
-@pytest.mark.parametrize(
-    "current_line",
-    [None, "wrong line"],
-)
-def test_opencode_finding_requires_exact_current_changed_line(tmp_path, current_line):
+def test_opencode_finding_requires_current_line_field(tmp_path):
     anchor = json.dumps(
         {"path": OPENCODE_SCOPE_PATH, "line": 1},
         ensure_ascii=False,
@@ -12893,14 +12983,43 @@ def test_opencode_finding_requires_exact_current_changed_line(tmp_path, current_
         "### New findings",
         "#### [MEDIUM] Grounded finding",
         f"- Changed anchor: {anchor}",
+        "Concrete impact.",
     ]
-    if current_line is not None:
-        lines.append(f"- Current line: {json.dumps(current_line)}")
-    lines.append("Concrete impact.")
     candidate = _bot("github-actions[bot]", "\n".join(lines), 10, updated="u2")
     body = _single_mutation_body(_run_opencode_canonicalize(tmp_path, [], [candidate]))
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "failure"
+
+
+@node_required
+def test_opencode_finding_with_wrong_current_line_is_filtered(tmp_path):
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    candidate = _bot(
+        "github-actions[bot]",
+        (
+            f"{OPENCODE_MARKER}\n### New findings\n"
+            f"#### [MEDIUM] Wrong source line\n- Changed anchor: {anchor}\n"
+            '- Current line: "wrong line"\nConcrete impact.'
+        ),
+        10,
+        updated="u2",
+    )
+
+    body = _single_mutation_body(
+        _run_opencode_canonicalize(tmp_path, [], [candidate])
+    )
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+
+    assert state["attempt_status"] == "success"
+    assert "### New findings\nNone" in body
+    assert "Wrong source line" not in body
+    assert "filtered_invalid_new_findings=1" in body
 
 
 @node_required
@@ -12964,19 +13083,83 @@ def test_opencode_finding_allows_nonseparator_named_entity_prose(
 
 @node_required
 @pytest.mark.parametrize(
-    ("anchor", "manifest_files", "git_diff", "git_failure"),
+    (
+        "anchor_path",
+        "anchor_line",
+        "current_line",
+        "manifest_files",
+        "git_diff",
+        "git_failure",
+        "expected_status",
+    ),
     [
-        ("old-name.js:1", [{"status": "renamed", "filename": OPENCODE_SCOPE_PATH, "previous_filename": "old-name.js"}], "@@ -1,0 +1,1 @@\n+x\n", False),
-        ("deleted.js:1", [{"status": "removed", "filename": "deleted.js"}], "@@ -1 +0,0 @@\n-x\n", False),
-        ("absent.js:1", [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}], "@@ -1,0 +1,1 @@\n+x\n", False),
-        (f"{OPENCODE_SCOPE_PATH}:2", [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}], "@@ -1,0 +1,1 @@\n+x\n", False),
-        (f"{OPENCODE_SCOPE_PATH}:1", [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}], "not a hunk\n", False),
-        (f"{OPENCODE_SCOPE_PATH}:1", [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}], "@@ -1,0 +1,1 @@\n+x\n", True),
+        (
+            "old-name.js",
+            1,
+            "added line 1",
+            [{
+                "status": "renamed",
+                "filename": OPENCODE_SCOPE_PATH,
+                "previous_filename": "old-name.js",
+            }],
+            "@@ -1,0 +1,1 @@\n+x\n",
+            False,
+            "success",
+        ),
+        (
+            "deleted.js",
+            1,
+            "stable line 1",
+            [{"status": "removed", "filename": "deleted.js"}],
+            "@@ -1 +0,0 @@\n-x\n",
+            False,
+            "success",
+        ),
+        (
+            "absent.js",
+            1,
+            "added line 1",
+            [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}],
+            "@@ -1,0 +1,1 @@\n+x\n",
+            False,
+            "success",
+        ),
+        (
+            OPENCODE_SCOPE_PATH,
+            2,
+            "stable line 1",
+            [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}],
+            "@@ -1,0 +1,1 @@\n+x\n",
+            False,
+            "success",
+        ),
+        (
+            OPENCODE_SCOPE_PATH,
+            1,
+            "added line 1",
+            [{"status": "modified", "filename": OPENCODE_SCOPE_PATH}],
+            "@@ -1,0 +1,1 @@\n+x\n",
+            True,
+            "failure",
+        ),
     ],
-    ids=("previous-rename", "deleted", "out-of-scope", "unchanged-line", "malformed-hunk", "git-failure"),
+    ids=(
+        "previous-rename",
+        "deleted",
+        "out-of-scope",
+        "unchanged-line",
+        "git-failure",
+    ),
 )
-def test_opencode_changed_anchor_scope_rejects_non_added_locations(
-    tmp_path, anchor, manifest_files, git_diff, git_failure
+def test_opencode_new_finding_scope_filters_invalid_locations_but_keeps_validation_failures_hard(
+    tmp_path,
+    anchor_path,
+    anchor_line,
+    current_line,
+    manifest_files,
+    git_diff,
+    git_failure,
+    expected_status,
 ):
     manifest = {
         "schema": 1,
@@ -12986,19 +13169,147 @@ def test_opencode_changed_anchor_scope_rejects_non_added_locations(
         "head_sha": "cd" * 20,
         "files": manifest_files,
     }
+    anchor = json.dumps(
+        {"path": anchor_path, "line": anchor_line},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     candidate = _bot(
         "github-actions[bot]",
-        f"{OPENCODE_MARKER}\n### New findings\n#### Finding\n- Changed anchor: `{anchor}`",
+        f"{OPENCODE_MARKER}\n### New findings\n#### Finding\n"
+        f"- Changed anchor: {anchor}\n"
+        f"- Current line: {json.dumps(current_line)}",
         10,
         updated="u2",
     )
     body = _single_mutation_body(
         _run_opencode_canonicalize(
-            tmp_path, [], [candidate], manifest=manifest, git_diff=git_diff, git_failure=git_failure
+            tmp_path,
+            [],
+            [candidate],
+            manifest=manifest,
+            git_diff=git_diff,
+            git_failure=git_failure,
         )
     )
-    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+    assert state["attempt_status"] == expected_status
+    if expected_status == "success":
+        assert "### New findings\nNone" in body
+        assert "filtered_invalid_new_findings=1" in body
+    else:
+        assert "Reason: anchor_out_of_scope" in body
+        assert "filtered_invalid_new_findings" not in body
+
+
+@node_required
+def test_opencode_removed_manifest_status_mismatch_remains_hard_failure(tmp_path):
+    repo = tmp_path / "repo"
+    _init_anchor_repo(repo)
+    path = "actually-modified.txt"
+    (repo / path).write_text("before\n", encoding="utf-8")
+    base = _commit_anchor_repo(repo, "base")
+    (repo / path).write_text("after\n", encoding="utf-8")
+    head = _commit_anchor_repo(repo, "modified head")
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": base,
+        "head_sha": head,
+        "files": [{"status": "removed", "filename": path}],
+    }
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [_anchor_candidate(path, 1, "Manifest status mismatch", "after")],
+        attempt_head=head,
+        current_head=head,
+        manifest=manifest,
+        trusted_workspace=repo,
+    )
+    body = _single_mutation_body(calls)
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+
     assert state["attempt_status"] == "failure"
+    assert "Reason: anchor_out_of_scope" in body
+    assert "filtered_invalid_new_findings" not in body
+
+
+@node_required
+def test_opencode_malformed_content_diff_remains_hard_failure(tmp_path):
+    repo = tmp_path / "repo"
+    _init_anchor_repo(repo)
+    path = "malformed-diff.txt"
+    (repo / path).write_text("before\n", encoding="utf-8")
+    base = _commit_anchor_repo(repo, "base")
+    (repo / path).write_text("after\n", encoding="utf-8")
+    head = _commit_anchor_repo(repo, "modified head")
+    manifest = {
+        "schema": 1,
+        "repository": "example/repo",
+        "pr_number": 7,
+        "merge_base_sha": base,
+        "head_sha": head,
+        "files": [{"status": "modified", "filename": path}],
+    }
+    git_log = tmp_path / "malformed-diff-calls.log"
+    preload = tmp_path / "malformed-diff-preload.js"
+    preload.write_text(
+        "const childProcess = require('child_process');\n"
+        "const fs = require('fs');\n"
+        f"const logPath = {json.dumps(str(git_log))};\n"
+        "const originalSpawnSync = childProcess.spawnSync;\n"
+        "childProcess.spawnSync = function(command, args, options) {\n"
+        "  if (command === '/usr/bin/git' && Array.isArray(args) "
+        "&& args.includes('-U0') && !args.includes('--output-indicator-new=%')) {\n"
+        "    fs.appendFileSync(logPath, 'content-diff\\n');\n"
+        "    return { status: 0, stdout: '@@ malformed\\n' };\n"
+        "  }\n"
+        "  return originalSpawnSync.apply(this, arguments);\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    anchor = json.dumps(
+        {"path": path, "line": 1}, separators=(",", ":")
+    )
+    candidate = _bot(
+        "github-actions[bot]",
+        (
+            f"{OPENCODE_MARKER}\n### New findings\n"
+            f"#### Malformed content diff one\n- Changed anchor: {anchor}\n"
+            '- Current line: "after"\nFirst candidate.\n\n'
+            f"#### Malformed content diff two\n- Changed anchor: {anchor}\n"
+            '- Current line: "after"\nSecond candidate.'
+        ),
+        10,
+        updated="u2",
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [candidate],
+        attempt_head=head,
+        current_head=head,
+        manifest=manifest,
+        trusted_workspace=repo,
+        node_preload=preload,
+    )
+    body = _single_mutation_body(calls)
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+
+    assert state["attempt_status"] == "failure"
+    assert "Reason: anchor_out_of_scope" in body
+    assert "filtered_invalid_new_findings" not in body
+    assert git_log.read_text(encoding="utf-8").splitlines() == ["content-diff"]
 
 
 @node_required
@@ -13410,7 +13721,11 @@ def test_opencode_pure_rename_does_not_turn_unchanged_destination_lines_into_add
         trusted_workspace=repo,
     )
 
-    assert _published_opencode_state(calls)["attempt_status"] == "failure"
+    assert _published_opencode_state(calls)["attempt_status"] == "success"
+    body = _single_mutation_body(calls)
+    assert "### New findings\nNone" in body
+    assert "#### Pure rename" not in body
+    assert "filtered_invalid_new_findings=1" in body
 
 
 @node_required
@@ -13452,6 +13767,9 @@ def test_opencode_modified_rename_accepts_only_the_real_added_destination_line(t
     )
 
     assert _published_opencode_state(calls)["attempt_status"] == "success"
+    accepted_body = _single_mutation_body(calls)
+    assert "#### Modified rename" in accepted_body
+    assert "filtered_invalid_new_findings" not in accepted_body
 
     unchanged_dir = tmp_path / "unchanged-line"
     unchanged_dir.mkdir()
@@ -13464,7 +13782,11 @@ def test_opencode_modified_rename_accepts_only_the_real_added_destination_line(t
         manifest=manifest,
         trusted_workspace=repo,
     )
-    assert _published_opencode_state(unchanged_calls)["attempt_status"] == "failure"
+    assert _published_opencode_state(unchanged_calls)["attempt_status"] == "success"
+    filtered_body = _single_mutation_body(unchanged_calls)
+    assert "### New findings\nNone" in filtered_body
+    assert "#### Rename context" not in filtered_body
+    assert "filtered_invalid_new_findings=1" in filtered_body
 
 
 @node_required
@@ -13541,12 +13863,12 @@ def test_opencode_gitlink_anchor_ignores_hostile_submodule_ignore_configuration(
 
 @node_required
 @pytest.mark.parametrize(
-    ("line", "expected_status"),
-    ((1, "success"), (2, "failure"), (3, "success")),
+    ("line", "expected_retained"),
+    ((1, True), (2, False), (3, True)),
     ids=("first-change", "unchanged-bridge", "last-change-no-newline"),
 )
 def test_opencode_anchor_uses_only_added_lines_under_hostile_inter_hunk_context(
-    tmp_path, line, expected_status
+    tmp_path, line, expected_retained
 ):
     repo = tmp_path / "repo"
     _init_anchor_repo(repo)
@@ -13580,7 +13902,15 @@ def test_opencode_anchor_uses_only_added_lines_under_hostile_inter_hunk_context(
         trusted_workspace=repo,
     )
 
-    assert _published_opencode_state(calls)["attempt_status"] == expected_status
+    assert _published_opencode_state(calls)["attempt_status"] == "success"
+    body = _single_mutation_body(calls)
+    if expected_retained:
+        assert "#### Inter-hunk bridge" in body
+        assert "filtered_invalid_new_findings" not in body
+    else:
+        assert "### New findings\nNone" in body
+        assert "#### Inter-hunk bridge" not in body
+        assert "filtered_invalid_new_findings=1" in body
 
 
 @node_required
