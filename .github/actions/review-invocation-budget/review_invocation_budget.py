@@ -1036,6 +1036,7 @@ def _read_pages(path: Path, name: str) -> list[object]:
         text = path.read_text(encoding="utf-8")
         decoder = json.JSONDecoder()
         cursor = 0
+        decoded_pages = 0
         values: list[object] = []
         while cursor < len(text):
             while cursor < len(text) and text[cursor].isspace():
@@ -1045,7 +1046,10 @@ def _read_pages(path: Path, name: str) -> list[object]:
             value, cursor = decoder.raw_decode(text, cursor)
             if not isinstance(value, list):
                 raise TransportError(f"{name}_invalid")
+            decoded_pages += 1
             values.extend(value)
+        if decoded_pages == 0:
+            raise TransportError(f"{name}_invalid")
         return values
     except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TransportError(f"{name}_invalid") from exc
@@ -1091,12 +1095,22 @@ def _transport_request(path: Path) -> dict[str, object]:
     value["pr"] = _decimal(value["pr"], "pr")
     value["run_id"] = _decimal(value["run_id"], "run_id")
     value["run_attempt"] = _decimal(value["run_attempt"], "run_attempt")
-    value["head_sha"] = _hash(value["head_sha"], _HEAD, "head_sha")
-    value["full_diff_sha256"] = _hash(
-        value["full_diff_sha256"], _HASH, "full_diff_sha256",
-    )
-    if value["diff_mode"] not in {"changed", "unchanged"}:
+    diff_mode = _string(value["diff_mode"], "diff_mode")
+    if diff_mode not in {"full", "delta", "unchanged", "unavailable"}:
         raise TransportError("diff_mode_invalid")
+    head_sha = _string(value["head_sha"], "head_sha")
+    full_diff_sha256 = _string(value["full_diff_sha256"], "full_diff_sha256")
+    if diff_mode == "unavailable":
+        if head_sha and _HEAD.fullmatch(head_sha) is None:
+            raise TransportError("head_sha_invalid")
+        if full_diff_sha256 and _HASH.fullmatch(full_diff_sha256) is None:
+            raise TransportError("full_diff_sha256_invalid")
+    else:
+        head_sha = _hash(head_sha, _HEAD, "head_sha")
+        full_diff_sha256 = _hash(full_diff_sha256, _HASH, "full_diff_sha256")
+    value["diff_mode"] = diff_mode
+    value["head_sha"] = head_sha
+    value["full_diff_sha256"] = full_diff_sha256
     for name in (
         "input_files_json", "authenticated_review_json", "model_route_json", "effort",
         "outcome", "stop_reason", "remaining_finding_ids_json", "checkpoint_file",
@@ -1151,7 +1165,8 @@ def _base_claim_request(
         repository=request["repository"], pr=request["pr"], reviewer=request["reviewer"],
         run_id=request["run_id"], run_attempt=request["run_attempt"],
         head_sha=request["head_sha"], full_diff_sha256=request["full_diff_sha256"],
-        estimated_input_tokens=estimated_input_tokens, diff_mode=request["diff_mode"],
+        estimated_input_tokens=estimated_input_tokens,
+        diff_mode="changed" if request["diff_mode"] in {"full", "delta"} else request["diff_mode"],
         authenticated_review=_authenticated_review(request), override_events=override_events,
         model_route=_model_route(request), effort=request["effort"],
         call_unit=_CALL_UNITS[request["reviewer"]],
@@ -1178,6 +1193,102 @@ def _decimal_or_zero(value: object, name: str) -> int:
     if value in {0, "0"}:
         return 0
     return _decimal(value, name)
+
+
+def _raw_request(path: Path) -> Mapping[str, object]:
+    value = _read_json(path, "request")
+    if not isinstance(value, dict):
+        raise TransportError("request_invalid")
+    return value
+
+
+def _safe_decimal(value: object) -> int | None:
+    try:
+        return _decimal(value, "identity")
+    except BudgetStateError:
+        return None
+
+
+def _safe_pattern(value: object, pattern: re.Pattern[str]) -> str | None:
+    return value if isinstance(value, str) and pattern.fullmatch(value) else None
+
+
+def _diagnostic_handoff(
+        raw_request: Mapping[str, object], decision: str, stop_reason: str,
+) -> dict[str, object]:
+    repository = raw_request.get("repository")
+    if (
+        not isinstance(repository, str) or _REPOSITORY.fullmatch(repository) is None or
+        os.environ.get("GITHUB_REPOSITORY") != repository
+    ):
+        repository = None
+    reviewer = raw_request.get("reviewer")
+    if reviewer not in MARKERS:
+        reviewer = None
+    return {
+        "current_full_diff_sha256": _safe_pattern(raw_request.get("full_diff_sha256"), _HASH),
+        "current_head_sha": _safe_pattern(raw_request.get("head_sha"), _HEAD),
+        "current_run_attempt": _safe_decimal(raw_request.get("run_attempt")),
+        "current_run_id": _safe_decimal(raw_request.get("run_id")),
+        "decision": decision,
+        "outcome": "checkpoint_failure",
+        "pr": _safe_decimal(raw_request.get("pr")),
+        "repository": repository,
+        "reviewer": reviewer,
+        "stop_reason": stop_reason,
+    }
+
+
+def _write_diagnostic(
+        output_directory: Path, raw_request: Mapping[str, object], decision: str,
+        stop_reason: str,
+) -> None:
+    if decision not in {"state_invalid", "diff_unavailable"}:
+        raise TransportError("diagnostic_decision_invalid")
+    if re.fullmatch(r"[a-z0-9_]{1,128}", stop_reason) is None:
+        stop_reason = "state_invalid"
+    handoff = _diagnostic_handoff(raw_request, decision, stop_reason)
+    checkpoint = _json_bytes({"schema": SCHEMA, "ledger": None, "handoff": handoff})
+    summary = (
+        "## Review invocation budget\n"
+        f"- Decision: {decision}\n"
+        "- Outcome: checkpoint_failure\n"
+        f"- Stop reason: {stop_reason}\n\n"
+        "No provider or GitHub API action was attempted.\n"
+    ).encode("ascii")
+    output = {
+        "allow-invocation": "false",
+        "checkpoint-sha256": hashlib.sha256(checkpoint).hexdigest(),
+        "comment-id": "",
+        "decision": decision,
+        "invocation-key": "",
+        "mutate-comment": False,
+        "mutation": "none",
+        "round": "",
+    }
+    checkpoint_file = raw_request.get("checkpoint_file")
+    if not isinstance(checkpoint_file, str) or not checkpoint_file:
+        raise TransportError("checkpoint_file_invalid")
+    write_private(output_directory / "checkpoint.json", checkpoint)
+    write_private(output_directory / "summary.md", summary)
+    write_private(output_directory / "output.json", _json_bytes(output))
+    write_private(output_directory / "preflight.json", _json_bytes({"continue": False}))
+    write_private(Path(checkpoint_file), checkpoint)
+
+
+def _preflight_request(request: Mapping[str, object]) -> bool:
+    candidate = dict(request)
+    unavailable = candidate["diff_mode"] == "unavailable"
+    if unavailable:
+        candidate["head_sha"] = candidate["head_sha"] or "0" * 40
+        candidate["full_diff_sha256"] = candidate["full_diff_sha256"] or "0" * 64
+        candidate["diff_mode"] = "full"
+    request_object = _safe_request_for_refusal(candidate)
+    if isinstance(request_object, ClaimRequest):
+        _validate_request(request_object)
+    else:
+        _validate_finalize_request(request_object)
+    return not unavailable
 
 
 def _verify_pr(request: Mapping[str, object], output_directory: Path) -> None:
@@ -1493,7 +1604,7 @@ def _cas_failed(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     commands = parser.add_subparsers(dest="operation", required=True)
-    for operation in ("list-run-identities", "claim", "finalize", "cas-failed"):
+    for operation in ("preflight", "list-run-identities", "claim", "finalize", "cas-failed"):
         command = commands.add_parser(operation, allow_abbrev=False)
         command.add_argument("--request-file", type=Path, required=True)
         command.add_argument("--comments-file", type=Path, required=True)
@@ -1503,10 +1614,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
-    request = _transport_request(arguments.request_file)
-    if arguments.operation not in {request["operation"], "list-run-identities", "cas-failed"}:
-        raise TransportError("operation_mismatch")
-    if arguments.operation == "list-run-identities":
+    raw_request = _raw_request(arguments.request_file)
+    try:
+        request = _transport_request(arguments.request_file)
+        if arguments.operation not in {
+                request["operation"], "preflight", "list-run-identities", "cas-failed"}:
+            raise TransportError("operation_mismatch")
+        continue_transport = _preflight_request(request)
+    except (BudgetStateError, KeyError, TypeError) as exc:
+        _write_diagnostic(
+            arguments.output_directory, raw_request, "state_invalid", str(exc),
+        )
+        return 0
+    if not continue_transport:
+        _write_diagnostic(
+            arguments.output_directory, raw_request, "diff_unavailable", "diff_unavailable",
+        )
+        return 0
+    if arguments.operation == "preflight":
+        write_private(
+            arguments.output_directory / "preflight.json", _json_bytes({"continue": True}),
+        )
+    elif arguments.operation == "list-run-identities":
         _list_run_identities(request, arguments.comments_file, arguments.output_directory)
     elif arguments.operation == "cas-failed":
         _cas_failed(request, arguments.comments_file, arguments.output_directory)

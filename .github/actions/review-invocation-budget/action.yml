@@ -83,13 +83,46 @@ runs:
         chmod 0700 "$budget_dir"
         trap 'rm -rf -- "$budget_dir"' EXIT
 
-        case "$BUDGET_MODE" in
-          claim|finalize) ;;
-          *) exit 2 ;;
-        esac
-        [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || exit 2
-        [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]] || exit 2
-        [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || exit 2
+        publish_outputs() {
+          local mutation_response="${1:-}"
+          cat -- "$budget_dir/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 - "$budget_dir/output.json" "$mutation_response" "$GITHUB_OUTPUT" <<'PY'
+        import json
+        import re
+        import sys
+        from pathlib import Path
+
+        output = json.loads(Path(sys.argv[1]).read_text())
+        comment_id = output["comment-id"]
+        if sys.argv[2]:
+            mutation = json.loads(Path(sys.argv[2]).read_text())
+            value = mutation.get("id")
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise SystemExit("invalid mutation comment id")
+            comment_id = str(value)
+        values = {
+            "allow-invocation": output["allow-invocation"],
+            "decision": output["decision"],
+            "round": output["round"],
+            "invocation-key": output["invocation-key"],
+            "checkpoint-sha256": output["checkpoint-sha256"],
+            "comment-id": comment_id,
+        }
+        patterns = {
+            "allow-invocation": r"(?:true|false)",
+            "decision": r"[a-z_]+",
+            "round": r"[0-9]*",
+            "invocation-key": r"[0-9:]*",
+            "checkpoint-sha256": r"[0-9a-f]{64}",
+            "comment-id": r"[0-9]*",
+        }
+        with Path(sys.argv[3]).open("a", encoding="utf-8") as stream:
+            for key, value in values.items():
+                if not isinstance(value, str) or re.fullmatch(patterns[key], value) is None:
+                    raise SystemExit(f"invalid output: {key}")
+                stream.write(f"{key}={value}\n")
+        PY
+        }
 
         python3 - "$budget_dir/request.json" \
           "$BUDGET_MODE" "$GITHUB_REPOSITORY" "$PR_NUMBER" "$REVIEWER" \
@@ -115,6 +148,23 @@ runs:
         destination.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
         destination.chmod(0o600)
         PY
+
+        python3 "$GITHUB_ACTION_PATH/review_invocation_budget.py" preflight \
+          --request-file "$budget_dir/request.json" \
+          --comments-file "$budget_dir/comments.json" \
+          --output-directory "$budget_dir"
+        transport_ready="$(python3 - "$budget_dir/preflight.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        print("true" if json.loads(Path(sys.argv[1]).read_text())["continue"] else "false")
+        PY
+        )"
+        if [[ "$transport_ready" != "true" ]]; then
+          publish_outputs ""
+          exit 0
+        fi
 
         gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$budget_dir/pr.json"
         gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > "$budget_dir/comments.json"
@@ -199,6 +249,7 @@ runs:
             text = path.read_text()
             decoder = json.JSONDecoder()
             cursor = 0
+            decoded_pages = 0
             values = []
             while cursor < len(text):
                 while cursor < len(text) and text[cursor].isspace():
@@ -208,7 +259,10 @@ runs:
                 page, cursor = decoder.raw_decode(text, cursor)
                 if not isinstance(page, list):
                     raise SystemExit(1)
+                decoded_pages += 1
                 values.extend(page)
+            if decoded_pages == 0:
+                raise SystemExit(1)
             return values
 
         expected = json.loads(Path(sys.argv[1]).read_text())
@@ -251,40 +305,4 @@ runs:
             --input "$budget_dir/comment-payload.json" > "$mutation_response"
         fi
 
-        python3 - "$budget_dir/output.json" "$mutation_response" "$GITHUB_OUTPUT" <<'PY'
-        import json
-        import re
-        import sys
-        from pathlib import Path
-
-        output = json.loads(Path(sys.argv[1]).read_text())
-        comment_id = output["comment-id"]
-        if sys.argv[2]:
-            mutation = json.loads(Path(sys.argv[2]).read_text())
-            value = mutation.get("id")
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise SystemExit("invalid mutation comment id")
-            comment_id = str(value)
-        values = {
-            "allow-invocation": output["allow-invocation"],
-            "decision": output["decision"],
-            "round": output["round"],
-            "invocation-key": output["invocation-key"],
-            "checkpoint-sha256": output["checkpoint-sha256"],
-            "comment-id": comment_id,
-        }
-        patterns = {
-            "allow-invocation": r"(?:true|false)",
-            "decision": r"[a-z_]+",
-            "round": r"[0-9]*",
-            "invocation-key": r"[0-9:]*",
-            "checkpoint-sha256": r"[0-9a-f]{64}",
-            "comment-id": r"[0-9]*",
-        }
-        with Path(sys.argv[3]).open("a", encoding="utf-8") as stream:
-            for key, value in values.items():
-                if not isinstance(value, str) or re.fullmatch(patterns[key], value) is None:
-                    raise SystemExit(f"invalid output: {key}")
-                stream.write(f"{key}={value}\n")
-        PY
-        cat -- "$budget_dir/summary.md" >> "$GITHUB_STEP_SUMMARY"
+        publish_outputs "$mutation_response"
