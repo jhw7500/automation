@@ -703,6 +703,10 @@ def test_claude_v2_is_display_only_and_cannot_enable_incremental_input(tmp_path)
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": "",
         "previous_full_hash": "",
+        "authenticated_review_json": (
+            '{"success":false,"head_sha":null,"full_diff_sha256":null,'
+            '"remaining_finding_ids":[]}'
+        ),
     }
     assert not (tmp_path / "claude-previous-review.md").exists()
 
@@ -717,6 +721,15 @@ def test_claude_v3_collects_authenticated_pair_and_exact_canonical_body(tmp_path
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": head,
         "previous_full_hash": "12" * 32,
+        "authenticated_review_json": json.dumps(
+            {
+                "success": True,
+                "head_sha": head,
+                "full_diff_sha256": "12" * 32,
+                "remaining_finding_ids": [],
+            },
+            separators=(",", ":"),
+        ),
     }
     assert (tmp_path / "claude-previous-review.md").read_bytes() == canonical.encode()
     assert context is not None and "### New findings" in context
@@ -1217,7 +1230,399 @@ def test_collect_leaves_diff_preparation_to_shared_action(tmp_path):
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": "",
         "previous_full_hash": "",
+        "authenticated_review_json": (
+            '{"success":false,"head_sha":null,"full_diff_sha256":null,'
+            '"remaining_finding_ids":[]}'
+        ),
     }
+
+
+def test_claude_budget_authenticated_review_uses_only_bounded_active_canonical_ids(
+    tmp_path,
+):
+    head = "ab" * 20
+    active_ids = [f"RVW-{index:012x}" for index in range(10)]
+    canonical = (
+        "### New findings\n\n"
+        + "\n".join(
+            f"#### {finding_id} [HIGH] Finding {index}"
+            for index, finding_id in enumerate(active_ids)
+        )
+        + f"\n#### {active_ids[0]} [HIGH] Duplicate\n"
+        + "\n### Resolved\n\n#### RVW-ffffffffffff [HIGH] Fixed\n"
+    )
+    trusted = _bot(
+        "github-actions[bot]",
+        _v3_body(_v3_state(head=head), canonical),
+        1,
+    )
+    forged = _bot(
+        "foreign-reviewer[bot]",
+        _v3_body(
+            _v3_state(run_id=99, head=head),
+            "### Still open\n\n#### RVW-eeeeeeeeeeee [HIGH] Forged",
+        ),
+        2,
+    )
+
+    _run_collect(tmp_path, [trusted, forged])
+    authenticated = json.loads(
+        _github_outputs(tmp_path / "github-output")["authenticated_review_json"]
+    )
+
+    assert authenticated == {
+        "success": True,
+        "head_sha": head,
+        "full_diff_sha256": "12" * 32,
+        "remaining_finding_ids": active_ids[:8],
+    }
+
+
+def test_claude_budget_claim_is_durable_before_provider_and_every_model_path_is_guarded():
+    workflow = _load("claude-code-review.yml")
+    job = workflow["jobs"]["claude-review"]
+    steps = job["steps"]
+    names = [step.get("name") for step in steps]
+    allow = "steps.review-budget-claim.outputs.allow-invocation == 'true'"
+
+    assert names.index("Prepare review diff") < names.index("Claim Claude review budget")
+    assert names.index("Claim Claude review budget") < names.index("Checkout prepared review head")
+    assert names.index("Claim Claude review budget") < names.index("Run Claude Code Review")
+    assert names.index("Start Claude review metrics") < names.index("Run Claude Code Review")
+    assert allow in _step(workflow, "claude-review", "Checkout prepared review head")["if"]
+    assert allow in _step(workflow, "claude-review", "Reset Claude review artifacts")["if"]
+    assert allow in _step(workflow, "claude-review", "Start Claude review metrics")["if"]
+    assert allow in _step(workflow, "claude-review", "Run Claude Code Review")["if"]
+    assert allow in _step(workflow, "claude-review", "Canonicalize Claude review")["if"]
+    assert job["timeout-minutes"] == "10"
+    assert job["permissions"] == {
+        "actions": "read",
+        "contents": "read",
+        "pull-requests": "write",
+        "issues": "read",
+        "id-token": "write",
+    }
+    claim = _step(workflow, "claude-review", "Claim Claude review budget")
+    assert claim["if"] == (
+        "${{ always() && steps.prepare-review-input.outcome == 'success' }}"
+    )
+    assert claim["with"] == {
+        "github-token": "${{ github.token }}",
+        "mode": "claim",
+        "reviewer": "claude",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number }}",
+        "expected-head-sha": "${{ steps.prepare-diff.outputs.head-sha }}",
+        "full-diff-sha256": "${{ steps.prepare-diff.outputs.full-diff-sha256 }}",
+        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}",
+        "input-files-json": (
+            "${{ steps.stage-claude-budget-input.outputs.input_files_json }}"
+        ),
+        "authenticated-review-json": (
+            "${{ steps.prepare-review-input.outputs.authenticated_review_json }}"
+        ),
+        "model-route-json": "${{ steps.claude-budget-config.outputs.model_route_json }}",
+        "effort": "final-review/default",
+        "checkpoint-file": "${{ runner.temp }}/claude-review-budget-claim.json",
+    }
+    record = _step(
+        workflow, "claude-review", "Record Claude budget claim checkpoint"
+    )
+    assert record["env"] == {
+        "BUDGET_DECISION": "${{ steps.review-budget-claim.outputs.decision }}",
+        "BUDGET_ROUND": "${{ steps.review-budget-claim.outputs.round }}",
+        "BUDGET_CHECKPOINT_SHA256": (
+            "${{ steps.review-budget-claim.outputs.checkpoint-sha256 }}"
+        ),
+    }
+
+
+def test_claude_budget_model_metadata_is_inert_valid_json(tmp_path):
+    step = _step(
+        _load("claude-code-review.yml"), "claude-review", "Resolve Claude budget metadata"
+    )
+    output = tmp_path / "github-output"
+    configured = 'claude-"quoted"; $(touch must-not-exist)'
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "CONFIGURED_MODEL": configured,
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(_github_outputs(output)["model_route_json"]) == [configured]
+    assert not (tmp_path / "must-not-exist").exists()
+    assert "jq -cn --arg model" in step["run"]
+
+
+def test_claude_budget_stages_workspace_input_and_cleans_it_immediately_after_claim():
+    workflow = _load("claude-code-review.yml")
+    steps = workflow["jobs"]["claude-review"]["steps"]
+    names = [step.get("name") for step in steps]
+    stage = _step(workflow, "claude-review", "Stage Claude budget input")
+    claim = _step(workflow, "claude-review", "Claim Claude review budget")
+    cleanup = _step(workflow, "claude-review", "Clean Claude budget input")
+
+    assert names.index("Stage Claude budget input") < names.index("Claim Claude review budget")
+    assert names.index("Clean Claude budget input") == names.index("Claim Claude review budget") + 1
+    assert names.index("Clean Claude budget input") < names.index("Checkout prepared review head")
+    assert 'mktemp -d "$GITHUB_WORKSPACE/' in stage["run"]
+    assert "chmod 0700" in stage["run"]
+    assert "chmod 0600" in stage["run"]
+    assert "jq -cn --arg path" in stage["run"]
+    assert claim["with"]["input-files-json"] == (
+        "${{ steps.stage-claude-budget-input.outputs.input_files_json }}"
+    )
+    assert claim["with"]["diff-mode"] == (
+        "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}"
+    )
+    assert cleanup["if"] == "${{ always() }}"
+
+
+@pytest.mark.parametrize("diff_mode", ("full", "delta"))
+def test_claude_budget_staged_input_is_byte_exact_private_and_removed(tmp_path, diff_mode):
+    workflow = _load("claude-code-review.yml")
+    stage = _step(workflow, "claude-review", "Stage Claude budget input")
+    cleanup = _step(workflow, "claude-review", "Clean Claude budget input")
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    source = runner_temp / f"review-{diff_mode}.diff"
+    source.write_bytes(b"binary\x00diff\nbytes\xff")
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "DIFF_MODE": diff_mode,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = _github_outputs(output)
+    staged = Path(json.loads(outputs["input_files_json"])[0])
+    staging_directory = Path(outputs["staging_directory"])
+    assert staged.read_bytes() == source.read_bytes()
+    assert staging_directory.parent == workspace
+    assert staging_directory.stat().st_mode & 0o777 == 0o700
+    assert staged.stat().st_mode & 0o777 == 0o600
+
+    clean_result = subprocess.run(
+        ["bash", "-c", cleanup["run"]],
+        env={
+            **os.environ,
+            "GITHUB_WORKSPACE": str(workspace),
+            "STAGING_DIRECTORY": str(staging_directory),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert clean_result.returncode == 0, clean_result.stderr
+    assert not staging_directory.exists()
+
+
+def test_claude_budget_unavailable_stages_no_file_and_passes_empty_json(tmp_path):
+    stage = _step(
+        _load("claude-code-review.yml"), "claude-review", "Stage Claude budget input"
+    )
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    output = tmp_path / "github-output"
+
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "DIFF_MODE": "unavailable",
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _github_outputs(output) == {
+        "input_files_json": "[]",
+        "staging_directory": "",
+    }
+    assert list(workspace.iterdir()) == []
+
+
+def test_claude_budget_preserves_zero_call_unchanged_and_denied_claim_cannot_publish_success():
+    workflow = _load("claude-code-review.yml")
+    provider = _step(workflow, "claude-review", "Run Claude Code Review")
+    upsert = _step(workflow, "claude-review", "Upsert review comment")
+
+    assert "diff-mode != 'unchanged'" in provider["if"]
+    assert "allow-invocation == 'true'" in provider["if"]
+    assert "diff-mode == 'unchanged'" in upsert["if"]
+    assert "allow-invocation == 'true'" in upsert["if"]
+    assert "BUDGET_ALLOW_INVOCATION" in upsert["env"]
+    assert "invocationAllowed && ok" in upsert["with"]["script"]
+
+
+def test_claude_budget_finalizes_after_review_state_upsert_and_uploads_both_checkpoints():
+    workflow = _load("claude-code-review.yml")
+    steps = workflow["jobs"]["claude-review"]["steps"]
+    names = [step.get("name") for step in steps]
+    finalize = _step(workflow, "claude-review", "Finalize Claude review budget")
+
+    assert names.index("Upsert review comment") < names.index("Finalize Claude review budget")
+    assert finalize["if"] == (
+        "${{ always() && !cancelled() "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+    )
+    assert finalize["uses"] == "$/.github/actions/review-invocation-budget"
+    assert finalize["with"] == {
+        "github-token": "${{ github.token }}",
+        "mode": "finalize",
+        "reviewer": "claude",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number }}",
+        "expected-head-sha": "${{ steps.prepare-diff.outputs.head-sha }}",
+        "full-diff-sha256": "${{ steps.prepare-diff.outputs.full-diff-sha256 }}",
+        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
+        "input-files-json": "[]",
+        "authenticated-review-json": (
+            "${{ steps.prepare-review-input.outputs.authenticated_review_json }}"
+        ),
+        "model-route-json": "${{ steps.claude-budget-config.outputs.model_route_json }}",
+        "effort": "final-review/default",
+        "actual-call-count": (
+            "${{ steps.claude-budget-metrics.outputs.call_count || '0' }}"
+        ),
+        "elapsed-seconds": (
+            "${{ steps.claude-budget-elapsed.outputs.elapsed_seconds || '0' }}"
+        ),
+        "outcome": "${{ steps.review-budget-outcome.outputs.outcome }}",
+        "stop-reason": "${{ steps.review-budget-outcome.outputs.stop_reason }}",
+        "remaining-finding-ids-json": (
+            "${{ steps.review-budget-outcome.outputs.remaining_finding_ids_json }}"
+        ),
+        "checkpoint-file": "${{ runner.temp }}/claude-review-budget-final.json",
+    }
+
+    uploads = [
+        step for step in steps
+        if step.get("uses")
+        == "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        and "review-budget" in step.get("with", {}).get("name", "")
+    ]
+    assert {step["with"]["name"] for step in uploads} == {
+        "claude-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}",
+        "claude-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
+    }
+    assert all("!cancelled()" in step["if"] for step in uploads)
+
+
+def test_claude_budget_outcome_is_deterministic_and_has_no_provider_fallback():
+    workflow = _load("claude-code-review.yml")
+    step = _step(workflow, "claude-review", "Resolve Claude budget outcome")
+    upsert = _step(workflow, "claude-review", "Upsert review comment")
+    run = step["run"]
+
+    for outcome in (
+        "success", "quality_filtered", "provider_failure",
+        "checkpoint_failure", "wall_time_exhausted",
+    ):
+        assert outcome in run
+    assert "remaining_finding_ids_json" in run
+    assert "RVW-[0-9a-f]{12}" in run
+    assert "fallback" not in run.lower()
+    assert "REVIEW_PUBLISHED" in step["env"]
+    assert "core.setOutput('published', 'false')" in upsert["with"]["script"]
+    assert "core.setOutput('published', 'true')" in upsert["with"]["script"]
+
+
+@pytest.mark.parametrize(
+    (
+        "provider_outcome", "canonical_outcome", "document_valid",
+        "accepted_count", "filtered_count", "published", "elapsed_seconds",
+        "expected_outcome", "expected_remaining",
+    ),
+    (
+        ("success", "success", "true", "1", "0", "true", "5", "success", ["RVW-111111111111"]),
+        ("success", "success", "true", "0", "2", "true", "5", "quality_filtered", []),
+        ("failure", "failure", "false", "", "", "false", "5", "provider_failure", ["RVW-aaaaaaaaaaaa"]),
+        ("success", "success", "true", "1", "0", "false", "5", "checkpoint_failure", ["RVW-aaaaaaaaaaaa"]),
+        ("success", "success", "true", "1", "0", "true", "601", "wall_time_exhausted", ["RVW-aaaaaaaaaaaa"]),
+    ),
+)
+def test_claude_budget_outcome_mapping_and_remaining_ids_are_reproducible(
+    tmp_path,
+    provider_outcome,
+    canonical_outcome,
+    document_valid,
+    accepted_count,
+    filtered_count,
+    published,
+    elapsed_seconds,
+    expected_outcome,
+    expected_remaining,
+):
+    step = _step(
+        _load("claude-code-review.yml"), "claude-review", "Resolve Claude budget outcome"
+    )
+    canonical_file = tmp_path / "claude-review-canonical.md"
+    canonical_body = "### New findings\n\nNone\n"
+    if accepted_count == "1":
+        canonical_body = (
+            "### New findings\n\n#### RVW-111111111111 [HIGH] Current\n"
+            "\n### Resolved\n\n#### RVW-222222222222 [HIGH] Fixed\n"
+        )
+    canonical_file.write_text(canonical_body, encoding="utf-8")
+    output = tmp_path / "github-output"
+    authenticated = json.dumps(
+        {
+            "success": True,
+            "head_sha": "ab" * 20,
+            "full_diff_sha256": "12" * 32,
+            "remaining_finding_ids": ["RVW-aaaaaaaaaaaa"],
+        },
+        separators=(",", ":"),
+    )
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={
+            **os.environ,
+            "PROVIDER_OUTCOME": provider_outcome,
+            "CANONICAL_OUTCOME": canonical_outcome,
+            "DOCUMENT_VALID": document_valid,
+            "ACCEPTED_COUNT": accepted_count,
+            "FILTERED_COUNT": filtered_count,
+            "UPSERT_OUTCOME": "success",
+            "REVIEW_PUBLISHED": published,
+            "ELAPSED_SECONDS": elapsed_seconds,
+            "AUTHENTICATED_REVIEW_JSON": authenticated,
+            "CANONICAL_FILE": str(canonical_file),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = _github_outputs(output)
+    assert outputs["outcome"] == expected_outcome
+    assert outputs["stop_reason"] == expected_outcome
+    assert json.loads(outputs["remaining_finding_ids_json"]) == expected_remaining
 
 
 def test_claude_prompt_pins_diff_source():
@@ -1237,10 +1642,14 @@ def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure_a
 
     assert model["if"] == (
         "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
     assert upsert["if"] == (
-        "${{ !cancelled() && steps.prepare-review-input.outcome == 'success' }}"
+        "${{ !cancelled() && steps.prepare-review-input.outcome == 'success' "
+        "&& (steps.prepare-diff.outputs.diff-ready != 'true' "
+        "|| steps.prepare-diff.outputs.diff-mode == 'unchanged' "
+        "|| steps.review-budget-claim.outputs.allow-invocation == 'true') }}"
     )
 
 
@@ -1255,7 +1664,12 @@ def test_claude_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tm
     )
     assert cleanup is not None
     cleanup_index = steps.index(cleanup)
-    assert cleanup_index == model_index - 1
+    metrics_index = next(
+        index for index, step in enumerate(steps)
+        if step.get("name") == "Start Claude review metrics"
+    )
+    assert cleanup_index == metrics_index - 1
+    assert metrics_index == model_index - 1
     assert cleanup["if"] == steps[model_index]["if"]
     canonicalize_step = _step(
         workflow, "claude-review", "Canonicalize Claude review"
@@ -1263,7 +1677,8 @@ def test_claude_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tm
     assert canonicalize_step["if"] == (
         "${{ always() && steps.reset-claude-artifacts.outcome == 'success' "
         "&& steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
 
     workspace = tmp_path / "workspace"
@@ -1345,7 +1760,8 @@ def test_claude_uses_one_shared_canonicalizer_and_upsert_reads_only_canonical_fi
     assert action["if"] == (
         "${{ always() && steps.reset-claude-artifacts.outcome == 'success' "
         "&& steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
     upsert = _step(workflow, "claude-review", "Upsert review comment")
     script = upsert["with"]["script"]
@@ -1490,12 +1906,20 @@ def test_rejected_candidates_retain_only_canonicalizer_owned_diagnostics(
     steps = job["steps"]
 
     assert steps.index(canonical) < steps.index(upload) < steps.index(upsert)
+    upload_condition = (
+        "${{ always() && steps.canonicalize-review.outcome != 'skipped' "
+        "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+    )
+    if workflow_name == "claude-code-review.yml":
+        upload_condition = (
+            "${{ always() "
+            "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+            "&& steps.canonicalize-review.outcome != 'skipped' "
+            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+        )
     assert upload == {
         "name": upload_step_name,
-        "if": (
-            "${{ always() && steps.canonicalize-review.outcome != 'skipped' "
-            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
-        ),
+        "if": upload_condition,
         "uses": (
             "actions/upload-artifact@"
             "ea165f8d65b6e75b540449e92b4886f43607fa02"
@@ -1708,9 +2132,16 @@ def test_shared_canonicalizer_runs_from_the_prepared_pr_head(
         < steps.index(provider)
         < steps.index(canonicalizer)
     )
+    checkout_condition = "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}"
+    if filename == "claude-code-review.yml":
+        checkout_condition = (
+            "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
+            "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+            "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+        )
     assert checkout == {
         "name": "Checkout prepared review head",
-        "if": "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}",
+        "if": checkout_condition,
         "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         "with": {
             "ref": "${{ steps.prepare-diff.outputs.head-sha }}",
@@ -1838,7 +2269,8 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert checkout["with"]["fetch-depth"] == "0"
     assert claude_model["if"] == (
         "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
     assert claude_model["env"]["REVIEW_DIFF_FILE"] == (
         "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
@@ -1973,7 +2405,19 @@ def test_collect_exports_validated_pair_for_incremental_round(tmp_path):
         pr_files=["a.py", "b.py"],
     )
     outputs = _github_outputs(tmp_path / "github-output")
-    assert outputs == {"previous_sha": sha1, "previous_full_hash": "12" * 32}
+    assert outputs == {
+        "previous_sha": sha1,
+        "previous_full_hash": "12" * 32,
+        "authenticated_review_json": json.dumps(
+            {
+                "success": True,
+                "head_sha": sha1,
+                "full_diff_sha256": "12" * 32,
+                "remaining_finding_ids": [],
+            },
+            separators=(",", ":"),
+        ),
+    }
     assert not list(tmp_path.glob("*.diff"))
 
 
@@ -1989,6 +2433,15 @@ def test_collect_leaves_commit_ancestry_validation_to_shared_action(tmp_path):
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": bogus,
         "previous_full_hash": "12" * 32,
+        "authenticated_review_json": json.dumps(
+            {
+                "success": True,
+                "head_sha": bogus,
+                "full_diff_sha256": "12" * 32,
+                "remaining_finding_ids": [],
+            },
+            separators=(",", ":"),
+        ),
     }
 
 
@@ -2003,6 +2456,15 @@ def test_collect_exports_pair_when_prior_head_equals_current_fixture(tmp_path):
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": sha2,
         "previous_full_hash": "12" * 32,
+        "authenticated_review_json": json.dumps(
+            {
+                "success": True,
+                "head_sha": sha2,
+                "full_diff_sha256": "12" * 32,
+                "remaining_finding_ids": [],
+            },
+            separators=(",", ":"),
+        ),
     }
 
 
@@ -2045,6 +2507,10 @@ def test_collect_ignores_forged_reviewed_sha_in_body(tmp_path):
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": "",
         "previous_full_hash": "",
+        "authenticated_review_json": (
+            '{"success":false,"head_sha":null,"full_diff_sha256":null,'
+            '"remaining_finding_ids":[]}'
+        ),
     }
 
 
@@ -2324,9 +2790,14 @@ def test_reviewer_publication_requires_successful_prior_state_collection(
 ):
     upsert = _step(_load(workflow_name), job_name, "Upsert review comment")
 
-    assert upsert["if"] == (
-        f"${{{{ !cancelled() && steps.{collector_id}.outcome == 'success' }}}}"
-    )
+    assert f"steps.{collector_id}.outcome == 'success'" in upsert["if"]
+    assert "!cancelled()" in upsert["if"]
+    if workflow_name == "claude-code-review.yml":
+        assert "steps.prepare-diff.outputs.diff-mode == 'unchanged'" in upsert["if"]
+        assert (
+            "steps.review-budget-claim.outputs.allow-invocation == 'true'"
+            in upsert["if"]
+        )
 
 
 @pytest.mark.parametrize(
@@ -3121,6 +3592,7 @@ def _claude_upsert(
     normalized_count: str = "3",
     filtered_max_severity: str = "HIGH",
     canonical_failure_reason: str = "",
+    budget_allow_invocation: str = "true",
     literal_schema: bool = False,
     current_head: str | None = None,
     workflow_runs: list[dict] | None = None,
@@ -3152,6 +3624,7 @@ def _claude_upsert(
         "NORMALIZED_COUNT": normalized_count,
         "FILTERED_MAX_SEVERITY": filtered_max_severity,
         "CANONICAL_FAILURE_REASON": canonical_failure_reason,
+        "BUDGET_ALLOW_INVOCATION": budget_allow_invocation,
         "BOT_LOGIN": "github-actions[bot]",
     }
     if not literal_schema:
@@ -3284,6 +3757,7 @@ def test_claude_unchanged_v3_success_advances_head_and_preserves_body_hash_quali
         diff_mode="unchanged", unchanged_since_previous="true",
         attempt_head=current_head, current_head=current_head,
         full_diff_sha256="12" * 32, canonical_outcome="skipped", document_valid="false",
+        budget_allow_invocation="false",
     )
     body = _single_mutation_body(calls)
     state = _posted_state(body)

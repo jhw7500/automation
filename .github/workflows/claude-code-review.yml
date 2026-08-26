@@ -101,6 +101,7 @@ jobs:
     #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
 
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       actions: read
       contents: read
@@ -345,6 +346,33 @@ jobs:
           {
             printf 'previous_sha=%s\n' "$PREV_SHA"
             printf 'previous_full_hash=%s\n' "$PREV_FULL_HASH"
+            printf 'authenticated_review_json=%s\n' "$(
+              printf '%s\n' "$PREV_RECORD" | jq -c \
+                --arg previous_sha "$PREV_SHA" \
+                --arg previous_full_hash "$PREV_FULL_HASH" '
+                  def active_finding_ids:
+                    reduce ((.canonical_body // "") | split("\n")[]) as $line
+                      ({active: false, ids: []};
+                        if $line == "### New findings" or $line == "### Still open" then
+                          .active = true
+                        elif ($line | test("^### ")) then
+                          .active = false
+                        elif .active then
+                          (([$line | capture("^#### (?<id>RVW-[0-9a-f]{12}) \\[(CRITICAL|HIGH|MEDIUM)\\] .+$")? | .id] | first) // null) as $id
+                          | if $id != null and (.ids | index($id) == null) and (.ids | length < 8)
+                            then .ids += [$id] else . end
+                        else . end)
+                    | .ids;
+                  if $previous_sha == "" or $previous_full_hash == "" then
+                    {success: false, head_sha: null, full_diff_sha256: null,
+                     remaining_finding_ids: []}
+                  else
+                    {success: true, head_sha: $previous_sha,
+                     full_diff_sha256: $previous_full_hash,
+                     remaining_finding_ids: active_finding_ids}
+                  end
+                '
+            )"
           } >> "$GITHUB_OUTPUT"
 
       - name: Prepare review diff
@@ -358,8 +386,110 @@ jobs:
           context-lines: '3'
           output-directory: ${{ runner.temp }}
 
+      - name: Resolve Claude budget metadata
+        id: claude-budget-config
+        if: ${{ always() && steps.prepare-review-input.outcome == 'success' }}
+        shell: bash
+        env:
+          CONFIGURED_MODEL: ${{ needs.check-enabled.outputs.model }}
+        run: |
+          set -euo pipefail
+          model="${CONFIGURED_MODEL:-claude-code-action-default}"
+          printf 'model_route_json=%s\n' "$(jq -cn --arg model "$model" '[$model]')" >> "$GITHUB_OUTPUT"
+
+      - name: Stage Claude budget input
+        id: stage-claude-budget-input
+        if: ${{ always() && steps.prepare-review-input.outcome == 'success' }}
+        shell: bash
+        env:
+          DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}
+          RUNNER_TEMP_DIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf 'input_files_json=[]\n' >> "$GITHUB_OUTPUT"
+          printf 'staging_directory=\n' >> "$GITHUB_OUTPUT"
+          if [[ "$DIFF_MODE" != 'full' && "$DIFF_MODE" != 'delta' ]]; then
+            exit 0
+          fi
+
+          source_file="$RUNNER_TEMP_DIR/review-${DIFF_MODE}.diff"
+          [[ -f "$source_file" && ! -L "$source_file" ]]
+          staging_directory="$(mktemp -d "$GITHUB_WORKSPACE/.claude-review-budget.XXXXXX")"
+          chmod 0700 "$staging_directory"
+          printf 'staging_directory=%s\n' "$staging_directory" >> "$GITHUB_OUTPUT"
+          staged_file="$staging_directory/review-${DIFF_MODE}.diff"
+          cp -- "$source_file" "$staged_file"
+          chmod 0600 "$staged_file"
+          cmp -s -- "$source_file" "$staged_file"
+          printf 'input_files_json=%s\n' \
+            "$(jq -cn --arg path "$staged_file" '[$path]')" >> "$GITHUB_OUTPUT"
+
+      - name: Claim Claude review budget
+        id: review-budget-claim
+        if: ${{ always() && steps.prepare-review-input.outcome == 'success' }}
+        uses: $/.github/actions/review-invocation-budget
+        with:
+          github-token: ${{ github.token }}
+          mode: claim
+          reviewer: claude
+          pr-number: ${{ inputs.pr_number || github.event.pull_request.number }}
+          expected-head-sha: ${{ steps.prepare-diff.outputs.head-sha }}
+          full-diff-sha256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
+          diff-mode: ${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}
+          input-files-json: ${{ steps.stage-claude-budget-input.outputs.input_files_json }}
+          authenticated-review-json: ${{ steps.prepare-review-input.outputs.authenticated_review_json }}
+          model-route-json: ${{ steps.claude-budget-config.outputs.model_route_json }}
+          effort: final-review/default
+          checkpoint-file: ${{ runner.temp }}/claude-review-budget-claim.json
+
+      - name: Clean Claude budget input
+        if: ${{ always() }}
+        shell: bash
+        env:
+          STAGING_DIRECTORY: ${{ steps.stage-claude-budget-input.outputs.staging_directory }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$STAGING_DIRECTORY" ]]; then
+            exit 0
+          fi
+          case "$STAGING_DIRECTORY" in
+            "$GITHUB_WORKSPACE"/.claude-review-budget.*) ;;
+            *) echo "::error::Refusing unexpected Claude budget staging path"; exit 1 ;;
+          esac
+          rm -rf -- "$STAGING_DIRECTORY"
+
+      - name: Record Claude budget claim checkpoint
+        if: ${{ always() && steps.review-budget-claim.outcome == 'success' }}
+        shell: bash
+        env:
+          BUDGET_DECISION: ${{ steps.review-budget-claim.outputs.decision }}
+          BUDGET_ROUND: ${{ steps.review-budget-claim.outputs.round }}
+          BUDGET_CHECKPOINT_SHA256: ${{ steps.review-budget-claim.outputs.checkpoint-sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$BUDGET_DECISION" =~ ^[a-z_]+$ ]]
+          [[ "$BUDGET_ROUND" =~ ^[0-9]*$ ]]
+          [[ "$BUDGET_CHECKPOINT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            printf '### Claude review budget claim\n\n'
+            printf -- '- Decision: `%s`\n' "$BUDGET_DECISION"
+            printf -- '- Round: `%s`\n' "${BUDGET_ROUND:-none}"
+            printf -- '- Checkpoint SHA-256: `%s`\n' "$BUDGET_CHECKPOINT_SHA256"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Claude review budget claim checkpoint
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: claude-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/claude-review-budget-claim.json
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: false
+
       - name: Checkout prepared review head
-        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' }}
+        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.prepare-diff.outputs.head-sha }}
@@ -369,7 +499,7 @@ jobs:
 
       - name: Reset Claude review artifacts
         id: reset-claude-artifacts
-        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
+        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
         run: |
           set -euo pipefail
           rm -f -- \
@@ -377,9 +507,18 @@ jobs:
             "$GITHUB_WORKSPACE/claude-review-canonical.md" \
             "$GITHUB_WORKSPACE/claude-review-result.json"
 
+      - name: Start Claude review metrics
+        id: claude-budget-metrics
+        if: ${{ steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'call_count=1\n' >> "$GITHUB_OUTPUT"
+          printf 'started_at=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code Review
         id: claude-review
-        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
+        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
         uses: anthropics/claude-code-action@6bcfb8263aca9b0eab0aba20d96dddd74de2875f # ratchet:anthropics/claude-code-action@v1.0.204
         env:
           REVIEW_DIFF_FILE: ${{ steps.prepare-diff.outputs.diff-mode == 'delta' && format('{0}/review-delta.diff', runner.temp) || format('{0}/review-full.diff', runner.temp) }}
@@ -465,9 +604,22 @@ jobs:
             ${{ needs.check-enabled.outputs.model && format('--model {0} ', needs.check-enabled.outputs.model) || '' }}--permission-mode acceptEdits --allowed-tools "Read,Write(claude-review.md)"
           show_full_output: true  # Enable for debugging (can be set to false in production)
 
+      - name: Capture Claude elapsed time
+        id: claude-budget-elapsed
+        if: ${{ always() && steps.claude-budget-metrics.outcome == 'success' }}
+        shell: bash
+        env:
+          STARTED_AT: ${{ steps.claude-budget-metrics.outputs.started_at }}
+        run: |
+          set -euo pipefail
+          now="$(date +%s)"
+          [[ "$STARTED_AT" =~ ^[0-9]+$ ]]
+          (( now >= STARTED_AT ))
+          printf 'elapsed_seconds=%s\n' "$((now - STARTED_AT))" >> "$GITHUB_OUTPUT"
+
       - name: Canonicalize Claude review
         id: canonicalize-review
-        if: ${{ always() && steps.reset-claude-artifacts.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
+        if: ${{ always() && steps.reset-claude-artifacts.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
         uses: $/.github/actions/canonicalize-review
         with:
           reviewer: claude
@@ -481,7 +633,7 @@ jobs:
           previous-review-file: ${{ steps.prepare-review-input.outputs.previous_sha != '' && format('{0}/claude-previous-review.md', runner.temp) || '' }}
 
       - name: Upload rejected Claude review diagnostic
-        if: ${{ always() && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.document-valid != 'true' }}
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.document-valid != 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: claude-review-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
@@ -494,7 +646,8 @@ jobs:
       # 달린 sticky 코멘트 하나로 upsert 한다. 실패 시 기존 정상 리뷰는 보존한다(교체 금지).
       # !cancelled(): 취소된 런이 정상 sticky를 에러로 덮어쓰지 않게 한다(always()는 취소에도 true).
       - name: Upsert review comment
-        if: ${{ !cancelled() && steps.prepare-review-input.outcome == 'success' }}
+        id: upsert-review-comment
+        if: ${{ !cancelled() && steps.prepare-review-input.outcome == 'success' && (steps.prepare-diff.outputs.diff-ready != 'true' || steps.prepare-diff.outputs.diff-mode == 'unchanged' || steps.review-budget-claim.outputs.allow-invocation == 'true') }}
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
@@ -516,11 +669,13 @@ jobs:
           NORMALIZED_COUNT: ${{ steps.canonicalize-review.outputs.normalized-count }}
           FILTERED_MAX_SEVERITY: ${{ steps.canonicalize-review.outputs.filtered-max-severity }}
           CANONICAL_FAILURE_REASON: ${{ steps.canonicalize-review.outputs.failure-reason }}
+          BUDGET_ALLOW_INVOCATION: ${{ steps.review-budget-claim.outputs.allow-invocation }}
           BOT_LOGIN: 'github-actions[bot]'
         with:
           github-token: ${{ github.token }}
           script: |
             const fs = require('fs');
+            core.setOutput('published', 'false');
             const header = '## Claude Code Review (latest)';
             const marker = '<!-- automation:claude-code-review:v3 -->';
             const v2Marker = '<!-- automation:claude-code-review:v2 -->';
@@ -533,6 +688,7 @@ jobs:
             const diffReady = process.env.DIFF_READY === 'true';
             const canonicalOutcome = (process.env.CANONICAL_OUTCOME || '').toLowerCase();
             const documentValid = process.env.DOCUMENT_VALID === 'true';
+            const invocationAllowed = process.env.BUDGET_ALLOW_INVOCATION === 'true';
             const runIdRaw = process.env.RUN_ID || '';
             const runIdIsValid = /^[1-9][0-9]*$/.test(runIdRaw)
               && Number.isSafeInteger(Number(runIdRaw));
@@ -715,7 +871,7 @@ jobs:
               && sha256(existing.state.full_diff_sha256)
               && existing.state.full_diff_sha256 === fullDiffSha256
               && preservedProse.length > 0;
-            const currentSuccess = ok && canonicalOutcome === 'success' && documentValid
+            const currentSuccess = invocationAllowed && ok && canonicalOutcome === 'success' && documentValid
               && qualityValid && review.length > 0 && reviewedInputIsValid;
             let checkpointFailed = !(currentSuccess || unchangedInputIsValid);
             let failureReason = !diffReady ? 'diff_unavailable'
@@ -789,6 +945,109 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
             }
+            core.setOutput('published', 'true');
+
+      - name: Resolve Claude budget outcome
+        id: review-budget-outcome
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        shell: bash
+        env:
+          PROVIDER_OUTCOME: ${{ steps.claude-review.outcome }}
+          CANONICAL_OUTCOME: ${{ steps.canonicalize-review.outcome }}
+          DOCUMENT_VALID: ${{ steps.canonicalize-review.outputs.document-valid }}
+          ACCEPTED_COUNT: ${{ steps.canonicalize-review.outputs.accepted-count }}
+          FILTERED_COUNT: ${{ steps.canonicalize-review.outputs.filtered-count }}
+          UPSERT_OUTCOME: ${{ steps.upsert-review-comment.outcome }}
+          REVIEW_PUBLISHED: ${{ steps.upsert-review-comment.outputs.published }}
+          ELAPSED_SECONDS: ${{ steps.claude-budget-elapsed.outputs.elapsed_seconds }}
+          AUTHENTICATED_REVIEW_JSON: ${{ steps.prepare-review-input.outputs.authenticated_review_json }}
+          CANONICAL_FILE: ${{ github.workspace }}/claude-review-canonical.md
+        run: |
+          set -euo pipefail
+          outcome='checkpoint_failure'
+          stop_reason='checkpoint_failure'
+          remaining_finding_ids_json="$(
+            jq -c '.remaining_finding_ids' <<< "$AUTHENTICATED_REVIEW_JSON"
+          )"
+
+          if [[ ! "$ELAPSED_SECONDS" =~ ^[0-9]+$ ]]; then
+            :
+          elif (( ELAPSED_SECONDS > 600 )); then
+            outcome='wall_time_exhausted'
+            stop_reason='wall_time_exhausted'
+          elif [[ "$PROVIDER_OUTCOME" == 'failure' ]]; then
+            outcome='provider_failure'
+            stop_reason='provider_failure'
+          elif [[ "$PROVIDER_OUTCOME" == 'success' \
+              && "$CANONICAL_OUTCOME" == 'success' \
+              && "$DOCUMENT_VALID" == 'true' \
+              && "$UPSERT_OUTCOME" == 'success' \
+              && "$REVIEW_PUBLISHED" == 'true' \
+              && "$ACCEPTED_COUNT" =~ ^[0-9]+$ \
+              && "$FILTERED_COUNT" =~ ^[0-9]+$ \
+              && -f "$CANONICAL_FILE" && ! -L "$CANONICAL_FILE" ]]; then
+            if (( ACCEPTED_COUNT == 0 && FILTERED_COUNT > 0 )); then
+              outcome='quality_filtered'
+              stop_reason='quality_filtered'
+            else
+              outcome='success'
+              stop_reason='success'
+            fi
+            remaining_finding_ids_json="$(
+              jq -Rsc '
+                reduce (split("\n")[]) as $line
+                  ({active: false, ids: []};
+                    if $line == "### New findings" or $line == "### Still open" then
+                      .active = true
+                    elif ($line | test("^### ")) then
+                      .active = false
+                    elif .active then
+                      (([$line | capture("^#### (?<id>RVW-[0-9a-f]{12}) \\[(CRITICAL|HIGH|MEDIUM)\\] .+$")? | .id] | first) // null) as $id
+                      | if $id != null and (.ids | index($id) == null) and (.ids | length < 8)
+                        then .ids += [$id] else . end
+                    else . end)
+                | .ids
+              ' "$CANONICAL_FILE"
+            )"
+          fi
+
+          printf 'outcome=%s\n' "$outcome" >> "$GITHUB_OUTPUT"
+          printf 'stop_reason=%s\n' "$stop_reason" >> "$GITHUB_OUTPUT"
+          printf 'remaining_finding_ids_json=%s\n' \
+            "$remaining_finding_ids_json" >> "$GITHUB_OUTPUT"
+
+      - name: Finalize Claude review budget
+        id: review-budget-finalize
+        if: ${{ always() && !cancelled() && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        uses: $/.github/actions/review-invocation-budget
+        with:
+          github-token: ${{ github.token }}
+          mode: finalize
+          reviewer: claude
+          pr-number: ${{ inputs.pr_number || github.event.pull_request.number }}
+          expected-head-sha: ${{ steps.prepare-diff.outputs.head-sha }}
+          full-diff-sha256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
+          diff-mode: ${{ steps.prepare-diff.outputs.diff-mode }}
+          input-files-json: '[]'
+          authenticated-review-json: ${{ steps.prepare-review-input.outputs.authenticated_review_json }}
+          model-route-json: ${{ steps.claude-budget-config.outputs.model_route_json }}
+          effort: final-review/default
+          actual-call-count: ${{ steps.claude-budget-metrics.outputs.call_count || '0' }}
+          elapsed-seconds: ${{ steps.claude-budget-elapsed.outputs.elapsed_seconds || '0' }}
+          outcome: ${{ steps.review-budget-outcome.outputs.outcome }}
+          stop-reason: ${{ steps.review-budget-outcome.outputs.stop_reason }}
+          remaining-finding-ids-json: ${{ steps.review-budget-outcome.outputs.remaining_finding_ids_json }}
+          checkpoint-file: ${{ runner.temp }}/claude-review-budget-final.json
+
+      - name: Upload Claude review budget final checkpoint
+        if: ${{ always() && !cancelled() && steps.review-budget-finalize.outcome != 'skipped' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: claude-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/claude-review-budget-final.json
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: false
 
 
   skipped:
