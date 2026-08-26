@@ -2124,6 +2124,63 @@ def test_v147_budget_workflow_semantics_bind_live_reviewer_call_caps(
         release_verifier.require_budget_workflow_contract(tree, workflow, reviewer)
 
 
+def test_v147_opencode_call_cap_rejects_complete_unreachable_sequence_decoy(
+    current_release_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+    mutate_named_step_text(
+        path,
+        "Run OpenCode PR review",
+        'count="$(cat "$call_count_file")"\n'
+        '            [[ "$count" =~ ^[0-9]+$ ]]\n'
+        "            (( count < 2 )) || {\n"
+        "              review_failure_reason=call_budget_exhausted\n"
+        "              return 1\n"
+        "            }\n"
+        '            python3 - "$call_count_file" "$((count + 1))" <<\'PY\'',
+        'count="$(printf 0)"\n'
+        '            [[ "$count" =~ ^[0-9]+$ ]]\n'
+        "            if false; then\n"
+        '              count="$(cat "$call_count_file")"\n'
+        '              [[ "$count" =~ ^[0-9]+$ ]]\n'
+        "              (( count < 2 )) || {\n"
+        "                review_failure_reason=call_budget_exhausted\n"
+        "                return 1\n"
+        "              }\n"
+        '              python3 - "$call_count_file" "$((count + 1))" <<\'PY\'',
+    )
+    mutate_named_step_text(
+        path,
+        "Run OpenCode PR review",
+        "          PY\n            env -i \\",
+        "          PY\n            fi\n            env -i \\",
+    )
+    bad_commit = commit(repo, "hide OpenCode budget sequence below if false")
+    payload = path.read_bytes()
+    monkeypatch.setitem(
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256,
+        "opencode",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    tree = release_verifier.VerifiedCommitTree.open(repo, bad_commit)
+    assert hashlib.sha256(
+        tree.read_file(".github/workflows/opencode-auto-review.yml")
+    ).hexdigest() == (
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256[
+            "opencode"
+        ]
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError, match="invocation-budget workflow contract"
+    ):
+        release_verifier.require_budget_workflow_contract(
+            tree, "opencode-auto-review.yml", "opencode"
+        )
+
+
 @pytest.mark.parametrize(
     ("filename", "size", "oid"),
     (

@@ -3228,42 +3228,83 @@ def _heredoc_python(script: str, declaration: str, terminator: str) -> ast.Modul
     return ast.parse("\n".join(lines[starts[0] + 1 : endings[0]]) + "\n")
 
 
-def _contains_contiguous_lines(
-    script: str, expected: tuple[str, ...]
-) -> bool:
-    lines = tuple(line.strip() for line in script.splitlines())
-    width = len(expected)
-    return sum(
-        lines[index : index + width] == expected
-        for index in range(len(lines) - width + 1)
-    ) == 1
+class _ShellCommand(NamedTuple):
+    text: str
+    controls: tuple[str, ...]
 
 
-def _shell_function_body(script: str, name: str) -> str:
-    lines = script.splitlines()
+def _shell_logical_lines(script: str) -> tuple[str, ...]:
+    """Tokenize shell commands while excluding authenticated heredoc data."""
+
+    physical = script.splitlines()
+    logical: list[str] = []
+    index = 0
+    while index < len(physical):
+        line = physical[index].strip()
+        index += 1
+        if not line or line.startswith("#"):
+            continue
+        parts = [line]
+        while parts[-1].endswith("\\"):
+            if index >= len(physical):
+                raise ValueError("shell continuation is unterminated")
+            parts[-1] = parts[-1][:-1].rstrip()
+            parts.append(physical[index].strip())
+            index += 1
+        command = " ".join(parts)
+        logical.append(command)
+        heredoc = re.search(
+            r"<<(?:'([A-Za-z_][A-Za-z0-9_]*)'|"
+            r'"([A-Za-z_][A-Za-z0-9_]*)"|'
+            r"([A-Za-z_][A-Za-z0-9_]*))",
+            command,
+        )
+        if heredoc is None:
+            continue
+        terminator = next(group for group in heredoc.groups() if group)
+        while index < len(physical) and physical[index].strip() != terminator:
+            index += 1
+        if index >= len(physical):
+            raise ValueError("shell heredoc is unterminated")
+        index += 1
+    return tuple(logical)
+
+
+def _shell_function_commands(script: str, name: str) -> tuple[_ShellCommand, ...]:
+    """Parse one shell function into commands and executable control nesting."""
+
+    lines = _shell_logical_lines(script)
     declaration = f"{name}() {{"
     starts = [index for index, line in enumerate(lines) if line == declaration]
     if len(starts) != 1:
         raise ValueError(f"shell function {name} differs")
-    endings = [
-        index
-        for index in range(starts[0] + 1, len(lines))
-        if lines[index] == "}"
-    ]
-    if not endings:
-        raise ValueError(f"shell function {name} is unterminated")
-    return "\n".join(lines[starts[0] + 1 : endings[0]])
-
-
-def _lines_after_unique_anchor(
-    script: str, anchor: str, expected: tuple[str, ...]
-) -> bool:
-    lines = tuple(line.strip() for line in script.splitlines())
-    positions = [index for index, line in enumerate(lines) if line == anchor]
-    return (
-        len(positions) == 1
-        and lines[positions[0] : positions[0] + len(expected)] == expected
-    )
+    controls: list[str] = []
+    commands: list[_ShellCommand] = []
+    for line in lines[starts[0] + 1 :]:
+        if line == "fi":
+            if not controls or not controls[-1].startswith("if:"):
+                raise ValueError(f"shell function {name} has unmatched fi")
+            controls.pop()
+            continue
+        if line == "}":
+            if controls:
+                if not controls[-1].startswith("group:"):
+                    raise ValueError(
+                        f"shell function {name} closes the wrong control"
+                    )
+                controls.pop()
+                continue
+            return tuple(commands)
+        if line in {"else", "do", "done", "esac"} or line.startswith(
+            ("elif ", "for ", "while ", "until ", "case ")
+        ):
+            raise ValueError(f"shell function {name} has unsupported control flow")
+        commands.append(_ShellCommand(line, tuple(controls)))
+        if line.startswith("if ") and line.endswith("; then"):
+            controls.append(f"if:{line}")
+        elif line.endswith("|| {"):
+            controls.append(f"group:{line}")
+    raise ValueError(f"shell function {name} is unterminated")
 
 
 def _local_literal(function: ast.FunctionDef, name: str) -> object:
@@ -4194,21 +4235,51 @@ def require_budget_workflow_contract(
             ):
                 raise ValueError("Gemini live call accounting differs")
         else:
-            run_opencode = _shell_function_body(
+            cap = "(( count < 2 )) || {"
+            cap_control = (f"group:{cap}",)
+            expected_commands = (
+                _ShellCommand('local prompt_path="$1"', ()),
+                _ShellCommand('local output_path="$2"', ()),
+                _ShellCommand("shift 2", ()),
+                _ShellCommand("local count", ()),
+                _ShellCommand(
+                    '[[ -f "$call_count_file" && ! -L "$call_count_file" ]]',
+                    (),
+                ),
+                _ShellCommand(
+                    '[[ "$(stat -c \'%a\' "$call_count_file")" == 600 ]]',
+                    (),
+                ),
+                _ShellCommand('count="$(cat "$call_count_file")"', ()),
+                _ShellCommand('[[ "$count" =~ ^[0-9]+$ ]]', ()),
+                _ShellCommand(cap, ()),
+                _ShellCommand(
+                    "review_failure_reason=call_budget_exhausted",
+                    cap_control,
+                ),
+                _ShellCommand("return 1", cap_control),
+                _ShellCommand(
+                    'python3 - "$call_count_file" "$((count + 1))" <<\'PY\'',
+                    (),
+                ),
+                _ShellCommand(
+                    'env -i PATH="$PATH" HOME="$isolated_home" '
+                    'XDG_CONFIG_HOME="$isolated_xdg" '
+                    'XDG_DATA_HOME="$isolated_xdg/data" '
+                    'XDG_CACHE_HOME="$isolated_xdg/cache" '
+                    'ZHIPU_API_KEY="$ZHIPU_API_KEY" '
+                    'OPENCODE_PURE="$OPENCODE_PURE" '
+                    'OPENCODE_DISABLE_PROJECT_CONFIG='
+                    '"$OPENCODE_DISABLE_PROJECT_CONFIG" '
+                    'OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_CONTENT" '
+                    'opencode run --model zai-coding-plan/glm-4.7 '
+                    '--format json "$@" < "$prompt_path" > "$output_path"',
+                    (),
+                ),
+            )
+            if _shell_function_commands(
                 provider.get("run", ""), "run_opencode"
-            )
-            call_sequence = (
-                'count="$(cat "$call_count_file")"',
-                '[[ "$count" =~ ^[0-9]+$ ]]',
-                "(( count < 2 )) || {",
-                "review_failure_reason=call_budget_exhausted",
-                "return 1",
-                "}",
-                'python3 - "$call_count_file" "$((count + 1))" <<\'PY\'',
-            )
-            if not _lines_after_unique_anchor(
-                run_opencode, call_sequence[0], call_sequence
-            ):
+            ) != expected_commands:
                 raise ValueError("OpenCode live call accounting differs")
         forbidden_reviewers = {
             "claude": ("Fallback to Gemini reviewer", "Fallback to OpenCode reviewer"),
