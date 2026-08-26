@@ -64,3 +64,5 @@ Task 3: fix round 1/5 (5 addressed, 0 open — exact producer diff vocabulary, c
 Task 3: fix round 2/5 (1 open — malformed request JSON raises before the local diagnostic boundary; write output-directory refusal artifacts with all unavailable identities null and write the requested external checkpoint only when its path was safely decoded; base commit 0cef9fc)
 
 Task 3: fix round 2/5 (1 addressed, 0 open — malformed, non-object, and undecodable requests now write canonical output-directory refusals with null identities and no invented external checkpoint path; base commit 0cef9fc)
+
+Task 3: complete (commits c3b3415..862ef0f, review clean; focused 81 passed, full 2550 passed + 48 subtests)
