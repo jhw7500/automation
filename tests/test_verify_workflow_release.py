@@ -1737,6 +1737,25 @@ def test_v146_rejects_canonicalizer_constant_drift(
         release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
 
 
+def test_v146_rejects_review_quality_behavior_drift(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    helper = repo / ".github/actions/canonicalize-review/canonicalize_review.py"
+    replace(
+        helper,
+        "if not evidence or any(item is None or not scope.validate_trigger(item) for item in evidence):",
+        "if not evidence or any(item is None for item in evidence):",
+        count=1,
+    )
+    bad_commit = commit(repo, "bypass review trigger evidence validation")
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract"
+    ):
+        release_verifier.verify_commit_content(repo, "v1.46", bad_commit)
+
+
 @pytest.mark.parametrize(
     ("relative", "rebind"),
     (
