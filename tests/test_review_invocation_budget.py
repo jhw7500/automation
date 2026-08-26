@@ -321,6 +321,74 @@ def test_provider_failure_preserves_prior_authenticated_findings_without_newer_l
     assert failed.handoff.authenticated_review_full_diff_sha256 == HASH_1
 
 
+@pytest.mark.parametrize("outcome", ["success", "quality_filtered"])
+def test_empty_current_canonical_findings_clear_prior_ids(outcome):
+    first_claim = claimed_state()
+    first = budget.finalize(
+        first_claim,
+        finalize_request(outcome="success", remaining=(FINDING_1, FINDING_2)),
+        current_provenances(first_claim),
+    ).state
+    second_claim = budget.claim(
+        first,
+        request(head=HEAD_B, full_hash=HASH_2, run_id=701),
+        valid_provenances(first),
+    ).state
+    prior_review = budget.AuthenticatedReview(
+        True, HEAD_A, HASH_1, (FINDING_1, FINDING_2),
+    )
+    completed = budget.finalize(
+        second_claim,
+        finalize_request(
+            head=HEAD_B, full_hash=HASH_2, run_id=701, outcome=outcome,
+            authenticated_review=prior_review, remaining=(),
+        ),
+        current_provenances(second_claim),
+    ).state
+    assert completed.invocations[-1].remaining_finding_ids == ()
+    assert completed.handoff.remaining_finding_ids == ()
+
+
+def test_repeat_finalization_refusal_updates_checkpoint_state_without_comment_mutation():
+    claimed = claimed_state()
+    finalized = budget.finalize(
+        claimed, finalize_request(), current_provenances(claimed),
+    ).state
+    refused = budget.finalize(
+        finalized, finalize_request(), valid_provenances(finalized),
+    )
+    assert refused.decision == "state_invalid"
+    assert refused.stop_reason == "invocation_not_claimed"
+    assert not refused.mutate_comment
+    assert refused.state.last_decision == budget.DecisionRecord(
+        "state_invalid", "invocation_not_claimed", 700, 1,
+    )
+    assert refused.state.handoff.current_head_sha == HEAD_A
+    assert refused.state.handoff.current_full_diff_sha256 == HASH_1
+    assert refused.state.handoff.outcome == "success"
+    assert refused.state.handoff.stop_reason == "invocation_not_claimed"
+    assert budget.load_checkpoint(budget.render_checkpoint(refused.state)) == refused.state
+
+
+def test_identity_drift_refusal_records_current_request_in_checkpoint_state():
+    claimed = claimed_state()
+    refused = budget.finalize(
+        claimed,
+        replace(finalize_request(), full_diff_sha256=HASH_2),
+        current_provenances(claimed),
+    )
+    assert refused.decision == "state_invalid"
+    assert refused.stop_reason == "finalization_identity_mismatch"
+    assert not refused.mutate_comment
+    assert refused.state.last_decision == budget.DecisionRecord(
+        "state_invalid", "finalization_identity_mismatch", 700, 1,
+    )
+    assert refused.state.handoff.current_head_sha == HEAD_A
+    assert refused.state.handoff.current_full_diff_sha256 == HASH_2
+    assert refused.state.handoff.outcome is None
+    assert budget.load_checkpoint(budget.render_checkpoint(refused.state)) == refused.state
+
+
 def test_comment_summary_and_handoff_are_exact_and_workflow_owned():
     state = claimed_state()
     finalized = budget.finalize(
@@ -386,6 +454,21 @@ def test_checkpoint_is_canonical_and_round_trips_without_external_context():
     tampered = json.dumps(mismatched, separators=(",", ":"), sort_keys=True).encode() + b"\n"
     with pytest.raises(budget.BudgetStateError, match="checkpoint_handoff_mismatch"):
         budget.load_checkpoint(tampered)
+
+
+def test_checkpoint_rejects_coordinated_current_identity_drift():
+    claimed = claimed_state()
+    finalized = budget.finalize(
+        claimed, finalize_request(), current_provenances(claimed),
+    ).state
+    raw = json.loads(budget.render_checkpoint(finalized))
+    for handoff in (raw["ledger"]["handoff"], raw["handoff"]):
+        handoff["current_head_sha"] = HEAD_B
+        handoff["current_full_diff_sha256"] = HASH_2
+        handoff["outcome"] = None
+    coordinated = json.dumps(raw, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+    with pytest.raises(budget.BudgetStateError, match="handoff_mismatch"):
+        budget.load_checkpoint(coordinated)
 
 
 def test_ledger_rejects_handoff_outcome_drift():

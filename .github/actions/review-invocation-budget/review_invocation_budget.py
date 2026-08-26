@@ -528,7 +528,17 @@ def _validate_state_shape(state: LedgerState) -> None:
             if (item.head_sha == handoff.current_head_sha or
                 item.full_diff_sha256 == handoff.current_full_diff_sha256)
         ]
-        expected_outcome = matching_inputs[-1].outcome if matching_inputs else None
+        exact_inputs = [
+            item for item in state.invocations
+            if (item.run_id, item.run_attempt, item.head_sha, item.full_diff_sha256) == (
+                handoff.current_run_id, handoff.current_run_attempt,
+                handoff.current_head_sha, handoff.current_full_diff_sha256,
+            )
+        ]
+        if handoff.decision in {"claimed", "finalized"} and len(exact_inputs) != 1:
+            raise BudgetStateError("handoff_mismatch")
+        outcome_inputs = exact_inputs if exact_inputs else matching_inputs
+        expected_outcome = outcome_inputs[-1].outcome if outcome_inputs else None
         if (
             (handoff.repository, handoff.pr, handoff.reviewer) !=
             (state.repository, state.pr, state.reviewer) or
@@ -654,7 +664,7 @@ def estimated_total(state: LedgerState) -> int:
     return sum(item.estimated_input_tokens for item in state.invocations)
 
 
-def _handoff_outcome(state: LedgerState, request: ClaimRequest) -> Outcome | None:
+def _handoff_outcome(state: LedgerState, request: ClaimRequest | FinalizeRequest) -> Outcome | None:
     for item in reversed(state.invocations):
         if item.head_sha == request.head_sha or item.full_diff_sha256 == request.full_diff_sha256:
             return item.outcome
@@ -745,6 +755,20 @@ def _invalid_transition(
     return Transition(state, False, "state_invalid", reason, None, None, False)
 
 
+def _finalization_refusal(
+        state: LedgerState, request: FinalizeRequest, reason: str) -> Transition:
+    updated = replace(
+        state,
+        last_decision=DecisionRecord("state_invalid", reason, request.run_id, request.run_attempt),
+    )
+    updated = replace(
+        updated,
+        handoff=_build_handoff(updated, request, outcome=_handoff_outcome(updated, request)),
+    )
+    _validate_state_shape(updated)
+    return Transition(updated, False, "state_invalid", reason, None, None, False)
+
+
 def claim(state: LedgerState | None, request: ClaimRequest,
           provenances: Mapping[tuple[int, int], RunProvenance]) -> Transition:
     try:
@@ -816,6 +840,8 @@ def _validate_finalize_request(request: FinalizeRequest) -> None:
 
 
 def _finalize_remaining_ids(state: LedgerState, request: FinalizeRequest) -> tuple[str, ...]:
+    if request.outcome in {"success", "quality_filtered"}:
+        return request.remaining_finding_ids
     if request.remaining_finding_ids:
         return request.remaining_finding_ids
     if request.authenticated_review.success:
@@ -835,12 +861,15 @@ def finalize(
     try:
         _validate_finalize_request(request)
         _validate_state_shape(state)
+    except BudgetStateError as exc:
+        return _invalid_transition(state, request, str(exc))
+    try:
         if (state.repository, state.pr, state.reviewer) != (
                 request.repository, request.pr, request.reviewer):
             raise BudgetStateError("identity_mismatch")
         _validate_provenance(state, request, provenances)
     except BudgetStateError as exc:
-        return _invalid_transition(state, request, str(exc))
+        return _finalization_refusal(state, request, str(exc))
 
     exact = [
         (index, item) for index, item in enumerate(state.invocations)
@@ -853,14 +882,14 @@ def finalize(
             (item.run_id, item.run_attempt) == (request.run_id, request.run_attempt)
             for item in state.invocations
         )
-        return _invalid_transition(
+        return _finalization_refusal(
             state, request, "finalization_identity_mismatch" if same_run else "invocation_not_claimed",
         )
     index, entry = exact[0]
     if entry.status != "claimed":
-        return _invalid_transition(state, request, "invocation_not_claimed")
+        return _finalization_refusal(state, request, "invocation_not_claimed")
     if request.model_route[0] != entry.model_route[0]:
-        return _invalid_transition(state, request, "model_route_unknown")
+        return _finalization_refusal(state, request, "model_route_unknown")
     outcome = request.outcome
     stop_reason = request.stop_reason
     if request.call_count > state.budgets.max_calls_per_round:
@@ -885,7 +914,7 @@ def finalize(
     try:
         _validate_state_shape(updated)
     except BudgetStateError as exc:
-        return _invalid_transition(state, request, str(exc))
+        return _finalization_refusal(state, request, str(exc))
     return Transition(
         updated, False, "finalized", stop_reason, completed.round_number,
         f"{request.run_id}:{request.run_attempt}", True,
