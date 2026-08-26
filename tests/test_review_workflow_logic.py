@@ -1311,8 +1311,12 @@ def test_claude_budget_claim_is_durable_before_provider_and_every_model_path_is_
         "mode": "claim",
         "reviewer": "claude",
         "pr-number": "${{ inputs.pr_number || github.event.pull_request.number }}",
-        "expected-head-sha": "${{ steps.prepare-diff.outputs.head-sha }}",
-        "full-diff-sha256": "${{ steps.prepare-diff.outputs.full-diff-sha256 }}",
+        "expected-head-sha": (
+            "${{ steps.stage-claude-budget-input.outputs.expected_head_sha }}"
+        ),
+        "full-diff-sha256": (
+            "${{ steps.stage-claude-budget-input.outputs.full_diff_sha256 }}"
+        ),
         "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}",
         "input-files-json": (
             "${{ steps.stage-claude-budget-input.outputs.input_files_json }}"
@@ -1402,6 +1406,8 @@ def test_claude_budget_staged_input_is_byte_exact_private_and_removed(tmp_path, 
         env={
             **os.environ,
             "DIFF_MODE": diff_mode,
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
             "RUNNER_TEMP_DIR": str(runner_temp),
             "GITHUB_WORKSPACE": str(workspace),
             "GITHUB_OUTPUT": str(output),
@@ -1414,6 +1420,8 @@ def test_claude_budget_staged_input_is_byte_exact_private_and_removed(tmp_path, 
     outputs = _github_outputs(output)
     staged = Path(json.loads(outputs["input_files_json"])[0])
     staging_directory = Path(outputs["staging_directory"])
+    assert outputs["expected_head_sha"] == "ab" * 20
+    assert outputs["full_diff_sha256"] == "12" * 32
     assert staged.read_bytes() == source.read_bytes()
     assert staging_directory.parent == workspace
     assert staging_directory.stat().st_mode & 0o777 == 0o700
@@ -1434,7 +1442,16 @@ def test_claude_budget_staged_input_is_byte_exact_private_and_removed(tmp_path, 
     assert not staging_directory.exists()
 
 
-def test_claude_budget_unavailable_stages_no_file_and_passes_empty_json(tmp_path):
+@pytest.mark.parametrize(
+    ("diff_mode", "expected_head", "expected_hash"),
+    (
+        ("unchanged", "ab" * 20, "12" * 32),
+        ("unavailable", "", ""),
+    ),
+)
+def test_claude_budget_non_provider_modes_normalize_identity_without_staging(
+    tmp_path, diff_mode, expected_head, expected_hash,
+):
     stage = _step(
         _load("claude-code-review.yml"), "claude-review", "Stage Claude budget input"
     )
@@ -1448,7 +1465,9 @@ def test_claude_budget_unavailable_stages_no_file_and_passes_empty_json(tmp_path
         ["bash", "-c", stage["run"]],
         env={
             **os.environ,
-            "DIFF_MODE": "unavailable",
+            "DIFF_MODE": diff_mode,
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
             "RUNNER_TEMP_DIR": str(runner_temp),
             "GITHUB_WORKSPACE": str(workspace),
             "GITHUB_OUTPUT": str(output),
@@ -1462,8 +1481,20 @@ def test_claude_budget_unavailable_stages_no_file_and_passes_empty_json(tmp_path
     assert _github_outputs(output) == {
         "input_files_json": "[]",
         "staging_directory": "",
+        "expected_head_sha": expected_head,
+        "full_diff_sha256": expected_hash,
     }
     assert list(workspace.iterdir()) == []
+
+    claim = _step(
+        _load("claude-code-review.yml"), "claude-review", "Claim Claude review budget"
+    )
+    assert claim["with"]["expected-head-sha"] == (
+        "${{ steps.stage-claude-budget-input.outputs.expected_head_sha }}"
+    )
+    assert claim["with"]["full-diff-sha256"] == (
+        "${{ steps.stage-claude-budget-input.outputs.full_diff_sha256 }}"
+    )
 
 
 def test_claude_budget_preserves_zero_call_unchanged_and_denied_claim_cannot_publish_success():

@@ -74,3 +74,7 @@ Ruling: Task 4 must preserve Task 3's reviewed rule that estimated-input files r
 Ruling: Tasks 4-6 intentionally make the unfiltered full suite fail only in Task 7-owned `test_workflow_release_bundle.py` / `test_verify_workflow_release.py` until the v1.47 inventory and verifier are implemented; intermediate tasks require all focused/workflow tests plus the full non-Task7 suite green, and Tasks 7-8 must restore the unfiltered full suite to green — this preserves the approved task/file boundaries without weakening release tests — if wrong, the release inventory work must move into each reviewer-integration task.
 
 Task 4: implementer complete (RED 6 expected failures; GREEN 15 focused, 133 Claude/actionlint, 1493 workflow-logic, and 2049 + 48 subtests non-Task7 full; unfiltered full 2422 + 48 subtests with 143 Task7-boundary failures; report: task-4-report.md)
+
+Task 4: fix round 1/5 (1 open — graceful `diff-mode=unavailable` preserves a producer head SHA; normalize both canonical head/hash claim inputs to empty while retaining exact identities for full/delta/unchanged; base commit 26f8afe)
+
+Task 4: fix round 1/5 (1 addressed, 0 open — unavailable producer identities are normalized empty before the Task 3 claim; RED 4 failed/12 passed, GREEN 16 focused, 134 Claude/actionlint, and 2050 + 48 subtests non-Task7 full; base commit 26f8afe)

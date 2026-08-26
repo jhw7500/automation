@@ -403,12 +403,22 @@ jobs:
         shell: bash
         env:
           DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}
+          PRODUCER_HEAD_SHA: ${{ steps.prepare-diff.outputs.head-sha }}
+          PRODUCER_FULL_DIFF_SHA256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
           RUNNER_TEMP_DIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
           umask 077
           printf 'input_files_json=[]\n' >> "$GITHUB_OUTPUT"
           printf 'staging_directory=\n' >> "$GITHUB_OUTPUT"
+          expected_head_sha=''
+          full_diff_sha256=''
+          if [[ "$DIFF_MODE" == 'full' || "$DIFF_MODE" == 'delta' || "$DIFF_MODE" == 'unchanged' ]]; then
+            expected_head_sha="$PRODUCER_HEAD_SHA"
+            full_diff_sha256="$PRODUCER_FULL_DIFF_SHA256"
+          fi
+          printf 'expected_head_sha=%s\n' "$expected_head_sha" >> "$GITHUB_OUTPUT"
+          printf 'full_diff_sha256=%s\n' "$full_diff_sha256" >> "$GITHUB_OUTPUT"
           if [[ "$DIFF_MODE" != 'full' && "$DIFF_MODE" != 'delta' ]]; then
             exit 0
           fi
@@ -434,8 +444,8 @@ jobs:
           mode: claim
           reviewer: claude
           pr-number: ${{ inputs.pr_number || github.event.pull_request.number }}
-          expected-head-sha: ${{ steps.prepare-diff.outputs.head-sha }}
-          full-diff-sha256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
+          expected-head-sha: ${{ steps.stage-claude-budget-input.outputs.expected_head_sha }}
+          full-diff-sha256: ${{ steps.stage-claude-budget-input.outputs.full_diff_sha256 }}
           diff-mode: ${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}
           input-files-json: ${{ steps.stage-claude-budget-input.outputs.input_files_json }}
           authenticated-review-json: ${{ steps.prepare-review-input.outputs.authenticated_review_json }}
