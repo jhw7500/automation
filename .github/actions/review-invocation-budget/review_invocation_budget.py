@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import math
+import os
 import re
 import stat
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
+from urllib.parse import quote
 
 
 Reviewer = Literal["claude", "gemini", "opencode"]
@@ -982,3 +986,534 @@ def load_checkpoint(payload: bytes) -> LedgerState:
     if payload != render_checkpoint(state):
         raise BudgetStateError("checkpoint_json_noncanonical")
     return state
+
+
+_BOT_LOGIN = "github-actions[bot]"
+_CALL_UNITS = {
+    "claude": "claude-code-action review session",
+    "gemini": "generate_content request",
+    "opencode": "opencode run session",
+}
+_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_DECIMAL = re.compile(r"[1-9][0-9]*\Z")
+
+
+class TransportError(BudgetStateError):
+    """A GitHub API payload or file transport failed validation."""
+
+
+def write_private(path: Path, payload: bytes) -> None:
+    """Atomically replace one explicitly named output with mode 0600."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.new")
+    temporary.write_bytes(payload)
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def _json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+    ).encode("ascii") + b"\n"
+
+
+def _read_json(path: Path, name: str) -> object:
+    try:
+        file_stat = path.lstat()
+        if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+            raise TransportError(f"{name}_not_regular")
+        return json.loads(path.read_bytes())
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TransportError(f"{name}_invalid") from exc
+
+
+def _read_pages(path: Path, name: str) -> list[object]:
+    """Read one JSON array or gh's concatenated --paginate arrays."""
+    try:
+        file_stat = path.lstat()
+        if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+            raise TransportError(f"{name}_not_regular")
+        text = path.read_text(encoding="utf-8")
+        decoder = json.JSONDecoder()
+        cursor = 0
+        values: list[object] = []
+        while cursor < len(text):
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+            if cursor == len(text):
+                break
+            value, cursor = decoder.raw_decode(text, cursor)
+            if not isinstance(value, list):
+                raise TransportError(f"{name}_invalid")
+            values.extend(value)
+        return values
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TransportError(f"{name}_invalid") from exc
+
+
+def _decimal(value: object, name: str) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        raise TransportError(f"{name}_invalid")
+    if _DECIMAL.fullmatch(text) is None:
+        raise TransportError(f"{name}_invalid")
+    parsed = int(text)
+    if parsed > 9_223_372_036_854_775_807:
+        raise TransportError(f"{name}_invalid")
+    return parsed
+
+
+def _transport_request(path: Path) -> dict[str, object]:
+    value = _read_json(path, "request")
+    keys = {
+        "operation", "repository", "pr", "reviewer", "run_id", "run_attempt",
+        "head_sha", "full_diff_sha256", "diff_mode", "input_files_json",
+        "authenticated_review_json", "model_route_json", "effort", "actual_call_count",
+        "elapsed_seconds", "outcome", "stop_reason", "remaining_finding_ids_json",
+        "checkpoint_file", "github_workspace", "server_url",
+    }
+    value = dict(_exact_keys(value, keys, "request"))
+    repository = _string(value["repository"], "repository")
+    if _REPOSITORY.fullmatch(repository) is None or os.environ.get("GITHUB_REPOSITORY") != repository:
+        raise TransportError("repository_identity_mismatch")
+    operation = _string(value["operation"], "operation")
+    if operation not in {"claim", "finalize"}:
+        raise TransportError("operation_invalid")
+    reviewer = _string(value["reviewer"], "reviewer")
+    if reviewer not in MARKERS:
+        raise TransportError("reviewer_invalid")
+    value["repository"] = repository
+    value["operation"] = operation
+    value["reviewer"] = reviewer
+    value["pr"] = _decimal(value["pr"], "pr")
+    value["run_id"] = _decimal(value["run_id"], "run_id")
+    value["run_attempt"] = _decimal(value["run_attempt"], "run_attempt")
+    value["head_sha"] = _hash(value["head_sha"], _HEAD, "head_sha")
+    value["full_diff_sha256"] = _hash(
+        value["full_diff_sha256"], _HASH, "full_diff_sha256",
+    )
+    if value["diff_mode"] not in {"changed", "unchanged"}:
+        raise TransportError("diff_mode_invalid")
+    for name in (
+        "input_files_json", "authenticated_review_json", "model_route_json", "effort",
+        "outcome", "stop_reason", "remaining_finding_ids_json", "checkpoint_file",
+        "github_workspace", "server_url",
+    ):
+        value[name] = _string(value[name], name)
+    return value
+
+
+def _embedded_json(request: Mapping[str, object], key: str) -> object:
+    try:
+        return json.loads(_string(request[key], key))
+    except json.JSONDecodeError as exc:
+        raise TransportError(f"{key}_invalid") from exc
+
+
+def _authenticated_review(request: Mapping[str, object]) -> AuthenticatedReview:
+    value = _exact_keys(
+        _embedded_json(request, "authenticated_review_json"),
+        {"success", "head_sha", "full_diff_sha256", "remaining_finding_ids"},
+        "authenticated_review",
+    )
+    findings = value["remaining_finding_ids"]
+    if not isinstance(findings, list):
+        raise TransportError("authenticated_review_invalid")
+    return AuthenticatedReview(
+        success=value["success"],
+        head_sha=value["head_sha"],
+        full_diff_sha256=value["full_diff_sha256"],
+        remaining_finding_ids=tuple(findings),
+    )
+
+
+def _model_route(request: Mapping[str, object]) -> tuple[str, ...]:
+    value = _embedded_json(request, "model_route_json")
+    if not isinstance(value, list):
+        raise TransportError("model_route_invalid")
+    return tuple(value)
+
+
+def _remaining_findings(request: Mapping[str, object]) -> tuple[str, ...]:
+    value = _embedded_json(request, "remaining_finding_ids_json")
+    if not isinstance(value, list):
+        raise TransportError("remaining_finding_ids_invalid")
+    return tuple(value)
+
+
+def _base_claim_request(
+        request: Mapping[str, object], *, estimated_input_tokens: int = 0,
+        override_events: tuple[OverrideEvent, ...] = ()) -> ClaimRequest:
+    return ClaimRequest(
+        repository=request["repository"], pr=request["pr"], reviewer=request["reviewer"],
+        run_id=request["run_id"], run_attempt=request["run_attempt"],
+        head_sha=request["head_sha"], full_diff_sha256=request["full_diff_sha256"],
+        estimated_input_tokens=estimated_input_tokens, diff_mode=request["diff_mode"],
+        authenticated_review=_authenticated_review(request), override_events=override_events,
+        model_route=_model_route(request), effort=request["effort"],
+        call_unit=_CALL_UNITS[request["reviewer"]],
+    )
+
+
+def _finalize_request(request: Mapping[str, object]) -> FinalizeRequest:
+    outcome = request["outcome"]
+    stop_reason = request["stop_reason"] or outcome
+    return FinalizeRequest(
+        repository=request["repository"], pr=request["pr"], reviewer=request["reviewer"],
+        run_id=request["run_id"], run_attempt=request["run_attempt"],
+        head_sha=request["head_sha"], full_diff_sha256=request["full_diff_sha256"],
+        model_route=_model_route(request), effort=request["effort"],
+        call_count=_decimal_or_zero(request["actual_call_count"], "actual_call_count"),
+        elapsed_seconds=_decimal_or_zero(request["elapsed_seconds"], "elapsed_seconds"),
+        outcome=outcome, stop_reason=stop_reason,
+        authenticated_review=_authenticated_review(request),
+        remaining_finding_ids=_remaining_findings(request),
+    )
+
+
+def _decimal_or_zero(value: object, name: str) -> int:
+    if value in {0, "0"}:
+        return 0
+    return _decimal(value, name)
+
+
+def _verify_pr(request: Mapping[str, object], output_directory: Path) -> None:
+    value = _read_json(output_directory / "pr.json", "pr")
+    if not isinstance(value, dict):
+        raise TransportError("pr_invalid")
+    head = value.get("head")
+    if (
+        value.get("number") != request["pr"] or not isinstance(head, dict) or
+        head.get("sha") != request["head_sha"]
+    ):
+        raise TransportError("pr_head_mismatch")
+
+
+def _ledger_comment(
+        comments_file: Path, request: Mapping[str, object],
+    ) -> tuple[LedgerState | None, dict[str, object] | None]:
+    comments = _read_pages(comments_file, "comments")
+    marker = MARKERS[request["reviewer"]]
+    matches = [
+        item for item in comments
+        if isinstance(item, dict) and isinstance(item.get("body"), str) and
+        (item["body"] == marker or item["body"].startswith(f"{marker}\n"))
+    ]
+    if len(matches) > 1:
+        raise TransportError("duplicate_ledger_comments")
+    if not matches:
+        return None, None
+    comment = matches[0]
+    user = comment.get("user")
+    if not isinstance(user, dict) or user.get("login") != _BOT_LOGIN:
+        raise TransportError("ledger_author_invalid")
+    comment_id = comment.get("id")
+    if isinstance(comment_id, bool) or not isinstance(comment_id, int) or comment_id <= 0:
+        raise TransportError("comment_id_invalid")
+    state = parse_ledger(
+        comment["body"], repository=request["repository"], pr=request["pr"],
+        reviewer=request["reviewer"],
+    )
+    return state, comment
+
+
+def _timeline_permission_actors(output_directory: Path) -> list[dict[str, object]]:
+    actors: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in _read_pages(output_directory / "timeline.json", "timeline"):
+        if not isinstance(item, dict) or item.get("event") != "labeled":
+            continue
+        label = item.get("label")
+        if not isinstance(label, dict) or label.get("name") != "review-budget-override":
+            continue
+        actor = item.get("actor")
+        login = actor.get("login") if isinstance(actor, dict) else None
+        if not isinstance(login, str) or not login:
+            raise TransportError("override_actor_invalid")
+        if login in seen:
+            continue
+        seen.add(login)
+        actors.append({"index": len(actors), "login": login, "encoded_login": quote(login, safe="")})
+    return actors
+
+
+def _override_events(output_directory: Path) -> tuple[OverrideEvent, ...]:
+    manifest = _read_json(output_directory / "run-identities.json", "run_identities")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("permission_actors"), list):
+        raise TransportError("run_identities_invalid")
+    permissions: dict[str, str] = {}
+    for actor in manifest["permission_actors"]:
+        actor = _exact_keys(actor, {"index", "login", "encoded_login"}, "permission_actor")
+        index = actor["index"]
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise TransportError("permission_actor_invalid")
+        payload = _read_json(output_directory / f"permission-{index}.json", "permission")
+        if not isinstance(payload, dict) or not isinstance(payload.get("user"), dict):
+            raise TransportError("permission_invalid")
+        if payload["user"].get("login") != actor["login"] or payload.get("permission") not in {
+                "admin", "maintain", "write", "triage", "read", "none"}:
+            raise TransportError("permission_invalid")
+        permissions[actor["login"]] = payload["permission"]
+    events: list[OverrideEvent] = []
+    for item in _read_pages(output_directory / "timeline.json", "timeline"):
+        if not isinstance(item, dict) or item.get("event") != "labeled":
+            continue
+        label = item.get("label")
+        if not isinstance(label, dict) or label.get("name") != "review-budget-override":
+            continue
+        actor = item.get("actor")
+        login = actor.get("login") if isinstance(actor, dict) else None
+        event_id = item.get("id")
+        if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id <= 0:
+            raise TransportError("override_event_invalid")
+        if not isinstance(login, str) or login not in permissions:
+            raise TransportError("override_actor_invalid")
+        events.append(OverrideEvent(event_id, "labeled", "review-budget-override", permissions[login]))
+    return tuple(events)
+
+
+def _run_provenances(
+        state: LedgerState | None, request: Mapping[str, object], output_directory: Path,
+    ) -> dict[tuple[int, int], RunProvenance]:
+    if state is None:
+        return {}
+    result: dict[tuple[int, int], RunProvenance] = {}
+    for invocation in state.invocations:
+        path = output_directory / f"run-{invocation.run_id}-{invocation.run_attempt}.json"
+        value = _read_json(path, "run")
+        if not isinstance(value, dict):
+            raise TransportError("provenance_mismatch")
+        repository = value.get("repository")
+        pulls = value.get("pull_requests")
+        if not isinstance(repository, dict) or not isinstance(pulls, list):
+            raise TransportError("provenance_mismatch")
+        pull_numbers = {
+            item.get("number") for item in pulls if isinstance(item, dict) and
+            isinstance(item.get("number"), int) and not isinstance(item.get("number"), bool)
+        }
+        provenance = RunProvenance(
+            repository=repository.get("full_name"), pr=request["pr"],
+            head_sha=value.get("head_sha"), workflow_path=value.get("path"),
+            run_id=value.get("id"), run_attempt=value.get("run_attempt"),
+            status=value.get("status"), conclusion=value.get("conclusion"),
+        )
+        if request["pr"] not in pull_numbers:
+            raise TransportError("provenance_mismatch")
+        result[(invocation.run_id, invocation.run_attempt)] = provenance
+    return result
+
+
+def _validated_input_paths(request: Mapping[str, object]) -> tuple[Path, ...]:
+    value = _embedded_json(request, "input_files_json")
+    if not isinstance(value, list) or len(value) > 128 or not all(isinstance(item, str) for item in value):
+        raise TransportError("input_files_invalid")
+    workspace_value = os.environ.get("GITHUB_WORKSPACE")
+    if not workspace_value or request["github_workspace"] != workspace_value:
+        raise TransportError("workspace_identity_mismatch")
+    workspace = Path(workspace_value)
+    try:
+        workspace = workspace.resolve(strict=True)
+        if not workspace.is_dir():
+            raise TransportError("workspace_invalid")
+    except OSError as exc:
+        raise TransportError("workspace_invalid") from exc
+    paths: list[Path] = []
+    for item in value:
+        candidate = Path(item)
+        try:
+            file_stat = candidate.lstat()
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(workspace)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise TransportError("input_path_invalid") from exc
+        if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+            raise TransportError("input_not_regular")
+        paths.append(resolved)
+    return tuple(paths)
+
+
+def _recorded_refusal(
+        state: LedgerState | None, request: ClaimRequest | FinalizeRequest, reason: str,
+    ) -> Transition:
+    if state is None:
+        state = LedgerState.initial(request.repository, request.pr, request.reviewer)
+    updated = replace(
+        state, last_decision=DecisionRecord("state_invalid", reason, request.run_id, request.run_attempt),
+    )
+    updated = replace(
+        updated, handoff=_build_handoff(updated, request, outcome=_handoff_outcome(updated, request)),
+    )
+    _validate_state_shape(updated)
+    return Transition(updated, False, "state_invalid", reason, None, None, False)
+
+
+def _write_transition(
+        output_directory: Path, request: Mapping[str, object], transition: Transition,
+        prior_state: LedgerState | None, prior_comment: Mapping[str, object] | None,
+    ) -> None:
+    checkpoint = render_checkpoint(transition.state)
+    summary = render_summary(transition.state).encode("utf-8") + b"\n"
+    comment = render_comment(transition.state, server_url=request["server_url"]).encode("utf-8")
+    comment_id = "" if prior_comment is None else str(prior_comment["id"])
+    mutation = "none"
+    if transition.mutate_comment:
+        mutation = "create" if prior_comment is None else "patch"
+    output = {
+        "allow-invocation": "true" if transition.allow_invocation else "false",
+        "decision": transition.decision,
+        "round": "" if transition.round_number is None else str(transition.round_number),
+        "invocation-key": transition.invocation_key or "",
+        "checkpoint-sha256": hashlib.sha256(checkpoint).hexdigest(),
+        "comment-id": comment_id,
+        "mutate-comment": transition.mutate_comment,
+        "mutation": mutation,
+        "expected-head-sha": request["head_sha"],
+        "prior-comment-id": comment_id,
+        "prior-comment-body": None if prior_comment is None else prior_comment["body"],
+        "marker": MARKERS[request["reviewer"]],
+    }
+    write_private(output_directory / "state.json", _json_bytes(transition.state.to_dict()))
+    write_private(
+        output_directory / "prior-state.json",
+        b"null\n" if prior_state is None else _json_bytes(prior_state.to_dict()),
+    )
+    write_private(output_directory / "comment-body.txt", comment)
+    write_private(output_directory / "comment-payload.json", _json_bytes({"body": comment.decode("utf-8")}))
+    write_private(output_directory / "checkpoint.json", checkpoint)
+    write_private(output_directory / "summary.md", summary)
+    write_private(output_directory / "output.json", _json_bytes(output))
+    write_private(Path(request["checkpoint_file"]), checkpoint)
+
+
+def _safe_request_for_refusal(request: Mapping[str, object]) -> ClaimRequest | FinalizeRequest:
+    if request["operation"] == "claim":
+        return _base_claim_request(request)
+    return _finalize_request(request)
+
+
+def _fallback_request(request: Mapping[str, object]) -> ClaimRequest | FinalizeRequest:
+    review = AuthenticatedReview(False, None, None)
+    if request["operation"] == "claim":
+        return ClaimRequest(
+            repository=request["repository"], pr=request["pr"], reviewer=request["reviewer"],
+            run_id=request["run_id"], run_attempt=request["run_attempt"],
+            head_sha=request["head_sha"], full_diff_sha256=request["full_diff_sha256"],
+            estimated_input_tokens=0, diff_mode="changed", authenticated_review=review,
+            override_events=(), model_route=("invalid",), effort=request["effort"],
+            call_unit=_CALL_UNITS[request["reviewer"]],
+        )
+    return FinalizeRequest(
+        repository=request["repository"], pr=request["pr"], reviewer=request["reviewer"],
+        run_id=request["run_id"], run_attempt=request["run_attempt"],
+        head_sha=request["head_sha"], full_diff_sha256=request["full_diff_sha256"],
+        model_route=("invalid",), effort=request["effort"], call_count=0, elapsed_seconds=0,
+        outcome="checkpoint_failure", stop_reason="checkpoint_failure",
+        authenticated_review=review, remaining_finding_ids=(),
+    )
+
+
+def _list_run_identities(
+        request: Mapping[str, object], comments_file: Path, output_directory: Path,
+    ) -> None:
+    error = None
+    state = None
+    try:
+        state, _ = _ledger_comment(comments_file, request)
+        actors = _timeline_permission_actors(output_directory)
+    except BudgetStateError as exc:
+        error = str(exc)
+        actors = []
+    runs = [] if state is None else [
+        {"run_id": item.run_id, "run_attempt": item.run_attempt} for item in state.invocations
+    ]
+    if len(runs) > 3:
+        error = "ledger_invalid"
+        runs = []
+    write_private(output_directory / "run-identities.json", _json_bytes({
+        "error": error, "permission_actors": actors, "runs": runs,
+    }))
+
+
+def _run_transition(
+        request: Mapping[str, object], comments_file: Path, output_directory: Path,
+    ) -> None:
+    state: LedgerState | None = None
+    comment: dict[str, object] | None = None
+    request_object = _fallback_request(request)
+    try:
+        request_object = _safe_request_for_refusal(request)
+        _verify_pr(request, output_directory)
+        state, comment = _ledger_comment(comments_file, request)
+        provenances = _run_provenances(state, request, output_directory)
+        if request["operation"] == "claim":
+            events = _override_events(output_directory)
+            preliminary_request = _base_claim_request(request, override_events=events)
+            preliminary = claim(state, preliminary_request, provenances)
+            if preliminary.decision in {
+                    "claimed", "round_budget_exhausted", "total_usage_budget_exhausted"}:
+                estimate = estimate_input_tokens(_validated_input_paths(request))
+                request_object = replace(preliminary_request, estimated_input_tokens=estimate)
+                transition = claim(state, request_object, provenances)
+            else:
+                request_object = preliminary_request
+                transition = preliminary
+        else:
+            if state is None:
+                raise TransportError("ledger_missing")
+            transition = finalize(state, request_object, provenances)
+        if transition.state.handoff.repository is None:
+            transition = _recorded_refusal(state, request_object, transition.stop_reason)
+    except (BudgetStateError, KeyError, TypeError) as exc:
+        transition = _recorded_refusal(state, request_object, str(exc))
+    _write_transition(output_directory, request, transition, state, comment)
+
+
+def _cas_failed(
+        request: Mapping[str, object], comments_file: Path, output_directory: Path,
+    ) -> None:
+    del comments_file
+    prior = _read_json(output_directory / "prior-state.json", "prior_state")
+    prior_state = None if prior is None else LedgerState.from_dict(prior)
+    prior_output = _read_json(output_directory / "output.json", "output")
+    if not isinstance(prior_output, dict):
+        raise TransportError("output_invalid")
+    request_object = _safe_request_for_refusal(request)
+    transition = _recorded_refusal(prior_state, request_object, "compare_and_swap_failed")
+    comment = None
+    comment_id = prior_output.get("prior-comment-id")
+    comment_body = prior_output.get("prior-comment-body")
+    if comment_id:
+        comment = {"id": _decimal(comment_id, "comment_id"), "body": comment_body}
+    _write_transition(output_directory, request, transition, prior_state, comment)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    commands = parser.add_subparsers(dest="operation", required=True)
+    for operation in ("list-run-identities", "claim", "finalize", "cas-failed"):
+        command = commands.add_parser(operation, allow_abbrev=False)
+        command.add_argument("--request-file", type=Path, required=True)
+        command.add_argument("--comments-file", type=Path, required=True)
+        command.add_argument("--output-directory", type=Path, required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = build_parser().parse_args(argv)
+    request = _transport_request(arguments.request_file)
+    if arguments.operation not in {request["operation"], "list-run-identities", "cas-failed"}:
+        raise TransportError("operation_mismatch")
+    if arguments.operation == "list-run-identities":
+        _list_run_identities(request, arguments.comments_file, arguments.output_directory)
+    elif arguments.operation == "cas-failed":
+        _cas_failed(request, arguments.comments_file, arguments.output_directory)
+    else:
+        _run_transition(request, arguments.comments_file, arguments.output_directory)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

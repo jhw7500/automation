@@ -1,0 +1,290 @@
+name: Review invocation budget
+description: Claim and finalize a durable fail-closed review invocation budget
+inputs:
+  github-token:
+    required: true
+  mode:
+    required: true
+  reviewer:
+    required: true
+  pr-number:
+    required: true
+  expected-head-sha:
+    required: true
+  full-diff-sha256:
+    required: true
+  diff-mode:
+    required: true
+  input-files-json:
+    required: true
+  authenticated-review-json:
+    required: true
+  model-route-json:
+    required: true
+  effort:
+    required: true
+  checkpoint-file:
+    required: true
+  actual-call-count:
+    required: false
+    default: '0'
+  elapsed-seconds:
+    required: false
+    default: '0'
+  outcome:
+    required: false
+    default: checkpoint_failure
+  stop-reason:
+    required: false
+    default: ''
+  remaining-finding-ids-json:
+    required: false
+    default: '[]'
+outputs:
+  allow-invocation:
+    value: ${{ steps.budget.outputs.allow-invocation }}
+  decision:
+    value: ${{ steps.budget.outputs.decision }}
+  round:
+    value: ${{ steps.budget.outputs.round }}
+  invocation-key:
+    value: ${{ steps.budget.outputs.invocation-key }}
+  checkpoint-sha256:
+    value: ${{ steps.budget.outputs.checkpoint-sha256 }}
+  comment-id:
+    value: ${{ steps.budget.outputs.comment-id }}
+runs:
+  using: composite
+  steps:
+    - id: budget
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        BUDGET_MODE: ${{ inputs.mode }}
+        REVIEWER: ${{ inputs.reviewer }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+        FULL_DIFF_SHA256: ${{ inputs.full-diff-sha256 }}
+        DIFF_MODE: ${{ inputs.diff-mode }}
+        INPUT_FILES_JSON: ${{ inputs.input-files-json }}
+        AUTHENTICATED_REVIEW_JSON: ${{ inputs.authenticated-review-json }}
+        MODEL_ROUTE_JSON: ${{ inputs.model-route-json }}
+        EFFORT: ${{ inputs.effort }}
+        ACTUAL_CALL_COUNT: ${{ inputs.actual-call-count }}
+        ELAPSED_SECONDS: ${{ inputs.elapsed-seconds }}
+        REVIEW_OUTCOME: ${{ inputs.outcome }}
+        STOP_REASON: ${{ inputs.stop-reason }}
+        REMAINING_FINDING_IDS_JSON: ${{ inputs.remaining-finding-ids-json }}
+        CHECKPOINT_FILE: ${{ inputs.checkpoint-file }}
+      run: |
+        set -euo pipefail
+        umask 077
+        budget_dir="$(mktemp -d "$RUNNER_TEMP/review-budget.XXXXXX")"
+        chmod 0700 "$budget_dir"
+        trap 'rm -rf -- "$budget_dir"' EXIT
+
+        case "$BUDGET_MODE" in
+          claim|finalize) ;;
+          *) exit 2 ;;
+        esac
+        [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || exit 2
+        [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]] || exit 2
+        [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || exit 2
+
+        python3 - "$budget_dir/request.json" \
+          "$BUDGET_MODE" "$GITHUB_REPOSITORY" "$PR_NUMBER" "$REVIEWER" \
+          "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$EXPECTED_HEAD_SHA" \
+          "$FULL_DIFF_SHA256" "$DIFF_MODE" "$INPUT_FILES_JSON" \
+          "$AUTHENTICATED_REVIEW_JSON" "$MODEL_ROUTE_JSON" "$EFFORT" \
+          "$ACTUAL_CALL_COUNT" "$ELAPSED_SECONDS" "$REVIEW_OUTCOME" \
+          "$STOP_REASON" "$REMAINING_FINDING_IDS_JSON" "$CHECKPOINT_FILE" \
+          "$GITHUB_WORKSPACE" "$GITHUB_SERVER_URL" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        names = (
+            "operation", "repository", "pr", "reviewer", "run_id", "run_attempt",
+            "head_sha", "full_diff_sha256", "diff_mode", "input_files_json",
+            "authenticated_review_json", "model_route_json", "effort", "actual_call_count",
+            "elapsed_seconds", "outcome", "stop_reason", "remaining_finding_ids_json",
+            "checkpoint_file", "github_workspace", "server_url",
+        )
+        destination = Path(sys.argv[1])
+        payload = dict(zip(names, sys.argv[2:], strict=True))
+        destination.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
+        destination.chmod(0o600)
+        PY
+
+        gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$budget_dir/pr.json"
+        gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > "$budget_dir/comments.json"
+        gh api --paginate -H 'Accept: application/vnd.github+json' "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/timeline?per_page=100" > "$budget_dir/timeline.json"
+
+        python3 "$GITHUB_ACTION_PATH/review_invocation_budget.py" list-run-identities \
+          --request-file "$budget_dir/request.json" \
+          --comments-file "$budget_dir/comments.json" \
+          --output-directory "$budget_dir"
+
+        while IFS=$'\t' read -r run_id run_attempt; do
+          [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || exit 2
+          [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]] || exit 2
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}" \
+            > "$budget_dir/run-${run_id}-${run_attempt}.json"
+        done < <(python3 - "$budget_dir/run-identities.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        payload = json.loads(Path(sys.argv[1]).read_text())
+        for item in payload["runs"]:
+            print(f'{item["run_id"]}\t{item["run_attempt"]}')
+        PY
+        )
+
+        while IFS=$'\t' read -r actor_index encoded_actor; do
+          [[ "$actor_index" =~ ^[0-9]+$ ]] || exit 2
+          [[ "$encoded_actor" =~ ^[A-Za-z0-9._~%+-]+$ ]] || exit 2
+          gh api "repos/${GITHUB_REPOSITORY}/collaborators/${encoded_actor}/permission" \
+            > "$budget_dir/permission-${actor_index}.json"
+        done < <(python3 - "$budget_dir/run-identities.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        payload = json.loads(Path(sys.argv[1]).read_text())
+        for item in payload["permission_actors"]:
+            print(f'{item["index"]}\t{item["encoded_login"]}')
+        PY
+        )
+
+        python3 "$GITHUB_ACTION_PATH/review_invocation_budget.py" "$BUDGET_MODE" \
+          --request-file "$budget_dir/request.json" \
+          --comments-file "$budget_dir/comments.json" \
+          --output-directory "$budget_dir"
+
+        readarray -t budget_fields < <(python3 - "$budget_dir/output.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        payload = json.loads(Path(sys.argv[1]).read_text())
+        print(payload["mutation"])
+        print(payload["prior-comment-id"])
+        PY
+        )
+        mutation="${budget_fields[0]}"
+        prior_comment_id="${budget_fields[1]}"
+        mutation_response=""
+
+        if [[ "$mutation" != "none" ]]; then
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$budget_dir/cas-pr.json"
+          if [[ "$mutation" == "patch" ]]; then
+            [[ "$prior_comment_id" =~ ^[1-9][0-9]*$ ]] || exit 2
+            gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${prior_comment_id}" \
+              > "$budget_dir/cas-comment.json"
+          elif [[ "$mutation" == "create" ]]; then
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+              > "$budget_dir/cas-comments.json"
+          else
+            exit 2
+          fi
+
+          if ! python3 - "$budget_dir/output.json" "$budget_dir/cas-pr.json" \
+              "$budget_dir/cas-comment.json" "$budget_dir/cas-comments.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        def pages(path):
+            text = path.read_text()
+            decoder = json.JSONDecoder()
+            cursor = 0
+            values = []
+            while cursor < len(text):
+                while cursor < len(text) and text[cursor].isspace():
+                    cursor += 1
+                if cursor == len(text):
+                    break
+                page, cursor = decoder.raw_decode(text, cursor)
+                if not isinstance(page, list):
+                    raise SystemExit(1)
+                values.extend(page)
+            return values
+
+        expected = json.loads(Path(sys.argv[1]).read_text())
+        pull = json.loads(Path(sys.argv[2]).read_text())
+        if pull.get("head", {}).get("sha") != expected["expected-head-sha"]:
+            raise SystemExit(1)
+        if expected["mutation"] == "patch":
+            current = json.loads(Path(sys.argv[3]).read_text())
+            if (
+                current.get("id") != int(expected["prior-comment-id"])
+                or current.get("body") != expected["prior-comment-body"]
+                or current.get("user", {}).get("login") != "github-actions[bot]"
+            ):
+                raise SystemExit(1)
+        else:
+            marker = expected["marker"]
+            if any(
+                isinstance(item, dict) and isinstance(item.get("body"), str)
+                and (item["body"] == marker or item["body"].startswith(marker + "\n"))
+                for item in pages(Path(sys.argv[4]))
+            ):
+                raise SystemExit(1)
+        PY
+          then
+            python3 "$GITHUB_ACTION_PATH/review_invocation_budget.py" cas-failed \
+              --request-file "$budget_dir/request.json" \
+              --comments-file "$budget_dir/comments.json" \
+              --output-directory "$budget_dir"
+            mutation="none"
+          fi
+        fi
+
+        if [[ "$mutation" == "create" ]]; then
+          mutation_response="$budget_dir/mutation.json"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --input "$budget_dir/comment-payload.json" > "$mutation_response"
+        elif [[ "$mutation" == "patch" ]]; then
+          mutation_response="$budget_dir/mutation.json"
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${prior_comment_id}" \
+            --input "$budget_dir/comment-payload.json" > "$mutation_response"
+        fi
+
+        python3 - "$budget_dir/output.json" "$mutation_response" "$GITHUB_OUTPUT" <<'PY'
+        import json
+        import re
+        import sys
+        from pathlib import Path
+
+        output = json.loads(Path(sys.argv[1]).read_text())
+        comment_id = output["comment-id"]
+        if sys.argv[2]:
+            mutation = json.loads(Path(sys.argv[2]).read_text())
+            value = mutation.get("id")
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise SystemExit("invalid mutation comment id")
+            comment_id = str(value)
+        values = {
+            "allow-invocation": output["allow-invocation"],
+            "decision": output["decision"],
+            "round": output["round"],
+            "invocation-key": output["invocation-key"],
+            "checkpoint-sha256": output["checkpoint-sha256"],
+            "comment-id": comment_id,
+        }
+        patterns = {
+            "allow-invocation": r"(?:true|false)",
+            "decision": r"[a-z_]+",
+            "round": r"[0-9]*",
+            "invocation-key": r"[0-9:]*",
+            "checkpoint-sha256": r"[0-9a-f]{64}",
+            "comment-id": r"[0-9]*",
+        }
+        with Path(sys.argv[3]).open("a", encoding="utf-8") as stream:
+            for key, value in values.items():
+                if not isinstance(value, str) or re.fullmatch(patterns[key], value) is None:
+                    raise SystemExit(f"invalid output: {key}")
+                stream.write(f"{key}={value}\n")
+        PY
+        cat -- "$budget_dir/summary.md" >> "$GITHUB_STEP_SUMMARY"
