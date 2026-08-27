@@ -390,6 +390,33 @@ jobs:
           {
             printf 'previous_sha=%s\n' "$PREV_SHA"
             printf 'previous_full_hash=%s\n' "$PREV_FULL_HASH"
+            printf 'authenticated_review_json=%s\n' "$(
+              printf '%s\n' "$PREV_RECORD" | jq -c \
+                --arg previous_sha "$PREV_SHA" \
+                --arg previous_full_hash "$PREV_FULL_HASH" '
+                  def active_finding_ids:
+                    reduce ((.canonical_body // "") | split("\n")[]) as $line
+                      ({active: false, ids: []};
+                        if $line == "### New findings" or $line == "### Still open" then
+                          .active = true
+                        elif ($line | test("^### ")) then
+                          .active = false
+                        elif .active then
+                          (([$line | capture("^#### (?<id>RVW-[0-9a-f]{12}) \\[(CRITICAL|HIGH|MEDIUM)\\] .+$")? | .id] | first) // null) as $id
+                          | if $id != null and (.ids | index($id) == null) and (.ids | length < 8)
+                            then .ids += [$id] else . end
+                        else . end)
+                    | .ids;
+                  if $previous_sha == "" or $previous_full_hash == "" then
+                    {success: false, head_sha: null, full_diff_sha256: null,
+                     remaining_finding_ids: []}
+                  else
+                    {success: true, head_sha: $previous_sha,
+                     full_diff_sha256: $previous_full_hash,
+                     remaining_finding_ids: active_finding_ids}
+                  end
+                '
+            )"
           } >> "$GITHUB_OUTPUT"
 
       - name: Prepare review diff
@@ -403,8 +430,126 @@ jobs:
           context-lines: '20'
           output-directory: ${{ runner.temp }}
 
+      - name: Resolve Gemini budget metadata
+        id: gemini-budget-config
+        if: ${{ always() && steps.pr-details.outcome == 'success' }}
+        shell: bash
+        env:
+          PRIMARY_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.7-flash' }}
+          THINKING_LEVEL: ${{ vars.GEMINI_THINKING_LEVEL || 'medium' }}
+        run: |
+          set -euo pipefail
+          case "$THINKING_LEVEL" in
+            low|medium|high) ;;
+            *) echo "::error::Unsupported Gemini thinking level"; exit 1 ;;
+          esac
+          printf 'model_route_json=%s\n' \
+            "$(jq -cn --arg model "$PRIMARY_MODEL" '[$model]')" >> "$GITHUB_OUTPUT"
+          printf 'effort=%s\n' "$THINKING_LEVEL" >> "$GITHUB_OUTPUT"
+
+      - name: Stage Gemini budget input
+        id: stage-gemini-budget-input
+        if: ${{ always() && steps.pr-details.outcome == 'success' }}
+        shell: bash
+        env:
+          DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}
+          PRODUCER_HEAD_SHA: ${{ steps.prepare-diff.outputs.head-sha }}
+          PRODUCER_FULL_DIFF_SHA256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
+          RUNNER_TEMP_DIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf 'input_files_json=[]\n' >> "$GITHUB_OUTPUT"
+          printf 'staging_directory=\n' >> "$GITHUB_OUTPUT"
+          expected_head_sha=''
+          full_diff_sha256=''
+          if [[ "$DIFF_MODE" == 'full' || "$DIFF_MODE" == 'delta' || "$DIFF_MODE" == 'unchanged' ]]; then
+            expected_head_sha="$PRODUCER_HEAD_SHA"
+            full_diff_sha256="$PRODUCER_FULL_DIFF_SHA256"
+          fi
+          printf 'expected_head_sha=%s\n' "$expected_head_sha" >> "$GITHUB_OUTPUT"
+          printf 'full_diff_sha256=%s\n' "$full_diff_sha256" >> "$GITHUB_OUTPUT"
+          if [[ "$DIFF_MODE" != 'full' && "$DIFF_MODE" != 'delta' ]]; then
+            exit 0
+          fi
+
+          source_file="$RUNNER_TEMP_DIR/review-${DIFF_MODE}.diff"
+          [[ -f "$source_file" && ! -L "$source_file" ]]
+          staging_directory="$(mktemp -d "$GITHUB_WORKSPACE/.gemini-review-budget.XXXXXX")"
+          chmod 0700 "$staging_directory"
+          printf 'staging_directory=%s\n' "$staging_directory" >> "$GITHUB_OUTPUT"
+          staged_file="$staging_directory/review-${DIFF_MODE}.diff"
+          cp -- "$source_file" "$staged_file"
+          chmod 0600 "$staged_file"
+          cmp -s -- "$source_file" "$staged_file"
+          printf 'input_files_json=%s\n' \
+            "$(jq -cn --arg path "$staged_file" '[$path]')" >> "$GITHUB_OUTPUT"
+
+      - name: Claim Gemini review budget
+        id: review-budget-claim
+        if: ${{ always() && steps.pr-details.outcome == 'success' && steps.stage-gemini-budget-input.outcome == 'success' }}
+        uses: $/.github/actions/review-invocation-budget
+        with:
+          github-token: ${{ github.token }}
+          mode: claim
+          reviewer: gemini
+          pr-number: ${{ inputs.pr_number || github.event.pull_request.number }}
+          expected-head-sha: ${{ steps.stage-gemini-budget-input.outputs.expected_head_sha }}
+          full-diff-sha256: ${{ steps.stage-gemini-budget-input.outputs.full_diff_sha256 }}
+          diff-mode: ${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}
+          input-files-json: ${{ steps.stage-gemini-budget-input.outputs.input_files_json }}
+          authenticated-review-json: ${{ steps.pr-details.outputs.authenticated_review_json }}
+          model-route-json: ${{ steps.gemini-budget-config.outputs.model_route_json }}
+          effort: ${{ steps.gemini-budget-config.outputs.effort }}
+          checkpoint-file: ${{ runner.temp }}/gemini-review-budget-claim.json
+
+      - name: Clean Gemini budget input
+        if: ${{ always() }}
+        shell: bash
+        env:
+          STAGING_DIRECTORY: ${{ steps.stage-gemini-budget-input.outputs.staging_directory }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$STAGING_DIRECTORY" ]]; then
+            exit 0
+          fi
+          case "$STAGING_DIRECTORY" in
+            "$GITHUB_WORKSPACE"/.gemini-review-budget.*) ;;
+            *) echo "::error::Refusing unexpected Gemini budget staging path"; exit 1 ;;
+          esac
+          rm -rf -- "$STAGING_DIRECTORY"
+
+      - name: Record Gemini budget claim checkpoint
+        if: ${{ always() && steps.review-budget-claim.outcome == 'success' }}
+        shell: bash
+        env:
+          BUDGET_DECISION: ${{ steps.review-budget-claim.outputs.decision }}
+          BUDGET_ROUND: ${{ steps.review-budget-claim.outputs.round }}
+          BUDGET_CHECKPOINT_SHA256: ${{ steps.review-budget-claim.outputs.checkpoint-sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$BUDGET_DECISION" =~ ^[a-z_]+$ ]]
+          [[ "$BUDGET_ROUND" =~ ^[0-9]*$ ]]
+          [[ "$BUDGET_CHECKPOINT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            printf '### Gemini review budget claim\n\n'
+            printf -- '- Decision: `%s`\n' "$BUDGET_DECISION"
+            printf -- '- Round: `%s`\n' "${BUDGET_ROUND:-none}"
+            printf -- '- Checkpoint SHA-256: `%s`\n' "$BUDGET_CHECKPOINT_SHA256"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Gemini review budget claim checkpoint
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gemini-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gemini-review-budget-claim.json
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: false
+
       - name: Checkout prepared review head
-        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' }}
+        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.prepare-diff.outputs.head-sha }}
@@ -414,7 +559,7 @@ jobs:
 
       - name: Reset Gemini review artifacts
         id: reset-gemini-artifacts
-        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
+        if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
         run: |
           set -euo pipefail
           rm -f -- \
@@ -425,9 +570,29 @@ jobs:
             "$GITHUB_WORKSPACE/gemini_failure_reason.txt" \
             "$GITHUB_WORKSPACE/review_diff_truncated.txt"
 
+      - name: Start Gemini review metrics
+        id: gemini-budget-metrics-start
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        shell: bash
+        env:
+          CALL_COUNT_FILE: ${{ runner.temp }}/gemini_call_count.txt
+          STARTED_AT_FILE: ${{ runner.temp }}/gemini_started_at.txt
+          ELAPSED_SECONDS_FILE: ${{ runner.temp }}/gemini_elapsed_seconds.txt
+          MODEL_ROUTE_FILE: ${{ runner.temp }}/gemini_model_route.json
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '0\n' > "$CALL_COUNT_FILE"
+          printf '%s\n' "$(date +%s)" > "$STARTED_AT_FILE"
+          printf '0\n' > "$ELAPSED_SECONDS_FILE"
+          printf '[]\n' > "$MODEL_ROUTE_FILE"
+          chmod 0600 \
+            "$CALL_COUNT_FILE" "$STARTED_AT_FILE" \
+            "$ELAPSED_SECONDS_FILE" "$MODEL_ROUTE_FILE"
+
       - name: Run Gemini Code Review
         id: gemini-review
-        if: ${{ steps.reset-gemini-artifacts.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
+        if: ${{ steps.reset-gemini-artifacts.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.7-flash' }}
@@ -442,16 +607,23 @@ jobs:
           PR_NUMBER_FILE: ${{ runner.temp }}/pr_number.txt
           PREVIOUS_REVIEW_FILE: ${{ runner.temp }}/prev_review.txt
           HUMAN_COMMENTS_FILE: ${{ runner.temp }}/human_comments.txt
+          GEMINI_CALL_COUNT_FILE: ${{ runner.temp }}/gemini_call_count.txt
+          GEMINI_STARTED_AT_FILE: ${{ runner.temp }}/gemini_started_at.txt
+          GEMINI_ELAPSED_SECONDS_FILE: ${{ runner.temp }}/gemini_elapsed_seconds.txt
+          GEMINI_MODEL_ROUTE_FILE: ${{ runner.temp }}/gemini_model_route.json
         run: |
+          set -euo pipefail
           # Install dependencies
           pip install -q google-genai
 
           # Create Python script for Gemini review
           cat > gemini_review.py << 'PYTHON_EOF'
+          import json
           import os
           import random
           import re
           import time
+          from pathlib import Path
 
           PROCESS_STARTED_AT = time.monotonic()
 
@@ -471,6 +643,80 @@ jobs:
               USING_CURRENT_SDK = False
 
           FAILURE_REASON_FILE = 'gemini_failure_reason.txt'
+
+          class ProviderFailure(RuntimeError):
+              pass
+
+          external_metrics = (
+              'GEMINI_CALL_COUNT_FILE' in os.environ
+              and 'GEMINI_MODEL_ROUTE_FILE' in os.environ
+          )
+          call_count_path = Path(
+              os.environ.get('GEMINI_CALL_COUNT_FILE', 'gemini_call_count.txt')
+          )
+          model_route_path = Path(
+              os.environ.get('GEMINI_MODEL_ROUTE_FILE', 'gemini_model_route.json')
+          )
+
+          def durable_write(path: Path, text: str):
+              temporary = path.with_name(f'.{path.name}.{os.getpid()}.new')
+              flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+              descriptor = os.open(temporary, flags, 0o600)
+              try:
+                  with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+                      stream.write(text)
+                      stream.flush()
+                      os.fsync(stream.fileno())
+                  os.replace(temporary, path)
+                  directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                  try:
+                      os.fsync(directory)
+                  finally:
+                      os.close(directory)
+              finally:
+                  try:
+                      temporary.unlink()
+                  except FileNotFoundError:
+                      pass
+
+          def read_call_count():
+              value = call_count_path.read_text(encoding='ascii').strip()
+              if not re.fullmatch(r'0|[1-9][0-9]*', value):
+                  raise ProviderFailure('call_counter_invalid')
+              return int(value)
+
+          def write_call_count(count):
+              durable_write(call_count_path, f'{count}\n')
+
+          def append_model_route(model):
+              try:
+                  route = json.loads(model_route_path.read_text(encoding='utf-8'))
+              except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                  raise ProviderFailure('model_route_invalid') from error
+              if not isinstance(route, list) or not all(
+                  isinstance(item, str) and item for item in route
+              ):
+                  raise ProviderFailure('model_route_invalid')
+              if model not in route:
+                  route.append(model)
+                  durable_write(
+                      model_route_path,
+                      json.dumps(route, separators=(',', ':')) + '\n',
+                  )
+
+          def counted_generate_content(prompt, model):
+              count = read_call_count()
+              if count >= 3:
+                  raise ProviderFailure('call_budget_exhausted')
+              write_call_count(count + 1)
+              append_model_route(model)
+              return generate_content(prompt, model)
+
+          # Hosted execution always receives workflow-preinitialized private metrics.
+          # Standalone hermetic tests use local files while exercising this same script.
+          if not external_metrics:
+              durable_write(call_count_path, '0\n')
+              durable_write(model_route_path, '[]\n')
 
           def record_failure_reason(reason):
               with open(FAILURE_REASON_FILE, 'w') as f:
@@ -824,6 +1070,11 @@ jobs:
 
           def provider_failure_reason(err):
               message = str(err).lower()
+              if isinstance(err, ProviderFailure):
+                  return message if message in {
+                      'call_budget_exhausted', 'call_counter_invalid',
+                      'model_route_invalid',
+                  } else 'provider_failed'
               if isinstance(err, EmptyModelResponse):
                   return 'empty_output'
               if isinstance(err, TruncatedModelResponse):
@@ -858,7 +1109,7 @@ jobs:
               review_text = ''
               for attempt in range(max_attempts):
                   try:
-                      response = generate_content(prompt, model)
+                      response = counted_generate_content(prompt, model)
                   except Exception as error:
                       if (
                           is_rate_limited(error)
@@ -961,6 +1212,19 @@ jobs:
           review_exit=$?
           review_elapsed=$((SECONDS - review_started_at))
           set -e
+          metrics_started_at_file="${GEMINI_STARTED_AT_FILE:-gemini_started_at.txt}"
+          metrics_elapsed_file="${GEMINI_ELAPSED_SECONDS_FILE:-gemini_elapsed_seconds.txt}"
+          metrics_started_at="$(cat -- "$metrics_started_at_file" 2>/dev/null || printf '0')"
+          metrics_now="$(date +%s)"
+          if [[ "$metrics_started_at" =~ ^[0-9]+$ ]] && (( metrics_now >= metrics_started_at )); then
+            metrics_elapsed="$((metrics_now - metrics_started_at))"
+          else
+            metrics_elapsed='0'
+          fi
+          metrics_elapsed_new="${metrics_elapsed_file}.new"
+          printf '%s\n' "$metrics_elapsed" > "$metrics_elapsed_new"
+          chmod 0600 "$metrics_elapsed_new"
+          mv -f -- "$metrics_elapsed_new" "$metrics_elapsed_file"
           if [ "$review_exit" -eq 124 ] || {
             [ "$review_exit" -eq 137 ] && [ "$review_elapsed" -ge "$GEMINI_REVIEW_PROCESS_TIMEOUT" ]
           }; then
@@ -972,9 +1236,96 @@ jobs:
           printf 'failure_reason=%s\n' "$(cat gemini_failure_reason.txt 2>/dev/null || printf 'provider_failed')" >> "$GITHUB_OUTPUT"
           exit "$review_exit"
 
+      - name: Read Gemini review metrics
+        id: gemini-budget-metrics
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        shell: bash
+        env:
+          CALL_COUNT_FILE: ${{ runner.temp }}/gemini_call_count.txt
+          STARTED_AT_FILE: ${{ runner.temp }}/gemini_started_at.txt
+          ELAPSED_SECONDS_FILE: ${{ runner.temp }}/gemini_elapsed_seconds.txt
+          MODEL_ROUTE_FILE: ${{ runner.temp }}/gemini_model_route.json
+          CONFIGURED_MODEL_ROUTE_JSON: ${{ steps.gemini-budget-config.outputs.model_route_json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import time
+          from pathlib import Path
+
+          def private_regular(path):
+              try:
+                  details = path.lstat()
+              except OSError:
+                  return False
+              return stat.S_ISREG(details.st_mode) and stat.S_IMODE(details.st_mode) == 0o600
+
+          def nonnegative(path):
+              if not private_regular(path):
+                  return None
+              try:
+                  value = path.read_text(encoding='ascii').strip()
+              except (OSError, UnicodeDecodeError):
+                  return None
+              return int(value) if re.fullmatch(r'0|[1-9][0-9]*', value) else None
+
+          call_path = Path(os.environ['CALL_COUNT_FILE'])
+          started_path = Path(os.environ['STARTED_AT_FILE'])
+          elapsed_path = Path(os.environ['ELAPSED_SECONDS_FILE'])
+          route_path = Path(os.environ['MODEL_ROUTE_FILE'])
+          output_path = Path(os.environ['GITHUB_OUTPUT'])
+          with output_path.open('a', encoding='utf-8') as output:
+              output.write('metrics_valid=false\n')
+          call_count = nonnegative(call_path)
+          started_at = nonnegative(started_path)
+          elapsed_seconds = nonnegative(elapsed_path)
+          valid = call_count is not None and started_at is not None and elapsed_seconds is not None
+          if started_at is not None and elapsed_seconds is not None:
+              elapsed_seconds = max(elapsed_seconds, max(int(time.time()) - started_at, 0))
+          try:
+              configured = json.loads(os.environ['CONFIGURED_MODEL_ROUTE_JSON'])
+          except (json.JSONDecodeError, TypeError):
+              configured = None
+              valid = False
+          if not isinstance(configured, list) or len(configured) != 1 or not all(
+              isinstance(item, str) and item for item in configured
+          ):
+              configured = None
+              valid = False
+          try:
+              route = json.loads(route_path.read_text(encoding='utf-8')) if private_regular(route_path) else None
+          except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+              route = None
+          if not isinstance(route, list) or not all(
+              isinstance(item, str) and item for item in route
+          ):
+              route = None
+              valid = False
+          if not valid:
+              raise SystemExit(0)
+          if call_count == 0 and route == []:
+              effective_route = configured
+          elif call_count > 0 and route and route[0] == configured[0]:
+              effective_route = route
+          else:
+              raise SystemExit(0)
+
+          with output_path.open('a', encoding='utf-8') as output:
+              output.write(f"call_count={call_count}\n")
+              output.write(f"elapsed_seconds={elapsed_seconds}\n")
+              output.write(
+                  'model_route_json='
+                  + json.dumps(effective_route, separators=(',', ':')) + '\n'
+              )
+              output.write(f"metrics_valid={'true' if valid else 'false'}\n")
+          PY
+
       - name: Canonicalize Gemini review
         id: canonicalize-review
-        if: ${{ always() && steps.reset-gemini-artifacts.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
+        if: ${{ always() && steps.reset-gemini-artifacts.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
         uses: $/.github/actions/canonicalize-review
         with:
           reviewer: gemini
@@ -988,7 +1339,7 @@ jobs:
           previous-review-file: ${{ steps.pr-details.outputs.previous_sha != '' && format('{0}/gemini-previous-review.md', runner.temp) || '' }}
 
       - name: Upload rejected Gemini review diagnostic
-        if: ${{ always() && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.document-valid != 'true' }}
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.document-valid != 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gemini-review-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1001,7 +1352,8 @@ jobs:
       # 않음). 실패 시 기존 정상 리뷰는 보존한다(교체 금지).
       # !cancelled(): 취소된 런이 정상 sticky를 에러로 덮어쓰지 않게 한다(always()는 취소에도 true).
       - name: Upsert review comment
-        if: ${{ !cancelled() && steps.pr-details.outcome == 'success' }}
+        id: upsert-review-comment
+        if: ${{ !cancelled() && steps.pr-details.outcome == 'success' && (steps.prepare-diff.outputs.diff-ready != 'true' || steps.prepare-diff.outputs.diff-mode == 'unchanged' || steps.review-budget-claim.outputs.allow-invocation == 'true') }}
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
@@ -1029,10 +1381,12 @@ jobs:
           AUTH_MODE: ${{ inputs.repo_write_auth }}
           PUBLISHER_APP_ID: ${{ inputs.publisher_app_id }}
           ACTIONS_TOKEN: ${{ github.token }}
+          BUDGET_ALLOW_INVOCATION: ${{ steps.review-budget-claim.outputs.allow-invocation }}
         with:
           github-token: ${{ steps.auth.outputs.token }}
           script: |
             const fs = require('fs');
+            core.setOutput('published', 'false');
             // 'Get PR details' 스텝의 canonical collection prefix와 반드시 동일하게 유지.
             const header = '## 🔎 Gemini Code Review';
             const marker = '<!-- automation:gemini-auto-review:v3 -->';
@@ -1067,6 +1421,7 @@ jobs:
             const diffTruncated = process.env.DIFF_TRUNCATED === 'true';
             const canonicalOutcome = (process.env.CANONICAL_OUTCOME || '').toLowerCase();
             const documentValid = process.env.DOCUMENT_VALID === 'true';
+            const invocationAllowed = process.env.BUDGET_ALLOW_INVOCATION === 'true';
             const runIdRaw = process.env.RUN_ID || '';
             const runIdIsValid = /^[1-9][0-9]*$/.test(runIdRaw)
               && Number.isSafeInteger(Number(runIdRaw));
@@ -1084,7 +1439,8 @@ jobs:
               'provider_failed', 'quota_exhausted', 'rate_limited', 'authentication_failed',
               'provider_timeout', 'unsupported_location',
               'coverage_input_too_large', 'invalid_input_budget', 'invalid_thinking_level',
-              'empty_output', 'output_truncated',
+              'empty_output', 'output_truncated', 'call_budget_exhausted',
+              'call_counter_invalid', 'model_route_invalid',
             ]);
             const providerFailureReason = allowedFailureReasons.has(reportedFailureReason)
               ? reportedFailureReason : 'provider_failed';
@@ -1281,7 +1637,7 @@ jobs:
               && sha256(existing.state.full_diff_sha256)
               && existing.state.full_diff_sha256 === fullDiffSha256
               && preservedProse.length > 0;
-            const currentSuccess = ok && !diffTruncated && canonicalOutcome === 'success'
+            const currentSuccess = invocationAllowed && ok && !diffTruncated && canonicalOutcome === 'success'
               && documentValid && qualityValid && review.length > 0 && reviewedInputIsValid;
             let checkpointFailed = !(currentSuccess || unchangedInputIsValid);
             let failureReason = !diffReady ? 'diff_unavailable'
@@ -1356,9 +1712,119 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
             }
+            core.setOutput('published', 'true');
             if (checkpointFailed) {
               core.setFailed(`Gemini review checkpoint failed: ${failureReason}`);
             }
+
+      - name: Resolve Gemini budget outcome
+        id: review-budget-outcome
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.gemini-budget-metrics.outputs.metrics_valid == 'true' }}
+        shell: bash
+        env:
+          PROVIDER_OUTCOME: ${{ steps.gemini-review.outcome }}
+          PROVIDER_FAILURE_REASON: ${{ steps.gemini-review.outputs.failure_reason }}
+          CANONICAL_OUTCOME: ${{ steps.canonicalize-review.outcome }}
+          DOCUMENT_VALID: ${{ steps.canonicalize-review.outputs.document-valid }}
+          ACCEPTED_COUNT: ${{ steps.canonicalize-review.outputs.accepted-count }}
+          FILTERED_COUNT: ${{ steps.canonicalize-review.outputs.filtered-count }}
+          UPSERT_OUTCOME: ${{ steps.upsert-review-comment.outcome }}
+          REVIEW_PUBLISHED: ${{ steps.upsert-review-comment.outputs.published }}
+          CALL_COUNT: ${{ steps.gemini-budget-metrics.outputs.call_count }}
+          ELAPSED_SECONDS: ${{ steps.gemini-budget-metrics.outputs.elapsed_seconds }}
+          METRICS_VALID: ${{ steps.gemini-budget-metrics.outputs.metrics_valid }}
+          AUTHENTICATED_REVIEW_JSON: ${{ steps.pr-details.outputs.authenticated_review_json }}
+          CANONICAL_FILE: ${{ github.workspace }}/gemini-review-canonical.md
+        run: |
+          set -euo pipefail
+          outcome='checkpoint_failure'
+          stop_reason='checkpoint_failure'
+          remaining_finding_ids_json="$(
+            jq -c '.remaining_finding_ids' <<< "$AUTHENTICATED_REVIEW_JSON"
+          )"
+
+          if [[ "$METRICS_VALID" != 'true' || ! "$CALL_COUNT" =~ ^[0-9]+$ ]]; then
+            :
+          elif (( CALL_COUNT > 3 )) || [[ "$PROVIDER_FAILURE_REASON" == 'call_budget_exhausted' ]]; then
+            stop_reason='call_budget_exhausted'
+          elif [[ ! "$ELAPSED_SECONDS" =~ ^[0-9]+$ ]]; then
+            :
+          elif (( ELAPSED_SECONDS > 600 )); then
+            outcome='wall_time_exhausted'
+            stop_reason='wall_time_exhausted'
+          elif [[ "$PROVIDER_OUTCOME" == 'failure' ]]; then
+            outcome='provider_failure'
+            stop_reason="${PROVIDER_FAILURE_REASON:-provider_failure}"
+          elif [[ "$PROVIDER_OUTCOME" == 'success' \
+              && "$CANONICAL_OUTCOME" == 'success' \
+              && "$DOCUMENT_VALID" == 'true' \
+              && "$UPSERT_OUTCOME" == 'success' \
+              && "$REVIEW_PUBLISHED" == 'true' \
+              && "$ACCEPTED_COUNT" =~ ^[0-9]+$ \
+              && "$FILTERED_COUNT" =~ ^[0-9]+$ \
+              && -f "$CANONICAL_FILE" && ! -L "$CANONICAL_FILE" ]]; then
+            if (( ACCEPTED_COUNT == 0 && FILTERED_COUNT > 0 )); then
+              outcome='quality_filtered'
+              stop_reason='quality_filtered'
+            else
+              outcome='success'
+              stop_reason='success'
+            fi
+            remaining_finding_ids_json="$(
+              jq -Rsc '
+                reduce (split("\n")[]) as $line
+                  ({active: false, ids: []};
+                    if $line == "### New findings" or $line == "### Still open" then
+                      .active = true
+                    elif ($line | test("^### ")) then
+                      .active = false
+                    elif .active then
+                      (([$line | capture("^#### (?<id>RVW-[0-9a-f]{12}) \\[(CRITICAL|HIGH|MEDIUM)\\] .+$")? | .id] | first) // null) as $id
+                      | if $id != null and (.ids | index($id) == null) and (.ids | length < 8)
+                        then .ids += [$id] else . end
+                    else . end)
+                | .ids
+              ' "$CANONICAL_FILE"
+            )"
+          fi
+
+          printf 'outcome=%s\n' "$outcome" >> "$GITHUB_OUTPUT"
+          printf 'stop_reason=%s\n' "$stop_reason" >> "$GITHUB_OUTPUT"
+          printf 'remaining_finding_ids_json=%s\n' \
+            "$remaining_finding_ids_json" >> "$GITHUB_OUTPUT"
+
+      - name: Finalize Gemini review budget
+        id: review-budget-finalize
+        if: ${{ always() && !cancelled() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.gemini-budget-metrics.outputs.metrics_valid == 'true' }}
+        uses: $/.github/actions/review-invocation-budget
+        with:
+          github-token: ${{ github.token }}
+          mode: finalize
+          reviewer: gemini
+          pr-number: ${{ inputs.pr_number || github.event.pull_request.number }}
+          expected-head-sha: ${{ steps.prepare-diff.outputs.head-sha }}
+          full-diff-sha256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
+          diff-mode: ${{ steps.prepare-diff.outputs.diff-mode }}
+          input-files-json: '[]'
+          authenticated-review-json: ${{ steps.pr-details.outputs.authenticated_review_json }}
+          model-route-json: ${{ steps.gemini-budget-metrics.outputs.model_route_json }}
+          effort: ${{ steps.gemini-budget-config.outputs.effort }}
+          actual-call-count: ${{ steps.gemini-budget-metrics.outputs.call_count }}
+          elapsed-seconds: ${{ steps.gemini-budget-metrics.outputs.elapsed_seconds }}
+          outcome: ${{ steps.review-budget-outcome.outputs.outcome }}
+          stop-reason: ${{ steps.review-budget-outcome.outputs.stop_reason }}
+          remaining-finding-ids-json: ${{ steps.review-budget-outcome.outputs.remaining_finding_ids_json }}
+          checkpoint-file: ${{ runner.temp }}/gemini-review-budget-final.json
+
+      - name: Upload Gemini review budget final checkpoint
+        if: ${{ always() && !cancelled() && steps.review-budget-finalize.outcome != 'skipped' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gemini-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gemini-review-budget-final.json
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: false
 
   skipped:
     permissions: {}

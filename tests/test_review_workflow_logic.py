@@ -703,6 +703,10 @@ def test_claude_v2_is_display_only_and_cannot_enable_incremental_input(tmp_path)
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": "",
         "previous_full_hash": "",
+        "authenticated_review_json": (
+            '{"success":false,"head_sha":null,"full_diff_sha256":null,'
+            '"remaining_finding_ids":[]}'
+        ),
     }
     assert not (tmp_path / "claude-previous-review.md").exists()
 
@@ -717,6 +721,15 @@ def test_claude_v3_collects_authenticated_pair_and_exact_canonical_body(tmp_path
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": head,
         "previous_full_hash": "12" * 32,
+        "authenticated_review_json": json.dumps(
+            {
+                "success": True,
+                "head_sha": head,
+                "full_diff_sha256": "12" * 32,
+                "remaining_finding_ids": [],
+            },
+            separators=(",", ":"),
+        ),
     }
     assert (tmp_path / "claude-previous-review.md").read_bytes() == canonical.encode()
     assert context is not None and "### New findings" in context
@@ -1217,7 +1230,1044 @@ def test_collect_leaves_diff_preparation_to_shared_action(tmp_path):
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": "",
         "previous_full_hash": "",
+        "authenticated_review_json": (
+            '{"success":false,"head_sha":null,"full_diff_sha256":null,'
+            '"remaining_finding_ids":[]}'
+        ),
     }
+
+
+def test_claude_budget_authenticated_review_uses_only_bounded_active_canonical_ids(
+    tmp_path,
+):
+    head = "ab" * 20
+    active_ids = [f"RVW-{index:012x}" for index in range(10)]
+    canonical = (
+        "### New findings\n\n"
+        + "\n".join(
+            f"#### {finding_id} [HIGH] Finding {index}"
+            for index, finding_id in enumerate(active_ids)
+        )
+        + f"\n#### {active_ids[0]} [HIGH] Duplicate\n"
+        + "\n### Resolved\n\n#### RVW-ffffffffffff [HIGH] Fixed\n"
+    )
+    trusted = _bot(
+        "github-actions[bot]",
+        _v3_body(_v3_state(head=head), canonical),
+        1,
+    )
+    forged = _bot(
+        "foreign-reviewer[bot]",
+        _v3_body(
+            _v3_state(run_id=99, head=head),
+            "### Still open\n\n#### RVW-eeeeeeeeeeee [HIGH] Forged",
+        ),
+        2,
+    )
+
+    _run_collect(tmp_path, [trusted, forged])
+    authenticated = json.loads(
+        _github_outputs(tmp_path / "github-output")["authenticated_review_json"]
+    )
+
+    assert authenticated == {
+        "success": True,
+        "head_sha": head,
+        "full_diff_sha256": "12" * 32,
+        "remaining_finding_ids": active_ids[:8],
+    }
+
+
+def test_claude_budget_claim_is_durable_before_provider_and_every_model_path_is_guarded():
+    workflow = _load("claude-code-review.yml")
+    job = workflow["jobs"]["claude-review"]
+    steps = job["steps"]
+    names = [step.get("name") for step in steps]
+    allow = "steps.review-budget-claim.outputs.allow-invocation == 'true'"
+
+    assert names.index("Prepare review diff") < names.index("Claim Claude review budget")
+    assert names.index("Claim Claude review budget") < names.index("Checkout prepared review head")
+    assert names.index("Claim Claude review budget") < names.index("Run Claude Code Review")
+    assert names.index("Start Claude review metrics") < names.index("Run Claude Code Review")
+    assert allow in _step(workflow, "claude-review", "Checkout prepared review head")["if"]
+    assert allow in _step(workflow, "claude-review", "Reset Claude review artifacts")["if"]
+    assert allow in _step(workflow, "claude-review", "Start Claude review metrics")["if"]
+    assert allow in _step(workflow, "claude-review", "Run Claude Code Review")["if"]
+    assert allow in _step(workflow, "claude-review", "Canonicalize Claude review")["if"]
+    assert job["timeout-minutes"] == "10"
+    assert job["permissions"] == {
+        "actions": "read",
+        "contents": "read",
+        "pull-requests": "write",
+        "issues": "read",
+        "id-token": "write",
+    }
+    claim = _step(workflow, "claude-review", "Claim Claude review budget")
+    assert claim["if"] == (
+        "${{ always() && steps.prepare-review-input.outcome == 'success' "
+        "&& steps.stage-claude-budget-input.outcome == 'success' }}"
+    )
+    assert claim["with"] == {
+        "github-token": "${{ github.token }}",
+        "mode": "claim",
+        "reviewer": "claude",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number }}",
+        "expected-head-sha": (
+            "${{ steps.stage-claude-budget-input.outputs.expected_head_sha }}"
+        ),
+        "full-diff-sha256": (
+            "${{ steps.stage-claude-budget-input.outputs.full_diff_sha256 }}"
+        ),
+        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}",
+        "input-files-json": (
+            "${{ steps.stage-claude-budget-input.outputs.input_files_json }}"
+        ),
+        "authenticated-review-json": (
+            "${{ steps.prepare-review-input.outputs.authenticated_review_json }}"
+        ),
+        "model-route-json": "${{ steps.claude-budget-config.outputs.model_route_json }}",
+        "effort": "final-review/default",
+        "checkpoint-file": "${{ runner.temp }}/claude-review-budget-claim.json",
+    }
+    record = _step(
+        workflow, "claude-review", "Record Claude budget claim checkpoint"
+    )
+    assert record["env"] == {
+        "BUDGET_DECISION": "${{ steps.review-budget-claim.outputs.decision }}",
+        "BUDGET_ROUND": "${{ steps.review-budget-claim.outputs.round }}",
+        "BUDGET_CHECKPOINT_SHA256": (
+            "${{ steps.review-budget-claim.outputs.checkpoint-sha256 }}"
+        ),
+    }
+
+
+def test_claude_budget_model_metadata_is_inert_valid_json(tmp_path):
+    step = _step(
+        _load("claude-code-review.yml"), "claude-review", "Resolve Claude budget metadata"
+    )
+    output = tmp_path / "github-output"
+    configured = 'claude-"quoted"; $(touch must-not-exist)'
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "CONFIGURED_MODEL": configured,
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(_github_outputs(output)["model_route_json"]) == [configured]
+    assert not (tmp_path / "must-not-exist").exists()
+    assert "jq -cn --arg model" in step["run"]
+
+
+def test_claude_budget_stages_workspace_input_and_cleans_it_immediately_after_claim():
+    workflow = _load("claude-code-review.yml")
+    steps = workflow["jobs"]["claude-review"]["steps"]
+    names = [step.get("name") for step in steps]
+    stage = _step(workflow, "claude-review", "Stage Claude budget input")
+    claim = _step(workflow, "claude-review", "Claim Claude review budget")
+    cleanup = _step(workflow, "claude-review", "Clean Claude budget input")
+
+    assert names.index("Stage Claude budget input") < names.index("Claim Claude review budget")
+    assert names.index("Clean Claude budget input") == names.index("Claim Claude review budget") + 1
+    assert names.index("Clean Claude budget input") < names.index("Checkout prepared review head")
+    assert 'mktemp -d "$GITHUB_WORKSPACE/' in stage["run"]
+    assert "chmod 0700" in stage["run"]
+    assert "chmod 0600" in stage["run"]
+    assert "jq -cn --arg path" in stage["run"]
+    assert claim["with"]["input-files-json"] == (
+        "${{ steps.stage-claude-budget-input.outputs.input_files_json }}"
+    )
+    assert claim["with"]["diff-mode"] == (
+        "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}"
+    )
+    assert cleanup["if"] == "${{ always() }}"
+
+
+@pytest.mark.parametrize("failure", ("missing_source", "copy_failure", "output_failure"))
+def test_claude_budget_staging_failure_cannot_claim_or_start_provider(
+    tmp_path, failure,
+):
+    workflow = _load("claude-code-review.yml")
+    stage = _step(workflow, "claude-review", "Stage Claude budget input")
+    claim = _step(workflow, "claude-review", "Claim Claude review budget")
+    provider = _step(workflow, "claude-review", "Run Claude Code Review")
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    source = runner_temp / "review-full.diff"
+    if failure != "missing_source":
+        source.write_bytes(b"diff")
+    output = tmp_path / "github-output"
+    path = os.environ["PATH"]
+    if failure == "copy_failure":
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        copy = bin_dir / "cp"
+        copy.write_text("#!/bin/sh\nexit 19\n", encoding="utf-8")
+        copy.chmod(0o755)
+        path = f"{bin_dir}:{path}"
+    elif failure == "output_failure":
+        output.mkdir()
+
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "PATH": path,
+            "DIFF_MODE": "full",
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "steps.stage-claude-budget-input.outcome == 'success'" in claim["if"]
+    assert "steps.review-budget-claim.outputs.allow-invocation == 'true'" in provider["if"]
+
+
+@pytest.mark.parametrize("diff_mode", ("full", "delta"))
+def test_claude_budget_staged_input_is_byte_exact_private_and_removed(tmp_path, diff_mode):
+    workflow = _load("claude-code-review.yml")
+    stage = _step(workflow, "claude-review", "Stage Claude budget input")
+    cleanup = _step(workflow, "claude-review", "Clean Claude budget input")
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    source = runner_temp / f"review-{diff_mode}.diff"
+    source.write_bytes(b"binary\x00diff\nbytes\xff")
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "DIFF_MODE": diff_mode,
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = _github_outputs(output)
+    staged = Path(json.loads(outputs["input_files_json"])[0])
+    staging_directory = Path(outputs["staging_directory"])
+    assert outputs["expected_head_sha"] == "ab" * 20
+    assert outputs["full_diff_sha256"] == "12" * 32
+    assert staged.read_bytes() == source.read_bytes()
+    assert staging_directory.parent == workspace
+    assert staging_directory.stat().st_mode & 0o777 == 0o700
+    assert staged.stat().st_mode & 0o777 == 0o600
+
+    clean_result = subprocess.run(
+        ["bash", "-c", cleanup["run"]],
+        env={
+            **os.environ,
+            "GITHUB_WORKSPACE": str(workspace),
+            "STAGING_DIRECTORY": str(staging_directory),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert clean_result.returncode == 0, clean_result.stderr
+    assert not staging_directory.exists()
+
+
+@pytest.mark.parametrize(
+    ("diff_mode", "expected_head", "expected_hash"),
+    (
+        ("unchanged", "ab" * 20, "12" * 32),
+        ("unavailable", "", ""),
+    ),
+)
+def test_claude_budget_non_provider_modes_normalize_identity_without_staging(
+    tmp_path, diff_mode, expected_head, expected_hash,
+):
+    stage = _step(
+        _load("claude-code-review.yml"), "claude-review", "Stage Claude budget input"
+    )
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    output = tmp_path / "github-output"
+
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "DIFF_MODE": diff_mode,
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _github_outputs(output) == {
+        "input_files_json": "[]",
+        "staging_directory": "",
+        "expected_head_sha": expected_head,
+        "full_diff_sha256": expected_hash,
+    }
+    assert list(workspace.iterdir()) == []
+
+    claim = _step(
+        _load("claude-code-review.yml"), "claude-review", "Claim Claude review budget"
+    )
+    assert claim["with"]["expected-head-sha"] == (
+        "${{ steps.stage-claude-budget-input.outputs.expected_head_sha }}"
+    )
+    assert claim["with"]["full-diff-sha256"] == (
+        "${{ steps.stage-claude-budget-input.outputs.full_diff_sha256 }}"
+    )
+
+
+def test_claude_budget_preserves_zero_call_unchanged_and_denied_claim_cannot_publish_success():
+    workflow = _load("claude-code-review.yml")
+    provider = _step(workflow, "claude-review", "Run Claude Code Review")
+    upsert = _step(workflow, "claude-review", "Upsert review comment")
+
+    assert "diff-mode != 'unchanged'" in provider["if"]
+    assert "allow-invocation == 'true'" in provider["if"]
+    assert "diff-mode == 'unchanged'" in upsert["if"]
+    assert "allow-invocation == 'true'" in upsert["if"]
+    assert "BUDGET_ALLOW_INVOCATION" in upsert["env"]
+    assert "invocationAllowed && ok" in upsert["with"]["script"]
+
+
+def test_claude_budget_finalizes_after_review_state_upsert_and_uploads_both_checkpoints():
+    workflow = _load("claude-code-review.yml")
+    steps = workflow["jobs"]["claude-review"]["steps"]
+    names = [step.get("name") for step in steps]
+    finalize = _step(workflow, "claude-review", "Finalize Claude review budget")
+
+    assert names.index("Upsert review comment") < names.index("Finalize Claude review budget")
+    assert finalize["if"] == (
+        "${{ always() && !cancelled() "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+        "&& steps.claude-budget-metrics.outputs.metrics_valid == 'true' }}"
+    )
+    assert finalize["uses"] == "$/.github/actions/review-invocation-budget"
+    assert finalize["with"] == {
+        "github-token": "${{ github.token }}",
+        "mode": "finalize",
+        "reviewer": "claude",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number }}",
+        "expected-head-sha": "${{ steps.prepare-diff.outputs.head-sha }}",
+        "full-diff-sha256": "${{ steps.prepare-diff.outputs.full-diff-sha256 }}",
+        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
+        "input-files-json": "[]",
+        "authenticated-review-json": (
+            "${{ steps.prepare-review-input.outputs.authenticated_review_json }}"
+        ),
+        "model-route-json": "${{ steps.claude-budget-metrics.outputs.model_route_json }}",
+        "effort": "final-review/default",
+        "actual-call-count": "${{ steps.claude-budget-metrics.outputs.call_count }}",
+        "elapsed-seconds": "${{ steps.claude-budget-metrics.outputs.elapsed_seconds }}",
+        "outcome": "${{ steps.review-budget-outcome.outputs.outcome }}",
+        "stop-reason": "${{ steps.review-budget-outcome.outputs.stop_reason }}",
+        "remaining-finding-ids-json": (
+            "${{ steps.review-budget-outcome.outputs.remaining_finding_ids_json }}"
+        ),
+        "checkpoint-file": "${{ runner.temp }}/claude-review-budget-final.json",
+    }
+
+    uploads = [
+        step for step in steps
+        if step.get("uses")
+        == "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        and "review-budget" in step.get("with", {}).get("name", "")
+    ]
+    assert {step["with"]["name"] for step in uploads} == {
+        "claude-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}",
+        "claude-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
+    }
+    assert all("!cancelled()" in step["if"] for step in uploads)
+
+
+@pytest.mark.parametrize(
+    ("call_count", "elapsed_seconds", "model_route_json"),
+    (
+        ("", "5", '["claude-code-action-default"]'),
+        ("1", "malformed", '["claude-code-action-default"]'),
+        ("1", "5", "not-json"),
+    ),
+)
+def test_claude_budget_invalid_metrics_expose_only_explicit_invalidity(
+    tmp_path, call_count, elapsed_seconds, model_route_json,
+):
+    step = _step(
+        _load("claude-code-review.yml"),
+        "claude-review",
+        "Validate Claude review metrics",
+    )
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={
+            **os.environ,
+            "CALL_COUNT": call_count,
+            "ELAPSED_SECONDS": elapsed_seconds,
+            "MODEL_ROUTE_JSON": model_route_json,
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _github_outputs(output) == {"metrics_valid": "false"}
+
+
+def test_claude_budget_elapsed_measurement_depends_on_initialized_metrics():
+    workflow = _load("claude-code-review.yml")
+    elapsed = _step(workflow, "claude-review", "Capture Claude elapsed time")
+
+    assert elapsed["if"] == (
+        "${{ always() && "
+        "steps.claude-budget-metrics-start.outcome == 'success' }}"
+    )
+    assert elapsed["env"]["STARTED_AT"] == (
+        "${{ steps.claude-budget-metrics-start.outputs.started_at }}"
+    )
+
+
+def test_claude_budget_finalize_requires_canonical_valid_metrics_without_fallbacks():
+    workflow = _load("claude-code-review.yml")
+    outcome = _step(workflow, "claude-review", "Resolve Claude budget outcome")
+    finalize = _step(workflow, "claude-review", "Finalize Claude review budget")
+    validity = "steps.claude-budget-metrics.outputs.metrics_valid == 'true'"
+    assert validity in outcome["if"]
+    assert validity in finalize["if"]
+    assert finalize["with"]["actual-call-count"] == (
+        "${{ steps.claude-budget-metrics.outputs.call_count }}"
+    )
+    assert finalize["with"]["elapsed-seconds"] == (
+        "${{ steps.claude-budget-metrics.outputs.elapsed_seconds }}"
+    )
+    assert finalize["with"]["model-route-json"] == (
+        "${{ steps.claude-budget-metrics.outputs.model_route_json }}"
+    )
+    assert "||" not in finalize["with"]["actual-call-count"]
+    assert "||" not in finalize["with"]["elapsed-seconds"]
+
+
+def test_claude_budget_outcome_is_deterministic_and_has_no_provider_fallback():
+    workflow = _load("claude-code-review.yml")
+    step = _step(workflow, "claude-review", "Resolve Claude budget outcome")
+    upsert = _step(workflow, "claude-review", "Upsert review comment")
+    run = step["run"]
+
+    for outcome in (
+        "success", "quality_filtered", "provider_failure",
+        "checkpoint_failure", "wall_time_exhausted",
+    ):
+        assert outcome in run
+    assert "remaining_finding_ids_json" in run
+    assert "RVW-[0-9a-f]{12}" in run
+    assert "fallback" not in run.lower()
+    assert "REVIEW_PUBLISHED" in step["env"]
+    assert "core.setOutput('published', 'false')" in upsert["with"]["script"]
+    assert "core.setOutput('published', 'true')" in upsert["with"]["script"]
+
+
+@pytest.mark.parametrize(
+    (
+        "provider_outcome", "canonical_outcome", "document_valid",
+        "accepted_count", "filtered_count", "published", "elapsed_seconds",
+        "expected_outcome", "expected_remaining",
+    ),
+    (
+        ("success", "success", "true", "1", "0", "true", "5", "success", ["RVW-111111111111"]),
+        ("success", "success", "true", "0", "2", "true", "5", "quality_filtered", []),
+        ("failure", "failure", "false", "", "", "false", "5", "provider_failure", ["RVW-aaaaaaaaaaaa"]),
+        ("success", "success", "true", "1", "0", "false", "5", "checkpoint_failure", ["RVW-aaaaaaaaaaaa"]),
+        ("success", "success", "true", "1", "0", "true", "601", "wall_time_exhausted", ["RVW-aaaaaaaaaaaa"]),
+    ),
+)
+def test_claude_budget_outcome_mapping_and_remaining_ids_are_reproducible(
+    tmp_path,
+    provider_outcome,
+    canonical_outcome,
+    document_valid,
+    accepted_count,
+    filtered_count,
+    published,
+    elapsed_seconds,
+    expected_outcome,
+    expected_remaining,
+):
+    step = _step(
+        _load("claude-code-review.yml"), "claude-review", "Resolve Claude budget outcome"
+    )
+    canonical_file = tmp_path / "claude-review-canonical.md"
+    canonical_body = "### New findings\n\nNone\n"
+    if accepted_count == "1":
+        canonical_body = (
+            "### New findings\n\n#### RVW-111111111111 [HIGH] Current\n"
+            "\n### Resolved\n\n#### RVW-222222222222 [HIGH] Fixed\n"
+        )
+    canonical_file.write_text(canonical_body, encoding="utf-8")
+    output = tmp_path / "github-output"
+    authenticated = json.dumps(
+        {
+            "success": True,
+            "head_sha": "ab" * 20,
+            "full_diff_sha256": "12" * 32,
+            "remaining_finding_ids": ["RVW-aaaaaaaaaaaa"],
+        },
+        separators=(",", ":"),
+    )
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={
+            **os.environ,
+            "PROVIDER_OUTCOME": provider_outcome,
+            "CANONICAL_OUTCOME": canonical_outcome,
+            "DOCUMENT_VALID": document_valid,
+            "ACCEPTED_COUNT": accepted_count,
+            "FILTERED_COUNT": filtered_count,
+            "UPSERT_OUTCOME": "success",
+            "REVIEW_PUBLISHED": published,
+            "ELAPSED_SECONDS": elapsed_seconds,
+            "AUTHENTICATED_REVIEW_JSON": authenticated,
+            "CANONICAL_FILE": str(canonical_file),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = _github_outputs(output)
+    assert outputs["outcome"] == expected_outcome
+    assert outputs["stop_reason"] == expected_outcome
+    assert json.loads(outputs["remaining_finding_ids_json"]) == expected_remaining
+
+
+def test_gemini_budget_authenticated_review_uses_only_bounded_active_canonical_ids(
+    tmp_path,
+):
+    head = "ab" * 20
+    active_ids = [f"RVW-{index:012x}" for index in range(10)]
+    canonical = (
+        "### New findings\n\n"
+        + "\n".join(
+            f"#### {finding_id} [HIGH] Finding {index}"
+            for index, finding_id in enumerate(active_ids)
+        )
+        + f"\n#### {active_ids[0]} [HIGH] Duplicate\n"
+        + "\n### Resolved\n\n#### RVW-ffffffffffff [HIGH] Fixed\n"
+    )
+    sticky = _v3_body(
+        _v3_state(reviewer="gemini", head=head),
+        canonical,
+        marker=GEMINI_V3_MARKER,
+        header=GEMINI_HEADER,
+    )
+
+    _previous, outputs = _run_gemini_details(
+        tmp_path, [_bot("github-actions[bot]", sticky)], head_sha=head
+    )
+
+    assert json.loads(outputs["authenticated_review_json"]) == {
+        "success": True,
+        "head_sha": head,
+        "full_diff_sha256": "12" * 32,
+        "remaining_finding_ids": active_ids[:8],
+    }
+
+
+def test_gemini_budget_claim_precedes_provider_and_guards_every_new_diff_path():
+    workflow = _load("gemini-auto-review.yml")
+    job = workflow["jobs"]["gemini-review"]
+    steps = job["steps"]
+    names = [step.get("name") for step in steps]
+    allow = "steps.review-budget-claim.outputs.allow-invocation == 'true'"
+
+    assert names.index("Prepare review diff") < names.index("Claim Gemini review budget")
+    assert names.index("Claim Gemini review budget") < names.index(
+        "Checkout prepared review head"
+    )
+    assert names.index("Claim Gemini review budget") < names.index(
+        "Run Gemini Code Review"
+    )
+    assert names.index("Start Gemini review metrics") < names.index(
+        "Run Gemini Code Review"
+    )
+    for step_name in (
+        "Checkout prepared review head",
+        "Reset Gemini review artifacts",
+        "Start Gemini review metrics",
+        "Run Gemini Code Review",
+        "Canonicalize Gemini review",
+        "Upload rejected Gemini review diagnostic",
+    ):
+        assert allow in _step(workflow, "gemini-review", step_name)["if"]
+    upsert = _step(workflow, "gemini-review", "Upsert review comment")
+    assert "diff-mode == 'unchanged'" in upsert["if"]
+    assert allow in upsert["if"]
+    assert "BUDGET_ALLOW_INVOCATION" in upsert["env"]
+    assert "invocationAllowed && ok" in upsert["with"]["script"]
+    assert "core.setOutput('published', 'false')" in upsert["with"]["script"]
+    assert "core.setOutput('published', 'true')" in upsert["with"]["script"]
+    assert job["timeout-minutes"] == "10"
+
+    claim = _step(workflow, "gemini-review", "Claim Gemini review budget")
+    assert claim["if"] == (
+        "${{ always() && steps.pr-details.outcome == 'success' "
+        "&& steps.stage-gemini-budget-input.outcome == 'success' }}"
+    )
+    assert claim["with"] == {
+        "github-token": "${{ github.token }}",
+        "mode": "claim",
+        "reviewer": "gemini",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number }}",
+        "expected-head-sha": (
+            "${{ steps.stage-gemini-budget-input.outputs.expected_head_sha }}"
+        ),
+        "full-diff-sha256": (
+            "${{ steps.stage-gemini-budget-input.outputs.full_diff_sha256 }}"
+        ),
+        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}",
+        "input-files-json": (
+            "${{ steps.stage-gemini-budget-input.outputs.input_files_json }}"
+        ),
+        "authenticated-review-json": (
+            "${{ steps.pr-details.outputs.authenticated_review_json }}"
+        ),
+        "model-route-json": (
+            "${{ steps.gemini-budget-config.outputs.model_route_json }}"
+        ),
+        "effort": "${{ steps.gemini-budget-config.outputs.effort }}",
+        "checkpoint-file": "${{ runner.temp }}/gemini-review-budget-claim.json",
+    }
+
+
+def test_gemini_budget_metadata_is_inert_valid_json_and_bounded_effort(tmp_path):
+    step = _step(
+        _load("gemini-auto-review.yml"),
+        "gemini-review",
+        "Resolve Gemini budget metadata",
+    )
+    output = tmp_path / "github-output"
+    configured = 'gemini-"quoted"; $(touch must-not-exist)'
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PRIMARY_MODEL": configured,
+            "THINKING_LEVEL": "high",
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(_github_outputs(output)["model_route_json"]) == [configured]
+    assert _github_outputs(output)["effort"] == "high"
+    assert not (tmp_path / "must-not-exist").exists()
+    assert "jq -cn --arg model" in step["run"]
+
+
+@pytest.mark.parametrize("diff_mode", ("full", "delta"))
+def test_gemini_budget_staged_input_is_byte_exact_private_and_removed(
+    tmp_path, diff_mode,
+):
+    workflow = _load("gemini-auto-review.yml")
+    stage = _step(workflow, "gemini-review", "Stage Gemini budget input")
+    cleanup = _step(workflow, "gemini-review", "Clean Gemini budget input")
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    source = runner_temp / f"review-{diff_mode}.diff"
+    source.write_bytes(b"binary\x00diff\nbytes\xff")
+    output = tmp_path / "github-output"
+
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "DIFF_MODE": diff_mode,
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = _github_outputs(output)
+    staged = Path(json.loads(outputs["input_files_json"])[0])
+    staging_directory = Path(outputs["staging_directory"])
+    assert staged.read_bytes() == source.read_bytes()
+    assert staging_directory.parent == workspace
+    assert staging_directory.stat().st_mode & 0o777 == 0o700
+    assert staged.stat().st_mode & 0o777 == 0o600
+
+    clean_result = subprocess.run(
+        ["bash", "-c", cleanup["run"]],
+        env={
+            **os.environ,
+            "GITHUB_WORKSPACE": str(workspace),
+            "STAGING_DIRECTORY": str(staging_directory),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert clean_result.returncode == 0, clean_result.stderr
+    assert not staging_directory.exists()
+
+
+@pytest.mark.parametrize("failure", ("missing_source", "copy_failure", "output_failure"))
+def test_gemini_budget_staging_failure_cannot_claim_or_start_provider(
+    tmp_path, failure,
+):
+    workflow = _load("gemini-auto-review.yml")
+    stage = _step(workflow, "gemini-review", "Stage Gemini budget input")
+    claim = _step(workflow, "gemini-review", "Claim Gemini review budget")
+    provider = _step(workflow, "gemini-review", "Run Gemini Code Review")
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    source = runner_temp / "review-full.diff"
+    if failure != "missing_source":
+        source.write_bytes(b"diff")
+    output = tmp_path / "github-output"
+    path = os.environ["PATH"]
+    if failure == "copy_failure":
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        copy = bin_dir / "cp"
+        copy.write_text("#!/bin/sh\nexit 19\n", encoding="utf-8")
+        copy.chmod(0o755)
+        path = f"{bin_dir}:{path}"
+    elif failure == "output_failure":
+        output.mkdir()
+
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "PATH": path,
+            "DIFF_MODE": "full",
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "steps.stage-gemini-budget-input.outcome == 'success'" in claim["if"]
+    assert "steps.review-budget-claim.outputs.allow-invocation == 'true'" in provider["if"]
+
+
+@pytest.mark.parametrize(
+    ("diff_mode", "expected_head", "expected_hash"),
+    (("unchanged", "ab" * 20, "12" * 32), ("unavailable", "", "")),
+)
+def test_gemini_budget_non_provider_modes_normalize_identity_without_staging(
+    tmp_path, diff_mode, expected_head, expected_hash,
+):
+    stage = _step(
+        _load("gemini-auto-review.yml"), "gemini-review", "Stage Gemini budget input"
+    )
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    output = tmp_path / "github-output"
+
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "DIFF_MODE": diff_mode,
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _github_outputs(output) == {
+        "input_files_json": "[]",
+        "staging_directory": "",
+        "expected_head_sha": expected_head,
+        "full_diff_sha256": expected_hash,
+    }
+    assert list(workspace.iterdir()) == []
+
+
+def test_gemini_budget_finalizes_after_upsert_with_actual_metrics_and_artifacts():
+    workflow = _load("gemini-auto-review.yml")
+    steps = workflow["jobs"]["gemini-review"]["steps"]
+    names = [step.get("name") for step in steps]
+    finalize = _step(workflow, "gemini-review", "Finalize Gemini review budget")
+
+    assert names.index("Upsert review comment") < names.index(
+        "Finalize Gemini review budget"
+    )
+    assert finalize["if"] == (
+        "${{ always() && !cancelled() "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+        "&& steps.gemini-budget-metrics.outputs.metrics_valid == 'true' }}"
+    )
+    assert finalize["uses"] == "$/.github/actions/review-invocation-budget"
+    assert finalize["with"]["actual-call-count"] == (
+        "${{ steps.gemini-budget-metrics.outputs.call_count }}"
+    )
+    assert finalize["with"]["elapsed-seconds"] == (
+        "${{ steps.gemini-budget-metrics.outputs.elapsed_seconds }}"
+    )
+    assert finalize["with"]["model-route-json"] == (
+        "${{ steps.gemini-budget-metrics.outputs.model_route_json }}"
+    )
+    assert finalize["with"]["outcome"] == (
+        "${{ steps.review-budget-outcome.outputs.outcome }}"
+    )
+    assert finalize["with"]["remaining-finding-ids-json"] == (
+        "${{ steps.review-budget-outcome.outputs.remaining_finding_ids_json }}"
+    )
+
+    uploads = [
+        step for step in steps
+        if step.get("uses")
+        == "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        and "review-budget" in step.get("with", {}).get("name", "")
+    ]
+    assert {step["with"]["name"] for step in uploads} == {
+        "gemini-review-budget-claim-${{ github.run_id }}-${{ github.run_attempt }}",
+        "gemini-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
+    }
+    assert all("!cancelled()" in step["if"] for step in uploads)
+
+
+def test_gemini_budget_zero_call_metrics_retain_claimed_primary_route(tmp_path):
+    workflow = _load("gemini-auto-review.yml")
+    start = _step(workflow, "gemini-review", "Start Gemini review metrics")
+    read = _step(workflow, "gemini-review", "Read Gemini review metrics")
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    paths = {
+        "CALL_COUNT_FILE": runner_temp / "gemini_call_count.txt",
+        "STARTED_AT_FILE": runner_temp / "gemini_started_at.txt",
+        "ELAPSED_SECONDS_FILE": runner_temp / "gemini_elapsed_seconds.txt",
+        "MODEL_ROUTE_FILE": runner_temp / "gemini_model_route.json",
+    }
+    start_result = subprocess.run(
+        ["bash", "-c", start["run"]],
+        env={**os.environ, **{key: str(value) for key, value in paths.items()}},
+        check=False, capture_output=True, text=True,
+    )
+    assert start_result.returncode == 0, start_result.stderr
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in paths.values())
+
+    output = tmp_path / "github-output"
+    read_result = subprocess.run(
+        ["bash", "-c", read["run"]],
+        env={
+            **os.environ,
+            **{key: str(value) for key, value in paths.items()},
+            "CONFIGURED_MODEL_ROUTE_JSON": '["gemini-3.7-flash"]',
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False, capture_output=True, text=True,
+    )
+    assert read_result.returncode == 0, read_result.stderr
+    metrics = _github_outputs(output)
+    assert metrics["call_count"] == "0"
+    assert re.fullmatch(r"0|[1-9][0-9]*", metrics["elapsed_seconds"])
+    assert json.loads(metrics["model_route_json"]) == ["gemini-3.7-flash"]
+    assert metrics["metrics_valid"] == "true"
+
+
+@pytest.mark.parametrize("malformed", ("missing_call", "elapsed", "route"))
+def test_gemini_budget_invalid_metrics_expose_only_explicit_invalidity(
+    tmp_path, malformed,
+):
+    workflow = _load("gemini-auto-review.yml")
+    read = _step(workflow, "gemini-review", "Read Gemini review metrics")
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    paths = {
+        "CALL_COUNT_FILE": runner_temp / "gemini_call_count.txt",
+        "STARTED_AT_FILE": runner_temp / "gemini_started_at.txt",
+        "ELAPSED_SECONDS_FILE": runner_temp / "gemini_elapsed_seconds.txt",
+        "MODEL_ROUTE_FILE": runner_temp / "gemini_model_route.json",
+    }
+    values = {
+        "CALL_COUNT_FILE": "0\n",
+        "STARTED_AT_FILE": "1\n",
+        "ELAPSED_SECONDS_FILE": "0\n",
+        "MODEL_ROUTE_FILE": "[]\n",
+    }
+    for name, path in paths.items():
+        if malformed == "missing_call" and name == "CALL_COUNT_FILE":
+            continue
+        payload = values[name]
+        if malformed == "elapsed" and name == "ELAPSED_SECONDS_FILE":
+            payload = "invalid\n"
+        if malformed == "route" and name == "MODEL_ROUTE_FILE":
+            payload = "not-json\n"
+        path.write_text(payload, encoding="utf-8")
+        path.chmod(0o600)
+
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", read["run"]],
+        env={
+            **os.environ,
+            **{key: str(value) for key, value in paths.items()},
+            "CONFIGURED_MODEL_ROUTE_JSON": '["gemini-3.7-flash"]',
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _github_outputs(output) == {"metrics_valid": "false"}
+
+
+def test_gemini_budget_finalize_requires_canonical_valid_metrics_without_fallbacks():
+    workflow = _load("gemini-auto-review.yml")
+    outcome = _step(workflow, "gemini-review", "Resolve Gemini budget outcome")
+    finalize = _step(workflow, "gemini-review", "Finalize Gemini review budget")
+    validity = "steps.gemini-budget-metrics.outputs.metrics_valid == 'true'"
+    assert validity in outcome["if"]
+    assert validity in finalize["if"]
+    assert finalize["with"]["actual-call-count"] == (
+        "${{ steps.gemini-budget-metrics.outputs.call_count }}"
+    )
+    assert finalize["with"]["elapsed-seconds"] == (
+        "${{ steps.gemini-budget-metrics.outputs.elapsed_seconds }}"
+    )
+    assert finalize["with"]["model-route-json"] == (
+        "${{ steps.gemini-budget-metrics.outputs.model_route_json }}"
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "provider_outcome", "provider_reason", "canonical_outcome",
+        "document_valid", "accepted_count", "filtered_count", "published",
+        "call_count", "elapsed_seconds", "metrics_valid", "expected_outcome",
+        "expected_stop",
+    ),
+    (
+        ("success", "", "success", "true", "1", "0", "true", "1", "5", "true", "success", "success"),
+        ("success", "", "success", "true", "0", "2", "true", "1", "5", "true", "quality_filtered", "quality_filtered"),
+        ("failure", "provider_timeout", "failure", "false", "", "", "true", "1", "5", "true", "provider_failure", "provider_timeout"),
+        ("success", "", "success", "true", "1", "0", "false", "1", "5", "true", "checkpoint_failure", "checkpoint_failure"),
+        ("failure", "call_budget_exhausted", "failure", "false", "", "", "true", "3", "5", "true", "checkpoint_failure", "call_budget_exhausted"),
+        ("failure", "provider_timeout", "failure", "false", "", "", "true", "1", "601", "true", "wall_time_exhausted", "wall_time_exhausted"),
+        ("failure", "provider_failed", "failure", "false", "", "", "true", "0", "0", "false", "checkpoint_failure", "checkpoint_failure"),
+    ),
+)
+def test_gemini_budget_outcome_mapping_is_deterministic(
+    tmp_path,
+    provider_outcome,
+    provider_reason,
+    canonical_outcome,
+    document_valid,
+    accepted_count,
+    filtered_count,
+    published,
+    call_count,
+    elapsed_seconds,
+    metrics_valid,
+    expected_outcome,
+    expected_stop,
+):
+    step = _step(
+        _load("gemini-auto-review.yml"), "gemini-review", "Resolve Gemini budget outcome"
+    )
+    canonical = tmp_path / "gemini-review-canonical.md"
+    canonical.write_text(
+        "### New findings\n\n#### RVW-111111111111 [HIGH] Current\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={
+            **os.environ,
+            "PROVIDER_OUTCOME": provider_outcome,
+            "PROVIDER_FAILURE_REASON": provider_reason,
+            "CANONICAL_OUTCOME": canonical_outcome,
+            "DOCUMENT_VALID": document_valid,
+            "ACCEPTED_COUNT": accepted_count,
+            "FILTERED_COUNT": filtered_count,
+            "UPSERT_OUTCOME": "success" if published == "true" else "failure",
+            "REVIEW_PUBLISHED": published,
+            "CALL_COUNT": call_count,
+            "ELAPSED_SECONDS": elapsed_seconds,
+            "METRICS_VALID": metrics_valid,
+            "AUTHENTICATED_REVIEW_JSON": (
+                '{"success":true,"head_sha":"' + "ab" * 20
+                + '","full_diff_sha256":"' + "12" * 32
+                + '","remaining_finding_ids":["RVW-aaaaaaaaaaaa"]}'
+            ),
+            "CANONICAL_FILE": str(canonical),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    values = _github_outputs(output)
+    assert values["outcome"] == expected_outcome
+    assert values["stop_reason"] == expected_stop
+    expected_remaining = (
+        ["RVW-111111111111"]
+        if expected_outcome in {"success", "quality_filtered"}
+        else ["RVW-aaaaaaaaaaaa"]
+    )
+    assert json.loads(values["remaining_finding_ids_json"]) == expected_remaining
 
 
 def test_claude_prompt_pins_diff_source():
@@ -1237,10 +2287,14 @@ def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure_a
 
     assert model["if"] == (
         "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
     assert upsert["if"] == (
-        "${{ !cancelled() && steps.prepare-review-input.outcome == 'success' }}"
+        "${{ !cancelled() && steps.prepare-review-input.outcome == 'success' "
+        "&& (steps.prepare-diff.outputs.diff-ready != 'true' "
+        "|| steps.prepare-diff.outputs.diff-mode == 'unchanged' "
+        "|| steps.review-budget-claim.outputs.allow-invocation == 'true') }}"
     )
 
 
@@ -1255,7 +2309,12 @@ def test_claude_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tm
     )
     assert cleanup is not None
     cleanup_index = steps.index(cleanup)
-    assert cleanup_index == model_index - 1
+    metrics_index = next(
+        index for index, step in enumerate(steps)
+        if step.get("name") == "Start Claude review metrics"
+    )
+    assert cleanup_index == metrics_index - 1
+    assert metrics_index == model_index - 1
     assert cleanup["if"] == steps[model_index]["if"]
     canonicalize_step = _step(
         workflow, "claude-review", "Canonicalize Claude review"
@@ -1263,7 +2322,8 @@ def test_claude_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tm
     assert canonicalize_step["if"] == (
         "${{ always() && steps.reset-claude-artifacts.outcome == 'success' "
         "&& steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
 
     workspace = tmp_path / "workspace"
@@ -1345,7 +2405,8 @@ def test_claude_uses_one_shared_canonicalizer_and_upsert_reads_only_canonical_fi
     assert action["if"] == (
         "${{ always() && steps.reset-claude-artifacts.outcome == 'success' "
         "&& steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
     upsert = _step(workflow, "claude-review", "Upsert review comment")
     script = upsert["with"]["script"]
@@ -1391,7 +2452,8 @@ def test_gemini_uses_the_same_canonicalizer_contract_as_claude():
     assert action["if"] == (
         "${{ always() && steps.reset-gemini-artifacts.outcome == 'success' "
         "&& steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
 
     python = _extract_gemini_python()
@@ -1490,12 +2552,20 @@ def test_rejected_candidates_retain_only_canonicalizer_owned_diagnostics(
     steps = job["steps"]
 
     assert steps.index(canonical) < steps.index(upload) < steps.index(upsert)
+    upload_condition = (
+        "${{ always() && steps.canonicalize-review.outcome != 'skipped' "
+        "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+    )
+    if workflow_name in {"claude-code-review.yml", "gemini-auto-review.yml"}:
+        upload_condition = (
+            "${{ always() "
+            "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+            "&& steps.canonicalize-review.outcome != 'skipped' "
+            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+        )
     assert upload == {
         "name": upload_step_name,
-        "if": (
-            "${{ always() && steps.canonicalize-review.outcome != 'skipped' "
-            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
-        ),
+        "if": upload_condition,
         "uses": (
             "actions/upload-artifact@"
             "ea165f8d65b6e75b540449e92b4886f43607fa02"
@@ -1525,10 +2595,12 @@ def test_gemini_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tm
         (step for step in steps if step.get("name") == "Reset Gemini review artifacts"), None
     )
     assert cleanup is not None
-    assert steps.index(cleanup) == model_index - 1
+    metrics = _step(workflow, "gemini-review", "Start Gemini review metrics")
+    assert steps.index(cleanup) < steps.index(metrics) < model_index
     expected_ready = (
         "steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged'"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true'"
     )
     assert cleanup["if"] == "${{ " + expected_ready + " }}"
     assert steps[model_index]["if"] == (
@@ -1606,7 +2678,7 @@ def test_gemini_collector_unlinks_seeded_destinations_before_redirection(tmp_pat
     )
 
     assert previous == ""
-    assert outputs == {"previous_sha": "", "previous_full_hash": ""}
+    assert outputs == _gemini_details_outputs()
     for index, destination in enumerate(destinations):
         assert targets[destination].read_text(encoding="utf-8") == f"sentinel-{index}"
     assert not (tmp_path / "gemini-previous-review.md").exists()
@@ -1708,9 +2780,16 @@ def test_shared_canonicalizer_runs_from_the_prepared_pr_head(
         < steps.index(provider)
         < steps.index(canonicalizer)
     )
+    checkout_condition = "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}"
+    if filename in {"claude-code-review.yml", "gemini-auto-review.yml"}:
+        checkout_condition = (
+            "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
+            "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+            "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+        )
     assert checkout == {
         "name": "Checkout prepared review head",
-        "if": "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}",
+        "if": checkout_condition,
         "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         "with": {
             "ref": "${{ steps.prepare-diff.outputs.head-sha }}",
@@ -1838,7 +2917,8 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert checkout["with"]["fetch-depth"] == "0"
     assert claude_model["if"] == (
         "${{ steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
     assert claude_model["env"]["REVIEW_DIFF_FILE"] == (
         "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
@@ -1864,7 +2944,8 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert gemini_model["if"] == (
         "${{ steps.reset-gemini-artifacts.outcome == 'success' "
         "&& steps.prepare-diff.outputs.diff-ready == 'true' "
-        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
     )
     assert gemini_model["env"]["REVIEW_DIFF_FILE"] == (
         "${{ steps.prepare-diff.outputs.diff-mode == 'delta' "
@@ -1973,7 +3054,19 @@ def test_collect_exports_validated_pair_for_incremental_round(tmp_path):
         pr_files=["a.py", "b.py"],
     )
     outputs = _github_outputs(tmp_path / "github-output")
-    assert outputs == {"previous_sha": sha1, "previous_full_hash": "12" * 32}
+    assert outputs == {
+        "previous_sha": sha1,
+        "previous_full_hash": "12" * 32,
+        "authenticated_review_json": json.dumps(
+            {
+                "success": True,
+                "head_sha": sha1,
+                "full_diff_sha256": "12" * 32,
+                "remaining_finding_ids": [],
+            },
+            separators=(",", ":"),
+        ),
+    }
     assert not list(tmp_path.glob("*.diff"))
 
 
@@ -1989,6 +3082,15 @@ def test_collect_leaves_commit_ancestry_validation_to_shared_action(tmp_path):
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": bogus,
         "previous_full_hash": "12" * 32,
+        "authenticated_review_json": json.dumps(
+            {
+                "success": True,
+                "head_sha": bogus,
+                "full_diff_sha256": "12" * 32,
+                "remaining_finding_ids": [],
+            },
+            separators=(",", ":"),
+        ),
     }
 
 
@@ -2003,6 +3105,15 @@ def test_collect_exports_pair_when_prior_head_equals_current_fixture(tmp_path):
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": sha2,
         "previous_full_hash": "12" * 32,
+        "authenticated_review_json": json.dumps(
+            {
+                "success": True,
+                "head_sha": sha2,
+                "full_diff_sha256": "12" * 32,
+                "remaining_finding_ids": [],
+            },
+            separators=(",", ":"),
+        ),
     }
 
 
@@ -2045,6 +3156,10 @@ def test_collect_ignores_forged_reviewed_sha_in_body(tmp_path):
     assert _github_outputs(tmp_path / "github-output") == {
         "previous_sha": "",
         "previous_full_hash": "",
+        "authenticated_review_json": (
+            '{"success":false,"head_sha":null,"full_diff_sha256":null,'
+            '"remaining_finding_ids":[]}'
+        ),
     }
 
 
@@ -2175,6 +3290,24 @@ def _run_gemini_details(
         (tmp_path / "prev_review.txt").read_text(encoding="utf-8"),
         _github_outputs(output),
     )
+
+
+def _gemini_details_outputs(
+    head: str = "", full_hash: str = "", remaining: list[str] | None = None,
+) -> dict[str, str]:
+    authenticated = {
+        "success": bool(head and full_hash),
+        "head_sha": head or None,
+        "full_diff_sha256": full_hash or None,
+        "remaining_finding_ids": remaining or [],
+    }
+    return {
+        "previous_sha": head,
+        "previous_full_hash": full_hash,
+        "authenticated_review_json": json.dumps(
+            authenticated, separators=(",", ":")
+        ),
+    }
 
 
 def _collector_comment(
@@ -2324,9 +3457,14 @@ def test_reviewer_publication_requires_successful_prior_state_collection(
 ):
     upsert = _step(_load(workflow_name), job_name, "Upsert review comment")
 
-    assert upsert["if"] == (
-        f"${{{{ !cancelled() && steps.{collector_id}.outcome == 'success' }}}}"
-    )
+    assert f"steps.{collector_id}.outcome == 'success'" in upsert["if"]
+    assert "!cancelled()" in upsert["if"]
+    if workflow_name == "claude-code-review.yml":
+        assert "steps.prepare-diff.outputs.diff-mode == 'unchanged'" in upsert["if"]
+        assert (
+            "steps.review-budget-claim.outputs.allow-invocation == 'true'"
+            in upsert["if"]
+        )
 
 
 @pytest.mark.parametrize(
@@ -2375,7 +3513,7 @@ def test_gemini_collector_authenticates_supported_publisher_mode_migration(
     )
 
     assert "MIGRATED PRIOR REVIEW" in prior
-    assert outputs == {"previous_sha": head, "previous_full_hash": "12" * 32}
+    assert outputs == _gemini_details_outputs(head, "12" * 32)
 
 
 @pytest.mark.parametrize(
@@ -2414,7 +3552,7 @@ def test_gemini_collector_rejects_untrusted_previous_publisher(
     )
 
     assert prior == ""
-    assert outputs == {"previous_sha": "", "previous_full_hash": ""}
+    assert outputs == _gemini_details_outputs()
 
 
 @pytest.mark.parametrize(
@@ -2504,7 +3642,7 @@ def test_gemini_v2_is_display_only_and_cannot_enable_incremental_input(tmp_path)
     )
 
     assert previous == ""
-    assert outputs == {"previous_sha": "", "previous_full_hash": ""}
+    assert outputs == _gemini_details_outputs()
     assert not (tmp_path / "gemini-previous-review.md").exists()
 
 
@@ -2522,7 +3660,7 @@ def test_gemini_v3_collects_authenticated_pair_and_exact_canonical_body(tmp_path
         tmp_path, [_bot("github-actions[bot]", sticky)], head_sha=head
     )
 
-    assert outputs == {"previous_sha": head, "previous_full_hash": "12" * 32}
+    assert outputs == _gemini_details_outputs(head, "12" * 32)
     assert (tmp_path / "gemini-previous-review.md").read_bytes() == canonical.encode()
     assert "### New findings" in previous
     for forbidden in (
@@ -2708,7 +3846,7 @@ def test_gemini_canonical_v2_collection_and_shared_action_contract(tmp_path):
     assert "BAD" not in previous
     assert "FOREIGN REVIEWER" not in previous
     assert "MISMATCHED PR" not in previous
-    assert outputs == {"previous_sha": head, "previous_full_hash": "12" * 32}
+    assert outputs == _gemini_details_outputs(head, "12" * 32)
     workflow = _load("gemini-auto-review.yml")
     job = workflow["jobs"]["gemini-review"]
     details = _step(workflow, "gemini-review", "Get PR details")["run"]
@@ -3121,6 +4259,7 @@ def _claude_upsert(
     normalized_count: str = "3",
     filtered_max_severity: str = "HIGH",
     canonical_failure_reason: str = "",
+    budget_allow_invocation: str = "true",
     literal_schema: bool = False,
     current_head: str | None = None,
     workflow_runs: list[dict] | None = None,
@@ -3152,6 +4291,7 @@ def _claude_upsert(
         "NORMALIZED_COUNT": normalized_count,
         "FILTERED_MAX_SEVERITY": filtered_max_severity,
         "CANONICAL_FAILURE_REASON": canonical_failure_reason,
+        "BUDGET_ALLOW_INVOCATION": budget_allow_invocation,
         "BOT_LOGIN": "github-actions[bot]",
     }
     if not literal_schema:
@@ -3284,6 +4424,7 @@ def test_claude_unchanged_v3_success_advances_head_and_preserves_body_hash_quali
         diff_mode="unchanged", unchanged_since_previous="true",
         attempt_head=current_head, current_head=current_head,
         full_diff_sha256="12" * 32, canonical_outcome="skipped", document_valid="false",
+        budget_allow_invocation="false",
     )
     body = _single_mutation_body(calls)
     state = _posted_state(body)
@@ -3411,6 +4552,7 @@ def _gemini_upsert(
     bot_login: str = "github-actions[bot]",
     auth_mode: str = "github_token",
     publisher_app_id: str = "",
+    budget_allow_invocation: str = "true",
 ) -> list:
     workdir = tmp_path / ("gemini-with-review" if with_review else "gemini-without-review")
     workdir.mkdir(parents=True)
@@ -3444,6 +4586,7 @@ def _gemini_upsert(
         "AUTH_MODE": auth_mode,
         "PUBLISHER_APP_ID": publisher_app_id,
         "ACTIONS_TOKEN": "actions-token-fixture",
+        "BUDGET_ALLOW_INVOCATION": budget_allow_invocation,
     }
     if not literal_schema:
         comments = [_upgrade_gemini_v2_fixture(comment) for comment in comments]
@@ -4461,6 +5604,60 @@ def test_gemini_soft_filtered_candidate_is_success_with_quality_metadata(tmp_pat
 
 
 @node_required
+def test_gemini_budget_denied_new_diff_cannot_publish_success(tmp_path):
+    calls = _gemini_upsert(
+        tmp_path,
+        "success",
+        [],
+        with_review=True,
+        review="### New findings\n\nNone",
+        budget_allow_invocation="false",
+    )
+    state = _posted_state(_single_mutation_body(calls))
+
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] is None
+
+
+@node_required
+def test_gemini_budget_authenticated_unchanged_reuse_succeeds_with_zero_calls(
+    tmp_path,
+):
+    prior_head = "ab" * 20
+    full_hash = "34" * 32
+    previous = _bot(
+        "github-actions[bot]",
+        _v3_body(
+            _v3_state(
+                reviewer="gemini",
+                run_id=1,
+                head=prior_head,
+                full_diff_sha256=full_hash,
+            ),
+            "### New findings\n\nNone",
+            marker=GEMINI_V3_MARKER,
+            header=GEMINI_HEADER,
+        ),
+        11,
+    )
+    calls = _gemini_upsert(
+        tmp_path,
+        "skipped",
+        [previous],
+        with_review=False,
+        diff_mode="unchanged",
+        unchanged_since_previous="true",
+        full_diff_sha256=full_hash,
+        budget_allow_invocation="false",
+    )
+    state = _posted_state(_single_mutation_body(calls))
+
+    assert state["attempt_status"] == "success"
+    assert state["successful_head"] == "cd" * 20
+    assert state["full_diff_sha256"] == full_hash
+
+
+@node_required
 def test_gemini_unchanged_v3_success_advances_head_and_preserves_body_hash_quality(tmp_path):
     prior_head = "ab" * 20
     current_head = "cd" * 20
@@ -5233,6 +6430,161 @@ def _gemini_script_env(tmp_path):
         "REVIEW_DIFF_MODE": "full",
     })
     return env
+
+
+def _write_legacy_gemini_request_stub(tmp_path: Path, body: str) -> None:
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class _R:\n"
+        "    text = 'COUNTED REVIEW'\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): self.name = name\n"
+        "    def generate_content(self, prompt):\n"
+        "        calls = pathlib.Path('sdk-calls.txt')\n"
+        "        with calls.open('a') as stream: stream.write(self.name + '\\n')\n"
+        f"{body}",
+        encoding="utf-8",
+    )
+
+
+def test_gemini_request_count_wraps_every_sdk_request_before_the_api_call():
+    source = _extract_gemini_python()
+    assert "def counted_generate_content(prompt, model):" in source
+    assert "response = counted_generate_content(prompt, model)" in source
+    assert "response = generate_content(prompt, model)" not in source
+    assert source.index("write_call_count(count + 1)") < source.index(
+        "return generate_content(prompt, model)"
+    )
+    assert source.index("append_model_route(model)") < source.index(
+        "return generate_content(prompt, model)"
+    )
+
+
+def test_gemini_request_count_primary_success_records_one_durable_attempt(tmp_path):
+    (tmp_path / "gemini_review.py").write_text(
+        _extract_gemini_python(), encoding="utf-8"
+    )
+    _write_legacy_gemini_request_stub(tmp_path, "        return _R()\n")
+    _write_gemini_script_inputs(tmp_path)
+    call_count = tmp_path / "gemini_call_count.txt"
+    model_route = tmp_path / "gemini_model_route.json"
+    call_count.write_text("0\n", encoding="ascii")
+    model_route.write_text("[]\n", encoding="utf-8")
+    call_count.chmod(0o600)
+    model_route.chmod(0o600)
+    env = _gemini_script_env(tmp_path)
+    env.update(
+        {
+            "GEMINI_MODEL": "primary-model",
+            "GEMINI_FALLBACK_MODEL": "fallback-model",
+            "GEMINI_CALL_COUNT_FILE": str(call_count),
+            "GEMINI_MODEL_ROUTE_FILE": str(model_route),
+        }
+    )
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert call_count.read_text(encoding="ascii") == "1\n"
+    assert json.loads(model_route.read_text(encoding="utf-8")) == ["primary-model"]
+    assert (tmp_path / "sdk-calls.txt").read_text().splitlines() == ["primary-model"]
+
+
+def test_gemini_request_count_primary_retries_and_fallback_share_three_calls(
+    tmp_path,
+):
+    (tmp_path / "gemini_review.py").write_text(
+        _extract_gemini_python(), encoding="utf-8"
+    )
+    _write_legacy_gemini_request_stub(
+        tmp_path,
+        "        if self.name == 'primary-model':\n"
+        "            raise RuntimeError('429 rate limited; Please retry in 0s')\n"
+        "        return _R()\n",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    call_count = tmp_path / "gemini_call_count.txt"
+    model_route = tmp_path / "gemini_model_route.json"
+    call_count.write_text("0\n", encoding="ascii")
+    model_route.write_text("[]\n", encoding="utf-8")
+    call_count.chmod(0o600)
+    model_route.chmod(0o600)
+    env = _gemini_script_env(tmp_path)
+    env.update(
+        {
+            "GEMINI_MODEL": "primary-model",
+            "GEMINI_FALLBACK_MODEL": "fallback-model",
+            "GEMINI_429_RETRY_SLEEP": "0",
+            "GEMINI_429_RETRY_JITTER": "0",
+            "GEMINI_CALL_COUNT_FILE": str(call_count),
+            "GEMINI_MODEL_ROUTE_FILE": str(model_route),
+        }
+    )
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert call_count.read_text(encoding="ascii") == "3\n"
+    assert json.loads(model_route.read_text(encoding="utf-8")) == [
+        "primary-model", "fallback-model",
+    ]
+    assert (tmp_path / "sdk-calls.txt").read_text().splitlines() == [
+        "primary-model", "primary-model", "fallback-model",
+    ]
+
+
+def test_gemini_request_count_rejects_fourth_before_sdk_and_persists_raised_calls(
+    tmp_path,
+):
+    source = _extract_gemini_python().replace("max_attempts = 3", "max_attempts = 4", 1)
+    assert source != _extract_gemini_python()
+    (tmp_path / "gemini_review.py").write_text(source, encoding="utf-8")
+    _write_legacy_gemini_request_stub(
+        tmp_path, "        raise RuntimeError('429 rate limited; Please retry in 0s')\n"
+    )
+    _write_gemini_script_inputs(tmp_path)
+    call_count = tmp_path / "gemini_call_count.txt"
+    model_route = tmp_path / "gemini_model_route.json"
+    call_count.write_text("0\n", encoding="ascii")
+    model_route.write_text("[]\n", encoding="utf-8")
+    call_count.chmod(0o600)
+    model_route.chmod(0o600)
+    env = _gemini_script_env(tmp_path)
+    env.update(
+        {
+            "GEMINI_MODEL": "primary-model",
+            "GEMINI_FALLBACK_MODEL": "primary-model",
+            "GEMINI_429_RETRY_SLEEP": "0",
+            "GEMINI_429_RETRY_JITTER": "0",
+            "GEMINI_CALL_COUNT_FILE": str(call_count),
+            "GEMINI_MODEL_ROUTE_FILE": str(model_route),
+        }
+    )
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert call_count.read_text(encoding="ascii") == "3\n"
+    assert json.loads(model_route.read_text(encoding="utf-8")) == ["primary-model"]
+    assert (tmp_path / "sdk-calls.txt").read_text().splitlines() == [
+        "primary-model", "primary-model", "primary-model",
+    ]
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == (
+        "call_budget_exhausted"
+    )
 
 
 def test_gemini_process_watchdog_records_provider_timeout(tmp_path):
@@ -6466,6 +7818,7 @@ def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
     }
     assert seal["if"] == "steps.prepare-diff.outputs.diff-ready == 'true'"
     assert model["if"] == (
+        "needs.opencode-prepare.outputs.allow_invocation == 'true' && "
         "needs.opencode-prepare.outputs.diff_ready == 'true' && "
         "needs.opencode-prepare.outputs.diff_mode != 'unchanged'"
     )
@@ -6476,6 +7829,252 @@ def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
         "Install pinned OpenCode CLI",
     ):
         assert _step(workflow, "opencode-review", step_name)["if"] == model["if"]
+
+
+def test_opencode_budget_claim_is_sealed_before_tokenless_model_job():
+    workflow = _load("opencode-auto-review.yml")
+    prepare = workflow["jobs"]["opencode-prepare"]
+    review = workflow["jobs"]["opencode-review"]
+    claim = _step(workflow, "opencode-prepare", "Claim OpenCode review budget")
+    prepare_diff = _step(workflow, "opencode-prepare", "Prepare review diff")
+
+    assert prepare["permissions"] == {
+        "actions": "read",
+        "checks": "read",
+        "contents": "read",
+        "pull-requests": "read",
+        "issues": "write",
+    }
+    assert prepare["steps"].index(prepare_diff) < prepare["steps"].index(claim)
+    assert prepare["outputs"]["allow_invocation"] == (
+        "${{ steps.review-budget-claim.outputs.allow-invocation }}"
+    )
+    assert prepare["outputs"]["budget_decision"] == (
+        "${{ steps.review-budget-claim.outputs.decision }}"
+    )
+    assert prepare["outputs"]["budget_checkpoint_sha256"] == (
+        "${{ steps.review-budget-claim.outputs.checkpoint-sha256 }}"
+    )
+    assert prepare["outputs"]["attempt_head"] == (
+        "${{ steps.prepare-diff.outputs.head-sha }}"
+    )
+    assert claim["uses"] == "$/.github/actions/review-invocation-budget"
+    assert claim["if"] == "${{ always() && steps.ctx.outcome == 'success' }}"
+    assert claim["with"] == {
+        "github-token": "${{ github.token }}",
+        "mode": "claim",
+        "reviewer": "opencode",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
+        "expected-head-sha": "${{ steps.prepare-diff.outputs.head-sha }}",
+        "full-diff-sha256": "${{ steps.prepare-diff.outputs.full-diff-sha256 }}",
+        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
+        "input-files-json": "${{ format('[\"{0}/review-full.diff\",\"{0}/review-scope.json\"]', github.workspace) }}",
+        "authenticated-review-json": "${{ steps.ctx.outputs.authenticated_review_json }}",
+        "model-route-json": '["zai-coding-plan/glm-4.7"]',
+        "effort": "final-review/default",
+        "checkpoint-file": "${{ runner.temp }}/opencode-review-budget-claim.json",
+    }
+    assert review["permissions"] == {}
+    assert review["timeout-minutes"] == "10"
+    assert "needs.opencode-prepare.outputs.allow_invocation == 'true'" in review["if"]
+
+
+def test_opencode_budget_handoff_seals_exact_claim_checkpoint_identity():
+    workflow = _load("opencode-auto-review.yml")
+    build = _step(
+        workflow, "opencode-prepare", "Build sealed canonicalization handoff"
+    )["run"]
+    validate_model = _step(
+        workflow, "opencode-review", "Validate sealed review handoff"
+    )["run"]
+    canonicalize = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )
+
+    assert 'cp -- "$BUDGET_CHECKPOINT_PATH" "$handoff/review-budget-claim.json"' in build
+    assert '"review-budget-claim.json":$budget_checkpoint' in build
+    assert "allow_invocation" in build
+    assert "budget_decision" in build
+    assert "budget_checkpoint_sha256" in build
+    expected_inventory = (
+        "handoff.json\\nopencode-attestations-before.json\\n"
+        "opencode-comments-before.json\\nreview-budget-claim.json\\n"
+        "review-full.diff\\nreview-scope.json"
+    )
+    assert expected_inventory in validate_model
+    assert "review-budget-claim.json" in canonicalize["env"]["BUDGET_CLAIM_PATH"]
+    assert canonicalize["env"]["BUDGET_CHECKPOINT_SHA256"] == (
+        "${{ needs.opencode-prepare.outputs.budget_checkpoint_sha256 }}"
+    )
+
+
+def test_opencode_invocation_budget_guards_every_model_dependency_and_counts_before_cli():
+    workflow = _load("opencode-auto-review.yml")
+    review_job = workflow["jobs"]["opencode-review"]
+    model = _step(workflow, "opencode-review", "Run OpenCode PR review")
+    initialize = _step(
+        workflow, "opencode-review", "Initialize OpenCode review metrics"
+    )
+    materialize = _step(
+        workflow, "opencode-review", "Materialize sealed OpenCode candidate"
+    )
+    allow = "needs.opencode-prepare.outputs.allow_invocation == 'true'"
+
+    assert review_job["permissions"] == {}
+    assert review_job["timeout-minutes"] == "10"
+    assert allow in review_job["if"]
+    assert review_job["steps"].index(initialize) < review_job["steps"].index(
+        _step(workflow, "opencode-review", "Cache pinned OpenCode CLI archive")
+    )
+    for name in (
+        "Cache pinned OpenCode CLI archive",
+        "Install pinned OpenCode CLI",
+        "Run OpenCode PR review",
+    ):
+        assert allow in _step(workflow, "opencode-review", name)["if"]
+    command = model["run"]
+    wrapper = command[command.index("run_opencode()") : command.index("extract_candidate()")]
+    assert 'count="$(cat "$call_count_file")"' in wrapper
+    assert "(( count < 2 ))" in wrapper
+    assert 'review_failure_reason=call_budget_exhausted' in wrapper
+    for durability_gate in ("os.O_EXCL", "os.O_NOFOLLOW", "os.fsync", "os.replace", "os.O_DIRECTORY"):
+        assert durability_gate in wrapper
+    assert wrapper.index("os.replace(temporary, destination)") < wrapper.index(
+        "opencode run --model zai-coding-plan/glm-4.7"
+    )
+    assert command.count("run_opencode ") == 2
+    assert materialize["if"] == (
+        "${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}"
+    )
+    assert review_job["outputs"]["review_call_count"] == (
+        "${{ steps.materialize-candidate.outputs.review_call_count }}"
+    )
+    assert review_job["outputs"]["review_elapsed_seconds"] == (
+        "${{ steps.materialize-candidate.outputs.review_elapsed_seconds }}"
+    )
+
+
+def test_opencode_budget_candidate_envelope_is_exact_and_mode_aware():
+    workflow = _load("opencode-auto-review.yml")
+    materialize = _step(
+        workflow, "opencode-review", "Materialize sealed OpenCode candidate"
+    )["run"]
+    upload = _step(
+        workflow, "opencode-review", "Upload untrusted OpenCode candidate"
+    )
+    canonicalize = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )["with"]["script"]
+
+    for field in (
+        "schema", "repository", "pr", "run_id", "run_attempt", "head_sha",
+        "full_diff_sha256", "diff_mode", "claim_checkpoint_sha256",
+        "call_count", "elapsed_seconds", "model_route", "outcome",
+        "failure_reason", "review_sha256",
+    ):
+        assert f'"{field}"' in materialize
+    assert "lstat" in materialize and "S_ISREG" in materialize
+    assert "0o600" in materialize
+    assert 'model_route != ["zai-coding-plan/glm-4.7"]' in materialize
+    assert upload["if"] == (
+        "${{ always() && steps.materialize-candidate.outcome == 'success' && "
+        "needs.opencode-prepare.outputs.allow_invocation == 'true' }}"
+    )
+    assert upload["with"]["path"] == "${{ runner.temp }}/opencode-candidate"
+    assert "candidate.json" in canonicalize
+    assert "candidate artifact inventory is not exact" in canonicalize
+    assert "candidate claim identity mismatch" in canonicalize
+    assert "candidate metrics mismatch" in canonicalize
+
+
+def test_opencode_budget_finalize_uses_only_attested_publication_outcome():
+    workflow = _load("opencode-auto-review.yml")
+    job = workflow["jobs"]["opencode-canonicalize"]
+    canonicalize = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )
+    outcome = _step(
+        workflow, "opencode-canonicalize", "Resolve OpenCode budget outcome"
+    )
+    finalize = _step(
+        workflow, "opencode-canonicalize", "Finalize OpenCode review budget"
+    )
+
+    assert "needs.opencode-prepare.outputs.allow_invocation == 'true'" in canonicalize["if"]
+    assert canonicalize["with"]["script"].index("checks.update") < canonicalize[
+        "with"
+    ]["script"].rindex("core.setOutput('publication_succeeded', 'true')")
+    assert outcome["if"] == (
+        "${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' && "
+        "steps.canonicalize-opencode-review.outputs.budget_metrics_valid == 'true' }}"
+    )
+    assert outcome["env"]["PROVIDER_OUTCOME"] == (
+        "${{ steps.canonicalize-opencode-review.outputs.validated_candidate_outcome }}"
+    )
+    assert outcome["env"]["PROVIDER_FAILURE_REASON"] == (
+        "${{ steps.canonicalize-opencode-review.outputs.validated_failure_reason }}"
+    )
+    assert outcome["env"]["CALL_COUNT"] == (
+        "${{ steps.canonicalize-opencode-review.outputs.validated_call_count }}"
+    )
+    assert outcome["env"]["ELAPSED_SECONDS"] == (
+        "${{ steps.canonicalize-opencode-review.outputs.validated_elapsed_seconds }}"
+    )
+    for value in (
+        "success", "quality_filtered", "provider_failure",
+        "checkpoint_failure", "wall_time_exhausted",
+    ):
+        assert value in outcome["run"]
+    assert "RVW-[0-9a-f]{12}" in outcome["run"]
+    assert "length) <= 8" in outcome["run"]
+    assert finalize["if"] == (
+        "${{ always() && !cancelled() && "
+        "needs.opencode-prepare.outputs.allow_invocation == 'true' && "
+        "steps.canonicalize-opencode-review.outputs.budget_metrics_valid == 'true' }}"
+    )
+    assert finalize["uses"] == "$/.github/actions/review-invocation-budget"
+    assert finalize["with"] == {
+        "github-token": "${{ github.token }}",
+        "mode": "finalize",
+        "reviewer": "opencode",
+        "pr-number": "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
+        "expected-head-sha": "${{ needs.opencode-prepare.outputs.attempt_head }}",
+        "full-diff-sha256": "${{ needs.opencode-prepare.outputs.full_diff_sha256 }}",
+        "diff-mode": "${{ needs.opencode-prepare.outputs.diff_mode }}",
+        "input-files-json": "[]",
+        "authenticated-review-json": "${{ steps.opencode-budget-outcome.outputs.authenticated_review_json }}",
+        "model-route-json": "${{ steps.canonicalize-opencode-review.outputs.validated_model_route_json }}",
+        "effort": "final-review/default",
+        "actual-call-count": "${{ steps.canonicalize-opencode-review.outputs.validated_call_count }}",
+        "elapsed-seconds": "${{ steps.canonicalize-opencode-review.outputs.validated_elapsed_seconds }}",
+        "outcome": "${{ steps.opencode-budget-outcome.outputs.outcome }}",
+        "stop-reason": "${{ steps.opencode-budget-outcome.outputs.stop_reason }}",
+        "remaining-finding-ids-json": "${{ steps.opencode-budget-outcome.outputs.remaining_finding_ids_json }}",
+        "checkpoint-file": "${{ runner.temp }}/opencode-review-budget-final.json",
+    }
+    assert any(step.get("name") == "Upload OpenCode review budget final checkpoint" for step in job["steps"])
+
+
+def test_opencode_budget_refusal_skips_model_and_schema2_publication_but_uploads_claim():
+    workflow = _load("opencode-auto-review.yml")
+    prepare_upload = _step(
+        workflow, "opencode-prepare", "Upload OpenCode review budget claim checkpoint"
+    )
+    canonical_job = workflow["jobs"]["opencode-canonicalize"]
+    canonicalize = _step(
+        workflow, "opencode-canonicalize", "Canonicalize OpenCode review"
+    )
+
+    assert prepare_upload["if"] == (
+        "${{ always() && steps.review-budget-claim.outcome == 'success' }}"
+    )
+    assert prepare_upload["with"]["path"] == (
+        "${{ runner.temp }}/opencode-review-budget-claim.json"
+    )
+    assert "needs.opencode-prepare.outputs.allow_invocation == 'true'" in canonical_job["if"]
+    assert "needs.opencode-prepare.outputs.budget_decision == 'authenticated_reuse'" in canonical_job["if"]
+    assert "needs.opencode-prepare.outputs.allow_invocation == 'true'" in canonicalize["if"]
+    assert "authenticated_reuse" in canonicalize["if"]
 
 
 def test_opencode_model_and_privileged_canonicalization_have_separate_token_boundaries():
@@ -6494,7 +8093,7 @@ def test_opencode_model_and_privileged_canonicalization_have_separate_token_boun
         "checks": "read",
         "contents": "read",
         "pull-requests": "read",
-        "issues": "read",
+        "issues": "write",
     }
     assert model_job["permissions"] == {}
     assert "actions" not in model_job["permissions"]
@@ -6569,7 +8168,7 @@ def test_opencode_model_is_tokenless_generic_run_with_exact_candidate_artifact()
         "opencode-candidate-${{ github.run_id }}-${{ github.run_attempt }}"
     )
     assert candidate_upload["with"]["path"] == (
-        "${{ runner.temp }}/opencode-candidate/review.md"
+        "${{ runner.temp }}/opencode-candidate"
     )
     assert candidate_download["with"]["artifact-ids"] == (
         "${{ needs.opencode-review.outputs.candidate_artifact_id }}"
@@ -6614,6 +8213,11 @@ def _run_opencode_model_step(
 ):
     model = _step(
         _load("opencode-auto-review.yml"), "opencode-review", "Run OpenCode PR review"
+    )
+    initialize = _step(
+        _load("opencode-auto-review.yml"),
+        "opencode-review",
+        "Initialize OpenCode review metrics",
     )
     runner_temp = tmp_path / "runner"
     handoff = tmp_path / "handoff"
@@ -6677,6 +8281,14 @@ def _run_opencode_model_step(
         "OPENCODE_CONFIG_CONTENT": model["env"]["OPENCODE_CONFIG_CONTENT"],
         "GITHUB_OUTPUT": str(github_output),
     }
+    subprocess.run(
+        ["bash", "-c", initialize["run"]],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
     result = subprocess.run(
         ["bash", "-c", model["run"]],
         cwd=tmp_path,
@@ -6697,6 +8309,16 @@ def _run_opencode_model_step(
         else None
     )
     return result, calls, candidate
+
+
+def test_opencode_invocation_budget_persists_count_before_raised_cli(tmp_path):
+    result, calls, _ = _run_opencode_model_step(tmp_path, [])
+
+    assert result.returncode != 0
+    assert len(calls) == 1, result.stderr
+    call_count = tmp_path / "runner" / "opencode-review-metrics" / "call-count"
+    assert call_count.read_text(encoding="ascii") == "1\n"
+    assert call_count.stat().st_mode & 0o777 == 0o600
 
 
 def test_opencode_valid_outer_format_does_not_spend_a_repair_call(tmp_path):
@@ -9954,6 +11576,9 @@ def test_opencode_unavailable_handoff_builds_exact_conditional_inventory(tmp_pat
     evidence = tmp_path / "attestations.json"
     snapshot.write_text("[]", encoding="utf-8")
     evidence.write_text('{"check_runs":[],"workflow_runs":[]}', encoding="utf-8")
+    budget_checkpoint = tmp_path / "budget-checkpoint.json"
+    budget_checkpoint.write_text('{"schema":1}\n', encoding="ascii")
+    budget_checkpoint_sha256 = hashlib.sha256(budget_checkpoint.read_bytes()).hexdigest()
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     gh = bin_dir / "gh"
@@ -9985,6 +11610,10 @@ def test_opencode_unavailable_handoff_builds_exact_conditional_inventory(tmp_pat
         "FULL_DIFF_SHA256": "",
         "SNAPSHOT_PATH": str(snapshot),
         "ATTESTATIONS_PATH": str(evidence),
+        "BUDGET_CHECKPOINT_PATH": str(budget_checkpoint),
+        "BUDGET_CHECKPOINT_SHA256": budget_checkpoint_sha256,
+        "BUDGET_DECISION": "diff_unavailable",
+        "ALLOW_INVOCATION": "false",
         "SERVER_URL": "https://github.com",
         "GH_TOKEN": "test-only",
     }
@@ -9994,13 +11623,18 @@ def test_opencode_unavailable_handoff_builds_exact_conditional_inventory(tmp_pat
     handoff_dir = runner_temp / "opencode-handoff"
     assert sorted(path.name for path in handoff_dir.iterdir()) == [
         "handoff.json", "opencode-attestations-before.json", "opencode-comments-before.json",
+        "review-budget-claim.json",
     ]
     handoff = json.loads((handoff_dir / "handoff.json").read_text(encoding="utf-8"))
     assert handoff["diff_ready"] is False
     assert handoff["merge_base_sha"] is None
     assert sorted(handoff["files"]) == [
         "opencode-attestations-before.json", "opencode-comments-before.json",
+        "review-budget-claim.json",
     ]
+    assert handoff["allow_invocation"] is False
+    assert handoff["budget_decision"] == "diff_unavailable"
+    assert handoff["budget_checkpoint_sha256"] == budget_checkpoint_sha256
 
 
 def test_opencode_reusable_caller_grants_attestation_ceiling_but_model_is_downgraded():
@@ -10915,6 +12549,7 @@ def test_opencode_snapshot_fetch_failure_fails_before_cli_or_canonicalization(tm
     assert "refusing to run OpenCode without a state snapshot" in collect
     assert "exit 1" in collect
     assert cli["if"] == (
+        "needs.opencode-prepare.outputs.allow_invocation == 'true' && "
         "needs.opencode-prepare.outputs.diff_ready == 'true' && "
         "needs.opencode-prepare.outputs.diff_mode != 'unchanged'"
     )
@@ -11087,6 +12722,7 @@ def _run_opencode_canonicalize(
     candidate_artifact_case: str = "valid",
     candidate_review: str | None = None,
     failure_reason: str = "",
+    candidate_envelope_changes: dict | None = None,
     node_preload: Path | None = None,
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
@@ -11231,10 +12867,68 @@ def _run_opencode_canonicalize(
         })
     attestations = handoff_dir / "opencode-attestations-before.json"
     attestations.write_text(json.dumps({"check_runs": effective_checks, "workflow_runs": sealed_workflow_runs}), encoding="utf-8")
+    budget_allow_invocation = (
+        diff_ready == "true" and diff_mode in {"full", "delta"}
+    )
+    budget_decision = (
+        "claimed"
+        if budget_allow_invocation
+        else "authenticated_reuse"
+        if diff_mode == "unchanged"
+        else "diff_unavailable"
+    )
+    budget_handoff = {
+        "current_run_id": int(run_id),
+        "current_run_attempt": int(sealed_run_attempt or run_attempt),
+        "current_head_sha": attempt_head,
+        "current_full_diff_sha256": full_diff_sha256,
+        "decision": budget_decision,
+        "stop_reason": budget_decision,
+    }
+    budget_invocations = []
+    if budget_allow_invocation:
+        budget_invocations.append(
+            {
+                "run_id": int(run_id),
+                "run_attempt": int(sealed_run_attempt or run_attempt),
+                "head_sha": attempt_head,
+                "full_diff_sha256": full_diff_sha256,
+                "model_route": ["zai-coding-plan/glm-4.7"],
+                "effort": "final-review/default",
+                "call_count": 0,
+                "elapsed_seconds": 0,
+                "status": "claimed",
+                "outcome": None,
+                "stop_reason": "claimed",
+            }
+        )
+    budget_checkpoint = handoff_dir / "review-budget-claim.json"
+    budget_checkpoint.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "ledger": {
+                    "schema": 1,
+                    "repository": "example/repo",
+                    "pr": 7,
+                    "reviewer": "opencode",
+                    "invocations": budget_invocations,
+                    "handoff": budget_handoff,
+                },
+                "handoff": budget_handoff,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    budget_checkpoint_sha256 = hashlib.sha256(budget_checkpoint.read_bytes()).hexdigest()
     handoff = handoff_dir / "handoff.json"
     sealed_files = {
         "opencode-attestations-before.json": hashlib.sha256(attestations.read_bytes()).hexdigest(),
         "opencode-comments-before.json": snapshot_sha256,
+        "review-budget-claim.json": budget_checkpoint_sha256,
     }
     if diff_ready == "true":
         sealed_files.update({
@@ -11255,6 +12949,9 @@ def _run_opencode_canonicalize(
         "diff_ready": diff_ready == "true", "diff_mode": diff_mode,
         "unchanged_since_previous": unchanged_since_previous == "true",
         "full_diff_sha256": full_diff_sha256,
+        "allow_invocation": budget_allow_invocation,
+        "budget_decision": budget_decision,
+        "budget_checkpoint_sha256": budget_checkpoint_sha256,
         "files": sealed_files,
     }
     handoff.write_text(json.dumps(handoff_document), encoding="utf-8")
@@ -11293,13 +12990,52 @@ def _run_opencode_canonicalize(
     candidate_dir = workdir / "candidate"
     candidate_dir.mkdir()
     candidate_path = candidate_dir / "review.md"
+    candidate_envelope_path = candidate_dir / "candidate.json"
+    candidate_succeeded = outcome == "success"
+    candidate_has_review = candidate_review is not None or len(raw_candidates) == 1
     candidate_available = (
-        candidate_review is not None or len(raw_candidates) == 1
-    ) and candidate_artifact_case != "absent"
+        budget_allow_invocation
+        and (not candidate_succeeded or candidate_has_review)
+        and candidate_artifact_case != "absent"
+    )
+    candidate_call_count = 0 if failure_reason == "model_job_failed" else 1
+    candidate_elapsed_seconds = 1
     if candidate_available:
-        candidate_path.write_text(
-            candidate_review if candidate_review is not None else raw_candidates[0]["body"],
-            encoding="utf-8",
+        review_sha256 = None
+        if candidate_succeeded:
+            candidate_path.write_text(
+                candidate_review if candidate_review is not None else raw_candidates[0]["body"],
+                encoding="utf-8",
+            )
+            review_sha256 = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+        envelope = {
+            "schema": 1,
+            "repository": "example/repo",
+            "pr": 7,
+            "run_id": int(run_id),
+            "run_attempt": int(run_attempt),
+            "head_sha": attempt_head,
+            "full_diff_sha256": full_diff_sha256,
+            "diff_mode": diff_mode,
+            "claim_checkpoint_sha256": budget_checkpoint_sha256,
+            "call_count": candidate_call_count,
+            "elapsed_seconds": candidate_elapsed_seconds,
+            "model_route": ["zai-coding-plan/glm-4.7"],
+            "outcome": "success" if candidate_succeeded else "failure",
+            "failure_reason": "none" if candidate_succeeded else (
+                failure_reason
+                if failure_reason in {
+                    "model_job_failed", "provider_failed", "candidate_contract_failed",
+                    "call_budget_exhausted",
+                }
+                else "provider_failed"
+            ),
+            "review_sha256": review_sha256,
+        }
+        envelope.update(candidate_envelope_changes or {})
+        candidate_envelope_path.write_text(
+            json.dumps(envelope, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="ascii",
         )
         if candidate_artifact_case == "extra":
             (candidate_dir / "extra.txt").write_text("extra", encoding="utf-8")
@@ -11333,10 +13069,18 @@ def _run_opencode_canonicalize(
             else f"opencode-candidate-{run_id}-{run_attempt}"
         ),
         "CANDIDATE_PATH": str(candidate_path),
+        "CANDIDATE_ENVELOPE_PATH": str(candidate_envelope_path),
         "CANDIDATE_DOWNLOAD_OUTCOME": "success" if candidate_available else "skipped",
         "HANDOFF_PATH": str(handoff),
+        "BUDGET_CLAIM_PATH": str(budget_checkpoint),
+        "BUDGET_ALLOW_INVOCATION": "true" if budget_allow_invocation else "false",
+        "BUDGET_DECISION": budget_decision,
+        "BUDGET_CHECKPOINT_SHA256": budget_checkpoint_sha256,
         "REVIEW_OUTCOME": outcome,
         "REVIEW_FAILURE_REASON": failure_reason,
+        "REVIEW_CALL_COUNT": str(candidate_call_count) if candidate_available else "",
+        "REVIEW_ELAPSED_SECONDS": str(candidate_elapsed_seconds) if candidate_available else "",
+        "REVIEW_MODEL_ROUTE_JSON": '["zai-coding-plan/glm-4.7"]' if candidate_available else "",
         "SNAPSHOT_PATH": str(snapshot_override or snapshot),
         "ATTESTATIONS_PATH": str(attestations),
         "REVIEW_DIFF_PATH": str(full_diff),
@@ -12122,6 +13866,130 @@ def test_opencode_candidate_artifact_failures_publish_no_success(
     assert not any(
         call[0] == "update-check" and call[1].get("conclusion") == "success"
         and "Reviewed:" in body
+        for call in calls
+    )
+
+
+@node_required
+@pytest.mark.parametrize(
+    "candidate_envelope_changes",
+    [
+        {"call_count": "1"},
+        {"elapsed_seconds": -1},
+        {"model_route": ["other-provider/model"]},
+        {"claim_checkpoint_sha256": "00" * 32},
+        {"diff_mode": "unchanged"},
+        {"unexpected": True},
+    ],
+    ids=(
+        "call-count-type",
+        "negative-elapsed",
+        "route-mismatch",
+        "claim-mismatch",
+        "mode-mismatch",
+        "extra-key",
+    ),
+)
+def test_opencode_candidate_metrics_and_claim_identity_fail_closed(
+    tmp_path, candidate_envelope_changes
+):
+    candidate = _bot(
+        "github-actions[bot]", _opencode_review("real finding"), 10, updated="u2"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [candidate],
+        candidate_envelope_changes=candidate_envelope_changes,
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "failure"
+    review_outputs = [
+        call[2] for call in calls
+        if call[0] == "output" and call[1] == "review_succeeded"
+    ]
+    assert review_outputs and set(review_outputs) == {"false"}
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("outcome", "failure_reason", "after", "expected_count", "expected_reason"),
+    [
+        (
+            "success",
+            "",
+            [_bot("github-actions[bot]", _opencode_review("real finding"), 10, updated="u2")],
+            "1",
+            "none",
+        ),
+        ("failure", "provider_failed", [], "1", "provider_failed"),
+        ("failure", "model_job_failed", [], "0", "model_job_failed"),
+    ],
+    ids=("success", "provider-failure", "zero-call-dependency-failure"),
+)
+def test_opencode_budget_canonicalizer_exports_validated_candidate_metrics(
+    tmp_path, outcome, failure_reason, after, expected_count, expected_reason
+):
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        after,
+        outcome=outcome,
+        failure_reason=failure_reason,
+    )
+
+    outputs = {
+        name: [call[2] for call in calls if call[0] == "output" and call[1] == name]
+        for name in (
+            "budget_metrics_valid",
+            "validated_call_count",
+            "validated_elapsed_seconds",
+            "validated_model_route_json",
+            "validated_candidate_outcome",
+            "validated_failure_reason",
+        )
+    }
+    assert outputs["budget_metrics_valid"][-1] == "true"
+    assert outputs["validated_call_count"] == [expected_count]
+    assert outputs["validated_elapsed_seconds"] == ["1"]
+    assert outputs["validated_model_route_json"] == ['["zai-coding-plan/glm-4.7"]']
+    assert outputs["validated_candidate_outcome"] == [outcome]
+    assert outputs["validated_failure_reason"] == [expected_reason]
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("candidate_artifact_case", "candidate_envelope_changes"),
+    [
+        ("absent", None),
+        ("valid", {"call_count": "1"}),
+    ],
+    ids=("missing", "malformed"),
+)
+def test_opencode_budget_invalid_candidate_metrics_cannot_enable_finalization(
+    tmp_path, candidate_artifact_case, candidate_envelope_changes
+):
+    candidate = _bot(
+        "github-actions[bot]", _opencode_review("real finding"), 10, updated="u2"
+    )
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [candidate],
+        candidate_artifact_case=candidate_artifact_case,
+        candidate_envelope_changes=candidate_envelope_changes,
+    )
+
+    metrics_valid = [
+        call[2] for call in calls
+        if call[0] == "output" and call[1] == "budget_metrics_valid"
+    ]
+    assert metrics_valid == ["false"]
+    assert not any(
+        call[0] == "output" and call[1].startswith("validated_")
         for call in calls
     )
 
@@ -14270,7 +16138,7 @@ def test_opencode_failure_preserves_prior_success_as_stale(tmp_path):
     body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert "LAST GOOD OPENCODE REVIEW" in body
-    assert "Reason: model_job_failed" in body
+    assert "Reason: provider_failed" in body
     assert "- Status: stale" in body
     assert state["attempt_status"] == "failure"
     assert state["successful_head"] == old_head
@@ -14400,7 +16268,7 @@ def test_opencode_unchanged_obeys_head_and_generation_gates(tmp_path, gate):
 
 
 @node_required
-def test_opencode_unavailable_preserves_prior_success_as_stale_without_artifacts(tmp_path):
+def test_opencode_unavailable_budget_refusal_skips_publication_without_artifacts(tmp_path):
     old = _bot(
         "github-actions[bot]",
         _opencode_v2_body(
@@ -14420,12 +16288,14 @@ def test_opencode_unavailable_preserves_prior_success_as_stale_without_artifacts
         attempt_head="cd" * 20,
         remove_prepared_artifacts=True,
     )
-    body = _single_mutation_body(calls)
-    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
-    assert "LAST GOOD OPENCODE REVIEW" in body
-    assert state["attempt_status"] == "failure"
-    assert state["successful_head"] == "ab" * 20
-    assert state["diff_mode"] == "unavailable"
+    assert not any(
+        call[0] in {"create", "update", "delete", "create-check", "update-check"}
+        for call in calls
+    )
+    assert [
+        call for call in calls
+        if call[0] == "output" and call[1] == "publication_succeeded"
+    ] == [["output", "publication_succeeded", "false"]]
 
 
 @node_required

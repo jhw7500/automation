@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+import hashlib
 import json
 import os
 import shutil
@@ -33,12 +34,24 @@ RELEASE_REF = "v1.40.2"
 EXACT_RELEASE_FILES = tuple(
     root.path.as_posix() for root in EXACT_RELEASE_ROOTS
 )
+V1462_RELEASE_FILES = tuple(
+    root.path.as_posix()
+    for root in release_inventory.release_roots_for("v1.46.2")
+    if root.kind == "file"
+)
 PREPARE_REVIEW_DIFF_ACTION = (
     ROOT / ".github/actions/prepare-review-diff/action.yml"
 )
 CANONICALIZE_REVIEW_ACTION = (
     ROOT / ".github/actions/canonicalize-review/action.yml"
 )
+REVIEW_INVOCATION_BUDGET_ACTION = (
+    ROOT / ".github/actions/review-invocation-budget/action.yml"
+)
+REVIEW_INVOCATION_BUDGET_RELEASE_FILES = {
+    ".github/actions/review-invocation-budget/action.yml",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py",
+}
 
 
 def test_canonicalize_review_composite_action_has_exact_safe_shell_contract() -> None:
@@ -340,6 +353,40 @@ def test_canonicalizer_capability_boundary_is_closed() -> None:
     )
 
 
+def test_review_invocation_budget_capability_boundary_is_closed() -> None:
+    capability = getattr(
+        release_inventory, "release_supports_review_invocation_budget", None
+    )
+    assert callable(capability)
+    assert capability("v1.46.2") is False
+    assert capability("v1.47") is True
+    assert REVIEW_INVOCATION_BUDGET_RELEASE_FILES <= {
+        root.path.as_posix()
+        for root in release_inventory.release_roots_for("v1.47")
+    }
+    assert REVIEW_INVOCATION_BUDGET_RELEASE_FILES.isdisjoint(
+        root.path.as_posix()
+        for root in release_inventory.release_roots_for("v1.46.2")
+    )
+    budget_roots = tuple(
+        root
+        for root in release_inventory.release_roots_for("v1.47")
+        if root.path.as_posix() in REVIEW_INVOCATION_BUDGET_RELEASE_FILES
+    )
+    assert {root.mode for root in budget_roots} == {"100644"}
+    assert {root.kind for root in budget_roots} == {"file"}
+
+
+def test_review_invocation_budget_action_has_exact_safe_contract() -> None:
+    payload = REVIEW_INVOCATION_BUDGET_ACTION.read_bytes()
+    document = yaml.load(payload, Loader=yaml.BaseLoader)
+
+    assert hashlib.sha256(payload).hexdigest() == (
+        "42462dad335073794bd5c46e1993e02e4dc9824113d1b36fd5c6b89dc0583a9c"
+    )
+    assert document == release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION
+
+
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -539,7 +586,7 @@ def test_authenticated_release_archive_supports_normal_storage_layouts(
     "mutation",
     ("missing", "directory-collision", "executable-mode", "gitlink"),
 )
-@pytest.mark.parametrize("relative", EXACT_RELEASE_FILES)
+@pytest.mark.parametrize("relative", V1462_RELEASE_FILES)
 def test_release_archive_requires_each_exact_file_as_one_0644_blob(
     release_repo: tuple[Path, str], relative: str, mutation: str
 ) -> None:
