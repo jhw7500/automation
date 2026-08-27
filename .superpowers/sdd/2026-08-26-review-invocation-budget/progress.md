@@ -178,3 +178,15 @@ Task 7: breaker adjudication (1 load-bearing Important remains after round 5/5 �
 Ruling: The round-5 residual is real and load-bearing, not parked as harmless: Task 8 explicitly permits corrections demonstrated by validated review findings, so Task 8 must add authenticated RED cases for false-heredoc hiding and a computed executor name, then make executable shell tokenization and target-bearing dynamic execution fail closed before any PR is opened. Task 8 stops without push/PR/merge if either bypass remains or if the exact tested head changes — if wrong, the proposed v1.47 verifier could authenticate a weakened live OpenCode budget path, so merge is prohibited rather than accepting this risk.
 
 Task 7: complete (commits 0b59828..c802c60, breaker reached after fix round 5/5; findings 1/2/4 addressed; 1 real load-bearing verifier finding carried into Task 8 by ruling)
+
+Task 8: carried-breaker RED complete (two authenticated, bash-syntax-valid OpenCode workflow mutations both escaped with `DID NOT RAISE`: quoted here-doc-like data hid a compact redefinition, and concatenated executor/target variables performed an indirect dynamic redefinition; 2 failed in 0.50s)
+
+Ruling: Parse heredocs only from quote-aware executable `<<` operator tokens and fail closed when parsed literal assignment/append words compute `eval`, `source`, `.`, or `run_opencode`, or when shell expansion occupies command position. Keep the accepted authentic shell subset, whole-program binding, semantic-before-digest ordering, and VerifiedCommitTree bytes unchanged — if wrong, the verifier could either accept a computed live budget bypass or falsely reject the authenticated OpenCode workflow, so both exact REDs, the positive candidate, prior parser matrix, release suite, and full suite must all be green before handoff.
+
+Task 8: carried-breaker GREEN complete (exact new cases 2 passed; authentic/prior OpenCode parser matrix 17 passed; unchanged structural regression 49 passed; release/bundle suite 591 passed; no Task 1–6 action/helper/workflow byte changed; implementation commit 8fa6bd6e1c62f92c787e212f8fd0876789ef3139)
+
+Ruling: The exact Step 4 diff-check exposed one extra blank line at EOF in the approved design spec. Remove only that empty line, preserve all prose/decisions, commit it separately, and rerun Steps 1–4 on the changed HEAD — if wrong, the cost is a reversible one-byte documentation-only correction with no runtime or release-boundary effect.
+
+Task 8: local Steps 1–4 complete on 0c63098a804a625bcce262cd0faed7115484a02c (helper py_compile exit 0; five-file suite 2206 passed; full suite 2681 passed + 48 subtests; 36 YAML mappings; digest-pinned actionlint 1.7.12 clean; mutation focus 73 passed; v1.47 commit-only PASS; diff-check/status/stat/log scope audit clean; report: task-8-report.md)
+
+Task 8: breaker ruling outcome — addressed locally with no remaining load-bearing verifier finding; Task 8 Steps 5–9, independent review, push, PR, merge, tag, release, rollout, GitHub, and Notion changes were not performed and remain controller-owned.
