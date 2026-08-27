@@ -408,4 +408,3 @@ Ruff, YAML parsing, actionlint, release-verifier mutation tests, and the complet
 | run reviewer/model/effort/calls/round/stop reason is reproducible | validated ledger entry, artifact, and job summary |
 | next session continues from checkpoint | bounded handoff object and visible ledger summary |
 | fixed same/new SHA, false-positive, provider-failure paths | pure fixtures plus workflow integration tests |
-
