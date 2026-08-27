@@ -631,11 +631,11 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256 = (
     "42462dad335073794bd5c46e1993e02e4dc9824113d1b36fd5c6b89dc0583a9c"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
-    "5a5b76d2369cb6bd7396f8939f7a810ea3a8f532ca33d805411ceb809c6a3566"
+    "89968fc857aa4718025d8b39dae5b0958d9d83b458b2325a905bb308a5905d11"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
-    "claude": "a1765c207d32bfc663ec377968f1937a93e0d4b10556f155757652a15ac30b2d",
-    "gemini": "ef258906d3a8c8310253e4dccbb64a45100562ca5f14a10c7f5a4994fdfdc0ea",
+    "claude": "92ec63f9b8a22703918d974e87e1eb3ab7f2f9ffaaca1a3c3f12e360f5839906",
+    "gemini": "a8b048f7862c3eed467482a750da57abad8d6ef04ed61964a35e4f90b4afeeda",
     "opencode": "067738b4e9d1316e9e1f6a88de8ef2c3607440c479c7b5f46995e7d9c4e79c63",
 }
 EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION = yaml.load(
@@ -3723,6 +3723,7 @@ def require_budget_helper_contract(source: str) -> None:
                 "gemini": ".github/workflows/gemini-auto-review.yml",
                 "opencode": ".github/workflows/opencode-auto-review.yml",
             },
+            "CENTRAL_REPOSITORY": "jhw7500/automation",
             "_BOT_LOGIN": "github-actions[bot]",
             "_OUTCOMES": {
                 "success", "provider_failure", "quality_filtered",
@@ -3811,11 +3812,30 @@ def require_budget_helper_contract(source: str) -> None:
                 ("max_estimated_tokens_per_round", "int", "200_000"),
                 ("max_estimated_tokens_total", "int", "400_000"),
             ),
+            "RunProvenance": (
+                ("repository", "str", None),
+                ("pr", "int", None),
+                ("head_sha", "str", None),
+                ("caller_workflow_path", "str", None),
+                ("caller_event", "str", None),
+                ("referenced_workflow_path", "str", None),
+                ("referenced_workflow_ref", "str", None),
+                ("referenced_workflow_sha", "str", None),
+                ("run_id", "int", None),
+                ("run_attempt", "int", None),
+                ("status", "str", None),
+                ("conclusion", "str | None", None),
+            ),
             "Invocation": (
                 ("run_id", "int", None),
                 ("run_attempt", "int", None),
                 ("head_sha", "str", None),
                 ("full_diff_sha256", "str", None),
+                ("caller_workflow_path", "str", None),
+                ("caller_event", "str", None),
+                ("referenced_workflow_path", "str", None),
+                ("referenced_workflow_ref", "str", None),
+                ("referenced_workflow_sha", "str", None),
                 ("round_number", "int", None),
                 ("override_event_id", "int | None", None),
                 ("model_route", "tuple[str, ...]", None),
@@ -3881,6 +3901,9 @@ def require_budget_helper_contract(source: str) -> None:
         schema_keys = {
             "Invocation": {
                 "run_id", "run_attempt", "head_sha", "full_diff_sha256",
+                "caller_workflow_path", "caller_event",
+                "referenced_workflow_path", "referenced_workflow_ref",
+                "referenced_workflow_sha",
                 "round_number", "override_event_id", "model_route", "effort",
                 "call_unit", "call_count", "estimated_input_tokens",
                 "elapsed_seconds", "status", "outcome", "stop_reason",
@@ -4077,7 +4100,8 @@ def require_budget_helper_contract(source: str) -> None:
             )
             or not _ast_statement_matches(
                 claim_body[11],
-                "return append_claim(validated, request, override)",
+                "return append_claim(validated, request, override, "
+                "provenances[(request.run_id, request.run_attempt)])",
             )
         ):
             raise ValueError("claim live control flow differs")
@@ -4167,6 +4191,7 @@ def require_budget_helper_contract(source: str) -> None:
         expected_invocation_loop = ast.parse(
             "for item in state.invocations:\n"
             "    Invocation.from_dict(item.to_dict())\n"
+            "    _validate_stored_provenance_identity(item, state.reviewer)\n"
             "    call_failure = (item.status == 'finalized' and "
             "item.outcome == 'checkpoint_failure' and "
             "item.stop_reason == 'call_budget_exhausted')\n"
@@ -4222,31 +4247,194 @@ def require_budget_helper_contract(source: str) -> None:
                 state_shape.body, expression, "BudgetStateError", reason
             )
 
-        provenance = _function_node(module, "_validate_provenance")
-        expected_provenance = ast.parse(
-            "for item in state.invocations:\n"
-            "    provenance = provenances.get((item.run_id, item.run_attempt))\n"
-            "    if not isinstance(provenance, RunProvenance):\n"
-            "        raise BudgetStateError('provenance_mismatch')\n"
-            "    current = (item.run_id, item.run_attempt) == "
-            "(request.run_id, request.run_attempt)\n"
-            "    if (provenance.repository != state.repository "
-            "or provenance.pr != state.pr "
-            "or provenance.head_sha != item.head_sha "
-            "or provenance.workflow_path != WORKFLOWS[state.reviewer] "
-            "or provenance.run_id != item.run_id "
-            "or provenance.run_attempt != item.run_attempt "
-            "or (not current and provenance.status != 'completed') "
-            "or (current and provenance.status not in "
-            "{'in_progress', 'completed'})):\n"
-            "        raise BudgetStateError('provenance_mismatch')"
+        provenance_identity = _function_node(
+            module, "_validate_provenance_identity"
+        )
+        _direct_guard(
+            provenance_identity.body,
+            "provenance.caller_event != 'pull_request' or "
+            "not isinstance(provenance.caller_workflow_path, str) or "
+            "_CALLER_WORKFLOW.fullmatch(provenance.caller_workflow_path) is None or "
+            "'..' in Path(provenance.caller_workflow_path).parts or "
+            "not isinstance(provenance.referenced_workflow_ref, str) or "
+            "_WORKFLOW_REF.fullmatch(provenance.referenced_workflow_ref) is None or "
+            "provenance.referenced_workflow_path != "
+            "_expected_referenced_workflow_path("
+            "reviewer, provenance.referenced_workflow_ref) or "
+            "not isinstance(provenance.referenced_workflow_sha, str) or "
+            "_HEAD.fullmatch(provenance.referenced_workflow_sha) is None",
+            "BudgetStateError",
+            "provenance_mismatch",
+        )
+        expected_stored_provenance = ast.parse(
+            "_validate_provenance_identity(\n"
+            "    RunProvenance(\n"
+            "        repository='stored/stored', pr=1, "
+            "head_sha=invocation.head_sha,\n"
+            "        caller_workflow_path=invocation.caller_workflow_path,\n"
+            "        caller_event=invocation.caller_event,\n"
+            "        referenced_workflow_path=invocation.referenced_workflow_path,\n"
+            "        referenced_workflow_ref=invocation.referenced_workflow_ref,\n"
+            "        referenced_workflow_sha=invocation.referenced_workflow_sha,\n"
+            "        run_id=invocation.run_id, "
+            "run_attempt=invocation.run_attempt,\n"
+            "        status=invocation.status, conclusion=invocation.outcome,\n"
+            "    ), reviewer,\n"
+            ")"
         ).body[0]
+        stored_provenance = _function_node(
+            module, "_validate_stored_provenance_identity"
+        )
         if (
-            len(provenance.body) != 1
-            or ast.dump(provenance.body[0], include_attributes=False)
-            != ast.dump(expected_provenance, include_attributes=False)
+            len(stored_provenance.body) != 1
+            or ast.dump(stored_provenance.body[0], include_attributes=False)
+            != ast.dump(expected_stored_provenance, include_attributes=False)
+        ):
+            raise ValueError("stored provenance identity differs")
+
+        expected_one_provenance = ast.parse(
+            "def expected(provenance, state, request, current, invocation):\n"
+            "    _validate_provenance_identity(provenance, state.reviewer)\n"
+            "    expected_head = request.head_sha if invocation is None else invocation.head_sha\n"
+            "    expected_run_id = request.run_id if invocation is None else invocation.run_id\n"
+            "    expected_run_attempt = (request.run_attempt if invocation is None else invocation.run_attempt)\n"
+            "    if (provenance.repository != state.repository or "
+            "provenance.pr != state.pr or provenance.head_sha != expected_head or "
+            "provenance.run_id != expected_run_id or "
+            "provenance.run_attempt != expected_run_attempt or "
+            "(not current and provenance.status != 'completed') or "
+            "(current and provenance.status not in {'in_progress', 'completed'})):\n"
+            "        raise BudgetStateError('provenance_mismatch')\n"
+            "    if invocation is not None and ("
+            "provenance.caller_workflow_path != invocation.caller_workflow_path or "
+            "provenance.caller_event != invocation.caller_event or "
+            "provenance.referenced_workflow_path != invocation.referenced_workflow_path or "
+            "provenance.referenced_workflow_ref != invocation.referenced_workflow_ref or "
+            "provenance.referenced_workflow_sha != invocation.referenced_workflow_sha):\n"
+            "        raise BudgetStateError('provenance_mismatch')\n"
+        ).body[0]
+        one_provenance = _function_node(module, "_validate_one_provenance")
+        if ast.dump(
+            ast.Module(body=one_provenance.body, type_ignores=[]),
+            include_attributes=False,
+        ) != ast.dump(
+            ast.Module(body=expected_one_provenance.body, type_ignores=[]),
+            include_attributes=False,
+        ):
+            raise ValueError("one-run provenance policy differs")
+
+        expected_provenance = ast.parse(
+            "def expected(state, request, provenances):\n"
+            "    for item in state.invocations:\n"
+            "        provenance = provenances.get((item.run_id, item.run_attempt))\n"
+            "        if not isinstance(provenance, RunProvenance):\n"
+            "            raise BudgetStateError('provenance_mismatch')\n"
+            "        current = (item.run_id, item.run_attempt) == "
+            "(request.run_id, request.run_attempt)\n"
+            "        _validate_one_provenance(provenance, state, request, "
+            "current=current, invocation=item)\n"
+            "    current_key = (request.run_id, request.run_attempt)\n"
+            "    if not any((item.run_id, item.run_attempt) == current_key "
+            "for item in state.invocations):\n"
+            "        provenance = provenances.get(current_key)\n"
+            "        if not isinstance(provenance, RunProvenance):\n"
+            "            raise BudgetStateError('provenance_mismatch')\n"
+            "        _validate_one_provenance(provenance, state, request, "
+            "current=True, invocation=None)\n"
+        ).body[0]
+        provenance = _function_node(module, "_validate_provenance")
+        if ast.dump(
+            ast.Module(body=provenance.body, type_ignores=[]),
+            include_attributes=False,
+        ) != ast.dump(
+            ast.Module(body=expected_provenance.body, type_ignores=[]),
+            include_attributes=False,
         ):
             raise ValueError("provenance policy differs")
+
+        run_provenances = _function_node(module, "_run_provenances")
+        run_loops = [
+            item for item in run_provenances.body
+            if isinstance(item, ast.For)
+            and _ast_expression_matches(item.iter, "sorted(identities)")
+        ]
+        expected_run_loop = ast.parse(
+            "for run_id, run_attempt in sorted(identities):\n"
+            "    path = output_directory / f'run-{run_id}-{run_attempt}.json'\n"
+            "    value = _read_json(path, 'run')\n"
+            "    if not isinstance(value, dict):\n"
+            "        raise TransportError('provenance_mismatch')\n"
+            "    repository = value.get('repository')\n"
+            "    pulls = value.get('pull_requests')\n"
+            "    referenced = value.get('referenced_workflows')\n"
+            "    if (not isinstance(repository, dict) or "
+            "not isinstance(pulls, list) or not isinstance(referenced, list)):\n"
+            "        raise TransportError('provenance_mismatch')\n"
+            "    pull_numbers = {item.get('number') for item in pulls "
+            "if isinstance(item, dict) and isinstance(item.get('number'), int) "
+            "and not isinstance(item.get('number'), bool)}\n"
+            "    prefix = f\"{CENTRAL_REPOSITORY}/{WORKFLOWS[request['reviewer']]}@\"\n"
+            "    central = [item for item in referenced "
+            "if isinstance(item, dict) and isinstance(item.get('path'), str) "
+            "and item['path'].startswith(prefix)]\n"
+            "    if len(central) != 1:\n"
+            "        raise TransportError('provenance_mismatch')\n"
+            "    central = central[0]\n"
+            "    provenance = RunProvenance("
+            "repository=repository.get('full_name'), pr=request['pr'], "
+            "head_sha=value.get('head_sha'), "
+            "caller_workflow_path=value.get('path'), "
+            "caller_event=value.get('event'), "
+            "referenced_workflow_path=central.get('path'), "
+            "referenced_workflow_ref=central.get('ref'), "
+            "referenced_workflow_sha=central.get('sha'), "
+            "run_id=value.get('id'), run_attempt=value.get('run_attempt'), "
+            "status=value.get('status'), conclusion=value.get('conclusion'))\n"
+            "    if request['pr'] not in pull_numbers:\n"
+            "        raise TransportError('provenance_mismatch')\n"
+            "    _validate_provenance_identity(provenance, request['reviewer'])\n"
+            "    result[(run_id, run_attempt)] = provenance\n"
+        ).body[0]
+        if (
+            len(run_loops) != 1
+            or ast.dump(run_loops[0], include_attributes=False)
+            != ast.dump(expected_run_loop, include_attributes=False)
+        ):
+            raise ValueError("provenance transport differs")
+        if not _ast_statement_matches(
+            run_provenances.body[1],
+            "identities = {(request['run_id'], request['run_attempt'])}",
+        ):
+            raise ValueError("current provenance lookup differs")
+
+        input_paths = _function_node(module, "_validated_input_paths")
+        _direct_guard(
+            input_paths.body,
+            "request.get('operation') == 'claim' and "
+            "request.get('diff_mode') in {'full', 'delta'} and not value",
+            "TransportError",
+            "input_files_empty",
+        )
+        list_identities = _function_node(module, "_list_run_identities")
+        if (
+            len(list_identities.body) != 8
+            or not _ast_statement_matches(
+                list_identities.body[4],
+                "current = {'run_id': request['run_id'], "
+                "'run_attempt': request['run_attempt']}",
+            )
+            or not _ast_statement_matches(
+                list_identities.body[5],
+                "if current not in runs:\n    runs.append(current)",
+            )
+            or not _ast_statement_matches(
+                list_identities.body[6],
+                "if len(runs) > 4:\n"
+                "    error = 'ledger_invalid'\n"
+                "    runs = []",
+            )
+        ):
+            raise ValueError("run identity manifest differs")
 
         choose_override = _function_node(module, "choose_override")
         if (
@@ -4341,14 +4529,28 @@ def require_budget_workflow_contract(
             raise ValueError("claim/finalize pair differs")
         claim_step = claim_steps[0]
         finalize_step = finalize_steps[0]
+        expected_claim_guards = {
+            "claude": (
+                "${{ always() && "
+                "steps.prepare-review-input.outcome == 'success' && "
+                "steps.stage-claude-budget-input.outcome == 'success' }}"
+            ),
+            "gemini": (
+                "${{ always() && steps.pr-details.outcome == 'success' && "
+                "steps.stage-gemini-budget-input.outcome == 'success' }}"
+            ),
+            "opencode": "${{ always() && steps.ctx.outcome == 'success' }}",
+        }
         expected_finalize_guards = {
             "claude": (
                 "${{ always() && !cancelled() && "
-                "steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+                "steps.review-budget-claim.outputs.allow-invocation == 'true' && "
+                "steps.claude-budget-metrics.outputs.metrics_valid == 'true' }}"
             ),
             "gemini": (
                 "${{ always() && !cancelled() && "
-                "steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+                "steps.review-budget-claim.outputs.allow-invocation == 'true' && "
+                "steps.gemini-budget-metrics.outputs.metrics_valid == 'true' }}"
             ),
             "opencode": (
                 "${{ always() && !cancelled() && "
@@ -4359,6 +4561,7 @@ def require_budget_workflow_contract(
         if (
             claim_step.get("id") != "review-budget-claim"
             or finalize_step.get("id") != "review-budget-finalize"
+            or claim_step.get("if") != expected_claim_guards[reviewer]
             or claim_step.get("with", {}).get("reviewer") != reviewer
             or finalize_step.get("with", {}).get("reviewer") != reviewer
             or claim_step.get("with", {}).get("checkpoint-file")
@@ -4368,6 +4571,67 @@ def require_budget_workflow_contract(
             or finalize_step.get("if") != expected_finalize_guards[reviewer]
         ):
             raise ValueError("claim/finalize contract differs")
+
+        if reviewer != "opencode":
+            stage_name = {
+                "claude": "Stage Claude budget input",
+                "gemini": "Stage Gemini budget input",
+            }[reviewer]
+            stage = _named_step(claim_job, stage_name)
+            expected_stage_id = f"stage-{reviewer}-budget-input"
+            stage_source = stage.get("run", "")
+            empty_output = "printf 'input_files_json=[]\\n' >> \"$GITHUB_OUTPUT\""
+            source_check = '[[ -f "$source_file" && ! -L "$source_file" ]]'
+            copy_command = 'cp -- "$source_file" "$staged_file"'
+            compare_command = 'cmp -s -- "$source_file" "$staged_file"'
+            final_output = "$(jq -cn --arg path \"$staged_file\" '[$path]')"
+            if (
+                stage.get("id") != expected_stage_id
+                or not all(
+                    fragment in stage_source
+                    for fragment in (
+                        empty_output, source_check, copy_command,
+                        compare_command, final_output,
+                    )
+                )
+                or not (
+                    stage_source.index(empty_output)
+                    < stage_source.index(source_check)
+                    < stage_source.index(copy_command)
+                    < stage_source.index(compare_command)
+                    < stage_source.index(final_output)
+                )
+            ):
+                raise ValueError("budget input staging differs")
+            metrics_id = f"{reviewer}-budget-metrics"
+            metrics_validity = (
+                f"steps.{metrics_id}.outputs.metrics_valid == 'true'"
+            )
+            outcome_step = _named_step(
+                claim_job,
+                {
+                    "claude": "Resolve Claude budget outcome",
+                    "gemini": "Resolve Gemini budget outcome",
+                }[reviewer],
+            )
+            if metrics_validity not in outcome_step.get("if", ""):
+                raise ValueError("budget outcome metrics guard differs")
+            expected_finalize_metrics = {
+                "model-route-json": (
+                    f"${{{{ steps.{metrics_id}.outputs.model_route_json }}}}"
+                ),
+                "actual-call-count": (
+                    f"${{{{ steps.{metrics_id}.outputs.call_count }}}}"
+                ),
+                "elapsed-seconds": (
+                    f"${{{{ steps.{metrics_id}.outputs.elapsed_seconds }}}}"
+                ),
+            }
+            if any(
+                finalize_step.get("with", {}).get(name) != value
+                for name, value in expected_finalize_metrics.items()
+            ):
+                raise ValueError("budget finalized metrics differ")
 
         provider_names = {
             "claude": "Run Claude Code Review",
@@ -4568,12 +4832,12 @@ def require_budget_workflow_contract(
                 raise ValueError("OpenCode sealed handoff validation differs")
 
         if reviewer == "claude":
-            metrics_step = _named_step(
+            metrics_start = _named_step(
                 claim_job, "Start Claude review metrics"
             )
-            if metrics_step != {
+            if metrics_start != {
                 "name": "Start Claude review metrics",
-                "id": "claude-budget-metrics",
+                "id": "claude-budget-metrics-start",
                 "if": (
                     "${{ steps.review-budget-claim.outputs."
                     "allow-invocation == 'true' }}"
@@ -4587,6 +4851,78 @@ def require_budget_workflow_contract(
                 ),
             }:
                 raise ValueError("Claude live call accounting differs")
+            elapsed = _named_step(claim_job, "Capture Claude elapsed time")
+            if elapsed != {
+                "name": "Capture Claude elapsed time",
+                "id": "claude-budget-elapsed",
+                "if": (
+                    "${{ always() && steps.claude-budget-metrics-start."
+                    "outcome == 'success' }}"
+                ),
+                "shell": "bash",
+                "env": {
+                    "STARTED_AT": (
+                        "${{ steps.claude-budget-metrics-start.outputs.started_at }}"
+                    ),
+                },
+                "run": (
+                    "set -euo pipefail\n"
+                    "now=\"$(date +%s)\"\n"
+                    "[[ \"$STARTED_AT\" =~ ^[0-9]+$ ]]\n"
+                    "(( now >= STARTED_AT ))\n"
+                    "printf 'elapsed_seconds=%s\\n' \"$((now - STARTED_AT))\" "
+                    ">> \"$GITHUB_OUTPUT\"\n"
+                ),
+            }:
+                raise ValueError("Claude elapsed accounting differs")
+            metrics_step = _named_step(
+                claim_job, "Validate Claude review metrics"
+            )
+            if metrics_step != {
+                "name": "Validate Claude review metrics",
+                "id": "claude-budget-metrics",
+                "if": (
+                    "${{ always() && steps.review-budget-claim.outputs."
+                    "allow-invocation == 'true' }}"
+                ),
+                "shell": "bash",
+                "env": {
+                    "CALL_COUNT": (
+                        "${{ steps.claude-budget-metrics-start.outputs.call_count }}"
+                    ),
+                    "ELAPSED_SECONDS": (
+                        "${{ steps.claude-budget-elapsed.outputs.elapsed_seconds }}"
+                    ),
+                    "MODEL_ROUTE_JSON": (
+                        "${{ steps.claude-budget-config.outputs.model_route_json }}"
+                    ),
+                },
+                "run": (
+                    "set -euo pipefail\n"
+                    "printf 'metrics_valid=false\\n' >> \"$GITHUB_OUTPUT\"\n"
+                    "if [[ ! \"$CALL_COUNT\" =~ ^[0-9]+$ ]] || "
+                    "(( CALL_COUNT > 1 )); then\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "if [[ ! \"$ELAPSED_SECONDS\" =~ ^[0-9]+$ ]]; then\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "if ! jq -e '\n"
+                    "    type == \"array\" and length == 1\n"
+                    "    and all(.[]; type == \"string\" and length > 0)\n"
+                    "  ' >/dev/null <<< \"$MODEL_ROUTE_JSON\"; then\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "{\n"
+                    "  printf 'call_count=%s\\n' \"$CALL_COUNT\"\n"
+                    "  printf 'elapsed_seconds=%s\\n' \"$ELAPSED_SECONDS\"\n"
+                    "  printf 'model_route_json=%s\\n' "
+                    "\"$(jq -c . <<< \"$MODEL_ROUTE_JSON\")\"\n"
+                    "  printf 'metrics_valid=true\\n'\n"
+                    "} >> \"$GITHUB_OUTPUT\"\n"
+                ),
+            }:
+                raise ValueError("Claude trusted metric publication differs")
         elif reviewer == "gemini":
             if provider.get("env", {}).get("GEMINI_CALL_COUNT_FILE") != (
                 "${{ runner.temp }}/gemini_call_count.txt"
@@ -4611,6 +4947,58 @@ def require_budget_workflow_contract(
                 expected_counted, include_attributes=False
             ):
                 raise ValueError("Gemini live call accounting differs")
+            metrics_step = _named_step(
+                claim_job, "Read Gemini review metrics"
+            )
+            if (
+                metrics_step.get("id") != "gemini-budget-metrics"
+                or metrics_step.get("if") != (
+                    "${{ always() && steps.review-budget-claim.outputs."
+                    "allow-invocation == 'true' }}"
+                )
+                or metrics_step.get("env") != {
+                    "CALL_COUNT_FILE": (
+                        "${{ runner.temp }}/gemini_call_count.txt"
+                    ),
+                    "STARTED_AT_FILE": (
+                        "${{ runner.temp }}/gemini_started_at.txt"
+                    ),
+                    "ELAPSED_SECONDS_FILE": (
+                        "${{ runner.temp }}/gemini_elapsed_seconds.txt"
+                    ),
+                    "MODEL_ROUTE_FILE": (
+                        "${{ runner.temp }}/gemini_model_route.json"
+                    ),
+                    "CONFIGURED_MODEL_ROUTE_JSON": (
+                        "${{ steps.gemini-budget-config.outputs.model_route_json }}"
+                    ),
+                }
+            ):
+                raise ValueError("Gemini metric inputs differ")
+            metrics_source = metrics_step.get("run", "")
+            required_metrics = (
+                "output.write('metrics_valid=false\\n')",
+                "valid = call_count is not None and started_at is not None "
+                "and elapsed_seconds is not None",
+                "if not isinstance(configured, list) or len(configured) != 1",
+                "if not isinstance(route, list) or not all(",
+                "if not valid:\n    raise SystemExit(0)",
+                "if call_count == 0 and route == []:\n"
+                "    effective_route = configured",
+                "elif call_count > 0 and route and route[0] == configured[0]:\n"
+                "    effective_route = route",
+                "output.write(f\"call_count={call_count}\\n\")",
+                "output.write(f\"elapsed_seconds={elapsed_seconds}\\n\")",
+                "output.write(f\"metrics_valid={'true' if valid else 'false'}\\n\")",
+            )
+            if (
+                not all(fragment in metrics_source for fragment in required_metrics)
+                or metrics_source.index(required_metrics[0])
+                >= metrics_source.index(required_metrics[4])
+                or metrics_source.index(required_metrics[4])
+                >= metrics_source.index(required_metrics[7])
+            ):
+                raise ValueError("Gemini trusted metric publication differs")
         else:
             cap = "(( count < 2 )) || {"
             cap_control = (f"group:{cap}",)

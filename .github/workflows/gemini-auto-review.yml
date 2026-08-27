@@ -487,7 +487,7 @@ jobs:
 
       - name: Claim Gemini review budget
         id: review-budget-claim
-        if: ${{ always() && steps.pr-details.outcome == 'success' }}
+        if: ${{ always() && steps.pr-details.outcome == 'success' && steps.stage-gemini-budget-input.outcome == 'success' }}
         uses: $/.github/actions/review-invocation-budget
         with:
           github-token: ${{ github.token }}
@@ -1276,23 +1276,24 @@ jobs:
           started_path = Path(os.environ['STARTED_AT_FILE'])
           elapsed_path = Path(os.environ['ELAPSED_SECONDS_FILE'])
           route_path = Path(os.environ['MODEL_ROUTE_FILE'])
+          output_path = Path(os.environ['GITHUB_OUTPUT'])
+          with output_path.open('a', encoding='utf-8') as output:
+              output.write('metrics_valid=false\n')
           call_count = nonnegative(call_path)
           started_at = nonnegative(started_path)
           elapsed_seconds = nonnegative(elapsed_path)
           valid = call_count is not None and started_at is not None and elapsed_seconds is not None
-          if started_at is not None:
-              elapsed_seconds = max(elapsed_seconds or 0, max(int(time.time()) - started_at, 0))
-          else:
-              elapsed_seconds = max(elapsed_seconds or 0, 0)
+          if started_at is not None and elapsed_seconds is not None:
+              elapsed_seconds = max(elapsed_seconds, max(int(time.time()) - started_at, 0))
           try:
               configured = json.loads(os.environ['CONFIGURED_MODEL_ROUTE_JSON'])
           except (json.JSONDecodeError, TypeError):
-              configured = []
+              configured = None
               valid = False
           if not isinstance(configured, list) or len(configured) != 1 or not all(
               isinstance(item, str) and item for item in configured
           ):
-              configured = ['gemini-3.7-flash']
+              configured = None
               valid = False
           try:
               route = json.loads(route_path.read_text(encoding='utf-8')) if private_regular(route_path) else None
@@ -1301,19 +1302,20 @@ jobs:
           if not isinstance(route, list) or not all(
               isinstance(item, str) and item for item in route
           ):
-              route = []
+              route = None
               valid = False
-          if (call_count or 0) == 0 and route == []:
+          if not valid:
+              raise SystemExit(0)
+          if call_count == 0 and route == []:
               effective_route = configured
-          elif (call_count or 0) > 0 and route and route[0] == configured[0]:
+          elif call_count > 0 and route and route[0] == configured[0]:
               effective_route = route
           else:
-              effective_route = configured
-              valid = False
+              raise SystemExit(0)
 
-          with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
-              output.write(f"call_count={max(call_count or 0, 0)}\n")
-              output.write(f"elapsed_seconds={max(elapsed_seconds, 0)}\n")
+          with output_path.open('a', encoding='utf-8') as output:
+              output.write(f"call_count={call_count}\n")
+              output.write(f"elapsed_seconds={elapsed_seconds}\n")
               output.write(
                   'model_route_json='
                   + json.dumps(effective_route, separators=(',', ':')) + '\n'
@@ -1717,7 +1719,7 @@ jobs:
 
       - name: Resolve Gemini budget outcome
         id: review-budget-outcome
-        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.gemini-budget-metrics.outputs.metrics_valid == 'true' }}
         shell: bash
         env:
           PROVIDER_OUTCOME: ${{ steps.gemini-review.outcome }}
@@ -1793,7 +1795,7 @@ jobs:
 
       - name: Finalize Gemini review budget
         id: review-budget-finalize
-        if: ${{ always() && !cancelled() && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        if: ${{ always() && !cancelled() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.gemini-budget-metrics.outputs.metrics_valid == 'true' }}
         uses: $/.github/actions/review-invocation-budget
         with:
           github-token: ${{ github.token }}

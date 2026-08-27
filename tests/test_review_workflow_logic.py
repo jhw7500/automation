@@ -1304,7 +1304,8 @@ def test_claude_budget_claim_is_durable_before_provider_and_every_model_path_is_
     }
     claim = _step(workflow, "claude-review", "Claim Claude review budget")
     assert claim["if"] == (
-        "${{ always() && steps.prepare-review-input.outcome == 'success' }}"
+        "${{ always() && steps.prepare-review-input.outcome == 'success' "
+        "&& steps.stage-claude-budget-input.outcome == 'success' }}"
     )
     assert claim["with"] == {
         "github-token": "${{ github.token }}",
@@ -1387,6 +1388,55 @@ def test_claude_budget_stages_workspace_input_and_cleans_it_immediately_after_cl
         "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}"
     )
     assert cleanup["if"] == "${{ always() }}"
+
+
+@pytest.mark.parametrize("failure", ("missing_source", "copy_failure", "output_failure"))
+def test_claude_budget_staging_failure_cannot_claim_or_start_provider(
+    tmp_path, failure,
+):
+    workflow = _load("claude-code-review.yml")
+    stage = _step(workflow, "claude-review", "Stage Claude budget input")
+    claim = _step(workflow, "claude-review", "Claim Claude review budget")
+    provider = _step(workflow, "claude-review", "Run Claude Code Review")
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    source = runner_temp / "review-full.diff"
+    if failure != "missing_source":
+        source.write_bytes(b"diff")
+    output = tmp_path / "github-output"
+    path = os.environ["PATH"]
+    if failure == "copy_failure":
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        copy = bin_dir / "cp"
+        copy.write_text("#!/bin/sh\nexit 19\n", encoding="utf-8")
+        copy.chmod(0o755)
+        path = f"{bin_dir}:{path}"
+    elif failure == "output_failure":
+        output.mkdir()
+
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "PATH": path,
+            "DIFF_MODE": "full",
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "steps.stage-claude-budget-input.outcome == 'success'" in claim["if"]
+    assert "steps.review-budget-claim.outputs.allow-invocation == 'true'" in provider["if"]
 
 
 @pytest.mark.parametrize("diff_mode", ("full", "delta"))
@@ -1519,7 +1569,8 @@ def test_claude_budget_finalizes_after_review_state_upsert_and_uploads_both_chec
     assert names.index("Upsert review comment") < names.index("Finalize Claude review budget")
     assert finalize["if"] == (
         "${{ always() && !cancelled() "
-        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+        "&& steps.claude-budget-metrics.outputs.metrics_valid == 'true' }}"
     )
     assert finalize["uses"] == "$/.github/actions/review-invocation-budget"
     assert finalize["with"] == {
@@ -1534,14 +1585,10 @@ def test_claude_budget_finalizes_after_review_state_upsert_and_uploads_both_chec
         "authenticated-review-json": (
             "${{ steps.prepare-review-input.outputs.authenticated_review_json }}"
         ),
-        "model-route-json": "${{ steps.claude-budget-config.outputs.model_route_json }}",
+        "model-route-json": "${{ steps.claude-budget-metrics.outputs.model_route_json }}",
         "effort": "final-review/default",
-        "actual-call-count": (
-            "${{ steps.claude-budget-metrics.outputs.call_count || '0' }}"
-        ),
-        "elapsed-seconds": (
-            "${{ steps.claude-budget-elapsed.outputs.elapsed_seconds || '0' }}"
-        ),
+        "actual-call-count": "${{ steps.claude-budget-metrics.outputs.call_count }}",
+        "elapsed-seconds": "${{ steps.claude-budget-metrics.outputs.elapsed_seconds }}",
         "outcome": "${{ steps.review-budget-outcome.outputs.outcome }}",
         "stop-reason": "${{ steps.review-budget-outcome.outputs.stop_reason }}",
         "remaining-finding-ids-json": (
@@ -1561,6 +1608,73 @@ def test_claude_budget_finalizes_after_review_state_upsert_and_uploads_both_chec
         "claude-review-budget-final-${{ github.run_id }}-${{ github.run_attempt }}",
     }
     assert all("!cancelled()" in step["if"] for step in uploads)
+
+
+@pytest.mark.parametrize(
+    ("call_count", "elapsed_seconds", "model_route_json"),
+    (
+        ("", "5", '["claude-code-action-default"]'),
+        ("1", "malformed", '["claude-code-action-default"]'),
+        ("1", "5", "not-json"),
+    ),
+)
+def test_claude_budget_invalid_metrics_expose_only_explicit_invalidity(
+    tmp_path, call_count, elapsed_seconds, model_route_json,
+):
+    step = _step(
+        _load("claude-code-review.yml"),
+        "claude-review",
+        "Validate Claude review metrics",
+    )
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={
+            **os.environ,
+            "CALL_COUNT": call_count,
+            "ELAPSED_SECONDS": elapsed_seconds,
+            "MODEL_ROUTE_JSON": model_route_json,
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _github_outputs(output) == {"metrics_valid": "false"}
+
+
+def test_claude_budget_elapsed_measurement_depends_on_initialized_metrics():
+    workflow = _load("claude-code-review.yml")
+    elapsed = _step(workflow, "claude-review", "Capture Claude elapsed time")
+
+    assert elapsed["if"] == (
+        "${{ always() && "
+        "steps.claude-budget-metrics-start.outcome == 'success' }}"
+    )
+    assert elapsed["env"]["STARTED_AT"] == (
+        "${{ steps.claude-budget-metrics-start.outputs.started_at }}"
+    )
+
+
+def test_claude_budget_finalize_requires_canonical_valid_metrics_without_fallbacks():
+    workflow = _load("claude-code-review.yml")
+    outcome = _step(workflow, "claude-review", "Resolve Claude budget outcome")
+    finalize = _step(workflow, "claude-review", "Finalize Claude review budget")
+    validity = "steps.claude-budget-metrics.outputs.metrics_valid == 'true'"
+    assert validity in outcome["if"]
+    assert validity in finalize["if"]
+    assert finalize["with"]["actual-call-count"] == (
+        "${{ steps.claude-budget-metrics.outputs.call_count }}"
+    )
+    assert finalize["with"]["elapsed-seconds"] == (
+        "${{ steps.claude-budget-metrics.outputs.elapsed_seconds }}"
+    )
+    assert finalize["with"]["model-route-json"] == (
+        "${{ steps.claude-budget-metrics.outputs.model_route_json }}"
+    )
+    assert "||" not in finalize["with"]["actual-call-count"]
+    assert "||" not in finalize["with"]["elapsed-seconds"]
 
 
 def test_claude_budget_outcome_is_deterministic_and_has_no_provider_fallback():
@@ -1725,7 +1839,10 @@ def test_gemini_budget_claim_precedes_provider_and_guards_every_new_diff_path():
     assert job["timeout-minutes"] == "10"
 
     claim = _step(workflow, "gemini-review", "Claim Gemini review budget")
-    assert claim["if"] == "${{ always() && steps.pr-details.outcome == 'success' }}"
+    assert claim["if"] == (
+        "${{ always() && steps.pr-details.outcome == 'success' "
+        "&& steps.stage-gemini-budget-input.outcome == 'success' }}"
+    )
     assert claim["with"] == {
         "github-token": "${{ github.token }}",
         "mode": "claim",
@@ -1835,6 +1952,55 @@ def test_gemini_budget_staged_input_is_byte_exact_private_and_removed(
     assert not staging_directory.exists()
 
 
+@pytest.mark.parametrize("failure", ("missing_source", "copy_failure", "output_failure"))
+def test_gemini_budget_staging_failure_cannot_claim_or_start_provider(
+    tmp_path, failure,
+):
+    workflow = _load("gemini-auto-review.yml")
+    stage = _step(workflow, "gemini-review", "Stage Gemini budget input")
+    claim = _step(workflow, "gemini-review", "Claim Gemini review budget")
+    provider = _step(workflow, "gemini-review", "Run Gemini Code Review")
+    workspace = tmp_path / "workspace"
+    runner_temp = tmp_path / "runner-temp"
+    workspace.mkdir()
+    runner_temp.mkdir()
+    source = runner_temp / "review-full.diff"
+    if failure != "missing_source":
+        source.write_bytes(b"diff")
+    output = tmp_path / "github-output"
+    path = os.environ["PATH"]
+    if failure == "copy_failure":
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        copy = bin_dir / "cp"
+        copy.write_text("#!/bin/sh\nexit 19\n", encoding="utf-8")
+        copy.chmod(0o755)
+        path = f"{bin_dir}:{path}"
+    elif failure == "output_failure":
+        output.mkdir()
+
+    result = subprocess.run(
+        ["bash", "-c", stage["run"]],
+        env={
+            **os.environ,
+            "PATH": path,
+            "DIFF_MODE": "full",
+            "PRODUCER_HEAD_SHA": "ab" * 20,
+            "PRODUCER_FULL_DIFF_SHA256": "12" * 32,
+            "RUNNER_TEMP_DIR": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "steps.stage-gemini-budget-input.outcome == 'success'" in claim["if"]
+    assert "steps.review-budget-claim.outputs.allow-invocation == 'true'" in provider["if"]
+
+
 @pytest.mark.parametrize(
     ("diff_mode", "expected_head", "expected_hash"),
     (("unchanged", "ab" * 20, "12" * 32), ("unavailable", "", "")),
@@ -1888,7 +2054,8 @@ def test_gemini_budget_finalizes_after_upsert_with_actual_metrics_and_artifacts(
     )
     assert finalize["if"] == (
         "${{ always() && !cancelled() "
-        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+        "&& steps.gemini-budget-metrics.outputs.metrics_valid == 'true' }}"
     )
     assert finalize["uses"] == "$/.github/actions/review-invocation-budget"
     assert finalize["with"]["actual-call-count"] == (
@@ -1957,6 +2124,72 @@ def test_gemini_budget_zero_call_metrics_retain_claimed_primary_route(tmp_path):
     assert re.fullmatch(r"0|[1-9][0-9]*", metrics["elapsed_seconds"])
     assert json.loads(metrics["model_route_json"]) == ["gemini-3.7-flash"]
     assert metrics["metrics_valid"] == "true"
+
+
+@pytest.mark.parametrize("malformed", ("missing_call", "elapsed", "route"))
+def test_gemini_budget_invalid_metrics_expose_only_explicit_invalidity(
+    tmp_path, malformed,
+):
+    workflow = _load("gemini-auto-review.yml")
+    read = _step(workflow, "gemini-review", "Read Gemini review metrics")
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    paths = {
+        "CALL_COUNT_FILE": runner_temp / "gemini_call_count.txt",
+        "STARTED_AT_FILE": runner_temp / "gemini_started_at.txt",
+        "ELAPSED_SECONDS_FILE": runner_temp / "gemini_elapsed_seconds.txt",
+        "MODEL_ROUTE_FILE": runner_temp / "gemini_model_route.json",
+    }
+    values = {
+        "CALL_COUNT_FILE": "0\n",
+        "STARTED_AT_FILE": "1\n",
+        "ELAPSED_SECONDS_FILE": "0\n",
+        "MODEL_ROUTE_FILE": "[]\n",
+    }
+    for name, path in paths.items():
+        if malformed == "missing_call" and name == "CALL_COUNT_FILE":
+            continue
+        payload = values[name]
+        if malformed == "elapsed" and name == "ELAPSED_SECONDS_FILE":
+            payload = "invalid\n"
+        if malformed == "route" and name == "MODEL_ROUTE_FILE":
+            payload = "not-json\n"
+        path.write_text(payload, encoding="utf-8")
+        path.chmod(0o600)
+
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", read["run"]],
+        env={
+            **os.environ,
+            **{key: str(value) for key, value in paths.items()},
+            "CONFIGURED_MODEL_ROUTE_JSON": '["gemini-3.7-flash"]',
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _github_outputs(output) == {"metrics_valid": "false"}
+
+
+def test_gemini_budget_finalize_requires_canonical_valid_metrics_without_fallbacks():
+    workflow = _load("gemini-auto-review.yml")
+    outcome = _step(workflow, "gemini-review", "Resolve Gemini budget outcome")
+    finalize = _step(workflow, "gemini-review", "Finalize Gemini review budget")
+    validity = "steps.gemini-budget-metrics.outputs.metrics_valid == 'true'"
+    assert validity in outcome["if"]
+    assert validity in finalize["if"]
+    assert finalize["with"]["actual-call-count"] == (
+        "${{ steps.gemini-budget-metrics.outputs.call_count }}"
+    )
+    assert finalize["with"]["elapsed-seconds"] == (
+        "${{ steps.gemini-budget-metrics.outputs.elapsed_seconds }}"
+    )
+    assert finalize["with"]["model-route-json"] == (
+        "${{ steps.gemini-budget-metrics.outputs.model_route_json }}"
+    )
 
 
 @pytest.mark.parametrize(

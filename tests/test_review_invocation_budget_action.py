@@ -18,6 +18,11 @@ HEAD_A = "a" * 40
 HEAD_B = "b" * 40
 HASH_1 = "1" * 64
 HASH_2 = "2" * 64
+CENTRAL_REF = "refs/tags/v1.47"
+CENTRAL_SHA = "d" * 40
+CENTRAL_PATH = (
+    "jhw7500/automation/.github/workflows/claude-code-review.yml@" + CENTRAL_REF
+)
 
 SPEC = importlib.util.spec_from_file_location("review_invocation_budget_action_helper", HELPER)
 assert SPEC and SPEC.loader
@@ -32,6 +37,11 @@ def _prior_comment() -> str:
         run_attempt=1,
         head_sha=HEAD_A,
         full_diff_sha256=HASH_1,
+        caller_workflow_path=".github/workflows/claude-review-caller.yml",
+        caller_event="pull_request",
+        referenced_workflow_path=CENTRAL_PATH,
+        referenced_workflow_ref=CENTRAL_REF,
+        referenced_workflow_sha=CENTRAL_SHA,
         round_number=1,
         override_event_id=None,
         model_route=("route-v1",),
@@ -58,6 +68,11 @@ def _claimed_comment() -> str:
         run_attempt=1,
         head_sha=HEAD_A,
         full_diff_sha256=HASH_1,
+        caller_workflow_path=".github/workflows/claude-review-caller.yml",
+        caller_event="pull_request",
+        referenced_workflow_path=CENTRAL_PATH,
+        referenced_workflow_ref=CENTRAL_REF,
+        referenced_workflow_sha=CENTRAL_SHA,
         round_number=1,
         override_event_id=None,
         model_route=("route-v2",),
@@ -124,11 +139,17 @@ elif "/actions/runs/501/attempts/1" in endpoint:
         "id": 501,
         "run_attempt": 1,
         "head_sha": HEAD_A if (HEAD_A := "a" * 40) else HEAD_A,
-        "path": ".github/workflows/claude-code-review.yml",
+        "event": "pull_request",
+        "path": ".github/workflows/claude-review-caller.yml",
         "status": "completed",
         "conclusion": "failure",
         "repository": {"full_name": "example/repo"},
         "pull_requests": [{"number": 52}],
+        "referenced_workflows": [{
+            "path": "jhw7500/automation/.github/workflows/claude-code-review.yml@refs/tags/v1.47",
+            "ref": "refs/tags/v1.47",
+            "sha": "d" * 40,
+        }],
     }
     if config["scenario"] == "historical-run-head-mismatch":
         response["head_sha"] = "b" * 40
@@ -136,13 +157,31 @@ elif "/actions/runs/700/attempts/1" in endpoint:
     response = {
         "id": 700,
         "run_attempt": 1,
-        "head_sha": "a" * 40,
-        "path": ".github/workflows/claude-code-review.yml",
+        "head_sha": config["head"],
+        "event": "pull_request",
+        "path": ".github/workflows/claude-review-caller.yml",
         "status": "in_progress",
         "conclusion": None,
         "repository": {"full_name": "example/repo"},
         "pull_requests": [{"number": 52}],
+        "referenced_workflows": [{
+            "path": "jhw7500/automation/.github/workflows/claude-code-review.yml@refs/tags/v1.47",
+            "ref": "refs/tags/v1.47",
+            "sha": "d" * 40,
+        }],
     }
+    if config["scenario"] == "current-run-reference-missing":
+        response["referenced_workflows"] = []
+    elif config["scenario"] == "current-run-reference-duplicate":
+        response["referenced_workflows"].append(dict(response["referenced_workflows"][0]))
+    elif config["scenario"] == "current-run-reference-wrong-path":
+        response["referenced_workflows"][0]["path"] = (
+            "other/repo/.github/workflows/claude-code-review.yml@refs/tags/v1.47"
+        )
+    elif config["scenario"] == "current-run-reference-wrong-ref":
+        response["referenced_workflows"][0]["ref"] = "refs/tags/v1.46.2"
+    elif config["scenario"] == "current-run-reference-wrong-sha":
+        response["referenced_workflows"][0]["sha"] = "not-a-sha"
 elif "/collaborators/" in endpoint and endpoint.endswith("/permission"):
     response = {"permission": "write", "user": {"login": "maintainer"}}
 elif method in {"POST", "PATCH"}:
@@ -340,6 +379,24 @@ def test_public_changed_diff_modes_map_to_a_claim(fake_github, diff_mode):
     assert result.checkpoint["ledger"]["invocations"][0]["full_diff_sha256"] == HASH_1
 
 
+@pytest.mark.parametrize("diff_mode", ["full", "delta"])
+def test_changed_claim_rejects_empty_staged_input_without_consuming_round(
+    fake_github, diff_mode,
+):
+    result = fake_github.run_action(
+        mode="claim",
+        scenario="first-comment-create",
+        diff_mode=diff_mode,
+        env_overrides={"INPUT_FILES_JSON": "[]"},
+    )
+    mutations = [call for call in result.calls if "--method" in call]
+    assert result.outputs["decision"] == "state_invalid"
+    assert result.outputs["allow-invocation"] == "false"
+    assert mutations == []
+    assert result.checkpoint["ledger"]["invocations"] == []
+    assert result.checkpoint["handoff"]["stop_reason"] == "input_files_empty"
+
+
 def test_unavailable_diff_refuses_locally_with_diagnostic_artifacts(fake_github):
     result = fake_github.run_action(
         mode="claim",
@@ -425,6 +482,36 @@ def test_claim_transport_is_fail_closed(fake_github, scenario, expected):
         assert mutations == []
         assert result.checkpoint["handoff"]["decision"] == "state_invalid"
         assert result.checkpoint["handoff"]["stop_reason"] == "compare_and_swap_failed"
+
+
+def test_first_claim_authenticates_and_stores_reusable_workflow_provenance(fake_github):
+    result = fake_github.run_action(mode="claim", scenario="first-comment-create")
+    assert any("/actions/runs/700/attempts/1" in " ".join(call) for call in result.calls)
+    invocation = result.checkpoint["ledger"]["invocations"][0]
+    assert invocation["caller_workflow_path"] == ".github/workflows/claude-review-caller.yml"
+    assert invocation["caller_event"] == "pull_request"
+    assert invocation["referenced_workflow_path"] == CENTRAL_PATH
+    assert invocation["referenced_workflow_ref"] == CENTRAL_REF
+    assert invocation["referenced_workflow_sha"] == CENTRAL_SHA
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "current-run-reference-missing",
+        "current-run-reference-duplicate",
+        "current-run-reference-wrong-path",
+        "current-run-reference-wrong-ref",
+        "current-run-reference-wrong-sha",
+    ],
+)
+def test_first_claim_rejects_malformed_reusable_workflow_provenance(fake_github, scenario):
+    result = fake_github.run_action(mode="claim", scenario=scenario)
+    mutations = [call for call in result.calls if "--method" in call]
+    assert result.outputs["decision"] == "state_invalid"
+    assert result.outputs["allow-invocation"] == "false"
+    assert mutations == []
+    assert result.checkpoint["handoff"]["stop_reason"] == "provenance_mismatch"
 
 
 def test_empty_cas_comment_pages_fail_closed_without_mutation(fake_github):

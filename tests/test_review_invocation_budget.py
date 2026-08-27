@@ -22,6 +22,8 @@ HEAD_C = "c" * 40
 HASH_1 = "1" * 64
 HASH_2 = "2" * 64
 HASH_3 = "3" * 64
+CENTRAL_SHA = "d" * 40
+CENTRAL_REF = "refs/tags/v1.47"
 FINDING_1 = "RVW-111111111111"
 FINDING_2 = "RVW-222222222222"
 
@@ -83,7 +85,7 @@ def finalize_request(*, reviewer="claude", head=HEAD_A, full_hash=HASH_1, run_id
     return budget.FinalizeRequest(**values)
 
 
-def invocation(*, head=HEAD_A, full_hash=HASH_1, run_id=501, run_attempt=1,
+def invocation(*, reviewer="claude", head=HEAD_A, full_hash=HASH_1, run_id=501, run_attempt=1,
                round_number=1, outcome="success", status="finalized", override_event_id=None,
                call_count=None, estimated_input_tokens=50_000, elapsed_seconds=None):
     if call_count is None:
@@ -92,9 +94,17 @@ def invocation(*, head=HEAD_A, full_hash=HASH_1, run_id=501, run_attempt=1,
         elapsed_seconds = 10 if status == "finalized" else 0
     return budget.Invocation(
         run_id=run_id, run_attempt=run_attempt, head_sha=head,
-        full_diff_sha256=full_hash, round_number=round_number,
-        override_event_id=override_event_id, model_route=("claude-code-action-default",),
-        effort="final-review/default", call_unit="claude-code-action review session",
+        full_diff_sha256=full_hash,
+        caller_workflow_path=f".github/workflows/{reviewer}-caller.yml",
+        caller_event="pull_request",
+        referenced_workflow_path=(
+            f"jhw7500/automation/{budget.WORKFLOWS[reviewer]}@{CENTRAL_REF}"
+        ),
+        referenced_workflow_ref=CENTRAL_REF,
+        referenced_workflow_sha=CENTRAL_SHA,
+        round_number=round_number,
+        override_event_id=override_event_id, model_route=ROUTES[reviewer],
+        effort=EFFORTS[reviewer], call_unit=CALL_UNITS[reviewer],
         call_count=call_count, estimated_input_tokens=estimated_input_tokens,
         elapsed_seconds=elapsed_seconds, status=status,
         outcome=outcome if status == "finalized" else None,
@@ -117,7 +127,12 @@ def valid_provenances(state):
     return {
         (entry.run_id, entry.run_attempt): budget.RunProvenance(
             repository=REPOSITORY, pr=PR, head_sha=entry.head_sha,
-            workflow_path=budget.WORKFLOWS[state.reviewer], run_id=entry.run_id,
+            caller_workflow_path=entry.caller_workflow_path,
+            caller_event=entry.caller_event,
+            referenced_workflow_path=entry.referenced_workflow_path,
+            referenced_workflow_ref=entry.referenced_workflow_ref,
+            referenced_workflow_sha=entry.referenced_workflow_sha,
+            run_id=entry.run_id,
             run_attempt=entry.run_attempt, status="completed", conclusion="cancelled",
         )
         for entry in state.invocations
@@ -133,8 +148,46 @@ def current_provenances(state, *, conclusion=None):
     return provenances
 
 
+def reusable_provenance(
+    reviewer="claude", *, head=HEAD_A, run_id=700, run_attempt=1,
+    status="in_progress", conclusion=None,
+):
+    return budget.RunProvenance(
+        repository=REPOSITORY,
+        pr=PR,
+        head_sha=head,
+        caller_workflow_path=f".github/workflows/{reviewer}-caller.yml",
+        caller_event="pull_request",
+        referenced_workflow_path=(
+            f"jhw7500/automation/{budget.WORKFLOWS[reviewer]}@{CENTRAL_REF}"
+        ),
+        referenced_workflow_ref=CENTRAL_REF,
+        referenced_workflow_sha=CENTRAL_SHA,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        status=status,
+        conclusion=conclusion,
+    )
+
+
 def claimed_state(reviewer="claude"):
-    return budget.claim(None, request(reviewer=reviewer), {}).state
+    claim_request = request(reviewer=reviewer)
+    provenance = reusable_provenance(reviewer)
+    return budget.claim(
+        None, claim_request,
+        {(claim_request.run_id, claim_request.run_attempt): provenance},
+    ).state
+
+
+def claim_provenances(state, claim_request):
+    provenances = {} if state is None else valid_provenances(state)
+    provenances[(claim_request.run_id, claim_request.run_attempt)] = reusable_provenance(
+        claim_request.reviewer,
+        head=claim_request.head_sha,
+        run_id=claim_request.run_id,
+        run_attempt=claim_request.run_attempt,
+    )
+    return provenances
 
 
 def ledger_body(state):
@@ -177,10 +230,13 @@ def test_fixed_claim_vectors():
         events = ()
         if "override_event" in vector:
             events = (budget.OverrideEvent(vector["override_event"], "labeled", "review-budget-override", "write"),)
+        prior_state = state_for(vector["prior"])
+        claim_request = request(
+            head=vector["head"], full_hash=vector["full_hash"],
+            override_events=events,
+        )
         result = budget.claim(
-            state_for(vector["prior"]),
-            request(head=vector["head"], full_hash=vector["full_hash"], override_events=events),
-            valid_provenances(state_for(vector["prior"])) if vector["prior"] != "empty" else {},
+            prior_state, claim_request, claim_provenances(prior_state, claim_request),
         )
         assert result.decision == vector["expected"], vector["name"]
         assert result.allow_invocation is vector["allow"], vector["name"]
@@ -191,6 +247,69 @@ def test_fixed_claim_vectors():
             assert result.round_number == (3 if vector["prior"] == "two-successes" else 1)
         if "override_event" in vector:
             assert result.state.consumed_override_event_ids == (vector["override_event"],)
+
+
+@pytest.mark.parametrize("reviewer", ["claude", "gemini", "opencode"])
+def test_reusable_run_provenance_survives_first_finalize_and_later_claim(reviewer):
+    first_request = request(reviewer=reviewer)
+    first_provenance = reusable_provenance(reviewer)
+    first = budget.claim(
+        None,
+        first_request,
+        {(first_request.run_id, first_request.run_attempt): first_provenance},
+    )
+    assert first.allow_invocation
+    stored = first.state.invocations[-1]
+    assert stored.caller_workflow_path == first_provenance.caller_workflow_path
+    assert stored.caller_event == "pull_request"
+    assert stored.referenced_workflow_path == first_provenance.referenced_workflow_path
+    assert stored.referenced_workflow_ref == CENTRAL_REF
+    assert stored.referenced_workflow_sha == CENTRAL_SHA
+
+    completed_provenance = replace(
+        first_provenance, status="completed", conclusion="success",
+    )
+    finalized = budget.finalize(
+        first.state,
+        finalize_request(reviewer=reviewer),
+        {(first_request.run_id, first_request.run_attempt): completed_provenance},
+    )
+    assert finalized.decision == "finalized"
+
+    second_request = request(
+        reviewer=reviewer, head=HEAD_B, full_hash=HASH_2, run_id=701,
+    )
+    second_provenance = reusable_provenance(
+        reviewer, head=HEAD_B, run_id=701,
+    )
+    second = budget.claim(
+        finalized.state,
+        second_request,
+        {
+            (700, 1): completed_provenance,
+            (701, 1): second_provenance,
+        },
+    )
+    assert second.allow_invocation
+    assert second.round_number == 2
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"caller_event": "workflow_dispatch"},
+        {"caller_workflow_path": ""},
+        {"referenced_workflow_path": "other/repo/.github/workflows/claude-code-review.yml@refs/tags/v1.47"},
+        {"referenced_workflow_ref": "refs/tags/v1.46.2"},
+        {"referenced_workflow_sha": "not-a-sha"},
+    ],
+)
+def test_reusable_run_provenance_fails_closed_when_central_identity_is_malformed(changes):
+    provenance = replace(reusable_provenance(), **changes)
+    result = budget.claim(None, request(), {(700, 1): provenance})
+    assert not result.allow_invocation
+    assert result.decision == "state_invalid"
+    assert result.stop_reason == "provenance_mismatch"
 
 
 def test_fixed_finalize_vectors():
@@ -306,7 +425,9 @@ def test_provider_failure_preserves_prior_authenticated_findings_without_newer_l
     second_claim = budget.claim(
         first,
         request(head=HEAD_B, full_hash=HASH_2, run_id=701),
-        valid_provenances(first),
+        claim_provenances(
+            first, request(head=HEAD_B, full_hash=HASH_2, run_id=701),
+        ),
     ).state
     failed = budget.finalize(
         second_claim,
@@ -332,7 +453,9 @@ def test_empty_current_canonical_findings_clear_prior_ids(outcome):
     second_claim = budget.claim(
         first,
         request(head=HEAD_B, full_hash=HASH_2, run_id=701),
-        valid_provenances(first),
+        claim_provenances(
+            first, request(head=HEAD_B, full_hash=HASH_2, run_id=701),
+        ),
     ).state
     prior_review = budget.AuthenticatedReview(
         True, HEAD_A, HASH_1, (FINDING_1, FINDING_2),
@@ -490,11 +613,15 @@ def test_checkpoint_alone_reconstructs_next_session(tmp_path):
     checkpoint = tmp_path / "budget.json"
     checkpoint.write_bytes(budget.render_checkpoint(provider_failed))
     restored = budget.load_checkpoint(checkpoint.read_bytes())
-    same = budget.claim(restored, request(run_id=701), valid_provenances(restored))
+    same_request = request(run_id=701)
+    same = budget.claim(
+        restored, same_request, claim_provenances(restored, same_request),
+    )
+    second_request = request(head=HEAD_B, full_hash=HASH_2, run_id=701)
     second = budget.claim(
         restored,
-        request(head=HEAD_B, full_hash=HASH_2, run_id=701),
-        valid_provenances(restored),
+        second_request,
+        claim_provenances(restored, second_request),
     )
     assert same.decision == "duplicate_head"
     assert second.allow_invocation
@@ -526,11 +653,13 @@ def test_estimate_input_tokens_rejects_non_regular_path(tmp_path):
         budget.estimate_input_tokens([tmp_path])
 
 
-@pytest.mark.parametrize("field", ["repository", "pr", "head_sha", "workflow_path", "run_attempt"])
+@pytest.mark.parametrize(
+    "field", ["repository", "pr", "head_sha", "caller_workflow_path", "run_attempt"],
+)
 def test_claim_fails_closed_when_historical_provenance_mismatches(field, two_round_state, claim_request):
-    provenances = valid_provenances(two_round_state)
+    provenances = claim_provenances(two_round_state, claim_request)
     mismatch = {"repository": "other/repo", "pr": 53, "head_sha": HEAD_B,
-                "workflow_path": "other.yml", "run_attempt": 2}[field]
+                "caller_workflow_path": "other.yml", "run_attempt": 2}[field]
     provenances[(501, 1)] = replace(provenances[(501, 1)], **{field: mismatch})
     result = budget.claim(two_round_state, claim_request, provenances)
     assert not result.allow_invocation
@@ -541,24 +670,28 @@ def test_claim_fails_closed_when_historical_provenance_mismatches(field, two_rou
 @pytest.mark.parametrize("conclusion", ["cancelled", "timed_out"])
 def test_claim_accepts_current_in_progress_and_historical_terminal_provenance(
         conclusion, two_round_state, claim_request):
-    provenances = valid_provenances(two_round_state)
-    provenances = {key: replace(value, conclusion=conclusion) for key, value in provenances.items()}
+    provenances = claim_provenances(two_round_state, claim_request)
+    provenances = {
+        key: replace(value, conclusion=conclusion)
+        if key != (claim_request.run_id, claim_request.run_attempt) else value
+        for key, value in provenances.items()
+    }
     result = budget.claim(two_round_state, claim_request, provenances)
     assert result.decision == "round_budget_exhausted"
-    claimed = budget.claim(None, claim_request, {})
+    claimed = budget.claim(
+        None, claim_request, claim_provenances(None, claim_request),
+    )
     assert claimed.allow_invocation
     existing = claimed.state
     same_request = request(head=HEAD_C, full_hash=HASH_3)
-    provenances = {
-        (700, 1): budget.RunProvenance(REPOSITORY, PR, HEAD_C, budget.WORKFLOWS["claude"], 700, 1, "in_progress", None)
-    }
+    provenances = {(700, 1): reusable_provenance(head=HEAD_C)}
     result = budget.claim(existing, same_request, provenances)
     assert result.decision == "duplicate_head"
     assert not result.allow_invocation
 
 
 def test_claim_rejects_historical_in_progress_provenance(two_round_state, claim_request):
-    provenances = valid_provenances(two_round_state)
+    provenances = claim_provenances(two_round_state, claim_request)
     provenances[(501, 1)] = replace(provenances[(501, 1)], status="in_progress", conclusion=None)
     result = budget.claim(two_round_state, claim_request, provenances)
     assert not result.allow_invocation
@@ -570,12 +703,15 @@ def test_claim_rejects_boolean_authenticated_success_and_duplicate_run_identity(
     malformed_review = request(
         diff_mode="unchanged", authenticated_review=budget.AuthenticatedReview(1, HEAD_A, HASH_1),
     )
-    assert budget.claim(None, malformed_review, {}).decision == "state_invalid"
-    existing = budget.claim(None, request(), {}).state
+    assert budget.claim(
+        None, malformed_review, claim_provenances(None, malformed_review),
+    ).decision == "state_invalid"
+    initial_request = request()
+    existing = budget.claim(
+        None, initial_request, claim_provenances(None, initial_request),
+    ).state
     duplicate_run = request(head=HEAD_B, full_hash=HASH_2)
-    current = {
-        (700, 1): budget.RunProvenance(REPOSITORY, PR, HEAD_A, budget.WORKFLOWS["claude"], 700, 1, "in_progress", None)
-    }
+    current = {(700, 1): reusable_provenance()}
     result = budget.claim(existing, duplicate_run, current)
     assert result.decision == "state_invalid"
     assert result.stop_reason == "duplicate_run_identity"
@@ -592,7 +728,10 @@ def test_parser_rejects_claimed_usage_before_provider_execution():
 
 
 def test_unchanged_requires_authenticated_exact_coverage(empty_state, unchanged_request):
-    refused = budget.claim(empty_state, unchanged_request, {})
+    refused = budget.claim(
+        empty_state, unchanged_request,
+        claim_provenances(empty_state, unchanged_request),
+    )
     assert refused.decision == "state_invalid"
     assert refused.stop_reason == "unchanged_without_authenticated_review"
 
@@ -602,7 +741,10 @@ def test_new_head_with_authenticated_same_hash_reuses_without_a_call(empty_state
         unchanged_request, head_sha=HEAD_B,
         authenticated_review=budget.AuthenticatedReview(True, HEAD_A, unchanged_request.full_diff_sha256),
     )
-    result = budget.claim(empty_state, request_with_authenticated, {})
+    result = budget.claim(
+        empty_state, request_with_authenticated,
+        claim_provenances(empty_state, request_with_authenticated),
+    )
     assert result.decision == "authenticated_reuse"
     assert not result.allow_invocation
 
@@ -640,7 +782,8 @@ def test_serializer_rejects_boolean_reviewer_budget():
 @pytest.mark.parametrize("reviewer,max_calls", [("claude", 1), ("gemini", 3), ("opencode", 2)])
 def test_stored_call_count_enforces_each_reviewer_boundary(reviewer, max_calls):
     at_limit = budget.LedgerState.initial(
-        REPOSITORY, PR, reviewer, invocations=(invocation(call_count=max_calls),),
+        REPOSITORY, PR, reviewer,
+        invocations=(invocation(reviewer=reviewer, call_count=max_calls),),
     )
     payload = budget.serialize_ledger(at_limit)
     assert budget.parse_ledger(

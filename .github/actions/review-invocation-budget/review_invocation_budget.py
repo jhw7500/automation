@@ -32,10 +32,13 @@ WORKFLOWS = {
     "gemini": ".github/workflows/gemini-auto-review.yml",
     "opencode": ".github/workflows/opencode-auto-review.yml",
 }
+CENTRAL_REPOSITORY = "jhw7500/automation"
 
 _HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _FINDING = re.compile(r"RVW-[0-9a-f]{12}\Z")
+_CALLER_WORKFLOW = re.compile(r"\.github/workflows/[A-Za-z0-9_./-]+\.ya?ml\Z")
+_WORKFLOW_REF = re.compile(r"[^\x00-\x20\x7f]{1,256}\Z")
 _OUTCOMES = {"success", "provider_failure", "quality_filtered", "checkpoint_failure", "wall_time_exhausted"}
 
 
@@ -128,7 +131,11 @@ class RunProvenance:
     repository: str
     pr: int
     head_sha: str
-    workflow_path: str
+    caller_workflow_path: str
+    caller_event: str
+    referenced_workflow_path: str
+    referenced_workflow_ref: str
+    referenced_workflow_sha: str
     run_id: int
     run_attempt: int
     status: str
@@ -141,6 +148,11 @@ class Invocation:
     run_attempt: int
     head_sha: str
     full_diff_sha256: str
+    caller_workflow_path: str
+    caller_event: str
+    referenced_workflow_path: str
+    referenced_workflow_ref: str
+    referenced_workflow_sha: str
     round_number: int
     override_event_id: int | None
     model_route: tuple[str, ...]
@@ -162,6 +174,11 @@ class Invocation:
             "elapsed_seconds": self.elapsed_seconds,
             "full_diff_sha256": self.full_diff_sha256,
             "head_sha": self.head_sha,
+            "caller_workflow_path": self.caller_workflow_path,
+            "caller_event": self.caller_event,
+            "referenced_workflow_path": self.referenced_workflow_path,
+            "referenced_workflow_ref": self.referenced_workflow_ref,
+            "referenced_workflow_sha": self.referenced_workflow_sha,
             "model_route": list(self.model_route),
             "outcome": self.outcome,
             "override_event_id": self.override_event_id,
@@ -177,7 +194,9 @@ class Invocation:
     @classmethod
     def from_dict(cls, value: object) -> "Invocation":
         keys = {
-            "run_id", "run_attempt", "head_sha", "full_diff_sha256", "round_number",
+            "run_id", "run_attempt", "head_sha", "full_diff_sha256",
+            "caller_workflow_path", "caller_event", "referenced_workflow_path",
+            "referenced_workflow_ref", "referenced_workflow_sha", "round_number",
             "override_event_id", "model_route", "effort", "call_unit", "call_count",
             "estimated_input_tokens", "elapsed_seconds", "status", "outcome", "stop_reason",
             "remaining_finding_ids",
@@ -207,6 +226,19 @@ class Invocation:
             run_attempt=_integer(value["run_attempt"], "run_attempt", positive=True),
             head_sha=_hash(value["head_sha"], _HEAD, "head_sha"),
             full_diff_sha256=_hash(value["full_diff_sha256"], _HASH, "full_diff_sha256"),
+            caller_workflow_path=_string(
+                value["caller_workflow_path"], "caller_workflow_path",
+            ),
+            caller_event=_string(value["caller_event"], "caller_event"),
+            referenced_workflow_path=_string(
+                value["referenced_workflow_path"], "referenced_workflow_path",
+            ),
+            referenced_workflow_ref=_string(
+                value["referenced_workflow_ref"], "referenced_workflow_ref",
+            ),
+            referenced_workflow_sha=_hash(
+                value["referenced_workflow_sha"], _HEAD, "referenced_workflow_sha",
+            ),
             round_number=_integer(value["round_number"], "round_number", positive=True),
             override_event_id=override, model_route=tuple(route), effort=_string(value["effort"], "effort"),
             call_unit=_string(value["call_unit"], "call_unit"),
@@ -475,6 +507,7 @@ def _validate_state_shape(state: LedgerState) -> None:
         raise BudgetStateError("consumed_override_event_ids_invalid")
     for item in state.invocations:
         Invocation.from_dict(item.to_dict())
+        _validate_stored_provenance_identity(item, state.reviewer)
         call_failure = (
             item.status == "finalized" and item.outcome == "checkpoint_failure" and
             item.stop_reason == "call_budget_exhausted"
@@ -633,6 +666,79 @@ def _validate_request(request: ClaimRequest) -> None:
     _string(request.call_unit, "call_unit")
 
 
+def _expected_referenced_workflow_path(reviewer: Reviewer, ref: str) -> str:
+    return f"{CENTRAL_REPOSITORY}/{WORKFLOWS[reviewer]}@{ref}"
+
+
+def _validate_provenance_identity(
+        provenance: RunProvenance, reviewer: Reviewer) -> None:
+    if (
+        provenance.caller_event != "pull_request" or
+        not isinstance(provenance.caller_workflow_path, str) or
+        _CALLER_WORKFLOW.fullmatch(provenance.caller_workflow_path) is None or
+        ".." in Path(provenance.caller_workflow_path).parts or
+        not isinstance(provenance.referenced_workflow_ref, str) or
+        _WORKFLOW_REF.fullmatch(provenance.referenced_workflow_ref) is None or
+        provenance.referenced_workflow_path != _expected_referenced_workflow_path(
+            reviewer, provenance.referenced_workflow_ref,
+        ) or
+        not isinstance(provenance.referenced_workflow_sha, str) or
+        _HEAD.fullmatch(provenance.referenced_workflow_sha) is None
+    ):
+        raise BudgetStateError("provenance_mismatch")
+
+
+def _validate_stored_provenance_identity(
+        invocation: Invocation, reviewer: Reviewer) -> None:
+    _validate_provenance_identity(
+        RunProvenance(
+            repository="stored/stored",
+            pr=1,
+            head_sha=invocation.head_sha,
+            caller_workflow_path=invocation.caller_workflow_path,
+            caller_event=invocation.caller_event,
+            referenced_workflow_path=invocation.referenced_workflow_path,
+            referenced_workflow_ref=invocation.referenced_workflow_ref,
+            referenced_workflow_sha=invocation.referenced_workflow_sha,
+            run_id=invocation.run_id,
+            run_attempt=invocation.run_attempt,
+            status=invocation.status,
+            conclusion=invocation.outcome,
+        ),
+        reviewer,
+    )
+
+
+def _validate_one_provenance(
+        provenance: RunProvenance, state: LedgerState,
+        request: ClaimRequest | FinalizeRequest, *, current: bool,
+        invocation: Invocation | None) -> None:
+    _validate_provenance_identity(provenance, state.reviewer)
+    expected_head = request.head_sha if invocation is None else invocation.head_sha
+    expected_run_id = request.run_id if invocation is None else invocation.run_id
+    expected_run_attempt = (
+        request.run_attempt if invocation is None else invocation.run_attempt
+    )
+    if (
+        provenance.repository != state.repository or
+        provenance.pr != state.pr or
+        provenance.head_sha != expected_head or
+        provenance.run_id != expected_run_id or
+        provenance.run_attempt != expected_run_attempt or
+        (not current and provenance.status != "completed") or
+        (current and provenance.status not in {"in_progress", "completed"})
+    ):
+        raise BudgetStateError("provenance_mismatch")
+    if invocation is not None and (
+        provenance.caller_workflow_path != invocation.caller_workflow_path or
+        provenance.caller_event != invocation.caller_event or
+        provenance.referenced_workflow_path != invocation.referenced_workflow_path or
+        provenance.referenced_workflow_ref != invocation.referenced_workflow_ref or
+        provenance.referenced_workflow_sha != invocation.referenced_workflow_sha
+    ):
+        raise BudgetStateError("provenance_mismatch")
+
+
 def _validate_provenance(
         state: LedgerState, request: ClaimRequest | FinalizeRequest,
         provenances: Mapping[tuple[int, int], RunProvenance]) -> None:
@@ -641,12 +747,19 @@ def _validate_provenance(
         if not isinstance(provenance, RunProvenance):
             raise BudgetStateError("provenance_mismatch")
         current = (item.run_id, item.run_attempt) == (request.run_id, request.run_attempt)
-        if (provenance.repository != state.repository or provenance.pr != state.pr or
-                provenance.head_sha != item.head_sha or provenance.workflow_path != WORKFLOWS[state.reviewer] or
-                provenance.run_id != item.run_id or provenance.run_attempt != item.run_attempt or
-                (not current and provenance.status != "completed") or
-                (current and provenance.status not in {"in_progress", "completed"})):
+        _validate_one_provenance(
+            provenance, state, request, current=current, invocation=item,
+        )
+    current_key = (request.run_id, request.run_attempt)
+    if not any(
+        (item.run_id, item.run_attempt) == current_key for item in state.invocations
+    ):
+        provenance = provenances.get(current_key)
+        if not isinstance(provenance, RunProvenance):
             raise BudgetStateError("provenance_mismatch")
+        _validate_one_provenance(
+            provenance, state, request, current=True, invocation=None,
+        )
 
 
 def validate_or_initialize(state: LedgerState | None, request: ClaimRequest,
@@ -733,11 +846,19 @@ def refuse(state: LedgerState, request: ClaimRequest, decision: str) -> Transiti
     return Transition(updated, False, decision, decision, None, None, True)
 
 
-def append_claim(state: LedgerState, request: ClaimRequest, override: OverrideEvent | None) -> Transition:
+def append_claim(
+        state: LedgerState, request: ClaimRequest, override: OverrideEvent | None,
+        provenance: RunProvenance) -> Transition:
     round_number = len(state.invocations) + 1
     item = Invocation(
         run_id=request.run_id, run_attempt=request.run_attempt, head_sha=request.head_sha,
-        full_diff_sha256=request.full_diff_sha256, round_number=round_number,
+        full_diff_sha256=request.full_diff_sha256,
+        caller_workflow_path=provenance.caller_workflow_path,
+        caller_event=provenance.caller_event,
+        referenced_workflow_path=provenance.referenced_workflow_path,
+        referenced_workflow_ref=provenance.referenced_workflow_ref,
+        referenced_workflow_sha=provenance.referenced_workflow_sha,
+        round_number=round_number,
         override_event_id=None if override is None else override.event_id, model_route=request.model_route,
         effort=request.effort, call_unit=request.call_unit, call_count=0,
         estimated_input_tokens=request.estimated_input_tokens, elapsed_seconds=0, status="claimed",
@@ -800,7 +921,10 @@ def claim(state: LedgerState | None, request: ClaimRequest,
     total_limit = 600_000 if override is not None else 400_000
     if estimated_total(validated) + request.estimated_input_tokens > total_limit:
         return refuse(validated, request, "total_usage_budget_exhausted")
-    return append_claim(validated, request, override)
+    return append_claim(
+        validated, request, override,
+        provenances[(request.run_id, request.run_attempt)],
+    )
 
 
 def _validate_finalize_request(request: FinalizeRequest) -> None:
@@ -1390,31 +1514,54 @@ def _override_events(output_directory: Path) -> tuple[OverrideEvent, ...]:
 def _run_provenances(
         state: LedgerState | None, request: Mapping[str, object], output_directory: Path,
     ) -> dict[tuple[int, int], RunProvenance]:
-    if state is None:
-        return {}
     result: dict[tuple[int, int], RunProvenance] = {}
-    for invocation in state.invocations:
-        path = output_directory / f"run-{invocation.run_id}-{invocation.run_attempt}.json"
+    identities = {(request["run_id"], request["run_attempt"])}
+    if state is not None:
+        identities.update(
+            (invocation.run_id, invocation.run_attempt)
+            for invocation in state.invocations
+        )
+    for run_id, run_attempt in sorted(identities):
+        path = output_directory / f"run-{run_id}-{run_attempt}.json"
         value = _read_json(path, "run")
         if not isinstance(value, dict):
             raise TransportError("provenance_mismatch")
         repository = value.get("repository")
         pulls = value.get("pull_requests")
-        if not isinstance(repository, dict) or not isinstance(pulls, list):
+        referenced = value.get("referenced_workflows")
+        if (
+            not isinstance(repository, dict) or not isinstance(pulls, list) or
+            not isinstance(referenced, list)
+        ):
             raise TransportError("provenance_mismatch")
         pull_numbers = {
             item.get("number") for item in pulls if isinstance(item, dict) and
             isinstance(item.get("number"), int) and not isinstance(item.get("number"), bool)
         }
+        prefix = f"{CENTRAL_REPOSITORY}/{WORKFLOWS[request['reviewer']]}@"
+        central = [
+            item for item in referenced
+            if isinstance(item, dict) and isinstance(item.get("path"), str) and
+            item["path"].startswith(prefix)
+        ]
+        if len(central) != 1:
+            raise TransportError("provenance_mismatch")
+        central = central[0]
         provenance = RunProvenance(
             repository=repository.get("full_name"), pr=request["pr"],
-            head_sha=value.get("head_sha"), workflow_path=value.get("path"),
+            head_sha=value.get("head_sha"),
+            caller_workflow_path=value.get("path"),
+            caller_event=value.get("event"),
+            referenced_workflow_path=central.get("path"),
+            referenced_workflow_ref=central.get("ref"),
+            referenced_workflow_sha=central.get("sha"),
             run_id=value.get("id"), run_attempt=value.get("run_attempt"),
             status=value.get("status"), conclusion=value.get("conclusion"),
         )
         if request["pr"] not in pull_numbers:
             raise TransportError("provenance_mismatch")
-        result[(invocation.run_id, invocation.run_attempt)] = provenance
+        _validate_provenance_identity(provenance, request["reviewer"])
+        result[(run_id, run_attempt)] = provenance
     return result
 
 
@@ -1422,6 +1569,11 @@ def _validated_input_paths(request: Mapping[str, object]) -> tuple[Path, ...]:
     value = _embedded_json(request, "input_files_json")
     if not isinstance(value, list) or len(value) > 128 or not all(isinstance(item, str) for item in value):
         raise TransportError("input_files_invalid")
+    if (
+        request.get("operation") == "claim" and
+        request.get("diff_mode") in {"full", "delta"} and not value
+    ):
+        raise TransportError("input_files_empty")
     workspace_value = os.environ.get("GITHUB_WORKSPACE")
     if not workspace_value or request["github_workspace"] != workspace_value:
         raise TransportError("workspace_identity_mismatch")
@@ -1541,7 +1693,10 @@ def _list_run_identities(
     runs = [] if state is None else [
         {"run_id": item.run_id, "run_attempt": item.run_attempt} for item in state.invocations
     ]
-    if len(runs) > 3:
+    current = {"run_id": request["run_id"], "run_attempt": request["run_attempt"]}
+    if current not in runs:
+        runs.append(current)
+    if len(runs) > 4:
         error = "ledger_invalid"
         runs = []
     write_private(output_directory / "run-identities.json", _json_bytes({

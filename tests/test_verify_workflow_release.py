@@ -1798,6 +1798,9 @@ def test_v147_budget_helper_semantics_reject_authenticated_mutations(
         "final-cap-dead-decoy",
         "rvw-bound-dead-decoy",
         "provenance-dead-decoy",
+        "caller-event-dead-decoy",
+        "referenced-workflow-cardinality-dead-decoy",
+        "empty-input-guard-dead-decoy",
     ),
 )
 def test_v147_budget_helper_semantics_bind_live_ast_relationships(
@@ -1853,7 +1856,7 @@ def test_v147_budget_helper_semantics_bind_live_ast_relationships(
             "    if False:\n"
             "        return len(findings) > 8\n"
         )
-    else:
+    elif mutation == "provenance-dead-decoy":
         substitute(
             '(not current and provenance.status != "completed")',
             "(not current and False)",
@@ -1862,6 +1865,34 @@ def test_v147_budget_helper_semantics_bind_live_ast_relationships(
             "\n\ndef _dead_provenance_decoy(current, provenance):\n"
             "    if False:\n"
             '        return not current and provenance.status != "completed"\n'
+        )
+    elif mutation == "caller-event-dead-decoy":
+        substitute(
+            'provenance.caller_event != "pull_request"',
+            'provenance.caller_event != "workflow_call"',
+        )
+        source += (
+            "\n\ndef _dead_caller_event_decoy(provenance):\n"
+            "    if False:\n"
+            '        return provenance.caller_event != "pull_request"\n'
+        )
+    elif mutation == "referenced-workflow-cardinality-dead-decoy":
+        substitute("        if len(central) != 1:\n", "        if not central:\n")
+        source += (
+            "\n\ndef _dead_referenced_cardinality_decoy(central):\n"
+            "    if False:\n"
+            "        return len(central) != 1\n"
+        )
+    else:
+        substitute(
+            'request.get("diff_mode") in {"full", "delta"} and not value',
+            'request.get("diff_mode") in {"full", "delta"} and False',
+        )
+        source += (
+            "\n\ndef _dead_empty_input_decoy(request, value):\n"
+            "    if False:\n"
+            "        return request.get('operation') == 'claim' and "
+            "request.get('diff_mode') in {'full', 'delta'} and not value\n"
         )
 
     with pytest.raises(
@@ -1962,6 +1993,12 @@ def test_v147_rejects_budget_workflow_safety_gate_mutations(
         ("claude", "claude-code-review.yml", "provider-predicate"),
         ("gemini", "gemini-auto-review.yml", "provider-predicate"),
         ("opencode", "opencode-auto-review.yml", "provider-predicate"),
+        ("claude", "claude-code-review.yml", "staging-claim-guard"),
+        ("gemini", "gemini-auto-review.yml", "staging-claim-guard"),
+        ("claude", "claude-code-review.yml", "metrics-finalize-guard"),
+        ("gemini", "gemini-auto-review.yml", "metrics-finalize-guard"),
+        ("claude", "claude-code-review.yml", "metrics-publication"),
+        ("gemini", "gemini-auto-review.yml", "metrics-publication"),
         ("claude", "claude-code-review.yml", "publication-order"),
         ("gemini", "gemini-auto-review.yml", "publication-order"),
         ("opencode", "opencode-auto-review.yml", "publication-order"),
@@ -2009,6 +2046,35 @@ def test_v147_budget_workflow_semantics_reject_authenticated_mutations(
         }[reviewer]
         mutate_named_step_text(
             path, provider_name, provider_if, provider_if + " || always()"
+        )
+    elif mutation == "staging-claim-guard":
+        stage_id = f"stage-{reviewer}-budget-input"
+        mutate_named_step_text(
+            path,
+            f"Claim {reviewer.title()} review budget",
+            f"steps.{stage_id}.outcome == 'success'",
+            "always()",
+        )
+    elif mutation == "metrics-finalize-guard":
+        mutate_named_step_text(
+            path,
+            f"Finalize {reviewer.title()} review budget",
+            f"steps.{reviewer}-budget-metrics.outputs.metrics_valid == 'true'",
+            "always()",
+        )
+    elif mutation == "metrics-publication" and reviewer == "claude":
+        mutate_named_step_text(
+            path,
+            "Validate Claude review metrics",
+            "printf 'metrics_valid=false\\n'",
+            "printf 'metrics_valid=true\\n'",
+        )
+    elif mutation == "metrics-publication":
+        mutate_named_step_text(
+            path,
+            "Read Gemini review metrics",
+            "if not valid:\n              raise SystemExit(0)",
+            "if False:\n              raise SystemExit(0)",
         )
     elif mutation == "publication-order":
         move_named_step(

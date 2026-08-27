@@ -437,7 +437,7 @@ jobs:
 
       - name: Claim Claude review budget
         id: review-budget-claim
-        if: ${{ always() && steps.prepare-review-input.outcome == 'success' }}
+        if: ${{ always() && steps.prepare-review-input.outcome == 'success' && steps.stage-claude-budget-input.outcome == 'success' }}
         uses: $/.github/actions/review-invocation-budget
         with:
           github-token: ${{ github.token }}
@@ -518,7 +518,7 @@ jobs:
             "$GITHUB_WORKSPACE/claude-review-result.json"
 
       - name: Start Claude review metrics
-        id: claude-budget-metrics
+        id: claude-budget-metrics-start
         if: ${{ steps.review-budget-claim.outputs.allow-invocation == 'true' }}
         shell: bash
         run: |
@@ -616,16 +616,46 @@ jobs:
 
       - name: Capture Claude elapsed time
         id: claude-budget-elapsed
-        if: ${{ always() && steps.claude-budget-metrics.outcome == 'success' }}
+        if: ${{ always() && steps.claude-budget-metrics-start.outcome == 'success' }}
         shell: bash
         env:
-          STARTED_AT: ${{ steps.claude-budget-metrics.outputs.started_at }}
+          STARTED_AT: ${{ steps.claude-budget-metrics-start.outputs.started_at }}
         run: |
           set -euo pipefail
           now="$(date +%s)"
           [[ "$STARTED_AT" =~ ^[0-9]+$ ]]
           (( now >= STARTED_AT ))
           printf 'elapsed_seconds=%s\n' "$((now - STARTED_AT))" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Claude review metrics
+        id: claude-budget-metrics
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        shell: bash
+        env:
+          CALL_COUNT: ${{ steps.claude-budget-metrics-start.outputs.call_count }}
+          ELAPSED_SECONDS: ${{ steps.claude-budget-elapsed.outputs.elapsed_seconds }}
+          MODEL_ROUTE_JSON: ${{ steps.claude-budget-config.outputs.model_route_json }}
+        run: |
+          set -euo pipefail
+          printf 'metrics_valid=false\n' >> "$GITHUB_OUTPUT"
+          if [[ ! "$CALL_COUNT" =~ ^[0-9]+$ ]] || (( CALL_COUNT > 1 )); then
+            exit 0
+          fi
+          if [[ ! "$ELAPSED_SECONDS" =~ ^[0-9]+$ ]]; then
+            exit 0
+          fi
+          if ! jq -e '
+              type == "array" and length == 1
+              and all(.[]; type == "string" and length > 0)
+            ' >/dev/null <<< "$MODEL_ROUTE_JSON"; then
+            exit 0
+          fi
+          {
+            printf 'call_count=%s\n' "$CALL_COUNT"
+            printf 'elapsed_seconds=%s\n' "$ELAPSED_SECONDS"
+            printf 'model_route_json=%s\n' "$(jq -c . <<< "$MODEL_ROUTE_JSON")"
+            printf 'metrics_valid=true\n'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Canonicalize Claude review
         id: canonicalize-review
@@ -959,7 +989,7 @@ jobs:
 
       - name: Resolve Claude budget outcome
         id: review-budget-outcome
-        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.claude-budget-metrics.outputs.metrics_valid == 'true' }}
         shell: bash
         env:
           PROVIDER_OUTCOME: ${{ steps.claude-review.outcome }}
@@ -969,7 +999,7 @@ jobs:
           FILTERED_COUNT: ${{ steps.canonicalize-review.outputs.filtered-count }}
           UPSERT_OUTCOME: ${{ steps.upsert-review-comment.outcome }}
           REVIEW_PUBLISHED: ${{ steps.upsert-review-comment.outputs.published }}
-          ELAPSED_SECONDS: ${{ steps.claude-budget-elapsed.outputs.elapsed_seconds }}
+          ELAPSED_SECONDS: ${{ steps.claude-budget-metrics.outputs.elapsed_seconds }}
           AUTHENTICATED_REVIEW_JSON: ${{ steps.prepare-review-input.outputs.authenticated_review_json }}
           CANONICAL_FILE: ${{ github.workspace }}/claude-review-canonical.md
         run: |
@@ -1028,7 +1058,7 @@ jobs:
 
       - name: Finalize Claude review budget
         id: review-budget-finalize
-        if: ${{ always() && !cancelled() && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        if: ${{ always() && !cancelled() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.claude-budget-metrics.outputs.metrics_valid == 'true' }}
         uses: $/.github/actions/review-invocation-budget
         with:
           github-token: ${{ github.token }}
@@ -1040,10 +1070,10 @@ jobs:
           diff-mode: ${{ steps.prepare-diff.outputs.diff-mode }}
           input-files-json: '[]'
           authenticated-review-json: ${{ steps.prepare-review-input.outputs.authenticated_review_json }}
-          model-route-json: ${{ steps.claude-budget-config.outputs.model_route_json }}
+          model-route-json: ${{ steps.claude-budget-metrics.outputs.model_route_json }}
           effort: final-review/default
-          actual-call-count: ${{ steps.claude-budget-metrics.outputs.call_count || '0' }}
-          elapsed-seconds: ${{ steps.claude-budget-elapsed.outputs.elapsed_seconds || '0' }}
+          actual-call-count: ${{ steps.claude-budget-metrics.outputs.call_count }}
+          elapsed-seconds: ${{ steps.claude-budget-metrics.outputs.elapsed_seconds }}
           outcome: ${{ steps.review-budget-outcome.outputs.outcome }}
           stop-reason: ${{ steps.review-budget-outcome.outputs.stop_reason }}
           remaining-finding-ids-json: ${{ steps.review-budget-outcome.outputs.remaining_finding_ids_json }}
