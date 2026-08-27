@@ -3639,6 +3639,11 @@ def _shell_function_analysis(script: str, name: str) -> _ShellFunctionAnalysis:
             dynamic_command = unwrapped_words[0] if unwrapped_words else ""
             if "$" in dynamic_command or "`" in dynamic_command:
                 raise ValueError("shell program contains computed command syntax")
+            if dynamic_command in {"alias", "unalias"} or (
+                dynamic_command == "shopt"
+                and "expand_aliases" in unwrapped_words[1:]
+            ) or "BASH_ALIASES" in _shell_identifier_tokens(words):
+                raise ValueError("shell program contains alias namespace syntax")
             if dynamic_command in {".", "eval", "source"}:
                 raise ValueError("shell program contains dynamic namespace syntax")
             if name in _shell_identifier_tokens(words):

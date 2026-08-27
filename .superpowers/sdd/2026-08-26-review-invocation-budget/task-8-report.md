@@ -187,3 +187,55 @@ advance, issue-43 file outside this scope, or user-owned original-checkout path.
 
 Blockers: none. Remaining concerns: none locally; independent controller review is
 still required before any push or PR action.
+
+## Independent-review fix round 1/5
+
+Both Important findings are addressed in the tracked fix that contains this report.
+The exact immutable commit SHA and all post-commit Steps 1–4 evidence are recorded in
+the intentionally git-ignored `task-8-final-head-evidence.md`; no tracked commit is
+made after that evidence boundary.
+
+### RED evidence
+
+```text
+rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_alias_executor_redefinition -q --tb=short
+```
+
+Result before the fix: `1 failed in 0.32s` with `Failed: DID NOT RAISE
+ReleaseVerificationError`. The test's Bash syntax check, Bash namespace-execution
+proof, authenticated mutated-tree commit, expected digest update, and
+`VerifiedCommitTree` digest assertion all passed first.
+
+The isolated parsed alias-state controls initially produced `3 failed, 5 passed in
+1.30s`, each failure `DID NOT RAISE`. Self-review added the direct Bash alias-array
+namespace form before finalizing production code; its focused RED was `1 failed in
+0.32s`, also `DID NOT RAISE`.
+
+### GREEN and covering regression evidence
+
+- Exact execution-proven bypass: `1 passed in 0.21s`.
+- Exact bypass plus all isolated target/alias controls:
+  `rtk python3 -m pytest tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_alias_executor_redefinition tests/test_verify_workflow_release.py::test_v147_opencode_call_cap_rejects_unparsed_target_affecting_syntax -q --tb=short`
+  → `10 passed in 1.78s`.
+- Authentic v1.47 candidate plus the prior 17 OpenCode parser cases and all new
+  controls → `22 passed in 3.99s`.
+- Unchanged prior structural regression command → `49 passed in 9.00s`.
+- `rtk python3 -m py_compile scripts/verify_workflow_release.py tests/test_verify_workflow_release.py`
+  → exit 0.
+- `rtk python3 -m pytest tests/test_workflow_release_bundle.py tests/test_verify_workflow_release.py -q --tb=short`
+  → `596 passed in 201.92s (0:03:21)`.
+
+### Fix self-review
+
+- Parsed command words are checked after assignment-prefix and `command`/`builtin`
+  wrapper removal; alias declaration/removal, the `expand_aliases` shell option, and
+  the Bash alias namespace array fail closed. The authentic workflow contains none.
+- The change adds no substring occurrence/count proof and does not interpret alias
+  bodies. Whole-program target declaration/invocation analysis remains unchanged.
+- The regression test executes the real Bash namespace transition before testing the
+  authenticated release verifier, so it does not assert only source text or syntax.
+- Finding 2 uses one tracked final-review commit followed by a new ignored evidence
+  artifact. This prevents evidence from changing the reviewed SHA while preserving
+  exact post-commit commands and results.
+- No Task 1–6 production byte, inventory/contract/config/default, tag, release,
+  rollout, GitHub, Notion, or other external state changed. Blockers: none.

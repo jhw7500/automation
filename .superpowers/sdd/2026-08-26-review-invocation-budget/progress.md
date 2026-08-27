@@ -190,3 +190,13 @@ Ruling: The exact Step 4 diff-check exposed one extra blank line at EOF in the a
 Task 8: local Steps 1–4 complete on 0c63098a804a625bcce262cd0faed7115484a02c (helper py_compile exit 0; five-file suite 2206 passed; full suite 2681 passed + 48 subtests; 36 YAML mappings; digest-pinned actionlint 1.7.12 clean; mutation focus 73 passed; v1.47 commit-only PASS; diff-check/status/stat/log scope audit clean; report: task-8-report.md)
 
 Task 8: breaker ruling outcome — addressed locally with no remaining load-bearing verifier finding; Task 8 Steps 5–9, independent review, push, PR, merge, tag, release, rollout, GitHub, and Notion changes were not performed and remain controller-owned.
+
+Task 8: fix round 1/5 RED complete (authenticated alias-executor mutation: 1 failed with `DID NOT RAISE` after Bash syntax/execution and exact mutated-tree digest proof; isolated alias state controls: 3 failed/5 passed; direct Bash alias namespace array: 1 failed with `DID NOT RAISE`)
+
+Ruling: Alias declaration/removal, explicit alias-expansion option changes, and direct Bash alias namespace mutation are outside the authenticated provider shell subset and fail closed as parsed executable constructs after assignment/wrapper unwrapping; do not interpret aliases or add text/count evidence — if wrong, an alternate namespace binding can replace the metered function, while over-broad rejection can break the authentic workflow, so the execution-proven RED, positive v1.47 candidate, full parser matrix, structural gate, and release suites must all pass.
+
+Task 8: fix round 1/5 focused GREEN complete (exact alias bypass 1 passed; isolated target/alias controls 10 passed; authentic/prior parser matrix plus new controls 22 passed; unchanged structural regression 49 passed; final release/bundle suite 596 passed; touched verifier/test py_compile exit 0)
+
+Ruling: The tracked commit containing this line is `FINAL_REVIEW_HEAD`. Run Task 8 Steps 1–4 only after that commit, write the exact immutable SHA/commands/results to ignored `task-8-final-head-evidence.md`, and make no later commit — if wrong, re-review could authenticate evidence from a different tree than the reviewed implementation.
+
+Task 8: fix round 1/5 tracked work ready for final-head verification (both Important findings addressed; post-commit Steps 1–4 and clean-status proof intentionally deferred to the ignored final-head evidence artifact; Steps 5–9 and all external state remain controller-owned)
