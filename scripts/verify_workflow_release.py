@@ -3274,21 +3274,40 @@ def _shell_logical_lines(script: str) -> tuple[str, ...]:
             index += 1
         command = " ".join(parts)
         logical.append(command)
-        heredoc = re.search(
-            r"<<(?:'([A-Za-z_][A-Za-z0-9_]*)'|"
-            r'"([A-Za-z_][A-Za-z0-9_]*)"|'
-            r"([A-Za-z_][A-Za-z0-9_]*))",
-            command,
-        )
-        if heredoc is None:
-            continue
-        terminator = next(group for group in heredoc.groups() if group)
-        while index < len(physical) and physical[index].strip() != terminator:
+        for terminator in _shell_heredoc_terminators(command):
+            while (
+                index < len(physical)
+                and physical[index].strip() != terminator
+            ):
+                index += 1
+            if index >= len(physical):
+                raise ValueError("shell heredoc is unterminated")
             index += 1
-        if index >= len(physical):
-            raise ValueError("shell heredoc is unterminated")
-        index += 1
     return tuple(logical)
+
+
+_SHELL_HEREDOC_TERMINATOR_PATTERN = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*\Z"
+)
+
+
+def _shell_heredoc_terminators(command: str) -> tuple[str, ...]:
+    """Return delimiters following real, unquoted shell ``<<`` operators."""
+
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.commenters = "#"
+    lexer.whitespace_split = True
+    tokens = tuple(lexer)
+    terminators: list[str] = []
+    for index, token in enumerate(tokens):
+        if token != "<<":
+            continue
+        if index + 1 >= len(tokens) or not _SHELL_HEREDOC_TERMINATOR_PATTERN.fullmatch(
+            tokens[index + 1]
+        ):
+            raise ValueError("shell heredoc delimiter differs")
+        terminators.append(tokens[index + 1])
+    return tuple(terminators)
 
 
 _SHELL_DECLARATION_PATTERN = re.compile(
@@ -3311,6 +3330,10 @@ _SHELL_DECLARATION_PREFIX_PATTERN = re.compile(
 )
 _SHELL_ASSIGNMENT_WORD_PATTERN = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\+?=).*\Z"
+)
+_SHELL_STATIC_ASSIGNMENT_PATTERN = re.compile(
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<append>\+)?="
+    r"(?P<value>[A-Za-z0-9_./:+-]*)\Z"
 )
 
 
@@ -3476,6 +3499,7 @@ def _shell_function_analysis(script: str, name: str) -> _ShellFunctionAnalysis:
     stack: list[_ShellFrame] = []
     definitions: list[_ShellFunctionDefinition] = []
     invocation_records: list[tuple[int, _ShellCommand]] = []
+    static_assignments: dict[str, str] = {}
 
     def active_target() -> tuple[int, int] | None:
         for stack_index in range(len(stack) - 1, -1, -1):
@@ -3577,10 +3601,34 @@ def _shell_function_analysis(script: str, name: str) -> _ShellFunctionAnalysis:
         else:
             words = _shell_command_words(line)
             unwrapped_words = list(words)
+            assignment_words: list[str] = []
             while unwrapped_words and _SHELL_ASSIGNMENT_WORD_PATTERN.fullmatch(
                 unwrapped_words[0]
             ):
-                unwrapped_words.pop(0)
+                assignment_words.append(unwrapped_words.pop(0))
+            if not unwrapped_words:
+                for assignment_word in assignment_words:
+                    assignment = _SHELL_STATIC_ASSIGNMENT_PATTERN.fullmatch(
+                        assignment_word
+                    )
+                    if assignment is None:
+                        assigned_name = assignment_word.split("=", 1)[0].rstrip(
+                            "+"
+                        )
+                        static_assignments.pop(assigned_name, None)
+                        continue
+                    assigned_name = assignment.group("name")
+                    assigned_value = assignment.group("value")
+                    if assignment.group("append"):
+                        prior_value = static_assignments.get(assigned_name)
+                        if prior_value is None:
+                            continue
+                        assigned_value = prior_value + assigned_value
+                    static_assignments[assigned_name] = assigned_value
+                    if assigned_value in {".", "eval", "source", name}:
+                        raise ValueError(
+                            "shell program computes dynamic namespace syntax"
+                        )
             while unwrapped_words and unwrapped_words[0] in {"builtin", "command"}:
                 unwrapped_words.pop(0)
                 while unwrapped_words and (
@@ -3589,6 +3637,8 @@ def _shell_function_analysis(script: str, name: str) -> _ShellFunctionAnalysis:
                 ):
                     unwrapped_words.pop(0)
             dynamic_command = unwrapped_words[0] if unwrapped_words else ""
+            if "$" in dynamic_command or "`" in dynamic_command:
+                raise ValueError("shell program contains computed command syntax")
             if dynamic_command in {".", "eval", "source"}:
                 raise ValueError("shell program contains dynamic namespace syntax")
             if name in _shell_identifier_tokens(words):
