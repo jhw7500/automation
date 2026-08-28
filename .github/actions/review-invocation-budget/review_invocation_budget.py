@@ -1547,13 +1547,14 @@ def _run_provenances(
         if len(central) != 1:
             raise TransportError("provenance_mismatch")
         central = central[0]
+        central_ref = central.get("ref") if "ref" in central else central.get("sha")
         provenance = RunProvenance(
             repository=repository.get("full_name"), pr=request["pr"],
             head_sha=value.get("head_sha"),
             caller_workflow_path=value.get("path"),
             caller_event=value.get("event"),
             referenced_workflow_path=central.get("path"),
-            referenced_workflow_ref=central.get("ref"),
+            referenced_workflow_ref=central_ref,
             referenced_workflow_sha=central.get("sha"),
             run_id=value.get("id"), run_attempt=value.get("run_attempt"),
             status=value.get("status"), conclusion=value.get("conclusion"),
