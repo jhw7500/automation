@@ -4338,6 +4338,7 @@ jobs:
               const carryover = sections.filter((item) => item.name !== 'New findings');
               if (carryover.length && !priorSuccess) return null;
               const parsedBlocks = [];
+              const filteredNewFindings = [];
               const currentHeadings = new Set();
               for (const [sectionIndex, section] of sections.entries()) {
                 const sectionFindingBlocks = sectionBlocks(section);
@@ -4349,7 +4350,12 @@ jobs:
                   if (section.name === 'New findings' && priorMatches !== 0) return null;
                   if (section.name !== 'New findings' && priorMatches !== 1) return null;
                   const evidence = parseBlockEvidence(block);
-                  if (!evidence) return null;
+                  if (!evidence) {
+                    if (section.name !== 'New findings') return null;
+                    filteredNewFindings.push({ sectionIndex, section: section.name, block,
+                      reason: 'finding_grammar_invalid' });
+                    continue;
+                  }
                   const currentPair = evidence.changedAnchors.length === 1
                     && evidence.currentLines.length === 1;
                   const removedPair = evidence.removedAnchors.length === 1
@@ -4358,6 +4364,12 @@ jobs:
                     && evidence.currentLines.length === 0;
                   const noRemovedPair = evidence.removedAnchors.length === 0
                     && evidence.removedLines.length === 0;
+                  if (section.name === 'New findings'
+                    && (!currentPair || !noRemovedPair)) {
+                    filteredNewFindings.push({ sectionIndex, section: section.name, block,
+                      reason: 'finding_grammar_invalid' });
+                    continue;
+                  }
                   if (currentPair && noRemovedPair) {
                     const anchor = { ...evidence.changedAnchors[0],
                       currentLine: evidence.currentLines[0] };
@@ -4383,7 +4395,7 @@ jobs:
                     evidence: { anchors: [], removals: [removal] } });
                 }
               }
-              return { blocks: parsedBlocks, sections };
+              return { blocks: parsedBlocks, sections, filteredNewFindings };
             };
 
             const changedPathValidation = new Map();
@@ -4655,7 +4667,8 @@ jobs:
             const candidate = candidateArtifactValid ? { body: candidateReview } : null;
             const review = candidate ? clean(candidate.body) : '';
             const parsedReview = review ? parseReview(review) : null;
-            const filteredNewFindings = [];
+            const filteredNewFindings = parsedReview
+              ? [...parsedReview.filteredNewFindings] : [];
             let anchorValidationFailed = false;
             if (parsedReview) {
               const newFindings = parsedReview.blocks.filter((entry) =>

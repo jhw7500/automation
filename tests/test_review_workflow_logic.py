@@ -14196,7 +14196,7 @@ def test_opencode_one_line_json_anchor_round_trips_every_utf8_path(tmp_path, pat
         '{"path":"src.py","line":1',
     ],
 )
-def test_opencode_json_anchor_rejects_extra_keys_and_malformed_values(tmp_path, anchor):
+def test_opencode_json_anchor_filters_extra_keys_and_malformed_values(tmp_path, anchor):
     review = (
         f"{OPENCODE_MARKER}\n### New findings\n#### Invalid anchor\n"
         f"- Changed anchor: {anchor}\nbody"
@@ -14208,7 +14208,12 @@ def test_opencode_json_anchor_rejects_extra_keys_and_malformed_values(tmp_path, 
 
     body = next(call[1]["body"] for call in calls if call[0] == "create")
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
-    assert state["attempt_status"] == "failure"
+    assert state["attempt_status"] == "success"
+    assert "### New findings\nNone" in body
+    assert "Invalid anchor" not in body
+    assert "filtered_invalid_new_findings=1" in body
+    assert "reasons=finding_grammar_invalid" in body
+    assert ["output", "quality_filtered", "true"] in calls
 
 
 @node_required
@@ -14468,6 +14473,74 @@ def test_opencode_filters_out_of_scope_new_finding_but_keeps_valid_high(tmp_path
         "- Validation: filtered_invalid_new_findings=1; "
         "reasons=anchor_out_of_scope"
     ) in body
+
+
+@node_required
+def test_opencode_filters_issue_65_malformed_current_line_as_quality_warning(tmp_path):
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        "#### [MEDIUM] Subprocess call blocks main daemon loop\n"
+        f"- Changed anchor: {anchor}\n"
+        '- Current line: "cur = norm(run_command(["mlanutl", IFACE, sub]))"\n\n'
+        "A blocking subprocess can stall the daemon loop."
+    )
+    candidate = _bot("github-actions[bot]", review, 10, updated="u2")
+
+    calls = _run_opencode_canonicalize(tmp_path, [], [candidate])
+    body = _single_mutation_body(calls)
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+
+    assert state["attempt_status"] == "success"
+    assert "### New findings\nNone" in body
+    assert "Subprocess call blocks main daemon loop" not in body
+    assert (
+        "- Validation: filtered_invalid_new_findings=1; "
+        "reasons=finding_grammar_invalid"
+    ) in body
+    assert ["output", "quality_filtered", "true"] in calls
+    assert not any(call[0] == "failed" for call in calls)
+
+
+@node_required
+def test_opencode_filters_malformed_new_finding_but_keeps_valid_sibling(tmp_path):
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        "#### [HIGH] Real regression\n"
+        f"- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\nConcrete, blocking impact.\n\n'
+        "#### [MEDIUM] Malformed evidence\n"
+        f"- Changed anchor: {anchor}\n"
+        '- Current line: "call(["unescaped"])"\nMalformed evidence body.'
+    )
+    candidate = _bot("github-actions[bot]", review, 10, updated="u2")
+
+    calls = _run_opencode_canonicalize(tmp_path, [], [candidate])
+    body = _single_mutation_body(calls)
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+
+    assert state["attempt_status"] == "success"
+    assert "#### [HIGH] Real regression" in body
+    assert "Concrete, blocking impact." in body
+    assert "Malformed evidence" not in body
+    assert (
+        "- Validation: filtered_invalid_new_findings=1; "
+        "reasons=finding_grammar_invalid"
+    ) in body
+    assert ["output", "quality_filtered", "false"] in calls
 
 @node_required
 def test_opencode_all_out_of_scope_new_findings_becomes_clean_success(tmp_path):
@@ -15197,8 +15270,6 @@ def test_opencode_current_state_parser_accepts_success_unchanged_before_generati
         f"{OPENCODE_MARKER}\n### New findings\n",
         f"{OPENCODE_MARKER}\n### New findings\ntext before block\n#### Finding\n- Changed anchor: `{OPENCODE_SCOPE_PATH}:1`",
         f"{OPENCODE_MARKER}\n### New findings\nNone\n#### Finding\n- Changed anchor: `{OPENCODE_SCOPE_PATH}:1`",
-        f"{OPENCODE_MARKER}\n### New findings\n#### Anchored\n- Changed anchor: `{OPENCODE_SCOPE_PATH}:1`\n#### Missing anchor\nbody",
-        f"{OPENCODE_MARKER}\n### New findings\n#### Anchored\n- Changed anchor: `{OPENCODE_SCOPE_PATH}:1`\n#### Malformed\n- Changed anchor: path:not-a-line",
     ],
 )
 def test_opencode_changed_anchor_scope_rejects_invalid_output_grammar(tmp_path, review):
@@ -15210,7 +15281,7 @@ def test_opencode_changed_anchor_scope_rejects_invalid_output_grammar(tmp_path, 
 
 
 @node_required
-def test_opencode_finding_requires_current_line_field(tmp_path):
+def test_opencode_filters_finding_without_current_line_field(tmp_path):
     anchor = json.dumps(
         {"path": OPENCODE_SCOPE_PATH, "line": 1},
         ensure_ascii=False,
@@ -15224,9 +15295,15 @@ def test_opencode_finding_requires_current_line_field(tmp_path):
         "Concrete impact.",
     ]
     candidate = _bot("github-actions[bot]", "\n".join(lines), 10, updated="u2")
-    body = _single_mutation_body(_run_opencode_canonicalize(tmp_path, [], [candidate]))
+    calls = _run_opencode_canonicalize(tmp_path, [], [candidate])
+    body = _single_mutation_body(calls)
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
-    assert state["attempt_status"] == "failure"
+    assert state["attempt_status"] == "success"
+    assert "### New findings\nNone" in body
+    assert "Grounded finding" not in body
+    assert "filtered_invalid_new_findings=1" in body
+    assert "reasons=finding_grammar_invalid" in body
+    assert ["output", "quality_filtered", "true"] in calls
 
 
 @node_required
@@ -16200,7 +16277,7 @@ def _tiny_git_repo(path: Path) -> tuple[str, str]:
 
 
 @node_required
-def test_opencode_absolute_git_ignores_path_shim_and_rejects_unchanged_anchor(tmp_path):
+def test_opencode_invalid_anchor_is_filtered_without_invoking_git(tmp_path):
     repo = tmp_path / "repo"
     base, head = _tiny_git_repo(repo)
     manifest = {"schema": 1, "repository": "example/repo", "pr_number": 7,
@@ -16213,7 +16290,12 @@ def test_opencode_absolute_git_ignores_path_shim_and_rejects_unchanged_anchor(tm
     )
     body = [call for call in calls if call[0] == "create"][-1][1]["body"]
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
-    assert state["attempt_status"] == "failure"
+    assert state["attempt_status"] == "success"
+    assert "### New findings\nNone" in body
+    assert "#### Fake" not in body
+    assert "filtered_invalid_new_findings=1" in body
+    assert "reasons=finding_grammar_invalid" in body
+    assert ["output", "quality_filtered", "true"] in calls
     assert not (tmp_path / "opencode-canonicalize" / "git-argv.txt").exists()
 
 
