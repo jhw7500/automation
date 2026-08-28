@@ -98,7 +98,7 @@ def invocation(*, reviewer="claude", head=HEAD_A, full_hash=HASH_1, run_id=501, 
         caller_workflow_path=f".github/workflows/{reviewer}-caller.yml",
         caller_event="pull_request",
         referenced_workflow_path=(
-            f"jhw7500/automation/{budget.WORKFLOWS[reviewer]}@{CENTRAL_REF}"
+            f"jhw7500/automation/{budget.WORKFLOWS[reviewer]}@{CENTRAL_SHA}"
         ),
         referenced_workflow_ref=CENTRAL_REF,
         referenced_workflow_sha=CENTRAL_SHA,
@@ -159,7 +159,7 @@ def reusable_provenance(
         caller_workflow_path=f".github/workflows/{reviewer}-caller.yml",
         caller_event="pull_request",
         referenced_workflow_path=(
-            f"jhw7500/automation/{budget.WORKFLOWS[reviewer]}@{CENTRAL_REF}"
+            f"jhw7500/automation/{budget.WORKFLOWS[reviewer]}@{CENTRAL_SHA}"
         ),
         referenced_workflow_ref=CENTRAL_REF,
         referenced_workflow_sha=CENTRAL_SHA,
@@ -294,13 +294,26 @@ def test_reusable_run_provenance_survives_first_finalize_and_later_claim(reviewe
     assert second.round_number == 2
 
 
+def test_reusable_run_accepts_symbolic_ref_resolved_to_workflow_sha():
+    provenance = reusable_provenance()
+
+    result = budget.claim(None, request(), {(700, 1): provenance})
+
+    assert result.allow_invocation
+    stored = result.state.invocations[-1]
+    assert stored.referenced_workflow_ref == "refs/tags/v1.47"
+    assert stored.referenced_workflow_path.endswith("@" + CENTRAL_SHA)
+
+
 @pytest.mark.parametrize(
     "changes",
     [
         {"caller_event": "workflow_dispatch"},
         {"caller_workflow_path": ""},
-        {"referenced_workflow_path": "other/repo/.github/workflows/claude-code-review.yml@refs/tags/v1.47"},
-        {"referenced_workflow_ref": "refs/tags/v1.46.2"},
+        {"referenced_workflow_path": (
+            "jhw7500/automation/.github/workflows/claude-code-review.yml@" + "e" * 40
+        )},
+        {"referenced_workflow_ref": "refs/tags/v1.47\n"},
         {"referenced_workflow_sha": "not-a-sha"},
     ],
 )

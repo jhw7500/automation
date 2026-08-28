@@ -631,7 +631,7 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256 = (
     "42462dad335073794bd5c46e1993e02e4dc9824113d1b36fd5c6b89dc0583a9c"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
-    "89968fc857aa4718025d8b39dae5b0958d9d83b458b2325a905bb308a5905d11"
+    "9e7cae2b39f41f693122ff80206e0c9ad4ccd32ffa7fb21b344d5383a6421f59"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "92ec63f9b8a22703918d974e87e1eb3ab7f2f9ffaaca1a3c3f12e360f5839906",
@@ -4260,7 +4260,7 @@ def require_budget_helper_contract(source: str) -> None:
             "_WORKFLOW_REF.fullmatch(provenance.referenced_workflow_ref) is None or "
             "provenance.referenced_workflow_path != "
             "_expected_referenced_workflow_path("
-            "reviewer, provenance.referenced_workflow_ref) or "
+            "reviewer, provenance.referenced_workflow_sha) or "
             "not isinstance(provenance.referenced_workflow_sha, str) or "
             "_HEAD.fullmatch(provenance.referenced_workflow_sha) is None",
             "BudgetStateError",

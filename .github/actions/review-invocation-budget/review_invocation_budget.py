@@ -666,8 +666,8 @@ def _validate_request(request: ClaimRequest) -> None:
     _string(request.call_unit, "call_unit")
 
 
-def _expected_referenced_workflow_path(reviewer: Reviewer, ref: str) -> str:
-    return f"{CENTRAL_REPOSITORY}/{WORKFLOWS[reviewer]}@{ref}"
+def _expected_referenced_workflow_path(reviewer: Reviewer, sha: str) -> str:
+    return f"{CENTRAL_REPOSITORY}/{WORKFLOWS[reviewer]}@{sha}"
 
 
 def _validate_provenance_identity(
@@ -680,7 +680,7 @@ def _validate_provenance_identity(
         not isinstance(provenance.referenced_workflow_ref, str) or
         _WORKFLOW_REF.fullmatch(provenance.referenced_workflow_ref) is None or
         provenance.referenced_workflow_path != _expected_referenced_workflow_path(
-            reviewer, provenance.referenced_workflow_ref,
+            reviewer, provenance.referenced_workflow_sha,
         ) or
         not isinstance(provenance.referenced_workflow_sha, str) or
         _HEAD.fullmatch(provenance.referenced_workflow_sha) is None
