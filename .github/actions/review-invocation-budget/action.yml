@@ -15,6 +15,9 @@ inputs:
     required: true
   diff-mode:
     required: true
+  force-review:
+    required: false
+    default: 'false'
   input-files-json:
     required: true
   authenticated-review-json:
@@ -66,6 +69,7 @@ runs:
         EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
         FULL_DIFF_SHA256: ${{ inputs.full-diff-sha256 }}
         DIFF_MODE: ${{ inputs.diff-mode }}
+        FORCE_REVIEW: ${{ inputs.force-review }}
         INPUT_FILES_JSON: ${{ inputs.input-files-json }}
         AUTHENTICATED_REVIEW_JSON: ${{ inputs.authenticated-review-json }}
         MODEL_ROUTE_JSON: ${{ inputs.model-route-json }}
@@ -128,6 +132,7 @@ runs:
           "$BUDGET_MODE" "$GITHUB_REPOSITORY" "$PR_NUMBER" "$REVIEWER" \
           "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$EXPECTED_HEAD_SHA" \
           "$FULL_DIFF_SHA256" "$DIFF_MODE" "$INPUT_FILES_JSON" \
+          "$FORCE_REVIEW" \
           "$AUTHENTICATED_REVIEW_JSON" "$MODEL_ROUTE_JSON" "$EFFORT" \
           "$ACTUAL_CALL_COUNT" "$ELAPSED_SECONDS" "$REVIEW_OUTCOME" \
           "$STOP_REASON" "$REMAINING_FINDING_IDS_JSON" "$CHECKPOINT_FILE" \
@@ -139,6 +144,7 @@ runs:
         names = (
             "operation", "repository", "pr", "reviewer", "run_id", "run_attempt",
             "head_sha", "full_diff_sha256", "diff_mode", "input_files_json",
+            "force_review",
             "authenticated_review_json", "model_route_json", "effort", "actual_call_count",
             "elapsed_seconds", "outcome", "stop_reason", "remaining_finding_ids_json",
             "checkpoint_file", "github_workspace", "server_url",

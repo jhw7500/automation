@@ -54,6 +54,21 @@
             "opened",
             "synchronize"
           ]
+        },
+        "workflow_dispatch": {
+          "inputs": {
+            "pr_number": {
+              "description": "Pull request number",
+              "type": "number",
+              "required": "true"
+            },
+            "force_review": {
+              "description": "Perform one authorized same-HEAD review",
+              "type": "boolean",
+              "required": "false",
+              "default": "false"
+            }
+          }
         }
       },
       "caller_jobs": [
@@ -67,6 +82,7 @@
             "pull-requests": "write"
           },
           "with": [
+            "force_review",
             "pr_number"
           ],
           "secrets": [
@@ -87,6 +103,21 @@
             "opened",
             "synchronize"
           ]
+        },
+        "workflow_dispatch": {
+          "inputs": {
+            "pr_number": {
+              "description": "Pull request number",
+              "type": "number",
+              "required": "true"
+            },
+            "force_review": {
+              "description": "Perform one authorized same-HEAD review",
+              "type": "boolean",
+              "required": "false",
+              "default": "false"
+            }
+          }
         }
       },
       "caller_jobs": [
@@ -100,6 +131,7 @@
           },
           "with": [
             "app_id",
+            "force_review",
             "pr_number",
             "publisher_app_id",
             "repo_write_auth"

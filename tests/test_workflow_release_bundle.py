@@ -202,6 +202,7 @@ def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() ->
             "pr-number": {"required": "true"},
             "previous-sha": {"required": "false", "default": ""},
             "previous-full-hash": {"required": "false", "default": ""},
+            "force-full": {"required": "false", "default": "false"},
             "context-lines": {"required": "false", "default": "3"},
             "output-directory": {"required": "true"},
         },
@@ -227,20 +228,30 @@ def test_prepare_review_diff_composite_action_has_exact_safe_shell_contract() ->
                         "PR_NUMBER": "${{ inputs.pr-number }}",
                         "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
                         "PREVIOUS_FULL_HASH": "${{ inputs.previous-full-hash }}",
+                        "FORCE_FULL": "${{ inputs.force-full }}",
                         "CONTEXT_LINES": "${{ inputs.context-lines }}",
                         "OUTPUT_DIRECTORY": "${{ inputs.output-directory }}",
                     },
                     "run": (
-                        'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" '
-                        '--repository "$GITHUB_REPOSITORY" '
-                        '--pr-number "$PR_NUMBER" '
-                        '--previous-sha "$PREVIOUS_SHA" '
-                        '--previous-full-hash "$PREVIOUS_FULL_HASH" '
-                        '--context-lines "$CONTEXT_LINES" '
-                        '--full-output "$OUTPUT_DIRECTORY/review-full.diff" '
-                        '--delta-output "$OUTPUT_DIRECTORY/review-delta.diff" '
-                        '--manifest-output "$OUTPUT_DIRECTORY/review-scope.json" '
-                        '--github-output "$GITHUB_OUTPUT"'
+                        "set -euo pipefail\n"
+                        "force_args=()\n"
+                        "if [[ \"$FORCE_FULL\" == 'true' ]]; then\n"
+                        "  force_args+=(--force-full)\n"
+                        "elif [[ \"$FORCE_FULL\" != 'false' ]]; then\n"
+                        "  echo 'force-full must be true or false' >&2\n"
+                        "  exit 2\n"
+                        "fi\n"
+                        'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" \\\n'
+                        '  --repository "$GITHUB_REPOSITORY" \\\n'
+                        '  --pr-number "$PR_NUMBER" \\\n'
+                        '  --previous-sha "$PREVIOUS_SHA" \\\n'
+                        '  --previous-full-hash "$PREVIOUS_FULL_HASH" \\\n'
+                        '  --context-lines "$CONTEXT_LINES" \\\n'
+                        '  --full-output "$OUTPUT_DIRECTORY/review-full.diff" \\\n'
+                        '  --delta-output "$OUTPUT_DIRECTORY/review-delta.diff" \\\n'
+                        '  --manifest-output "$OUTPUT_DIRECTORY/review-scope.json" \\\n'
+                        '  --github-output "$GITHUB_OUTPUT" \\\n'
+                        '  "${force_args[@]}"\n'
                     ),
                 }
             ],
@@ -282,6 +293,7 @@ def test_prepare_review_diff_action_run_passes_quoted_environment_values_to_help
         "PR_NUMBER": pr_number,
         "PREVIOUS_SHA": "a" * 40,
         "PREVIOUS_FULL_HASH": "b" * 64,
+        "FORCE_FULL": "false",
         "CONTEXT_LINES": "20",
         "OUTPUT_DIRECTORY": str(runner_temp),
     }
@@ -382,7 +394,7 @@ def test_review_invocation_budget_action_has_exact_safe_contract() -> None:
     document = yaml.load(payload, Loader=yaml.BaseLoader)
 
     assert hashlib.sha256(payload).hexdigest() == (
-        "42462dad335073794bd5c46e1993e02e4dc9824113d1b36fd5c6b89dc0583a9c"
+        "70b50ce482ff0e54df9fff88d5126cd8e760ed8bdabfefcc2f2ccdc639cb693b"
     )
     assert document == release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION
 

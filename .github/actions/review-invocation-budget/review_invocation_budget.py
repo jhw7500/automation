@@ -467,6 +467,7 @@ class ClaimRequest:
     model_route: tuple[str, ...]
     effort: str
     call_unit: str
+    force_review: bool = False
 
 
 @dataclass(frozen=True)
@@ -532,20 +533,37 @@ def _validate_state_shape(state: LedgerState) -> None:
     run_keys = {(item.run_id, item.run_attempt) for item in state.invocations}
     if len(run_keys) != len(state.invocations):
         raise BudgetStateError("duplicate_run_identity")
-    if len({item.head_sha for item in state.invocations}) != len(state.invocations):
-        raise BudgetStateError("duplicate_head")
-    if len({item.full_diff_sha256 for item in state.invocations}) != len(state.invocations):
-        raise BudgetStateError("duplicate_effective_diff")
     automatic = [item for item in state.invocations if item.override_event_id is None]
     overrides = [item for item in state.invocations if item.override_event_id is not None]
+    forced_override = next(
+        (item for item in overrides if item.caller_event == "workflow_dispatch"), None
+    )
+    for attribute, reason in (
+        ("head_sha", "duplicate_head"),
+        ("full_diff_sha256", "duplicate_effective_diff"),
+    ):
+        values = [getattr(item, attribute) for item in state.invocations]
+        duplicates = {value for value in values if values.count(value) > 1}
+        if duplicates and (
+            forced_override is None
+            or any(values.count(value) != 2 for value in duplicates)
+            or any(getattr(forced_override, attribute) != value for value in duplicates)
+            or all(getattr(item, attribute) not in duplicates for item in automatic)
+        ):
+            raise BudgetStateError(reason)
     if len(automatic) > state.budgets.max_rounds or len(overrides) > state.budgets.max_override_rounds:
         raise BudgetStateError("rounds_invalid")
     if [item.round_number for item in automatic] != list(range(1, len(automatic) + 1)):
         raise BudgetStateError("rounds_invalid")
     if overrides:
         item = overrides[0]
-        if (len(automatic) != state.budgets.max_rounds or state.invocations[-1] != item or
-                item.round_number != state.budgets.max_rounds + 1 or
+        expected_automatic_rounds = (
+            range(0, state.budgets.max_rounds + 1)
+            if item.caller_event == "workflow_dispatch"
+            else (state.budgets.max_rounds,)
+        )
+        if (len(automatic) not in expected_automatic_rounds or state.invocations[-1] != item or
+                item.round_number != len(automatic) + 1 or
                 item.override_event_id not in state.consumed_override_event_ids):
             raise BudgetStateError("override_invalid")
     if len(state.consumed_override_event_ids) != len(overrides):
@@ -643,6 +661,10 @@ def _validate_request(request: ClaimRequest) -> None:
     _hash(request.full_diff_sha256, _HASH, "full_diff_sha256")
     if request.diff_mode not in {"changed", "unchanged"}:
         raise BudgetStateError("diff_mode_invalid")
+    if not isinstance(request.force_review, bool):
+        raise BudgetStateError("force_review_invalid")
+    if request.force_review and request.diff_mode != "changed":
+        raise BudgetStateError("force_review_diff_invalid")
     if not isinstance(request.authenticated_review, AuthenticatedReview):
         raise BudgetStateError("authenticated_review_invalid")
     review = request.authenticated_review
@@ -678,7 +700,7 @@ def _expected_referenced_workflow_path(reviewer: Reviewer, sha: str) -> str:
 def _validate_provenance_identity(
         provenance: RunProvenance, reviewer: Reviewer) -> None:
     if (
-        provenance.caller_event != "pull_request" or
+        provenance.caller_event not in {"pull_request", "workflow_dispatch"} or
         not isinstance(provenance.caller_workflow_path, str) or
         _CALLER_WORKFLOW.fullmatch(provenance.caller_workflow_path) is None or
         ".." in Path(provenance.caller_workflow_path).parts or
@@ -724,10 +746,20 @@ def _validate_one_provenance(
     expected_run_attempt = (
         request.run_attempt if invocation is None else invocation.run_attempt
     )
+    expected_event = (
+        invocation.caller_event
+        if invocation is not None
+        else (
+            "workflow_dispatch"
+            if isinstance(request, ClaimRequest) and request.force_review
+            else "pull_request"
+        )
+    )
     if (
         provenance.repository != state.repository or
         provenance.pr != state.pr or
         provenance.head_sha != expected_head or
+        provenance.caller_event != expected_event or
         provenance.run_id != expected_run_id or
         provenance.run_attempt != expected_run_attempt or
         (not current and provenance.status != "completed") or
@@ -912,14 +944,25 @@ def claim(state: LedgerState | None, request: ClaimRequest,
         if not request.authenticated_review.covers_hash(request.full_diff_sha256):
             return _invalid_transition(validated, request, "unchanged_without_authenticated_review")
         return refuse(validated, request, "authenticated_reuse")
-    if any(item.head_sha == request.head_sha for item in validated.invocations):
+    if not request.force_review and any(
+        item.head_sha == request.head_sha for item in validated.invocations
+    ):
         return refuse(validated, request, "duplicate_head")
-    if any(item.full_diff_sha256 == request.full_diff_sha256 for item in validated.invocations):
+    if not request.force_review and any(
+        item.full_diff_sha256 == request.full_diff_sha256
+        for item in validated.invocations
+    ):
         return refuse(validated, request, "duplicate_effective_diff")
     if request.estimated_input_tokens > validated.budgets.max_estimated_tokens_per_round:
         return refuse(validated, request, "input_budget_exhausted")
     override = None
-    if automatic_rounds(validated) >= validated.budgets.max_rounds:
+    if any(item.override_event_id is not None for item in validated.invocations):
+        return refuse(validated, request, "round_budget_exhausted")
+    if request.force_review:
+        override = choose_override(validated, request.override_events)
+        if override is None:
+            return refuse(validated, request, "round_budget_exhausted")
+    elif automatic_rounds(validated) >= validated.budgets.max_rounds:
         override = choose_override(validated, request.override_events)
         if override is None:
             return refuse(validated, request, "round_budget_exhausted")
@@ -1207,6 +1250,7 @@ def _transport_request(path: Path) -> dict[str, object]:
         "authenticated_review_json", "model_route_json", "effort", "actual_call_count",
         "elapsed_seconds", "outcome", "stop_reason", "remaining_finding_ids_json",
         "checkpoint_file", "github_workspace", "server_url",
+        "force_review",
     }
     value = dict(_exact_keys(value, keys, "request"))
     repository = _string(value["repository"], "repository")
@@ -1240,6 +1284,10 @@ def _transport_request(path: Path) -> dict[str, object]:
     value["diff_mode"] = diff_mode
     value["head_sha"] = head_sha
     value["full_diff_sha256"] = full_diff_sha256
+    force_review = _string(value["force_review"], "force_review")
+    if force_review not in {"true", "false"}:
+        raise TransportError("force_review_invalid")
+    value["force_review"] = force_review == "true"
     for name in (
         "input_files_json", "authenticated_review_json", "model_route_json", "effort",
         "outcome", "stop_reason", "remaining_finding_ids_json", "checkpoint_file",
@@ -1299,6 +1347,7 @@ def _base_claim_request(
         authenticated_review=_authenticated_review(request), override_events=override_events,
         model_route=_model_route(request), effort=request["effort"],
         call_unit=_CALL_UNITS[request["reviewer"]],
+        force_review=request["force_review"],
     )
 
 
@@ -1520,6 +1569,9 @@ def _run_provenances(
         state: LedgerState | None, request: Mapping[str, object], output_directory: Path,
     ) -> dict[tuple[int, int], RunProvenance]:
     result: dict[tuple[int, int], RunProvenance] = {}
+    stored_by_identity = {} if state is None else {
+        (item.run_id, item.run_attempt): item for item in state.invocations
+    }
     identities = {(request["run_id"], request["run_attempt"])}
     if state is not None:
         identities.update(
@@ -1553,9 +1605,22 @@ def _run_provenances(
             raise TransportError("provenance_mismatch")
         central = central[0]
         central_ref = central.get("ref") if "ref" in central else central.get("sha")
+        stored = stored_by_identity.get((run_id, run_attempt))
+        is_force_dispatch = (
+            stored is not None and stored.caller_event == "workflow_dispatch"
+        ) or (
+            stored is None
+            and request["operation"] == "claim"
+            and request["force_review"]
+            and (run_id, run_attempt) == (request["run_id"], request["run_attempt"])
+        )
+        reviewed_head = stored.head_sha if stored is not None else request["head_sha"]
         provenance = RunProvenance(
             repository=repository.get("full_name"), pr=request["pr"],
-            head_sha=value.get("head_sha"),
+            # workflow_dispatch runs are rooted at the caller's default branch, not
+            # the reviewed PR. The independently fetched PR payload binds the target
+            # head; the Actions payload still binds run/attempt/caller/reusable ref.
+            head_sha=reviewed_head if is_force_dispatch else value.get("head_sha"),
             caller_workflow_path=value.get("path"),
             caller_event=value.get("event"),
             referenced_workflow_path=central.get("path"),
@@ -1564,7 +1629,10 @@ def _run_provenances(
             run_id=value.get("id"), run_attempt=value.get("run_attempt"),
             status=value.get("status"), conclusion=value.get("conclusion"),
         )
-        if request["pr"] not in pull_numbers:
+        if is_force_dispatch:
+            if value.get("event") != "workflow_dispatch":
+                raise TransportError("provenance_mismatch")
+        elif request["pr"] not in pull_numbers:
             raise TransportError("provenance_mismatch")
         _validate_provenance_identity(provenance, request["reviewer"])
         result[(run_id, run_attempt)] = provenance

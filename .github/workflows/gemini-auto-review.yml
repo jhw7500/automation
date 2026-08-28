@@ -26,6 +26,11 @@ on:
         type: boolean
         required: false
         default: false
+      force_review:
+        description: 'Perform one explicitly authorized review even when HEAD is unchanged'
+        type: boolean
+        required: false
+        default: false
 
     secrets:
       APP_PRIVATE_KEY:
@@ -55,12 +60,12 @@ jobs:
         uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1.1
         with:
           workflow-name: gemini-auto-review
-          force-run: ${{ inputs.force_run && 'true' || 'false' }}
+          force-run: ${{ (inputs.force_run || inputs.force_review) && 'true' || 'false' }}
 
       - name: Check auto review mode
         id: auto_mode
         env:
-          FORCE_RUN: ${{ inputs.force_run && 'true' || 'false' }}
+          FORCE_RUN: ${{ (inputs.force_run || inputs.force_review) && 'true' || 'false' }}
         run: |-
           CONFIG_FILE=".github/workflow-config.yml"
           if [[ "$FORCE_RUN" == 'true' ]]; then
@@ -221,6 +226,8 @@ jobs:
                 type == "string" and (. == "success" or . == "failure");
               def diff_mode:
                 type == "string" and (. == "full" or . == "delta" or . == "unchanged" or . == "unavailable");
+              def review_execution:
+                . == null or . == "performed" or . == "reused" or . == "not_performed";
               def successful_pair:
                 if .successful_head == null then .full_diff_sha256 == null
                 else (.successful_head | sha1) and (.full_diff_sha256 | sha256)
@@ -229,12 +236,19 @@ jobs:
                 if .attempt_status == "success" then
                   .successful_head != null and .successful_head == .attempt_head and successful_pair
                   and (.diff_mode == "full" or .diff_mode == "delta" or .diff_mode == "unchanged")
+                  and (if .diff_mode == "unchanged" then
+                    (.review_execution == null or .review_execution == "reused")
+                  else
+                    (.review_execution == null or .review_execution == "performed")
+                  end)
                   and (.accepted_count | nonnegative_integer)
                   and (.filtered_count | nonnegative_integer)
                   and (.normalized_count | nonnegative_integer)
                   and (.filtered_max_severity | max_severity)
                 elif .attempt_status == "failure" then
                   successful_pair
+                  and (.review_execution == null or .review_execution == "performed"
+                    or .review_execution == "not_performed")
                   and (if .successful_head == null then
                     .accepted_count == null and .filtered_count == null
                     and .normalized_count == null and .filtered_max_severity == null
@@ -269,7 +283,8 @@ jobs:
                 | select($lines[0] == $header and $lines[1] == $marker)
                 | (($lines[2]? // "") | (capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$")? | .json? | fromjson?)) as $s
                 | select(($s | type) == "object")
-                | select(($s | keys | sort) == ["accepted_count", "attempt_head", "attempt_status", "diff_mode", "filtered_count", "filtered_max_severity", "full_diff_sha256", "normalized_count", "pr", "quality_schema", "reviewer", "run_attempt", "run_id", "schema", "successful_head"])
+                | select((($s | keys | sort) == ["accepted_count", "attempt_head", "attempt_status", "diff_mode", "filtered_count", "filtered_max_severity", "full_diff_sha256", "normalized_count", "pr", "quality_schema", "reviewer", "run_attempt", "run_id", "schema", "successful_head"])
+                  or (($s | keys | sort) == ["accepted_count", "attempt_head", "attempt_status", "diff_mode", "filtered_count", "filtered_max_severity", "full_diff_sha256", "normalized_count", "pr", "quality_schema", "review_execution", "reviewer", "run_attempt", "run_id", "schema", "successful_head"]))
                 | select(($s.schema | type) == "number" and $s.schema == 3)
                 | select(($s.quality_schema | type) == "number" and $s.quality_schema == 1)
                 | select(($s.reviewer | type) == "string" and $s.reviewer == $reviewer)
@@ -278,12 +293,15 @@ jobs:
                 | select($s.run_attempt | positive_integer)
                 | select($s.attempt_head | sha1)
                 | select($s.attempt_status | attempt_status)
+                | select($s.review_execution | review_execution)
                 | select($s | state_semantics)
                 | select($s.diff_mode | diff_mode)
                 | ("- Run: " + $server + "/" + $repo + "/actions/runs/" + ($s.run_id | tostring)) as $run
                 | (if $s.attempt_status == "success" then "success"
                    elif $s.successful_head == null then "failure" else "stale" end) as $status
-                | (["- Status: " + $status, $run]
+                | (["- Status: " + $status]
+                  + (if $s.review_execution == null then [] else ["- Execution: " + $s.review_execution] end)
+                  + [$run]
                   + (if $s.successful_head == null then [] else ["- Reviewed: " + $s.successful_head] end)
                   + (if $s.accepted_count == null then [] else [
                       "- Validation: accepted=" + ($s.accepted_count | tostring)
@@ -346,9 +364,10 @@ jobs:
                 .id == $run_id and .run_attempt == $run_attempt
                 and .status == "completed"
                 and (.conclusion == "success" or .conclusion == "failure")
-                and .event == "pull_request" and .head_sha == $head
+                and ((.event == "pull_request" and .head_sha == $head
+                  and ([.pull_requests[]? | select(.number == $pr)] | length == 1))
+                  or .event == "workflow_dispatch")
                 and .repository.full_name == $repo
-                and ([.pull_requests[]? | select(.number == $pr)] | length == 1)
                 and ([.referenced_workflows[]? | select(
                   (.path | startswith($workflow_prefix))
                   and (.sha | test("^[0-9a-f]{40}$"))
@@ -364,7 +383,7 @@ jobs:
           PREV_FULL_HASH="$(printf '%s\n' "$PREV_STATE" | jq -r '(.full_diff_sha256 // "") | if test("^[0-9a-f]{64}$") then . else "" end')"
           PREV_BODY_B64="$(printf '%s\n' "$PREV_RECORD" | jq -r '(.canonical_body // "") | @base64')"
           strip_reserved() {
-            grep -vE '^(- Status: |- Run: |- Reviewed: |- Last attempt: |- Validation: |<!-- automation:|<!-- automation-state:|## 🔎 Gemini Code Review$|REPO: |PR NUMBER: |Reviewer: Gemini|\*Reviewed by Gemini\*)'
+            grep -vE '^(- Status: |- Execution: |- Run: |- Reviewed: |- Last attempt: |- Validation: |<!-- automation:|<!-- automation-state:|## 🔎 Gemini Code Review$|REPO: |PR NUMBER: |Reviewer: Gemini|\*Reviewed by Gemini\*)'
           }
           # A first failure or historical v2 display has no authenticated successful pair.
           # Decode the canonical body directly so the shared action receives exact UTF-8 bytes.
@@ -427,6 +446,7 @@ jobs:
           pr-number: ${{ inputs.pr_number || github.event.pull_request.number }}
           previous-sha: ${{ steps.pr-details.outputs.previous_sha }}
           previous-full-hash: ${{ steps.pr-details.outputs.previous_full_hash }}
+          force-full: ${{ inputs.force_review && 'true' || 'false' }}
           context-lines: '20'
           output-directory: ${{ runner.temp }}
 
@@ -497,6 +517,7 @@ jobs:
           expected-head-sha: ${{ steps.stage-gemini-budget-input.outputs.expected_head_sha }}
           full-diff-sha256: ${{ steps.stage-gemini-budget-input.outputs.full_diff_sha256 }}
           diff-mode: ${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}
+          force-review: ${{ inputs.force_review && 'true' || 'false' }}
           input-files-json: ${{ steps.stage-gemini-budget-input.outputs.input_files_json }}
           authenticated-review-json: ${{ steps.pr-details.outputs.authenticated_review_json }}
           model-route-json: ${{ steps.gemini-budget-config.outputs.model_route_json }}
@@ -547,6 +568,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
           overwrite: false
+
+      - name: Enforce force-review claim
+        if: ${{ always() && !cancelled() && inputs.force_review && steps.review-budget-claim.outputs.allow-invocation != 'true' }}
+        run: |
+          echo '::error::force-review was not authorized by the bounded review budget'
+          exit 1
 
       - name: Checkout prepared review head
         if: ${{ steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
@@ -1416,7 +1443,9 @@ jobs:
                 || (authMode === 'github_app' && appPublisherMatches(comment, '15368'))
                 || (authMode === 'github_token' && publisherAppIdIsValid
                   && publisherAppId !== '' && appPublisherMatches(comment, publisherAppId)));
-            const ok = (process.env.REVIEW_OUTCOME || '').toLowerCase() === 'success';
+            const reviewOutcome = (process.env.REVIEW_OUTCOME || '').toLowerCase();
+            const ok = reviewOutcome === 'success';
+            const modelStepEntered = ['success', 'failure'].includes(reviewOutcome);
             const diffReady = process.env.DIFF_READY === 'true';
             const diffTruncated = process.env.DIFF_TRUNCATED === 'true';
             const canonicalOutcome = (process.env.CANONICAL_OUTCOME || '').toLowerCase();
@@ -1488,9 +1517,11 @@ jobs:
               && Number.isSafeInteger(state.filtered_count) && state.filtered_count >= 0
               && Number.isSafeInteger(state.normalized_count) && state.normalized_count >= 0
               && maxSeverity(state.filtered_max_severity);
-            const expectedStateKeys = ['accepted_count', 'attempt_head', 'attempt_status', 'diff_mode', 'filtered_count', 'filtered_max_severity', 'full_diff_sha256', 'normalized_count', 'pr', 'quality_schema', 'reviewer', 'run_attempt', 'run_id', 'schema', 'successful_head'];
+            const legacyStateKeys = ['accepted_count', 'attempt_head', 'attempt_status', 'diff_mode', 'filtered_count', 'filtered_max_severity', 'full_diff_sha256', 'normalized_count', 'pr', 'quality_schema', 'reviewer', 'run_attempt', 'run_id', 'schema', 'successful_head'];
+            const expectedStateKeys = [...legacyStateKeys, 'review_execution'].sort();
             const validState = (state) => state && typeof state === 'object' && !Array.isArray(state)
-              && JSON.stringify(Object.keys(state).sort()) === JSON.stringify(expectedStateKeys)
+              && [legacyStateKeys, expectedStateKeys].some((keys) =>
+                JSON.stringify(Object.keys(state).sort()) === JSON.stringify(keys))
               && state.schema === 3 && state.quality_schema === 1
               && state.reviewer === 'gemini' && state.pr === issueNumber
               && Number.isSafeInteger(state.run_id) && state.run_id > 0
@@ -1500,6 +1531,10 @@ jobs:
                 ? state.successful_head === state.attempt_head && state.successful_head !== null
                   && sha1(state.successful_head) && sha256(state.full_diff_sha256)
                   && ['full', 'delta', 'unchanged'].includes(state.diff_mode)
+                  && (state.review_execution === undefined
+                    || (state.diff_mode === 'unchanged'
+                      ? state.review_execution === 'reused'
+                      : state.review_execution === 'performed'))
                   && validQuality(state)
                 : state.attempt_status === 'failure' && (state.successful_head === null
                 ? state.full_diff_sha256 === null && state.accepted_count === null
@@ -1507,13 +1542,19 @@ jobs:
                   && state.filtered_max_severity === null
                 : sha1(state.successful_head) && sha256(state.full_diff_sha256)
                   && validQuality(state)))
-              && ['full', 'delta', 'unchanged', 'unavailable'].includes(state.diff_mode);
+              && ['full', 'delta', 'unchanged', 'unavailable'].includes(state.diff_mode)
+              && (state.review_execution === undefined
+                || ['performed', 'reused', 'not_performed'].includes(state.review_execution))
+              && (state.attempt_status !== 'failure'
+                || state.review_execution === undefined
+                || ['performed', 'not_performed'].includes(state.review_execution));
             const metadata = (state) => {
               const trustedRun = `${serverUrl}/${repository}/actions/runs/${state.run_id}`;
               const status = state.attempt_status === 'success' ? 'success'
                 : (state.successful_head === null ? 'failure' : 'stale');
               return [
                 `- Status: ${status}`,
+                state.review_execution === undefined ? null : `- Execution: ${state.review_execution}`,
                 `- Run: ${trustedRun}`,
                 state.successful_head === null ? null : `- Reviewed: ${state.successful_head}`,
                 state.accepted_count === null ? null
@@ -1571,11 +1612,12 @@ jobs:
               && run?.run_attempt === record.state.run_attempt
               && run?.status === 'completed'
               && ['success', 'failure'].includes(run?.conclusion)
-              && run?.event === 'pull_request' && run?.head_sha === record.state.attempt_head
+              && ((run?.event === 'pull_request' && run?.head_sha === record.state.attempt_head
+                && (run?.pull_requests || []).filter((pr) =>
+                  pr?.number === issueNumber
+                ).length === 1)
+                || run?.event === 'workflow_dispatch')
               && run?.repository?.full_name === repository
-              && (run?.pull_requests || []).filter((pr) =>
-                pr?.number === issueNumber
-              ).length === 1
               && (run?.referenced_workflows || []).filter((item) =>
                 (item?.path || '').startsWith(workflowPrefix) && sha1(item?.sha)
               ).length === 1;
@@ -1665,6 +1707,9 @@ jobs:
               successful_head: failed ? (preserveSuccess ? existing.state.successful_head : null) : attemptHead,
               attempt_status: failed ? 'failure' : 'success',
               diff_mode: stateDiffMode,
+              review_execution: unchangedInputIsValid
+                ? 'reused'
+                : (modelStepEntered ? 'performed' : 'not_performed'),
               full_diff_sha256: failed
                 ? (preserveSuccess ? existing.state.full_diff_sha256 : null)
                 : fullDiffSha256,

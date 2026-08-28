@@ -25,6 +25,7 @@ from release_fixture_helpers import (
     HISTORICAL_REVIEW_WORKFLOWS,
     V145_REVIEW_FIXTURE_ROOT,
     restore_historical_review_workflows,
+    restore_pre_force_review_callers,
     restore_v145_review_workflows,
 )
 
@@ -214,6 +215,7 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
 def restore_v1462_workflow_fixtures(repo: Path) -> None:
     """Restore authenticated v1.46.2 workflow bytes without consulting the worktree."""
 
+    restore_pre_force_review_callers(repo)
     tree = release_verifier.VerifiedCommitTree.open(
         ROOT, V1462_WORKFLOW_FIXTURE_COMMIT
     )
@@ -1828,8 +1830,10 @@ def test_v147_budget_helper_semantics_bind_live_ast_relationships(
         )
     elif mutation == "claim-gate-dead-body":
         substitute(
-            "    if any(item.head_sha == request.head_sha "
-            "for item in validated.invocations):\n"
+            "    if not request.force_review and any(\n"
+            "        item.head_sha == request.head_sha "
+            "for item in validated.invocations\n"
+            "    ):\n"
             "        return refuse(validated, request, \"duplicate_head\")\n",
             "    if False:\n"
             "        return refuse(validated, request, \"duplicate_head\")\n",
@@ -1868,13 +1872,14 @@ def test_v147_budget_helper_semantics_bind_live_ast_relationships(
         )
     elif mutation == "caller-event-dead-decoy":
         substitute(
-            'provenance.caller_event != "pull_request"',
-            'provenance.caller_event != "workflow_call"',
+            'provenance.caller_event not in {"pull_request", "workflow_dispatch"}',
+            'provenance.caller_event not in {"pull_request"}',
         )
         source += (
             "\n\ndef _dead_caller_event_decoy(provenance):\n"
             "    if False:\n"
-            '        return provenance.caller_event != "pull_request"\n'
+            '        return provenance.caller_event not in '
+            '{"pull_request", "workflow_dispatch"}\n'
         )
     elif mutation == "referenced-workflow-cardinality-dead-decoy":
         substitute("        if len(central) != 1:\n", "        if not central:\n")
