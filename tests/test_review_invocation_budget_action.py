@@ -180,6 +180,8 @@ elif "/actions/runs/700/attempts/1" in endpoint:
         )
     elif config["scenario"] == "current-run-reference-malformed-ref":
         response["referenced_workflows"][0]["ref"] = "bad ref"
+    elif config["scenario"] == "current-run-reference-null-ref":
+        response["referenced_workflows"][0]["ref"] = None
     elif config["scenario"] == "current-run-reference-omits-ref":
         response["referenced_workflows"][0].pop("ref")
     elif config["scenario"] == "current-run-reference-wrong-sha":
@@ -518,6 +520,7 @@ def test_first_claim_uses_resolved_sha_when_github_omits_reusable_workflow_ref(f
         "current-run-reference-duplicate",
         "current-run-reference-wrong-path",
         "current-run-reference-malformed-ref",
+        "current-run-reference-null-ref",
         "current-run-reference-wrong-sha",
     ],
 )
