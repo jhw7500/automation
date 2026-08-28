@@ -92,7 +92,7 @@ jobs:
       actions: read
       checks: read
       contents: read
-      pull-requests: read
+      pull-requests: write
       issues: write
     outputs:
       prev_context: ${{ steps.ctx.outputs.prev_context }}

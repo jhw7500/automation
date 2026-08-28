@@ -636,7 +636,7 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "92ec63f9b8a22703918d974e87e1eb3ab7f2f9ffaaca1a3c3f12e360f5839906",
     "gemini": "a8b048f7862c3eed467482a750da57abad8d6ef04ed61964a35e4f90b4afeeda",
-    "opencode": "067738b4e9d1316e9e1f6a88de8ef2c3607440c479c7b5f46995e7d9c4e79c63",
+    "opencode": "2c4b874047a877f87da6ff47fe2316292a955d07c9c3012e0f772926ca528756",
 }
 EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION = yaml.load(
     r"""name: Review invocation budget
@@ -6006,7 +6006,7 @@ def _verify_commit_content(
             "actions": "read",
             "checks": "read",
             "contents": "read",
-            "pull-requests": "read",
+            "pull-requests": "write" if budget_release else "read",
             "issues": "write" if budget_release else "read",
         }
         expected_canonical = {"actions": "read", "checks": "write", "contents": "read", "pull-requests": "write", "issues": "write"}

@@ -7842,7 +7842,7 @@ def test_opencode_budget_claim_is_sealed_before_tokenless_model_job():
         "actions": "read",
         "checks": "read",
         "contents": "read",
-        "pull-requests": "read",
+        "pull-requests": "write",
         "issues": "write",
     }
     assert prepare["steps"].index(prepare_diff) < prepare["steps"].index(claim)
@@ -8092,7 +8092,7 @@ def test_opencode_model_and_privileged_canonicalization_have_separate_token_boun
         "actions": "read",
         "checks": "read",
         "contents": "read",
-        "pull-requests": "read",
+        "pull-requests": "write",
         "issues": "write",
     }
     assert model_job["permissions"] == {}
