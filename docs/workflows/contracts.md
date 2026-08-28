@@ -298,7 +298,9 @@ and `- Removed line: "exact previous source line"`; no other section may use tha
 current and removed pairs cannot be mixed. JSON string escaping makes every UTF-8 path reversible,
 including embedded newlines, backticks, colons, Unicode, and leading dashes. Duplicate keys, extra
 keys, alternate/noncanonical serialization, malformed JSON, empty paths, non-positive or unsafe
-line integers, and evidence-like noncanonical field labels fail closed. Canonical JSON rendering
+line integers, and evidence-like noncanonical field labels invalidate that finding block. Invalid
+`New findings` blocks are filtered as described below; invalid authenticated carryover or
+disposition blocks fail closed. Canonical JSON rendering
 also escapes every character that Python `splitlines()` recognizes as a
 line boundary, including U+0085, U+2028, and U+2029, so a validated escaped path or quotation cannot
 poison the next round's strict prior-document layout.
@@ -330,15 +332,16 @@ parser then:
    truncated hunk bodies, counters, coordinates, and controls fail closed; diff prelude metadata is
    not treated as hunk-body evidence.
 
-After the document grammar and evidence fields validate, OpenCode checks each `New findings` block
-independently. A block whose path is absent or removed, whose line is not an actual added-side line,
-or whose quoted current line does not match is omitted without failing an otherwise valid review.
-Valid blocks—including `[HIGH]` blocks—remain unchanged. If every new block is omitted, the
-canonical section becomes exactly `### New findings` followed by `None`; the successful attested
-comment reports `filtered_invalid_new_findings=N` and `reasons=anchor_out_of_scope` on its visible
-validation line. Git invocation or parsing failures, sealed manifest inconsistencies, malformed
-document/evidence grammar, and invalid carryover or disposition evidence still fail the checkpoint
-without advancing `successful_head`.
+After the top-level document and section grammar validates, OpenCode checks each `New findings`
+block independently. A block with malformed, missing, mixed, or noncanonical evidence fields is
+omitted with reason `finding_grammar_invalid`. A syntactically valid block whose path is absent or
+removed, whose line is not an actual added-side line, or whose quoted current line does not match is
+omitted with reason `anchor_out_of_scope`. Valid blocks—including `[HIGH]` blocks—remain unchanged.
+If every new block is omitted, the canonical section becomes exactly `### New findings` followed by
+`None`; the successful attested comment reports `filtered_invalid_new_findings=N` and the sorted
+set of filtering reasons on its visible validation line. Git invocation or parsing failures, sealed
+manifest inconsistencies, malformed document or section grammar, and invalid carryover or
+disposition evidence still fail the checkpoint without advancing `successful_head`.
 
 The sole zero-record case is an exact empty full review: the sealed manifest has `files: []`, the
 selected full diff is a zero-byte regular file, and local full-range name-status reconstruction is
