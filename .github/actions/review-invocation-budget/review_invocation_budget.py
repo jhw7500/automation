@@ -88,7 +88,12 @@ class BudgetPolicy:
     def for_reviewer(cls, reviewer: Reviewer) -> "BudgetPolicy":
         if reviewer not in MARKERS:
             raise BudgetStateError("reviewer_invalid")
-        return cls(max_calls_per_round={"claude": 1, "gemini": 3, "opencode": 2}[reviewer])
+        return cls(
+            max_calls_per_round={"claude": 1, "gemini": 3, "opencode": 2}[reviewer],
+            max_wall_seconds_per_round={
+                "claude": 1080, "gemini": 600, "opencode": 600,
+            }[reviewer],
+        )
 
     def to_dict(self) -> dict[str, int]:
         return {

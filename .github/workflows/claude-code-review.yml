@@ -101,7 +101,7 @@ jobs:
     #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
 
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       actions: read
       contents: read
@@ -1012,7 +1012,7 @@ jobs:
 
           if [[ ! "$ELAPSED_SECONDS" =~ ^[0-9]+$ ]]; then
             :
-          elif (( ELAPSED_SECONDS > 600 )); then
+          elif (( ELAPSED_SECONDS > 1080 )); then
             outcome='wall_time_exhausted'
             stop_reason='wall_time_exhausted'
           elif [[ "$PROVIDER_OUTCOME" == 'failure' ]]; then

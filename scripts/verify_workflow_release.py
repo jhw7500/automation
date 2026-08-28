@@ -631,10 +631,10 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256 = (
     "42462dad335073794bd5c46e1993e02e4dc9824113d1b36fd5c6b89dc0583a9c"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
-    "e9dcfd404c8d427a6af3b35c248b5cdb5ee226b7b0080c9ee27b370128a947d9"
+    "b58044cadbded4e91b2b021e4902e56b4ca267cc47e75f3984037f61b662ee48"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
-    "claude": "92ec63f9b8a22703918d974e87e1eb3ab7f2f9ffaaca1a3c3f12e360f5839906",
+    "claude": "2fa6fdb6fbad2e874c5dfab7e059d53c8d2f610731f3d3dcf918cd531c585876",
     "gemini": "a8b048f7862c3eed467482a750da57abad8d6ef04ed61964a35e4f90b4afeeda",
     "opencode": "28791fa77f05454775043cb5b582f849aef7fe81c109c65161bcf860a6d6531a",
 }
@@ -3994,11 +3994,14 @@ def require_budget_helper_contract(source: str) -> None:
             )
             or not _ast_statement_matches(
                 reviewer_policy.body[1],
-                "return cls(max_calls_per_round={"
-                "'claude': 1, 'gemini': 3, 'opencode': 2}[reviewer])",
+                "return cls("
+                "max_calls_per_round={'claude': 1, 'gemini': 3, "
+                "'opencode': 2}[reviewer], "
+                "max_wall_seconds_per_round={'claude': 1080, "
+                "'gemini': 600, 'opencode': 600}[reviewer])",
             )
         ):
-            raise ValueError("reviewer call caps differ")
+            raise ValueError("reviewer execution caps differ")
         finding_bindings = [
             item.value
             for item in module.body
@@ -4663,7 +4666,8 @@ def require_budget_workflow_contract(
         }
         if provider.get("if") != expected_provider_guards[reviewer]:
             raise ValueError("provider allow predicate differs")
-        if provider_job.get("timeout-minutes") != "10":
+        expected_timeouts = {"claude": "20", "gemini": "10", "opencode": "10"}
+        if provider_job.get("timeout-minutes") != expected_timeouts[reviewer]:
             raise ValueError("review timeout differs")
 
         claim_names = {

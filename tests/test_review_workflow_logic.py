@@ -1294,7 +1294,7 @@ def test_claude_budget_claim_is_durable_before_provider_and_every_model_path_is_
     assert allow in _step(workflow, "claude-review", "Start Claude review metrics")["if"]
     assert allow in _step(workflow, "claude-review", "Run Claude Code Review")["if"]
     assert allow in _step(workflow, "claude-review", "Canonicalize Claude review")["if"]
-    assert job["timeout-minutes"] == "10"
+    assert job["timeout-minutes"] == "20"
     assert job["permissions"] == {
         "actions": "read",
         "contents": "read",
@@ -1707,7 +1707,7 @@ def test_claude_budget_outcome_is_deterministic_and_has_no_provider_fallback():
         ("success", "success", "true", "0", "2", "true", "5", "quality_filtered", []),
         ("failure", "failure", "false", "", "", "false", "5", "provider_failure", ["RVW-aaaaaaaaaaaa"]),
         ("success", "success", "true", "1", "0", "false", "5", "checkpoint_failure", ["RVW-aaaaaaaaaaaa"]),
-        ("success", "success", "true", "1", "0", "true", "601", "wall_time_exhausted", ["RVW-aaaaaaaaaaaa"]),
+        ("success", "success", "true", "1", "0", "true", "1081", "wall_time_exhausted", ["RVW-aaaaaaaaaaaa"]),
     ),
 )
 def test_claude_budget_outcome_mapping_and_remaining_ids_are_reproducible(
