@@ -7842,7 +7842,7 @@ def test_opencode_budget_claim_is_sealed_before_tokenless_model_job():
         "actions": "read",
         "checks": "read",
         "contents": "read",
-        "pull-requests": "read",
+        "pull-requests": "write",
         "issues": "write",
     }
     assert prepare["steps"].index(prepare_diff) < prepare["steps"].index(claim)
@@ -7976,6 +7976,7 @@ def test_opencode_budget_candidate_envelope_is_exact_and_mode_aware():
     assert "lstat" in materialize and "S_ISREG" in materialize
     assert "0o600" in materialize
     assert 'model_route != ["zai-coding-plan/glm-4.7"]' in materialize
+    assert '(candidate_dir / "review-repaired.md").unlink(missing_ok=True)' in materialize
     assert upload["if"] == (
         "${{ always() && steps.materialize-candidate.outcome == 'success' && "
         "needs.opencode-prepare.outputs.allow_invocation == 'true' }}"
@@ -8092,7 +8093,7 @@ def test_opencode_model_and_privileged_canonicalization_have_separate_token_boun
         "actions": "read",
         "checks": "read",
         "contents": "read",
-        "pull-requests": "read",
+        "pull-requests": "write",
         "issues": "write",
     }
     assert model_job["permissions"] == {}

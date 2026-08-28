@@ -21,7 +21,7 @@ HASH_2 = "2" * 64
 CENTRAL_REF = "refs/tags/v1.47"
 CENTRAL_SHA = "d" * 40
 CENTRAL_PATH = (
-    "jhw7500/automation/.github/workflows/claude-code-review.yml@" + CENTRAL_REF
+    "jhw7500/automation/.github/workflows/claude-code-review.yml@" + CENTRAL_SHA
 )
 
 SPEC = importlib.util.spec_from_file_location("review_invocation_budget_action_helper", HELPER)
@@ -146,7 +146,7 @@ elif "/actions/runs/501/attempts/1" in endpoint:
         "repository": {"full_name": "example/repo"},
         "pull_requests": [{"number": 52}],
         "referenced_workflows": [{
-            "path": "jhw7500/automation/.github/workflows/claude-code-review.yml@refs/tags/v1.47",
+            "path": "jhw7500/automation/.github/workflows/claude-code-review.yml@" + "d" * 40,
             "ref": "refs/tags/v1.47",
             "sha": "d" * 40,
         }],
@@ -165,7 +165,7 @@ elif "/actions/runs/700/attempts/1" in endpoint:
         "repository": {"full_name": "example/repo"},
         "pull_requests": [{"number": 52}],
         "referenced_workflows": [{
-            "path": "jhw7500/automation/.github/workflows/claude-code-review.yml@refs/tags/v1.47",
+            "path": "jhw7500/automation/.github/workflows/claude-code-review.yml@" + "d" * 40,
             "ref": "refs/tags/v1.47",
             "sha": "d" * 40,
         }],
@@ -176,10 +176,10 @@ elif "/actions/runs/700/attempts/1" in endpoint:
         response["referenced_workflows"].append(dict(response["referenced_workflows"][0]))
     elif config["scenario"] == "current-run-reference-wrong-path":
         response["referenced_workflows"][0]["path"] = (
-            "other/repo/.github/workflows/claude-code-review.yml@refs/tags/v1.47"
+            "other/repo/.github/workflows/claude-code-review.yml@" + "d" * 40
         )
-    elif config["scenario"] == "current-run-reference-wrong-ref":
-        response["referenced_workflows"][0]["ref"] = "refs/tags/v1.46.2"
+    elif config["scenario"] == "current-run-reference-malformed-ref":
+        response["referenced_workflows"][0]["ref"] = "bad ref"
     elif config["scenario"] == "current-run-reference-wrong-sha":
         response["referenced_workflows"][0]["sha"] = "not-a-sha"
 elif "/collaborators/" in endpoint and endpoint.endswith("/permission"):
@@ -501,7 +501,7 @@ def test_first_claim_authenticates_and_stores_reusable_workflow_provenance(fake_
         "current-run-reference-missing",
         "current-run-reference-duplicate",
         "current-run-reference-wrong-path",
-        "current-run-reference-wrong-ref",
+        "current-run-reference-malformed-ref",
         "current-run-reference-wrong-sha",
     ],
 )

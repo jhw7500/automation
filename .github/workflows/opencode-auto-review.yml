@@ -92,7 +92,7 @@ jobs:
       actions: read
       checks: read
       contents: read
-      pull-requests: read
+      pull-requests: write
       issues: write
     outputs:
       prev_context: ${{ steps.ctx.outputs.prev_context }}
@@ -2991,6 +2991,7 @@ jobs:
               failure_reason = "none"
           else:
               review_path.unlink(missing_ok=True)
+              (candidate_dir / "review-repaired.md").unlink(missing_ok=True)
               if failure_reason not in allowed_reasons - {"none"}:
                   failure_reason = "model_job_failed"
 

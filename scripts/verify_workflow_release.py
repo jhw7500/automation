@@ -631,12 +631,12 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256 = (
     "42462dad335073794bd5c46e1993e02e4dc9824113d1b36fd5c6b89dc0583a9c"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
-    "89968fc857aa4718025d8b39dae5b0958d9d83b458b2325a905bb308a5905d11"
+    "9e7cae2b39f41f693122ff80206e0c9ad4ccd32ffa7fb21b344d5383a6421f59"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "92ec63f9b8a22703918d974e87e1eb3ab7f2f9ffaaca1a3c3f12e360f5839906",
     "gemini": "a8b048f7862c3eed467482a750da57abad8d6ef04ed61964a35e4f90b4afeeda",
-    "opencode": "067738b4e9d1316e9e1f6a88de8ef2c3607440c479c7b5f46995e7d9c4e79c63",
+    "opencode": "28791fa77f05454775043cb5b582f849aef7fe81c109c65161bcf860a6d6531a",
 }
 EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION = yaml.load(
     r"""name: Review invocation budget
@@ -4260,7 +4260,7 @@ def require_budget_helper_contract(source: str) -> None:
             "_WORKFLOW_REF.fullmatch(provenance.referenced_workflow_ref) is None or "
             "provenance.referenced_workflow_path != "
             "_expected_referenced_workflow_path("
-            "reviewer, provenance.referenced_workflow_ref) or "
+            "reviewer, provenance.referenced_workflow_sha) or "
             "not isinstance(provenance.referenced_workflow_sha, str) or "
             "_HEAD.fullmatch(provenance.referenced_workflow_sha) is None",
             "BudgetStateError",
@@ -6006,7 +6006,7 @@ def _verify_commit_content(
             "actions": "read",
             "checks": "read",
             "contents": "read",
-            "pull-requests": "read",
+            "pull-requests": "write" if budget_release else "read",
             "issues": "write" if budget_release else "read",
         }
         expected_canonical = {"actions": "read", "checks": "write", "contents": "read", "pull-requests": "write", "issues": "write"}
