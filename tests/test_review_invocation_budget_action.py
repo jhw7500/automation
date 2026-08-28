@@ -180,6 +180,10 @@ elif "/actions/runs/700/attempts/1" in endpoint:
         )
     elif config["scenario"] == "current-run-reference-malformed-ref":
         response["referenced_workflows"][0]["ref"] = "bad ref"
+    elif config["scenario"] == "current-run-reference-null-ref":
+        response["referenced_workflows"][0]["ref"] = None
+    elif config["scenario"] == "current-run-reference-omits-ref":
+        response["referenced_workflows"][0].pop("ref")
     elif config["scenario"] == "current-run-reference-wrong-sha":
         response["referenced_workflows"][0]["sha"] = "not-a-sha"
 elif "/collaborators/" in endpoint and endpoint.endswith("/permission"):
@@ -244,7 +248,10 @@ class FakeGitHub:
         input_path.write_bytes(b"abcde")
 
         prior = _prior_comment()
-        if scenario in {"first-comment-create", "empty-cas-pages"}:
+        if scenario in {
+            "first-comment-create", "empty-cas-pages",
+            "current-run-reference-omits-ref",
+        }:
             comments = []
             head, full_hash = HEAD_A, HASH_1
         elif scenario == "finalize-trusted-comment":
@@ -495,6 +502,17 @@ def test_first_claim_authenticates_and_stores_reusable_workflow_provenance(fake_
     assert invocation["referenced_workflow_sha"] == CENTRAL_SHA
 
 
+def test_first_claim_uses_resolved_sha_when_github_omits_reusable_workflow_ref(fake_github):
+    result = fake_github.run_action(
+        mode="claim", scenario="current-run-reference-omits-ref",
+    )
+
+    assert result.outputs["decision"] == "claimed"
+    assert result.outputs["allow-invocation"] == "true"
+    invocation = result.checkpoint["ledger"]["invocations"][0]
+    assert invocation["referenced_workflow_ref"] == CENTRAL_SHA
+
+
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -502,6 +520,7 @@ def test_first_claim_authenticates_and_stores_reusable_workflow_provenance(fake_
         "current-run-reference-duplicate",
         "current-run-reference-wrong-path",
         "current-run-reference-malformed-ref",
+        "current-run-reference-null-ref",
         "current-run-reference-wrong-sha",
     ],
 )

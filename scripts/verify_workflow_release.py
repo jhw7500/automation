@@ -631,7 +631,7 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256 = (
     "42462dad335073794bd5c46e1993e02e4dc9824113d1b36fd5c6b89dc0583a9c"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
-    "9e7cae2b39f41f693122ff80206e0c9ad4ccd32ffa7fb21b344d5383a6421f59"
+    "e9dcfd404c8d427a6af3b35c248b5cdb5ee226b7b0080c9ee27b370128a947d9"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "92ec63f9b8a22703918d974e87e1eb3ab7f2f9ffaaca1a3c3f12e360f5839906",
@@ -4380,13 +4380,14 @@ def require_budget_helper_contract(source: str) -> None:
             "    if len(central) != 1:\n"
             "        raise TransportError('provenance_mismatch')\n"
             "    central = central[0]\n"
+            "    central_ref = central.get('ref') if 'ref' in central else central.get('sha')\n"
             "    provenance = RunProvenance("
             "repository=repository.get('full_name'), pr=request['pr'], "
             "head_sha=value.get('head_sha'), "
             "caller_workflow_path=value.get('path'), "
             "caller_event=value.get('event'), "
             "referenced_workflow_path=central.get('path'), "
-            "referenced_workflow_ref=central.get('ref'), "
+            "referenced_workflow_ref=central_ref, "
             "referenced_workflow_sha=central.get('sha'), "
             "run_id=value.get('id'), run_attempt=value.get('run_attempt'), "
             "status=value.get('status'), conclusion=value.get('conclusion'))\n"
