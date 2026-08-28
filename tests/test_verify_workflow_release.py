@@ -1942,7 +1942,7 @@ def test_v147_rejects_budget_workflow_safety_gate_mutations(
             )
             provider["if"] = "${{ steps.prepare-diff.outputs.diff-ready == 'true' }}"
         elif mutation == "raise-timeout":
-            target_job["timeout-minutes"] = "11"
+            target_job["timeout-minutes"] = "21"
         elif mutation == "omit-finalize":
             steps.remove(
                 next(item for item in steps if item.get("name") == "Finalize Gemini review budget")

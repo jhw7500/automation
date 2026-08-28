@@ -828,15 +828,25 @@ def test_stored_call_count_enforces_each_reviewer_boundary(reviewer, max_calls):
     )
 
 
-def test_stored_elapsed_seconds_enforces_round_boundary():
+@pytest.mark.parametrize(
+    ("reviewer", "max_elapsed"),
+    (("claude", 1080), ("gemini", 600), ("opencode", 600)),
+)
+def test_stored_elapsed_seconds_enforces_each_reviewer_round_boundary(
+    reviewer, max_elapsed,
+):
     at_limit = budget.LedgerState.initial(
-        REPOSITORY, PR, "claude", invocations=(invocation(elapsed_seconds=600),),
+        REPOSITORY, PR, reviewer,
+        invocations=(invocation(reviewer=reviewer, elapsed_seconds=max_elapsed),),
     )
     assert budget.parse_ledger(
-        ledger_body(at_limit), repository=REPOSITORY, pr=PR, reviewer="claude",
+        ledger_body(at_limit), repository=REPOSITORY, pr=PR, reviewer=reviewer,
     ) == at_limit
     above_limit = replace(
-        at_limit, invocations=(replace(at_limit.invocations[0], elapsed_seconds=601),),
+        at_limit,
+        invocations=(replace(
+            at_limit.invocations[0], elapsed_seconds=max_elapsed + 1,
+        ),),
     )
     assert_stored_state_rejected(above_limit, "wall_time_exhausted")
 
@@ -849,7 +859,8 @@ def test_stored_elapsed_seconds_enforces_round_boundary():
         ),),
     )
     assert budget.parse_ledger(
-        ledger_body(normalized_failure), repository=REPOSITORY, pr=PR, reviewer="claude",
+        ledger_body(normalized_failure),
+        repository=REPOSITORY, pr=PR, reviewer=reviewer,
     ) == normalized_failure
     assert_stored_state_rejected(
         replace(normalized_failure, invocations=(replace(

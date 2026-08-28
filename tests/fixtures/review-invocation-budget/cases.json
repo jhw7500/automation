@@ -11,8 +11,8 @@
   {"kind":"finalize","name":"gemini-call-over-cap","reviewer":"gemini","calls":4,"expected_outcome":"checkpoint_failure"},
   {"kind":"finalize","name":"opencode-call-at-cap","reviewer":"opencode","calls":2,"expected_outcome":"success"},
   {"kind":"finalize","name":"opencode-call-over-cap","reviewer":"opencode","calls":3,"expected_outcome":"checkpoint_failure"},
-  {"kind":"finalize","name":"wall-at-cap","reviewer":"claude","elapsed":600,"expected_outcome":"success"},
-  {"kind":"finalize","name":"wall-over-cap","reviewer":"claude","elapsed":601,"expected_outcome":"wall_time_exhausted"},
+  {"kind":"finalize","name":"wall-at-cap","reviewer":"claude","elapsed":1080,"expected_outcome":"success"},
+  {"kind":"finalize","name":"wall-over-cap","reviewer":"claude","elapsed":1081,"expected_outcome":"wall_time_exhausted"},
   {"kind":"finalize","name":"quality-filtered","reviewer":"claude","outcome":"quality_filtered","expected_outcome":"quality_filtered"},
   {"kind":"finalize","name":"provider-failure","reviewer":"claude","outcome":"provider_failure","expected_outcome":"provider_failure"},
   {"kind":"finalize","name":"remaining-finding-ids","reviewer":"claude","remaining":["RVW-111111111111","RVW-222222222222"],"expected_outcome":"success"}
