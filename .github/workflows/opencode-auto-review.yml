@@ -600,6 +600,23 @@ jobs:
           retention-days: 7
           overwrite: false
 
+      - name: Enforce authenticated review budget decision
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        env:
+          BUDGET_ALLOW_INVOCATION: ${{ steps.review-budget-claim.outputs.allow-invocation }}
+          BUDGET_DECISION: ${{ steps.review-budget-claim.outputs.decision }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUDGET_ALLOW_INVOCATION" == 'true' && "$BUDGET_DECISION" == 'claimed' ]]; then
+            exit 0
+          fi
+          if [[ "$BUDGET_ALLOW_INVOCATION" == 'false' && "$BUDGET_DECISION" == 'authenticated_reuse' ]]; then
+            exit 0
+          fi
+          echo "::error::OpenCode review has no authenticated checkpoint for this attempt ($BUDGET_DECISION)"
+          exit 1
+
   opencode-review:
     needs: [check-enabled, opencode-prepare]
     if: >-
@@ -955,6 +972,7 @@ jobs:
 
           contract_tool="$RUNNER_TEMP/opencode-candidate-contract.py"
           cat > "$contract_tool" <<'PY'
+          import hashlib
           import json
           import re
           import sys
@@ -1182,8 +1200,15 @@ jobs:
           )
           FENCE_LINE = re.compile(r"^ {0,3}((?:`{3,}|~{3,}))(.*)$")
 
-          def reject():
-              raise SystemExit(1)
+          class ContractRejection(Exception):
+              def __init__(self, rule="candidate_contract", line=1, column=1):
+                  super().__init__(rule)
+                  self.rule = rule
+                  self.line = line
+                  self.column = column
+
+          def reject(rule="candidate_contract", line=1, column=1):
+              raise ContractRejection(rule, line, column)
 
           def read_candidate(path):
               try:
@@ -2642,10 +2667,11 @@ jobs:
                   )
               return lines
 
-          def parse_sections(lines, signature_mode=False):
+          def parse_sections(lines, signature_mode=False, line_offset=0):
               sections = []
               section = None
-              for line in lines:
+              for index, line in enumerate(lines):
+                  line_number = line_offset + index + 1
                   if TOP_HEADING.match(line):
                       if signature_mode:
                           name = signature_section_name(line)
@@ -2653,43 +2679,72 @@ jobs:
                           match = VALID_HEADING.fullmatch(line)
                           name = match.group(1) if match is not None else None
                       if name is None:
-                          reject()
-                      section = {"name": name, "lines": []}
+                          reject("unknown_section", line_number)
+                      section = {
+                          "name": name,
+                          "lines": [],
+                          "line_numbers": [],
+                          "line": line_number,
+                      }
                       sections.append(section)
                   elif section is None:
                       if line.strip():
-                          reject()
+                          reject("section_preamble", line_number)
                   else:
                       section["lines"].append(line)
+                      section["line_numbers"].append(line_number)
               return sections
 
           def validate_outer(text, nonce):
               if re.fullmatch(r"[0-9a-f]{64}", nonce) is None:
-                  reject()
+                  reject("nonce_invalid", 2)
               nonce_line = f"<!-- automation-candidate:{nonce} -->"
               lines = text.split("\n")
-              if len(lines) < 3 or lines[0] != MARKER or lines[1] != nonce_line:
-                  reject()
+              if not lines or lines[0] != MARKER:
+                  reject("required_marker", 1)
+              if len(lines) < 2 or lines[1] != nonce_line:
+                  reject("required_nonce", 2)
+              if len(lines) < 3:
+                  reject("empty_review", 3)
               if lines.count(MARKER) != 1:
-                  reject()
+                  reject("marker_count", lines.index(MARKER, 1) + 1)
               nonce_markers = [
                   index for index, line in enumerate(lines)
                   if line.startswith("<!-- automation-candidate:")
               ]
               if nonce_markers != [1]:
-                  reject()
+                  offending_nonce = next(
+                      (index for index in nonce_markers if index != 1), 1
+                  )
+                  reject(
+                      "candidate_nonce_marker",
+                      offending_nonce + 1,
+                  )
 
-              review = "\n".join(lines[2:]).strip()
-              if not review:
-                  reject()
-              sections = parse_sections(review.split("\n"))
+              review_lines = lines[2:]
+              if not "\n".join(review_lines).strip():
+                  reject("empty_review", 3)
+              sections = parse_sections(review_lines, line_offset=2)
               names = [item["name"] for item in sections]
               if not names or names[0] != "New findings":
-                  reject()
-              if names.count("New findings") != 1 or len(set(names)) != len(names):
-                  reject()
+                  reject("new_findings_first", sections[0]["line"] if sections else 3)
+              if names.count("New findings") != 1:
+                  duplicate = next(
+                      item for item in sections[1:] if item["name"] == "New findings"
+                  )
+                  reject("duplicate_section", duplicate["line"])
+              if len(set(names)) != len(names):
+                  duplicate = next(
+                      item
+                      for index, item in enumerate(sections)
+                      if item["name"] in names[:index]
+                  )
+                  reject("duplicate_section", duplicate["line"])
               if any(not "\n".join(item["lines"]).strip() for item in sections):
-                  reject()
+                  empty = next(
+                      item for item in sections if not "\n".join(item["lines"]).strip()
+                  )
+                  reject("empty_section", empty["line"])
 
               headings = set()
               for item in sections:
@@ -2697,18 +2752,28 @@ jobs:
                   if item["name"] == "New findings" and body == "None":
                       continue
                   if re.match(r"^None(?:\s|$)", body):
-                      reject()
+                      none_line = next(
+                          line_number
+                          for line_number, line in zip(
+                              item["line_numbers"], item["lines"]
+                          )
+                          if re.match(r"^None(?:\s|$)", line.strip())
+                      )
+                      reject("none_with_finding", none_line)
                   has_block = False
-                  for line in item["lines"]:
+                  for offset, line in enumerate(item["lines"], 1):
+                      line_number = item["line"] + offset
                       if line.startswith("####"):
-                          if BLOCK_HEADING.fullmatch(line) is None or line in headings:
-                              reject()
+                          if BLOCK_HEADING.fullmatch(line) is None:
+                              reject("invalid_finding_heading", line_number)
+                          if line in headings:
+                              reject("duplicate_finding_heading", line_number)
                           headings.add(line)
                           has_block = True
                       elif not has_block and line.strip():
-                          reject()
+                          reject("section_preamble", line_number)
                   if not has_block:
-                      reject()
+                      reject("missing_finding_block", item["line"] + 1)
 
           def substance_signature(text, candidate_nonce):
               lines = text.split("\n")
@@ -2778,7 +2843,25 @@ jobs:
           mode, candidate_path, candidate_nonce = sys.argv[1:]
           candidate = read_candidate(candidate_path)
           if mode == "outer":
-              validate_outer(candidate, candidate_nonce)
+              rejection = None
+              try:
+                  validate_outer(candidate, candidate_nonce)
+              except ContractRejection as error:
+                  rejection = error
+              print(json.dumps(
+                  {
+                      "sha256": hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
+                      "valid": rejection is None,
+                      "rule": None if rejection is None else rejection.rule,
+                      "line": None if rejection is None else rejection.line,
+                      "column": None if rejection is None else rejection.column,
+                  },
+                  ensure_ascii=True,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              ))
+              if rejection is not None:
+                  raise SystemExit(1)
           elif mode == "signature":
               print(json.dumps(
                   substance_signature(candidate, candidate_nonce),
@@ -2792,7 +2875,20 @@ jobs:
           chmod 0500 "$contract_tool"
 
           candidate_outer_format_valid() {
-            python3 "$contract_tool" outer "$1" "$CANDIDATE_NONCE"
+            local candidate_path="$1"
+            local attempt="$2"
+            local raw_validation="$candidate_dir/.${attempt}-validation.json"
+            local validation="$candidate_dir/${attempt}-validation.json"
+            local status=0
+            python3 "$contract_tool" outer "$candidate_path" "$CANDIDATE_NONCE" \
+              > "$raw_validation" || status=$?
+            jq -ce --arg attempt "$attempt" 'select(type == "object" and (keys | sort) == ["column","line","rule","sha256","valid"] and (.sha256 | test("^[0-9a-f]{64}$")) and (.valid | type) == "boolean" and (if .valid then .rule == null and .line == null and .column == null else (.rule | test("^[a-z_]+$")) and (.line | type) == "number" and .line >= 1 and .line == (.line | floor) and (.column | type) == "number" and .column >= 1 and .column == (.column | floor) end)) | {attempt:$attempt,sha256,valid,rule,line,column}' "$raw_validation" > "$validation" || {
+              rm -f -- "$raw_validation" "$validation"
+              return 1
+            }
+            rm -f -- "$raw_validation"
+            chmod 0600 "$validation"
+            return "$status"
           }
 
           candidate_substance_signature() {
@@ -2808,7 +2904,7 @@ jobs:
           extract_candidate \
             "$RUNNER_TEMP/opencode-review.jsonl" "$candidate_dir/review.md"
 
-          if ! candidate_outer_format_valid "$candidate_dir/review.md"; then
+          if ! candidate_outer_format_valid "$candidate_dir/review.md" initial; then
             echo "OpenCode candidate outer grammar is invalid; attempting one format-only repair" >&2
             candidate_json="$RUNNER_TEMP/opencode-candidate.json"
             repair_prompt="$RUNNER_TEMP/opencode-format-repair-prompt.txt"
@@ -2842,7 +2938,7 @@ jobs:
             review_failure_reason=candidate_contract_failed
             extract_candidate \
               "$RUNNER_TEMP/opencode-format-repair.jsonl" "$candidate_dir/review-repaired.md"
-            if ! candidate_outer_format_valid "$candidate_dir/review-repaired.md"; then
+            if ! candidate_outer_format_valid "$candidate_dir/review-repaired.md" repair; then
               echo "OpenCode format repair still violates the required outer grammar" >&2
               exit 1
             fi
@@ -2969,6 +3065,65 @@ jobs:
               "candidate_contract_failed",
               "call_budget_exhausted",
           }
+          validation_rules = {
+              "candidate_contract",
+              "candidate_nonce_marker",
+              "duplicate_finding_heading",
+              "duplicate_section",
+              "empty_review",
+              "empty_section",
+              "invalid_finding_heading",
+              "marker_count",
+              "missing_finding_block",
+              "new_findings_first",
+              "nonce_invalid",
+              "none_with_finding",
+              "required_marker",
+              "required_nonce",
+              "section_preamble",
+              "unknown_section",
+          }
+
+          def load_validation(attempt: str):
+              path = candidate_dir / f"{attempt}-validation.json"
+              if not path.exists():
+                  return None
+              if not private_regular(path) or path.stat().st_size > 512:
+                  raise SystemExit(f"invalid {attempt} candidate validation")
+              try:
+                  record = json.loads(path.read_text(encoding="ascii"))
+              except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                  raise SystemExit(f"invalid {attempt} candidate validation") from error
+              expected_keys = {"attempt", "sha256", "valid", "rule", "line", "column"}
+              if (
+                  not isinstance(record, dict)
+                  or set(record) != expected_keys
+                  or record["attempt"] != attempt
+                  or re.fullmatch(r"[0-9a-f]{64}", record["sha256"] or "") is None
+                  or not isinstance(record["valid"], bool)
+              ):
+                  raise SystemExit(f"invalid {attempt} candidate validation")
+              if record["valid"]:
+                  if any(record[field] is not None for field in ("rule", "line", "column")):
+                      raise SystemExit(f"invalid {attempt} candidate validation")
+              elif (
+                  record["rule"] not in validation_rules
+                  or isinstance(record["line"], bool)
+                  or not isinstance(record["line"], int)
+                  or record["line"] < 1
+                  or isinstance(record["column"], bool)
+                  or not isinstance(record["column"], int)
+                  or record["column"] < 1
+              ):
+                  raise SystemExit(f"invalid {attempt} candidate validation")
+              return record
+
+          candidate_validations = [
+              record
+              for attempt in ("initial", "repair")
+              for record in (load_validation(attempt),)
+              if record is not None
+          ]
           model_outcome = os.environ.get("MODEL_OUTCOME", "")
           failure_reason = os.environ.get("MODEL_FAILURE_REASON", "")
           review_path = candidate_dir / "review.md"
@@ -2987,6 +3142,10 @@ jobs:
               ):
                   raise SystemExit("successful review candidate invalid")
               review_sha256 = hashlib.sha256(review_path.read_bytes()).hexdigest()
+              if not candidate_validations or not candidate_validations[-1]["valid"]:
+                  raise SystemExit("successful review candidate validation missing")
+              if candidate_validations[-1]["sha256"] != review_sha256:
+                  raise SystemExit("successful review candidate validation mismatch")
               review_path.chmod(0o600)
               failure_reason = "none"
           else:
@@ -2994,9 +3153,11 @@ jobs:
               (candidate_dir / "review-repaired.md").unlink(missing_ok=True)
               if failure_reason not in allowed_reasons - {"none"}:
                   failure_reason = "model_job_failed"
+          for attempt in ("initial", "repair"):
+              (candidate_dir / f"{attempt}-validation.json").unlink(missing_ok=True)
 
           envelope = {
-              "schema": 1,
+              "schema": 2,
               "repository": identity["repository"],
               "pr": int(identity["pr"]),
               "run_id": int(identity["run_id"]),
@@ -3011,6 +3172,7 @@ jobs:
               "outcome": "success" if succeeded else "failure",
               "failure_reason": failure_reason,
               "review_sha256": review_sha256,
+              "candidate_validations": candidate_validations,
           }
           candidate_json = candidate_dir / "candidate.json"
           candidate_json.write_text(
@@ -3051,7 +3213,8 @@ jobs:
       needs.check-enabled.outputs.safe_pr == 'true' &&
       needs.opencode-prepare.result == 'success' &&
       (needs.opencode-prepare.outputs.allow_invocation == 'true' ||
-      needs.opencode-prepare.outputs.budget_decision == 'authenticated_reuse')
+      (needs.opencode-prepare.outputs.budget_decision == 'authenticated_reuse' &&
+      needs.opencode-prepare.outputs.diff_mode == 'unchanged'))
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -3365,15 +3528,37 @@ jobs:
                 candidateEnvelope = JSON.parse(
                   new TextDecoder('utf-8', { fatal: true })
                     .decode(fs.readFileSync(candidateEnvelopePath)));
-                const candidateKeys = ['call_count','claim_checkpoint_sha256','diff_mode',
+                const candidateKeys = ['call_count','candidate_validations','claim_checkpoint_sha256','diff_mode',
                   'elapsed_seconds','failure_reason','full_diff_sha256','head_sha','model_route',
                   'outcome','pr','repository','review_sha256','run_attempt','run_id','schema'];
                 const nonnegativeInteger = (value) => Number.isSafeInteger(value) && value >= 0;
+                const validationRules = new Set([
+                  'candidate_contract', 'candidate_nonce_marker', 'duplicate_finding_heading',
+                  'duplicate_section', 'empty_review', 'empty_section', 'invalid_finding_heading',
+                  'marker_count', 'missing_finding_block', 'new_findings_first', 'nonce_invalid',
+                  'none_with_finding', 'required_marker', 'required_nonce', 'section_preamble',
+                  'unknown_section',
+                ]);
+                const candidateValidationKeys = ['attempt','column','line','rule','sha256','valid'];
+                const validations = candidateEnvelope?.candidate_validations;
+                const validationsValid = Array.isArray(validations) && validations.length <= 2
+                  && validations.every((record, index) => record && typeof record === 'object'
+                    && !Array.isArray(record)
+                    && JSON.stringify(Object.keys(record).sort())
+                      === JSON.stringify(candidateValidationKeys)
+                    && record.attempt === ['initial', 'repair'][index]
+                    && /^[0-9a-f]{64}$/.test(record.sha256 || '')
+                    && typeof record.valid === 'boolean'
+                    && (record.valid
+                      ? record.rule === null && record.line === null && record.column === null
+                      : validationRules.has(record.rule)
+                        && Number.isSafeInteger(record.line) && record.line >= 1
+                        && Number.isSafeInteger(record.column) && record.column >= 1));
                 if (!candidateEnvelope || typeof candidateEnvelope !== 'object'
                   || Array.isArray(candidateEnvelope)
                   || JSON.stringify(Object.keys(candidateEnvelope).sort())
                     !== JSON.stringify(candidateKeys)
-                  || candidateEnvelope.schema !== 1
+                  || candidateEnvelope.schema !== 2
                   || candidateEnvelope.repository !== repository
                   || candidateEnvelope.pr !== issueNumber
                   || candidateEnvelope.run_id !== runId
@@ -3381,6 +3566,7 @@ jobs:
                   || candidateEnvelope.head_sha !== attemptHead
                   || candidateEnvelope.full_diff_sha256 !== fullDiffSha256
                   || candidateEnvelope.diff_mode !== diffMode
+                  || !validationsValid
                   || candidateEnvelope.claim_checkpoint_sha256
                     !== handoff.budget_checkpoint_sha256) {
                   throw new Error('candidate claim identity mismatch');
@@ -3414,7 +3600,10 @@ jobs:
                 }
                 if (candidateEnvelope.outcome === 'success') {
                   if (candidateEnvelope.failure_reason !== 'none'
-                    || !/^[0-9a-f]{64}$/.test(candidateEnvelope.review_sha256 || '')) {
+                    || !/^[0-9a-f]{64}$/.test(candidateEnvelope.review_sha256 || '')
+                    || validations.length === 0
+                    || validations.at(-1).valid !== true
+                    || validations.at(-1).sha256 !== candidateEnvelope.review_sha256) {
                     throw new Error('successful candidate mode invalid');
                   }
                   const candidateStat = fs.lstatSync(candidatePath);

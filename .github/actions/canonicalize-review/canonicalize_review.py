@@ -109,6 +109,26 @@ class CandidateReason:
 
 
 @dataclass(frozen=True)
+class CandidateValidation:
+    attempt: Literal["initial"]
+    sha256: str
+    valid: Literal[False]
+    rule: str
+    line: int
+    column: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "attempt": self.attempt,
+            "sha256": self.sha256,
+            "valid": self.valid,
+            "rule": self.rule,
+            "line": self.line,
+            "column": self.column,
+        }
+
+
+@dataclass(frozen=True)
 class CanonicalizationResult:
     document_valid: bool
     accepted_count: int
@@ -117,10 +137,11 @@ class CanonicalizationResult:
     filtered_max_severity: Literal["none", "MEDIUM", "HIGH", "CRITICAL"]
     failure_reason: str
     candidate_reasons: tuple[CandidateReason, ...]
+    candidate_validations: tuple[CandidateValidation, ...]
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema": 1,
+            "schema": 2,
             "document_valid": self.document_valid,
             "accepted_count": self.accepted_count,
             "filtered_count": self.filtered_count,
@@ -128,6 +149,9 @@ class CanonicalizationResult:
             "filtered_max_severity": self.filtered_max_severity,
             "failure_reason": self.failure_reason,
             "candidate_reasons": [reason.to_dict() for reason in self.candidate_reasons],
+            "candidate_validations": [
+                validation.to_dict() for validation in self.candidate_validations
+            ],
         }
 
 
@@ -140,6 +164,14 @@ class _Block:
     low_severity: bool
     title: str
     lines: tuple[str, ...]
+
+
+class _CandidateSyntaxError(ValueError):
+    def __init__(self, rule: str, line: int, column: int = 1):
+        super().__init__(rule)
+        self.rule = rule
+        self.line = line
+        self.column = column
 
 
 @dataclass(frozen=True)
@@ -188,8 +220,13 @@ def stable_finding_id(reviewer: str, anchor: SourceAnchor, severity: str, title:
     return "RVW-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
 
 
-def _hard(reason: str) -> CanonicalizationResult:
-    return CanonicalizationResult(False, 0, 0, 0, "none", reason, ())
+def _hard(
+    reason: str,
+    candidate_validations: tuple[CandidateValidation, ...] = (),
+) -> CanonicalizationResult:
+    return CanonicalizationResult(
+        False, 0, 0, 0, "none", reason, (), candidate_validations
+    )
 
 
 def _strict_object(value: str, keys: set[str]) -> dict[str, object] | None:
@@ -242,61 +279,77 @@ def _parse_document(text: str) -> dict[str, list[_Block]]:
     if stripped in {"No blocking issues found.", "No validated blocking issues found."}:
         return {name: [] for name in SECTION_NAMES}
     lines = text.splitlines()
-    sections: dict[str, list[str]] = {}
+    sections: dict[str, list[tuple[int, str]]] = {}
+    section_heading_lines: dict[str, int] = {}
     section_order: list[str] = []
     active: str | None = None
-    for line in lines:
+    for line_number, line in enumerate(lines, 1):
         if line.startswith("####"):
             if active is None:
-                raise ValueError("finding_before_section")
-            sections[active].append(line)
+                raise _CandidateSyntaxError("finding_before_section", line_number)
+            sections[active].append((line_number, line))
         elif line.startswith("###"):
             if line not in {f"### {name}" for name in SECTION_NAMES}:
-                raise ValueError(
+                raise _CandidateSyntaxError(
                     "unknown_section_after_document"
                     if sections
-                    else "unknown_section_before_document"
+                    else "unknown_section_before_document",
+                    line_number,
                 )
             active = line[4:]
             if active in sections:
-                raise ValueError("duplicate_section")
+                raise _CandidateSyntaxError("duplicate_section", line_number)
             sections[active] = []
+            section_heading_lines[active] = line_number
             section_order.append(active)
         elif active is not None:
-            sections[active].append(line)
+            sections[active].append((line_number, line))
         elif line.strip():
-            raise ValueError("preamble")
+            raise _CandidateSyntaxError("preamble", line_number)
     if "New findings" not in sections:
-        raise ValueError("missing_new_findings")
+        raise _CandidateSyntaxError("missing_new_findings", 1)
     parsed: dict[str, list[_Block]] = {name: [] for name in SECTION_NAMES}
     index = 0
     for section in section_order:
-        contents = sections.get(section, [])
+        records = sections.get(section, [])
+        contents = [line for _, line in records]
         heading_positions = [position for position, line in enumerate(contents) if line.startswith("####")]
         if not heading_positions:
-            meaningful = [line for line in contents if line.strip()]
-            if section == "New findings" and meaningful not in (
+            meaningful = [(line_number, line) for line_number, line in records if line.strip()]
+            meaningful_lines = [line for _, line in meaningful]
+            if section == "New findings" and meaningful_lines not in (
                 ["None"],
                 ["None", "No validated blocking issues found."],
             ):
-                raise ValueError("invalid_empty_new_findings")
+                raise _CandidateSyntaxError(
+                    "invalid_empty_new_findings",
+                    meaningful[0][0] if meaningful else section_heading_lines[section],
+                )
             if section != "New findings" and meaningful:
-                raise ValueError("content_without_finding")
+                raise _CandidateSyntaxError("content_without_finding", meaningful[0][0])
             continue
         if section == "New findings" and any(line.strip() == "None" for line in contents):
-            raise ValueError("none_with_finding")
+            none_position = next(
+                position for position, line in enumerate(contents) if line.strip() == "None"
+            )
+            raise _CandidateSyntaxError("none_with_finding", records[none_position][0])
         if any(line.strip() for line in contents[:heading_positions[0]]):
-            raise ValueError("section_preamble")
+            preamble_position = next(
+                position
+                for position, line in enumerate(contents[:heading_positions[0]])
+                if line.strip()
+            )
+            raise _CandidateSyntaxError("section_preamble", records[preamble_position][0])
         for block_number, start in enumerate(heading_positions):
             parsed_heading = _heading(contents[start])
             if parsed_heading is None:
-                raise ValueError("invalid_finding_heading")
+                raise _CandidateSyntaxError("invalid_finding_heading", records[start][0])
             end = heading_positions[block_number + 1] if block_number + 1 < len(heading_positions) else len(contents)
             finding_id, severity, low_severity, title = parsed_heading
             parsed[section].append(_Block(index, section, finding_id, severity, low_severity, title, tuple(contents[start + 1:end])))
             index += 1
             if index > MAX_CANDIDATE_BLOCKS:
-                raise ValueError("too_many_blocks")
+                raise _CandidateSyntaxError("too_many_blocks", records[start][0])
     return parsed
 
 
@@ -797,7 +850,21 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                         f"review-canonicalization-diagnostic: {diagnostic}",
                         file=sys.stderr,
                     )
-                    result = _hard("ambiguous_document")
+                    line = error.line if isinstance(error, _CandidateSyntaxError) else 1
+                    column = error.column if isinstance(error, _CandidateSyntaxError) else 1
+                    result = _hard(
+                        "ambiguous_document",
+                        (
+                            CandidateValidation(
+                                "initial",
+                                hashlib.sha256(payload).hexdigest(),
+                                False,
+                                diagnostic,
+                                line,
+                                column,
+                            ),
+                        ),
+                    )
                 else:
                     accepted: list[tuple[_Block, _Finding]] = []
                     still_open: list[_PriorFinding] = []
@@ -875,6 +942,7 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                     result = CanonicalizationResult(
                         True, len(canonical_new) + len(still_open), filtered, normalized, maximum, "",
                         tuple(sorted(reasons, key=lambda item: item.index)),
+                        (),
                     )
                     canonical_payload = _render_document(
                         canonical_new,
@@ -927,6 +995,12 @@ def _summary(result: CanonicalizationResult) -> list[str]:
         f"candidate[{item.index}]: section={item.section} outcome={item.outcome} "
         f"reason={item.reason} claimed_severity={item.claimed_severity}"
         for item in result.candidate_reasons
+    )
+    lines.extend(
+        "candidate-validation: "
+        f"attempt={item.attempt} sha256={item.sha256} valid=false "
+        f"rule={item.rule} line={item.line} column={item.column}"
+        for item in result.candidate_validations
     )
     return lines
 

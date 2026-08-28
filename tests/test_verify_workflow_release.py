@@ -855,8 +855,8 @@ def test_approved_legacy_opencode_releases_remain_verifiable(
             "true",
         ),
         (
-            'if ! candidate_outer_format_valid "$candidate_dir/review.md"; then',
-            'if candidate_outer_format_valid "$candidate_dir/review.md"; then',
+            'if ! candidate_outer_format_valid "$candidate_dir/review.md" initial; then',
+            'if candidate_outer_format_valid "$candidate_dir/review.md" initial; then',
         ),
         (
             'echo "OpenCode format repair still violates the required outer grammar" >&2\n'
@@ -1834,6 +1834,12 @@ def test_v147_budget_helper_semantics_bind_live_ast_relationships(
             "        item.head_sha == request.head_sha "
             "for item in validated.invocations\n"
             "    ):\n"
+            "        if (\n"
+            "            request.authenticated_review.head_sha == request.head_sha\n"
+            "            and request.authenticated_review.covers_hash("
+            "request.full_diff_sha256)\n"
+            "        ):\n"
+            "            return refuse(validated, request, \"authenticated_reuse\")\n"
             "        return refuse(validated, request, \"duplicate_head\")\n",
             "    if False:\n"
             "        return refuse(validated, request, \"duplicate_head\")\n",
