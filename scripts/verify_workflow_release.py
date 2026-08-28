@@ -64,7 +64,7 @@ OPENCODE_REVIEW_RUN_SHA256 = (
     "9f1468128086b438cce0ce53fc20a9f0e02a14d581cd12b63f021c8c3a7620c6"
 )
 OPENCODE_REVIEW_RUN_V147_SHA256 = (
-    "d5b3cd5349d5bfd0d78aab2a925891a5e1e2c9f0d44cd86c1876c5cc28ea4b70"
+    "be6e7fc1c937cacc1c789463ec80a1612621395b02a5050b0923fe373fb4265d"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
     "a38218bc27e672f7f7bde1873b9fa3de811057490f3fab7dc91c74d03d80ba97"
@@ -488,7 +488,7 @@ EXPECTED_CANONICALIZER_SOFT_REASONS = frozenset(
     }
 )
 EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256 = (
-    "36babc0bc0159e7f1315cadca22ba8a7e1a8756bfd929637bab0fe1d21ed8d68"
+    "eb4ba827d3b03e3c9169cd95e9194d49b2b8b9b6956e7317b5c9cc9b7bb04fc5"
 )
 EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
     "68779c9038c31aa09a846b643bc0178b147798527e1a34ee5821ab539f10b19a"
@@ -531,6 +531,14 @@ EXPECTED_CANONICALIZER_RECORDS = {
         ("reason", "str"),
         ("claimed_severity", "Literal['none', 'MEDIUM', 'HIGH', 'CRITICAL']"),
     ),
+    "CandidateValidation": (
+        ("attempt", "Literal['initial']"),
+        ("sha256", "str"),
+        ("valid", "Literal[False]"),
+        ("rule", "str"),
+        ("line", "int"),
+        ("column", "int"),
+    ),
     "CanonicalizationResult": (
         ("document_valid", "bool"),
         ("accepted_count", "int"),
@@ -539,6 +547,7 @@ EXPECTED_CANONICALIZER_RECORDS = {
         ("filtered_max_severity", "Literal['none', 'MEDIUM', 'HIGH', 'CRITICAL']"),
         ("failure_reason", "str"),
         ("candidate_reasons", "tuple[CandidateReason, ...]"),
+        ("candidate_validations", "tuple[CandidateValidation, ...]"),
     ),
 }
 EXPECTED_SCOPE_RECORDS = {
@@ -644,12 +653,12 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256 = (
     "70b50ce482ff0e54df9fff88d5126cd8e760ed8bdabfefcc2f2ccdc639cb693b"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
-    "a2ccb7dcfa131186ed302836172f03502d71ec191bf58780477b2e447a42c594"
+    "43f15d59df0f529e2fa4f06488e49dc5ff78280762ee8d7248dbecb45cbb609d"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d34dfc388a393a6679bfd6a38ac281cc2c14a843063a010e9f1303c68df58cc7",
-    "gemini": "6837358dbbdcc2f3f5ebf6aca3956b646f89b35fed7c9a201bbde2d6af7519dd",
-    "opencode": "28791fa77f05454775043cb5b582f849aef7fe81c109c65161bcf860a6d6531a",
+    "gemini": "cf3da7805be2f707f07eb2fa01e812083412d4dfb87d81ba3990f6222e616e9e",
+    "opencode": "7bff235fe723c79eaf34d21ebc3e8032ade23da82dd22fa61c4a3a3aa5f5d31c",
 }
 EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION = yaml.load(
     r"""name: Review invocation budget
@@ -2102,11 +2111,19 @@ def verify_opencode_runtime(
         "opencode run --model zai-coding-plan/glm-4.7 --format json "
         "--file review-full.diff --file review-scope.json"
     ) in run_script
+    current_diagnostics_contract = (
+        workflow_sha256
+        == EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256["opencode"]
+    )
+    initial_validation_argument = " initial" if current_diagnostics_contract else ""
+    repair_validation_argument = " repair" if current_diagnostics_contract else ""
     format_sequence = (
         'run_opencode "$initial_prompt" "$RUNNER_TEMP/opencode-review.jsonl"',
-        'if ! candidate_outer_format_valid "$candidate_dir/review.md"; then',
+        'if ! candidate_outer_format_valid "$candidate_dir/review.md"'
+        f'{initial_validation_argument}; then',
         '"$repair_prompt" "$RUNNER_TEMP/opencode-format-repair.jsonl"',
-        'if ! candidate_outer_format_valid "$candidate_dir/review-repaired.md"; then',
+        'if ! candidate_outer_format_valid "$candidate_dir/review-repaired.md"'
+        f'{repair_validation_argument}; then',
         'echo "OpenCode format repair still violates the required outer grammar" >&2',
         "exit 1",
         'if ! initial_signature="$(candidate_substance_signature "$candidate_dir/review.md")"; then',
@@ -4130,6 +4147,10 @@ def require_budget_helper_contract(source: str) -> None:
             "        return refuse(validated, request, 'authenticated_reuse')\n"
             "    if not request.force_review and any("
             "item.head_sha == request.head_sha for item in validated.invocations):\n"
+            "        if (request.authenticated_review.head_sha == request.head_sha "
+            "and request.authenticated_review.covers_hash("
+            "request.full_diff_sha256)):\n"
+            "            return refuse(validated, request, 'authenticated_reuse')\n"
             "        return refuse(validated, request, 'duplicate_head')\n"
             "    if not request.force_review and any("
             "item.full_diff_sha256 == request.full_diff_sha256 "
@@ -5117,8 +5138,8 @@ def require_budget_workflow_contract(
                     'run_opencode "$repair_prompt" '
                     '"$RUNNER_TEMP/opencode-format-repair.jsonl"',
                     (
-                        "if:if ! candidate_outer_format_valid "
-                        '"$candidate_dir/review.md"; then',
+                            "if:if ! candidate_outer_format_valid "
+                            '"$candidate_dir/review.md" initial; then',
                     ),
                 ),
             )

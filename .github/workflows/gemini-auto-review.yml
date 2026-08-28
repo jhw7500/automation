@@ -1871,6 +1871,23 @@ jobs:
           retention-days: 7
           overwrite: false
 
+      - name: Enforce authenticated review budget decision
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        env:
+          BUDGET_ALLOW_INVOCATION: ${{ steps.review-budget-claim.outputs.allow-invocation }}
+          BUDGET_DECISION: ${{ steps.review-budget-claim.outputs.decision }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUDGET_ALLOW_INVOCATION" == 'true' && "$BUDGET_DECISION" == 'claimed' ]]; then
+            exit 0
+          fi
+          if [[ "$BUDGET_ALLOW_INVOCATION" == 'false' && "$BUDGET_DECISION" == 'authenticated_reuse' ]]; then
+            exit 0
+          fi
+          echo "::error::Gemini review has no authenticated checkpoint for this attempt ($BUDGET_DECISION)"
+          exit 1
+
   skipped:
     permissions: {}
     name: Workflow Skipped

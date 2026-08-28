@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from types import SimpleNamespace
 from pathlib import Path
@@ -316,6 +317,36 @@ def test_hard_document_failures_are_exact_and_write_no_canonical_body(case_facto
     assert result.candidate_reasons == ()
 
 
+def test_ambiguous_document_records_only_rule_location_and_candidate_hash(case_factory):
+    """Dropping parser context must not leave a paid rejected candidate undiagnosable."""
+    secret_claim = "UNTRUSTED-GEMINI-CANDIDATE"
+    payload = (
+        "### New findings\n"
+        "None\n\n"
+        "### New findings\n"
+        f"{secret_claim}\n"
+    ).encode("utf-8")
+
+    result, canonical = case_factory(payload).run()
+    encoded = json.dumps(result.to_dict(), sort_keys=True)
+
+    assert result.document_valid is False
+    assert result.failure_reason == "ambiguous_document"
+    assert canonical is None
+    assert result.to_dict()["schema"] == 2
+    assert result.to_dict()["candidate_validations"] == [
+        {
+            "attempt": "initial",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "valid": False,
+            "rule": "duplicate_section",
+            "line": 4,
+            "column": 1,
+        }
+    ]
+    assert secret_claim not in encoded
+
+
 def test_result_json_never_repeats_rejected_model_text(case_factory):
     """Leaking rejected prose into the result would expose untrusted model text."""
     secret_claim = "INJECTED-REJECTED-CLAIM"
@@ -333,7 +364,8 @@ def test_result_json_never_repeats_rejected_model_text(case_factory):
     assert result.candidate_reasons == (
         CandidateReason(0, "New findings", "filtered", "invalid_anchor", "HIGH"),
     )
-    assert set(result.to_dict()) == {"schema", "document_valid", "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity", "failure_reason", "candidate_reasons"}
+    assert set(result.to_dict()) == {"schema", "document_valid", "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity", "failure_reason", "candidate_reasons", "candidate_validations"}
+    assert result.to_dict()["candidate_validations"] == []
     assert set(result.to_dict()["candidate_reasons"][0]) == {"index", "section", "outcome", "reason", "claimed_severity"}
 
 
@@ -521,7 +553,7 @@ def test_clean_candidate_accepts_a_tree_equivalent_empty_full_scope(tmp_path: Pa
     ))
 
     assert result == canonicalize_review.CanonicalizationResult(
-        True, 0, 0, 0, "none", "", (),
+        True, 0, 0, 0, "none", "", (), (),
     )
     assert canonical.read_text(encoding="utf-8") == (
         "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
@@ -559,7 +591,7 @@ def test_preexisting_canonical_symlink_is_never_followed(case_factory):
     target.write_text("preserve", encoding="utf-8")
     case.canonical.symlink_to(target)
     result, canonical = case.run()
-    assert result == canonicalize_review.CanonicalizationResult(False, 0, 0, 0, "none", "canonicalizer_error", ())
+    assert result == canonicalize_review.CanonicalizationResult(False, 0, 0, 0, "none", "canonicalizer_error", (), ())
     assert canonical is None
     assert target.read_text(encoding="utf-8") == "preserve"
 
@@ -590,7 +622,7 @@ def test_performance_basis_is_canonicalized_from_validated_fields(scoped_case, k
 - Material impact: The changed exception path is exercised for every invalid request.
 - Performance basis: {basis}
 ''')
-    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", ())
+    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", (), ())
     assert expected_basis in canonical
     assert canonical == f'''### New findings
 
@@ -733,7 +765,8 @@ def test_cli_writes_bounded_schema_result_scalar_outputs_and_metadata_only_logs(
     completed = subprocess.run(_cli_args(case, github_output), cwd=ACTION_DIR, capture_output=True, text=True)
     assert completed.returncode == 0
     result = json.loads(case.result.read_text(encoding="utf-8"))
-    assert set(result) == {"schema", "document_valid", "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity", "failure_reason", "candidate_reasons"}
+    assert set(result) == {"schema", "document_valid", "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity", "failure_reason", "candidate_reasons", "candidate_validations"}
+    assert result["candidate_validations"] == []
     assert len(case.result.read_bytes()) <= 131_072
     assert secret not in case.result.read_text(encoding="utf-8")
     assert secret not in completed.stdout
@@ -843,9 +876,10 @@ def test_cli_canonical_symlink_becomes_closed_canonicalizer_error(case_factory):
     completed = subprocess.run(_cli_args(case), cwd=ACTION_DIR, capture_output=True, text=True)
     assert completed.returncode == 0
     assert json.loads(case.result.read_text(encoding="utf-8")) == {
-        "schema": 1, "document_valid": False, "accepted_count": 0,
+        "schema": 2, "document_valid": False, "accepted_count": 0,
         "filtered_count": 0, "normalized_count": 0, "filtered_max_severity": "none",
         "failure_reason": "canonicalizer_error", "candidate_reasons": [],
+        "candidate_validations": [],
     }
     assert not case.canonical.exists()
     assert target.read_text(encoding="utf-8") == "preserve"
@@ -984,6 +1018,7 @@ def test_duplicate_generated_new_id_is_normalized_before_rendering(review_qualit
         (canonicalize_review.CandidateReason(
             1, "New findings", "normalized", "duplicate_prior_binding", "MEDIUM",
         ),),
+        (),
     )
     assert canonical.count("#### RVW-61d4cd9ac260 [MEDIUM]") == 1
     followup, _ = review_quality_repo._run(review_quality_repo._request(
@@ -1019,6 +1054,7 @@ def test_new_finding_cannot_duplicate_a_carried_active_id(review_quality_repo):
         (canonicalize_review.CandidateReason(
             0, "New findings", "normalized", "duplicate_prior_binding", "HIGH",
         ),),
+        (),
     )
     assert canonical.count("#### RVW-3253866a28c6 [HIGH]") == 1
     assert "### Still open" in canonical
@@ -1078,7 +1114,7 @@ def test_retracted_prior_renders_canonical_reason(review_quality_repo):
     result, canonical = review_quality_repo.run_carryover(
         accepted_rejected_plan_review(), retracted_rejected_plan_candidate(),
     )
-    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
     assert canonical == '''### New findings
 
 None
@@ -1117,7 +1153,7 @@ def test_known_prior_still_open_renders_prior_identity_and_exact_markdown(review
     result, canonical = review_quality_repo.run_delta(
         accepted_rejected_plan_review(), valid_still_open_candidate(),
     )
-    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", ())
+    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", (), ())
     assert canonical == '''### New findings
 
 None
@@ -1392,7 +1428,7 @@ def test_escape_expansion_over_canonical_ceiling_fails_before_publication(
     ))
 
     assert result == canonicalize_review.CanonicalizationResult(
-        False, 0, 0, 0, "none", "candidate_oversize", (),
+        False, 0, 0, 0, "none", "candidate_oversize", (), (),
     )
     assert canonical == ""
     assert not review_quality_repo.canonical.exists()
@@ -1421,7 +1457,7 @@ def test_max_candidate_renderer_output_is_valid_authenticated_previous_input(rev
         candidate, reviewer="gemini", head=review_quality_repo.review_head,
     ))
     previous_bytes = previous.encode("utf-8")
-    assert initial == canonicalize_review.CanonicalizationResult(True, 200, 0, 0, "none", "", ())
+    assert initial == canonicalize_review.CanonicalizationResult(True, 200, 0, 0, "none", "", (), ())
     assert len(previous_bytes) == canonicalize_review.MAX_CANDIDATE_BYTES + (17 * 200)
     assert (
         canonicalize_review.MAX_CANDIDATE_BYTES
@@ -1437,7 +1473,7 @@ def test_max_candidate_renderer_output_is_valid_authenticated_previous_input(rev
     assert request.previous_review_file is not None
     assert request.previous_review_file.read_bytes() == previous_bytes
     followup, canonical = review_quality_repo._run(request)
-    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
     assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
 
 
@@ -1570,7 +1606,7 @@ def test_accepted_new_free_text_is_visible_safe_and_uses_canonical_title_identit
 ):
     """Accepted free text must not create a marker, metadata line, or sticky Markdown heading."""
     result, canonical = scoped_case.run(_new_free_text_candidate(title, material, prose))
-    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", ())
+    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", (), ())
     assert expected in canonical
     assert "<!-- automation:" not in canonical
     assert "<!-- automation-state:" not in canonical
@@ -1610,7 +1646,7 @@ def test_accepted_resolution_and_reason_are_visible_safe_without_counter_changes
     """Renderer-only escaping must preserve accepted carryover classification and counts."""
     runner = review_quality_repo.run_delta if "### Resolved" in candidate else review_quality_repo.run_carryover
     result, canonical = runner(accepted_rejected_plan_review(), candidate)
-    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
     assert expected in canonical
     assert f": {raw}" not in canonical
     assert "<!-- automation:" not in canonical
@@ -1666,7 +1702,7 @@ def test_current_resolved_fix_anchor_accepts_literal_json_controls_and_authentic
     )
     result, canonical = review_quality_repo.run_delta(accepted_rejected_plan_review(), candidate)
 
-    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
     encoded = next(
         line.removeprefix("- Fix anchor: ")
         for line in canonical.splitlines()
@@ -1680,7 +1716,7 @@ def test_current_resolved_fix_anchor_accepts_literal_json_controls_and_authentic
         "### New findings\n\nNone\n", reviewer="gemini", head=review_quality_repo.fixed_head,
         previous_sha=review_quality_repo.fixed_head, previous_review=canonical,
     ))
-    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
 
 
 def test_current_retracted_trigger_accepts_literal_json_controls_and_authenticates_output(
@@ -1694,7 +1730,7 @@ def test_current_retracted_trigger_accepts_literal_json_controls_and_authenticat
     )
     result, canonical = review_quality_repo.run_carryover(accepted_rejected_plan_review(), candidate)
 
-    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
     encoded = next(
         line.removeprefix("- Trigger evidence: ")
         for line in canonical.splitlines()
@@ -1707,7 +1743,7 @@ def test_current_retracted_trigger_accepts_literal_json_controls_and_authenticat
     followup, _ = review_quality_repo.run_carryover(
         canonical, "### New findings\n\nNone\n",
     )
-    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
 
 
 def test_canonicalized_marker_title_is_strict_byte_stable_authenticated_prior_input(review_quality_repo):
@@ -1719,7 +1755,7 @@ def test_canonicalized_marker_title_is_strict_byte_stable_authenticated_prior_in
         initial, reviewer="gemini", head=review_quality_repo.review_head,
     ))
     expected_id = stable_finding_id("gemini", SourceAnchor("review_cases.py", 26), "HIGH", canonical_title)
-    assert prior_result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", ())
+    assert prior_result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", (), ())
     assert f"#### {expected_id} [HIGH] {canonical_title}" in previous
     request = review_quality_repo._request(
         "### New findings\n\nNone\n", reviewer="gemini", head=review_quality_repo.review_head,
@@ -1738,7 +1774,7 @@ None
 - Material impact: The rejection remains visible to callers.
 '''
     result, canonical = review_quality_repo.run_delta(previous, still_open)
-    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", ())
+    assert result == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", (), ())
     assert canonical_title in canonical
     assert "<!-- automation:" not in canonical
     assert "<!-- automation-state:" not in canonical
@@ -1750,7 +1786,7 @@ None
     loaded_followup = canonicalize_review._load_prior_active(followup_request)
     assert loaded_followup[expected_id].finding.anchor == SourceAnchor("review_cases.py", 20)
     followup, followup_canonical = review_quality_repo._run(followup_request)
-    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", ())
+    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
     assert followup_canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
 
 
@@ -1774,7 +1810,7 @@ def test_bulleted_supplemental_prose_round_trips_as_authenticated_prior(
         "gemini", SourceAnchor("review_cases.py", 26), "HIGH", title,
     )
     assert prior_result == canonicalize_review.CanonicalizationResult(
-        True, 1, 0, 0, "none", "", (),
+        True, 1, 0, 0, "none", "", (), (),
     )
     assert detail in previous
 

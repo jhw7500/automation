@@ -8171,7 +8171,7 @@ def test_opencode_budget_candidate_envelope_is_exact_and_mode_aware():
         "schema", "repository", "pr", "run_id", "run_attempt", "head_sha",
         "full_diff_sha256", "diff_mode", "claim_checkpoint_sha256",
         "call_count", "elapsed_seconds", "model_route", "outcome",
-        "failure_reason", "review_sha256",
+        "failure_reason", "review_sha256", "candidate_validations",
     ):
         assert f'"{field}"' in materialize
     assert "lstat" in materialize and "S_ISREG" in materialize
@@ -8277,6 +8277,49 @@ def test_opencode_budget_refusal_skips_model_and_schema2_publication_but_uploads
     assert "needs.opencode-prepare.outputs.budget_decision == 'authenticated_reuse'" in canonical_job["if"]
     assert "needs.opencode-prepare.outputs.allow_invocation == 'true'" in canonicalize["if"]
     assert "authenticated_reuse" in canonicalize["if"]
+
+
+@pytest.mark.parametrize(
+    ("workflow_name", "job_name"),
+    (
+        ("gemini-auto-review.yml", "gemini-review"),
+        ("opencode-auto-review.yml", "opencode-prepare"),
+    ),
+)
+@pytest.mark.parametrize(
+    "decision",
+    (
+        "duplicate_head",
+        "duplicate_effective_diff",
+        "input_budget_exhausted",
+        "round_budget_exhausted",
+        "total_usage_budget_exhausted",
+    ),
+)
+def test_review_budget_refusal_fails_without_authenticated_checkpoint(
+    tmp_path, workflow_name, job_name, decision
+):
+    """A normal budget refusal is not approval for a successful required check."""
+    workflow = _load(workflow_name)
+    enforce = _step(workflow, job_name, "Enforce authenticated review budget decision")
+
+    def run(allow_invocation: str, decision: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", enforce["run"]],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "BUDGET_ALLOW_INVOCATION": allow_invocation,
+                "BUDGET_DECISION": decision,
+            },
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+
+    assert run("false", decision).returncode != 0
+    assert run("false", "authenticated_reuse").returncode == 0
+    assert run("true", "claimed").returncode == 0
 
 
 def test_opencode_model_and_privileged_canonicalization_have_separate_token_boundaries():
@@ -8513,6 +8556,46 @@ def _run_opencode_model_step(
     return result, calls, candidate
 
 
+def _run_opencode_materialize_step(tmp_path: Path, model_outcome: str) -> dict[str, object]:
+    materialize = _step(
+        _load("opencode-auto-review.yml"),
+        "opencode-review",
+        "Materialize sealed OpenCode candidate",
+    )
+    runner_temp = tmp_path / "runner"
+    github_output = tmp_path / "materialize-output"
+    model_outputs = _github_outputs(tmp_path / "github-output")
+    env = {
+        **os.environ,
+        "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_OUTPUT": str(github_output),
+        "GITHUB_REPOSITORY": "example/repo",
+        "GITHUB_RUN_ID": "101",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "MODEL_OUTCOME": model_outcome,
+        "MODEL_FAILURE_REASON": model_outputs["failure_reason"],
+        "PR_NUMBER": "7",
+        "ATTEMPT_HEAD": "12" * 20,
+        "FULL_DIFF_SHA256": "34" * 32,
+        "DIFF_MODE": "full",
+        "CLAIM_CHECKPOINT_SHA256": "56" * 32,
+    }
+    completed = subprocess.run(
+        ["bash", "-c", materialize["run"]],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(
+        (runner_temp / "opencode-candidate" / "candidate.json").read_text(
+            encoding="ascii"
+        )
+    )
+
+
 def test_opencode_invocation_budget_persists_count_before_raised_cli(tmp_path):
     result, calls, _ = _run_opencode_model_step(tmp_path, [])
 
@@ -8614,6 +8697,80 @@ def test_opencode_format_repair_still_requires_exact_final_section_case(tmp_path
 
     assert result.returncode != 0
     assert len(calls) == 2
+
+
+def test_opencode_failed_initial_and_repair_keep_separate_sanitized_diagnostics(tmp_path):
+    secret_claim = "UNTRUSTED-OPENCODE-CANDIDATE"
+    initial = secret_claim + "\n" + _opencode_candidate()
+    repaired = _opencode_candidate("### New Findings\nNone")
+
+    result, calls, _ = _run_opencode_model_step(tmp_path, [initial, repaired])
+    envelope = _run_opencode_materialize_step(tmp_path, "failure")
+    encoded = json.dumps(envelope, sort_keys=True)
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+    assert envelope["schema"] == 2
+    assert envelope["failure_reason"] == "candidate_contract_failed"
+    assert envelope["candidate_validations"] == [
+        {
+            "attempt": "initial",
+            "sha256": hashlib.sha256((initial + "\n").encode()).hexdigest(),
+            "valid": False,
+            "rule": "required_marker",
+            "line": 1,
+            "column": 1,
+        },
+        {
+            "attempt": "repair",
+            "sha256": hashlib.sha256((repaired + "\n").encode()).hexdigest(),
+            "valid": False,
+            "rule": "unknown_section",
+            "line": 3,
+            "column": 1,
+        },
+    ]
+    assert secret_claim not in encoded
+
+
+@pytest.mark.parametrize(
+    ("candidate", "rule", "line"),
+    (
+        (
+            _opencode_candidate("\n\n### New Findings\nNone"),
+            "unknown_section",
+            5,
+        ),
+        (
+            _opencode_candidate()
+            + f"\n<!-- automation-candidate:{OPENCODE_CANDIDATE_NONCE} -->",
+            "candidate_nonce_marker",
+            5,
+        ),
+        (
+            _opencode_candidate(
+                "### New findings\n\n\nNone\n" + OPENCODE_FINDING_BLOCK
+            ),
+            "none_with_finding",
+            6,
+        ),
+    ),
+    ids=("leading-blank-lines", "extra-nonce", "padded-none"),
+)
+def test_opencode_rejected_candidate_diagnostics_report_actual_source_line(
+    tmp_path, candidate, rule, line
+):
+    result, calls, _ = _run_opencode_model_step(
+        tmp_path, [candidate, candidate]
+    )
+    envelope = _run_opencode_materialize_step(tmp_path, "failure")
+
+    assert result.returncode != 0
+    assert len(calls) == 2
+    assert [
+        (record["attempt"], record["rule"], record["line"])
+        for record in envelope["candidate_validations"]
+    ] == [("initial", rule, line), ("repair", rule, line)]
 
 
 def test_opencode_format_repair_rejects_non_ascii_case_lookalike(tmp_path):
@@ -13210,8 +13367,18 @@ def _run_opencode_canonicalize(
                 encoding="utf-8",
             )
             review_sha256 = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+        candidate_validations = []
+        if candidate_succeeded:
+            candidate_validations.append({
+                "attempt": "initial",
+                "sha256": review_sha256,
+                "valid": True,
+                "rule": None,
+                "line": None,
+                "column": None,
+            })
         envelope = {
-            "schema": 1,
+            "schema": 2,
             "repository": "example/repo",
             "pr": 7,
             "run_id": int(run_id),
@@ -13233,6 +13400,7 @@ def _run_opencode_canonicalize(
                 else "provider_failed"
             ),
             "review_sha256": review_sha256,
+            "candidate_validations": candidate_validations,
         }
         envelope.update(candidate_envelope_changes or {})
         candidate_envelope_path.write_text(

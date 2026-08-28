@@ -389,6 +389,35 @@ def test_quality_filtered_is_terminal_and_duplicate_input_stays_blocked():
     assert not again.allow_invocation
 
 
+def test_same_head_noop_requires_exact_authenticated_checkpoint():
+    """A rerun may be green only when the prior checkpoint covers this exact head and diff."""
+    existing = budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        "gemini",
+        invocations=(invocation(reviewer="gemini", outcome="success"),),
+    )
+    exact_request = replace(
+        request(reviewer="gemini"),
+        authenticated_review=budget.AuthenticatedReview(True, HEAD_A, HASH_1),
+    )
+    exact = budget.claim(
+        existing, exact_request, claim_provenances(existing, exact_request)
+    )
+    missing_request = replace(
+        exact_request,
+        authenticated_review=budget.AuthenticatedReview(False, None, None),
+    )
+    missing = budget.claim(
+        existing, missing_request, claim_provenances(existing, missing_request)
+    )
+
+    assert exact.decision == "authenticated_reuse"
+    assert not exact.allow_invocation
+    assert missing.decision == "duplicate_head"
+    assert not missing.allow_invocation
+
+
 def test_force_review_claims_same_head_once_with_dispatch_and_authorized_override():
     existing = budget.LedgerState.initial(
         REPOSITORY,

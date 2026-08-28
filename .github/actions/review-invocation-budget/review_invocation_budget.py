@@ -947,6 +947,11 @@ def claim(state: LedgerState | None, request: ClaimRequest,
     if not request.force_review and any(
         item.head_sha == request.head_sha for item in validated.invocations
     ):
+        if (
+            request.authenticated_review.head_sha == request.head_sha
+            and request.authenticated_review.covers_hash(request.full_diff_sha256)
+        ):
+            return refuse(validated, request, "authenticated_reuse")
         return refuse(validated, request, "duplicate_head")
     if not request.force_review and any(
         item.full_diff_sha256 == request.full_diff_sha256
