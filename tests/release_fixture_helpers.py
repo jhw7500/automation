@@ -34,9 +34,86 @@ V145_PREPARE_DIFF_FIXTURE = (
 )
 
 
+def restore_pre_force_review_callers(repo: Path) -> None:
+    """Remove the force-review caller surface from historical fixtures."""
+
+    baseline_root = repo / "examples/baseline-workflows/.github/workflows"
+    for filename in ("claude-code-review.yml", "gemini-auto-review.yml"):
+        path = baseline_root / filename
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        dispatch = (
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      pr_number:\n"
+            "        description: Pull request number\n"
+            "        type: number\n"
+            "        required: true\n"
+            "      force_review:\n"
+            "        description: Perform one authorized same-HEAD review\n"
+            "        type: boolean\n"
+            "        required: false\n"
+            "        default: false\n"
+        )
+        forced_if = (
+            "    if: >-\n"
+            "      (github.event_name == 'pull_request' &&\n"
+            "      github.event.pull_request.head.repo.fork == false &&\n"
+            "      github.event.pull_request.head.repo.full_name == github.repository) ||\n"
+            "      (github.event_name == 'workflow_dispatch' && inputs.force_review)\n"
+        )
+        assert text.count(dispatch) == 1
+        assert text.count(forced_if) == 1
+        assert text.count("      force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}\n") == 1
+        text = text.replace(dispatch, "", 1).replace(
+            forced_if,
+            "    if: ${{ github.event.pull_request.head.repo.fork == false && github.event.pull_request.head.repo.full_name == github.repository }}\n",
+            1,
+        ).replace(
+            "      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}\n",
+            "      pr_number: ${{ github.event.pull_request.number }}\n",
+            1,
+        ).replace(
+            "      force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}\n",
+            "",
+            1,
+        )
+        path.write_text(text, encoding="utf-8")
+
+    catalog = repo / "scripts/workflow-catalog.json"
+    if catalog.exists():
+        text = catalog.read_text(encoding="utf-8")
+        dispatch = (
+            '        },\n'
+            '        "workflow_dispatch": {\n'
+            '          "inputs": {\n'
+            '            "pr_number": {\n'
+            '              "description": "Pull request number",\n'
+            '              "type": "number",\n'
+            '              "required": "true"\n'
+            '            },\n'
+            '            "force_review": {\n'
+            '              "description": "Perform one authorized same-HEAD review",\n'
+            '              "type": "boolean",\n'
+            '              "required": "false",\n'
+            '              "default": "false"\n'
+            '            }\n'
+            '          }\n'
+            '        }\n'
+        )
+        assert text.count(dispatch) == 2
+        assert text.count('            "force_review",\n') == 2
+        text = text.replace(dispatch, "        }\n", 2).replace(
+            '            "force_review",\n', "", 2
+        )
+        catalog.write_text(text, encoding="utf-8")
+
+
 def restore_pre_v146_review_contracts(repo: Path) -> None:
     """Restore shared auth identity and Claude/Gemini caller ceilings."""
 
+    restore_pre_force_review_callers(repo)
     setup = repo / ".github/actions/setup-gemini-auth/action.yml"
     setup.parent.mkdir(parents=True, exist_ok=True)
     setup.write_bytes(PRE_V146_SETUP_AUTH_FIXTURE.read_bytes())

@@ -389,6 +389,83 @@ def test_quality_filtered_is_terminal_and_duplicate_input_stays_blocked():
     assert not again.allow_invocation
 
 
+def test_force_review_claims_same_head_once_with_dispatch_and_authorized_override():
+    existing = budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        "claude",
+        invocations=(invocation(),),
+    )
+    force_request = replace(
+        request(run_id=700),
+        force_review=True,
+        override_events=(
+            budget.OverrideEvent(9001, "labeled", "review-budget-override", "write"),
+        ),
+    )
+    provenances = valid_provenances(existing)
+    provenances[(700, 1)] = replace(
+        reusable_provenance(run_id=700), caller_event="workflow_dispatch"
+    )
+
+    result = budget.claim(existing, force_request, provenances)
+
+    assert result.allow_invocation
+    assert result.decision == "claimed"
+    assert result.round_number == 2
+    assert result.state.consumed_override_event_ids == (9001,)
+    assert result.state.invocations[-1].head_sha == HEAD_A
+    assert result.state.invocations[-1].full_diff_sha256 == HASH_1
+    assert result.state.invocations[-1].caller_event == "workflow_dispatch"
+
+
+def test_force_review_fails_closed_without_dispatch_or_authorized_override():
+    existing = budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        "claude",
+        invocations=(invocation(),),
+    )
+    force_request = replace(request(run_id=700), force_review=True)
+    pull_request_provenances = claim_provenances(existing, force_request)
+
+    wrong_event = budget.claim(existing, force_request, pull_request_provenances)
+    assert not wrong_event.allow_invocation
+    assert wrong_event.decision == "state_invalid"
+    assert wrong_event.stop_reason == "provenance_mismatch"
+
+    dispatch_provenances = dict(pull_request_provenances)
+    dispatch_provenances[(700, 1)] = replace(
+        dispatch_provenances[(700, 1)], caller_event="workflow_dispatch"
+    )
+    no_override = budget.claim(existing, force_request, dispatch_provenances)
+    assert not no_override.allow_invocation
+    assert no_override.decision == "round_budget_exhausted"
+
+
+def test_normal_same_head_remains_zero_call_when_override_label_exists():
+    existing = budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        "claude",
+        invocations=(invocation(),),
+    )
+    normal_request = replace(
+        request(run_id=700),
+        override_events=(
+            budget.OverrideEvent(9001, "labeled", "review-budget-override", "write"),
+        ),
+    )
+
+    result = budget.claim(
+        existing, normal_request, claim_provenances(existing, normal_request)
+    )
+
+    assert not result.allow_invocation
+    assert result.decision == "duplicate_head"
+    assert result.state.consumed_override_event_ids == ()
+
+
 def test_finalization_matches_one_claim_and_rejects_identity_or_status_drift():
     state = claimed_state()
     finalized = budget.finalize(state, finalize_request(), current_provenances(state))

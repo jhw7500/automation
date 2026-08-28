@@ -59,6 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pr-number", required=True, type=int)
     parser.add_argument("--previous-sha", required=True)
     parser.add_argument("--previous-full-hash", required=True)
+    parser.add_argument("--force-full", action="store_true")
     parser.add_argument("--context-lines", required=True, type=int)
     parser.add_argument("--full-output", required=True)
     parser.add_argument("--delta-output", required=True)
@@ -358,9 +359,13 @@ def prepare(args: argparse.Namespace, cwd: Path) -> PreparedReviewDiff:
         full_hash = hashlib.sha256(full_diff).hexdigest()
         mode: Literal["full", "delta", "unchanged"] = "full"
         delta_diff: bytes | None = None
-        if args.previous_full_hash and full_hash.lower() == args.previous_full_hash.lower():
+        if (
+            not args.force_full
+            and args.previous_full_hash
+            and full_hash.lower() == args.previous_full_hash.lower()
+        ):
             mode = "unchanged"
-        elif args.previous_sha:
+        elif not args.force_full and args.previous_sha:
             try:
                 ensure_commit(args.previous_sha, cwd)
                 ancestor = run(

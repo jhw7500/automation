@@ -11,6 +11,9 @@ inputs:
   previous-full-hash:
     required: false
     default: ''
+  force-full:
+    required: false
+    default: 'false'
   context-lines:
     required: false
     default: '3'
@@ -37,16 +40,26 @@ runs:
         PR_NUMBER: ${{ inputs.pr-number }}
         PREVIOUS_SHA: ${{ inputs.previous-sha }}
         PREVIOUS_FULL_HASH: ${{ inputs.previous-full-hash }}
+        FORCE_FULL: ${{ inputs.force-full }}
         CONTEXT_LINES: ${{ inputs.context-lines }}
         OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
-      run: >-
-        python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py"
-        --repository "$GITHUB_REPOSITORY"
-        --pr-number "$PR_NUMBER"
-        --previous-sha "$PREVIOUS_SHA"
-        --previous-full-hash "$PREVIOUS_FULL_HASH"
-        --context-lines "$CONTEXT_LINES"
-        --full-output "$OUTPUT_DIRECTORY/review-full.diff"
-        --delta-output "$OUTPUT_DIRECTORY/review-delta.diff"
-        --manifest-output "$OUTPUT_DIRECTORY/review-scope.json"
-        --github-output "$GITHUB_OUTPUT"
+      run: |
+        set -euo pipefail
+        force_args=()
+        if [[ "$FORCE_FULL" == 'true' ]]; then
+          force_args+=(--force-full)
+        elif [[ "$FORCE_FULL" != 'false' ]]; then
+          echo 'force-full must be true or false' >&2
+          exit 2
+        fi
+        python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" \
+          --repository "$GITHUB_REPOSITORY" \
+          --pr-number "$PR_NUMBER" \
+          --previous-sha "$PREVIOUS_SHA" \
+          --previous-full-hash "$PREVIOUS_FULL_HASH" \
+          --context-lines "$CONTEXT_LINES" \
+          --full-output "$OUTPUT_DIRECTORY/review-full.diff" \
+          --delta-output "$OUTPUT_DIRECTORY/review-delta.diff" \
+          --manifest-output "$OUTPUT_DIRECTORY/review-scope.json" \
+          --github-output "$GITHUB_OUTPUT" \
+          "${force_args[@]}"

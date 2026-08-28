@@ -316,6 +316,7 @@ EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
         "pr-number": {"required": "true"},
         "previous-sha": {"required": "false", "default": ""},
         "previous-full-hash": {"required": "false", "default": ""},
+        "force-full": {"required": "false", "default": "false"},
         "context-lines": {"required": "false", "default": "3"},
         "output-directory": {"required": "true"},
     },
@@ -341,20 +342,30 @@ EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
                     "PR_NUMBER": "${{ inputs.pr-number }}",
                     "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
                     "PREVIOUS_FULL_HASH": "${{ inputs.previous-full-hash }}",
+                    "FORCE_FULL": "${{ inputs.force-full }}",
                     "CONTEXT_LINES": "${{ inputs.context-lines }}",
                     "OUTPUT_DIRECTORY": "${{ inputs.output-directory }}",
                 },
                 "run": (
-                    'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" '
-                    '--repository "$GITHUB_REPOSITORY" '
-                    '--pr-number "$PR_NUMBER" '
-                    '--previous-sha "$PREVIOUS_SHA" '
-                    '--previous-full-hash "$PREVIOUS_FULL_HASH" '
-                    '--context-lines "$CONTEXT_LINES" '
-                    '--full-output "$OUTPUT_DIRECTORY/review-full.diff" '
-                    '--delta-output "$OUTPUT_DIRECTORY/review-delta.diff" '
-                    '--manifest-output "$OUTPUT_DIRECTORY/review-scope.json" '
-                    '--github-output "$GITHUB_OUTPUT"'
+                    "set -euo pipefail\n"
+                    "force_args=()\n"
+                    "if [[ \"$FORCE_FULL\" == 'true' ]]; then\n"
+                    "  force_args+=(--force-full)\n"
+                    "elif [[ \"$FORCE_FULL\" != 'false' ]]; then\n"
+                    "  echo 'force-full must be true or false' >&2\n"
+                    "  exit 2\n"
+                    "fi\n"
+                    'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" \\\n'
+                    '  --repository "$GITHUB_REPOSITORY" \\\n'
+                    '  --pr-number "$PR_NUMBER" \\\n'
+                    '  --previous-sha "$PREVIOUS_SHA" \\\n'
+                    '  --previous-full-hash "$PREVIOUS_FULL_HASH" \\\n'
+                    '  --context-lines "$CONTEXT_LINES" \\\n'
+                    '  --full-output "$OUTPUT_DIRECTORY/review-full.diff" \\\n'
+                    '  --delta-output "$OUTPUT_DIRECTORY/review-delta.diff" \\\n'
+                    '  --manifest-output "$OUTPUT_DIRECTORY/review-scope.json" \\\n'
+                    '  --github-output "$GITHUB_OUTPUT" \\\n'
+                    '  "${force_args[@]}"\n'
                 ),
             }
         ],
@@ -364,8 +375,10 @@ EXPECTED_PREPARE_REVIEW_DIFF_ACTION = {
 # required output-directory input so the final checkout cannot replace them.
 EXPECTED_PREPARE_REVIEW_DIFF_ACTION_V145 = deepcopy(EXPECTED_PREPARE_REVIEW_DIFF_ACTION)
 del EXPECTED_PREPARE_REVIEW_DIFF_ACTION_V145["inputs"]["output-directory"]
+del EXPECTED_PREPARE_REVIEW_DIFF_ACTION_V145["inputs"]["force-full"]
 _legacy_prepare_step = EXPECTED_PREPARE_REVIEW_DIFF_ACTION_V145["runs"]["steps"][0]
 del _legacy_prepare_step["env"]["OUTPUT_DIRECTORY"]
+del _legacy_prepare_step["env"]["FORCE_FULL"]
 _legacy_prepare_step["run"] = (
     'python3 "$GITHUB_ACTION_PATH/prepare_review_diff.py" '
     '--repository "$GITHUB_REPOSITORY" '
@@ -628,14 +641,14 @@ REVIEWER_WORKFLOWS = {
     "opencode": "opencode-auto-review.yml",
 }
 EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256 = (
-    "42462dad335073794bd5c46e1993e02e4dc9824113d1b36fd5c6b89dc0583a9c"
+    "70b50ce482ff0e54df9fff88d5126cd8e760ed8bdabfefcc2f2ccdc639cb693b"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
-    "b58044cadbded4e91b2b021e4902e56b4ca267cc47e75f3984037f61b662ee48"
+    "a2ccb7dcfa131186ed302836172f03502d71ec191bf58780477b2e447a42c594"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
-    "claude": "2fa6fdb6fbad2e874c5dfab7e059d53c8d2f610731f3d3dcf918cd531c585876",
-    "gemini": "a8b048f7862c3eed467482a750da57abad8d6ef04ed61964a35e4f90b4afeeda",
+    "claude": "d34dfc388a393a6679bfd6a38ac281cc2c14a843063a010e9f1303c68df58cc7",
+    "gemini": "6837358dbbdcc2f3f5ebf6aca3956b646f89b35fed7c9a201bbde2d6af7519dd",
     "opencode": "28791fa77f05454775043cb5b582f849aef7fe81c109c65161bcf860a6d6531a",
 }
 EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION = yaml.load(
@@ -656,6 +669,9 @@ inputs:
     required: true
   diff-mode:
     required: true
+  force-review:
+    required: false
+    default: 'false'
   input-files-json:
     required: true
   authenticated-review-json:
@@ -707,6 +723,7 @@ runs:
         EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
         FULL_DIFF_SHA256: ${{ inputs.full-diff-sha256 }}
         DIFF_MODE: ${{ inputs.diff-mode }}
+        FORCE_REVIEW: ${{ inputs.force-review }}
         INPUT_FILES_JSON: ${{ inputs.input-files-json }}
         AUTHENTICATED_REVIEW_JSON: ${{ inputs.authenticated-review-json }}
         MODEL_ROUTE_JSON: ${{ inputs.model-route-json }}
@@ -769,6 +786,7 @@ runs:
           "$BUDGET_MODE" "$GITHUB_REPOSITORY" "$PR_NUMBER" "$REVIEWER" \
           "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$EXPECTED_HEAD_SHA" \
           "$FULL_DIFF_SHA256" "$DIFF_MODE" "$INPUT_FILES_JSON" \
+          "$FORCE_REVIEW" \
           "$AUTHENTICATED_REVIEW_JSON" "$MODEL_ROUTE_JSON" "$EFFORT" \
           "$ACTUAL_CALL_COUNT" "$ELAPSED_SECONDS" "$REVIEW_OUTCOME" \
           "$STOP_REASON" "$REMAINING_FINDING_IDS_JSON" "$CHECKPOINT_FILE" \
@@ -780,6 +798,7 @@ runs:
         names = (
             "operation", "repository", "pr", "reviewer", "run_id", "run_attempt",
             "head_sha", "full_diff_sha256", "diff_mode", "input_files_json",
+            "force_review",
             "authenticated_review_json", "model_route_json", "effort", "actual_call_count",
             "elapsed_seconds", "outcome", "stop_reason", "remaining_finding_ids_json",
             "checkpoint_file", "github_workspace", "server_url",
@@ -969,11 +988,15 @@ QUALITY_STATE_KEYS = (
     "normalized_count",
     "pr",
     "quality_schema",
+    "review_execution",
     "reviewer",
     "run_attempt",
     "run_id",
     "schema",
     "successful_head",
+)
+LEGACY_QUALITY_STATE_KEYS = tuple(
+    key for key in QUALITY_STATE_KEYS if key != "review_execution"
 )
 REVIEW_PUBLICATION_CONTRACTS = {
     "claude-code-review.yml": {
@@ -994,7 +1017,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
             "d2f1d2eab1e974bf05f184406e854cfe0861ab4b863520a4189d987ceccf27cc"
         ),
         "upsert_sha256_v147": (
-            "250893bab0d29e25706b7512a9cddb5f7aca687292a9c66de27cf9a1cc323842"
+            "bc79b2db414640a7a707f9c5dfe6e13fd05a726aaad74ad163c6d46f71caf766"
         ),
         "bot_login": "github-actions[bot]",
         "workflow_prefix": (
@@ -1026,7 +1049,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
             "cc81b9e370c357366a384a059c9d6e1fe02065f085985f30532b92410c49c43d"
         ),
         "upsert_sha256_v147": (
-            "1eb58f53bd3af4dc3db2e580e02078df961b9ecb52c9b75af233db2475e45635"
+            "b924753e8c9eda60ac3047dfc2c085ec4c56d62b2d6ad81a3ec979a3ff85e5f0"
         ),
         "bot_login": "${{ steps.auth.outputs.bot-login }}",
         "auth_mode": "${{ inputs.repo_write_auth }}",
@@ -3849,6 +3872,23 @@ def require_budget_helper_contract(source: str) -> None:
                 ("stop_reason", "str", None),
                 ("remaining_finding_ids", "tuple[str, ...]", None),
             ),
+            "ClaimRequest": (
+                ("repository", "str", None),
+                ("pr", "int", None),
+                ("reviewer", "Reviewer", None),
+                ("run_id", "int", None),
+                ("run_attempt", "int", None),
+                ("head_sha", "str", None),
+                ("full_diff_sha256", "str", None),
+                ("estimated_input_tokens", "int", None),
+                ("diff_mode", "str", None),
+                ("authenticated_review", "AuthenticatedReview", None),
+                ("override_events", "tuple[OverrideEvent, ...]", None),
+                ("model_route", "tuple[str, ...]", None),
+                ("effort", "str", None),
+                ("call_unit", "str", None),
+                ("force_review", "bool", "False"),
+            ),
             "DecisionRecord": (
                 ("decision", "str | None", "None"),
                 ("stop_reason", "str | None", "None"),
@@ -3979,6 +4019,20 @@ def require_budget_helper_contract(source: str) -> None:
             _direct_guard(
                 function.body, expression, "BudgetStateError", reason
             )
+        claim_request_validation = _function_node(module, "_validate_request")
+        for expression, reason in (
+            ("not isinstance(request.force_review, bool)", "force_review_invalid"),
+            (
+                "request.force_review and request.diff_mode != 'changed'",
+                "force_review_diff_invalid",
+            ),
+        ):
+            _direct_guard(
+                claim_request_validation.body,
+                expression,
+                "BudgetStateError",
+                reason,
+            )
         reviewer_policy = _function_node(policy, "for_reviewer")
         if (
             len(reviewer_policy.body) != 2
@@ -4054,118 +4108,64 @@ def require_budget_helper_contract(source: str) -> None:
         ):
             raise ValueError("public helper function differs")
         claim_function = _function_node(module, "claim")
-        claim_body = claim_function.body
-        claim_tests = {
-            2: (
-                "same_run and any((item.head_sha, item.full_diff_sha256) != "
-                "(request.head_sha, request.full_diff_sha256) "
-                "for item in same_run)"
-            ),
-            3: "request.diff_mode == 'unchanged'",
-            4: (
-                "any(item.head_sha == request.head_sha "
-                "for item in validated.invocations)"
-            ),
-            5: (
-                "any(item.full_diff_sha256 == request.full_diff_sha256 "
-                "for item in validated.invocations)"
-            ),
-            6: (
-                "request.estimated_input_tokens > "
-                "validated.budgets.max_estimated_tokens_per_round"
-            ),
-            8: (
-                "automatic_rounds(validated) >= "
-                "validated.budgets.max_rounds"
-            ),
-            10: (
-                "estimated_total(validated) + request.estimated_input_tokens "
-                "> total_limit"
-            ),
-        }
-        if (
-            len(claim_body) != 12
-            or not all(
-                isinstance(claim_body[index], ast.If)
-                and _ast_expression_matches(claim_body[index].test, expression)
-                for index, expression in claim_tests.items()
-            )
-            or not _ast_statement_matches(
-                claim_body[1],
-                "same_run = [item for item in validated.invocations "
-                "if (item.run_id, item.run_attempt) == "
-                "(request.run_id, request.run_attempt)]",
-            )
-            or not _ast_statement_matches(claim_body[7], "override = None")
-            or not _ast_statement_matches(
-                claim_body[9],
-                "total_limit = 600_000 if override is not None else 400_000",
-            )
-            or not _ast_statement_matches(
-                claim_body[11],
-                "return append_claim(validated, request, override, "
-                "provenances[(request.run_id, request.run_attempt)])",
-            )
+        expected_claim = ast.parse(
+            "def expected(state, request, provenances):\n"
+            "    try:\n"
+            "        validated = validate_or_initialize(state, request, provenances)\n"
+            "    except BudgetStateError as exc:\n"
+            "        return _invalid_transition(state, request, str(exc))\n"
+            "    same_run = [item for item in validated.invocations "
+            "if (item.run_id, item.run_attempt) == "
+            "(request.run_id, request.run_attempt)]\n"
+            "    if same_run and any((item.head_sha, item.full_diff_sha256) != "
+            "(request.head_sha, request.full_diff_sha256) "
+            "for item in same_run):\n"
+            "        return _invalid_transition(validated, request, "
+            "'duplicate_run_identity')\n"
+            "    if request.diff_mode == 'unchanged':\n"
+            "        if not request.authenticated_review.covers_hash("
+            "request.full_diff_sha256):\n"
+            "            return _invalid_transition(validated, request, "
+            "'unchanged_without_authenticated_review')\n"
+            "        return refuse(validated, request, 'authenticated_reuse')\n"
+            "    if not request.force_review and any("
+            "item.head_sha == request.head_sha for item in validated.invocations):\n"
+            "        return refuse(validated, request, 'duplicate_head')\n"
+            "    if not request.force_review and any("
+            "item.full_diff_sha256 == request.full_diff_sha256 "
+            "for item in validated.invocations):\n"
+            "        return refuse(validated, request, 'duplicate_effective_diff')\n"
+            "    if request.estimated_input_tokens > "
+            "validated.budgets.max_estimated_tokens_per_round:\n"
+            "        return refuse(validated, request, 'input_budget_exhausted')\n"
+            "    override = None\n"
+            "    if any(item.override_event_id is not None "
+            "for item in validated.invocations):\n"
+            "        return refuse(validated, request, 'round_budget_exhausted')\n"
+            "    if request.force_review:\n"
+            "        override = choose_override(validated, request.override_events)\n"
+            "        if override is None:\n"
+            "            return refuse(validated, request, 'round_budget_exhausted')\n"
+            "    elif automatic_rounds(validated) >= validated.budgets.max_rounds:\n"
+            "        override = choose_override(validated, request.override_events)\n"
+            "        if override is None:\n"
+            "            return refuse(validated, request, 'round_budget_exhausted')\n"
+            "    total_limit = 600_000 if override is not None else 400_000\n"
+            "    if estimated_total(validated) + request.estimated_input_tokens "
+            "> total_limit:\n"
+            "        return refuse(validated, request, "
+            "'total_usage_budget_exhausted')\n"
+            "    return append_claim(validated, request, override, "
+            "provenances[(request.run_id, request.run_attempt)])\n"
+        ).body[0]
+        if ast.dump(
+            ast.Module(body=claim_function.body, type_ignores=[]),
+            include_attributes=False,
+        ) != ast.dump(
+            ast.Module(body=expected_claim.body, type_ignores=[]),
+            include_attributes=False,
         ):
-            raise ValueError("claim live control flow differs")
-        if (
-            len(claim_body[2].body) != 1
-            or not _ast_statement_matches(
-                claim_body[2].body[0],
-                'return _invalid_transition(validated, request, '
-                '"duplicate_run_identity")',
-            )
-            or len(claim_body[3].body) != 2
-            or not isinstance(claim_body[3].body[0], ast.If)
-            or not _ast_expression_matches(
-                claim_body[3].body[0].test,
-                "not request.authenticated_review.covers_hash("
-                "request.full_diff_sha256)",
-            )
-            or len(claim_body[3].body[0].body) != 1
-            or not _ast_statement_matches(
-                claim_body[3].body[0].body[0],
-                'return _invalid_transition(validated, request, '
-                '"unchanged_without_authenticated_review")',
-            )
-            or not _refusal_return(
-                claim_body[3].body[1], "validated", "authenticated_reuse"
-            )
-            or len(claim_body[4].body) != 1
-            or not _refusal_return(
-                claim_body[4].body[0], "validated", "duplicate_head"
-            )
-            or len(claim_body[5].body) != 1
-            or not _refusal_return(
-                claim_body[5].body[0], "validated", "duplicate_effective_diff"
-            )
-            or len(claim_body[6].body) != 1
-            or not _refusal_return(
-                claim_body[6].body[0], "validated", "input_budget_exhausted"
-            )
-            or len(claim_body[8].body) != 2
-            or not _ast_statement_matches(
-                claim_body[8].body[0],
-                "override = choose_override(validated, request.override_events)",
-            )
-            or not isinstance(claim_body[8].body[1], ast.If)
-            or not _ast_expression_matches(
-                claim_body[8].body[1].test, "override is None"
-            )
-            or len(claim_body[8].body[1].body) != 1
-            or not _refusal_return(
-                claim_body[8].body[1].body[0],
-                "validated",
-                "round_budget_exhausted",
-            )
-            or len(claim_body[10].body) != 1
-            or not _refusal_return(
-                claim_body[10].body[0],
-                "validated",
-                "total_usage_budget_exhausted",
-            )
-        ):
-            raise ValueError("claim gate relationship differs")
+            raise ValueError("claim policy differs")
 
         finalize_function = _function_node(module, "finalize")
         if (
@@ -4220,17 +4220,54 @@ def require_budget_helper_contract(source: str) -> None:
             != ast.dump(expected_invocation_loop, include_attributes=False)
         ):
             raise ValueError("stored cap policy differs")
+        expected_duplicate_policy = ast.parse(
+            "automatic = [item for item in state.invocations "
+            "if item.override_event_id is None]\n"
+            "overrides = [item for item in state.invocations "
+            "if item.override_event_id is not None]\n"
+            "forced_override = next((item for item in overrides "
+            "if item.caller_event == 'workflow_dispatch'), None)\n"
+            "for attribute, reason in (('head_sha', 'duplicate_head'), "
+            "('full_diff_sha256', 'duplicate_effective_diff')):\n"
+            "    values = [getattr(item, attribute) for item in state.invocations]\n"
+            "    duplicates = {value for value in values "
+            "if values.count(value) > 1}\n"
+            "    if duplicates and (forced_override is None or "
+            "any(values.count(value) != 2 for value in duplicates) or "
+            "any(getattr(forced_override, attribute) != value "
+            "for value in duplicates) or "
+            "all(getattr(item, attribute) not in duplicates "
+            "for item in automatic)):\n"
+            "        raise BudgetStateError(reason)\n"
+            "if len(automatic) > state.budgets.max_rounds or "
+            "len(overrides) > state.budgets.max_override_rounds:\n"
+            "    raise BudgetStateError('rounds_invalid')\n"
+            "if [item.round_number for item in automatic] != "
+            "list(range(1, len(automatic) + 1)):\n"
+            "    raise BudgetStateError('rounds_invalid')\n"
+            "if overrides:\n"
+            "    item = overrides[0]\n"
+            "    expected_automatic_rounds = ("
+            "range(0, state.budgets.max_rounds + 1) "
+            "if item.caller_event == 'workflow_dispatch' "
+            "else (state.budgets.max_rounds,))\n"
+            "    if (len(automatic) not in expected_automatic_rounds or "
+            "state.invocations[-1] != item or "
+            "item.round_number != len(automatic) + 1 or "
+            "item.override_event_id not in state.consumed_override_event_ids):\n"
+            "        raise BudgetStateError('override_invalid')\n"
+            "if len(state.consumed_override_event_ids) != len(overrides):\n"
+            "    raise BudgetStateError('override_invalid')\n"
+        ).body
+        if ast.dump(
+            ast.Module(body=state_shape.body[9:17], type_ignores=[]),
+            include_attributes=False,
+        ) != ast.dump(
+            ast.Module(body=expected_duplicate_policy, type_ignores=[]),
+            include_attributes=False,
+        ):
+            raise ValueError("forced duplicate policy differs")
         for expression, reason in (
-            (
-                "len({item.head_sha for item in state.invocations}) "
-                "!= len(state.invocations)",
-                "duplicate_head",
-            ),
-            (
-                "len({item.full_diff_sha256 for item in state.invocations}) "
-                "!= len(state.invocations)",
-                "duplicate_effective_diff",
-            ),
             (
                 "len(automatic) > state.budgets.max_rounds or "
                 "len(overrides) > state.budgets.max_override_rounds",
@@ -4255,7 +4292,7 @@ def require_budget_helper_contract(source: str) -> None:
         )
         _direct_guard(
             provenance_identity.body,
-            "provenance.caller_event != 'pull_request' or "
+            "provenance.caller_event not in {'pull_request', 'workflow_dispatch'} or "
             "not isinstance(provenance.caller_workflow_path, str) or "
             "_CALLER_WORKFLOW.fullmatch(provenance.caller_workflow_path) is None or "
             "'..' in Path(provenance.caller_workflow_path).parts or "
@@ -4301,8 +4338,12 @@ def require_budget_helper_contract(source: str) -> None:
             "    expected_head = request.head_sha if invocation is None else invocation.head_sha\n"
             "    expected_run_id = request.run_id if invocation is None else invocation.run_id\n"
             "    expected_run_attempt = (request.run_attempt if invocation is None else invocation.run_attempt)\n"
+            "    expected_event = (invocation.caller_event if invocation is not None "
+            "else ('workflow_dispatch' if isinstance(request, ClaimRequest) "
+            "and request.force_review else 'pull_request'))\n"
             "    if (provenance.repository != state.repository or "
             "provenance.pr != state.pr or provenance.head_sha != expected_head or "
+            "provenance.caller_event != expected_event or "
             "provenance.run_id != expected_run_id or "
             "provenance.run_attempt != expected_run_attempt or "
             "(not current and provenance.status != 'completed') or "
@@ -4384,9 +4425,17 @@ def require_budget_helper_contract(source: str) -> None:
             "        raise TransportError('provenance_mismatch')\n"
             "    central = central[0]\n"
             "    central_ref = central.get('ref') if 'ref' in central else central.get('sha')\n"
+            "    stored = stored_by_identity.get((run_id, run_attempt))\n"
+            "    is_force_dispatch = (stored is not None and "
+            "stored.caller_event == 'workflow_dispatch') or ("
+            "stored is None and request['operation'] == 'claim' and "
+            "request['force_review'] and (run_id, run_attempt) == "
+            "(request['run_id'], request['run_attempt']))\n"
+            "    reviewed_head = stored.head_sha if stored is not None "
+            "else request['head_sha']\n"
             "    provenance = RunProvenance("
             "repository=repository.get('full_name'), pr=request['pr'], "
-            "head_sha=value.get('head_sha'), "
+            "head_sha=reviewed_head if is_force_dispatch else value.get('head_sha'), "
             "caller_workflow_path=value.get('path'), "
             "caller_event=value.get('event'), "
             "referenced_workflow_path=central.get('path'), "
@@ -4394,7 +4443,10 @@ def require_budget_helper_contract(source: str) -> None:
             "referenced_workflow_sha=central.get('sha'), "
             "run_id=value.get('id'), run_attempt=value.get('run_attempt'), "
             "status=value.get('status'), conclusion=value.get('conclusion'))\n"
-            "    if request['pr'] not in pull_numbers:\n"
+            "    if is_force_dispatch:\n"
+            "        if value.get('event') != 'workflow_dispatch':\n"
+            "            raise TransportError('provenance_mismatch')\n"
+            "    elif request['pr'] not in pull_numbers:\n"
             "        raise TransportError('provenance_mismatch')\n"
             "    _validate_provenance_identity(provenance, request['reviewer'])\n"
             "    result[(run_id, run_attempt)] = provenance\n"
@@ -4407,6 +4459,13 @@ def require_budget_helper_contract(source: str) -> None:
             raise ValueError("provenance transport differs")
         if not _ast_statement_matches(
             run_provenances.body[1],
+            "stored_by_identity = {} if state is None else {"
+            "(item.run_id, item.run_attempt): item "
+            "for item in state.invocations}",
+        ):
+            raise ValueError("stored provenance lookup differs")
+        if not _ast_statement_matches(
+            run_provenances.body[2],
             "identities = {(request['run_id'], request['run_attempt'])}",
         ):
             raise ValueError("current provenance lookup differs")
@@ -5332,7 +5391,10 @@ def _verify_review_publication_contracts(
 ) -> None:
     budget = release_supports_review_invocation_budget(ref)
     jq_state_keys = json.dumps(list(QUALITY_STATE_KEYS))
-    js_state_keys = ", ".join(repr(key) for key in QUALITY_STATE_KEYS)
+    legacy_jq_state_keys = json.dumps(list(LEGACY_QUALITY_STATE_KEYS))
+    legacy_js_state_keys = ", ".join(
+        repr(key) for key in LEGACY_QUALITY_STATE_KEYS
+    )
     expected_output_env = {
         "CANONICAL_OUTCOME": "${{ steps.canonicalize-review.outcome }}",
         "DOCUMENT_VALID": "${{ steps.canonicalize-review.outputs.document-valid }}",
@@ -5416,12 +5478,21 @@ def _verify_review_publication_contracts(
                 and "app_publisher($publisher_app_id)" in collector_script
                 and "select(publisher_matches(" in collector_script
             )
+            collector_state_keys_contract = (
+                f"== {legacy_jq_state_keys}" in collector_script
+                and (not budget or f"== {jq_state_keys}" in collector_script)
+            )
+            collector_run_event_contract = (
+                '.event == "pull_request" and .head_sha == $head'
+                in collector_script
+                and (not budget or '.event == "workflow_dispatch"' in collector_script)
+            )
             collector_contract = (
                 collector_marker
                 and collector_token_contract
                 and collector_publisher_contract
                 and collector.get("id") == contract["collector_id"]
-                and f"== {jq_state_keys}" in collector_script
+                and collector_state_keys_contract
                 and "$s.schema == 3" in collector_script
                 and "$s.quality_schema == 1" in collector_script
                 and "canonical_body" in collector_script
@@ -5444,8 +5515,7 @@ def _verify_review_publication_contracts(
                 and "proceeding without re-review context" not in collector_script
                 and ("actions/runs/${candidate_run_id}/attempts/${candidate_attempt}")
                 in collector_script
-                and '.event == "pull_request" and .head_sha == $head'
-                in collector_script
+                and collector_run_event_contract
                 and ".repository.full_name == $repo" in collector_script
                 and ".number == $pr" in collector_script
                 and ".head.sha == $head" not in collector_script
@@ -5532,11 +5602,35 @@ def _verify_review_publication_contracts(
                 and "if (!publisherMatches(comment)) return null;" in upsert_script
                 and "if (!publisherMatches(comment)) return false;" in upsert_script
             )
+            upsert_state_keys_contract = (
+                (
+                    f"const legacyStateKeys = [{legacy_js_state_keys}];"
+                    in upsert_script
+                    and "const expectedStateKeys = "
+                    "[...legacyStateKeys, 'review_execution'].sort();"
+                    in upsert_script
+                    and "review_execution: unchangedInputIsValid" in upsert_script
+                    and "const modelStepEntered = ['success', 'failure'].includes(reviewOutcome);"
+                    in upsert_script
+                    and ": (modelStepEntered ? 'performed' : 'not_performed'),"
+                    in upsert_script
+                    and "`- Execution: ${state.review_execution}`" in upsert_script
+                )
+                if budget
+                else (
+                    f"const expectedStateKeys = [{legacy_js_state_keys}];"
+                    in upsert_script
+                )
+            )
+            upsert_run_event_contract = (
+                "run?.event === 'pull_request'" in upsert_script
+                and (not budget or "run?.event === 'workflow_dispatch'" in upsert_script)
+            )
             upsert_contract = (
                 f"const marker = '{marker}';" in upsert_script
                 and f"const v2Marker = '{contract['v2_marker']}';" in upsert_script
                 and ":v1 -->" not in upsert_script
-                and f"const expectedStateKeys = [{js_state_keys}];" in upsert_script
+                and upsert_state_keys_contract
                 and "state.schema === 3" in upsert_script
                 and "state.quality_schema === 1" in upsert_script
                 and "schema: 3" in upsert_script
@@ -5552,7 +5646,7 @@ def _verify_review_publication_contracts(
                 and upsert_publisher_contract
                 and upsert_run_lookup_contract
                 and contract["workflow_prefix"] in upsert_script
-                and "run?.event === 'pull_request'" in upsert_script
+                and upsert_run_event_contract
                 and "run?.head_sha === record.state.attempt_head" in upsert_script
                 and "run?.repository?.full_name === repository" in upsert_script
                 and "pr?.number === issueNumber" in upsert_script

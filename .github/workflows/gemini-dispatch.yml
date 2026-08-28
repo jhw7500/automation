@@ -90,6 +90,7 @@ jobs:
       request: '${{ steps.extract_command.outputs.request }}'
       additional_context: '${{ steps.extract_command.outputs.additional_context }}'
       target_commit: '${{ steps.extract_command.outputs.target_commit }}'
+      reviewed_sha: '${{ steps.resolve_review_target.outputs.reviewed_sha }}'
       scope: '${{ steps.extract_command.outputs.scope }}'
       target_url: '${{ steps.extract_command.outputs.target_url }}'
       patch: '${{ steps.extract_command.outputs.patch }}'
@@ -215,7 +216,7 @@ jobs:
             core.setOutput('command', command);
 
             // Command parsing (commit=<sha>, scope=line|thread, from=<url>)
-            const commitMatch = request.match(/commit=([a-f0-9]+)/);
+            const commitMatch = request.match(/(?:^|\s)commit=([^\s]+)/);
             if (commitMatch) core.setOutput('target_commit', commitMatch[1]);
 
             const scopeMatch = request.match(/scope=(line|thread)/);
@@ -280,6 +281,54 @@ jobs:
 
             core.setOutput('additional_context', additionalContext);
 
+      - name: Resolve review target
+        id: resolve_review_target
+        if: steps.extract_command.outputs.command == 'review'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
+        env:
+          ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          TARGET_COMMIT: '${{ steps.extract_command.outputs.target_commit }}'
+        with:
+          github-token: '${{ steps.auth.outputs.token }}'
+          script: |
+            const { owner, repo } = context.repo;
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            const requested = (process.env.TARGET_COMMIT || '').trim().toLowerCase();
+            if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+              throw new Error('review target requires a pull request number');
+            }
+            if (requested && !/^[0-9a-f]{7,40}$/.test(requested)) {
+              throw new Error('commit must be a 7-40 character hexadecimal SHA');
+            }
+
+            const { data: pull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: issueNumber,
+            });
+            const currentHead = pull?.head?.sha;
+            if (!/^[0-9a-f]{40}$/.test(currentHead || '')) {
+              throw new Error('pull request head is unavailable');
+            }
+
+            let reviewedSha = currentHead;
+            if (requested) {
+              const commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner,
+                repo,
+                pull_number: issueNumber,
+                per_page: 100,
+              });
+              const matches = commits
+                .map((item) => item?.sha)
+                .filter((sha) => /^[0-9a-f]{40}$/.test(sha || '') && sha.startsWith(requested));
+              if (matches.length !== 1) {
+                throw new Error('commit does not identify exactly one commit in this pull request');
+              }
+              reviewedSha = matches[0];
+            }
+            core.setOutput('reviewed_sha', reviewedSha);
+
       - name: 'Acknowledge request'
         if: steps.extract_command.outputs.command != 'noop' && steps.extract_command.outputs.command != 'unauthorized'
         env:
@@ -307,6 +356,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: '${{ needs.dispatch.outputs.reviewed_sha }}'
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Validate repository-write auth
         shell: bash
@@ -355,6 +408,7 @@ jobs:
           ADDITIONAL_CONTEXT: '${{ needs.dispatch.outputs.additional_context }}'
           PATCH: '${{ needs.dispatch.outputs.patch }}'
           INCREMENTAL: '${{ needs.dispatch.outputs.incremental }}'
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
           gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
@@ -383,6 +437,7 @@ jobs:
 
             **Repository:** ${{ github.repository }}
             **PR/Issue:** #${{ github.event.pull_request.number || github.event.issue.number }}
+            **Reviewed SHA:** ${{ needs.dispatch.outputs.reviewed_sha }}
 
             You are performing a deep, professional review that goes BEYOND the current diff.
             Focus on missing improvements, latent risks, and hardening opportunities in areas touched by this PR.
@@ -435,6 +490,7 @@ jobs:
           ADDITIONAL_CONTEXT: '${{ needs.dispatch.outputs.additional_context }}'
           PATCH: '${{ needs.dispatch.outputs.patch }}'
           INCREMENTAL: '${{ needs.dispatch.outputs.incremental }}'
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
           gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
@@ -464,6 +520,7 @@ jobs:
             **Repository:** ${{ github.repository }}
             **PR/Issue:** #${{ github.event.pull_request.number || github.event.issue.number }}
             **Model:** ${{ vars.GEMINI_FALLBACK_MODEL }}
+            **Reviewed SHA:** ${{ needs.dispatch.outputs.reviewed_sha }}
 
             You are performing a deep, professional review that goes BEYOND the current diff.
             Focus on missing improvements, latent risks, and hardening opportunities in areas touched by this PR.
@@ -540,6 +597,7 @@ jobs:
           OUTCOME: '${{ steps.final_review.outputs.outcome }}'
           RESPONSE: '${{ steps.final_review.outputs.response }}'
           ERRORS: '${{ steps.final_review.outputs.errors }}'
+          REVIEWED_SHA: '${{ needs.dispatch.outputs.reviewed_sha }}'
         with:
           github-token: '${{ steps.auth.outputs.token }}'
           script: |
@@ -552,6 +610,10 @@ jobs:
             const runUrl = process.env.RUN_URL;
             const modelUsed = process.env.MODEL_USED || '';
             const outcome = (process.env.OUTCOME || '').toLowerCase();
+            const reviewedSha = (process.env.REVIEWED_SHA || '').toLowerCase();
+            if (!/^[0-9a-f]{40}$/.test(reviewedSha)) {
+              throw new Error('reviewed SHA is invalid');
+            }
 
             const maxLen = 60000;
             const trim = (s) => {
@@ -605,13 +667,16 @@ jobs:
             // gemini-review 워크플로가 남긴 JSON 마커({..., last_success_sha})가 있으면 그대로
             // 승계한다 — 닫힌 마커로 덮어쓰면 incremental 리뷰의 기준 SHA가 소실된다.
             const jsonMarker = existing ? (existing.body || '').match(/<!-- automation:gemini-review \{.*\} -->/) : null;
-            const markerLine = jsonMarker ? jsonMarker[0] : marker;
+            const markerLine = ok
+              ? `<!-- automation:gemini-review ${JSON.stringify({ last_success_sha: reviewedSha })} -->`
+              : (jsonMarker ? jsonMarker[0] : marker);
 
             const header = `## Gemini Review (latest)\n${markerLine}`;
             const meta = [
               `- Status: ${ok ? 'success' : 'failure'}`,
               modelUsed ? `- Model: ${modelUsed}` : null,
               `- Run: ${runUrl}`,
+              `- Reviewed: ${reviewedSha}`,
             ].filter(Boolean).join('\n');
 
             const content = ok

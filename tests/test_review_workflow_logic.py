@@ -131,6 +131,10 @@ def _v3_state(
         "normalized_count": 3,
         "filtered_max_severity": "HIGH",
     }
+    if "review_execution" not in changes:
+        state["review_execution"] = (
+            "reused" if changes.get("diff_mode") == "unchanged" else "performed"
+        )
     state.update(changes)
     return state
 
@@ -146,7 +150,10 @@ def _v3_body(
         "stale" if state.get("successful_head") is not None else "failure"
     )
     run_url = f"https://github.com/example/repo/actions/runs/{state.get('run_id')}"
-    meta = [f"- Status: {status}", f"- Run: {run_url}"]
+    meta = [f"- Status: {status}"]
+    if state.get("review_execution") is not None:
+        meta.append(f"- Execution: {state.get('review_execution')}")
+    meta.append(f"- Run: {run_url}")
     if state.get("successful_head") is not None:
         meta.append(f"- Reviewed: {state.get('successful_head')}")
     if state.get("accepted_count") is not None:
@@ -190,6 +197,9 @@ def _upgrade_claude_v2_fixture(comment: dict) -> dict:
     for key, value in old.items():
         if key != "schema":
             state[key] = value
+    state["review_execution"] = (
+        "reused" if state.get("diff_mode") == "unchanged" else "performed"
+    )
     state["schema"] = 3 if old.get("schema") == 2 else old.get("schema")
     for required in (
         "reviewer", "pr", "run_id", "run_attempt", "attempt_head", "successful_head",
@@ -242,6 +252,9 @@ def _upgrade_gemini_v2_fixture(comment: dict) -> dict:
     for key, value in old.items():
         if key != "schema":
             state[key] = value
+    state["review_execution"] = (
+        "reused" if state.get("diff_mode") == "unchanged" else "performed"
+    )
     state["schema"] = 3 if old.get("schema") == 2 else old.get("schema")
     for required in (
         "reviewer", "pr", "run_id", "run_attempt", "attempt_head", "successful_head",
@@ -1318,7 +1331,8 @@ def test_claude_budget_claim_is_durable_before_provider_and_every_model_path_is_
         "full-diff-sha256": (
             "${{ steps.stage-claude-budget-input.outputs.full_diff_sha256 }}"
         ),
-        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}",
+            "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}",
+            "force-review": "${{ inputs.force_review && 'true' || 'false' }}",
         "input-files-json": (
             "${{ steps.stage-claude-budget-input.outputs.input_files_json }}"
         ),
@@ -1854,7 +1868,8 @@ def test_gemini_budget_claim_precedes_provider_and_guards_every_new_diff_path():
         "full-diff-sha256": (
             "${{ steps.stage-gemini-budget-input.outputs.full_diff_sha256 }}"
         ),
-        "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}",
+            "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}",
+            "force-review": "${{ inputs.force_review && 'true' || 'false' }}",
         "input-files-json": (
             "${{ steps.stage-gemini-budget-input.outputs.input_files_json }}"
         ),
@@ -2743,6 +2758,7 @@ def test_shared_diff_wiring_is_exact_and_scope_safe():
             "pr-number": pr_number,
             "previous-sha": f"${{{{ steps.{_step_id(job, collector_name)}.outputs.previous_sha }}}}",
             "previous-full-hash": f"${{{{ steps.{_step_id(job, collector_name)}.outputs.previous_full_hash }}}}",
+            "force-full": "${{ inputs.force_review && 'true' || 'false' }}",
             "context-lines": context_lines,
             "output-directory": "${{ runner.temp }}",
         }
@@ -2968,6 +2984,56 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     assert _step(gemini, "gemini-review", "Get PR details")["env"]["PR_NUMBER"] == (
         "${{ inputs.pr_number || github.event.pull_request.number }}"
     )
+
+
+def test_force_review_is_opt_in_and_forces_a_full_diff_for_both_reviewers():
+    for workflow_name, job_name, prepare_name, claim_name in (
+        (
+            "claude-code-review.yml",
+            "claude-review",
+            "Prepare review diff",
+            "Claim Claude review budget",
+        ),
+        (
+            "gemini-auto-review.yml",
+            "gemini-review",
+            "Prepare review diff",
+            "Claim Gemini review budget",
+        ),
+    ):
+        workflow = _load(workflow_name)
+        force_input = workflow["on"]["workflow_call"]["inputs"]["force_review"]
+        assert force_input["type"] == "boolean"
+        assert force_input["default"] == "false"
+        assert _step(workflow, job_name, prepare_name)["with"]["force-full"] == (
+            "${{ inputs.force_review && 'true' || 'false' }}"
+        )
+        assert _step(workflow, job_name, claim_name)["with"]["force-review"] == (
+            "${{ inputs.force_review && 'true' || 'false' }}"
+        )
+        enforce = _step(workflow, job_name, "Enforce force-review claim")
+        assert "inputs.force_review" in enforce["if"]
+        assert "allow-invocation != 'true'" in enforce["if"]
+        assert "exit 1" in enforce["run"]
+
+    for workflow_name, job_name in (
+        ("claude-code-review.yml", "claude-review"),
+        ("gemini-auto-review.yml", "gemini-review"),
+    ):
+        caller = yaml.load(
+            (
+                ROOT
+                / "examples/baseline-workflows/.github/workflows"
+                / workflow_name
+            ).read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+        dispatch_inputs = caller["on"]["workflow_dispatch"]["inputs"]
+        assert dispatch_inputs["force_review"]["default"] == "false"
+        assert dispatch_inputs["pr_number"]["required"] == "true"
+        assert caller["jobs"][job_name]["with"]["force_review"] == (
+            "${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}"
+        )
 
 
 def test_collect_strips_sticky_meta_from_injected_context(tmp_path):
@@ -3359,6 +3425,26 @@ def _run_reviewer_collector(
         comments_fail=comments_fail,
     )
     return previous
+
+
+@pytest.mark.parametrize("reviewer", ["claude", "gemini"])
+def test_reviewer_collector_authenticates_force_dispatch_state(tmp_path, reviewer):
+    forced = _collector_comment(
+        reviewer,
+        run_id=20,
+        text="FORCED REVIEW RESULT",
+        comment_id=20,
+        head="bb" * 20,
+    )
+    run = _review_run_fixtures([forced], reviewer)[0]
+    run.update({"event": "workflow_dispatch", "head_sha": "aa" * 20, "pull_requests": []})
+
+    previous = _run_reviewer_collector(
+        tmp_path, reviewer, [forced], workflow_runs=[run]
+    )
+
+    assert previous is not None
+    assert "FORCED REVIEW RESULT" in previous
 
 
 @pytest.mark.parametrize("reviewer", ["claude", "gemini"])
@@ -3991,6 +4077,7 @@ const github = {
   paginate: async (method) => {
     if (method === github.rest.checks.listForRef) return checkRuns;
     if (method === github.rest.actions.listJobsForWorkflowRunAttempt) return fx.runJobs || [];
+    if (method === github.rest.pulls.listCommits) return fx.pullCommits || [];
     listCommentCalls += 1;
     for (const item of (fx.injectCommentsAtListCall || {})[String(listCommentCalls)] || []) {
       if (!comments.some((comment) => comment.id === item.id)) comments.push(JSON.parse(JSON.stringify(item)));
@@ -4022,7 +4109,8 @@ const github = {
         },
     },
     pulls: {
-      get: async () => ({ data: { head: { sha: fx.currentHead } } }),
+      get: async () => ({ data: fx.pullRequest || { head: { sha: fx.currentHead } } }),
+      listCommits: 'LIST_COMMITS',
     },
     checks: {
       listForRef: async (a) => {
@@ -4170,6 +4258,8 @@ def _run_upsert(
     current_workflow_run: dict | None = None,
     inject_comments_at_list_call: dict[int, list[dict]] | None = None,
     node_preload: Path | None = None,
+    pull_request: dict | None = None,
+    pull_commits: list[dict] | None = None,
 ) -> list:
     workflow = _load(workflow_file)
     script = _step(workflow, job, step_name)["with"]["script"]
@@ -4215,6 +4305,8 @@ def _run_upsert(
         "workflowRunListResponses": workflow_run_list_responses,
         "checkRunListResponses": check_run_list_responses,
         "currentWorkflowRun": current_workflow_run,
+        "pullRequest": pull_request,
+        "pullCommits": pull_commits or [],
         "runJobs": [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "success"}],
         "runJobsByAttempt": run_jobs_by_attempt or {},
     }
@@ -4432,6 +4524,8 @@ def test_claude_unchanged_v3_success_advances_head_and_preserves_body_hash_quali
     assert state["attempt_head"] == current_head
     assert state["successful_head"] == current_head
     assert state["full_diff_sha256"] == "12" * 32
+    assert state["review_execution"] == "reused"
+    assert "- Execution: reused" in body
     assert [state[key] for key in (
         "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity"
     )] == [1, 2, 3, "HIGH"]
@@ -4485,7 +4579,8 @@ def test_claude_oversize_success_becomes_candidate_oversize_without_truncation(t
 
 @node_required
 def test_claude_oversize_stale_envelope_leaves_prior_success_untouched(tmp_path):
-    prior = _v3_body(_v3_state(run_id=1), "X" * 64810)
+    empty = _v3_body(_v3_state(run_id=1), "")
+    prior = empty + ("X" * (65_533 - len(empty.encode("utf-8"))))
     assert len(prior.encode("utf-8")) == 65533
     existing = _bot("github-actions[bot]", prior, 11)
 
@@ -4615,6 +4710,33 @@ def _single_mutation_body(calls: list) -> str:
         return canonical[-1][1]["body"]
     assert len(mutations) == 1
     return mutations[0][1]["body"]
+
+
+@node_required
+@pytest.mark.parametrize("reviewer", ["claude", "gemini"])
+@pytest.mark.parametrize(
+    ("outcome", "expected_execution"),
+    [("skipped", "not_performed"), ("failure", "performed")],
+)
+def test_provider_step_outcome_controls_execution_state(
+    tmp_path, reviewer, outcome, expected_execution
+):
+    upsert = _claude_upsert if reviewer == "claude" else _gemini_upsert
+    calls = upsert(
+        tmp_path,
+        outcome,
+        [],
+        with_review=False,
+        canonical_outcome="skipped",
+        document_valid="false",
+        budget_allow_invocation="true",
+    )
+
+    body = _single_mutation_body(calls)
+    state = _posted_state(body)
+    assert state["attempt_status"] == "failure"
+    assert state["review_execution"] == expected_execution
+    assert f"- Execution: {expected_execution}" in body
 
 
 def _updated_comment_body(calls: list, comment_id: int) -> str:
@@ -4951,7 +5073,7 @@ def test_upsert_prefers_newest_comment_for_duplicate_authenticated_generation(
         ("gemini", GEMINI_HEADER, GEMINI_V3_MARKER, _gemini_upsert),
     ],
 )
-@pytest.mark.parametrize("mismatch", ("repository", "head", "pr", "workflow", "event"))
+@pytest.mark.parametrize("mismatch", ("repository", "head", "pr", "workflow"))
 def test_upsert_rejects_mismatched_state_run_provenance(
     tmp_path, reviewer, header, marker, upsert, mismatch
 ):
@@ -4986,9 +5108,6 @@ def test_upsert_rejects_mismatched_state_run_provenance(
         forged_run["referenced_workflows"][0]["path"] = (
             "jhw7500/automation/.github/workflows/opencode-auto-review.yml@refs/tags/v1.46"
         )
-    else:
-        forged_run["event"] = "workflow_dispatch"
-
     calls = upsert(
         tmp_path,
         "success",
@@ -5687,6 +5806,8 @@ def test_gemini_unchanged_v3_success_advances_head_and_preserves_body_hash_quali
     assert state["attempt_status"] == "success"
     assert state["successful_head"] == current_head
     assert state["full_diff_sha256"] == "12" * 32
+    assert state["review_execution"] == "reused"
+    assert "- Execution: reused" in body
     assert [state[key] for key in (
         "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity"
     )] == [4, 5, 6, "CRITICAL"]
@@ -6284,6 +6405,7 @@ def test_dispatch_upsert_carries_json_marker_forward(tmp_path):
     env = {
         "ISSUE_NUMBER": "7", "RUN_URL": "run-url", "MODEL_USED": "m",
         "OUTCOME": "success", "RESPONSE": "new dispatch review", "ERRORS": "",
+        "REVIEWED_SHA": "ab" * 20,
     }
     calls = _run_upsert(
         tmp_path, "gemini-dispatch.yml", "review", "Upsert PR comment (Gemini Review)",
@@ -6292,6 +6414,7 @@ def test_dispatch_upsert_carries_json_marker_forward(tmp_path):
     updates = [c for c in calls if c[0] == "update"]
     assert [c[1]["comment_id"] for c in updates] == [21]
     assert "last_success_sha" in updates[0][1]["body"]
+    assert f"- Reviewed: {'ab' * 20}" in updates[0][1]["body"]
 
 
 @node_required
@@ -6305,6 +6428,7 @@ def test_dispatch_upsert_failure_preserves_sticky_and_stamps_attempt(tmp_path):
     env = {
         "ISSUE_NUMBER": "7", "RUN_URL": "run-url", "MODEL_USED": "m",
         "OUTCOME": "failure", "RESPONSE": "", "ERRORS": "boom",
+        "REVIEWED_SHA": "ab" * 20,
     }
     calls = _run_upsert(
         tmp_path, "gemini-dispatch.yml", "review", "Upsert PR comment (Gemini Review)",
@@ -6400,6 +6524,83 @@ def test_dispatch_extract_ignores_forged_human_json_marker(tmp_path):
     )
     outputs = _dispatch_extract_outputs(tmp_path, [forged])
     assert "last_success_sha" not in outputs
+
+
+@node_required
+def test_dispatch_resolves_current_pr_head_and_validates_requested_commit_membership(
+    tmp_path,
+):
+    default_head = "ef" * 20
+    current_head = "ab" * 20
+    older_commit = "cd" * 20
+    fixture_files = {default_head: "default-only", current_head: "pr-head-only"}
+    pull_request = {"number": 7, "head": {"sha": current_head}}
+    pull_commits = [{"sha": older_commit}, {"sha": current_head}]
+    for name in ("current", "commit", "foreign"):
+        (tmp_path / name).mkdir()
+
+    current_calls = _run_upsert(
+        tmp_path / "current",
+        "gemini-dispatch.yml",
+        "dispatch",
+        "Resolve review target",
+        {"ISSUE_NUMBER": "7", "TARGET_COMMIT": ""},
+        [],
+        context=DISPATCH_CONTEXT,
+        pull_request=pull_request,
+        pull_commits=pull_commits,
+    )
+    reviewed = [call for call in current_calls if call[:2] == ["output", "reviewed_sha"]]
+    assert reviewed == [
+        ["output", "reviewed_sha", current_head]
+    ]
+    assert current_head != default_head
+    assert fixture_files[reviewed[0][2]] == "pr-head-only"
+
+    commit_calls = _run_upsert(
+        tmp_path / "commit",
+        "gemini-dispatch.yml",
+        "dispatch",
+        "Resolve review target",
+        {"ISSUE_NUMBER": "7", "TARGET_COMMIT": older_commit[:12]},
+        [],
+        context=DISPATCH_CONTEXT,
+        pull_request=pull_request,
+        pull_commits=pull_commits,
+    )
+    assert [call for call in commit_calls if call[:2] == ["output", "reviewed_sha"]] == [
+        ["output", "reviewed_sha", older_commit]
+    ]
+
+    _run_upsert(
+        tmp_path / "foreign",
+        "gemini-dispatch.yml",
+        "dispatch",
+        "Resolve review target",
+        {"ISSUE_NUMBER": "7", "TARGET_COMMIT": "ef" * 20},
+        [],
+        context=DISPATCH_CONTEXT,
+        pull_request=pull_request,
+        pull_commits=pull_commits,
+        expect_error=True,
+    )
+
+
+def test_dispatch_checks_out_resolved_head_trusts_ci_workspace_and_records_sha():
+    workflow = _load("gemini-dispatch.yml")
+    checkout = _step(workflow, "review", "Checkout repository")
+    assert checkout["with"]["ref"] == "${{ needs.dispatch.outputs.reviewed_sha }}"
+    assert checkout["with"]["fetch-depth"] == "0"
+
+    for step_name in (
+        "Run Gemini pull request review (primary)",
+        "Run Gemini pull request review (fallback)",
+    ):
+        model = _step(workflow, "review", step_name)
+        assert model["env"]["GEMINI_CLI_TRUST_WORKSPACE"] == "true"
+
+    upsert = _step(workflow, "review", "Upsert PR comment (Gemini Review)")
+    assert upsert["env"]["REVIEWED_SHA"] == "${{ needs.dispatch.outputs.reviewed_sha }}"
 
 
 def _extract_gemini_python() -> str:

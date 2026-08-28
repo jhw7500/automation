@@ -213,6 +213,9 @@ manifest has schema `1`, repository, PR number, merge-base SHA, head SHA, and fi
 `status`, `filename`, and optional `previous_filename`.
 The file list may be empty only for a tree-equivalent head whose authenticated full diff and local
 full-range name-status reconstruction are both empty.
+`force-full=true` is reserved for the authenticated force-review entrypoint. It ignores only the
+previous SHA/hash optimization and therefore produces the same immutable full PR diff and manifest;
+it does not relax PR-head, scope, or output validation.
 
 `prepare-review-diff` requires an explicit `output-directory`; Claude and Gemini bind it to
 `${{ runner.temp }}`. Their prior canonical body and context files use the same runner-temporary
@@ -478,8 +481,13 @@ hash; otherwise both are `null`. Status is `success` or `failure`; mode is `full
 pair with `successful_head == attempt_head`; failure may carry either a null pair or a valid pair
 retained from an earlier success.
 
-Claude/Gemini schema 3 adds exactly `quality_schema`, `accepted_count`, `filtered_count`,
-`normalized_count`, and `filtered_max_severity`. `quality_schema` is always `1`. On full or delta
+Claude/Gemini schema 3 additionally emits `review_execution` and the quality fields
+`quality_schema`, `accepted_count`, `filtered_count`, `normalized_count`, and
+`filtered_max_severity`. `review_execution` is `performed` when this attempt entered the model
+step, `reused` only for authenticated unchanged reuse, and `not_performed` when the attempt failed
+before a model call. Existing schema-3 records without this additive field remain readable.
+The same value appears in the trusted `- Execution:` metadata line, so a reused success cannot be
+presented as a new model review. `quality_schema` is always `1`. On full or delta
 success the counts are non-negative safe integers and the maximum is `none`, `MEDIUM`, `HIGH`, or
 `CRITICAL`. A first schema-3 failure has all four count/severity values `null`. A stale failure that
 preserves a prior schema-3 success also preserves that success's four values with its body, head,
@@ -780,9 +788,10 @@ one compact `<!-- automation-budget-state:{...} -->` JSON marker:
 Only a comment authored by exactly `github-actions[bot]` is eligible, and exactly one
 comment may match a reviewer marker. Invalid, duplicate, or provenance-unverifiable
 state fails closed. The effective-diff identity is the SHA-256 of the immutable
-`review-full.diff`, including when a provider consumes a delta. A prior invocation by
+`review-full.diff`, including when a provider consumes a delta. A normal invocation by
 the same reviewer with the same head SHA or full-diff hash is an absolute zero-call
-gate and cannot be overridden.
+gate. Only the explicit force-review contract below may consume the one override round
+to review that input again.
 
 A round is one distinct effective diff claimed by one reviewer. Each reviewer has two
 automatic rounds. One `review-budget-override` label timeline-event ID can authorize
@@ -794,9 +803,34 @@ action session, three Gemini `generate_content` requests across primary, retries
 configured same-reviewer fallback, and two OpenCode `opencode run` sessions including
 format repair.
 
+Claude and Gemini baseline callers expose a `workflow_dispatch` input pair:
+`pr_number` (required) and `force_review` (boolean, default `false`). A force claim is accepted only
+when the run event is `workflow_dispatch` and the PR timeline contains an unconsumed
+`review-budget-override` label event created by an actor with write, maintain, or admin permission.
+It prepares the current full PR diff, binds publication and budget state to the fetched current
+head plus the exact run ID/attempt, consumes the override immediately, and is terminal for that
+reviewer budget. A label alone never bypasses the normal same-head zero-call gate.
+
+`/jhw:ship` or an operator uses the stable sequence below, substituting the repository, PR, and
+caller filename. The Gemini caller uses `gemini-auto-review.yml` with the same inputs.
+
+```bash
+gh pr edit 26 --repo OWNER/REPO --add-label review-budget-override
+gh workflow run claude-code-review.yml --repo OWNER/REPO \
+  -f pr_number=26 -f force_review=true
+```
+
+The caller job is skipped when `force_review` is omitted or false. A missing, unauthorized,
+already-consumed, or otherwise unavailable override returns `round_budget_exhausted` and performs
+no model call. A non-dispatch force request or a run/PR/head/ref mismatch returns `state_invalid`;
+diff preparation and provider/canonicalization failures retain their existing fail-closed outcomes.
+Neither a failed force run nor budget exhaustion is merge approval, and orchestration must require
+`review_execution=performed` on a current-head successful state before treating the force request
+as satisfied.
+
 Claim decisions are applied in this order: invalid state/provenance/head/diff;
-authenticated unchanged reuse; duplicate head; duplicate effective diff; per-round
-input exhaustion; automatic-round exhaustion and eligible override consumption;
+authenticated unchanged reuse; normal duplicate head; normal duplicate effective diff; per-round
+input exhaustion; force authorization or automatic-round exhaustion and eligible override consumption;
 aggregate usage exhaustion; then `claimed` with `allow-invocation=true`. The claim is
 persisted before provider execution. Cancelled, timed-out, provider-failed,
 quality-filtered, and unfinalized claims remain consumed. Immediately before ledger

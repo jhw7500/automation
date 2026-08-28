@@ -506,6 +506,35 @@ def test_matching_full_hash_reports_unchanged_and_removes_delta(
     assert not delta.exists()
 
 
+def test_force_full_reviews_same_head_instead_of_reusing_matching_hash(
+    history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
+) -> None:
+    configure_gh(gh_fixture, base=history.base, head=history.head)
+    full, delta, manifest = outputs(tmp_path)
+    baseline = run_prepare(history.repo, gh_fixture, *prepare_args(full, delta, manifest))
+    baseline_hash = json.loads(baseline.stdout)["full_diff_sha256"]
+    configure_gh(gh_fixture, base=history.base, head=history.head)
+
+    result = run_prepare(
+        history.repo,
+        gh_fixture,
+        *prepare_args(
+            full,
+            delta,
+            manifest,
+            "--previous-full-hash",
+            baseline_hash,
+            "--force-full",
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert state["diff_mode"] == "full"
+    assert state["unchanged_since_previous"] is False
+    assert state["full_diff_sha256"] == baseline_hash
+
+
 def test_invalid_invocation_is_nonzero_and_does_not_call_gh(
     history: RepositoryHistory, gh_fixture: GhFixture, tmp_path: Path
 ) -> None:

@@ -281,6 +281,7 @@ class FakeGitHub:
             "EXPECTED_HEAD_SHA": head,
             "FULL_DIFF_SHA256": full_hash,
             "DIFF_MODE": diff_mode,
+            "FORCE_REVIEW": "false",
             "INPUT_FILES_JSON": json.dumps([str(input_path)]),
             "AUTHENTICATED_REVIEW_JSON": json.dumps({
                 "success": False,
@@ -338,6 +339,7 @@ def test_action_metadata_has_one_inert_environment_bridge():
     assert set(document["inputs"]) == {
         "github-token", "mode", "reviewer", "pr-number", "expected-head-sha",
         "full-diff-sha256", "diff-mode", "input-files-json", "authenticated-review-json",
+        "force-review",
         "model-route-json", "effort", "checkpoint-file", "actual-call-count",
         "elapsed-seconds", "outcome", "stop-reason", "remaining-finding-ids-json",
     }
@@ -348,6 +350,7 @@ def test_action_metadata_has_one_inert_environment_bridge():
     }
     assert {name: value["default"] for name, value in document["inputs"].items() if "default" in value} == {
         "actual-call-count": "0",
+        "force-review": "false",
         "elapsed-seconds": "0",
         "outcome": "checkpoint_failure",
         "stop-reason": "",

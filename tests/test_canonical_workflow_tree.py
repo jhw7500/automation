@@ -61,10 +61,40 @@ EXPECTED_TRIGGERS: dict[str, object] = {
         "issues": {"types": ["opened", "assigned"]},
     },
     "claude-code-review.yml": {
-        "pull_request": {"types": ["opened", "synchronize"]}
+        "pull_request": {"types": ["opened", "synchronize"]},
+        "workflow_dispatch": {
+            "inputs": {
+                "pr_number": {
+                    "description": "Pull request number",
+                    "type": "number",
+                    "required": "true",
+                },
+                "force_review": {
+                    "description": "Perform one authorized same-HEAD review",
+                    "type": "boolean",
+                    "required": "false",
+                    "default": "false",
+                },
+            }
+        },
     },
     "gemini-auto-review.yml": {
-        "pull_request": {"types": ["opened", "synchronize"]}
+        "pull_request": {"types": ["opened", "synchronize"]},
+        "workflow_dispatch": {
+            "inputs": {
+                "pr_number": {
+                    "description": "Pull request number",
+                    "type": "number",
+                    "required": "true",
+                },
+                "force_review": {
+                    "description": "Perform one authorized same-HEAD review",
+                    "type": "boolean",
+                    "required": "false",
+                    "default": "false",
+                },
+            }
+        },
     },
     "gemini-chat.yml": {
         "issue_comment": {"types": ["created"]},
