@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "gh_owner": "jhw7500",
-  "automation_ref": "v1.46.2",
+  "automation_ref": "v1.47",
   "canonical_dir": "examples/baseline-workflows/.github",
   "catalog": "scripts/workflow-catalog.json",
   "repos": {
