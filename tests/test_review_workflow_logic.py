@@ -6630,12 +6630,51 @@ def test_dispatch_checks_out_resolved_head_trusts_ci_workspace_and_records_sha()
     assert upsert["env"]["REVIEWED_SHA"] == "${{ needs.dispatch.outputs.reviewed_sha }}"
 
 
+def test_dispatch_resolves_fallback_route_with_case_sensitive_model_comparison(
+    tmp_path,
+):
+    workflow = _load("gemini-dispatch.yml")
+    resolver = next(
+        (
+            step
+            for step in workflow["jobs"]["review"]["steps"]
+            if step.get("name") == "Resolve Gemini review fallback route"
+        ),
+        None,
+    )
+    assert resolver is not None, "case-sensitive fallback route resolver is missing"
+
+    cases = (
+        ("gemini-3-flash-preview", "", "false"),
+        ("gemini-3-flash-preview", "gemini-3-flash-preview", "false"),
+        ("Gemini-3-Flash-Preview", "gemini-3-flash-preview", "true"),
+        ("gemini-3-flash-preview", "gemini-2.5-flash", "true"),
+    )
+    for index, (primary, fallback, expected) in enumerate(cases):
+        output = tmp_path / f"github-output-{index}"
+        result = subprocess.run(
+            ["bash", "-c", resolver["run"]],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "PRIMARY_MODEL": primary,
+                "FALLBACK_MODEL": fallback,
+                "GITHUB_OUTPUT": str(output),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert _github_outputs(output) == {"enabled": expected}
+
+
 def test_dispatch_skips_identical_fallback_model_route():
     workflow = _load("gemini-dispatch.yml")
     expected = (
         "steps.gemini_review_primary.outcome == 'failure' && "
-        "vars.GEMINI_FALLBACK_MODEL != '' && "
-        "vars.GEMINI_FALLBACK_MODEL != vars.GEMINI_MODEL"
+        "steps.gemini_review_fallback_route.outputs.enabled == 'true'"
     )
 
     assert _step(workflow, "review", "Log primary model failure")["if"] == expected

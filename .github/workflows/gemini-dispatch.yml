@@ -395,6 +395,19 @@ jobs:
           private-key: ${{ inputs.repo_write_auth == 'github_app' && secrets.APP_PRIVATE_KEY || '' }}
           fallback-token: ${{ inputs.repo_write_auth == 'github_token' && github.token || '' }}
 
+      - name: Resolve Gemini review fallback route
+        id: gemini_review_fallback_route
+        env:
+          PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
+          FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
+        run: |
+          set -euo pipefail
+          enabled=false
+          if [[ -n "$FALLBACK_MODEL" && "$FALLBACK_MODEL" != "$PRIMARY_MODEL" ]]; then
+            enabled=true
+          fi
+          printf 'enabled=%s\n' "$enabled" >> "$GITHUB_OUTPUT"
+
       - name: Run Gemini pull request review (primary)
         id: gemini_review_primary
         uses: google-github-actions/run-gemini-cli@v0
@@ -452,7 +465,7 @@ jobs:
             Keep the response concise and structured with clear headings.
 
       - name: Log primary model failure
-        if: steps.gemini_review_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != '' && vars.GEMINI_FALLBACK_MODEL != vars.GEMINI_MODEL
+        if: steps.gemini_review_primary.outcome == 'failure' && steps.gemini_review_fallback_route.outputs.enabled == 'true'
         env:
           GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
@@ -478,7 +491,7 @@ jobs:
 
       - name: Run Gemini pull request review (fallback)
         id: gemini_review_fallback
-        if: steps.gemini_review_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != '' && vars.GEMINI_FALLBACK_MODEL != vars.GEMINI_MODEL
+        if: steps.gemini_review_primary.outcome == 'failure' && steps.gemini_review_fallback_route.outputs.enabled == 'true'
         uses: google-github-actions/run-gemini-cli@v0
         continue-on-error: true
         env:
