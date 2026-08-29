@@ -6495,6 +6495,33 @@ def _dispatch_extract_outputs(tmp_path: Path, comments: list[dict]) -> dict:
 
 
 @node_required
+def test_dispatch_rejects_unauthorized_review_command_before_model_job(tmp_path):
+    context = {
+        "eventName": "issue_comment",
+        "payload": {
+            "comment": {
+                "body": "@gemini-cli /review",
+                "author_association": "NONE",
+            },
+            "issue": {"number": 7},
+        },
+    }
+    calls = _run_upsert(
+        tmp_path,
+        "gemini-dispatch.yml",
+        "dispatch",
+        "Extract command",
+        {},
+        [],
+        context=context,
+    )
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+
+    assert outputs["command"] == "unauthorized"
+    assert "additional_context" not in outputs
+
+
+@node_required
 def test_dispatch_extract_takes_sha_from_newest_bot_sticky_only(tmp_path):
     forged = _human(
         "attacker",
@@ -6601,6 +6628,60 @@ def test_dispatch_checks_out_resolved_head_trusts_ci_workspace_and_records_sha()
 
     upsert = _step(workflow, "review", "Upsert PR comment (Gemini Review)")
     assert upsert["env"]["REVIEWED_SHA"] == "${{ needs.dispatch.outputs.reviewed_sha }}"
+
+
+def test_dispatch_resolves_fallback_route_with_case_sensitive_model_comparison(
+    tmp_path,
+):
+    workflow = _load("gemini-dispatch.yml")
+    resolver = next(
+        (
+            step
+            for step in workflow["jobs"]["review"]["steps"]
+            if step.get("name") == "Resolve Gemini review fallback route"
+        ),
+        None,
+    )
+    assert resolver is not None, "case-sensitive fallback route resolver is missing"
+
+    cases = (
+        ("gemini-3-flash-preview", "", "false"),
+        ("gemini-3-flash-preview", "gemini-3-flash-preview", "false"),
+        ("Gemini-3-Flash-Preview", "gemini-3-flash-preview", "true"),
+        ("gemini-3-flash-preview", "gemini-2.5-flash", "true"),
+    )
+    for index, (primary, fallback, expected) in enumerate(cases):
+        output = tmp_path / f"github-output-{index}"
+        result = subprocess.run(
+            ["bash", "-c", resolver["run"]],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "PRIMARY_MODEL": primary,
+                "FALLBACK_MODEL": fallback,
+                "GITHUB_OUTPUT": str(output),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert _github_outputs(output) == {"enabled": expected}
+
+
+def test_dispatch_skips_identical_fallback_model_route():
+    workflow = _load("gemini-dispatch.yml")
+    expected = (
+        "steps.gemini_review_primary.outcome == 'failure' && "
+        "steps.gemini_review_fallback_route.outputs.enabled == 'true'"
+    )
+
+    assert _step(workflow, "review", "Log primary model failure")["if"] == expected
+    assert (
+        _step(workflow, "review", "Run Gemini pull request review (fallback)")["if"]
+        == expected
+    )
 
 
 def _extract_gemini_python() -> str:
