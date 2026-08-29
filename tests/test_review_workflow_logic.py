@@ -6495,6 +6495,33 @@ def _dispatch_extract_outputs(tmp_path: Path, comments: list[dict]) -> dict:
 
 
 @node_required
+def test_dispatch_rejects_unauthorized_review_command_before_model_job(tmp_path):
+    context = {
+        "eventName": "issue_comment",
+        "payload": {
+            "comment": {
+                "body": "@gemini-cli /review",
+                "author_association": "NONE",
+            },
+            "issue": {"number": 7},
+        },
+    }
+    calls = _run_upsert(
+        tmp_path,
+        "gemini-dispatch.yml",
+        "dispatch",
+        "Extract command",
+        {},
+        [],
+        context=context,
+    )
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+
+    assert outputs["command"] == "unauthorized"
+    assert "additional_context" not in outputs
+
+
+@node_required
 def test_dispatch_extract_takes_sha_from_newest_bot_sticky_only(tmp_path):
     forged = _human(
         "attacker",
@@ -6601,6 +6628,21 @@ def test_dispatch_checks_out_resolved_head_trusts_ci_workspace_and_records_sha()
 
     upsert = _step(workflow, "review", "Upsert PR comment (Gemini Review)")
     assert upsert["env"]["REVIEWED_SHA"] == "${{ needs.dispatch.outputs.reviewed_sha }}"
+
+
+def test_dispatch_skips_identical_fallback_model_route():
+    workflow = _load("gemini-dispatch.yml")
+    expected = (
+        "steps.gemini_review_primary.outcome == 'failure' && "
+        "vars.GEMINI_FALLBACK_MODEL != '' && "
+        "vars.GEMINI_FALLBACK_MODEL != vars.GEMINI_MODEL"
+    )
+
+    assert _step(workflow, "review", "Log primary model failure")["if"] == expected
+    assert (
+        _step(workflow, "review", "Run Gemini pull request review (fallback)")["if"]
+        == expected
+    )
 
 
 def _extract_gemini_python() -> str:

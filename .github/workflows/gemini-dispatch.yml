@@ -452,7 +452,7 @@ jobs:
             Keep the response concise and structured with clear headings.
 
       - name: Log primary model failure
-        if: steps.gemini_review_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != ''
+        if: steps.gemini_review_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != '' && vars.GEMINI_FALLBACK_MODEL != vars.GEMINI_MODEL
         env:
           GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
@@ -478,7 +478,7 @@ jobs:
 
       - name: Run Gemini pull request review (fallback)
         id: gemini_review_fallback
-        if: steps.gemini_review_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != ''
+        if: steps.gemini_review_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != '' && vars.GEMINI_FALLBACK_MODEL != vars.GEMINI_MODEL
         uses: google-github-actions/run-gemini-cli@v0
         continue-on-error: true
         env:
