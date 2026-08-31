@@ -116,6 +116,7 @@ def test_schema_one_config_remains_default_only(tmp_path: Path) -> None:
     ["ported", 1],
     [""],
     ["-invalid"],
+    ["@"],
 ])
 def test_schema_two_rejects_invalid_additional_branches(
     tmp_path: Path, additional_branches: list[object]

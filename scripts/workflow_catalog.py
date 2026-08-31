@@ -157,6 +157,7 @@ def _additional_branches(value: object, where: str) -> tuple[str, ...]:
         components = branch.split("/")
         if (
             not branch
+            or branch == "@"
             or branch.startswith(("-", "/"))
             or branch.endswith(("/", "."))
             or "//" in branch
