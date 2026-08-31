@@ -57,7 +57,13 @@ class WorkflowSecretContractsTest(unittest.TestCase):
                     self.assertIn("permissions", job)
                     self.assertIsInstance(job["permissions"], dict)
                     if job_name == "check-enabled":
-                        self.assertEqual({"contents": "read"}, job["permissions"])
+                        expected = {"contents": "read"}
+                        if filename == "gemini-auto-review.yml":
+                            expected["pull-requests"] = "read"
+                        self.assertEqual(
+                            expected,
+                            job["permissions"],
+                        )
                     elif job_name == "skipped":
                         self.assertEqual({}, job["permissions"])
 

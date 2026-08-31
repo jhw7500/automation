@@ -163,6 +163,20 @@ PRs, `skip`, unsafe forks, and closed PRs succeed without invoking a model. `req
 `workflows.<name>.enabled: false`, and `workflows.<name>.auto` still takes precedence over the
 baseline `review.auto: false`.
 
+Beginning with `v1.51`, the closed release inventory also contains exactly these regular,
+non-executable `100644` files:
+
+```text
+.github/actions/resolve-review-policy/action.yml
+.github/actions/resolve-review-policy/resolve_review_policy.py
+```
+
+Release verification authenticates that exact composite-action interface and helper, requires each
+of the Claude, Gemini, and OpenCode reusable workflows to call the resolver exactly once, and checks
+the exact ready-for-review, draft-guard, label, dispatch, and configuration-precedence wiring in
+their managed callers. These inventory and semantic checks apply only to `v1.51+`; `v1.50` and every
+earlier release retain their existing closed inventories and historical caller contracts.
+
 `/jhw:pr` posts `@codex review` and `/gemini review` after the final ready head, so manual
 App review remains available. Operators must keep Codex Code review enabled while disabling
 Automatic reviews in ChatGPT Codex settings. Gemini disables only PR-open automatic review:

@@ -61,7 +61,7 @@ def _build_git_archive(
     automation: Path,
     revision: str,
     *,
-    ref: str = "v1.46",
+    ref: str = "v1.51",
     tree: VerifiedCommitTree | None = None,
 ) -> bytes:
     verified = tree if tree is not None else VerifiedCommitTree.open(automation, revision)
@@ -94,7 +94,7 @@ def _git_archive(
     automation: Path,
     revision: str,
     *,
-    ref: str = "v1.46",
+    ref: str = "v1.51",
     tree: VerifiedCommitTree | None = None,
 ) -> bytes:
     archive: bytes | None = None
@@ -108,7 +108,7 @@ def _git_archive(
 
 
 def _safe_member(
-    member: tarfile.TarInfo, roots: tuple[ReleaseRoot, ...] = release_roots_for("v1.46")
+    member: tarfile.TarInfo, roots: tuple[ReleaseRoot, ...] = release_roots_for("v1.51")
 ) -> PurePosixPath:
     path = PurePosixPath(member.name)
     allowed_modes = release_file_modes(path, roots)
@@ -131,7 +131,7 @@ def _extract_archive(
     archive_bytes: bytes,
     destination: Path,
     *,
-    roots: tuple[ReleaseRoot, ...] = release_roots_for("v1.46"),
+    roots: tuple[ReleaseRoot, ...] = release_roots_for("v1.51"),
 ) -> None:
     try:
         with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:") as archive:

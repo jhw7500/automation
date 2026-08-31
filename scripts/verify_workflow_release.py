@@ -37,6 +37,8 @@ from scripts.workflow_release_inventory import (
     PREPARE_REVIEW_DIFF_ACTION_ROOT,
     REVIEW_INVOCATION_BUDGET_ACTION_ROOT,
     REVIEW_INVOCATION_BUDGET_HELPER_ROOT,
+    REVIEW_POLICY_ACTION_ROOT,
+    REVIEW_POLICY_HELPER_ROOT,
     REVIEW_SCOPE_HELPER_ROOT,
     SETUP_GEMINI_AUTH_ROOT,
     release_paths_for,
@@ -44,6 +46,7 @@ from scripts.workflow_release_inventory import (
     release_supports_canonicalize_review,
     release_supports_prepare_review_diff,
     release_supports_review_invocation_budget,
+    release_supports_review_policy,
     validate_release_listing,
 )
 
@@ -644,6 +647,9 @@ CANONICALIZE_REVIEW_ACTION = (
 REVIEW_INVOCATION_BUDGET_ACTION = (
     f"$/{REVIEW_INVOCATION_BUDGET_ACTION_ROOT.path.parent.as_posix()}"
 )
+REVIEW_POLICY_ACTION = (
+    f"$/{REVIEW_POLICY_ACTION_ROOT.path.parent.as_posix()}"
+)
 REVIEWER_WORKFLOWS = {
     "claude": "claude-code-review.yml",
     "gemini": "gemini-auto-review.yml",
@@ -660,6 +666,139 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "gemini": "cf3da7805be2f707f07eb2fa01e812083412d4dfb87d81ba3990f6222e616e9e",
     "opencode": "c249bd40a072d74179f5313f4e53d8ef9817f05bbdbc1f0c0e94bf513af1d2ba",
 }
+EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256 = {
+    "claude": "2950d9dbf0923dfc463a872e8602e4d73ba2457a0df90ca3cca228ffb661343a",
+    "gemini": "97065b368b6e50a2cff0149cdb472337ee36fb8cd102a2887c8a56c1bbdca8cc",
+    "opencode": "6a80a008783826618baed22c0675f354cdf7a1b845ef8f6aecd224f00f800249",
+}
+EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
+    "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
+)
+EXPECTED_REVIEW_POLICY_RECORDS = {
+    "PolicyRequest": (
+        ("workflow_name", "str"),
+        ("review_mode", "str"),
+        ("force_run", "bool"),
+        ("force_review", "bool"),
+        ("event_name", "str"),
+        ("repository", "str"),
+        ("pr", "dict[str, object]"),
+        ("config", "dict[str, object]"),
+    ),
+    "PolicyDecision": (
+        ("run_review", "bool"),
+        ("effective_mode", "str"),
+        ("reason", "str"),
+        ("head_sha", "str"),
+    ),
+}
+EXPECTED_REVIEW_POLICY_LITERALS = frozenset(
+    {
+        "PolicyError",
+        "PolicyRequest",
+        "PolicyDecision",
+        "resolve_policy",
+        "review:request",
+        "review:skip",
+        "review_label_conflict",
+        "review_mode_label_mismatch",
+        "workflow_auto_false",
+        "review_auto_false",
+        "default_auto_true",
+    }
+)
+EXPECTED_REVIEW_POLICY_ACTION = yaml.load(
+    r"""name: Resolve Review Policy
+description: Resolve a deterministic review policy before model invocation.
+
+inputs:
+  workflow-name:
+    description: Workflow name in workflow-config.yml.
+    required: true
+  pr-number:
+    description: Pull request number.
+    required: true
+  review-mode:
+    description: Requested review mode.
+    required: true
+  force-run:
+    description: Run even when the workflow is disabled.
+    required: true
+  force-review:
+    description: Request a review for a manual dispatch.
+    required: true
+  github-token:
+    description: Token used to read the pull request.
+    required: true
+
+outputs:
+  run-review:
+    description: Whether a review may run.
+    value: ${{ steps.resolve.outputs.run-review }}
+  effective-mode:
+    description: The resolved review mode.
+    value: ${{ steps.resolve.outputs.effective-mode }}
+  reason:
+    description: Deterministic resolution reason.
+    value: ${{ steps.resolve.outputs.reason }}
+  head-sha:
+    description: Validated pull request head SHA.
+    value: ${{ steps.resolve.outputs.head-sha }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        REVIEW_MODE: ${{ inputs.review-mode }}
+        WORKFLOW_NAME: ${{ inputs.workflow-name }}
+        FORCE_RUN: ${{ inputs.force-run }}
+        FORCE_REVIEW: ${{ inputs.force-review }}
+      run: |
+        set -euo pipefail
+        policy_dir="$RUNNER_TEMP/review-policy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        install -d -m 0700 "$policy_dir"
+        gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$policy_dir/pr.json"
+        ruby -ryaml -rjson -e 'cfg = File.file?(ARGV[0]) ? (YAML.safe_load_file(ARGV[0], aliases: false) || {}) : {}; File.write(ARGV[1], JSON.generate(cfg))' \
+          .github/workflow-config.yml "$policy_dir/config.json"
+        python3 - "$policy_dir/pr.json" "$policy_dir/config.json" "$policy_dir/request.json" <<'PY'
+        import json
+        import os
+        import sys
+        from pathlib import Path
+
+        def boolean(name: str) -> bool:
+            value = os.environ[name]
+            if value not in {"true", "false"}:
+                raise SystemExit(f"{name.lower()}_invalid")
+            return value == "true"
+
+        pr_path, config_path, request_path = map(Path, sys.argv[1:])
+        payload = {
+            "workflow_name": os.environ["WORKFLOW_NAME"],
+            "review_mode": os.environ["REVIEW_MODE"],
+            "force_run": boolean("FORCE_RUN"),
+            "force_review": boolean("FORCE_REVIEW"),
+            "event_name": os.environ["GITHUB_EVENT_NAME"],
+            "repository": os.environ["GITHUB_REPOSITORY"],
+            "pr": json.loads(pr_path.read_text(encoding="utf-8")),
+            "config": json.loads(config_path.read_text(encoding="utf-8")),
+        }
+        request_path.write_text(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        PY
+        python3 "$GITHUB_ACTION_PATH/resolve_review_policy.py" \
+          --request-file "$policy_dir/request.json" \
+          --result-file "$policy_dir/result.json" \
+          --github-output "$GITHUB_OUTPUT"
+""",
+    Loader=yaml.BaseLoader,
+)
 EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION = yaml.load(
     r"""name: Review invocation budget
 description: Claim and finalize a durable fail-closed review invocation budget
@@ -2111,10 +2250,10 @@ def verify_opencode_runtime(
         "opencode run --model zai-coding-plan/glm-4.7 --format json "
         "--file review-full.diff --file review-scope.json"
     ) in run_script
-    current_diagnostics_contract = (
-        workflow_sha256
-        == EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256["opencode"]
-    )
+    current_diagnostics_contract = workflow_sha256 in {
+        EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256["opencode"],
+        EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256["opencode"],
+    }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
     format_sequence = (
@@ -2144,6 +2283,7 @@ def verify_opencode_runtime(
         workflow_sha256 in {
             OPENCODE_AUTO_REVIEW_SHA256,
             EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256["opencode"],
+            EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256["opencode"],
         }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
@@ -2658,6 +2798,113 @@ def _class_function_headers(node: ast.ClassDef) -> dict[str, str]:
                 raise ValueError("duplicate method")
             functions[item.name] = _function_header(item)
     return functions
+
+
+def require_review_policy_helper_contract(source: str) -> None:
+    """Authenticate and statically validate the public policy-helper surface."""
+
+    try:
+        if (
+            hashlib.sha256(source.encode("utf-8")).hexdigest()
+            != EXPECTED_REVIEW_POLICY_HELPER_SHA256
+        ):
+            raise ValueError("helper source digest differs")
+        compile(
+            source,
+            REVIEW_POLICY_HELPER_ROOT.path.as_posix(),
+            "exec",
+            dont_inherit=True,
+        )
+        module = ast.parse(
+            source, filename=REVIEW_POLICY_HELPER_ROOT.path.as_posix()
+        )
+        _require_unique_module_bindings(
+            module,
+            frozenset(
+                {
+                    "PolicyError",
+                    *EXPECTED_REVIEW_POLICY_RECORDS,
+                    "resolve_policy",
+                }
+            ),
+        )
+        error = _class_node(module, "PolicyError")
+        if [ast.unparse(base) for base in error.bases] != ["ValueError"]:
+            raise ValueError("policy error base differs")
+        for name, expected in EXPECTED_REVIEW_POLICY_RECORDS.items():
+            if _record_fields(_class_node(module, name)) != expected:
+                raise ValueError("policy record differs")
+        functions = _module_function_headers(module)
+        if functions.get("resolve_policy") != (
+            "def resolve_policy(request: PolicyRequest) -> PolicyDecision"
+        ):
+            raise ValueError("policy function differs")
+        direct_literals = EXPECTED_REVIEW_POLICY_LITERALS - {
+            "workflow_auto_false",
+            "review_auto_false",
+        }
+        if any(literal not in source for literal in direct_literals):
+            raise ValueError("policy literal differs")
+        automatic = _function_node(module, "_automatic_decision")
+        automatic_source = ast.unparse(automatic)
+        if (
+            "workflow_auto_{str(automatic).lower()}"
+            not in automatic_source
+            or "review_auto_{str(automatic).lower()}"
+            not in automatic_source
+        ):
+            raise ValueError("automatic policy reasons differ")
+    except (SyntaxError, TypeError, UnicodeError, ValueError):
+        raise ReleaseVerificationError(
+            "review-policy helper contract is invalid"
+        ) from None
+
+
+def _verify_review_policy_action(
+    tree: VerifiedCommitTree, ref: str
+) -> None:
+    if not release_supports_review_policy(ref):
+        return
+    expected_files = {
+        (REVIEW_POLICY_ACTION_ROOT.path.as_posix(), "100644", "blob"),
+        (REVIEW_POLICY_HELPER_ROOT.path.as_posix(), "100644", "blob"),
+    }
+    actual_files = {
+        (entry.path.as_posix(), entry.mode, entry.object_type)
+        for entry in tree.files(REVIEW_POLICY_ACTION_ROOT.path.parent)
+    }
+    if actual_files != expected_files:
+        raise ReleaseVerificationError("review-policy inventory is not closed")
+    try:
+        action = yaml.load(
+            tree.read_file(REVIEW_POLICY_ACTION_ROOT.path),
+            Loader=yaml.BaseLoader,
+        )
+        if (
+            action != EXPECTED_REVIEW_POLICY_ACTION
+            or tuple(action["inputs"])
+            != tuple(EXPECTED_REVIEW_POLICY_ACTION["inputs"])
+            or tuple(action["outputs"])
+            != tuple(EXPECTED_REVIEW_POLICY_ACTION["outputs"])
+        ):
+            raise ValueError("action differs")
+    except (
+        AttributeError,
+        ReleaseVerificationError,
+        TypeError,
+        ValueError,
+        yaml.YAMLError,
+    ):
+        raise ReleaseVerificationError(
+            "review-policy action contract is invalid"
+        ) from None
+    try:
+        helper = tree.read_file(REVIEW_POLICY_HELPER_ROOT.path).decode("utf-8")
+    except (ReleaseVerificationError, UnicodeDecodeError):
+        raise ReleaseVerificationError(
+            "review-policy helper contract is invalid"
+        ) from None
+    require_review_policy_helper_contract(helper)
 
 
 def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree) -> None:
@@ -4577,7 +4824,11 @@ def require_budget_helper_contract(source: str) -> None:
 
 
 def require_budget_workflow_contract(
-    tree: VerifiedCommitTree, workflow: str, reviewer: str
+    tree: VerifiedCommitTree,
+    workflow: str,
+    reviewer: str,
+    *,
+    review_policy: bool = False,
 ) -> None:
     """Require reviewer semantics from authenticated commit-tree workflow bytes."""
 
@@ -4855,10 +5106,16 @@ def require_budget_workflow_contract(
             if provider_job.get("needs") != ["check-enabled", "opencode-prepare"]:
                 raise ValueError("OpenCode provider dependencies differ")
             provider_job_if = " ".join(provider_job.get("if", "").split())
-            expected_job_if = (
-                "needs.check-enabled.outputs.enabled == 'true' && "
-                "needs.check-enabled.outputs.auto_enabled == 'true' && "
-                "needs.check-enabled.outputs.safe_pr == 'true' && "
+            expected_job_if = "needs.check-enabled.outputs.enabled == 'true' && "
+            expected_job_if += (
+                "needs.check-enabled.outputs.policy_run == 'true' && "
+                if review_policy
+                else (
+                    "needs.check-enabled.outputs.auto_enabled == 'true' && "
+                    "needs.check-enabled.outputs.safe_pr == 'true' && "
+                )
+            )
+            expected_job_if += (
                 "needs.opencode-prepare.result == 'success' && "
                 "needs.opencode-prepare.outputs.allow_invocation == 'true'"
             )
@@ -5212,7 +5469,12 @@ def _verify_review_invocation_budget(
         ) from None
     require_budget_helper_contract(helper)
     for reviewer, workflow in REVIEWER_WORKFLOWS.items():
-        require_budget_workflow_contract(tree, workflow, reviewer)
+        require_budget_workflow_contract(
+            tree,
+            workflow,
+            reviewer,
+            review_policy=release_supports_review_policy(ref),
+        )
     authenticated_digests = {
         action_path: (
             action_payload,
@@ -5223,11 +5485,16 @@ def _verify_review_invocation_budget(
             EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256,
         ),
     }
+    workflow_digests = (
+        EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256
+        if release_supports_review_policy(ref)
+        else EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256
+    )
     for reviewer, workflow in REVIEWER_WORKFLOWS.items():
         path = f".github/workflows/{workflow}"
         authenticated_digests[path] = (
             tree.read_file(path),
-            EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256[reviewer],
+            workflow_digests[reviewer],
         )
     if any(
         hashlib.sha256(payload).hexdigest() != expected
@@ -5242,6 +5509,8 @@ def expected_review_actions(ref: str, workflow: str) -> list[str]:
     """Return the exact ordered release-local action dependencies."""
 
     actions: list[str] = []
+    if release_supports_review_policy(ref):
+        actions.append(REVIEW_POLICY_ACTION)
     if _release_version(ref) >= (1, 46) and workflow == "gemini-auto-review.yml":
         actions.append(SETUP_GEMINI_AUTH_REVIEW)
     if release_supports_prepare_review_diff(ref):
@@ -5256,6 +5525,205 @@ def expected_review_actions(ref: str, workflow: str) -> list[str]:
     if release_supports_review_invocation_budget(ref):
         actions.append(REVIEW_INVOCATION_BUDGET_ACTION)
     return actions
+
+
+def _normalize_expression(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expression is not a string")
+    return " ".join(value.split())
+
+
+def _verify_review_policy_workflows(documents: dict[str, dict]) -> None:
+    contracts = {
+        "claude-code-review.yml": {
+            "workflow_name": "claude-code-review",
+            "provider_job": "claude-review",
+            "pr_number": "${{ inputs.pr_number || github.event.pull_request.number }}",
+            "outputs": {
+                "enabled": "${{ steps.check.outputs.enabled }}",
+                "policy_run": "${{ steps.review_policy.outputs.run-review }}",
+                "policy_reason": "${{ steps.review_policy.outputs.reason }}",
+                "policy_head": "${{ steps.review_policy.outputs.head-sha }}",
+                "model": "${{ steps.model.outputs.model }}",
+            },
+        },
+        "gemini-auto-review.yml": {
+            "workflow_name": "gemini-auto-review",
+            "provider_job": "gemini-review",
+            "pr_number": "${{ inputs.pr_number || github.event.pull_request.number }}",
+            "outputs": {
+                "enabled": "${{ steps.check.outputs.enabled }}",
+                "policy_run": "${{ steps.review_policy.outputs.run-review }}",
+                "policy_reason": "${{ steps.review_policy.outputs.reason }}",
+                "policy_head": "${{ steps.review_policy.outputs.head-sha }}",
+            },
+        },
+        "opencode-auto-review.yml": {
+            "workflow_name": "opencode-auto-review",
+            "provider_job": "opencode-review",
+            "pr_number": (
+                "${{ inputs.pr_number || github.event.pull_request.number || "
+                "github.event.issue.number }}"
+            ),
+            "outputs": {
+                "enabled": "${{ steps.check.outputs.enabled }}",
+                "policy_run": "${{ steps.review_policy.outputs.run-review }}",
+                "policy_reason": "${{ steps.review_policy.outputs.reason }}",
+                "policy_head": "${{ steps.review_policy.outputs.head-sha }}",
+            },
+        },
+    }
+    review_mode_input = {
+        "description": "Resolved PR review policy",
+        "type": "string",
+        "required": "false",
+        "default": "auto",
+    }
+    try:
+        for workflow, contract in contracts.items():
+            document = documents[workflow]
+            jobs = document["jobs"]
+            call_inputs = document["on"]["workflow_call"]["inputs"]
+            if call_inputs.get("review_mode") != review_mode_input:
+                raise ValueError("review mode input differs")
+            check = jobs["check-enabled"]
+            if check.get("outputs") != contract["outputs"]:
+                raise ValueError("policy outputs differ")
+            policy_steps = [
+                step
+                for step in check["steps"]
+                if step.get("uses") == REVIEW_POLICY_ACTION
+            ]
+            expected_step = {
+                "name": "Resolve PR review policy",
+                "id": "review_policy",
+                "uses": REVIEW_POLICY_ACTION,
+                "with": {
+                    "workflow-name": contract["workflow_name"],
+                    "pr-number": contract["pr_number"],
+                    "review-mode": "${{ inputs.review_mode }}",
+                    "force-run": "${{ inputs.force_run && 'true' || 'false' }}",
+                    "force-review": (
+                        "${{ inputs.force_review && 'true' || 'false' }}"
+                    ),
+                    "github-token": "${{ github.token }}",
+                },
+            }
+            if policy_steps != [expected_step]:
+                raise ValueError("policy call differs")
+            provider_job = jobs[contract["provider_job"]]
+            provider_if = _normalize_expression(provider_job.get("if"))
+            if workflow == "opencode-auto-review.yml":
+                expected_provider_if = (
+                    "needs.check-enabled.outputs.enabled == 'true' && "
+                    "needs.check-enabled.outputs.policy_run == 'true' && "
+                    "needs.opencode-prepare.result == 'success' && "
+                    "needs.opencode-prepare.outputs.allow_invocation == 'true'"
+                )
+                if provider_job.get("needs") != [
+                    "check-enabled",
+                    "opencode-prepare",
+                ]:
+                    raise ValueError("provider needs differ")
+                for job_name in ("opencode-prepare", "opencode-canonicalize"):
+                    if "needs.check-enabled.outputs.policy_run == 'true'" not in (
+                        _normalize_expression(jobs[job_name].get("if"))
+                    ):
+                        raise ValueError("pipeline policy predicate differs")
+            else:
+                expected_provider_if = (
+                    "needs.check-enabled.outputs.enabled == 'true' && "
+                    "needs.check-enabled.outputs.policy_run == 'true'"
+                )
+                if provider_job.get("needs") != "check-enabled":
+                    raise ValueError("provider needs differ")
+            if provider_if != expected_provider_if:
+                raise ValueError("provider policy predicate differs")
+            skipped = jobs["skipped"]
+            skipped_if = _normalize_expression(skipped.get("if"))
+            if "needs.check-enabled.outputs.policy_run != 'true'" not in skipped_if:
+                raise ValueError("skipped policy predicate differs")
+    except (KeyError, TypeError, ValueError):
+        raise ReleaseVerificationError(
+            "review-policy workflow contract is invalid"
+        ) from None
+
+
+def _verify_review_policy_callers(tree: VerifiedCommitTree) -> None:
+    trigger = {
+        "pull_request": {
+            "types": ["opened", "synchronize", "ready_for_review"]
+        },
+        "workflow_dispatch": {
+            "inputs": {
+                "pr_number": {
+                    "description": "Pull request number",
+                    "type": "number",
+                    "required": "true",
+                },
+                "force_review": {
+                    "description": "Perform one authorized same-HEAD review",
+                    "type": "boolean",
+                    "required": "false",
+                    "default": "false",
+                },
+            }
+        },
+    }
+    caller_if = (
+        "(github.event_name == 'pull_request' && "
+        "github.event.pull_request.head.repo.fork == false && "
+        "github.event.pull_request.head.repo.full_name == github.repository && "
+        "github.event.pull_request.draft == false) || "
+        "(github.event_name == 'workflow_dispatch' && inputs.force_review)"
+    )
+    review_mode = (
+        "${{\n"
+        "  github.event_name == 'workflow_dispatch' && inputs.force_review && 'request' ||\n"
+        "  contains(github.event.pull_request.labels.*.name, 'review:request') &&\n"
+        "  contains(github.event.pull_request.labels.*.name, 'review:skip') && 'conflict' ||\n"
+        "  contains(github.event.pull_request.labels.*.name, 'review:request') && 'request' ||\n"
+        "  contains(github.event.pull_request.labels.*.name, 'review:skip') && 'skip' ||\n"
+        "  'auto'\n"
+        "}}"
+    )
+    callers = {
+        "claude-code-review.yml": "claude-review",
+        "gemini-auto-review.yml": "gemini-review",
+        "opencode-auto-review.yml": "opencode-review",
+    }
+    try:
+        for workflow, job_name in callers.items():
+            path = (
+                "examples/baseline-workflows/.github/workflows/" + workflow
+            )
+            document = yaml.load(
+                tree.read_file(path), Loader=yaml.BaseLoader
+            )
+            if not isinstance(document, dict) or document.get("on") != trigger:
+                raise ValueError("caller trigger differs")
+            job = document["jobs"][job_name]
+            if _normalize_expression(job.get("if")) != caller_if:
+                raise ValueError("caller draft/manual guard differs")
+            values = job["with"]
+            if (
+                values.get("pr_number")
+                != "${{ github.event.pull_request.number || inputs.pr_number }}"
+                or values.get("force_review")
+                != "${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}"
+                or values.get("review_mode") != review_mode
+            ):
+                raise ValueError("caller review mode differs")
+    except (
+        KeyError,
+        ReleaseVerificationError,
+        TypeError,
+        ValueError,
+        yaml.YAMLError,
+    ):
+        raise ReleaseVerificationError(
+            "review-policy caller contract is invalid"
+        ) from None
 
 
 def _verify_review_action_dependencies(
@@ -5830,6 +6298,8 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
         }
     if release_supports_review_invocation_budget(ref):
         approved_actions |= {REVIEW_INVOCATION_BUDGET_ACTION}
+    if release_supports_review_policy(ref):
+        approved_actions |= {REVIEW_POLICY_ACTION}
     unapproved_actions = sorted(set(_action_references(document)) - approved_actions)
     if unapproved_actions:
         raise ReleaseVerificationError(
@@ -5898,10 +6368,17 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
                 and step.get("uses") == REVIEW_INVOCATION_BUDGET_ACTION
                 and step_values.count("github.token") == 1
             )
+            policy_step = (
+                release_supports_review_policy(ref)
+                and name == "gemini-auto-review.yml"
+                and job_name == "check-enabled"
+                and step.get("uses") == REVIEW_POLICY_ACTION
+                and step_values.count("github.token") == 1
+            )
             if (
                 step_index not in candidates
                 and "github.token" in step_values
-                and not (provenance_step or budget_state_step)
+                and not (provenance_step or budget_state_step or policy_step)
             ):
                 raise ReleaseVerificationError(
                     f"{name}:{job_name} bypasses the resolved repository-write token"
@@ -5983,6 +6460,9 @@ def _verify_commit_content(
         _verify_prepare_review_diff_action(tree, ref)
     if release_supports_canonicalize_review(ref):
         _verify_canonicalize_review_action(tree)
+    if release_supports_review_policy(ref):
+        _verify_review_policy_action(tree, ref)
+        _verify_review_policy_callers(tree)
     _verify_approved_v140_policy(tree, ref)
     _verify_manual_gemini_output_contract(tree, ref)
     catalog = _verify_tag_catalog(tree, ref)
@@ -6022,6 +6502,8 @@ def _verify_commit_content(
 
     _verify_claude_code_action_pin(ref, documents)
     _verify_review_action_dependencies(ref, documents)
+    if release_supports_review_policy(ref):
+        _verify_review_policy_workflows(documents)
     if release_supports_canonicalize_review(ref):
         _verify_review_publication_contracts(documents, ref)
 
@@ -6454,12 +6936,21 @@ def _verify_commit_content(
         {},
     )
     condition = job.get("if", "")
-    if (
-        safe_output != "${{ steps.pr_scope.outputs.safe_pr }}"
-        or "gh api" not in scope_step.get("run", "")
-        or not isinstance(condition, str)
-        or "needs.check-enabled.outputs.safe_pr == 'true'" not in condition
-    ):
+    policy_guard = (
+        release_supports_review_policy(ref)
+        and check_job.get("outputs", {}).get("policy_run")
+        == "${{ steps.review_policy.outputs.run-review }}"
+        and isinstance(condition, str)
+        and "needs.check-enabled.outputs.policy_run == 'true'" in condition
+    )
+    historical_guard = (
+        not release_supports_review_policy(ref)
+        and safe_output == "${{ steps.pr_scope.outputs.safe_pr }}"
+        and "gh api" in scope_step.get("run", "")
+        and isinstance(condition, str)
+        and "needs.check-enabled.outputs.safe_pr == 'true'" in condition
+    )
+    if not (policy_guard or historical_guard):
         raise ReleaseVerificationError(
             "OpenCode auto review lacks a central same-repository PR guard"
         )
