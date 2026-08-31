@@ -402,6 +402,13 @@ def test_automation_config_has_an_explicit_disabled_review_default() -> None:
     assert config["review"] == {"auto": "false"}
 
 
+def test_automation_gemini_app_is_manual_review_only() -> None:
+    config = yaml.safe_load((ROOT / ".gemini/config.yaml").read_text())
+
+    assert config == {"code_review": {"pull_request_opened": {"code_review": False}}}
+    assert config["code_review"].get("disable") is None
+
+
 def test_triggers_and_permissions_match_the_approved_policy() -> None:
     workflow_root = CANONICAL / "workflows"
     actual_names = {path.name for path in workflow_root.glob("*.yml")}
