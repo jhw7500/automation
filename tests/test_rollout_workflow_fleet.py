@@ -74,6 +74,7 @@ def outcome(repo: str, status: str = "planned") -> rollout.RepoOutcome:
         detail="one managed file differs",
         base_sha=BASE,
         changed_paths=(".github/workflows/claude.yml",),
+        base_branch="main",
     )
 
 
@@ -89,7 +90,9 @@ def prepared(repo: str, status: str = "planned") -> rollout.PreparedRepo:
         frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}),
         frozenset(),
     )
-    return rollout.PreparedRepo(repo, "create_branch", outcome(repo, status), plan)
+    return rollout.PreparedRepo(
+        repo, "create_branch", outcome(repo, status), plan, "main", None, "main"
+    )
 
 
 def fake_bundle_context(bundle: ReleaseBundle):
@@ -417,6 +420,63 @@ def test_blocked_ported_prevalidation_prevents_all_selected_publication(
         ("gstApp", None),
     ]
     publish.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "default_by_target",
+    [
+        {None: "ported", "ported": "ported"},
+        {None: "main", "ported": "trunk"},
+    ],
+)
+def test_inconsistent_resolved_targets_block_the_repository_before_publication(
+    tmp_path: Path,
+    bundle: ReleaseBundle,
+    default_by_target: dict[str | None, str],
+) -> None:
+    """Catch target clones that collapse or disagree before the global publish gate."""
+
+    workspace = marked_workspace(tmp_path)
+
+    def prevalidate(*_args, repo: str, base_branch: str | None, **_kwargs):
+        default_branch = default_by_target[base_branch]
+        selected_base = default_branch if base_branch is None else base_branch
+        return rollout.PreparedRepo(
+            repo,
+            "create_branch",
+            rollout.RepoOutcome(
+                repo, "planned", "ready", BASE, base_branch=selected_base
+            ),
+            None,
+            selected_base,
+            base_branch,
+            default_branch,
+        )
+
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(rollout, "prevalidate_repository", side_effect=prevalidate),
+        mock.patch.object(
+            rollout,
+            "publish_repository",
+            return_value=rollout.RepoOutcome("wlan-driver-v2", "published", "ready"),
+        ) as publish,
+    ):
+        rc = rollout.main(
+            [
+                "--mode", "publish", "--confirm", "--workspace", str(workspace),
+                "--repo", "wlan-driver-v2",
+            ]
+        )
+
+    assert rc == 1
+    publish.assert_not_called()
+    manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+    assert [item["status"] for item in manifest] == ["blocked", "blocked"]
 
 
 @pytest.mark.parametrize(
@@ -1035,9 +1095,9 @@ def test_main_journals_actual_fresh_stage_failure_after_prevalidation_base_moves
             "prevalidate_repository",
             return_value=prepared("gstApp"),
         ),
-        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "clone_branch", return_value=snap),
         mock.patch.object(
-            rollout.fleet_git, "refetch_default", return_value=FRESH_BASE
+            rollout.fleet_git, "refetch_branch", return_value=FRESH_BASE
         ),
         mock.patch.object(rollout, "git", return_value=""),
         mock.patch.object(rollout, "_render", side_effect=render),

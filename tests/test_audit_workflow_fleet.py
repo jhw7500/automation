@@ -510,6 +510,67 @@ def test_target_refetch_failure_blocks_only_ported_and_keeps_main_visible(
 
 
 @pytest.mark.parametrize(
+    "defaults,labels",
+    [
+        ({None: "ported", "ported": "ported"}, ("default:ported", "ported")),
+        ({None: "main", "ported": "trunk"}, ("default:main", "ported")),
+    ],
+)
+def test_inconsistent_resolved_targets_are_blocked_without_hiding_target_rows(
+    tmp_path: Path,
+    bundle: ReleaseBundle,
+    capsys,
+    defaults: dict[str | None, str],
+    labels: tuple[str, str],
+) -> None:
+    """Catch audits that call duplicate or metadata-split targets all current."""
+
+    workspace = marked_workspace(tmp_path)
+
+    def clone(_owner: str, repo: str, root: Path, branch: str | None) -> RepositorySnapshot:
+        path = root / repo
+        path.mkdir()
+        (path / ".git").mkdir()
+        default_branch = defaults[branch]
+        return RepositorySnapshot(
+            path,
+            default_branch,
+            BASE,
+            frozenset(ALL_SECRETS),
+            frozenset(ALL_VARIABLES),
+            default_branch if branch is None else branch,
+        )
+
+    with (
+        mock.patch.object(
+            audit, "materialize_release_bundle", side_effect=lambda *_a, **_k: nullcontext(bundle)
+        ),
+        mock.patch.object(audit.fleet_git, "clone_branch", side_effect=clone),
+        mock.patch.object(audit.fleet_git, "refetch_branch", return_value=BASE),
+        mock.patch.object(
+            audit,
+            "audit_repository",
+            side_effect=lambda path, *_a, **kwargs: AuditResult(
+                path.name, kwargs["base_branch"], "current", "managed content matches", ()
+            ),
+        ),
+        mock.patch.object(audit, "git", return_value=""),
+    ):
+        rc = audit.main(
+            [
+                "--automation", str(ROOT), "--workspace", str(workspace), "--ref", "v1.40",
+                "--repo", "wlan-driver-v2",
+            ]
+        )
+
+    assert rc == 1
+    output = capsys.readouterr().out
+    assert f"BLOCKED wlan-driver-v2[{labels[0]}]:" in output
+    assert f"BLOCKED wlan-driver-v2[{labels[1]}]:" in output
+    assert "total=2 current=0 drift=0 blocked=2" in output
+
+
+@pytest.mark.parametrize(
     "args",
     [
         ["push", "origin", "main"],

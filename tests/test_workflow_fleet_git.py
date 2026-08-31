@@ -471,6 +471,10 @@ def test_clone_branch_retains_repository_default_and_selected_base(
             "defaultBranchRef": {"name": "bad branch"},
             "url": "https://github.com/jhw7500/repo",
         },
+        {
+            "defaultBranchRef": {"name": "@"},
+            "url": "https://github.com/jhw7500/repo",
+        },
     ],
 )
 def test_clone_branch_rejects_missing_or_malformed_default_branch_metadata(

@@ -5,6 +5,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+from scripts import workflow_catalog
 from scripts.workflow_catalog import (
     CatalogError,
     configured_branch_targets,
@@ -93,6 +94,24 @@ def test_live_configures_ordered_additional_branch_targets() -> None:
         if name != "wlan-driver-v2":
             assert profile.additional_branches == ()
             assert configured_branch_targets(profile) == (None,)
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    [
+        ((None, "ported", "ported"), ("ported", "ported", "ported")),
+        ((None, "main", "main"), ("ported", "trunk", "ported")),
+    ],
+)
+def test_resolved_targets_fail_closed_on_duplicate_or_changing_default_metadata(
+    resolved: tuple[tuple[str | None, str, str], ...]
+) -> None:
+    """Catch configured targets that collapse or disagree after repository lookup."""
+
+    profile = load_fleet_config(ROOT, load_catalog(ROOT)).profiles["wlan-driver-v2"]
+
+    with pytest.raises(workflow_catalog.CatalogError, match="branch target"):
+        workflow_catalog.validate_resolved_branch_targets(profile, resolved)
 
 
 def test_schema_one_config_remains_default_only(tmp_path: Path) -> None:

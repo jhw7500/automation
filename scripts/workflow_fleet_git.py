@@ -226,6 +226,7 @@ def _validate_branch(branch: object) -> None:
     if (
         not isinstance(branch, str)
         or not branch
+        or branch == "@"
         or branch.startswith(("-", "/"))
         or branch.endswith(("/", "."))
         or "//" in branch

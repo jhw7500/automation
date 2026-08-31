@@ -106,6 +106,32 @@ def configured_branch_targets(profile: RepoProfile) -> tuple[str | None, ...]:
     return (None, *profile.additional_branches)
 
 
+def validate_resolved_branch_targets(
+    profile: RepoProfile,
+    resolved: tuple[tuple[str | None, str, str], ...],
+) -> None:
+    """Require configured branch targets to retain one unambiguous identity."""
+
+    expected = configured_branch_targets(profile)
+    if len(resolved) != len(expected):
+        raise CatalogError("branch target resolution is incomplete")
+    if tuple(item[0] for item in resolved) != expected:
+        raise CatalogError("branch target resolution does not match the configuration")
+    defaults = {item[1] for item in resolved}
+    bases = [item[2] for item in resolved]
+    if (
+        any(
+            not isinstance(value, str) or not value
+            for item in resolved
+            for value in item[1:]
+        )
+        or len(defaults) != 1
+        or len(set(bases)) != len(bases)
+        or any(target is not None and target == default for target, default, _ in resolved)
+    ):
+        raise CatalogError("branch target resolution is inconsistent")
+
+
 def _require_keys(value: dict[str, object], *, exact: set[str], where: str) -> None:
     actual = set(value)
     if actual != exact:

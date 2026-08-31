@@ -32,8 +32,11 @@ from scripts.prepare_workflow_rollout import (  # noqa: E402
     render_repository,
 )
 from scripts.workflow_catalog import (  # noqa: E402
+    CatalogError,
+    RepoProfile,
     WorkflowCatalog,
     configured_branch_targets,
+    validate_resolved_branch_targets,
 )
 from scripts.workflow_fleet_git import (  # noqa: E402
     FleetGitError,
@@ -1112,6 +1115,45 @@ def _prepared_outcome(
     )
 
 
+def _block_inconsistent_prepared_targets(
+    profile: RepoProfile,
+    ref: str,
+    prepared: Sequence[PreparedRepo],
+) -> tuple[PreparedRepo, ...]:
+    """Fail closed when configured targets no longer have unique identities."""
+
+    if any(item.outcome.status == "blocked" for item in prepared):
+        return tuple(prepared)
+    resolved = tuple(
+        (item.target_branch, item.default_branch, item.base_branch)
+        for item in prepared
+    )
+    try:
+        validate_resolved_branch_targets(profile, resolved)
+        heads = tuple(
+            rollout_branch(ref, base_branch, default_branch)
+            for _, default_branch, base_branch in resolved
+        )
+        if len(set(heads)) != len(heads):
+            raise CatalogError("branch target rollout heads are not unique")
+    except CatalogError as exc:
+        detail = f"branch target consistency failed: {exc}"
+        return tuple(
+            replace(
+                item,
+                action="blocked",
+                outcome=replace(
+                    item.outcome,
+                    status="blocked",
+                    detail=detail,
+                    stage="consistency",
+                ),
+            )
+            for item in prepared
+        )
+    return tuple(prepared)
+
+
 def prevalidate_repository(
     bundle: ReleaseBundle,
     workspace: Path,
@@ -1611,6 +1653,18 @@ def main(argv: list[str] | None = None) -> int:
                             actionlint=actionlint,
                         )
                     )
+
+        for repo in repos:
+            indexes = [
+                index for index, item in enumerate(prepared) if item.repo == repo
+            ]
+            checked = _block_inconsistent_prepared_targets(
+                bundle.config.profiles[repo],
+                bundle.ref,
+                tuple(prepared[index] for index in indexes),
+            )
+            for index, item in zip(indexes, checked):
+                prepared[index] = item
 
         if args.mode == "plan" or any(
             item.outcome.status == "blocked" for item in prepared

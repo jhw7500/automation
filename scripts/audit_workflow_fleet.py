@@ -25,8 +25,10 @@ from scripts.prepare_workflow_rollout import (  # noqa: E402
 )
 from scripts.workflow_fleet_git import FleetGitError  # noqa: E402
 from scripts.workflow_catalog import (  # noqa: E402
+    CatalogError,
     RepoProfile,
     configured_branch_targets,
+    validate_resolved_branch_targets,
 )
 from scripts.workflow_release_bundle import (  # noqa: E402
     ReleaseBundle,
@@ -89,6 +91,38 @@ def audit_repository(
     if plan.status in {"drift", "bootstrap_required"}:
         return AuditResult(repo.name, base_branch, "drift", plan.reason, changed_paths)
     return AuditResult(repo.name, base_branch, "current", plan.reason, ())
+
+
+def _block_inconsistent_audit_targets(
+    profile: RepoProfile,
+    targets: list[tuple[str | None, AuditResult, tuple[str, str] | None]],
+) -> list[AuditResult]:
+    """Keep every configured target visible when metadata makes them ambiguous."""
+
+    if any(resolution is None for _, _, resolution in targets):
+        return [outcome for _, outcome, _ in targets]
+    resolved = tuple(
+        (target, resolution[0], resolution[1])
+        for target, _, resolution in targets
+        if resolution is not None
+    )
+    try:
+        validate_resolved_branch_targets(profile, resolved)
+    except CatalogError as exc:
+        detail = f"branch target consistency failed: {exc}"
+        return [
+            AuditResult(
+                outcome.repo,
+                f"default:{outcome.base_branch}"
+                if target is None
+                else outcome.base_branch,
+                "blocked",
+                detail,
+                (),
+            )
+            for target, outcome, _ in targets
+        ]
+    return [outcome for _, outcome, _ in targets]
 
 
 def git(args: list[str], *, cwd: Path | None = None) -> str:
@@ -161,8 +195,12 @@ def main(argv: list[str] | None = None) -> int:
         outcomes: list[AuditResult] = []
         for repo in repos:
             profile = bundle.config.profiles[repo]
+            target_outcomes: list[
+                tuple[str | None, AuditResult, tuple[str, str] | None]
+            ] = []
             for target_branch in configured_branch_targets(profile):
                 selected_base = target_branch or UNRESOLVED_DEFAULT_BRANCH
+                resolution: tuple[str, str] | None = None
                 with tempfile.TemporaryDirectory(
                     prefix=f".audit-{repo}-", dir=workspace
                 ) as temporary:
@@ -175,10 +213,13 @@ def main(argv: list[str] | None = None) -> int:
                             bundle.config.owner, repo, clone_workspace, target_branch
                         )
                         selected_base = snapshot.base_branch or snapshot.default_branch
+                        resolution = (snapshot.default_branch, selected_base)
                         base_sha = fleet_git.refetch_branch(snapshot)
                         git(["switch", "--detach", base_sha], cwd=snapshot.path)
-                        outcomes.append(
-                            audit_repository(
+                        target_outcomes.append(
+                            (
+                                target_branch,
+                                audit_repository(
                                 snapshot.path,
                                 bundle,
                                 profile,
@@ -186,28 +227,39 @@ def main(argv: list[str] | None = None) -> int:
                                 set(snapshot.variable_names),
                                 observed_revision=base_sha,
                                 base_branch=selected_base,
+                                ),
+                                resolution,
                             )
                         )
                     except (FleetGitError, RolloutError):
-                        outcomes.append(
-                            AuditResult(
-                                repo,
-                                selected_base,
-                                "blocked",
-                                "repository audit failed",
-                                (),
+                        target_outcomes.append(
+                            (
+                                target_branch,
+                                AuditResult(
+                                    repo,
+                                    selected_base,
+                                    "blocked",
+                                    "repository audit failed",
+                                    (),
+                                ),
+                                resolution,
                             )
                         )
                     except (OSError, KeyError, ValueError):
-                        outcomes.append(
-                            AuditResult(
-                                repo,
-                                selected_base,
-                                "blocked",
-                                "local audit failed",
-                                (),
+                        target_outcomes.append(
+                            (
+                                target_branch,
+                                AuditResult(
+                                    repo,
+                                    selected_base,
+                                    "blocked",
+                                    "local audit failed",
+                                    (),
+                                ),
+                                resolution,
                             )
                         )
+            outcomes.extend(_block_inconsistent_audit_targets(profile, target_outcomes))
 
         for outcome in outcomes:
             print(
