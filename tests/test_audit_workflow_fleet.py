@@ -401,13 +401,16 @@ def test_target_clone_failure_blocks_only_the_exact_target_and_stays_in_totals(
     assert "total=2 current=1 drift=0 blocked=1" in output
 
 
-def test_unresolved_implicit_default_has_a_label_distinct_from_a_branch_named_default(
+def test_unresolved_implicit_default_has_a_label_distinct_from_a_valid_branch_named_like_the_old_sentinel(
     tmp_path: Path, bundle: ReleaseBundle, capsys
 ) -> None:
-    """Catch a failed implicit-default clone mislabeled as a real `default` branch."""
+    """Catch a failed implicit-default clone mislabeled as a valid configured branch."""
 
     workspace = marked_workspace(tmp_path)
-    profile = replace(bundle.config.profiles["gstApp"], additional_branches=("default",))
+    profile = replace(
+        bundle.config.profiles["gstApp"],
+        additional_branches=("<default-unresolved>",),
+    )
     scenario_bundle = replace(
         bundle,
         config=replace(bundle.config, profiles={**bundle.config.profiles, "gstApp": profile}),
@@ -449,8 +452,8 @@ def test_unresolved_implicit_default_has_a_label_distinct_from_a_branch_named_de
 
     assert rc == 1
     output = capsys.readouterr().out
-    assert "BLOCKED gstApp[<default-unresolved>]: repository audit failed" in output
-    assert "CURRENT gstApp[default]: managed content matches" in output
+    assert "BLOCKED gstApp[default:unresolved]: repository audit failed" in output
+    assert "CURRENT gstApp[<default-unresolved>]: managed content matches" in output
     assert "total=2 current=1 drift=0 blocked=1" in output
 
 

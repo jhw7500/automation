@@ -36,7 +36,7 @@ from scripts.workflow_release_bundle import (  # noqa: E402
 
 VERSION_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
 WORKSPACE_MARKER = ".automation-fleet-workspace"
-UNRESOLVED_DEFAULT_BRANCH = "<default-unresolved>"
+UNRESOLVED_DEFAULT_BRANCH = "default:unresolved"
 GIT_PREFIX = (
     "git",
     "-c",

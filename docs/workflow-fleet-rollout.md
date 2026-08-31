@@ -554,7 +554,7 @@ target legitimately remains `drift`. The current fleet completion condition is `
 `drift=0`, and `blocked=0`.
 
 If the implicit default target cannot be cloned far enough to discover its remote name,
-its blocked result is labeled `<default-unresolved>`; this cannot collide with a valid branch.
+its blocked result is labeled `default:unresolved`; the colon makes it invalid as a Git branch.
 
 ### Review, merge, and recovery
 
