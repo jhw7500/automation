@@ -124,11 +124,23 @@ class WorkflowSecretContractsTest(unittest.TestCase):
     def test_opencode_auto_review_enforces_same_repository_prs_centrally(self) -> None:
         workflow = load_workflow(WORKFLOWS / "opencode-auto-review.yml")
         check = workflow["jobs"]["check-enabled"]
-        self.assertEqual("${{ steps.pr_scope.outputs.safe_pr }}", check["outputs"]["safe_pr"])
-        scope_step = next(step for step in check["steps"] if step.get("id") == "pr_scope")
-        self.assertIn("gh api", scope_step["run"])
-        condition = workflow["jobs"]["opencode-review"]["if"]
-        self.assertIn("needs.check-enabled.outputs.safe_pr == 'true'", condition)
+        self.assertEqual(
+            "${{ steps.review_policy.outputs.run-review }}",
+            check["outputs"]["policy_run"],
+        )
+        policy_step = next(
+            step for step in check["steps"] if step.get("id") == "review_policy"
+        )
+        self.assertEqual(
+            "$/.github/actions/resolve-review-policy", policy_step["uses"]
+        )
+        self.assertNotIn("if", policy_step)
+        self.assertEqual(
+            "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
+            policy_step["with"]["pr-number"],
+        )
+        condition = workflow["jobs"]["opencode-prepare"]["if"]
+        self.assertIn("needs.check-enabled.outputs.policy_run == 'true'", condition)
 
     def test_opencode_command_keeps_read_only_checkout_auth_for_private_repos(self) -> None:
         workflow = load_workflow(WORKFLOWS / "opencode.yml")

@@ -8,13 +8,16 @@ paths:
       - 'specifying action "\$/\.github/actions/prepare-review-diff" in invalid format because ref is missing'
       - 'specifying action "\$/\.github/actions/review-invocation-budget" in invalid format because ref is missing'
       - 'specifying action "\$/\.github/actions/canonicalize-review" in invalid format because ref is missing'
+      - 'specifying action "\$/\.github/actions/resolve-review-policy" in invalid format because ref is missing'
   .github/workflows/gemini-auto-review.yml:
     ignore:
       - 'specifying action "\$/\.github/actions/setup-gemini-auth" in invalid format because ref is missing'
       - 'specifying action "\$/\.github/actions/prepare-review-diff" in invalid format because ref is missing'
       - 'specifying action "\$/\.github/actions/review-invocation-budget" in invalid format because ref is missing'
       - 'specifying action "\$/\.github/actions/canonicalize-review" in invalid format because ref is missing'
+      - 'specifying action "\$/\.github/actions/resolve-review-policy" in invalid format because ref is missing'
   .github/workflows/opencode-auto-review.yml:
     ignore:
       - 'specifying action "\$/\.github/actions/prepare-review-diff" in invalid format because ref is missing'
       - 'specifying action "\$/\.github/actions/review-invocation-budget" in invalid format because ref is missing'
+      - 'specifying action "\$/\.github/actions/resolve-review-policy" in invalid format because ref is missing'
