@@ -9,7 +9,7 @@ name: Self Gemini Auto Review
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, ready_for_review]
 
 jobs:
   check-secret:
@@ -36,7 +36,8 @@ jobs:
     if: >-
       needs.check-secret.outputs.has_key == 'true' &&
       github.event.pull_request.head.repo.fork == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
     permissions:
       actions: read
       contents: read
@@ -45,6 +46,15 @@ jobs:
     uses: ./.github/workflows/gemini-auto-review.yml
     with:
       pr_number: ${{ github.event.pull_request.number }}
+      force_review: false
+      review_mode: >-
+        ${{
+          contains(github.event.pull_request.labels.*.name, 'review:request') &&
+          contains(github.event.pull_request.labels.*.name, 'review:skip') && 'conflict' ||
+          contains(github.event.pull_request.labels.*.name, 'review:request') && 'request' ||
+          contains(github.event.pull_request.labels.*.name, 'review:skip') && 'skip' ||
+          'auto'
+        }}
       repo_write_auth: github_token
       publisher_app_id: ${{ vars.APP_ID }}
     secrets:

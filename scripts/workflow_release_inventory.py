@@ -92,6 +92,18 @@ REVIEW_INVOCATION_BUDGET_HELPER_ROOT = ReleaseRoot(
     "file",
     "100644",
 )
+REVIEW_POLICY_ACTION_ROOT = ReleaseRoot(
+    PurePosixPath(".github/actions/resolve-review-policy/action.yml"),
+    "file",
+    "100644",
+)
+REVIEW_POLICY_HELPER_ROOT = ReleaseRoot(
+    PurePosixPath(
+        ".github/actions/resolve-review-policy/resolve_review_policy.py"
+    ),
+    "file",
+    "100644",
+)
 
 HISTORICAL_RELEASE_ROOTS = (
     CENTRAL_WORKFLOW_ROOT,
@@ -113,11 +125,16 @@ REVIEW_INVOCATION_BUDGET_ROOTS = (
     REVIEW_INVOCATION_BUDGET_ACTION_ROOT,
     REVIEW_INVOCATION_BUDGET_HELPER_ROOT,
 )
+REVIEW_POLICY_ROOTS = (
+    REVIEW_POLICY_ACTION_ROOT,
+    REVIEW_POLICY_HELPER_ROOT,
+)
 RELEASE_ROOTS = (
     HISTORICAL_RELEASE_ROOTS
     + PREPARE_REVIEW_DIFF_ROOTS
     + CANONICALIZE_REVIEW_ROOTS
     + REVIEW_INVOCATION_BUDGET_ROOTS
+    + REVIEW_POLICY_ROOTS
 )
 RELEASE_PATHS = tuple(root.path.as_posix() for root in RELEASE_ROOTS)
 EXACT_RELEASE_ROOTS = tuple(root for root in RELEASE_ROOTS if root.kind == "file")
@@ -129,6 +146,7 @@ _RELEASE_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
 PREPARE_REVIEW_DIFF_RELEASE = (1, 45)
 CANONICALIZE_REVIEW_RELEASE = (1, 46)
 REVIEW_INVOCATION_BUDGET_RELEASE = (1, 47)
+REVIEW_POLICY_RELEASE = (1, 51)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -155,6 +173,12 @@ def release_supports_review_invocation_budget(ref: str) -> bool:
     return _release_version(ref) >= REVIEW_INVOCATION_BUDGET_RELEASE
 
 
+def release_supports_review_policy(ref: str) -> bool:
+    """Return whether ``ref`` owns the deterministic review-policy action."""
+
+    return _release_version(ref) >= REVIEW_POLICY_RELEASE
+
+
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:
     """Select the authenticated inventory that existed at ``ref``'s release line."""
     roots = HISTORICAL_RELEASE_ROOTS
@@ -164,6 +188,8 @@ def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:
         roots += CANONICALIZE_REVIEW_ROOTS
     if release_supports_review_invocation_budget(ref):
         roots += REVIEW_INVOCATION_BUDGET_ROOTS
+    if release_supports_review_policy(ref):
+        roots += REVIEW_POLICY_ROOTS
     return roots
 
 

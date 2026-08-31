@@ -7,8 +7,18 @@ on:
         description: 'Pull request number (optional; defaults to event PR number)'
         type: string
         required: false
+      review_mode:
+        description: Resolved PR review policy
+        type: string
+        required: false
+        default: auto
       force_run:
         description: 'Run even if disabled in workflow-config.yml'
+        type: boolean
+        required: false
+        default: false
+      force_review:
+        description: Perform one explicitly authorized review even when HEAD is unchanged
         type: boolean
         required: false
         default: false
@@ -31,8 +41,9 @@ jobs:
       pull-requests: read
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
-      auto_enabled: ${{ steps.auto_mode.outputs.auto_enabled }}
-      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}
+      policy_run: ${{ steps.review_policy.outputs.run-review }}
+      policy_reason: ${{ steps.review_policy.outputs.reason }}
+      policy_head: ${{ steps.review_policy.outputs.head-sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,47 +57,22 @@ jobs:
           workflow-name: opencode-auto-review
           force-run: ${{ inputs.force_run && 'true' || 'false' }}
 
-      - name: Check auto review mode
-        id: auto_mode
-        env:
-          FORCE_RUN: ${{ inputs.force_run && 'true' || 'false' }}
-        run: |-
-          CONFIG_FILE=".github/workflow-config.yml"
-          if [[ "$FORCE_RUN" == 'true' ]]; then
-            echo "auto_enabled=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          auto_enabled="true"
-          if [[ -f "$CONFIG_FILE" ]]; then
-            # Precedence (matches claude/gemini): workflows.opencode-auto-review.auto → review.auto → default true
-            auto_enabled="$(ruby -ryaml -e 'cfg = (YAML.load_file(ARGV[0]) rescue {}) || {}; v = cfg.dig("workflows", "opencode-auto-review", "auto"); v = cfg.dig("review", "auto") if v.nil?; v = true if v.nil?; puts(v ? "true" : "false")' "$CONFIG_FILE" 2>/dev/null || echo true)"
-          fi
-          echo "auto_enabled=${auto_enabled}" >> "$GITHUB_OUTPUT"
-
-      - name: Verify same-repository PR
-        id: pr_scope
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
-        run: |
-          echo "safe_pr=false" >> "$GITHUB_OUTPUT"
-          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
-            exit 0
-          fi
-          metadata="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
-            --jq '[.head.repo.full_name, .head.repo.fork] | @tsv' 2>/dev/null)" || exit 0
-          IFS=$'\t' read -r head_repo head_fork <<< "$metadata"
-          if [[ "$head_repo" == "$GITHUB_REPOSITORY" && "$head_fork" == "false" ]]; then
-            echo "safe_pr=true" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Resolve PR review policy
+        id: review_policy
+        uses: $/.github/actions/resolve-review-policy
+        with:
+          workflow-name: opencode-auto-review
+          pr-number: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+          review-mode: ${{ inputs.review_mode }}
+          force-run: ${{ inputs.force_run && 'true' || 'false' }}
+          force-review: ${{ inputs.force_review && 'true' || 'false' }}
+          github-token: ${{ github.token }}
 
   opencode-prepare:
     needs: check-enabled
     if: >-
       needs.check-enabled.outputs.enabled == 'true' &&
-      needs.check-enabled.outputs.auto_enabled == 'true' &&
-      needs.check-enabled.outputs.safe_pr == 'true'
+      needs.check-enabled.outputs.policy_run == 'true'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -470,6 +456,7 @@ jobs:
           pr-number: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
           previous-sha: ${{ steps.ctx.outputs.previous_sha }}
           previous-full-hash: ${{ steps.ctx.outputs.previous_full_hash }}
+          force-full: ${{ inputs.force_review && 'true' || 'false' }}
           context-lines: '3'
           output-directory: ${{ github.workspace }}
 
@@ -485,11 +472,18 @@ jobs:
           expected-head-sha: ${{ steps.prepare-diff.outputs.head-sha }}
           full-diff-sha256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
           diff-mode: ${{ steps.prepare-diff.outputs.diff-mode }}
+          force-review: ${{ inputs.force_review && 'true' || 'false' }}
           input-files-json: ${{ format('["{0}/review-full.diff","{0}/review-scope.json"]', github.workspace) }}
           authenticated-review-json: ${{ steps.ctx.outputs.authenticated_review_json }}
           model-route-json: '["zai-coding-plan/glm-4.7"]'
           effort: final-review/default
           checkpoint-file: ${{ runner.temp }}/opencode-review-budget-claim.json
+
+      - name: Enforce force-review claim
+        if: ${{ always() && !cancelled() && inputs.force_review && steps.review-budget-claim.outputs.allow-invocation != 'true' }}
+        run: |
+          echo '::error::force-review was not authorized by the bounded review budget'
+          exit 1
 
       - name: Seal review scope manifest
         id: scope-integrity
@@ -621,8 +615,7 @@ jobs:
     needs: [check-enabled, opencode-prepare]
     if: >-
       needs.check-enabled.outputs.enabled == 'true' &&
-      needs.check-enabled.outputs.auto_enabled == 'true' &&
-      needs.check-enabled.outputs.safe_pr == 'true' &&
+      needs.check-enabled.outputs.policy_run == 'true' &&
       needs.opencode-prepare.result == 'success' &&
       needs.opencode-prepare.outputs.allow_invocation == 'true'
     runs-on: ubuntu-latest
@@ -3209,8 +3202,7 @@ jobs:
     if: >-
       always() && !cancelled() &&
       needs.check-enabled.outputs.enabled == 'true' &&
-      needs.check-enabled.outputs.auto_enabled == 'true' &&
-      needs.check-enabled.outputs.safe_pr == 'true' &&
+      needs.check-enabled.outputs.policy_run == 'true' &&
       needs.opencode-prepare.result == 'success' &&
       (needs.opencode-prepare.outputs.allow_invocation == 'true' ||
       (needs.opencode-prepare.outputs.budget_decision == 'authenticated_reuse' &&
@@ -5102,8 +5094,7 @@ jobs:
     needs: check-enabled
     if: >-
       needs.check-enabled.outputs.enabled != 'true' ||
-      needs.check-enabled.outputs.auto_enabled != 'true' ||
-      needs.check-enabled.outputs.safe_pr != 'true'
+      needs.check-enabled.outputs.policy_run != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Notice

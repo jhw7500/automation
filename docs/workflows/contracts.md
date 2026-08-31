@@ -152,6 +152,51 @@ Manual mention/comment and manual-dispatch behavior remains available when the a
 caller is enabled. The disabled bootstrap template uses `workflows.<name>.enabled: false`
 for every common caller; enabling any of them is a later repository-owned PR.
 
+## Review controls and external App operation
+
+`review:request` and `review:skip` control only the managed Claude, Gemini, and OpenCode
+workflows. They do not control GitHub App reviews. The resolved managed-workflow mode is, in
+order: both labels are `conflict`; only `review:request` is `request`; only `review:skip` is
+`skip`; and neither label is `auto`. Only with neither label may a `workflow_dispatch`
+`force_review` change `auto` to `request`. `conflict` fails before a model is invoked. Draft
+PRs, `skip`, unsafe forks, and closed PRs succeed without invoking a model. `request` never overrides
+`workflows.<name>.enabled: false`, and `workflows.<name>.auto` still takes precedence over the
+baseline `review.auto: false`.
+
+Beginning with `v1.51`, the closed release inventory also contains exactly these regular,
+non-executable `100644` files:
+
+```text
+.github/actions/resolve-review-policy/action.yml
+.github/actions/resolve-review-policy/resolve_review_policy.py
+```
+
+Release verification authenticates that exact composite-action interface and helper, requires each
+of the Claude, Gemini, and OpenCode reusable workflows to call the resolver exactly once, and checks
+the exact ready-for-review, draft-guard, label, dispatch, and configuration-precedence wiring in
+their managed callers. These inventory and semantic checks apply only to `v1.51+`; `v1.50` and every
+earlier release retain their existing closed inventories and historical caller contracts.
+
+`/jhw:pr` posts `@codex review` and `/gemini review` after the final ready head, so manual
+App review remains available. Operators must keep Codex Code review enabled while disabling
+Automatic reviews in ChatGPT Codex settings. Gemini disables only PR-open automatic review:
+
+```yaml
+code_review:
+  pull_request_opened:
+    code_review: false
+```
+
+This uses only `pull_request_opened.code_review: false`; it does not set `code_review.disable`
+and preserves unrelated existing Gemini configuration keys. `review:skip` cannot cancel an App
+or managed-workflow review that has already started. Fleet activation stops unless an operator
+confirms the Codex setting and the Gemini configuration is mechanically verified.
+
+To roll back the external-App opt-in, restore only Gemini's
+`pull_request_opened.code_review` value to `true` and re-enable Automatic reviews in ChatGPT
+Codex settings; keep Codex Code review enabled. No label or managed-workflow policy changes are
+needed for this rollback.
+
 ## Deterministic automated-review input
 
 Claude, Gemini, and OpenCode call the same composite action:

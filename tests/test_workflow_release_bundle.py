@@ -52,6 +52,10 @@ REVIEW_INVOCATION_BUDGET_RELEASE_FILES = {
     ".github/actions/review-invocation-budget/action.yml",
     ".github/actions/review-invocation-budget/review_invocation_budget.py",
 }
+REVIEW_POLICY_RELEASE_FILES = {
+    ".github/actions/resolve-review-policy/action.yml",
+    ".github/actions/resolve-review-policy/resolve_review_policy.py",
+}
 
 
 def test_canonicalize_review_composite_action_has_exact_safe_shell_contract() -> None:
@@ -389,6 +393,31 @@ def test_review_invocation_budget_capability_boundary_is_closed() -> None:
     assert {root.kind for root in budget_roots} == {"file"}
 
 
+def test_review_policy_release_boundary() -> None:
+    capability = getattr(
+        release_inventory, "release_supports_review_policy", None
+    )
+    assert callable(capability)
+    assert capability("v1.50") is False
+    assert capability("v1.51") is True
+    paths = {
+        root.path.as_posix()
+        for root in release_inventory.release_roots_for("v1.51")
+    }
+    assert REVIEW_POLICY_RELEASE_FILES <= paths
+    assert REVIEW_POLICY_RELEASE_FILES.isdisjoint(
+        root.path.as_posix()
+        for root in release_inventory.release_roots_for("v1.50")
+    )
+    policy_roots = tuple(
+        root
+        for root in release_inventory.release_roots_for("v1.51")
+        if root.path.as_posix() in REVIEW_POLICY_RELEASE_FILES
+    )
+    assert {root.mode for root in policy_roots} == {"100644"}
+    assert {root.kind for root in policy_roots} == {"file"}
+
+
 def test_review_invocation_budget_action_has_exact_safe_contract() -> None:
     payload = REVIEW_INVOCATION_BUDGET_ACTION.read_bytes()
     document = yaml.load(payload, Loader=yaml.BaseLoader)
@@ -543,7 +572,7 @@ def test_release_archive_uses_only_authenticated_tree_and_blob_reads(
     assert release_bundle._git_archive(repo, release_commit)
 
 
-def test_latest_release_archive_default_includes_v146_canonicalizer_files(
+def test_latest_release_archive_default_includes_v151_release_files(
     release_repo: tuple[Path, str],
 ) -> None:
     repo, release_commit = release_repo
@@ -556,7 +585,57 @@ def test_latest_release_archive_default_includes_v146_canonicalizer_files(
         ".github/actions/canonicalize-review/action.yml",
         ".github/actions/canonicalize-review/canonicalize_review.py",
         ".github/actions/canonicalize-review/review_scope.py",
-    } <= names
+    } | REVIEW_POLICY_RELEASE_FILES <= names
+
+
+def test_v150_archive_preserves_historical_inventory_without_review_policy(
+    release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = release_repo
+    for relative in REVIEW_POLICY_RELEASE_FILES:
+        (repo / relative).unlink()
+    historical_commit = commit(repo, "historical v1.50 without review policy")
+
+    archive = release_bundle._git_archive(
+        repo, historical_commit, ref="v1.50"
+    )
+
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as stream:
+        names = set(stream.getnames())
+    assert REVIEW_POLICY_RELEASE_FILES.isdisjoint(names)
+
+
+@pytest.mark.parametrize("mutation", ("missing", "executable"))
+def test_v151_archive_requires_closed_review_policy_inventory(
+    release_repo: tuple[Path, str], mutation: str
+) -> None:
+    repo, _ = release_repo
+    action = repo / ".github/actions/resolve-review-policy/action.yml"
+    if mutation == "missing":
+        action.unlink()
+    elif mutation == "executable":
+        action.chmod(0o755)
+    candidate = commit(repo, f"v1.51 review policy {mutation}")
+
+    with pytest.raises(ReleaseVerificationError, match="archive verified release"):
+        release_bundle._git_archive(repo, candidate, ref="v1.51")
+
+
+def test_v151_release_listing_rejects_extra_review_policy_descendant(
+    release_repo: tuple[Path, str],
+) -> None:
+    repo, release_commit = release_repo
+    roots = release_inventory.release_roots_for("v1.51")
+    tree = release_verifier.VerifiedCommitTree.open(repo, release_commit)
+    listing = tree.listing(release_inventory.release_paths_for("v1.51"))
+    listing += (
+        b"100644 blob "
+        + b"f" * 40
+        + b"\t.github/actions/resolve-review-policy/unowned.py\0"
+    )
+
+    with pytest.raises(ValueError, match="invalid release tree listing"):
+        release_inventory.validate_release_listing(listing, roots)
 
 
 def test_release_archive_rejects_semantically_valid_blob_at_wrong_object_name(

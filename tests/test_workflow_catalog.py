@@ -58,6 +58,26 @@ def test_catalog_and_profiles_are_closed() -> None:
     assert by_kind["config"] == {"workflow-config.yml"}
     assert by_kind["retired"] == {"bump-automation-ref.yml"}
 
+    callers = {
+        entry.path.name: entry
+        for entry in catalog.callers
+        if entry.path.name in {
+            "claude-code-review.yml",
+            "gemini-auto-review.yml",
+            "opencode-auto-review.yml",
+        }
+    }
+    assert set(callers) == {
+        "claude-code-review.yml",
+        "gemini-auto-review.yml",
+        "opencode-auto-review.yml",
+    }
+    for entry in callers.values():
+        assert entry.trigger["pull_request"]["types"] == [
+            "opened", "synchronize", "ready_for_review",
+        ]
+        assert "review_mode" in entry.caller_jobs[0].with_keys
+
 
 def _write(root: Path, catalog: list[dict], repos: dict[str, dict]) -> None:
     (root / "scripts").mkdir()

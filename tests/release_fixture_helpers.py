@@ -34,8 +34,343 @@ V145_PREPARE_DIFF_FIXTURE = (
 )
 
 
+def restore_pre_v151_review_policy_callers(repo: Path) -> None:
+    """Remove only the v1.51 caller policy surface from historical fixtures."""
+
+    baseline_root = repo / "examples/baseline-workflows/.github/workflows"
+    review_mode = (
+        "      review_mode: >-\n"
+        "        ${{\n"
+        "          github.event_name == 'workflow_dispatch' && inputs.force_review && 'request' ||\n"
+        "          contains(github.event.pull_request.labels.*.name, 'review:request') &&\n"
+        "          contains(github.event.pull_request.labels.*.name, 'review:skip') && 'conflict' ||\n"
+        "          contains(github.event.pull_request.labels.*.name, 'review:request') && 'request' ||\n"
+        "          contains(github.event.pull_request.labels.*.name, 'review:skip') && 'skip' ||\n"
+        "          'auto'\n"
+        "        }}\n"
+    )
+    draft_guard = (
+        "      github.event.pull_request.head.repo.full_name == github.repository &&\n"
+        "      github.event.pull_request.draft == false) ||\n"
+    )
+    historical_head_guard = (
+        "      github.event.pull_request.head.repo.full_name == github.repository) ||\n"
+    )
+    dispatch = (
+        "  workflow_dispatch:\n"
+        "    inputs:\n"
+        "      pr_number:\n"
+        "        description: Pull request number\n"
+        "        type: number\n"
+        "        required: true\n"
+        "      force_review:\n"
+        "        description: Perform one authorized same-HEAD review\n"
+        "        type: boolean\n"
+        "        required: false\n"
+        "        default: false\n"
+    )
+    forced_if = (
+        "    if: >-\n"
+        "      (github.event_name == 'pull_request' &&\n"
+        "      github.event.pull_request.head.repo.fork == false &&\n"
+        "      github.event.pull_request.head.repo.full_name == github.repository) ||\n"
+        "      (github.event_name == 'workflow_dispatch' && inputs.force_review)\n"
+    )
+    for filename in (
+        "claude-code-review.yml",
+        "gemini-auto-review.yml",
+        "opencode-auto-review.yml",
+    ):
+        path = baseline_root / filename
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        live_trigger_count = text.count(
+            "    types: [opened, synchronize, ready_for_review]\n"
+        )
+        if live_trigger_count == 0:
+            assert text.count("    types: [opened, synchronize]\n") == 1
+            assert review_mode not in text
+            assert draft_guard not in text
+            continue
+        assert live_trigger_count == 1
+        assert text.count(draft_guard) == 1
+        assert text.count(review_mode) == 1
+        text = text.replace(
+            "    types: [opened, synchronize, ready_for_review]\n",
+            "    types: [opened, synchronize]\n",
+            1,
+        ).replace(draft_guard, historical_head_guard, 1).replace(
+            review_mode, "", 1
+        )
+        if filename == "opencode-auto-review.yml":
+            assert text.count(dispatch) == 1
+            assert text.count(forced_if) == 1
+            assert text.count(
+                "      force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}\n"
+            ) == 1
+            text = text.replace(dispatch, "", 1).replace(forced_if, "", 1).replace(
+                "      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}\n",
+                "      pr_number: ${{ github.event.pull_request.number }}\n",
+                1,
+            ).replace(
+                "      force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}\n",
+                "",
+                1,
+            )
+        path.write_text(text, encoding="utf-8")
+
+    catalog = repo / "scripts/workflow-catalog.json"
+    if catalog.exists():
+        text = catalog.read_text(encoding="utf-8")
+        ready = '            "synchronize",\n            "ready_for_review"\n'
+        review_mode_entry = ',\n            "review_mode"\n'
+        ready_count = text.count(ready)
+        review_mode_count = text.count(review_mode_entry)
+        if ready_count == 0 and review_mode_count == 0:
+            return
+        assert ready_count == 3
+        assert review_mode_count == 3
+        text = text.replace(ready, '            "synchronize"\n', 3).replace(
+            review_mode_entry, "\n", 3
+        )
+        opencode_start = text.index(
+            '      "path": ".github/workflows/opencode-auto-review.yml"'
+        )
+        opencode_end = text.index(
+            '      "path": ".github/workflow-config.yml"', opencode_start
+        )
+        opencode = text[opencode_start:opencode_end]
+        dispatch_entry = (
+            '        },\n'
+            '        "workflow_dispatch": {\n'
+            '          "inputs": {\n'
+            '            "pr_number": {\n'
+            '              "description": "Pull request number",\n'
+            '              "type": "number",\n'
+            '              "required": "true"\n'
+            '            },\n'
+            '            "force_review": {\n'
+            '              "description": "Perform one authorized same-HEAD review",\n'
+            '              "type": "boolean",\n'
+            '              "required": "false",\n'
+            '              "default": "false"\n'
+            '            }\n'
+            '          }\n'
+            '        }\n'
+        )
+        assert opencode.count(dispatch_entry) == 1
+        assert opencode.count('            "force_review",\n') == 1
+        opencode = opencode.replace(dispatch_entry, "        }\n", 1).replace(
+            '            "force_review",\n', "", 1
+        )
+        catalog.write_text(
+            text[:opencode_start] + opencode + text[opencode_end:],
+            encoding="utf-8",
+        )
+
+
+def restore_pre_v151_review_policy(repo: Path) -> None:
+    """Restore live reusable workflows and callers to their pre-v1.51 policy."""
+
+    restore_pre_v151_review_policy_callers(repo)
+    workflow_root = repo / ".github/workflows"
+    review_mode_input = (
+        "      review_mode:\n"
+        "        description: Resolved PR review policy\n"
+        "        type: string\n"
+        "        required: false\n"
+        "        default: auto\n"
+    )
+    policy_outputs = (
+        "      policy_run: ${{ steps.review_policy.outputs.run-review }}\n"
+        "      policy_reason: ${{ steps.review_policy.outputs.reason }}\n"
+        "      policy_head: ${{ steps.review_policy.outputs.head-sha }}\n"
+    )
+
+    for filename, workflow_name in (
+        ("claude-code-review.yml", "claude-code-review"),
+        ("gemini-auto-review.yml", "gemini-auto-review"),
+    ):
+        path = workflow_root / filename
+        text = path.read_text(encoding="utf-8")
+        pr_number = "${{ inputs.pr_number || github.event.pull_request.number }}"
+        policy_step = (
+            "      - name: Resolve PR review policy\n"
+            "        id: review_policy\n"
+            "        uses: $/.github/actions/resolve-review-policy\n"
+            "        with:\n"
+            f"          workflow-name: {workflow_name}\n"
+            f"          pr-number: {pr_number}\n"
+            "          review-mode: ${{ inputs.review_mode }}\n"
+            "          force-run: ${{ inputs.force_run && 'true' || 'false' }}\n"
+            "          force-review: ${{ inputs.force_review && 'true' || 'false' }}\n"
+            "          github-token: ${{ github.token }}\n"
+        )
+        auto_step = (
+            "      - name: Check auto review mode\n"
+            "        id: auto_mode\n"
+            "        env:\n"
+            "          FORCE_RUN: ${{ (inputs.force_run || inputs.force_review) && 'true' || 'false' }}\n"
+            "        run: |-\n"
+            "          CONFIG_FILE=\".github/workflow-config.yml\"\n"
+            "          if [[ \"$FORCE_RUN\" == 'true' ]]; then\n"
+            "            echo \"auto_enabled=true\" >> \"$GITHUB_OUTPUT\"\n"
+            "            exit 0\n"
+            "          fi\n"
+            "\n"
+            "          auto_enabled=\"true\"\n"
+            "          if [[ -f \"$CONFIG_FILE\" ]]; then\n"
+            "            # Per-workflow auto field: workflows.<name>.auto (default: true)\n"
+            "            # Falls back to global review.auto for backward compatibility\n"
+            "            auto_enabled=\"$(ruby -ryaml -e '\n"
+            "              cfg = (YAML.load_file(ARGV[0]) rescue {}) || {}\n"
+            f"              v = cfg.dig(\"workflows\", \"{workflow_name}\", \"auto\")\n"
+            "              v = cfg.dig(\"review\", \"auto\") if v.nil?\n"
+            "              v = true if v.nil?\n"
+            "              puts(v ? \"true\" : \"false\")\n"
+            "            ' \"$CONFIG_FILE\" 2>/dev/null || echo true)\"\n"
+            "          fi\n"
+            "          echo \"auto_enabled=${auto_enabled}\" >> \"$GITHUB_OUTPUT\"\n"
+        )
+        assert text.count(review_mode_input) == 1
+        assert text.count(policy_outputs) == 1
+        assert text.count(policy_step) == 1
+        assert text.count(
+            "          force-run: ${{ inputs.force_run && 'true' || 'false' }}\n"
+        ) == 2
+        assert text.count("needs.check-enabled.outputs.policy_run") == 2
+        text = text.replace(review_mode_input, "", 1).replace(
+            policy_outputs,
+            "      auto_enabled: ${{ steps.auto_mode.outputs.auto_enabled }}\n",
+            1,
+        ).replace(
+            "          force-run: ${{ inputs.force_run && 'true' || 'false' }}\n",
+            "          force-run: ${{ (inputs.force_run || inputs.force_review) && 'true' || 'false' }}\n",
+            1,
+        ).replace(policy_step, auto_step, 1).replace(
+            "needs.check-enabled.outputs.policy_run",
+            "needs.check-enabled.outputs.auto_enabled",
+            2,
+        )
+        if filename == "gemini-auto-review.yml":
+            permission_block = (
+                "    permissions:\n"
+                "      contents: read\n"
+                "      pull-requests: read\n"
+                "    name: Check if enabled\n"
+            )
+            assert text.count(permission_block) == 1
+            text = text.replace(
+                permission_block,
+                "    permissions:\n      contents: read\n    name: Check if enabled\n",
+                1,
+            )
+        path.write_text(text, encoding="utf-8")
+
+    path = workflow_root / "opencode-auto-review.yml"
+    text = path.read_text(encoding="utf-8")
+    force_review_input = (
+        "      force_review:\n"
+        "        description: Perform one explicitly authorized review even when HEAD is unchanged\n"
+        "        type: boolean\n"
+        "        required: false\n"
+        "        default: false\n"
+    )
+    policy_step = (
+        "      - name: Resolve PR review policy\n"
+        "        id: review_policy\n"
+        "        uses: $/.github/actions/resolve-review-policy\n"
+        "        with:\n"
+        "          workflow-name: opencode-auto-review\n"
+        "          pr-number: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}\n"
+        "          review-mode: ${{ inputs.review_mode }}\n"
+        "          force-run: ${{ inputs.force_run && 'true' || 'false' }}\n"
+        "          force-review: ${{ inputs.force_review && 'true' || 'false' }}\n"
+        "          github-token: ${{ github.token }}\n"
+    )
+    historical_steps = (
+        "      - name: Check auto review mode\n"
+        "        id: auto_mode\n"
+        "        env:\n"
+        "          FORCE_RUN: ${{ inputs.force_run && 'true' || 'false' }}\n"
+        "        run: |-\n"
+        "          CONFIG_FILE=\".github/workflow-config.yml\"\n"
+        "          if [[ \"$FORCE_RUN\" == 'true' ]]; then\n"
+        "            echo \"auto_enabled=true\" >> \"$GITHUB_OUTPUT\"\n"
+        "            exit 0\n"
+        "          fi\n"
+        "\n"
+        "          auto_enabled=\"true\"\n"
+        "          if [[ -f \"$CONFIG_FILE\" ]]; then\n"
+        "            # Precedence (matches claude/gemini): workflows.opencode-auto-review.auto → review.auto → default true\n"
+        "            auto_enabled=\"$(ruby -ryaml -e 'cfg = (YAML.load_file(ARGV[0]) rescue {}) || {}; v = cfg.dig(\"workflows\", \"opencode-auto-review\", \"auto\"); v = cfg.dig(\"review\", \"auto\") if v.nil?; v = true if v.nil?; puts(v ? \"true\" : \"false\")' \"$CONFIG_FILE\" 2>/dev/null || echo true)\"\n"
+        "          fi\n"
+        "          echo \"auto_enabled=${auto_enabled}\" >> \"$GITHUB_OUTPUT\"\n"
+        "\n"
+        "      - name: Verify same-repository PR\n"
+        "        id: pr_scope\n"
+        "        env:\n"
+        "          GH_TOKEN: ${{ github.token }}\n"
+        "          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}\n"
+        "        run: |\n"
+        "          echo \"safe_pr=false\" >> \"$GITHUB_OUTPUT\"\n"
+        "          if [[ ! \"$PR_NUMBER\" =~ ^[0-9]+$ ]]; then\n"
+        "            exit 0\n"
+        "          fi\n"
+        "          metadata=\"$(gh api \"repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}\" \\\n"
+        "            --jq '[.head.repo.full_name, .head.repo.fork] | @tsv' 2>/dev/null)\" || exit 0\n"
+        "          IFS=$'\\t' read -r head_repo head_fork <<< \"$metadata\"\n"
+        "          if [[ \"$head_repo\" == \"$GITHUB_REPOSITORY\" && \"$head_fork\" == \"false\" ]]; then\n"
+        "            echo \"safe_pr=true\" >> \"$GITHUB_OUTPUT\"\n"
+        "          fi\n"
+    )
+    assert text.count(review_mode_input) == 1
+    assert text.count(force_review_input) == 1
+    assert text.count(policy_outputs) == 1
+    assert text.count(policy_step) == 1
+    assert text.count("needs.check-enabled.outputs.policy_run == 'true'") == 3
+    assert text.count("needs.check-enabled.outputs.policy_run != 'true'") == 1
+    text = text.replace(review_mode_input, "", 1).replace(
+        force_review_input, "", 1
+    ).replace(
+        policy_outputs,
+        "      auto_enabled: ${{ steps.auto_mode.outputs.auto_enabled }}\n"
+        "      safe_pr: ${{ steps.pr_scope.outputs.safe_pr }}\n",
+        1,
+    ).replace(policy_step, historical_steps, 1).replace(
+        "needs.check-enabled.outputs.policy_run == 'true'",
+        "needs.check-enabled.outputs.auto_enabled == 'true' &&\n"
+        "      needs.check-enabled.outputs.safe_pr == 'true'",
+        3,
+    ).replace(
+        "needs.check-enabled.outputs.policy_run != 'true'",
+        "needs.check-enabled.outputs.auto_enabled != 'true' ||\n"
+        "      needs.check-enabled.outputs.safe_pr != 'true'",
+        1,
+    )
+    for line in (
+        "          force-full: ${{ inputs.force_review && 'true' || 'false' }}\n",
+        "          force-review: ${{ inputs.force_review && 'true' || 'false' }}\n",
+    ):
+        assert text.count(line) == 1
+        text = text.replace(line, "", 1)
+    force_claim = (
+        "      - name: Enforce force-review claim\n"
+        "        if: ${{ always() && !cancelled() && inputs.force_review && steps.review-budget-claim.outputs.allow-invocation != 'true' }}\n"
+        "        run: |\n"
+        "          echo '::error::force-review was not authorized by the bounded review budget'\n"
+        "          exit 1\n"
+        "\n"
+    )
+    assert text.count(force_claim) == 1
+    path.write_text(text.replace(force_claim, "", 1), encoding="utf-8")
+
+
 def restore_pre_force_review_callers(repo: Path) -> None:
     """Remove the force-review caller surface from historical fixtures."""
+
+    restore_pre_v151_review_policy_callers(repo)
 
     baseline_root = repo / "examples/baseline-workflows/.github/workflows"
     for filename in ("claude-code-review.yml", "gemini-auto-review.yml"):

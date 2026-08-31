@@ -26,6 +26,7 @@ from release_fixture_helpers import (
     V145_REVIEW_FIXTURE_ROOT,
     restore_historical_review_workflows,
     restore_pre_force_review_callers,
+    restore_pre_v151_review_policy,
     restore_v145_review_workflows,
 )
 
@@ -87,6 +88,10 @@ CANONICALIZER_RELEASE_FILES = (
 REVIEW_INVOCATION_BUDGET_RELEASE_FILES = (
     ".github/actions/review-invocation-budget/action.yml",
     ".github/actions/review-invocation-budget/review_invocation_budget.py",
+)
+REVIEW_POLICY_RELEASE_FILES = (
+    ".github/actions/resolve-review-policy/action.yml",
+    ".github/actions/resolve-review-policy/resolve_review_policy.py",
 )
 V1462_WORKFLOW_FIXTURE_COMMIT = "d42c28ddd827554e6e46a2ab49dfe34c838c0425"
 V1462_WORKFLOW_FIXTURE_SHA256 = {
@@ -206,6 +211,7 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v151_review_policy(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -269,6 +275,32 @@ def prepare_v147(repo: Path) -> str:
         if git(repo, "status", "--porcelain")
         else git(repo, "rev-parse", "HEAD")
     )
+
+
+def prepare_v151(repo: Path) -> str:
+    for relative in (
+        ".github/actions/resolve-review-policy/action.yml",
+        ".github/actions/resolve-review-policy/resolve_review_policy.py",
+        ".github/workflows/claude-code-review.yml",
+        ".github/workflows/gemini-auto-review.yml",
+        ".github/workflows/opencode-auto-review.yml",
+        "examples/baseline-workflows/.github/workflows/claude-code-review.yml",
+        "examples/baseline-workflows/.github/workflows/gemini-auto-review.yml",
+        "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml",
+        "scripts/workflow-catalog.json",
+    ):
+        source = ROOT / relative
+        target = repo / relative
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists() or target.is_symlink():
+            target.unlink()
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    return commit(repo, "v1.51 candidate")
 
 
 def verify_v147(repo: Path, message: str) -> str:
@@ -1630,6 +1662,337 @@ def test_v147_accepts_current_budget_release_contract(
     candidate = prepare_v147(repo)
 
     assert release_verifier.verify_commit_content(repo, "v1.47", candidate) == candidate
+
+
+def test_v151_accepts_current_review_policy_release_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v151(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.51", candidate) == candidate
+
+
+@pytest.mark.parametrize("relative", REVIEW_POLICY_RELEASE_FILES)
+@pytest.mark.parametrize("mutation", ("missing", "executable", "symlink"))
+def test_v151_requires_each_review_policy_file_as_one_regular_0644_blob(
+    current_release_repo: tuple[Path, str], relative: str, mutation: str
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    target = repo / relative
+    if mutation == "missing":
+        target.unlink()
+    elif mutation == "executable":
+        target.chmod(0o755)
+    else:
+        target.unlink()
+        target.symlink_to("untrusted-policy")
+    bad_commit = commit(repo, f"mutate v1.51 policy file {relative}: {mutation}")
+
+    with pytest.raises(ReleaseVerificationError, match="release inventory"):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+def test_v151_rejects_files_outside_closed_review_policy_action_inventory(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    extra = repo / ".github/actions/resolve-review-policy/unowned.py"
+    extra.write_text("raise RuntimeError('unowned')\n", encoding="utf-8")
+    bad_commit = commit(repo, "add unowned review-policy helper")
+
+    with pytest.raises(ReleaseVerificationError, match="review-policy inventory"):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("section", "mutation"),
+    (
+        ("inputs", "missing"),
+        ("inputs", "extra"),
+        ("inputs", "reordered"),
+        ("outputs", "missing"),
+        ("outputs", "extra"),
+        ("outputs", "reordered"),
+    ),
+)
+def test_v151_rejects_review_policy_action_interface_mutations(
+    current_release_repo: tuple[Path, str], section: str, mutation: str
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = repo / REVIEW_POLICY_RELEASE_FILES[0]
+
+    def mutate(document: dict) -> None:
+        values = document[section]
+        first = next(iter(values))
+        if mutation == "missing":
+            values.pop(first)
+        elif mutation == "extra":
+            values["unowned"] = {"required": "false"}
+        else:
+            value = values.pop(first)
+            values[first] = value
+
+    mutate_yaml(path, mutate)
+    bad_commit = commit(repo, f"mutate review-policy {section}: {mutation}")
+
+    with pytest.raises(ReleaseVerificationError, match="review-policy action"):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("set -euo pipefail", "set -eu"),
+        (
+            'gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}"',
+            'gh pr view "$PR_NUMBER"',
+        ),
+        (
+            '--request-file "$policy_dir/request.json"',
+            '--request-json "$(cat "$policy_dir/request.json")"',
+        ),
+    ),
+)
+def test_v151_rejects_review_policy_action_transport_mutations(
+    current_release_repo: tuple[Path, str], old: str, new: str
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = repo / REVIEW_POLICY_RELEASE_FILES[0]
+    replace(path, old, new, count=1)
+    bad_commit = commit(repo, "weaken review-policy action transport")
+
+    with pytest.raises(ReleaseVerificationError, match="review-policy action"):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+def test_v151_rejects_duplicate_top_level_review_policy_action_key(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = repo / REVIEW_POLICY_RELEASE_FILES[0]
+    replace(
+        path,
+        "\nruns:\n",
+        "\nruns:\n  using: docker\n\nruns:\n",
+        count=1,
+    )
+    bad_commit = commit(repo, "duplicate top-level review-policy action key")
+
+    with pytest.raises(ReleaseVerificationError, match="review-policy action"):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+def test_v151_rejects_duplicate_nested_reusable_workflow_key(
+    current_release_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = repo / ".github/workflows/claude-code-review.yml"
+    replace(
+        path,
+        "      review_mode:\n",
+        "      review_mode:\n"
+        "        description: ignored duplicate\n"
+        "      review_mode:\n",
+        count=1,
+    )
+    monkeypatch.setitem(
+        release_verifier.EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256,
+        "claude",
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    bad_commit = commit(repo, "duplicate nested reusable-workflow key")
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+def test_v151_rejects_duplicate_nested_review_policy_caller_key(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = (
+        repo
+        / "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml"
+    )
+    replace(
+        path,
+        "      review_mode: >-\n",
+        "      review_mode: skip\n      review_mode: >-\n",
+        count=1,
+    )
+    bad_commit = commit(repo, "duplicate nested review-policy caller key")
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("review:request", "review:ask"),
+        ("workflow_auto_", "workflow_default_"),
+        ("    workflow_name: str\n", "    workflow_name: int\n"),
+        (
+            '    if workflow is not None and "auto" in workflow:\n',
+            '    if False and workflow is not None and "auto" in workflow:\n',
+        ),
+    ),
+)
+def test_v151_rejects_review_policy_helper_mutations(
+    current_release_repo: tuple[Path, str], old: str, new: str
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = repo / REVIEW_POLICY_RELEASE_FILES[1]
+    replace(path, old, new, count=1)
+    bad_commit = commit(repo, "weaken review-policy helper")
+
+    with pytest.raises(ReleaseVerificationError, match="review-policy helper"):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "mutation"),
+    (
+        ("claude-code-review.yml", "missing"),
+        ("gemini-auto-review.yml", "duplicate"),
+        ("opencode-auto-review.yml", "missing"),
+    ),
+)
+def test_v151_requires_each_reusable_to_call_review_policy_exactly_once(
+    current_release_repo: tuple[Path, str], workflow: str, mutation: str
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = repo / ".github/workflows" / workflow
+
+    def mutate(document: dict) -> None:
+        job = document["jobs"]["check-enabled"]
+        step = next(
+            item
+            for item in job["steps"]
+            if item.get("uses") == "$/.github/actions/resolve-review-policy"
+        )
+        if mutation == "missing":
+            job["steps"].remove(step)
+        else:
+            job["steps"].append(dict(step))
+
+    mutate_yaml(path, mutate)
+    bad_commit = commit(repo, f"{mutation} review-policy action in {workflow}")
+
+    with pytest.raises(ReleaseVerificationError, match="review action dependency"):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("reviewer", "workflow", "job"),
+    (
+        ("claude", "claude-code-review.yml", "claude-review"),
+        ("gemini", "gemini-auto-review.yml", "gemini-review"),
+        ("opencode", "opencode-auto-review.yml", "opencode-review"),
+    ),
+)
+def test_v151_rejects_provider_job_without_policy_run_dependency(
+    current_release_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    reviewer: str,
+    workflow: str,
+    job: str,
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = repo / ".github/workflows" / workflow
+
+    def mutate(document: dict) -> None:
+        condition = document["jobs"][job]["if"]
+        document["jobs"][job]["if"] = condition.replace(
+            "needs.check-enabled.outputs.policy_run == 'true'", "true", 1
+        )
+
+    mutate_yaml(path, mutate)
+    monkeypatch.setitem(
+        release_verifier.EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256,
+        reviewer,
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    bad_commit = commit(repo, f"remove {reviewer} policy_run dependency")
+
+    with pytest.raises(ReleaseVerificationError, match="review-policy workflow"):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "mutation"),
+    (
+        ("claude-code-review.yml", "ready-trigger"),
+        ("gemini-auto-review.yml", "draft-guard"),
+        ("opencode-auto-review.yml", "review-mode"),
+        ("claude-code-review.yml", "label-spelling"),
+        ("gemini-auto-review.yml", "precedence"),
+        ("opencode-auto-review.yml", "dispatch-shape"),
+    ),
+)
+def test_v151_rejects_review_policy_caller_mutations(
+    current_release_repo: tuple[Path, str], workflow: str, mutation: str
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = (
+        repo
+        / "examples/baseline-workflows/.github/workflows"
+        / workflow
+    )
+    if mutation == "ready-trigger":
+        replace(path, ", ready_for_review", "", count=1)
+    elif mutation == "draft-guard":
+        replace(
+            path,
+            "      github.event.pull_request.head.repo.full_name == github.repository &&\n"
+            "      github.event.pull_request.draft == false) ||\n",
+            "      github.event.pull_request.head.repo.full_name == github.repository) ||\n",
+            count=1,
+        )
+    elif mutation == "review-mode":
+        mutate_yaml(
+            path,
+            lambda document: document["jobs"]["opencode-review"]["with"].pop(
+                "review_mode"
+            ),
+        )
+    elif mutation == "label-spelling":
+        replace(path, "review:request", "review:ask")
+    elif mutation == "precedence":
+        text = path.read_text(encoding="utf-8")
+        request = "          contains(github.event.pull_request.labels.*.name, 'review:request') && 'request' ||\n"
+        skip = "          contains(github.event.pull_request.labels.*.name, 'review:skip') && 'skip' ||\n"
+        assert text.count(request) == 1 and text.count(skip) == 1
+        path.write_text(
+            text.replace(request, "__REQUEST_BRANCH__\n", 1)
+            .replace(skip, request, 1)
+            .replace("__REQUEST_BRANCH__\n", skip, 1),
+            encoding="utf-8",
+        )
+    else:
+        replace(
+            path,
+            "      (github.event_name == 'workflow_dispatch' && inputs.force_review)\n",
+            "      github.event_name == 'workflow_dispatch'\n",
+            count=1,
+        )
+    bad_commit = commit(repo, f"mutate {workflow} policy caller: {mutation}")
+
+    with pytest.raises(ReleaseVerificationError, match="review-policy caller"):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
 
 
 @pytest.mark.parametrize("relative", REVIEW_INVOCATION_BUDGET_RELEASE_FILES)

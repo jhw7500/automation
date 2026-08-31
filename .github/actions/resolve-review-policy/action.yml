@@ -1,0 +1,88 @@
+name: Resolve Review Policy
+description: Resolve a deterministic review policy before model invocation.
+
+inputs:
+  workflow-name:
+    description: Workflow name in workflow-config.yml.
+    required: true
+  pr-number:
+    description: Pull request number.
+    required: true
+  review-mode:
+    description: Requested review mode.
+    required: true
+  force-run:
+    description: Run even when the workflow is disabled.
+    required: true
+  force-review:
+    description: Request a review for a manual dispatch.
+    required: true
+  github-token:
+    description: Token used to read the pull request.
+    required: true
+
+outputs:
+  run-review:
+    description: Whether a review may run.
+    value: ${{ steps.resolve.outputs.run-review }}
+  effective-mode:
+    description: The resolved review mode.
+    value: ${{ steps.resolve.outputs.effective-mode }}
+  reason:
+    description: Deterministic resolution reason.
+    value: ${{ steps.resolve.outputs.reason }}
+  head-sha:
+    description: Validated pull request head SHA.
+    value: ${{ steps.resolve.outputs.head-sha }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        REVIEW_MODE: ${{ inputs.review-mode }}
+        WORKFLOW_NAME: ${{ inputs.workflow-name }}
+        FORCE_RUN: ${{ inputs.force-run }}
+        FORCE_REVIEW: ${{ inputs.force-review }}
+      run: |
+        set -euo pipefail
+        policy_dir="$RUNNER_TEMP/review-policy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        install -d -m 0700 "$policy_dir"
+        gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$policy_dir/pr.json"
+        ruby -ryaml -rjson -e 'cfg = File.file?(ARGV[0]) ? (YAML.safe_load_file(ARGV[0], aliases: false) || {}) : {}; File.write(ARGV[1], JSON.generate(cfg))' \
+          .github/workflow-config.yml "$policy_dir/config.json"
+        python3 - "$policy_dir/pr.json" "$policy_dir/config.json" "$policy_dir/request.json" <<'PY'
+        import json
+        import os
+        import sys
+        from pathlib import Path
+
+        def boolean(name: str) -> bool:
+            value = os.environ[name]
+            if value not in {"true", "false"}:
+                raise SystemExit(f"{name.lower()}_invalid")
+            return value == "true"
+
+        pr_path, config_path, request_path = map(Path, sys.argv[1:])
+        payload = {
+            "workflow_name": os.environ["WORKFLOW_NAME"],
+            "review_mode": os.environ["REVIEW_MODE"],
+            "force_run": boolean("FORCE_RUN"),
+            "force_review": boolean("FORCE_REVIEW"),
+            "event_name": os.environ["GITHUB_EVENT_NAME"],
+            "repository": os.environ["GITHUB_REPOSITORY"],
+            "pr": json.loads(pr_path.read_text(encoding="utf-8")),
+            "config": json.loads(config_path.read_text(encoding="utf-8")),
+        }
+        request_path.write_text(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        PY
+        python3 "$GITHUB_ACTION_PATH/resolve_review_policy.py" \
+          --request-file "$policy_dir/request.json" \
+          --result-file "$policy_dir/result.json" \
+          --github-output "$GITHUB_OUTPUT"

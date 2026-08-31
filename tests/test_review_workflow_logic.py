@@ -368,6 +368,125 @@ def _step_id(job: dict, name: str) -> str:
     return next(step["id"] for step in job["steps"] if step.get("name") == name)
 
 
+REVIEW_WORKFLOWS = {
+    name: _load(f"{name}.yml")
+    for name in (
+        "claude-code-review",
+        "gemini-auto-review",
+        "opencode-auto-review",
+    )
+}
+
+
+@pytest.mark.parametrize("workflow_name", REVIEW_WORKFLOWS)
+def test_review_policy_wiring_is_exact_for_every_provider(workflow_name):
+    workflow = REVIEW_WORKFLOWS[workflow_name]
+    mode = workflow["on"]["workflow_call"]["inputs"]["review_mode"]
+    policy = _step(workflow, "check-enabled", "Resolve PR review policy")
+
+    assert mode == {
+        "description": "Resolved PR review policy",
+        "type": "string",
+        "required": "false",
+        "default": "auto",
+    }
+    assert policy["id"] == "review_policy"
+    assert policy["uses"] == "$/.github/actions/resolve-review-policy"
+    assert policy["with"] == {
+        "workflow-name": workflow_name,
+        "pr-number": (
+            "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}"
+            if workflow_name == "opencode-auto-review"
+            else "${{ inputs.pr_number || github.event.pull_request.number }}"
+        ),
+        "review-mode": "${{ inputs.review_mode }}",
+        "force-run": "${{ inputs.force_run && 'true' || 'false' }}",
+        "force-review": "${{ inputs.force_review && 'true' || 'false' }}",
+        "github-token": "${{ github.token }}",
+    }
+    assert "if" not in policy
+    assert workflow["jobs"]["check-enabled"]["outputs"] | {
+        "policy_run": "${{ steps.review_policy.outputs.run-review }}",
+        "policy_reason": "${{ steps.review_policy.outputs.reason }}",
+        "policy_head": "${{ steps.review_policy.outputs.head-sha }}",
+    } == workflow["jobs"]["check-enabled"]["outputs"]
+    assert all(
+        step.get("name") != "Check auto review mode"
+        for step in workflow["jobs"]["check-enabled"]["steps"]
+    )
+
+
+def test_every_provider_job_is_review_policy_gated():
+    cases = (
+        ("claude-code-review", "claude-review"),
+        ("gemini-auto-review", "gemini-review"),
+        ("opencode-auto-review", "opencode-prepare"),
+    )
+    for workflow_name, job_name in cases:
+        condition = REVIEW_WORKFLOWS[workflow_name]["jobs"][job_name]["if"]
+        assert "needs.check-enabled.outputs.enabled == 'true'" in condition
+        assert "needs.check-enabled.outputs.policy_run == 'true'" in condition
+
+
+def test_review_policy_jobs_do_not_drop_pull_request_read_permission():
+    for workflow in REVIEW_WORKFLOWS.values():
+        check_job = workflow["jobs"]["check-enabled"]
+        assert _step(workflow, "check-enabled", "Resolve PR review policy")
+
+        permissions = check_job.get("permissions")
+        pull_request_permission = (
+            "inherited" if permissions is None else permissions.get("pull-requests")
+        )
+        assert pull_request_permission in {"inherited", "read"}
+
+
+def _job_needs(job: dict) -> set[str]:
+    needs = job.get("needs", [])
+    return {needs} if isinstance(needs, str) else set(needs)
+
+
+def _transitive_job_needs(jobs: dict, job_name: str) -> set[str]:
+    pending = list(_job_needs(jobs[job_name]))
+    result: set[str] = set()
+    while pending:
+        dependency = pending.pop()
+        if dependency in result:
+            continue
+        result.add(dependency)
+        pending.extend(_job_needs(jobs[dependency]))
+    return result
+
+
+def test_review_policy_precedes_diff_and_every_model_path_depends_on_its_gate():
+    cases = (
+        ("claude-code-review", "claude-review", "Run Claude Code Review"),
+        ("gemini-auto-review", "gemini-review", "Run Gemini Code Review"),
+        ("opencode-auto-review", "opencode-review", "Run OpenCode PR review"),
+    )
+    for workflow_name, provider_job_name, provider_step_name in cases:
+        workflow = REVIEW_WORKFLOWS[workflow_name]
+        jobs = workflow["jobs"]
+        first_job_name = (
+            "opencode-prepare" if workflow_name == "opencode-auto-review" else provider_job_name
+        )
+        first_job = jobs[first_job_name]
+        policy = _step(workflow, "check-enabled", "Resolve PR review policy")
+
+        assert sum(
+            step.get("uses") == "$/.github/actions/resolve-review-policy"
+            for job in jobs.values()
+            for step in job.get("steps", [])
+        ) == 1
+        assert "if" not in policy
+        assert "check-enabled" in _job_needs(first_job)
+        assert "needs.check-enabled.outputs.policy_run == 'true'" in first_job["if"]
+        assert _step(workflow, provider_job_name, provider_step_name)
+
+        dependencies = _transitive_job_needs(jobs, provider_job_name)
+        assert first_job_name == provider_job_name or first_job_name in dependencies
+        assert "check-enabled" in dependencies
+
+
 def _github_outputs(path: Path) -> dict[str, str]:
     return dict(
         line.split("=", 1)
@@ -2986,7 +3105,7 @@ def test_shared_diff_models_use_one_selected_artifact_and_scope_prompt():
     )
 
 
-def test_force_review_is_opt_in_and_forces_a_full_diff_for_both_reviewers():
+def test_force_review_is_opt_in_and_forces_a_full_diff_for_every_provider():
     for workflow_name, job_name, prepare_name, claim_name in (
         (
             "claude-code-review.yml",
@@ -2999,6 +3118,12 @@ def test_force_review_is_opt_in_and_forces_a_full_diff_for_both_reviewers():
             "gemini-review",
             "Prepare review diff",
             "Claim Gemini review budget",
+        ),
+        (
+            "opencode-auto-review.yml",
+            "opencode-prepare",
+            "Prepare review diff",
+            "Claim OpenCode review budget",
         ),
     ):
         workflow = _load(workflow_name)
@@ -8095,6 +8220,7 @@ def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
         "pr-number": "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
         "previous-sha": "${{ steps.ctx.outputs.previous_sha }}",
         "previous-full-hash": "${{ steps.ctx.outputs.previous_full_hash }}",
+        "force-full": "${{ inputs.force_review && 'true' || 'false' }}",
         "context-lines": "3",
         "output-directory": "${{ github.workspace }}",
     }
@@ -8150,6 +8276,7 @@ def test_opencode_budget_claim_is_sealed_before_tokenless_model_job():
         "expected-head-sha": "${{ steps.prepare-diff.outputs.head-sha }}",
         "full-diff-sha256": "${{ steps.prepare-diff.outputs.full-diff-sha256 }}",
         "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
+        "force-review": "${{ inputs.force_review && 'true' || 'false' }}",
         "input-files-json": "${{ format('[\"{0}/review-full.diff\",\"{0}/review-scope.json\"]', github.workspace) }}",
         "authenticated-review-json": "${{ steps.ctx.outputs.authenticated_review_json }}",
         "model-route-json": '["zai-coding-plan/glm-4.7"]',

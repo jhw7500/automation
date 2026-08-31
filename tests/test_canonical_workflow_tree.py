@@ -20,6 +20,26 @@ from scripts.workflow_catalog import (  # noqa: E402
 )
 
 
+REVIEW_MODE_EXPRESSION = " ".join(
+    """
+    ${{
+      github.event_name == 'workflow_dispatch' && inputs.force_review && 'request' ||
+      contains(github.event.pull_request.labels.*.name, 'review:request') &&
+      contains(github.event.pull_request.labels.*.name, 'review:skip') && 'conflict' ||
+      contains(github.event.pull_request.labels.*.name, 'review:request') && 'request' ||
+      contains(github.event.pull_request.labels.*.name, 'review:skip') && 'skip' ||
+      'auto'
+    }}
+    """.split()
+)
+SELF_REVIEW_MODE_EXPRESSION = " ".join(
+    REVIEW_MODE_EXPRESSION.replace(
+        "github.event_name == 'workflow_dispatch' && inputs.force_review && 'request' || ",
+        "",
+    ).split()
+)
+
+
 EXPECTED_WORKFLOW_NAMES = {
     "auto-rereview-request",
     "claude",
@@ -61,7 +81,7 @@ EXPECTED_TRIGGERS: dict[str, object] = {
         "issues": {"types": ["opened", "assigned"]},
     },
     "claude-code-review.yml": {
-        "pull_request": {"types": ["opened", "synchronize"]},
+        "pull_request": {"types": ["opened", "synchronize", "ready_for_review"]},
         "workflow_dispatch": {
             "inputs": {
                 "pr_number": {
@@ -79,7 +99,7 @@ EXPECTED_TRIGGERS: dict[str, object] = {
         },
     },
     "gemini-auto-review.yml": {
-        "pull_request": {"types": ["opened", "synchronize"]},
+        "pull_request": {"types": ["opened", "synchronize", "ready_for_review"]},
         "workflow_dispatch": {
             "inputs": {
                 "pr_number": {
@@ -230,7 +250,22 @@ EXPECTED_TRIGGERS: dict[str, object] = {
         "pull_request_review_comment": {"types": ["created"]},
     },
     "opencode-auto-review.yml": {
-        "pull_request": {"types": ["opened", "synchronize"]}
+        "pull_request": {"types": ["opened", "synchronize", "ready_for_review"]},
+        "workflow_dispatch": {
+            "inputs": {
+                "pr_number": {
+                    "description": "Pull request number",
+                    "type": "number",
+                    "required": "true",
+                },
+                "force_review": {
+                    "description": "Perform one authorized same-HEAD review",
+                    "type": "boolean",
+                    "required": "false",
+                    "default": "false",
+                },
+            }
+        },
     },
 }
 
@@ -361,6 +396,19 @@ def test_bootstrap_config_matches_the_approved_disabled_policy() -> None:
     )
 
 
+def test_automation_config_has_an_explicit_disabled_review_default() -> None:
+    config = load_yaml(ROOT / ".github/workflow-config.yml")
+
+    assert config["review"] == {"auto": "false"}
+
+
+def test_automation_gemini_app_is_manual_review_only() -> None:
+    config = yaml.safe_load((ROOT / ".gemini/config.yaml").read_text())
+
+    assert config == {"code_review": {"pull_request_opened": {"code_review": False}}}
+    assert config["code_review"].get("disable") is None
+
+
 def test_triggers_and_permissions_match_the_approved_policy() -> None:
     workflow_root = CANONICAL / "workflows"
     actual_names = {path.name for path in workflow_root.glob("*.yml")}
@@ -434,3 +482,38 @@ def test_canonical_callers_use_only_the_selected_auth_contract() -> None:
                 }
             else:
                 assert "secrets" not in job
+
+
+def test_auto_review_callers_forward_the_resolved_review_mode() -> None:
+    callers = {
+        "claude-code-review.yml": "claude-review",
+        "gemini-auto-review.yml": "gemini-review",
+        "opencode-auto-review.yml": "opencode-review",
+    }
+    for filename, job_name in callers.items():
+        caller = load_yaml(CANONICAL / "workflows" / filename)
+        job = caller["jobs"][job_name]
+
+        assert caller["on"]["pull_request"]["types"] == [
+            "opened", "synchronize", "ready_for_review",
+        ]
+        assert " ".join(job["with"]["review_mode"].split()) == REVIEW_MODE_EXPRESSION
+        assert "github.event.pull_request.draft == false" in job["if"]
+
+
+def test_self_auto_review_callers_forward_label_review_mode() -> None:
+    callers = {
+        "_self-claude-review.yml": "claude-review",
+        "_self-gemini-auto-review.yml": "gemini-review",
+        "_self-opencode-auto-review.yml": "opencode-review",
+    }
+    for filename, job_name in callers.items():
+        caller = load_yaml(ROOT / ".github/workflows" / filename)
+        job = caller["jobs"][job_name]
+
+        assert caller["on"]["pull_request"]["types"] == [
+            "opened", "synchronize", "ready_for_review",
+        ]
+        assert " ".join(job["with"]["review_mode"].split()) == SELF_REVIEW_MODE_EXPRESSION
+        assert "github.event.pull_request.draft == false" in job["if"]
+        assert job["with"]["force_review"] == "false"

@@ -52,7 +52,8 @@
         "pull_request": {
           "types": [
             "opened",
-            "synchronize"
+            "synchronize",
+            "ready_for_review"
           ]
         },
         "workflow_dispatch": {
@@ -83,7 +84,8 @@
           },
           "with": [
             "force_review",
-            "pr_number"
+            "pr_number",
+            "review_mode"
           ],
           "secrets": [
             "CLAUDE_CODE_OAUTH_TOKEN"
@@ -101,7 +103,8 @@
         "pull_request": {
           "types": [
             "opened",
-            "synchronize"
+            "synchronize",
+            "ready_for_review"
           ]
         },
         "workflow_dispatch": {
@@ -134,7 +137,8 @@
             "force_review",
             "pr_number",
             "publisher_app_id",
-            "repo_write_auth"
+            "repo_write_auth",
+            "review_mode"
           ],
           "secrets": [
             "APP_PRIVATE_KEY",
@@ -607,8 +611,24 @@
         "pull_request": {
           "types": [
             "opened",
-            "synchronize"
+            "synchronize",
+            "ready_for_review"
           ]
+        },
+        "workflow_dispatch": {
+          "inputs": {
+            "pr_number": {
+              "description": "Pull request number",
+              "type": "number",
+              "required": "true"
+            },
+            "force_review": {
+              "description": "Perform one authorized same-HEAD review",
+              "type": "boolean",
+              "required": "false",
+              "default": "false"
+            }
+          }
         }
       },
       "caller_jobs": [
@@ -622,7 +642,9 @@
             "pull-requests": "write"
           },
           "with": [
-            "pr_number"
+            "force_review",
+            "pr_number",
+            "review_mode"
           ],
           "secrets": [
             "ZHIPU_API_KEY"
