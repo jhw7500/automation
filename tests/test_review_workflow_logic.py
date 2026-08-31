@@ -428,6 +428,18 @@ def test_every_provider_job_is_review_policy_gated():
         assert "needs.check-enabled.outputs.policy_run == 'true'" in condition
 
 
+def test_review_policy_jobs_do_not_drop_pull_request_read_permission():
+    for workflow in REVIEW_WORKFLOWS.values():
+        check_job = workflow["jobs"]["check-enabled"]
+        assert _step(workflow, "check-enabled", "Resolve PR review policy")
+
+        permissions = check_job.get("permissions")
+        pull_request_permission = (
+            "inherited" if permissions is None else permissions.get("pull-requests")
+        )
+        assert pull_request_permission in {"inherited", "read"}
+
+
 def _job_needs(job: dict) -> set[str]:
     needs = job.get("needs", [])
     return {needs} if isinstance(needs, str) else set(needs)

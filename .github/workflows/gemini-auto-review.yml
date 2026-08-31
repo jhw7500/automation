@@ -49,6 +49,7 @@ jobs:
   check-enabled:
     permissions:
       contents: read
+      pull-requests: read
     name: Check if enabled
     runs-on: ubuntu-latest
     outputs:
