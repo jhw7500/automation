@@ -1238,6 +1238,49 @@ class ReleaseVerificationError(RuntimeError):
     """The requested release is absent, points elsewhere, or violates invariants."""
 
 
+class _DuplicateKeyRejectingLoader(yaml.BaseLoader):
+    """Preserve BaseLoader scalars while rejecting every duplicate mapping key."""
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict:
+        mapping: dict = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in mapping
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found an unhashable key",
+                    key_node.start_mark,
+                ) from exc
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
+
+
+def _load_release_yaml(
+    payload: str | bytes, *, reject_duplicate_keys: bool
+) -> object:
+    loader = (
+        _DuplicateKeyRejectingLoader
+        if reject_duplicate_keys
+        else yaml.BaseLoader
+    )
+    try:
+        return yaml.load(payload, Loader=loader)
+    except yaml.YAMLError:
+        if not reject_duplicate_keys:
+            raise
+        raise ReleaseVerificationError("v1.51 release YAML is invalid") from None
+
+
 @dataclass(frozen=True)
 class AnnotatedTag:
     ref: str
@@ -2455,8 +2498,9 @@ def _release_version(ref: str) -> tuple[int, ...]:
 def _verify_setup_gemini_auth(tree: VerifiedCommitTree, ref: str) -> None:
     path = SETUP_GEMINI_AUTH_ROOT.path.as_posix()
     try:
-        document = yaml.load(
-            tree.read_text(path), Loader=yaml.BaseLoader
+        document = _load_release_yaml(
+            tree.read_text(path),
+            reject_duplicate_keys=release_supports_review_policy(ref),
         )
     except (ReleaseVerificationError, yaml.YAMLError):
         raise ReleaseVerificationError(
@@ -2474,7 +2518,10 @@ def _verify_setup_gemini_auth(tree: VerifiedCommitTree, ref: str) -> None:
 def _verify_prepare_review_diff_action(tree: VerifiedCommitTree, ref: str) -> None:
     path = PREPARE_REVIEW_DIFF_ACTION_ROOT.path.as_posix()
     try:
-        document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
+        document = _load_release_yaml(
+            tree.read_text(path),
+            reject_duplicate_keys=release_supports_review_policy(ref),
+        )
     except (ReleaseVerificationError, yaml.YAMLError):
         raise ReleaseVerificationError(
             "prepare-review-diff action contract is invalid"
@@ -2876,9 +2923,9 @@ def _verify_review_policy_action(
     if actual_files != expected_files:
         raise ReleaseVerificationError("review-policy inventory is not closed")
     try:
-        action = yaml.load(
+        action = _load_release_yaml(
             tree.read_file(REVIEW_POLICY_ACTION_ROOT.path),
-            Loader=yaml.BaseLoader,
+            reject_duplicate_keys=True,
         )
         if (
             action != EXPECTED_REVIEW_POLICY_ACTION
@@ -3022,7 +3069,9 @@ def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree) -> None:
         ) from None
 
 
-def _verify_canonicalize_review_action(tree: VerifiedCommitTree) -> None:
+def _verify_canonicalize_review_action(
+    tree: VerifiedCommitTree, ref: str
+) -> None:
     expected_files = {
         (root.path.as_posix(), "100644", "blob")
         for root in (
@@ -3041,7 +3090,10 @@ def _verify_canonicalize_review_action(tree: VerifiedCommitTree) -> None:
         )
     path = CANONICALIZE_REVIEW_ACTION_ROOT.path.as_posix()
     try:
-        document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
+        document = _load_release_yaml(
+            tree.read_text(path),
+            reject_duplicate_keys=release_supports_review_policy(ref),
+        )
     except (ReleaseVerificationError, yaml.YAMLError):
         raise ReleaseVerificationError(
             "canonicalize-review action contract is invalid"
@@ -3151,7 +3203,10 @@ def _verify_tag_catalog(
             name = f"{config.canonical_dir}/{relative}"
             text = tree.read_text(name)
             try:
-                document = yaml.load(text, Loader=yaml.BaseLoader)
+                document = _load_release_yaml(
+                    text,
+                    reject_duplicate_keys=release_supports_review_policy(ref),
+                )
             except yaml.YAMLError as exc:
                 raise ReleaseVerificationError(f"{name} is invalid YAML") from exc
             if not isinstance(document, dict):
@@ -3294,7 +3349,10 @@ def _verify_manual_gemini_output_contract(
     for filename, contract in MANUAL_GEMINI_FETCH_CONTRACTS.items():
         path = f"{root}/{filename}"
         try:
-            document = yaml.load(tree.read_text(path), Loader=yaml.BaseLoader)
+            document = _load_release_yaml(
+                tree.read_text(path),
+                reject_duplicate_keys=release_supports_review_policy(ref),
+            )
             prepare = document["jobs"]["prepare"]
             downstream = document["jobs"][contract.downstream_job]
             downstream_with = downstream["with"]
@@ -4836,7 +4894,10 @@ def require_budget_workflow_contract(
         if REVIEWER_WORKFLOWS.get(reviewer) != workflow:
             raise ValueError("reviewer workflow mismatch")
         payload = tree.read_file(f".github/workflows/{workflow}")
-        document = yaml.load(payload, Loader=yaml.BaseLoader)
+        document = _load_release_yaml(
+            payload,
+            reject_duplicate_keys=review_policy,
+        )
         if not isinstance(document, dict) or not isinstance(document.get("jobs"), dict):
             raise ValueError("workflow document differs")
         jobs = document["jobs"]
@@ -5453,7 +5514,10 @@ def _verify_review_invocation_budget(
     action_path = REVIEW_INVOCATION_BUDGET_ACTION_ROOT.path.as_posix()
     try:
         action_payload = tree.read_file(action_path)
-        action = yaml.load(action_payload, Loader=yaml.BaseLoader)
+        action = _load_release_yaml(
+            action_payload,
+            reject_duplicate_keys=release_supports_review_policy(ref),
+        )
         if action != EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION:
             raise ValueError("action differs")
     except (AttributeError, ReleaseVerificationError, TypeError, ValueError, yaml.YAMLError):
@@ -5697,8 +5761,9 @@ def _verify_review_policy_callers(tree: VerifiedCommitTree) -> None:
             path = (
                 "examples/baseline-workflows/.github/workflows/" + workflow
             )
-            document = yaml.load(
-                tree.read_file(path), Loader=yaml.BaseLoader
+            document = _load_release_yaml(
+                tree.read_file(path),
+                reject_duplicate_keys=True,
             )
             if not isinstance(document, dict) or document.get("on") != trigger:
                 raise ValueError("caller trigger differs")
@@ -6459,7 +6524,7 @@ def _verify_commit_content(
     if release_supports_prepare_review_diff(ref):
         _verify_prepare_review_diff_action(tree, ref)
     if release_supports_canonicalize_review(ref):
-        _verify_canonicalize_review_action(tree)
+        _verify_canonicalize_review_action(tree, ref)
     if release_supports_review_policy(ref):
         _verify_review_policy_action(tree, ref)
         _verify_review_policy_callers(tree)
@@ -6490,7 +6555,10 @@ def _verify_commit_content(
                 raise ReleaseVerificationError(
                     f"{name} checkout reference is not the approved immutable commit"
                 )
-        data = yaml.load(text, Loader=yaml.BaseLoader)
+        data = _load_release_yaml(
+            text,
+            reject_duplicate_keys=release_supports_review_policy(ref),
+        )
         relative = PurePosixPath(name).relative_to(workflow_root)
         if len(relative.parts) != 1:
             if relative.name in central_workflows:

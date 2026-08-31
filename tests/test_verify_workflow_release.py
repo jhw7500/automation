@@ -1770,6 +1770,71 @@ def test_v151_rejects_review_policy_action_transport_mutations(
         release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
 
 
+def test_v151_rejects_duplicate_top_level_review_policy_action_key(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = repo / REVIEW_POLICY_RELEASE_FILES[0]
+    replace(
+        path,
+        "\nruns:\n",
+        "\nruns:\n  using: docker\n\nruns:\n",
+        count=1,
+    )
+    bad_commit = commit(repo, "duplicate top-level review-policy action key")
+
+    with pytest.raises(ReleaseVerificationError, match="review-policy action"):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+def test_v151_rejects_duplicate_nested_reusable_workflow_key(
+    current_release_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = repo / ".github/workflows/claude-code-review.yml"
+    replace(
+        path,
+        "      review_mode:\n",
+        "      review_mode:\n"
+        "        description: ignored duplicate\n"
+        "      review_mode:\n",
+        count=1,
+    )
+    monkeypatch.setitem(
+        release_verifier.EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256,
+        "claude",
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    bad_commit = commit(repo, "duplicate nested reusable-workflow key")
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
+def test_v151_rejects_duplicate_nested_review_policy_caller_key(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v151(repo)
+    path = (
+        repo
+        / "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml"
+    )
+    replace(
+        path,
+        "      review_mode: >-\n",
+        "      review_mode: skip\n      review_mode: >-\n",
+        count=1,
+    )
+    bad_commit = commit(repo, "duplicate nested review-policy caller key")
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.51", bad_commit)
+
+
 @pytest.mark.parametrize(
     ("old", "new"),
     (
