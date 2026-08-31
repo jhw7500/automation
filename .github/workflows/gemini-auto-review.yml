@@ -1014,11 +1014,33 @@ jobs:
           # 요구한 49초보다 짧게 기다려 마지막 재시도를 3초 일찍 소진했다.
           RETRY_SLEEP = float(os.environ.get("GEMINI_429_RETRY_SLEEP", "35"))
           RETRY_JITTER = float(os.environ.get("GEMINI_429_RETRY_JITTER", "5"))
+          TRANSIENT_RETRY_SLEEP = float(
+              os.environ.get("GEMINI_TRANSIENT_RETRY_SLEEP", "5")
+          )
           EMPTY_RETRY_SLEEP = float(os.environ.get("GEMINI_EMPTY_RETRY_SLEEP", "2"))
           PROCESS_TIMEOUT = max(
               float(os.environ.get("GEMINI_REVIEW_PROCESS_TIMEOUT", "450")), 0
           )
           RETRY_DEADLINE_MARGIN = 5.0
+
+          def provider_http_status(err):
+              status = getattr(err, 'status_code', None)
+              if not isinstance(status, int):
+                  status = getattr(err, 'code', None)
+              if isinstance(status, int):
+                  return status
+              message = str(err)
+              patterns = (
+                  r'^\s*([45][0-9]{2})(?:\s+[A-Z][A-Z_]*\b|[\s:.,{])',
+                  r'\bhttp(?:\s+status)?\s*[:=]?\s*([45][0-9]{2})\b',
+                  r'''["']?(?:status[_ ]?code|code)["']?\s*[:=]\s*'''
+                  r'([45][0-9]{2})\b',
+              )
+              for pattern in patterns:
+                  match = re.search(pattern, message, re.I)
+                  if match:
+                      return int(match.group(1))
+              return None
 
           # 429 판정은 SDK의 정식 예외 타입을 우선 보고, 메시지 문자열은 SDK 포맷 변화
           # 대비 보조 조건으로 남긴다. google.api_core는 google-generativeai의 의존성이라
@@ -1027,10 +1049,16 @@ jobs:
               from google.api_core import exceptions as api_exceptions
 
               def is_rate_limited(err):
-                  return isinstance(err, api_exceptions.ResourceExhausted) or "429" in str(err)
+                  return (
+                      isinstance(err, api_exceptions.ResourceExhausted)
+                      or provider_http_status(err) == 429
+                  )
           except ImportError:
               def is_rate_limited(err):
-                  return "429" in str(err)
+                  return provider_http_status(err) == 429
+
+          def is_transient_provider_failure(err):
+              return provider_http_status(err) in {500, 502, 503, 504}
 
           def server_retry_delay(err):
               message = str(err)
@@ -1132,8 +1160,9 @@ jobs:
                   try:
                       response = counted_generate_content(prompt, model)
                   except Exception as error:
+                      rate_limited = is_rate_limited(error)
                       if (
-                          is_rate_limited(error)
+                          rate_limited
                           and is_daily_request_quota_exhausted(error)
                           and server_retry_delay(error) <= 0
                       ):
@@ -1142,7 +1171,27 @@ jobs:
                               "skipping unrecoverable retries"
                           )
                           raise
-                      if not is_rate_limited(error) or attempt == max_attempts - 1:
+                      if not rate_limited and is_transient_provider_failure(error):
+                          # A provider-side 5xx can be a short-lived outage. Retry only
+                          # once inside this already-claimed round; do not turn the
+                          # three-call ceiling into three same-model 5xx attempts.
+                          if attempt > 0 or attempt == max_attempts - 1:
+                              raise
+                          delay = max(TRANSIENT_RETRY_SLEEP, 0)
+                          if not retry_delay_fits_process_budget(delay):
+                              print(
+                                  f"Transient retry delay {delay:.2f}s does not fit within "
+                                  "the remaining Gemini process budget; skipping retry"
+                              )
+                              raise
+                          print(
+                              f"Transient provider failure "
+                              f"(attempt {attempt + 1}/{max_attempts}): {error}; "
+                              f"retrying once in {delay:.2f}s"
+                          )
+                          time.sleep(delay)
+                          continue
+                      if not rate_limited or attempt == max_attempts - 1:
                           raise
                       # 서버 대기시간을 절대 줄이지 않으며, 지터는 동시 재시도만 분산한다.
                       delay_floor = max(RETRY_SLEEP * (2 ** attempt), server_retry_delay(error))

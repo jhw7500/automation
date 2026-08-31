@@ -608,6 +608,14 @@ triggers the model fallback because changing models cannot repair that failure c
 unsupported caller location is published as `unsupported_location` rather than collapsed into
 `provider_failed`.
 
+A provider-side HTTP `500`, `502`, `503`, or `504` failure receives at most one same-model retry
+after a short bounded delay inside the already-claimed review round. If that retry also fails, the
+configured fallback may use the final request; without a distinct fallback the failure stops after
+two calls instead of spending the full three-call allowance. The retry is counted normally and
+must fit within the existing process watchdog. It does not refund the claimed automatic round or
+relax duplicate-head admission. Authentication, unsupported-location, invalid-input, and other
+non-transient failures are not retried.
+
 Gemini 429 handling separates retry eligibility from the final failure classification. A positive
 provider `RetryInfo`/`Please retry in` delay remains authoritative even when the same response
 contains a requests-per-day quota ID. Second and millisecond guidance both use the existing

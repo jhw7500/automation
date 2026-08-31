@@ -7210,6 +7210,159 @@ def test_gemini_retries_on_429_then_succeeds(tmp_path):
     assert "RETRY SURVIVOR REVIEW" in (tmp_path / "gemini_review.md").read_text(encoding="utf-8")
 
 
+def test_gemini_retries_transient_503_once_then_succeeds(tmp_path):
+    """A short provider outage must not strand the already-claimed review round."""
+    (tmp_path / "gemini_review.py").write_text(
+        _extract_gemini_python(), encoding="utf-8"
+    )
+    _write_legacy_gemini_request_stub(
+        tmp_path,
+        "        counter = pathlib.Path('attempts.txt')\n"
+        "        n = int(counter.read_text()) if counter.exists() else 0\n"
+        "        counter.write_text(str(n + 1))\n"
+        "        if n == 0:\n"
+        "            raise RuntimeError(\n"
+        "                '503 UNAVAILABLE: This model is currently experiencing high demand. '\n"
+        "                'Please try again later.'\n"
+        "            )\n"
+        "        return _R()\n",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env["GEMINI_TRANSIENT_RETRY_SLEEP"] = "0"
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "attempts.txt").read_text() == "2"
+    assert (tmp_path / "gemini_review.md").read_text() == "COUNTED REVIEW"
+
+
+def test_gemini_stops_after_one_transient_503_retry(tmp_path):
+    """Repeated 5xx failures get one retry, not the full three-call allowance."""
+    (tmp_path / "gemini_review.py").write_text(
+        _extract_gemini_python(), encoding="utf-8"
+    )
+    _write_legacy_gemini_request_stub(
+        tmp_path,
+        "        raise RuntimeError(\n"
+        "            '503 UNAVAILABLE: This model is currently experiencing high demand. '\n"
+        "            'Please try again later.'\n"
+        "        )\n",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env["GEMINI_TRANSIENT_RETRY_SLEEP"] = "0"
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "sdk-calls.txt").read_text().splitlines() == [
+        "gemini-3.7-flash", "gemini-3.7-flash",
+    ]
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "provider_failed"
+
+
+def test_gemini_429_retry_delay_containing_503ms_is_not_a_5xx(tmp_path):
+    """RetryInfo milliseconds are delay data, not an embedded HTTP status."""
+    (tmp_path / "gemini_review.py").write_text(
+        _extract_gemini_python(), encoding="utf-8"
+    )
+    _write_legacy_gemini_request_stub(
+        tmp_path,
+        "        counter = pathlib.Path('attempts.txt')\n"
+        "        n = int(counter.read_text()) if counter.exists() else 0\n"
+        "        counter.write_text(str(n + 1))\n"
+        "        if n == 0:\n"
+        "            raise RuntimeError(\n"
+        "                '429 RESOURCE_EXHAUSTED: Please retry in 503ms'\n"
+        "            )\n"
+        "        return _R()\n",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env.update({
+        "GEMINI_429_RETRY_SLEEP": "0",
+        "GEMINI_429_RETRY_JITTER": "0",
+        "GEMINI_TRANSIENT_RETRY_SLEEP": "0",
+    })
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "attempts.txt").read_text() == "2"
+    assert "Rate limited (attempt 1/3)" in result.stdout
+    assert "Transient provider failure" not in result.stdout
+
+
+def test_gemini_invalid_input_containing_500_is_not_retried(tmp_path):
+    """An input limit mentioned in prose must not be mistaken for HTTP 500."""
+    (tmp_path / "gemini_review.py").write_text(
+        _extract_gemini_python(), encoding="utf-8"
+    )
+    _write_legacy_gemini_request_stub(
+        tmp_path,
+        "        raise RuntimeError(\n"
+        "            '400 INVALID_ARGUMENT: input exceeds the 500-token limit'\n"
+        "        )\n",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env["GEMINI_TRANSIENT_RETRY_SLEEP"] = "0"
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "sdk-calls.txt").read_text().splitlines() == [
+        "gemini-3.7-flash",
+    ]
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == "provider_failed"
+
+
+def test_gemini_503_retry_delay_containing_429ms_stays_transient(tmp_path):
+    """A 5xx status keeps precedence over delay data that happens to contain 429."""
+    (tmp_path / "gemini_review.py").write_text(
+        _extract_gemini_python(), encoding="utf-8"
+    )
+    _write_legacy_gemini_request_stub(
+        tmp_path,
+        "        raise RuntimeError(\n"
+        "            '503 UNAVAILABLE: Please retry in 429ms'\n"
+        "        )\n",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env.update({
+        "GEMINI_429_RETRY_SLEEP": "0",
+        "GEMINI_429_RETRY_JITTER": "0",
+        "GEMINI_TRANSIENT_RETRY_SLEEP": "0",
+    })
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "sdk-calls.txt").read_text().splitlines() == [
+        "gemini-3.7-flash", "gemini-3.7-flash",
+    ]
+    assert "Transient provider failure (attempt 1/3)" in result.stdout
+    assert "Rate limited" not in result.stdout
+
+
 def test_gemini_retries_empty_response_with_balanced_thinking(tmp_path):
     """Gemini 3 may finish thinking without text; retry it with an explicit medium budget."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
@@ -7343,19 +7496,25 @@ def test_gemini_auto_review_configures_stable_primary_and_fallback_models():
 
 
 @pytest.mark.parametrize(
-    "primary_error",
+    ("primary_error", "expected_models"),
     (
-        "Server disconnected without sending a response",
         (
-            "503 UNAVAILABLE. {'error': {'code': 503, 'message': "
-            "'This model is currently experiencing high demand. Please try again later.', "
-            "'status': 'UNAVAILABLE'}}"
+            "Server disconnected without sending a response",
+            ["primary-model", "fallback-model"],
+        ),
+        (
+            (
+                "503 UNAVAILABLE. {'error': {'code': 503, 'message': "
+                "'This model is currently experiencing high demand. Please try again later.', "
+                "'status': 'UNAVAILABLE'}}"
+            ),
+            ["primary-model", "primary-model", "fallback-model"],
         ),
     ),
     ids=("transport", "high-demand"),
 )
 def test_gemini_uses_configured_fallback_after_eligible_provider_failure(
-    tmp_path, primary_error,
+    tmp_path, primary_error, expected_models,
 ):
     """An eligible provider failure gets one isolated attempt on the fallback model."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
@@ -7396,6 +7555,7 @@ def test_gemini_uses_configured_fallback_after_eligible_provider_failure(
     env.update({
         "GEMINI_MODEL": "primary-model",
         "GEMINI_FALLBACK_MODEL": "fallback-model",
+        "GEMINI_TRANSIENT_RETRY_SLEEP": "0",
     })
 
     result = subprocess.run(
@@ -7404,9 +7564,7 @@ def test_gemini_uses_configured_fallback_after_eligible_provider_failure(
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (tmp_path / "models.txt").read_text().splitlines() == [
-        "primary-model", "fallback-model",
-    ]
+    assert (tmp_path / "models.txt").read_text().splitlines() == expected_models
     assert (tmp_path / "gemini_review.md").read_text() == "FALLBACK REVIEW"
     assert (tmp_path / "gemini_failure_reason.txt").read_text() == ""
 
