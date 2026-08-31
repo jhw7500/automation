@@ -156,10 +156,10 @@ for every common caller; enabling any of them is a later repository-owned PR.
 
 `review:request` and `review:skip` control only the managed Claude, Gemini, and OpenCode
 workflows. They do not control GitHub App reviews. The resolved managed-workflow mode is, in
-order: a `workflow_dispatch` `force_review` is `request`; both labels are `conflict`; only
-`review:request` is `request`; only `review:skip` is `skip`; and neither label is `auto`.
-`conflict` fails before a model is invoked. Draft PRs, `skip`, unsafe forks, and closed PRs
-succeed without invoking a model. `request` never overrides
+order: both labels are `conflict`; only `review:request` is `request`; only `review:skip` is
+`skip`; and neither label is `auto`. Only with neither label may a `workflow_dispatch`
+`force_review` change `auto` to `request`. `conflict` fails before a model is invoked. Draft
+PRs, `skip`, unsafe forks, and closed PRs succeed without invoking a model. `request` never overrides
 `workflows.<name>.enabled: false`, and `workflows.<name>.auto` still takes precedence over the
 baseline `review.auto: false`.
 
