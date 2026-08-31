@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass, replace
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -30,7 +31,13 @@ from scripts.prepare_workflow_rollout import (  # noqa: E402
     RolloutError,
     render_repository,
 )
-from scripts.workflow_catalog import WorkflowCatalog  # noqa: E402
+from scripts.workflow_catalog import (  # noqa: E402
+    CatalogError,
+    RepoProfile,
+    WorkflowCatalog,
+    configured_branch_targets,
+    validate_resolved_branch_targets,
+)
 from scripts.workflow_fleet_git import (  # noqa: E402
     FleetGitError,
     PullRequest,
@@ -102,6 +109,7 @@ class RepoOutcome:
     pr_url: str = ""
     changed_paths: tuple[str, ...] = ()
     stage: str = ""
+    base_branch: str = ""
 
 
 @dataclass(frozen=True)
@@ -117,6 +125,9 @@ class PreparedRepo:
     action: str
     outcome: RepoOutcome
     plan: RenderPlan | None
+    base_branch: str = ""
+    target_branch: str | None = None
+    default_branch: str = ""
 
 
 @dataclass
@@ -125,6 +136,7 @@ class PublicationProgress:
     base_sha: str = ""
     head_sha: str = ""
     changed_paths: tuple[str, ...] = ()
+    base_branch: str = ""
 
 
 def _publication_blocked(
@@ -143,6 +155,7 @@ def _publication_blocked(
         pr_url,
         progress.changed_paths,
         progress.stage,
+        progress.base_branch,
     )
 
 
@@ -159,22 +172,55 @@ def git(
     return fleet_git.run([*GIT_PREFIX, *args], cwd=cwd, stdin=stdin)
 
 
-def rollout_branch(ref: str) -> str:
+def _selected_base_branch(snapshot: RepositorySnapshot) -> str:
+    return snapshot.base_branch or snapshot.default_branch
+
+
+def _is_additional_branch(base_branch: str | None, default_branch: str | None) -> bool:
+    return base_branch is not None and default_branch is not None and base_branch != default_branch
+
+
+def rollout_branch(
+    ref: str,
+    base_branch: str | None = None,
+    default_branch: str | None = None,
+) -> str:
     if VERSION_REF.fullmatch(ref) is None:
         raise CommandError(f"invalid release ref: {ref}")
-    return f"automation/common-workflows-{ref}"
+    branch = f"automation/common-workflows-{ref}"
+    if _is_additional_branch(base_branch, default_branch):
+        assert base_branch is not None
+        return f"{branch}-{hashlib.sha256(base_branch.encode('utf-8')).hexdigest()}"
+    return branch
 
 
-def pr_title(ref: str) -> str:
+def pr_title(
+    ref: str,
+    base_branch: str | None = None,
+    default_branch: str | None = None,
+) -> str:
+    if _is_additional_branch(base_branch, default_branch):
+        return f"ci: adopt common automation workflows ({ref}; base={base_branch})"
     return f"ci: adopt common automation workflows ({ref})"
 
 
-def pr_body(ref: str, commit: str, changed_paths: Sequence[str]) -> str:
+def pr_body(
+    ref: str,
+    commit: str,
+    changed_paths: Sequence[str],
+    base_branch: str | None = None,
+    default_branch: str | None = None,
+) -> str:
     paths = "\n".join(f"- `{path}`" for path in sorted(changed_paths))
+    base = (
+        f"- base branch: `{base_branch}`\n"
+        if _is_additional_branch(base_branch, default_branch)
+        else ""
+    )
     return (
         "Standardize only the catalogued common AI workflow callers.\n\n"
         f"- automation tag: `{ref}`\n- automation commit: `{commit}`\n"
-        f"- managed paths:\n{paths}\n\n"
+        f"{base}- managed paths:\n{paths}\n\n"
         "Project-specific workflows are unchanged. This PR does not modify secrets. "
         "Merge and recovery use this repository's normal GitHub controls.\n"
     )
@@ -809,7 +855,8 @@ def construct_rollout_commit(
             )
         ):
             raise RolloutError("render change does not match the managed result")
-    branch = rollout_branch(ref)
+    selected_base = _selected_base_branch(snapshot)
+    branch = rollout_branch(ref, selected_base, snapshot.default_branch)
     with tempfile.TemporaryDirectory(prefix="workflow-fleet-index-") as temporary:
         root = Path(temporary)
         environment = _hermetic_environment(root, root / "index")
@@ -876,7 +923,7 @@ def construct_rollout_commit(
                 ["commit-tree", tree, "-p", base_sha],
                 cwd=snapshot.path,
                 environment=environment,
-                stdin=(pr_title(ref) + "\n").encode("utf-8"),
+                stdin=(pr_title(ref, selected_base, snapshot.default_branch) + "\n").encode("utf-8"),
             ).decode("ascii"),
             "rollout commit",
         )
@@ -899,7 +946,7 @@ def construct_rollout_commit(
         tree_sha=tree,
         base_tree_sha=base_tree,
         base_sha=base_sha,
-        message=pr_title(ref),
+        message=pr_title(ref, selected_base, snapshot.default_branch),
         blobs=tuple(blobs),
         deletions=tuple(
             change.path.as_posix()
@@ -939,10 +986,11 @@ def inspect_rollout(
 ) -> RolloutInspection:
     """Classify the exact release branch and pull-request identity."""
 
-    branch = rollout_branch(ref)
+    selected_base = _selected_base_branch(snapshot)
+    branch = rollout_branch(ref, selected_base, snapshot.default_branch)
     changed = _changed_paths(plan)
-    title = pr_title(ref)
-    body = pr_body(ref, commit, changed)
+    title = pr_title(ref, selected_base, snapshot.default_branch)
+    body = pr_body(ref, commit, changed, selected_base, snapshot.default_branch)
     branch_sha = fleet_git.remote_branch_sha(snapshot, branch)
     if branch_sha is None:
         requests = fleet_git.list_rollout_prs(
@@ -960,7 +1008,7 @@ def inspect_rollout(
         return RolloutInspection("create_pr", branch_sha)
     if len(requests) != 1 or not _exact_pr(
         requests[0],
-        base=snapshot.default_branch,
+        base=selected_base,
         branch=branch,
         head_repo=f"{fleet_git.OWNER}/{snapshot.path.name}",
         head_sha=branch_sha,
@@ -974,7 +1022,10 @@ def inspect_rollout(
 def require_no_current_rollout_branch(snapshot: RepositorySnapshot, ref: str) -> None:
     """Refuse a stale exact release branch when the default is already current."""
 
-    if fleet_git.remote_branch_sha(snapshot, rollout_branch(ref)) is not None:
+    selected_base = _selected_base_branch(snapshot)
+    if fleet_git.remote_branch_sha(
+        snapshot, rollout_branch(ref, selected_base, snapshot.default_branch)
+    ) is not None:
         raise CommandError(
             "rollout branch exists although the observed default is already current"
         )
@@ -990,7 +1041,8 @@ def attest_pull_request(
 ) -> None:
     """Re-read the release branch and exact PR before reporting publication."""
 
-    branch = rollout_branch(ref)
+    selected_base = _selected_base_branch(snapshot)
+    branch = rollout_branch(ref, selected_base, snapshot.default_branch)
     if fleet_git.remote_branch_sha(snapshot, branch) != head_sha:
         raise CommandError("rollout branch changed after pull request creation")
     requests = fleet_git.list_rollout_prs(fleet_git.OWNER, snapshot.path.name, branch)
@@ -1000,12 +1052,14 @@ def attest_pull_request(
         or requests[0].url != request.url
         or not _exact_pr(
             requests[0],
-            base=snapshot.default_branch,
+            base=selected_base,
             branch=branch,
             head_repo=f"{fleet_git.OWNER}/{snapshot.path.name}",
             head_sha=head_sha,
-            title=pr_title(ref),
-            body=pr_body(ref, commit, changed_paths),
+            title=pr_title(ref, selected_base, snapshot.default_branch),
+            body=pr_body(
+                ref, commit, changed_paths, selected_base, snapshot.default_branch
+            ),
         )
     ):
         raise CommandError("pull request attestation failed")
@@ -1035,12 +1089,13 @@ def _render(
 def _prepared_outcome(
     repo: str,
     base_sha: str,
+    base_branch: str,
     plan: RenderPlan,
     inspection: RolloutInspection | None,
 ) -> RepoOutcome:
     changed = _changed_paths(plan)
     if plan.status == "current":
-        return RepoOutcome(repo, "current", plan.reason, base_sha)
+        return RepoOutcome(repo, "current", plan.reason, base_sha, base_branch=base_branch)
     assert inspection is not None
     details = {
         "create_branch": "would create an exact branch, commit, and pull request",
@@ -1056,7 +1111,47 @@ def _prepared_outcome(
         inspection.branch_sha,
         inspection.pr_url,
         changed,
+        base_branch=base_branch,
     )
+
+
+def _block_inconsistent_prepared_targets(
+    profile: RepoProfile,
+    ref: str,
+    prepared: Sequence[PreparedRepo],
+) -> tuple[PreparedRepo, ...]:
+    """Fail closed when configured targets no longer have unique identities."""
+
+    if any(item.outcome.status == "blocked" for item in prepared):
+        return tuple(prepared)
+    resolved = tuple(
+        (item.target_branch, item.default_branch, item.base_branch)
+        for item in prepared
+    )
+    try:
+        validate_resolved_branch_targets(profile, resolved)
+        heads = tuple(
+            rollout_branch(ref, base_branch, default_branch)
+            for _, default_branch, base_branch in resolved
+        )
+        if len(set(heads)) != len(heads):
+            raise CatalogError("branch target rollout heads are not unique")
+    except CatalogError as exc:
+        detail = f"branch target consistency failed: {exc}"
+        return tuple(
+            replace(
+                item,
+                action="blocked",
+                outcome=replace(
+                    item.outcome,
+                    status="blocked",
+                    detail=detail,
+                    stage="consistency",
+                ),
+            )
+            for item in prepared
+        )
+    return tuple(prepared)
 
 
 def prevalidate_repository(
@@ -1064,30 +1159,68 @@ def prevalidate_repository(
     workspace: Path,
     *,
     repo: str,
+    base_branch: str | None = None,
     bootstrap: bool,
     actionlint: Path | None,
 ) -> PreparedRepo:
     """Perform every read/render/validation gate without remote mutation."""
 
     base_sha = ""
+    selected_base = base_branch or ""
+    observed_default = ""
     plan: RenderPlan | None = None
     try:
-        snapshot = fleet_git.clone_default_branch(bundle.config.owner, repo, workspace)
-        base_sha = fleet_git.refetch_default(snapshot)
+        if base_branch is None:
+            snapshot = fleet_git.clone_default_branch(
+                bundle.config.owner, repo, workspace
+            )
+            base_sha = fleet_git.refetch_default(snapshot)
+        else:
+            snapshot = fleet_git.clone_branch(
+                bundle.config.owner, repo, workspace, base_branch
+            )
+            base_sha = fleet_git.refetch_branch(snapshot)
+        selected_base = _selected_base_branch(snapshot)
+        observed_default = snapshot.default_branch
         snapshot = replace(snapshot, base_sha=base_sha)
+        if bootstrap and selected_base != snapshot.default_branch:
+            return PreparedRepo(
+                repo,
+                "blocked",
+                RepoOutcome(
+                    repo,
+                    "blocked",
+                    "bootstrap is permitted only on the default branch",
+                    base_sha,
+                    base_branch=selected_base,
+                ),
+                None,
+                selected_base,
+                base_branch,
+                observed_default,
+            )
         git(["switch", "--detach", base_sha], cwd=snapshot.path)
         plan = _render(snapshot, bundle, repo, bootstrap=bootstrap)
         if plan.status == "blocked":
             return PreparedRepo(
                 repo,
                 "blocked",
-                RepoOutcome(repo, "blocked", plan.reason, base_sha),
+                RepoOutcome(repo, "blocked", plan.reason, base_sha, base_branch=selected_base),
                 plan,
+                selected_base,
+                base_branch,
+                observed_default,
             )
         if plan.status == "current":
             require_no_current_rollout_branch(snapshot, bundle.ref)
             return PreparedRepo(
-                repo, "current", _prepared_outcome(repo, base_sha, plan, None), plan
+                repo,
+                "current",
+                _prepared_outcome(repo, base_sha, selected_base, plan, None),
+                plan,
+                selected_base,
+                base_branch,
+                observed_default,
             )
         validate_managed_result(
             snapshot.path, bundle, plan, actionlint, bootstrap=bootstrap
@@ -1098,22 +1231,34 @@ def prevalidate_repository(
         return PreparedRepo(
             repo,
             inspection.action,
-            _prepared_outcome(repo, base_sha, plan, inspection),
+            _prepared_outcome(repo, base_sha, selected_base, plan, inspection),
             plan,
+            selected_base,
+            base_branch,
+            observed_default,
         )
     except (CommandError, FleetGitError, RolloutError) as exc:
         return PreparedRepo(
             repo,
             "blocked",
-            RepoOutcome(repo, "blocked", str(exc), base_sha),
+            RepoOutcome(repo, "blocked", str(exc), base_sha, base_branch=selected_base),
             plan,
+            selected_base,
+            base_branch,
+            observed_default,
         )
     except (OSError, KeyError, ValueError):
         return PreparedRepo(
             repo,
             "blocked",
-            RepoOutcome(repo, "blocked", "local prevalidation failed", base_sha),
+            RepoOutcome(
+                repo, "blocked", "local prevalidation failed", base_sha,
+                base_branch=selected_base,
+            ),
             plan,
+            selected_base,
+            base_branch,
+            observed_default,
         )
 
 
@@ -1129,7 +1274,8 @@ def publish_new_branch(
 ) -> str:
     """Create one local commit and publish one previously absent exact branch."""
 
-    branch = rollout_branch(ref)
+    selected_base = _selected_base_branch(snapshot)
+    branch = rollout_branch(ref, selected_base, snapshot.default_branch)
     if bundle is not None:
         validate_managed_result(
             snapshot.path,
@@ -1166,19 +1312,42 @@ def _publish_repository_fresh(
     workspace: Path,
     *,
     repo: str,
+    base_branch: str | None,
+    prevalidated_default_branch: str | None,
     bootstrap: bool,
     actionlint: Path | None,
     progress: PublicationProgress,
 ) -> RepoOutcome:
     """Refetch/recompute one repository and create or reuse only its exact PR."""
 
-    branch = rollout_branch(bundle.ref)
     with _make_clone_workspace(workspace, f".publish-{repo}-") as temporary:
-        snapshot = fleet_git.clone_default_branch(
-            bundle.config.owner, repo, Path(temporary)
-        )
+        if base_branch is None:
+            snapshot = fleet_git.clone_default_branch(
+                bundle.config.owner, repo, Path(temporary)
+            )
+        else:
+            snapshot = fleet_git.clone_branch(
+                bundle.config.owner, repo, Path(temporary), base_branch
+            )
+        selected_base = _selected_base_branch(snapshot)
+        progress.base_branch = selected_base
+        if (
+            (base_branch is not None and selected_base != base_branch)
+            or (
+                prevalidated_default_branch is not None
+                and snapshot.default_branch != prevalidated_default_branch
+            )
+        ):
+            raise CommandError(
+                "prevalidated base/default branch identity no longer matches"
+            )
+        branch = rollout_branch(bundle.ref, selected_base, snapshot.default_branch)
         progress.stage = "refetch"
-        base_sha = fleet_git.refetch_default(snapshot)
+        base_sha = (
+            fleet_git.refetch_default(snapshot)
+            if base_branch is None
+            else fleet_git.refetch_branch(snapshot)
+        )
         snapshot = replace(snapshot, base_sha=base_sha)
         progress.base_sha = base_sha
         git(["switch", "--detach", base_sha], cwd=snapshot.path)
@@ -1191,7 +1360,10 @@ def _publish_repository_fresh(
         if plan.status == "current":
             progress.stage = "branch"
             require_no_current_rollout_branch(snapshot, bundle.ref)
-            return RepoOutcome(repo, "current", plan.reason, base_sha, stage="complete")
+            return RepoOutcome(
+                repo, "current", plan.reason, base_sha, stage="complete",
+                base_branch=selected_base,
+            )
         progress.stage = "validation"
         validate_managed_result(
             snapshot.path, bundle, plan, actionlint, bootstrap=bootstrap
@@ -1200,8 +1372,10 @@ def _publish_repository_fresh(
         inspection = inspect_rollout(
             snapshot, base_sha, bundle.ref, bundle.commit, plan
         )
-        body = pr_body(bundle.ref, bundle.commit, changed)
-        title = pr_title(bundle.ref)
+        body = pr_body(
+            bundle.ref, bundle.commit, changed, selected_base, snapshot.default_branch
+        )
+        title = pr_title(bundle.ref, selected_base, snapshot.default_branch)
         if inspection.action == "reuse":
             return RepoOutcome(
                 repo,
@@ -1212,6 +1386,7 @@ def _publish_repository_fresh(
                 inspection.pr_url,
                 changed,
                 "complete",
+                selected_base,
             )
         if inspection.action == "create_branch":
             try:
@@ -1235,7 +1410,7 @@ def _publish_repository_fresh(
             request = fleet_git.create_pull_request(
                 bundle.config.owner,
                 repo,
-                snapshot.default_branch,
+                selected_base,
                 branch,
                 head_sha,
                 title,
@@ -1249,7 +1424,7 @@ def _publish_repository_fresh(
                     for item in requests
                     if _exact_pr(
                         item,
-                        base=snapshot.default_branch,
+                        base=selected_base,
                         branch=branch,
                         head_repo=f"{bundle.config.owner}/{repo}",
                         head_sha=head_sha,
@@ -1295,6 +1470,7 @@ def _publish_repository_fresh(
             request.url,
             changed,
             "complete",
+            selected_base,
         )
 
 
@@ -1303,6 +1479,8 @@ def publish_repository(
     workspace: Path,
     *,
     repo: str,
+    base_branch: str | None = None,
+    prevalidated_default_branch: str | None = None,
     bootstrap: bool,
     actionlint: Path | None,
 ) -> RepoOutcome:
@@ -1314,6 +1492,8 @@ def publish_repository(
             bundle,
             workspace,
             repo=repo,
+            base_branch=base_branch,
+            prevalidated_default_branch=prevalidated_default_branch,
             bootstrap=bootstrap,
             actionlint=actionlint,
             progress=progress,
@@ -1452,21 +1632,39 @@ def main(argv: list[str] | None = None) -> int:
             and not bundle.config.profiles[args.bootstrap_repo].bootstrap_allowed
         ):
             parser.error("release profile does not allow bootstrap")
-        branch = rollout_branch(bundle.ref)
-        del branch  # parsing the exact branch is an early fail-closed gate
+        rollout_branch(bundle.ref)  # parse the default identity before prevalidation
 
         prepared: list[PreparedRepo] = []
-        with _make_clone_workspace(workspace, ".prevalidate-") as temporary:
-            for repo in repos:
-                prepared.append(
-                    prevalidate_repository(
-                        bundle,
-                        Path(temporary),
-                        repo=repo,
-                        bootstrap=args.bootstrap_repo == repo,
-                        actionlint=actionlint,
+        for repo in repos:
+            profile = bundle.config.profiles[repo]
+            for target_branch in configured_branch_targets(profile):
+                with _make_clone_workspace(
+                    workspace, f".prevalidate-{repo}-"
+                ) as temporary:
+                    prepared.append(
+                        prevalidate_repository(
+                            bundle,
+                            Path(temporary),
+                            repo=repo,
+                            base_branch=target_branch,
+                            bootstrap=(
+                                args.bootstrap_repo == repo and target_branch is None
+                            ),
+                            actionlint=actionlint,
+                        )
                     )
-                )
+
+        for repo in repos:
+            indexes = [
+                index for index, item in enumerate(prepared) if item.repo == repo
+            ]
+            checked = _block_inconsistent_prepared_targets(
+                bundle.config.profiles[repo],
+                bundle.ref,
+                tuple(prepared[index] for index in indexes),
+            )
+            for index, item in zip(indexes, checked):
+                prepared[index] = item
 
         if args.mode == "plan" or any(
             item.outcome.status == "blocked" for item in prepared
@@ -1488,7 +1686,12 @@ def main(argv: list[str] | None = None) -> int:
                             bundle,
                             workspace,
                             repo=item.repo,
-                            bootstrap=args.bootstrap_repo == item.repo,
+                            base_branch=item.base_branch or None,
+                            prevalidated_default_branch=item.default_branch or None,
+                            bootstrap=(
+                                args.bootstrap_repo == item.repo
+                                and item.target_branch is None
+                            ),
                             actionlint=actionlint,
                         )
                     )
@@ -1527,7 +1730,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         for item in outcomes:
             suffix = f" {item.pr_url}" if item.pr_url else ""
-            print(f"{item.status.upper():9} {item.repo}: {item.detail}{suffix}")
+            target = item.base_branch or "unknown"
+            print(
+                f"{item.status.upper():9} {item.repo}[{target}]: "
+                f"{item.detail}{suffix}"
+            )
         blocked = sum(item.status == "blocked" for item in outcomes)
         print(
             f"SUMMARY mode={args.mode} ref={bundle.ref} commit={bundle.commit} "

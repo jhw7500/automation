@@ -24,7 +24,12 @@ from scripts.prepare_workflow_rollout import (  # noqa: E402
     render_repository,
 )
 from scripts.workflow_fleet_git import FleetGitError  # noqa: E402
-from scripts.workflow_catalog import RepoProfile  # noqa: E402
+from scripts.workflow_catalog import (  # noqa: E402
+    CatalogError,
+    RepoProfile,
+    configured_branch_targets,
+    validate_resolved_branch_targets,
+)
 from scripts.workflow_release_bundle import (  # noqa: E402
     ReleaseBundle,
     materialize_release_bundle,
@@ -33,6 +38,7 @@ from scripts.workflow_release_bundle import (  # noqa: E402
 
 VERSION_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
 WORKSPACE_MARKER = ".automation-fleet-workspace"
+UNRESOLVED_DEFAULT_BRANCH = "default:unresolved"
 GIT_PREFIX = (
     "git",
     "-c",
@@ -45,6 +51,7 @@ GIT_PREFIX = (
 @dataclass(frozen=True)
 class AuditResult:
     repo: str
+    base_branch: str
     status: Literal["current", "drift", "blocked"]
     detail: str
     changed_paths: tuple[str, ...]
@@ -58,6 +65,7 @@ def audit_repository(
     variable_names: set[str],
     *,
     observed_revision: str | None = None,
+    base_branch: str = "",
 ) -> AuditResult:
     """Return a renderer-derived content classification without writing."""
 
@@ -75,14 +83,46 @@ def audit_repository(
             observed_revision=observed_revision,
         )
     except RolloutError as exc:
-        return AuditResult(repo.name, "blocked", str(exc), ())
+        return AuditResult(repo.name, base_branch, "blocked", str(exc), ())
 
     if plan.status == "blocked":
-        return AuditResult(repo.name, "blocked", plan.reason, ())
+        return AuditResult(repo.name, base_branch, "blocked", plan.reason, ())
     changed_paths = tuple(sorted(change.path.as_posix() for change in plan.changes))
     if plan.status in {"drift", "bootstrap_required"}:
-        return AuditResult(repo.name, "drift", plan.reason, changed_paths)
-    return AuditResult(repo.name, "current", plan.reason, ())
+        return AuditResult(repo.name, base_branch, "drift", plan.reason, changed_paths)
+    return AuditResult(repo.name, base_branch, "current", plan.reason, ())
+
+
+def _block_inconsistent_audit_targets(
+    profile: RepoProfile,
+    targets: list[tuple[str | None, AuditResult, tuple[str, str] | None]],
+) -> list[AuditResult]:
+    """Keep every configured target visible when metadata makes them ambiguous."""
+
+    if any(resolution is None for _, _, resolution in targets):
+        return [outcome for _, outcome, _ in targets]
+    resolved = tuple(
+        (target, resolution[0], resolution[1])
+        for target, _, resolution in targets
+        if resolution is not None
+    )
+    try:
+        validate_resolved_branch_targets(profile, resolved)
+    except CatalogError as exc:
+        detail = f"branch target consistency failed: {exc}"
+        return [
+            AuditResult(
+                outcome.repo,
+                f"default:{outcome.base_branch}"
+                if target is None
+                else outcome.base_branch,
+                "blocked",
+                detail,
+                (),
+            )
+            for target, outcome, _ in targets
+        ]
+    return [outcome for _, outcome, _ in targets]
 
 
 def git(args: list[str], *, cwd: Path | None = None) -> str:
@@ -153,39 +193,79 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"repositories not in release bundle: {', '.join(unknown)}")
 
         outcomes: list[AuditResult] = []
-        with tempfile.TemporaryDirectory(prefix=".audit-", dir=workspace) as temporary:
-            clone_workspace = Path(temporary)
-            (clone_workspace / WORKSPACE_MARKER).write_text(
-                "managed disposable clones only\n", encoding="utf-8"
-            )
-            for repo in repos:
-                try:
-                    snapshot = fleet_git.clone_default_branch(
-                        bundle.config.owner, repo, clone_workspace
+        for repo in repos:
+            profile = bundle.config.profiles[repo]
+            target_outcomes: list[
+                tuple[str | None, AuditResult, tuple[str, str] | None]
+            ] = []
+            for target_branch in configured_branch_targets(profile):
+                selected_base = target_branch or UNRESOLVED_DEFAULT_BRANCH
+                resolution: tuple[str, str] | None = None
+                with tempfile.TemporaryDirectory(
+                    prefix=f".audit-{repo}-", dir=workspace
+                ) as temporary:
+                    clone_workspace = Path(temporary)
+                    (clone_workspace / WORKSPACE_MARKER).write_text(
+                        "managed disposable clones only\n", encoding="utf-8"
                     )
-                    base_sha = fleet_git.refetch_default(snapshot)
-                    git(["switch", "--detach", base_sha], cwd=snapshot.path)
-                    outcomes.append(
-                        audit_repository(
-                            snapshot.path,
-                            bundle,
-                            bundle.config.profiles[repo],
-                            set(snapshot.secret_names),
-                            set(snapshot.variable_names),
-                            observed_revision=base_sha,
+                    try:
+                        snapshot = fleet_git.clone_branch(
+                            bundle.config.owner, repo, clone_workspace, target_branch
                         )
-                    )
-                except (FleetGitError, RolloutError):
-                    outcomes.append(
-                        AuditResult(repo, "blocked", "repository audit failed", ())
-                    )
-                except (OSError, KeyError, ValueError):
-                    outcomes.append(
-                        AuditResult(repo, "blocked", "local audit failed", ())
-                    )
+                        selected_base = snapshot.base_branch or snapshot.default_branch
+                        resolution = (snapshot.default_branch, selected_base)
+                        base_sha = fleet_git.refetch_branch(snapshot)
+                        git(["switch", "--detach", base_sha], cwd=snapshot.path)
+                        target_outcomes.append(
+                            (
+                                target_branch,
+                                audit_repository(
+                                snapshot.path,
+                                bundle,
+                                profile,
+                                set(snapshot.secret_names),
+                                set(snapshot.variable_names),
+                                observed_revision=base_sha,
+                                base_branch=selected_base,
+                                ),
+                                resolution,
+                            )
+                        )
+                    except (FleetGitError, RolloutError):
+                        target_outcomes.append(
+                            (
+                                target_branch,
+                                AuditResult(
+                                    repo,
+                                    selected_base,
+                                    "blocked",
+                                    "repository audit failed",
+                                    (),
+                                ),
+                                resolution,
+                            )
+                        )
+                    except (OSError, KeyError, ValueError):
+                        target_outcomes.append(
+                            (
+                                target_branch,
+                                AuditResult(
+                                    repo,
+                                    selected_base,
+                                    "blocked",
+                                    "local audit failed",
+                                    (),
+                                ),
+                                resolution,
+                            )
+                        )
+            outcomes.extend(_block_inconsistent_audit_targets(profile, target_outcomes))
 
         for outcome in outcomes:
-            print(f"{outcome.status.upper():7} {outcome.repo}: {outcome.detail}")
+            print(
+                f"{outcome.status.upper():7} "
+                f"{outcome.repo}[{outcome.base_branch}]: {outcome.detail}"
+            )
         counts = {
             status: sum(item.status == status for item in outcomes)
             for status in ("current", "drift", "blocked")
