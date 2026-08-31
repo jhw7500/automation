@@ -124,6 +124,7 @@ class PreparedRepo:
     plan: RenderPlan | None
     base_branch: str = ""
     target_branch: str | None = None
+    default_branch: str = ""
 
 
 @dataclass
@@ -1124,6 +1125,7 @@ def prevalidate_repository(
 
     base_sha = ""
     selected_base = base_branch or ""
+    observed_default = ""
     plan: RenderPlan | None = None
     try:
         if base_branch is None:
@@ -1137,6 +1139,7 @@ def prevalidate_repository(
             )
             base_sha = fleet_git.refetch_branch(snapshot)
         selected_base = _selected_base_branch(snapshot)
+        observed_default = snapshot.default_branch
         snapshot = replace(snapshot, base_sha=base_sha)
         if bootstrap and selected_base != snapshot.default_branch:
             return PreparedRepo(
@@ -1152,6 +1155,7 @@ def prevalidate_repository(
                 None,
                 selected_base,
                 base_branch,
+                observed_default,
             )
         git(["switch", "--detach", base_sha], cwd=snapshot.path)
         plan = _render(snapshot, bundle, repo, bootstrap=bootstrap)
@@ -1163,6 +1167,7 @@ def prevalidate_repository(
                 plan,
                 selected_base,
                 base_branch,
+                observed_default,
             )
         if plan.status == "current":
             require_no_current_rollout_branch(snapshot, bundle.ref)
@@ -1173,6 +1178,7 @@ def prevalidate_repository(
                 plan,
                 selected_base,
                 base_branch,
+                observed_default,
             )
         validate_managed_result(
             snapshot.path, bundle, plan, actionlint, bootstrap=bootstrap
@@ -1187,6 +1193,7 @@ def prevalidate_repository(
             plan,
             selected_base,
             base_branch,
+            observed_default,
         )
     except (CommandError, FleetGitError, RolloutError) as exc:
         return PreparedRepo(
@@ -1196,6 +1203,7 @@ def prevalidate_repository(
             plan,
             selected_base,
             base_branch,
+            observed_default,
         )
     except (OSError, KeyError, ValueError):
         return PreparedRepo(
@@ -1208,6 +1216,7 @@ def prevalidate_repository(
             plan,
             selected_base,
             base_branch,
+            observed_default,
         )
 
 
@@ -1262,6 +1271,7 @@ def _publish_repository_fresh(
     *,
     repo: str,
     base_branch: str | None,
+    prevalidated_default_branch: str | None,
     bootstrap: bool,
     actionlint: Path | None,
     progress: PublicationProgress,
@@ -1279,6 +1289,16 @@ def _publish_repository_fresh(
             )
         selected_base = _selected_base_branch(snapshot)
         progress.base_branch = selected_base
+        if (
+            (base_branch is not None and selected_base != base_branch)
+            or (
+                prevalidated_default_branch is not None
+                and snapshot.default_branch != prevalidated_default_branch
+            )
+        ):
+            raise CommandError(
+                "prevalidated base/default branch identity no longer matches"
+            )
         branch = rollout_branch(bundle.ref, selected_base, snapshot.default_branch)
         progress.stage = "refetch"
         base_sha = (
@@ -1418,6 +1438,7 @@ def publish_repository(
     *,
     repo: str,
     base_branch: str | None = None,
+    prevalidated_default_branch: str | None = None,
     bootstrap: bool,
     actionlint: Path | None,
 ) -> RepoOutcome:
@@ -1430,6 +1451,7 @@ def publish_repository(
             workspace,
             repo=repo,
             base_branch=base_branch,
+            prevalidated_default_branch=prevalidated_default_branch,
             bootstrap=bootstrap,
             actionlint=actionlint,
             progress=progress,
@@ -1610,7 +1632,8 @@ def main(argv: list[str] | None = None) -> int:
                             bundle,
                             workspace,
                             repo=item.repo,
-                            base_branch=item.target_branch,
+                            base_branch=item.base_branch or None,
+                            prevalidated_default_branch=item.default_branch or None,
                             bootstrap=(
                                 args.bootstrap_repo == item.repo
                                 and item.target_branch is None

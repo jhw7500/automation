@@ -177,6 +177,154 @@ def test_ported_identity_binds_the_head_title_body_and_pr_base(
         )
 
 
+def test_ported_commit_matches_the_task2_branch_publication_contract(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    """Catch a ported rollout commit that Task 2 would reject."""
+
+    snap, plan = initialized_repository(tmp_path)
+    ported = replace(snap, base_branch="ported")
+
+    constructed = rollout.construct_rollout_commit(
+        ported, ported.base_sha, "v1.40", plan, bundle.catalog
+    )
+
+    rollout.fleet_git._validate_rollout_commit(
+        constructed, "v1.40", "ported", "main"
+    )
+    assert constructed.message == "ci: adopt common automation workflows (v1.40; base=ported)"
+    assert rollout.rollout_branch("v1.40", "ported", "main") == (
+        "automation/common-workflows-v1.40-"
+        "8b6809aa4897b8f29d43ba741152d8c90bd46f96c609af9fc5daaee8e5348ea5"
+    )
+
+
+def test_ported_pr_creation_and_attestation_bind_the_exact_base(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    """Catch a ported publication that creates or attests a PR against main."""
+
+    workspace = marked_workspace(tmp_path)
+    snap = replace(snapshot(workspace), base_branch="ported")
+    plan = make_plan()
+    branch = rollout.rollout_branch(bundle.ref, "ported", "main")
+    body = rollout.pr_body(
+        bundle.ref,
+        bundle.commit,
+        rollout._changed_paths(plan),
+        "ported",
+        "main",
+    )
+    request = PullRequest(
+        7,
+        "https://github.com/jhw7500/gstApp/pull/7",
+        "OPEN",
+        "ported",
+        branch,
+        "jhw7500/gstApp",
+        HEAD,
+        rollout.pr_title(bundle.ref, "ported", "main"),
+        body,
+    )
+    created_bases: list[str] = []
+
+    def create_pr(_owner, _repo, base, *_args):
+        created_bases.append(base)
+        return request
+
+    with (
+        mock.patch.object(
+            rollout, "_make_clone_workspace", return_value=nullcontext(str(workspace))
+        ),
+        mock.patch.object(rollout.fleet_git, "clone_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "refetch_branch", return_value=BASE),
+        mock.patch.object(rollout, "git", return_value=""),
+        mock.patch.object(rollout, "_render", return_value=plan),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(
+            rollout,
+            "inspect_rollout",
+            return_value=rollout.RolloutInspection("create_pr", HEAD),
+        ),
+        mock.patch.object(rollout.fleet_git, "create_pull_request", side_effect=create_pr),
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=HEAD),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", return_value=(request,)),
+    ):
+        result = rollout.publish_repository(
+            bundle,
+            workspace,
+            repo="gstApp",
+            base_branch="ported",
+            prevalidated_default_branch="main",
+            bootstrap=False,
+            actionlint=Path("/bin/true"),
+        )
+
+    assert result.status == "published"
+    assert result.base_branch == "ported"
+    assert created_bases == ["ported"]
+
+
+def test_direct_additional_target_bootstrap_is_rejected(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    """Catch bootstrap rendering on a configured additional branch."""
+
+    workspace = marked_workspace(tmp_path)
+    snap = replace(snapshot(workspace), base_branch="ported")
+    with (
+        mock.patch.object(rollout.fleet_git, "clone_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "refetch_branch", return_value=BASE),
+        mock.patch.object(rollout, "_render") as render,
+        mock.patch.object(rollout, "git") as local_git,
+    ):
+        result = rollout.prevalidate_repository(
+            bundle,
+            workspace,
+            repo="gstApp",
+            base_branch="ported",
+            bootstrap=True,
+            actionlint=Path("/bin/true"),
+        )
+
+    assert result.outcome.status == "blocked"
+    assert result.outcome.base_branch == "ported"
+    render.assert_not_called()
+    local_git.assert_not_called()
+
+
+def test_default_metadata_change_after_prevalidation_blocks_publication_before_mutation(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    """Catch a default target republished after its repository default changed."""
+
+    workspace = marked_workspace(tmp_path)
+    fresh = replace(snapshot(workspace), default_branch="trunk", base_branch="main")
+    with (
+        mock.patch.object(rollout, "_make_clone_workspace", return_value=nullcontext(str(workspace))),
+        mock.patch.object(rollout.fleet_git, "clone_branch", return_value=fresh),
+        mock.patch.object(rollout.fleet_git, "refetch_branch") as refetch,
+        mock.patch.object(rollout.fleet_git, "create_rollout_branch") as create_branch,
+        mock.patch.object(rollout.fleet_git, "create_pull_request") as create_pr,
+    ):
+        result = rollout.publish_repository(
+            bundle,
+            workspace,
+            repo="gstApp",
+            base_branch="main",
+            prevalidated_default_branch="main",
+            bootstrap=False,
+            actionlint=Path("/bin/true"),
+        )
+
+    assert result.status == "blocked"
+    assert result.base_branch == "main"
+    assert "prevalidated" in result.detail
+    refetch.assert_not_called()
+    create_branch.assert_not_called()
+    create_pr.assert_not_called()
+
+
 def test_selected_profile_expands_default_and_ported_before_publication(
     tmp_path: Path, bundle: ReleaseBundle
 ) -> None:
@@ -196,6 +344,7 @@ def test_selected_profile_expands_default_and_ported_before_publication(
             None,
             exact_base,
             base_branch,
+            "main",
         )
 
     def publish(*_args, repo: str, base_branch: str | None, **_kwargs):
@@ -222,7 +371,7 @@ def test_selected_profile_expands_default_and_ported_before_publication(
         ) == 0
 
     assert checked == [("wlan-driver-v2", None), ("wlan-driver-v2", "ported")]
-    assert published == checked
+    assert published == [("wlan-driver-v2", "main"), ("wlan-driver-v2", "ported")]
 
 
 def test_blocked_ported_prevalidation_prevents_all_selected_publication(
