@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "gh_owner": "jhw7500",
   "automation_ref": "v1.51",
   "canonical_dir": "examples/baseline-workflows/.github",
@@ -14,7 +14,8 @@
         "opencode-auto-review.yml"
       ],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "max9296": {
       "profile": "common-ai-v1",
@@ -25,7 +26,8 @@
         "opencode-auto-review.yml"
       ],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "imx-vpu": {
       "profile": "common-ai-v1",
@@ -36,7 +38,8 @@
         "opencode-auto-review.yml"
       ],
       "repo_write_auth": "github_token",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "wlan-driver-v2": {
       "profile": "common-ai-v1",
@@ -46,7 +49,10 @@
         "opencode-auto-review.yml"
       ],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": [
+        "ported"
+      ]
     },
     "wlan-bridge": {
       "profile": "common-ai-v1",
@@ -56,7 +62,8 @@
         "opencode-auto-review.yml"
       ],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "wlan-package": {
       "profile": "common-ai-v1",
@@ -65,7 +72,8 @@
         "opencode-auto-review.yml"
       ],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "pim-package-jhw": {
       "profile": "common-ai-v1",
@@ -73,7 +81,8 @@
         "opencode-auto-review.yml"
       ],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "wlan-opc": {
       "profile": "common-ai-v1",
@@ -81,55 +90,64 @@
         "opencode.yml"
       ],
       "repo_write_auth": "github_token",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "pcap-analyzer": {
       "profile": "common-ai-v1",
       "optional_workflows": [],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "wpa-supplicant": {
       "profile": "common-ai-v1",
       "optional_workflows": [],
       "repo_write_auth": "github_token",
-      "bootstrap_allowed": true
+      "bootstrap_allowed": true,
+      "additional_branches": []
     },
     "sc16is7xx": {
       "profile": "common-ai-v1",
       "optional_workflows": [],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "pim-check": {
       "profile": "common-ai-v1",
       "optional_workflows": [],
       "repo_write_auth": "github_token",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "redmine": {
       "profile": "common-ai-v1",
       "optional_workflows": [],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "jhw-notion": {
       "profile": "common-ai-v1",
       "optional_workflows": [],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "personal-ops": {
       "profile": "common-ai-v1",
       "optional_workflows": [],
       "repo_write_auth": "github_app",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     },
     "claude-config": {
       "profile": "common-ai-v1",
       "optional_workflows": [],
       "repo_write_auth": "github_token",
-      "bootstrap_allowed": false
+      "bootstrap_allowed": false,
+      "additional_branches": []
     }
   }
 }

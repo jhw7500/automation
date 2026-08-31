@@ -90,6 +90,7 @@ class RepoProfile:
     optional_workflows: frozenset[str]
     repo_write_auth: Literal["github_app", "github_token"]
     bootstrap_allowed: bool
+    additional_branches: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,11 @@ class FleetConfig:
     automation_ref: str
     canonical_dir: PurePosixPath
     profiles: Mapping[str, RepoProfile]
+
+
+def configured_branch_targets(profile: RepoProfile) -> tuple[str | None, ...]:
+    """Return the default branch followed by configured additional targets."""
+    return (None, *profile.additional_branches)
 
 
 def _require_keys(value: dict[str, object], *, exact: set[str], where: str) -> None:
@@ -139,6 +145,32 @@ def _string(value: object, where: str) -> str:
     if not isinstance(value, str):
         raise CatalogError(f"{where} must be a string")
     return value
+
+
+def _additional_branches(value: object, where: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(branch, str) for branch in value):
+        raise CatalogError(f"{where} must be a string list")
+    if len(value) != len(set(value)):
+        raise CatalogError(f"{where} must be unique")
+    for branch in value:
+        forbidden = " ~^:?*[\\"
+        components = branch.split("/")
+        if (
+            not branch
+            or branch.startswith(("-", "/"))
+            or branch.endswith(("/", "."))
+            or "//" in branch
+            or ".." in branch
+            or "@{" in branch
+            or any(character in branch for character in forbidden)
+            or any(ord(character) < 32 or ord(character) == 127 for character in branch)
+            or any(
+                not component or component.startswith(".") or component.endswith(".lock")
+                for component in components
+            )
+        ):
+            raise CatalogError(f"{where}: invalid Git branch name: {branch!r}")
+    return tuple(value)
 
 
 def _jobs(value: object, where: str) -> tuple[CallerJobContract, ...]:
@@ -201,7 +233,8 @@ def load_catalog(root: Path) -> WorkflowCatalog:
 def load_fleet_config(root: Path, catalog: WorkflowCatalog) -> FleetConfig:
     raw = _mapping(_load_json(root / "scripts/workflow-config.json"), "fleet config")
     _require_keys(raw, exact={"schema_version", "gh_owner", "automation_ref", "canonical_dir", "catalog", "repos"}, where="fleet config")
-    if raw["schema_version"] != 1:
+    schema_version = raw["schema_version"]
+    if schema_version not in {1, 2}:
         raise CatalogError("unsupported fleet config schema")
     canonical_dir = PurePosixPath(_string(raw["canonical_dir"], "canonical_dir"))
     if canonical_dir != _CANONICAL_DIR:
@@ -219,7 +252,13 @@ def load_fleet_config(root: Path, catalog: WorkflowCatalog) -> FleetConfig:
     bootstrap: set[str] = set()
     for name, value in repos.items():
         profile = _mapping(value, f"repos.{name}")
-        _require_keys(profile, exact={"profile", "optional_workflows", "repo_write_auth", "bootstrap_allowed"}, where=f"repos.{name}")
+        _require_keys(
+            profile,
+            exact={"profile", "optional_workflows", "repo_write_auth", "bootstrap_allowed"}
+            if schema_version == 1
+            else {"profile", "optional_workflows", "repo_write_auth", "bootstrap_allowed", "additional_branches"},
+            where=f"repos.{name}",
+        )
         optional = profile["optional_workflows"]
         auth = profile["repo_write_auth"]
         allowed = profile["bootstrap_allowed"]
@@ -233,9 +272,14 @@ def load_fleet_config(root: Path, catalog: WorkflowCatalog) -> FleetConfig:
             raise CatalogError(f"repos.{name}: invalid repo_write_auth")
         if not isinstance(allowed, bool):
             raise CatalogError(f"repos.{name}.bootstrap_allowed must be boolean")
+        additional_branches = () if schema_version == 1 else _additional_branches(
+            profile["additional_branches"], f"repos.{name}.additional_branches"
+        )
         if allowed:
             bootstrap.add(name)
-        profiles[name] = RepoProfile(name, "common-ai-v1", frozenset(optional), auth, allowed)
+        profiles[name] = RepoProfile(
+            name, "common-ai-v1", frozenset(optional), auth, allowed, additional_branches
+        )
     if bootstrap != generation.bootstrap:
         raise CatalogError(f"invalid bootstrap repositories: {sorted(bootstrap)}")
     return FleetConfig(_string(raw["gh_owner"], "gh_owner"), _string(raw["automation_ref"], "automation_ref"), canonical_dir, profiles)

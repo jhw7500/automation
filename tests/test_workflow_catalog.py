@@ -5,7 +5,12 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from scripts.workflow_catalog import CatalogError, load_catalog, load_fleet_config
+from scripts.workflow_catalog import (
+    CatalogError,
+    configured_branch_targets,
+    load_catalog,
+    load_fleet_config,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -77,6 +82,55 @@ def test_catalog_and_profiles_are_closed() -> None:
             "opened", "synchronize", "ready_for_review",
         ]
         assert "review_mode" in entry.caller_jobs[0].with_keys
+
+
+def test_live_configures_ordered_additional_branch_targets() -> None:
+    config = load_fleet_config(ROOT, load_catalog(ROOT))
+
+    assert config.profiles["wlan-driver-v2"].additional_branches == ("ported",)
+    assert configured_branch_targets(config.profiles["wlan-driver-v2"]) == (None, "ported")
+    for name, profile in config.profiles.items():
+        if name != "wlan-driver-v2":
+            assert profile.additional_branches == ()
+            assert configured_branch_targets(profile) == (None,)
+
+
+def test_schema_one_config_remains_default_only(tmp_path: Path) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for filename in ("workflow-catalog.json", "workflow-config.json"):
+        (scripts / filename).write_text((ROOT / "scripts" / filename).read_text())
+    config_path = scripts / "workflow-config.json"
+    config = json.loads(config_path.read_text())
+    config["schema_version"] = 1
+    for profile in config["repos"].values():
+        profile.pop("additional_branches")
+    config_path.write_text(json.dumps(config))
+
+    fleet = load_fleet_config(tmp_path, load_catalog(tmp_path))
+    assert all(profile.additional_branches == () for profile in fleet.profiles.values())
+
+
+@pytest.mark.parametrize("additional_branches", [
+    ["ported", "ported"],
+    ["ported", 1],
+    [""],
+    ["-invalid"],
+])
+def test_schema_two_rejects_invalid_additional_branches(
+    tmp_path: Path, additional_branches: list[object]
+) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for filename in ("workflow-catalog.json", "workflow-config.json"):
+        (scripts / filename).write_text((ROOT / "scripts" / filename).read_text())
+    config_path = scripts / "workflow-config.json"
+    config = json.loads(config_path.read_text())
+    config["repos"]["wlan-driver-v2"]["additional_branches"] = additional_branches
+    config_path.write_text(json.dumps(config))
+
+    with pytest.raises(CatalogError):
+        load_fleet_config(tmp_path, load_catalog(tmp_path))
 
 
 def _write(root: Path, catalog: list[dict], repos: dict[str, dict]) -> None:
