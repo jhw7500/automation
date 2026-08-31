@@ -8,7 +8,7 @@ name: Self OpenCode Auto Review
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, ready_for_review]
 
 jobs:
   check-secret:
@@ -37,7 +37,8 @@ jobs:
     if: >-
       needs.check-secret.outputs.has_key == 'true' &&
       github.event.pull_request.head.repo.fork == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
     permissions:
       actions: read
       checks: write
@@ -47,5 +48,14 @@ jobs:
     uses: ./.github/workflows/opencode-auto-review.yml
     with:
       pr_number: ${{ github.event.pull_request.number }}
+      force_review: false
+      review_mode: >-
+        ${{
+          contains(github.event.pull_request.labels.*.name, 'review:request') &&
+          contains(github.event.pull_request.labels.*.name, 'review:skip') && 'conflict' ||
+          contains(github.event.pull_request.labels.*.name, 'review:request') && 'request' ||
+          contains(github.event.pull_request.labels.*.name, 'review:skip') && 'skip' ||
+          'auto'
+        }}
     secrets:
       ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}

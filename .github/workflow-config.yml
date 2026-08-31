@@ -63,6 +63,9 @@ workflows:
     description: "Auto-notify reviewers when review feedback is addressed"
 
 # === Shared Settings ===
+review:
+  auto: false
+
 claude:
   # Optional. If empty/omitted, claude-code-action default is used.
   # Examples: claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5-20251001
