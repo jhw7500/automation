@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import fields
+from dataclasses import fields, replace
 import json
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -106,6 +106,7 @@ def test_public_report_model_and_exact_release_text() -> None:
         "pr_url",
         "changed_paths",
         "stage",
+        "base_branch",
     ]
     assert rollout.rollout_branch("v1.40") == "automation/common-workflows-v1.40"
     assert rollout.rollout_branch("v2.3.4") == "automation/common-workflows-v2.3.4"
@@ -118,6 +119,155 @@ def test_public_report_model_and_exact_release_text() -> None:
         "Project-specific workflows are unchanged. This PR does not modify secrets. "
         "Merge and recovery use this repository's normal GitHub controls.\n"
     )
+
+
+def test_ported_identity_binds_the_head_title_body_and_pr_base(
+    tmp_path: Path,
+) -> None:
+    """Catch a rollout that reuses the default identity for an active port."""
+
+    digest = "8b6809aa4897b8f29d43ba741152d8c90bd46f96c609af9fc5daaee8e5348ea5"
+    branch = f"automation/common-workflows-v1.40-{digest}"
+    title = "ci: adopt common automation workflows (v1.40; base=ported)"
+    changed = (".github/workflows/claude.yml",)
+    body = (
+        "Standardize only the catalogued common AI workflow callers.\n\n"
+        "- automation tag: `v1.40`\n"
+        f"- automation commit: `{COMMIT}`\n"
+        "- base branch: `ported`\n"
+        "- managed paths:\n- `.github/workflows/claude.yml`\n\n"
+        "Project-specific workflows are unchanged. This PR does not modify secrets. "
+        "Merge and recovery use this repository's normal GitHub controls.\n"
+    )
+    snap = replace(snapshot(tmp_path), base_branch="ported")
+    request = PullRequest(
+        7,
+        "https://github.com/jhw7500/gstApp/pull/7",
+        "OPEN",
+        "ported",
+        branch,
+        "jhw7500/gstApp",
+        HEAD,
+        title,
+        body,
+    )
+    plan = RenderPlan(
+        "drift",
+        "managed bytes differ",
+        (
+            FileChange(
+                PurePosixPath(".github/workflows/claude.yml"), b"old\n", b"new\n"
+            ),
+        ),
+        frozenset(),
+        frozenset(),
+    )
+
+    assert rollout.rollout_branch("v1.40", "ported", "main") == branch
+    assert rollout.pr_title("v1.40", "ported", "main") == title
+    assert rollout.pr_body("v1.40", COMMIT, changed, "ported", "main") == body
+    with (
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=HEAD),
+        mock.patch.object(rollout, "validate_existing_branch"),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", return_value=(request,)),
+    ):
+        assert (
+            rollout.inspect_rollout(snap, BASE, "v1.40", COMMIT, plan).action
+            == "reuse"
+        )
+
+
+def test_selected_profile_expands_default_and_ported_before_publication(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    """Catch an operator selection that silently skips the configured port."""
+
+    workspace = marked_workspace(tmp_path)
+    checked: list[tuple[str, str | None]] = []
+    published: list[tuple[str, str | None]] = []
+
+    def prevalidate(*_args, repo: str, base_branch: str | None, **_kwargs):
+        checked.append((repo, base_branch))
+        exact_base = "main" if base_branch is None else base_branch
+        return rollout.PreparedRepo(
+            repo,
+            "create_branch",
+            rollout.RepoOutcome(repo, "planned", "ready", BASE, base_branch=exact_base),
+            None,
+            exact_base,
+            base_branch,
+        )
+
+    def publish(*_args, repo: str, base_branch: str | None, **_kwargs):
+        published.append((repo, base_branch))
+        exact_base = "main" if base_branch is None else base_branch
+        return rollout.RepoOutcome(
+            repo, "published", "ready", BASE, base_branch=exact_base
+        )
+
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(rollout, "prevalidate_repository", side_effect=prevalidate),
+        mock.patch.object(rollout, "publish_repository", side_effect=publish),
+    ):
+        assert rollout.main(
+            [
+                "--mode", "publish", "--confirm", "--workspace", str(workspace),
+                "--repo", "wlan-driver-v2",
+            ]
+        ) == 0
+
+    assert checked == [("wlan-driver-v2", None), ("wlan-driver-v2", "ported")]
+    assert published == checked
+
+
+def test_blocked_ported_prevalidation_prevents_all_selected_publication(
+    tmp_path: Path, bundle: ReleaseBundle
+) -> None:
+    """Catch publication starting before every expanded branch target is gated."""
+
+    workspace = marked_workspace(tmp_path)
+    checked: list[tuple[str, str | None]] = []
+
+    def prevalidate(*_args, repo: str, base_branch: str | None, **_kwargs):
+        checked.append((repo, base_branch))
+        exact_base = "main" if base_branch is None else base_branch
+        status = "blocked" if base_branch == "ported" else "planned"
+        return rollout.PreparedRepo(
+            repo,
+            "blocked" if status == "blocked" else "create_branch",
+            rollout.RepoOutcome(repo, status, "ported is blocked", BASE, base_branch=exact_base),
+            None,
+            exact_base,
+            base_branch,
+        )
+
+    with (
+        mock.patch.object(
+            rollout,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: fake_bundle_context(bundle),
+        ),
+        mock.patch.object(rollout, "prevalidate_repository", side_effect=prevalidate),
+        mock.patch.object(rollout, "publish_repository") as publish,
+    ):
+        assert rollout.main(
+            [
+                "--mode", "publish", "--confirm", "--workspace", str(workspace),
+                "--repo", "wlan-driver-v2", "--repo", "gstApp",
+            ]
+        ) == 1
+
+    assert checked == [
+        ("wlan-driver-v2", None),
+        ("wlan-driver-v2", "ported"),
+        ("gstApp", None),
+    ]
+    publish.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1366,6 +1516,7 @@ def test_real_mode_only_drift_is_planned_audited_and_published_as_a_repair(
     published = rollout._prepared_outcome(
         snap.path.name,
         base,
+        snap.base_branch or snap.default_branch,
         plan,
         rollout.RolloutInspection("create_branch"),
     )
@@ -1381,7 +1532,10 @@ def test_real_mode_only_drift_is_planned_audited_and_published_as_a_repair(
     )
     rollout.validate_commit_tree(snap, constructed.head_sha, base, plan)
     rollout.fleet_git._validate_rollout_commit(
-        constructed, rollout.rollout_branch(bundle.ref)
+        constructed,
+        bundle.ref,
+        snap.base_branch or snap.default_branch,
+        snap.default_branch,
     )
     assert tree_entry(snap.path, constructed.head_sha, relative)[:2] == (
         "100644",
@@ -1658,7 +1812,10 @@ def test_local_commit_identity_matches_atomic_api_commit_contract(
     )
 
     rollout.fleet_git._validate_rollout_commit(
-        constructed, "automation/common-workflows-v1.40"
+        constructed,
+        "v1.40",
+        snap.base_branch or snap.default_branch,
+        snap.default_branch,
     )
 
 
