@@ -36,6 +36,7 @@ from scripts.workflow_release_bundle import (  # noqa: E402
 
 VERSION_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+")
 WORKSPACE_MARKER = ".automation-fleet-workspace"
+UNRESOLVED_DEFAULT_BRANCH = "<default-unresolved>"
 GIT_PREFIX = (
     "git",
     "-c",
@@ -161,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         for repo in repos:
             profile = bundle.config.profiles[repo]
             for target_branch in configured_branch_targets(profile):
-                selected_base = target_branch or "default"
+                selected_base = target_branch or UNRESOLVED_DEFAULT_BRANCH
                 with tempfile.TemporaryDirectory(
                     prefix=f".audit-{repo}-", dir=workspace
                 ) as temporary:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import replace
 import json
 from pathlib import Path
 from unittest import mock
@@ -394,6 +395,111 @@ def test_target_clone_failure_blocks_only_the_exact_target_and_stays_in_totals(
         )
 
     assert rc == 1
+    output = capsys.readouterr().out
+    assert "CURRENT wlan-driver-v2[main]: managed content matches" in output
+    assert "BLOCKED wlan-driver-v2[ported]: repository audit failed" in output
+    assert "total=2 current=1 drift=0 blocked=1" in output
+
+
+def test_unresolved_implicit_default_has_a_label_distinct_from_a_branch_named_default(
+    tmp_path: Path, bundle: ReleaseBundle, capsys
+) -> None:
+    """Catch a failed implicit-default clone mislabeled as a real `default` branch."""
+
+    workspace = marked_workspace(tmp_path)
+    profile = replace(bundle.config.profiles["gstApp"], additional_branches=("default",))
+    scenario_bundle = replace(
+        bundle,
+        config=replace(bundle.config, profiles={**bundle.config.profiles, "gstApp": profile}),
+    )
+
+    def clone(_owner: str, repo: str, root: Path, branch: str | None) -> RepositorySnapshot:
+        if branch is None:
+            raise audit.FleetGitError("default metadata unavailable")
+        path = root / repo
+        path.mkdir()
+        (path / ".git").mkdir()
+        return RepositorySnapshot(
+            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), branch
+        )
+
+    with (
+        mock.patch.object(
+            audit,
+            "materialize_release_bundle",
+            side_effect=lambda *_a, **_k: nullcontext(scenario_bundle),
+        ),
+        mock.patch.object(audit.fleet_git, "clone_branch", side_effect=clone),
+        mock.patch.object(audit.fleet_git, "refetch_branch", return_value=BASE),
+        mock.patch.object(
+            audit,
+            "audit_repository",
+            side_effect=lambda path, *_a, **kwargs: AuditResult(
+                path.name, kwargs["base_branch"], "current", "managed content matches", ()
+            ),
+        ),
+        mock.patch.object(audit, "git", return_value=""),
+    ):
+        rc = audit.main(
+            [
+                "--automation", str(ROOT), "--workspace", str(workspace), "--ref", "v1.40",
+                "--repo", "gstApp",
+            ]
+        )
+
+    assert rc == 1
+    output = capsys.readouterr().out
+    assert "BLOCKED gstApp[<default-unresolved>]: repository audit failed" in output
+    assert "CURRENT gstApp[default]: managed content matches" in output
+    assert "total=2 current=1 drift=0 blocked=1" in output
+
+
+def test_target_refetch_failure_blocks_only_ported_and_keeps_main_visible(
+    tmp_path: Path, bundle: ReleaseBundle, capsys
+) -> None:
+    """Catch a post-clone ported refetch failure that hides the current main target."""
+
+    workspace = marked_workspace(tmp_path)
+    cloned: list[str] = []
+
+    def clone(_owner: str, repo: str, root: Path, branch: str | None) -> RepositorySnapshot:
+        cloned.append(branch or "main")
+        path = root / repo
+        path.mkdir()
+        (path / ".git").mkdir()
+        return RepositorySnapshot(
+            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), branch or "main"
+        )
+
+    def refetch(snapshot: RepositorySnapshot) -> str:
+        if snapshot.base_branch == "ported":
+            raise audit.FleetGitError("ported refetch unavailable")
+        return BASE
+
+    with (
+        mock.patch.object(
+            audit, "materialize_release_bundle", side_effect=lambda *_a, **_k: nullcontext(bundle)
+        ),
+        mock.patch.object(audit.fleet_git, "clone_branch", side_effect=clone),
+        mock.patch.object(audit.fleet_git, "refetch_branch", side_effect=refetch),
+        mock.patch.object(
+            audit,
+            "audit_repository",
+            side_effect=lambda path, *_a, **kwargs: AuditResult(
+                path.name, kwargs["base_branch"], "current", "managed content matches", ()
+            ),
+        ),
+        mock.patch.object(audit, "git", return_value=""),
+    ):
+        rc = audit.main(
+            [
+                "--automation", str(ROOT), "--workspace", str(workspace), "--ref", "v1.40",
+                "--repo", "wlan-driver-v2",
+            ]
+        )
+
+    assert rc == 1
+    assert cloned == ["main", "ported"]
     output = capsys.readouterr().out
     assert "CURRENT wlan-driver-v2[main]: managed content matches" in output
     assert "BLOCKED wlan-driver-v2[ported]: repository audit failed" in output

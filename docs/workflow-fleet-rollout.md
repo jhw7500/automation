@@ -553,6 +553,9 @@ paths are absent, and no project-owned path is changed. During rollout, an unmer
 target legitimately remains `drift`. The current fleet completion condition is `current=17`,
 `drift=0`, and `blocked=0`.
 
+If the implicit default target cannot be cloned far enough to discover its remote name,
+its blocked result is labeled `<default-unresolved>`; this cannot collide with a valid branch.
+
 ### Review, merge, and recovery
 
 Repository owners inspect each diff, run project-specific CI, obtain their normal reviews,
