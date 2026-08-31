@@ -549,9 +549,6 @@ paths are absent, and no project-owned path is changed. During rollout, an unmer
 repository legitimately remains `drift`. The historical fleet completion condition is
 `current=19`, `drift=0`, and `blocked=0`.
 
-If the implicit default target cannot be cloned far enough to discover its remote name,
-its blocked result is labeled `default:unresolved`; the colon makes it invalid as a Git branch.
-
 ## Post-merge multi-branch contract
 
 Use this section only with the first immutable automation release containing #76 after it
@@ -560,6 +557,9 @@ repository default as an implicit target and expands each profile's ordered
 `additional_branches`. The current 16-repository configuration therefore has 17 targets:
 `wlan-driver-v2` expands to its discovered default plus `ported`; every other profile has
 only its default target.
+
+If the implicit default target cannot be cloned far enough to discover its remote name,
+its blocked result is labeled `default:unresolved`; the colon makes it invalid as a Git branch.
 
 For that post-merge release, `--repo wlan-driver-v2` plans, publishes, and audits both
 targets without another flag. The default rollout head remains
