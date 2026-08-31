@@ -1,7 +1,7 @@
 # Review-mode command control design
 
 Date: 2026-08-31
-Status: conversation design approved; internally reviewed; awaiting user review
+Status: approved; implementation plans written
 
 ## 1. Decision
 
