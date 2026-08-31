@@ -574,7 +574,12 @@ def test_refetch_default_uses_origin_tracking_ref(
     assert calls == [
         ["remote", "get-url", "--all", "origin"],
         ["remote", "get-url", "--push", "--all", "origin"],
-        ["fetch", "--no-recurse-submodules", "origin", "main"],
+        [
+            "fetch",
+            "--no-recurse-submodules",
+            "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ],
         ["rev-parse", "refs/remotes/origin/main"],
     ]
 
@@ -602,9 +607,74 @@ def test_refetch_branch_uses_selected_base_origin_tracking_ref(
     assert calls == [
         ["remote", "get-url", "--all", "origin"],
         ["remote", "get-url", "--push", "--all", "origin"],
-        ["fetch", "--no-recurse-submodules", "origin", "ported"],
+        [
+            "fetch",
+            "--no-recurse-submodules",
+            "origin",
+            "+refs/heads/ported:refs/remotes/origin/ported",
+        ],
         ["rev-parse", "refs/remotes/origin/ported"],
     ]
+
+
+def test_refetch_branch_advances_selected_origin_tracking_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def git(*args: str, cwd: Path | None = None) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    root = tmp_path / "workspace"
+    source.mkdir()
+    root.mkdir()
+    workspace(root)
+    git("init", "--bare", "-q", str(remote))
+    git("init", "-q", "-b", "main", cwd=source)
+    git("config", "user.name", "Fleet Test", cwd=source)
+    git("config", "user.email", "fleet-test@example.invalid", cwd=source)
+    (source / "tracked.txt").write_text("main\n", encoding="utf-8")
+    git("add", "tracked.txt", cwd=source)
+    git("commit", "-q", "-m", "main", cwd=source)
+    git("remote", "add", "origin", str(remote), cwd=source)
+    git("push", "-q", "origin", "main", cwd=source)
+    git("switch", "-q", "-c", "ported", cwd=source)
+    (source / "tracked.txt").write_text("ported one\n", encoding="utf-8")
+    git("commit", "-qam", "ported one", cwd=source)
+    git("push", "-q", "-u", "origin", "ported", cwd=source)
+
+    clone = root / "repo"
+    git("clone", "-q", "--single-branch", "--branch", "ported", str(remote), str(clone))
+    before = git("rev-parse", "refs/remotes/origin/ported", cwd=clone)
+    git(
+        "config",
+        "--replace-all",
+        "remote.origin.fetch",
+        "+refs/heads/main:refs/remotes/origin/main",
+        cwd=clone,
+    )
+    (source / "tracked.txt").write_text("ported two\n", encoding="utf-8")
+    git("commit", "-qam", "ported two", cwd=source)
+    expected = git("rev-parse", "HEAD", cwd=source)
+    git("push", "-q", "origin", "ported", cwd=source)
+    item = workflow_fleet_git.RepositorySnapshot(
+        path=clone,
+        default_branch="main",
+        base_sha=before,
+        secret_names=frozenset(),
+        variable_names=frozenset(),
+        base_branch="ported",
+    )
+    monkeypatch.setattr(workflow_fleet_git, "_verify_origin", lambda *_args: None)
+
+    assert workflow_fleet_git.refetch_branch(item) == expected
+    assert git("rev-parse", "refs/remotes/origin/ported", cwd=clone) == expected
 
 
 @pytest.mark.parametrize(

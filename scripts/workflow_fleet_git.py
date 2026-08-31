@@ -468,7 +468,7 @@ def refetch_branch(snapshot: RepositorySnapshot) -> str:
             "fetch",
             "--no-recurse-submodules",
             "origin",
-            base_branch,
+            f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}",
         ],
         cwd=path,
     )
