@@ -86,21 +86,28 @@ def apply_bundle(repo: Path, bundle: ReleaseBundle, profile) -> None:
 def test_audit_classifies_content_not_history(
     repo: Path, bundle: ReleaseBundle, profile
 ) -> None:
-    result = audit_repository(repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES)
+    result = audit_repository(
+        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+    )
     assert result.status == "drift"
     assert result.repo == "gstApp"
+    assert result.base_branch == "main"
     assert result.changed_paths == tuple(sorted(result.changed_paths))
 
     apply_bundle(repo, bundle, profile)
     assert (
-        audit_repository(repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES).status
+        audit_repository(
+            repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+        ).status
         == "current"
     )
     (repo / ".github/workflows/project-build.yml").write_text(
         "on: push\n", encoding="utf-8"
     )
     assert (
-        audit_repository(repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES).status
+        audit_repository(
+            repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+        ).status
         == "current"
     )
 
@@ -111,7 +118,9 @@ def test_audit_reports_managed_byte_mismatch_as_drift(
     apply_bundle(repo, bundle, profile)
     managed = repo / ".github/workflows/claude.yml"
     managed.write_bytes(managed.read_bytes() + b"# drift\n")
-    result = audit_repository(repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES)
+    result = audit_repository(
+        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+    )
     assert result.status == "drift"
     assert ".github/workflows/claude.yml" in result.changed_paths
 
@@ -122,9 +131,12 @@ def test_audit_reports_unknown_or_malformed_content_as_blocked(
     (repo / ".github/workflows/unknown.yml").write_text(
         "jobs:\n  call:\n    uses: jhw7500/automation/.github/workflows/claude.yml@v1.40\n"
     )
-    result = audit_repository(repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES)
+    result = audit_repository(
+        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+    )
     assert result == AuditResult(
         "gstApp",
+        "main",
         "blocked",
         "unknown central caller path: .github/workflows/unknown.yml",
         (),
@@ -134,7 +146,9 @@ def test_audit_reports_unknown_or_malformed_content_as_blocked(
     (repo / ".github/workflow-config.yml").write_text(
         "automation_ref:\n  nested: value\n"
     )
-    result = audit_repository(repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES)
+    result = audit_repository(
+        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+    )
     assert result.status == "blocked"
     assert "automation_ref must be a scalar" in result.detail
 
@@ -142,7 +156,7 @@ def test_audit_reports_unknown_or_malformed_content_as_blocked(
 def test_audit_reports_missing_prerequisite_names_as_blocked(
     repo: Path, bundle: ReleaseBundle, profile
 ) -> None:
-    result = audit_repository(repo, bundle, profile, set(), set())
+    result = audit_repository(repo, bundle, profile, set(), set(), base_branch="main")
     assert result.status == "blocked"
     assert "missing secrets" in result.detail
     assert "missing variables" in result.detail
@@ -151,6 +165,7 @@ def test_audit_reports_missing_prerequisite_names_as_blocked(
 def test_audit_result_contains_no_history_or_publish_fields() -> None:
     assert set(AuditResult.__dataclass_fields__) == {
         "repo",
+        "base_branch",
         "status",
         "detail",
         "changed_paths",
@@ -168,25 +183,38 @@ def test_fleet_cli_audits_all_profiles_with_refetch_and_no_remote_write(
     tmp_path: Path, bundle: ReleaseBundle, capsys
 ) -> None:
     workspace = marked_workspace(tmp_path)
-    cloned: list[str] = []
-    fetched: list[str] = []
+    cloned: list[tuple[str, str | None, Path]] = []
+    fetched: list[tuple[str, str]] = []
+    marked_clone_roots: list[bool] = []
 
-    def clone(_owner: str, repo: str, root: Path) -> RepositorySnapshot:
-        cloned.append(repo)
+    def clone(
+        _owner: str, repo: str, root: Path, branch: str | None = None
+    ) -> RepositorySnapshot:
+        cloned.append((repo, branch, root))
+        marked_clone_roots.append((root / audit.WORKSPACE_MARKER).is_file())
         path = root / repo
         path.mkdir()
         (path / ".git").mkdir()
         return RepositorySnapshot(
-            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES)
+            path,
+            "main",
+            BASE,
+            frozenset(ALL_SECRETS),
+            frozenset(ALL_VARIABLES),
+            branch or "main",
         )
 
     def refetch(snapshot: RepositorySnapshot) -> str:
-        fetched.append(snapshot.path.name)
+        fetched.append((snapshot.path.name, snapshot.base_branch or snapshot.default_branch))
         return BASE
 
-    def classify(path, _bundle, _profile, _secrets, _variables, **_kwargs):
+    def classify(path, _bundle, _profile, _secrets, _variables, *, base_branch, **_kwargs):
         return AuditResult(
-            path.name, "drift", "managed drift", (".github/workflows/claude.yml",)
+            path.name,
+            base_branch,
+            "drift",
+            "managed drift",
+            (".github/workflows/claude.yml",),
         )
 
     commands: list[list[str]] = []
@@ -197,7 +225,9 @@ def test_fleet_cli_audits_all_profiles_with_refetch_and_no_remote_write(
             side_effect=lambda *_a, **_k: nullcontext(bundle),
         ),
         mock.patch.object(audit.fleet_git, "clone_default_branch", side_effect=clone),
+        mock.patch.object(audit.fleet_git, "clone_branch", side_effect=clone),
         mock.patch.object(audit.fleet_git, "refetch_default", side_effect=refetch),
+        mock.patch.object(audit.fleet_git, "refetch_branch", side_effect=refetch),
         mock.patch.object(audit, "audit_repository", side_effect=classify),
         mock.patch.object(
             audit,
@@ -210,11 +240,21 @@ def test_fleet_cli_audits_all_profiles_with_refetch_and_no_remote_write(
         )
 
     assert rc == 0
-    assert cloned == sorted(bundle.config.profiles)
-    assert fetched == cloned
+    assert len(cloned) == 17
+    assert [(repo, branch) for repo, branch, _root in cloned] == [
+        (repo, branch)
+        for repo in sorted(bundle.config.profiles)
+        for branch in (None, "ported")
+        if repo == "wlan-driver-v2" or branch is None
+    ]
+    assert fetched == [(repo, branch or "main") for repo, branch, _root in cloned]
+    assert len({root for _repo, _branch, root in cloned}) == 17
+    assert all(marked_clone_roots)
     assert all(command[:2] == ["switch", "--detach"] for command in commands)
     output = capsys.readouterr().out
-    assert "total=16" in output and "drift=16" in output and "blocked=0" in output
+    assert "DRIFT   wlan-driver-v2[main]: managed drift" in output
+    assert "DRIFT   wlan-driver-v2[ported]: managed drift" in output
+    assert "total=17" in output and "drift=17" in output and "blocked=0" in output
     flattened = " ".join(" ".join(command) for command in commands)
     for forbidden in (
         "push",
@@ -232,11 +272,11 @@ def test_fleet_cli_selects_repositories_and_blocks_only_on_blocked(
 ) -> None:
     workspace = marked_workspace(tmp_path)
 
-    def clone(_owner: str, repo: str, root: Path) -> RepositorySnapshot:
+    def clone(_owner: str, repo: str, root: Path, branch: str | None = None) -> RepositorySnapshot:
         path = root / repo
         path.mkdir()
         (path / ".git").mkdir()
-        return RepositorySnapshot(path, "main", BASE, frozenset(), frozenset())
+        return RepositorySnapshot(path, "main", BASE, frozenset(), frozenset(), branch or "main")
 
     with (
         mock.patch.object(
@@ -245,13 +285,15 @@ def test_fleet_cli_selects_repositories_and_blocks_only_on_blocked(
             side_effect=lambda *_a, **_k: nullcontext(bundle),
         ),
         mock.patch.object(audit.fleet_git, "clone_default_branch", side_effect=clone),
+        mock.patch.object(audit.fleet_git, "clone_branch", side_effect=clone),
         mock.patch.object(audit.fleet_git, "refetch_default", return_value=BASE),
+        mock.patch.object(audit.fleet_git, "refetch_branch", return_value=BASE),
         mock.patch.object(audit, "git", return_value=""),
         mock.patch.object(
             audit,
             "audit_repository",
-            side_effect=lambda path, *_a, **_k: AuditResult(
-                path.name, "blocked", "missing names", ()
+            side_effect=lambda path, *_a, **kwargs: AuditResult(
+                path.name, kwargs["base_branch"], "blocked", "missing names", ()
             ),
         ),
     ):
@@ -268,6 +310,94 @@ def test_fleet_cli_selects_repositories_and_blocks_only_on_blocked(
             ]
         )
     assert rc == 1
+
+
+def test_selected_repository_audits_main_and_ported_and_ported_drift_prevents_all_current(
+    tmp_path: Path, bundle: ReleaseBundle, capsys
+) -> None:
+    """Catch a selected active branch silently omitted from an otherwise current audit."""
+
+    workspace = marked_workspace(tmp_path)
+
+    def clone(_owner: str, repo: str, root: Path, branch: str | None) -> RepositorySnapshot:
+        path = root / repo
+        path.mkdir()
+        (path / ".git").mkdir()
+        return RepositorySnapshot(
+            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), branch or "main"
+        )
+
+    def classify(path, _bundle, _profile, _secrets, _variables, *, base_branch, **_kwargs):
+        status = "drift" if base_branch == "ported" else "current"
+        return AuditResult(path.name, base_branch, status, f"{base_branch} {status}", ())
+
+    with (
+        mock.patch.object(
+            audit, "materialize_release_bundle", side_effect=lambda *_a, **_k: nullcontext(bundle)
+        ),
+        mock.patch.object(audit.fleet_git, "clone_branch", side_effect=clone),
+        mock.patch.object(audit.fleet_git, "refetch_branch", return_value=BASE),
+        mock.patch.object(audit, "audit_repository", side_effect=classify),
+        mock.patch.object(audit, "git", return_value=""),
+    ):
+        rc = audit.main(
+            [
+                "--automation", str(ROOT), "--workspace", str(workspace), "--ref", "v1.40",
+                "--repo", "wlan-driver-v2",
+            ]
+        )
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "CURRENT wlan-driver-v2[main]: main current" in output
+    assert "DRIFT   wlan-driver-v2[ported]: ported drift" in output
+    assert "total=2 current=1 drift=1 blocked=0" in output
+
+
+def test_target_clone_failure_blocks_only_the_exact_target_and_stays_in_totals(
+    tmp_path: Path, bundle: ReleaseBundle, capsys
+) -> None:
+    """Catch a target failure that suppresses another target or loses its branch identity."""
+
+    workspace = marked_workspace(tmp_path)
+
+    def clone(_owner: str, repo: str, root: Path, branch: str | None) -> RepositorySnapshot:
+        if branch == "ported":
+            raise audit.FleetGitError("ported fetch unavailable")
+        path = root / repo
+        path.mkdir()
+        (path / ".git").mkdir()
+        return RepositorySnapshot(
+            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), "main"
+        )
+
+    with (
+        mock.patch.object(
+            audit, "materialize_release_bundle", side_effect=lambda *_a, **_k: nullcontext(bundle)
+        ),
+        mock.patch.object(audit.fleet_git, "clone_branch", side_effect=clone),
+        mock.patch.object(audit.fleet_git, "refetch_branch", return_value=BASE),
+        mock.patch.object(
+            audit,
+            "audit_repository",
+            side_effect=lambda path, *_a, **kwargs: AuditResult(
+                path.name, kwargs["base_branch"], "current", "managed content matches", ()
+            ),
+        ),
+        mock.patch.object(audit, "git", return_value=""),
+    ):
+        rc = audit.main(
+            [
+                "--automation", str(ROOT), "--workspace", str(workspace), "--ref", "v1.40",
+                "--repo", "wlan-driver-v2",
+            ]
+        )
+
+    assert rc == 1
+    output = capsys.readouterr().out
+    assert "CURRENT wlan-driver-v2[main]: managed content matches" in output
+    assert "BLOCKED wlan-driver-v2[ported]: repository audit failed" in output
+    assert "total=2 current=1 drift=0 blocked=1" in output
 
 
 @pytest.mark.parametrize(

@@ -24,6 +24,12 @@ by `scripts/workflow-config.json`. Consumer-repository Git and `gh` operations u
 operator's normal GitHub authentication, but provider credentials are removed from child
 environments. Supply the locally installed, reviewed `actionlint` executable explicitly.
 
+Fleet configuration schema v2 treats the repository default branch as an implicit target
+and adds any active branches through a profile's ordered `additional_branches` list. A
+selected repository expands to all of its configured targets: `--repo wlan-driver-v2`
+therefore covers both `main` and `ported` without another flag. Schema-1 release bundles
+remain default-only.
+
 Automation release verification has a narrower boundary. It discovers a normal repository
 or linked worktree by reading the `.git` pointer and `commondir` itself, reads tag refs
 directly, rejects alternates and promisor/shallow object stores, and creates an isolated
@@ -415,11 +421,12 @@ The pure renderer's renderer-only content classifications are `current`, `drift`
 inspection, safe `drift` and an explicitly requested safe `bootstrap_required` become
 `planned`. A missing config without explicit bootstrap is `blocked`; it is never presented
 as an implicit bootstrap opportunity. Audit reports `current`, `drift`, or `blocked` for
-default-branch content.
+each configured target.
 
-The manifest includes the observed base SHA, release commit, required secret and variable
-**names**, and managed diff paths. It is a convenience report, not an approval token;
-publish always refetches and recomputes.
+The manifest and operator output qualify every result with its exact base branch and include
+the observed base SHA, release commit, required secret and variable **names**, and managed
+diff paths. The manifest is a convenience report, not an approval token; publish always
+refetches and recomputes.
 
 ### 2. Publish independent PRs
 
@@ -436,8 +443,9 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
   --actionlint "$ACTIONLINT"
 ```
 
-For `v1.40.1`, every repository uses the deterministic branch
-`automation/common-workflows-v1.40.1`. Publish computes exact blob, tree, and commit SHA-1
+For `v1.40.1`, the default target keeps the deterministic branch
+`automation/common-workflows-v1.40.1`; each configured non-default target adds the complete
+SHA-256 digest of its base-branch name. Publish computes exact blob, tree, and commit SHA-1
 identities locally with fixed author, committer, timestamp, and message fields. JSON sent
 through stdin creates those detached objects only at the literal GitHub Git Data API
 endpoints `repos/jhw7500/<catalog-repo>/git/blobs`, `trees`, and `commits`; the final
@@ -457,11 +465,11 @@ cleanup ref is created. There is no ordinary Git
 branch push, force option, merge, auto-merge, update-branch, default-branch write,
 secret-write, variable-write, or revert operation.
 
-All selected repositories pass read-only prevalidation before the first remote effect.
+All selected repository/branch targets pass read-only prevalidation before the first remote effect.
 Publication then refetches and recomputes each repository immediately before its branch
 is created or reused. The reuse rules are fail-closed:
 
-- an absent rollout branch may be created from the freshly fetched default branch;
+- an absent rollout branch may be created from the freshly fetched selected base branch;
 - a matching branch may receive its missing PR only when its base, release commit, and
   managed path/mode/blob diff exactly match the fresh render;
 - one exact open PR is reusable only when its base branch, head repository, head branch,
@@ -477,7 +485,8 @@ repository is blocked. It does not roll back successful repositories. Correct th
 and rerun the same command; exact branches and PRs are safely reused.
 
 Bootstrap is deliberately separate and accepts exactly one matching, bootstrap-allowed
-repository. Its new config disables every common workflow:
+repository's default target; additional targets cannot bootstrap. Its new config disables
+every common workflow:
 
 ```bash
 python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
@@ -523,7 +532,7 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
 
 ### 4. Read-only audit
 
-Audit current default-branch content after reviewed merges:
+Audit current content on every configured target after reviewed merges:
 
 ```bash
 python3 "$AUTOMATION_RELEASE_ROOT/scripts/audit_workflow_fleet.py" \
@@ -532,14 +541,16 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/audit_workflow_fleet.py" \
   --ref v1.40.1
 ```
 
-Repeated `--repo NAME` arguments narrow the audit. Audit reports `current`, `drift`, or
+Repeated `--repo NAME` arguments narrow the audit but still expand each selected profile's
+default and additional targets. Output is target-qualified (for example,
+`wlan-driver-v2[main]` and `wlan-driver-v2[ported]`). Audit reports `current`, `drift`, or
 `blocked` from managed bytes, tracked Git entry metadata, and contracts; it ignores
 project-owned workflow differences. A mode-only drift is `drift`, appears in
 `changed_paths`, and is repaired to an exact `100644 blob`. Commit construction and final
 attestation cover the complete managed set: every required or selected optional/config
 file that is present has canonical bytes and mode/type, unselected optional and retired
 paths are absent, and no project-owned path is changed. During rollout, an unmerged
-repository legitimately remains `drift`. The completion condition is `current=19`,
+target legitimately remains `drift`. The current fleet completion condition is `current=17`,
 `drift=0`, and `blocked=0`.
 
 ### Review, merge, and recovery
