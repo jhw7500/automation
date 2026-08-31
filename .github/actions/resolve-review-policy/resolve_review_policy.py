@@ -59,7 +59,9 @@ def resolve_policy(request: PolicyRequest) -> PolicyDecision:
     manual_request = request.event_name == "workflow_dispatch" and request.force_review
     if manual_request and request.review_mode != "request":
         raise PolicyError("force_review_mode_invalid")
-    if not manual_request and request.review_mode != label_mode:
+    if request.review_mode != label_mode and not (
+        manual_request and label_mode == "auto"
+    ):
         raise PolicyError("review_mode_label_mismatch")
     head_sha = _validated_head(request.pr, request.repository)
     if request.pr.get("state") != "open":

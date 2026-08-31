@@ -92,6 +92,18 @@ def test_manual_force_review_allows_request_without_label():
     assert decision.reason == "request"
 
 
+def test_manual_force_review_rejects_skip_label_mismatch():
+    with pytest.raises(PolicyError, match="review_mode_label_mismatch"):
+        resolve_policy(
+            request(
+                labels=["review:skip"],
+                mode="request",
+                event="workflow_dispatch",
+                force_review=True,
+            )
+        )
+
+
 def test_request_does_not_override_disabled_workflow():
     decision = resolve_policy(
         request(
