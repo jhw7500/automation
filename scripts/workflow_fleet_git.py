@@ -35,7 +35,9 @@ WORKSPACE_MARKER = ".automation-fleet-workspace"
 _REPO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
-_ROLLOUT_BRANCH = re.compile(r"automation/common-workflows-v[0-9]+(?:\.[0-9]+)+\Z")
+_ROLLOUT_BRANCH = re.compile(
+    r"automation/common-workflows-(v[0-9]+(?:\.[0-9]+)+)(?:-([0-9a-f]{64}))?\Z"
+)
 _PULL_URL = re.compile(
     r"https://github\.com/jhw7500/([A-Za-z0-9][A-Za-z0-9._-]{0,99})/pull/([1-9][0-9]*)\Z"
 )
@@ -59,6 +61,7 @@ class RepositorySnapshot:
     base_sha: str
     secret_names: frozenset[str]
     variable_names: frozenset[str]
+    base_branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,10 +102,12 @@ __all__ = (
     "PullRequest",
     "RepositorySnapshot",
     "RolloutCommit",
+    "clone_branch",
     "clone_default_branch",
     "create_rollout_branch",
     "create_pull_request",
     "list_rollout_prs",
+    "refetch_branch",
     "refetch_default",
     "remote_branch_sha",
 )
@@ -216,11 +221,11 @@ def _validate_target(owner: str, repo: str) -> None:
         raise FleetGitError("repository name is invalid")
 
 
-def _validate_branch(branch: str) -> None:
+def _validate_branch(branch: object) -> None:
     forbidden = " ~^:?*[\\"
-    components = branch.split("/")
     if (
-        not branch
+        not isinstance(branch, str)
+        or not branch
         or branch.startswith(("-", "/"))
         or branch.endswith(("/", "."))
         or "//" in branch
@@ -228,10 +233,12 @@ def _validate_branch(branch: str) -> None:
         or "@{" in branch
         or any(character in branch for character in forbidden)
         or any(ord(character) < 32 or ord(character) == 127 for character in branch)
-        or any(
-            not component or component.startswith(".") or component.endswith(".lock")
-            for component in components
-        )
+    ):
+        raise FleetGitError("branch name is invalid")
+    components = branch.split("/")
+    if any(
+        not component or component.startswith(".") or component.endswith(".lock")
+        for component in components
     ):
         raise FleetGitError("branch name is invalid")
 
@@ -343,8 +350,15 @@ def _snapshot_repo(snapshot: RepositorySnapshot) -> tuple[str, Path]:
     repo = snapshot.path.name
     _validate_target(OWNER, repo)
     _validate_branch(snapshot.default_branch)
+    _snapshot_base_branch(snapshot)
     _validate_object_id(snapshot.base_sha)
     return repo, _validate_repository_path(snapshot.path, repo)
+
+
+def _snapshot_base_branch(snapshot: RepositorySnapshot) -> str:
+    branch = snapshot.default_branch if snapshot.base_branch is None else snapshot.base_branch
+    _validate_branch(branch)
+    return branch
 
 
 def _inventory(owner: str, repo: str, kind: str) -> frozenset[str]:
@@ -362,10 +376,14 @@ def _inventory(owner: str, repo: str, kind: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def clone_default_branch(owner: str, repo: str, workspace: Path) -> RepositorySnapshot:
-    """Clone exactly one permitted repository and inventory prerequisite names."""
+def clone_branch(
+    owner: str, repo: str, workspace: Path, branch: str | None
+) -> RepositorySnapshot:
+    """Clone one permitted selected branch and inventory prerequisite names."""
 
     _validate_target(owner, repo)
+    if branch is not None:
+        _validate_branch(branch)
     workspace = _resolved_without_symlinks(workspace, "workspace")
     marker_mode: int | None = None
     try:
@@ -404,6 +422,7 @@ def clone_default_branch(owner: str, repo: str, workspace: Path) -> RepositorySn
         raise FleetGitError("GitHub returned malformed repository metadata")
     default_branch = default_ref["name"]
     _validate_branch(default_branch)
+    base_branch = default_branch if branch is None else branch
     clone_url = _clone_url(repo, metadata.get("url"))
 
     _git(
@@ -412,7 +431,7 @@ def clone_default_branch(owner: str, repo: str, workspace: Path) -> RepositorySn
             "--no-recurse-submodules",
             "--single-branch",
             "--branch",
-            default_branch,
+            base_branch,
             clone_url,
             str(target),
         ]
@@ -428,29 +447,45 @@ def clone_default_branch(owner: str, repo: str, workspace: Path) -> RepositorySn
         base_sha=base_sha,
         secret_names=secret_names,
         variable_names=variable_names,
+        base_branch=base_branch,
     )
 
 
-def refetch_default(snapshot: RepositorySnapshot) -> str:
-    """Fetch and return the current permitted origin's default-branch SHA."""
+def clone_default_branch(owner: str, repo: str, workspace: Path) -> RepositorySnapshot:
+    """Clone the reported default branch for compatibility callers."""
+
+    return clone_branch(owner, repo, workspace, None)
+
+
+def refetch_branch(snapshot: RepositorySnapshot) -> str:
+    """Fetch and return the current permitted origin's selected-base SHA."""
 
     repo, path = _snapshot_repo(snapshot)
+    base_branch = _snapshot_base_branch(snapshot)
     _verify_origin(path, repo)
     _git(
         [
             "fetch",
             "--no-recurse-submodules",
             "origin",
-            snapshot.default_branch,
+            base_branch,
         ],
         cwd=path,
     )
     return _validate_object_id(
         _git(
-            ["rev-parse", f"refs/remotes/origin/{snapshot.default_branch}"],
+            ["rev-parse", f"refs/remotes/origin/{base_branch}"],
             cwd=path,
         )
     )
+
+
+def refetch_default(snapshot: RepositorySnapshot) -> str:
+    """Fetch the default branch for compatibility callers."""
+
+    if _snapshot_base_branch(snapshot) != snapshot.default_branch:
+        raise FleetGitError("snapshot does not select the default branch")
+    return refetch_branch(snapshot)
 
 
 def remote_branch_sha(snapshot: RepositorySnapshot, branch: str) -> str | None:
@@ -550,7 +585,9 @@ def _validate_ref_response(
         raise FleetGitError("GitHub returned an invalid ref identity")
 
 
-def _validate_rollout_commit(commit: RolloutCommit, branch: str) -> None:
+def _validate_rollout_commit(
+    commit: RolloutCommit, ref: str, base_branch: str, default_branch: str
+) -> None:
     if (
         not isinstance(commit, RolloutCommit)
         or not isinstance(commit.message, str)
@@ -565,8 +602,11 @@ def _validate_rollout_commit(commit: RolloutCommit, branch: str) -> None:
         (commit.base_sha, "default commit identity"),
     ):
         _validate_sha1(value, description)
-    ref = branch.removeprefix("automation/common-workflows-")
     expected_message = f"ci: adopt common automation workflows ({ref})"
+    if base_branch != default_branch:
+        expected_message = (
+            f"ci: adopt common automation workflows ({ref}; base={base_branch})"
+        )
     raw_commit = (
         f"tree {commit.tree_sha}\n"
         f"parent {commit.base_sha}\n"
@@ -625,11 +665,19 @@ def create_rollout_branch(
     """Atomically create one exact rollout ref through the closed Git Data API."""
 
     _validate_branch(branch)
-    if _ROLLOUT_BRANCH.fullmatch(branch) is None or branch == snapshot.default_branch:
+    match = _ROLLOUT_BRANCH.fullmatch(branch)
+    if match is None or branch == snapshot.default_branch:
         raise FleetGitError("rollout branch publication is not permitted")
     repo, path = _snapshot_repo(snapshot)
+    base_branch = _snapshot_base_branch(snapshot)
+    ref, suffix = match.groups()
+    if base_branch == snapshot.default_branch:
+        if suffix is not None:
+            raise FleetGitError("rollout branch publication is not permitted")
+    elif suffix != hashlib.sha256(base_branch.encode("utf-8")).hexdigest():
+        raise FleetGitError("rollout branch publication is not permitted")
     _verify_origin(path, repo)
-    _validate_rollout_commit(commit, branch)
+    _validate_rollout_commit(commit, ref, base_branch, snapshot.default_branch)
     if commit.base_sha != snapshot.base_sha:
         raise FleetGitError("rollout base does not match the repository snapshot")
 

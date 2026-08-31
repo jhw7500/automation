@@ -34,12 +34,14 @@ def object_oid(kind: str, payload: bytes) -> str:
     ).hexdigest()
 
 
-def atomic_publication_values(base_sha: str = SHA) -> dict[str, object]:
+def atomic_publication_values(
+    base_sha: str = SHA,
+    message: str = "ci: adopt common automation workflows (v1.40)",
+) -> dict[str, object]:
     content = b"name: managed\n"
     blob_sha = object_oid("blob", content)
     base_tree_sha = "4" * 40
     tree_sha = "5" * 40
-    message = "ci: adopt common automation workflows (v1.40)"
     commit_payload = (
         f"tree {tree_sha}\n"
         f"parent {base_sha}\n"
@@ -132,6 +134,7 @@ def raw_snapshot(path: Path) -> workflow_fleet_git.RepositorySnapshot:
         base_sha=SHA,
         secret_names=frozenset({"A_SECRET"}),
         variable_names=frozenset({"A_VARIABLE"}),
+        base_branch="main",
     )
 
 
@@ -357,6 +360,7 @@ def test_clone_reads_only_metadata_and_prerequisite_names(
         base_sha=SHA,
         secret_names=frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}),
         variable_names=frozenset({"APP_ID"}),
+        base_branch="main",
     )
     clone = next(
         git_payload(args) for args, _ in calls if args[0] == "git" and "clone" in args
@@ -399,6 +403,90 @@ def test_clone_reads_only_metadata_and_prerequisite_names(
             "name",
         ],
     ]
+
+
+def test_clone_branch_retains_repository_default_and_selected_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = workspace(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if args[:3] == ["gh", "repo", "view"]:
+            return completed(
+                args,
+                json.dumps(
+                    {
+                        "defaultBranchRef": {"name": "main"},
+                        "url": "https://github.com/jhw7500/wlan-package",
+                    }
+                ),
+            )
+        if args[:3] in (["gh", "secret", "list"], ["gh", "variable", "list"]):
+            return completed(args, "[]")
+        payload = git_payload(args)
+        if payload[0] == "clone":
+            Path(payload[-1]).mkdir()
+            (Path(payload[-1]) / ".git").mkdir()
+            return completed(args)
+        if payload in [
+            ["remote", "get-url", "--all", "origin"],
+            ["remote", "get-url", "--push", "--all", "origin"],
+        ]:
+            return completed(args, "https://github.com/jhw7500/wlan-package.git\n")
+        if payload == ["rev-parse", "HEAD"]:
+            return completed(args, SHA)
+        raise AssertionError(args)
+
+    monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
+
+    result = workflow_fleet_git.clone_branch(
+        "jhw7500", "wlan-package", root, "ported"
+    )
+
+    assert result.default_branch == "main"
+    assert result.base_branch == "ported"
+    assert next(
+        git_payload(args)
+        for args in calls
+        if args[0] == "git" and "clone" in args
+    ) == [
+        "clone",
+        "--no-recurse-submodules",
+        "--single-branch",
+        "--branch",
+        "ported",
+        "https://github.com/jhw7500/wlan-package.git",
+        str(root / "wlan-package"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"url": "https://github.com/jhw7500/repo"},
+        {"defaultBranchRef": None, "url": "https://github.com/jhw7500/repo"},
+        {
+            "defaultBranchRef": {"name": "bad branch"},
+            "url": "https://github.com/jhw7500/repo",
+        },
+    ],
+)
+def test_clone_branch_rejects_missing_or_malformed_default_branch_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata: dict[str, object]
+) -> None:
+    monkeypatch.setattr(
+        workflow_fleet_git.subprocess,
+        "run",
+        lambda args, **kwargs: completed(args, json.dumps(metadata)),
+    )
+
+    with pytest.raises(
+        workflow_fleet_git.FleetGitError,
+        match="malformed repository metadata|branch name is invalid",
+    ):
+        workflow_fleet_git.clone_branch("jhw7500", "repo", workspace(tmp_path), "ported")
 
 
 @pytest.mark.parametrize(
@@ -491,6 +579,34 @@ def test_refetch_default_uses_origin_tracking_ref(
     ]
 
 
+def test_refetch_branch_uses_selected_base_origin_tracking_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(git_payload(args))
+        if calls[-1] in [
+            ["remote", "get-url", "--all", "origin"],
+            ["remote", "get-url", "--push", "--all", "origin"],
+        ]:
+            return completed(args, "https://github.com/jhw7500/repo.git")
+        if calls[-1] == ["rev-parse", "refs/remotes/origin/ported"]:
+            return completed(args, HEAD_SHA)
+        return completed(args)
+
+    monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
+    item = replace(snapshot(tmp_path / "repo"), base_branch="ported")
+
+    assert workflow_fleet_git.refetch_branch(item) == HEAD_SHA
+    assert calls == [
+        ["remote", "get-url", "--all", "origin"],
+        ["remote", "get-url", "--push", "--all", "origin"],
+        ["fetch", "--no-recurse-submodules", "origin", "ported"],
+        ["rev-parse", "refs/remotes/origin/ported"],
+    ]
+
+
 @pytest.mark.parametrize(
     ("output", "expected"),
     [("", None), (f"{HEAD_SHA}\trefs/heads/release\n", HEAD_SHA)],
@@ -520,6 +636,40 @@ def test_remote_branch_sha_is_read_only(
         == expected
     )
     assert calls[-1] == ["ls-remote", "--heads", "origin", "refs/heads/release"]
+
+
+def test_additional_base_rollout_identity_requires_its_exact_digest_and_commit_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_branch = "ported"
+    digest = hashlib.sha256(base_branch.encode("utf-8")).hexdigest()
+    branch = f"automation/common-workflows-v1.40-{digest}"
+    message = f"ci: adopt common automation workflows (v1.40; base={base_branch})"
+    item = replace(snapshot(tmp_path / "repo"), base_branch=base_branch)
+    values = atomic_publication_values(message=message)
+
+    monkeypatch.setattr(workflow_fleet_git, "_verify_origin", lambda *_args: None)
+    monkeypatch.setattr(
+        workflow_fleet_git,
+        "_github_post",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("reached GitHub API")),
+    )
+
+    with pytest.raises(RuntimeError, match="reached GitHub API"):
+        workflow_fleet_git.create_rollout_branch(
+            item, branch, commit=rollout_commit(values)
+        )
+
+    for invalid_branch, invalid_message in (
+        (f"automation/common-workflows-v1.40-{'0' * 64}", message),
+        ("automation/common-workflows-v1.40", message),
+        (branch, "ci: adopt common automation workflows (v1.40)"),
+    ):
+        invalid_values = atomic_publication_values(message=invalid_message)
+        with pytest.raises(workflow_fleet_git.FleetGitError):
+            workflow_fleet_git.create_rollout_branch(
+                item, invalid_branch, commit=rollout_commit(invalid_values)
+            )
 
 
 def test_atomic_rollout_branch_creation_uses_only_literal_git_data_post_schemas(
@@ -1316,10 +1466,12 @@ def test_adapter_exposes_no_merge_revert_or_prerequisite_write_api() -> None:
         "PullRequest",
         "RepositorySnapshot",
         "RolloutCommit",
+        "clone_branch",
         "clone_default_branch",
         "create_pull_request",
         "create_rollout_branch",
         "list_rollout_prs",
+        "refetch_branch",
         "refetch_default",
         "remote_branch_sha",
     }
