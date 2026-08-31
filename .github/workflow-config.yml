@@ -64,7 +64,7 @@ workflows:
 
 # === Shared Settings ===
 review:
-  auto: false
+  auto: true
 
 claude:
   # Optional. If empty/omitted, claude-code-action default is used.
