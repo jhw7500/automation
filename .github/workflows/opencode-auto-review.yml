@@ -383,7 +383,7 @@ jobs:
           PREV_SUCCESSFUL_HEAD="$(printf '%s\n' "$PREV_RECORD" | jq -r '.state.successful_head // ""')"
           PREV_FULL_HASH="$(printf '%s\n' "$PREV_RECORD" | jq -r '.state.full_diff_sha256 // ""')"
           # Reserved workflow-owned text is never model input, even from a validated record.
-          PREV_REVIEW="$(printf '%s\n' "$PREV_REVIEW" | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Last attempt: )' || true)"
+          PREV_REVIEW="$(printf '%s\n' "$PREV_REVIEW" | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Filtered candidate \(raw\): |- Last attempt: )' || true)"
           # A first failure has no checkpoint and must not become re-review context. A stale
           # failure is useful only when it retained a validated successful checkpoint/body.
           if ! [[ "$PREV_SUCCESSFUL_HEAD" =~ ^[0-9a-f]{40}$ ]] \
@@ -399,7 +399,7 @@ jobs:
             '[.[] | select((.user.type // "") != "Bot")] | .[-10:]
              | map("@" + (.user.login // "ghost") + " (" + (.created_at // "") + "):\n" + ((.body // "") | .[0:1500]))
              | join("\n\n---\n\n")' "$COMMENTS" \
-            | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Last attempt: )' || true)"
+            | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Filtered candidate \(raw\): |- Last attempt: )' || true)"
 
           clip() {
             local text="$1"
@@ -4040,7 +4040,7 @@ jobs:
               }
               return true;
             };
-            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Validation: filtered_invalid_new_findings=[1-9][0-9]*; reasons=[a-z_,]+$|- Last attempt: failure \(https?:\/\/\S+\)$|- Reason: [a-z_]+$)/;
+            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Validation: filtered_invalid_new_findings=[1-9][0-9]*; reasons=[a-z_,]+$|- Filtered candidate \(raw\): artifact `opencode-candidate-[1-9][0-9]*-[1-9][0-9]*` → `review\.md`$|- Last attempt: failure \(https?:\/\/\S+\)$|- Reason: [a-z_]+$)/;
             const clean = (body) => {
               const rawLines = (body || '').split('\n');
               // OpenCode can include tool/thinking traces in the final text event. Only an exact
@@ -4740,12 +4740,15 @@ jobs:
             const validationSummary = modelSucceeded && filteredNewFindings.length > 0
               ? `\n- Validation: filtered_invalid_new_findings=${filteredNewFindings.length}; reasons=${filteredReasons}`
               : '';
+            const filteredCandidateSummary = modelSucceeded && filteredNewFindings.length > 0
+              ? `\n- Filtered candidate (raw): artifact \`opencode-candidate-${runId}-${runAttempt}\` → \`review.md\``
+              : '';
             const retainedNewFindingCount = parsedReview
               ? parsedReview.blocks.filter((entry) => entry.section === 'New findings'
                 && !filteredEntries.has(entry)).length : 0;
             const qualityFiltered = modelSucceeded && filteredNewFindings.length > 0
               && retainedNewFindingCount === 0;
-            const bodyFor = (attestationId) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${attestationId}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${validationSummary}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})\n- Reason: ${failureReason}` : ''}\n\n${displayBody}`;
+            const bodyFor = (attestationId) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${attestationId}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${validationSummary}${filteredCandidateSummary}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})\n- Reason: ${failureReason}` : ''}\n\n${displayBody}`;
             if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536) {
               throw new Error('canonical OpenCode comment exceeds 65,536-byte publication limit');
             }
