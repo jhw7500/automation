@@ -1629,6 +1629,32 @@ def test_current_release_rejects_opencode_attestation_boundary_drift(
         release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
 
 
+def test_v147_rejects_opencode_filtered_candidate_location_drift(
+    current_release_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = current_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+    mutate_named_step_text(
+        path,
+        "Canonicalize OpenCode review",
+        "` → \\`review.md\\``",
+        "` → \\`filtered.md\\``",
+    )
+    bad_commit = commit(repo, "drift filtered OpenCode candidate location")
+    monkeypatch.setitem(
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256,
+        "opencode",
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="OpenCode sealed handoff/attestation contract is invalid",
+    ):
+        release_verifier.verify_commit_content(repo, "v1.47", bad_commit)
+
+
 def test_prepare_diff_capability_boundary_is_shared_with_release_inventory() -> None:
     capability = getattr(
         release_inventory, "release_supports_prepare_review_diff", None

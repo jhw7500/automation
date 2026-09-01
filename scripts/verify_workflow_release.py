@@ -664,12 +664,12 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d34dfc388a393a6679bfd6a38ac281cc2c14a843063a010e9f1303c68df58cc7",
     "gemini": "54bbd6c197a74a6c0524509877a1bbe6b1918bc83d28b6c98605b63ec4bece7d",
-    "opencode": "c249bd40a072d74179f5313f4e53d8ef9817f05bbdbc1f0c0e94bf513af1d2ba",
+    "opencode": "c13a61cf3362586da6230f3de03f623fea8e50b9756f337408351c35d970c0f0",
 }
 EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256 = {
     "claude": "2950d9dbf0923dfc463a872e8602e4d73ba2457a0df90ca3cca228ffb661343a",
     "gemini": "0c00a267e7415c0f2d90ba538ee5432f1c1e78c29ab76c44472b44263e97aec8",
-    "opencode": "6a80a008783826618baed22c0675f354cdf7a1b845ef8f6aecd224f00f800249",
+    "opencode": "947600cb0ae3d0564a59ba03f8eccc4b5fa991138b280152c24e18e61ecc25a2",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
@@ -6864,6 +6864,32 @@ def _verify_commit_content(
             and repair_call > body_limit_gate
             and canonical_script.count("if (!(await repairComments())) return;") == 1
         )
+        filtered_candidate_location_contract = (
+            "const filteredCandidateSummary = modelSucceeded "
+            "&& filteredNewFindings.length > 0"
+            in canonical_script
+            and canonical_script.count(
+                "? `\\n- Filtered candidate (raw): artifact "
+                "\\`opencode-candidate-${runId}-${runAttempt}\\` → "
+                "\\`review.md\\``"
+            )
+            == 1
+            and (
+                "${validationSummary}${filteredCandidateSummary}"
+                "${!succeeded"
+            )
+            in canonical_script
+            and (
+                "- Filtered candidate \\(raw\\): artifact "
+                "`opencode-candidate-[1-9][0-9]*-[1-9][0-9]*` → "
+                "`review\\.md`$"
+            )
+            in canonical_script
+            and prepare_script.count(
+                "|- Filtered candidate \\(raw\\): |"
+            )
+            == 2
+        )
         artifact_contract = (
             prepare.get("permissions") == expected_prepare
             and canonical.get("permissions") == expected_canonical
@@ -6928,6 +6954,7 @@ def _verify_commit_content(
             and canonical_anchor_contract
             and (canonical_removed_contract or approved_legacy_opencode_release)
             and canonical_pre_mutation_size_contract
+            and (filtered_candidate_location_contract if budget_release else True)
             and "github.rest.checks.create" in canonical_script
             and "github.rest.checks.update" in canonical_script
             and "github.rest.actions.listWorkflowRunsForRepo" in canonical_script

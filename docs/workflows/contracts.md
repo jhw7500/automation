@@ -384,7 +384,11 @@ removed, whose line is not an actual added-side line, or whose quoted current li
 omitted with reason `anchor_out_of_scope`. Valid blocks—including `[HIGH]` blocks—remain unchanged.
 If every new block is omitted, the canonical section becomes exactly `### New findings` followed by
 `None`; the successful attested comment reports `filtered_invalid_new_findings=N` and the sorted
-set of filtering reasons on its visible validation line. Git invocation or parsing failures, sealed
+set of filtering reasons on its visible validation line. Whenever that count is nonzero, the next
+line identifies the untrusted source as artifact `opencode-candidate-<run_id>-<run_attempt>` and
+file `review.md`; the adjacent run URL opens the Actions run that owns the artifact. The artifact is
+retained for one day, and this workflow-owned location line is excluded from later review context.
+Git invocation or parsing failures, sealed
 manifest inconsistencies, malformed document or section grammar, and invalid carryover or
 disposition evidence still fail the checkpoint without advancing `successful_head`.
 

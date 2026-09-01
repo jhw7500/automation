@@ -14801,6 +14801,7 @@ def test_opencode_changed_anchor_scope_accepts_none_or_anchored_findings(tmp_pat
     assert state["attempt_status"] == "success"
     assert state["diff_mode"] == "full"
     assert state["successful_head"] == state["attempt_head"]
+    assert "- Filtered candidate (raw):" not in body
 
 
 @node_required
@@ -14838,6 +14839,10 @@ def test_opencode_filters_out_of_scope_new_finding_but_keeps_valid_high(tmp_path
     assert (
         "- Validation: filtered_invalid_new_findings=1; "
         "reasons=anchor_out_of_scope"
+    ) in body
+    assert (
+        "- Filtered candidate (raw): artifact "
+        "`opencode-candidate-42-1` → `review.md`"
     ) in body
 
 
@@ -14946,6 +14951,11 @@ def test_opencode_all_out_of_scope_new_findings_becomes_clean_success(tmp_path):
         "- Validation: filtered_invalid_new_findings=2; "
         "reasons=anchor_out_of_scope"
     ) in body
+    filtered_candidate_location = (
+        "- Filtered candidate (raw): artifact "
+        "`opencode-candidate-42-1` → `review.md`"
+    )
+    assert filtered_candidate_location in body
 
     canonical, receipt = _opencode_published_from_calls(calls)
     next_round = tmp_path / "next-round"
@@ -14955,6 +14965,54 @@ def test_opencode_all_out_of_scope_new_findings_becomes_clean_success(tmp_path):
     )
     assert "### New findings\nNone" in context
     assert "filtered_invalid_new_findings" not in context
+    assert "Filtered candidate (raw)" not in context
+
+
+@node_required
+def test_opencode_failed_retry_does_not_republish_prior_filtered_candidate_location(
+    tmp_path,
+):
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    candidate = _bot(
+        "github-actions[bot]",
+        (
+            f"{OPENCODE_MARKER}\n### New findings\n"
+            "#### [MEDIUM] Misquoted current source\n"
+            f"- Changed anchor: {anchor}\n"
+            '- Current line: "not the current added line"\n'
+            "The quoted source does not match the prepared diff."
+        ),
+        10,
+        updated="u2",
+    )
+    successful_calls = _run_opencode_canonicalize(tmp_path, [], [candidate])
+    canonical, receipt = _opencode_published_from_calls(successful_calls)
+    assert "- Filtered candidate (raw):" in canonical["body"]
+
+    retry = tmp_path / "failed-retry"
+    retry.mkdir()
+    failed_calls = _run_opencode_canonicalize(
+        retry,
+        [canonical],
+        [canonical],
+        run_id="43",
+        outcome="failure",
+        failure_reason="provider_failed",
+        check_runs=[receipt],
+    )
+    body = _single_mutation_body(failed_calls)
+    state = json.loads(
+        re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
+    )
+
+    assert state["attempt_status"] == "failure"
+    assert state["successful_head"] is not None
+    assert "- Status: stale" in body
+    assert "- Filtered candidate (raw):" not in body
 
 
 @node_required
@@ -15644,6 +15702,7 @@ def test_opencode_changed_anchor_scope_rejects_invalid_output_grammar(tmp_path, 
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "failure"
     assert state["successful_head"] is None
+    assert "- Filtered candidate (raw):" not in body
 
 
 @node_required
