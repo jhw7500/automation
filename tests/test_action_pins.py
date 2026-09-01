@@ -18,6 +18,7 @@ from scripts.verify_workflow_release import CHECKOUT_ACTION, CLAUDE_CODE_ACTION
 
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 CACHE_SHA = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+SETUP_PYTHON_SHA = "5fda3b95a4ea91299a34e894583c3862153e4b97"
 OPENCODE_VERSION = "1.18.17"
 OPENCODE_ARCHIVE_SHA256 = (
     "3f14a4c61c7f6b0d3b6d933d1d212e64e19683eba6fa453ad98e46303afe144a"
@@ -59,6 +60,21 @@ class ActionPinsTest(unittest.TestCase):
 
         self.assertGreater(len(references), 0, "no managed checkout references found")
         self.assertEqual([], offenders)
+
+    def test_fleet_tool_ci_uses_the_approved_setup_python_sha(self) -> None:
+        workflow = yaml.load(
+            (ROOT / ".github/workflows/test-fleet-tools.yml").read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        references = [
+            step["uses"]
+            for step in workflow["jobs"]["pytest"]["steps"]
+            if step.get("uses", "").startswith("actions/setup-python@")
+        ]
+
+        self.assertEqual([f"actions/setup-python@{SETUP_PYTHON_SHA}"], references)
 
     def test_managed_workflows_do_not_contain_empty_github_expressions(self) -> None:
         offenders: list[str] = []
