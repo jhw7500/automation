@@ -9,6 +9,17 @@ name: Self OpenCode Auto Review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number
+        type: number
+        required: true
+      force_review:
+        description: Perform one authorized same-HEAD review
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   check-secret:
@@ -36,9 +47,11 @@ jobs:
     # 호출부에서도 명시해 이중 방어 + _self-gemini 쪽과 조건을 통일한다.
     if: >-
       needs.check-secret.outputs.has_key == 'true' &&
+      ((github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.fork == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft == false
+      github.event.pull_request.draft == false) ||
+      (github.event_name == 'workflow_dispatch' && inputs.force_review))
     permissions:
       actions: read
       checks: write
@@ -47,10 +60,11 @@ jobs:
       pull-requests: write
     uses: ./.github/workflows/opencode-auto-review.yml
     with:
-      pr_number: ${{ github.event.pull_request.number }}
-      force_review: false
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}
       review_mode: >-
         ${{
+          github.event_name == 'workflow_dispatch' && inputs.force_review && 'request' ||
           contains(github.event.pull_request.labels.*.name, 'review:request') &&
           contains(github.event.pull_request.labels.*.name, 'review:skip') && 'conflict' ||
           contains(github.event.pull_request.labels.*.name, 'review:request') && 'request' ||

@@ -519,9 +519,38 @@ def test_self_auto_review_callers_forward_label_review_mode() -> None:
         assert caller["on"]["pull_request"]["types"] == [
             "opened", "synchronize", "ready_for_review",
         ]
-        assert " ".join(job["with"]["review_mode"].split()) == SELF_REVIEW_MODE_EXPRESSION
+        assert " ".join(job["with"]["review_mode"].split()) == REVIEW_MODE_EXPRESSION
         assert "github.event.pull_request.draft == false" in job["if"]
-        assert job["with"]["force_review"] == "false"
+
+        # 라운드 소진 후 재판정을 요청할 수 있어야 한다. 예산 액션이 override 라운드에
+        # workflow_dispatch provenance 를 요구하므로 트리거와 전달이 함께 있어야 한다.
+        assert caller["on"]["workflow_dispatch"]["inputs"]["pr_number"]["type"] == "number"
+        assert caller["on"]["workflow_dispatch"]["inputs"]["pr_number"]["required"] == "true"
+        force_input = caller["on"]["workflow_dispatch"]["inputs"]["force_review"]
+        assert force_input["type"] == "boolean"
+        assert force_input["default"] == "false"
+        assert job["with"]["force_review"] == (
+            "${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}"
+        )
+        assert job["with"]["pr_number"] == (
+            "${{ github.event.pull_request.number || inputs.pr_number }}"
+        )
+        assert (
+            "(github.event_name == 'workflow_dispatch' && inputs.force_review)"
+            in " ".join(job["if"].split())
+        )
+
+        # && 가 || 보다 강하게 결합하므로, 시크릿 게이트가 있는 caller 는 이벤트 분기
+        # 전체를 괄호로 묶어야 workflow_dispatch 경로가 그 게이트를 건너뛰지 않는다.
+        condition = " ".join(job["if"].split())
+        if "needs.check-secret" in condition:
+            assert condition.startswith(
+                "needs.check-secret.outputs.has_key == 'true' "
+                "&& ((github.event_name == 'pull_request'"
+            ), filename
+            assert condition.endswith(
+                "|| (github.event_name == 'workflow_dispatch' && inputs.force_review))"
+            ), filename
 
 
 def test_comment_callers_carry_the_request_scoped_run_name() -> None:
