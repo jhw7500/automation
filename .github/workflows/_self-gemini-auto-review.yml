@@ -10,6 +10,17 @@ name: Self Gemini Auto Review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number
+        type: number
+        required: true
+      force_review:
+        description: Perform one authorized same-HEAD review
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   check-secret:
@@ -35,9 +46,11 @@ jobs:
     needs: check-secret
     if: >-
       needs.check-secret.outputs.has_key == 'true' &&
+      ((github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.fork == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft == false
+      github.event.pull_request.draft == false) ||
+      (github.event_name == 'workflow_dispatch' && inputs.force_review))
     permissions:
       actions: read
       contents: read
@@ -45,10 +58,11 @@ jobs:
       pull-requests: write
     uses: ./.github/workflows/gemini-auto-review.yml
     with:
-      pr_number: ${{ github.event.pull_request.number }}
-      force_review: false
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}
       review_mode: >-
         ${{
+          github.event_name == 'workflow_dispatch' && inputs.force_review && 'request' ||
           contains(github.event.pull_request.labels.*.name, 'review:request') &&
           contains(github.event.pull_request.labels.*.name, 'review:skip') && 'conflict' ||
           contains(github.event.pull_request.labels.*.name, 'review:request') && 'request' ||

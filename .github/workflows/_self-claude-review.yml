@@ -8,13 +8,26 @@ name: Self Claude Review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number
+        type: number
+        required: true
+      force_review:
+        description: Perform one authorized same-HEAD review
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   claude-review:
     if: >-
+      (github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.fork == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft == false
+      github.event.pull_request.draft == false) ||
+      (github.event_name == 'workflow_dispatch' && inputs.force_review)
     permissions:
       actions: read
       contents: read
@@ -23,11 +36,12 @@ jobs:
       id-token: write
     uses: ./.github/workflows/claude-code-review.yml
     with:
-      pr_number: '${{ github.event.pull_request.number }}'
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
       force_run: false
-      force_review: false
+      force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}
       review_mode: >-
         ${{
+          github.event_name == 'workflow_dispatch' && inputs.force_review && 'request' ||
           contains(github.event.pull_request.labels.*.name, 'review:request') &&
           contains(github.event.pull_request.labels.*.name, 'review:skip') && 'conflict' ||
           contains(github.event.pull_request.labels.*.name, 'review:request') && 'request' ||
