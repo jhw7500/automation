@@ -17213,5 +17213,73 @@ def test_dogfood_workflows_registered_in_config():
         )
 
 
+def test_gemini_uploads_the_raw_candidate_alongside_the_rejected_diagnostic():
+    workflow = _load("gemini-auto-review.yml")
+    names = [step.get("name") for step in workflow["jobs"]["gemini-review"]["steps"]]
+    candidate = _step(workflow, "gemini-review", "Upload Gemini review candidate")
+
+    assert (
+        names.index("Canonicalize Gemini review")
+        < names.index("Upload Gemini review candidate")
+        < names.index("Upload rejected Gemini review diagnostic")
+    )
+    assert candidate["uses"] == (
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+    )
+    assert candidate["if"] == (
+        "${{ always() "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+        "&& steps.canonicalize-review.outcome != 'skipped' "
+        "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+    )
+    assert candidate["with"] == {
+        "name": "gemini-candidate-${{ github.run_id }}-${{ github.run_attempt }}",
+        "path": "${{ github.workspace }}/gemini_review.md",
+        "if-no-files-found": "ignore",
+        "retention-days": "1",
+        "overwrite": "false",
+    }
+
+
+@node_required
+def test_gemini_rejected_candidate_failure_comment_names_the_raw_artifact(tmp_path):
+    calls = _gemini_upsert(
+        tmp_path,
+        "success",
+        [],
+        with_review=False,
+        canonical_outcome="success",
+        document_valid="false",
+        canonical_failure_reason="ambiguous_document",
+    )
+
+    body = _single_mutation_body(calls)
+    assert "Reason: ambiguous_document" in body
+    assert "Candidate (raw): artifact `gemini-candidate-42-1`" in body
+
+
+@node_required
+def test_gemini_failure_without_a_rejected_candidate_omits_the_pointer(tmp_path):
+    calls = _gemini_upsert(
+        tmp_path,
+        "failure",
+        [],
+        with_review=False,
+        canonical_outcome="skipped",
+        document_valid="false",
+    )
+
+    body = _single_mutation_body(calls)
+    assert "- Status: failure" in body
+    assert "gemini-candidate-" not in body
+
+
+@node_required
+def test_gemini_success_comment_omits_the_raw_candidate_pointer(tmp_path):
+    calls = _gemini_upsert(tmp_path, "success", [], with_review=True)
+
+    assert "gemini-candidate-" not in _single_mutation_body(calls)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -470,11 +470,18 @@ body above 64,000 UTF-8 bytes. The second bound is checked after canonical JSON 
 escaping, before the canonical file is published, and reserves 1,536 bytes for the authenticated
 v3 sticky envelope under GitHub's 65,536-byte comment limit.
 After an attempted Claude or Gemini canonicalization that does not produce
-`document-valid=true`, the workflow uploads only the bounded schema-1
+`document-valid=true`, the workflow uploads the bounded schema-1
 `<reviewer>-review-result.json` as a uniquely named, non-overwriting diagnostic artifact for one
-day. The untrusted raw candidate is never uploaded: it may contain provider-echoed secrets and a
-workspace path could otherwise expose a checkout-seeded symlink target. A missing result is
-ignored. The diagnostic is not authority: neither the upsert program nor later review state or
+day. Gemini additionally uploads the rejected raw candidate as
+`gemini-candidate-<run>-<attempt>` under that same rejection-only condition and the same
+one-day, non-overwriting bound, because the structural code alone cannot separate a
+prompt/format regression from an over-strict validator. Claude never uploads its raw candidate.
+The Gemini upload is bounded to rejected rounds, whose text is by definition never published,
+and it stays untrusted provider output that no program reads: the upsert program never names or
+opens the raw file, and the failure comment cites only the artifact name. The workspace path is
+safe because the reset step removes it with `rm -f --` before generation and the canonicalizer
+runs only after that reset succeeds, so no checkout-seeded symlink target survives. A missing
+result is ignored. The diagnostic is not authority: neither the upsert program nor later review state or
 carryover reads it. For `ambiguous_document`, logs expose only a fixed structural diagnostic code
 such as `preamble`, `unknown_section_before_document`,
 `unknown_section_after_document`, or `invalid_finding_heading`; candidate text is never copied into

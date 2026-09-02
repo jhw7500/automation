@@ -663,12 +663,12 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d34dfc388a393a6679bfd6a38ac281cc2c14a843063a010e9f1303c68df58cc7",
-    "gemini": "54bbd6c197a74a6c0524509877a1bbe6b1918bc83d28b6c98605b63ec4bece7d",
+    "gemini": "16d400da3e074f3a4deb3c5c49089e300b61639aee239979235e63f1abc9c937",
     "opencode": "c13a61cf3362586da6230f3de03f623fea8e50b9756f337408351c35d970c0f0",
 }
 EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256 = {
     "claude": "2950d9dbf0923dfc463a872e8602e4d73ba2457a0df90ca3cca228ffb661343a",
-    "gemini": "0c00a267e7415c0f2d90ba538ee5432f1c1e78c29ab76c44472b44263e97aec8",
+    "gemini": "f20fc659d9023585cd3d2201d4fbe380e97c5796d0ea2bd442b9cf42457a51f1",
     "opencode": "947600cb0ae3d0564a59ba03f8eccc4b5fa991138b280152c24e18e61ecc25a2",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
@@ -1197,7 +1197,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
             "cc81b9e370c357366a384a059c9d6e1fe02065f085985f30532b92410c49c43d"
         ),
         "upsert_sha256_v147": (
-            "b924753e8c9eda60ac3047dfc2c085ec4c56d62b2d6ad81a3ec979a3ff85e5f0"
+            "dcd3ae4370bc4048dce767d89755102f17d1bf97a503bc0b73b52cc7676d9047"
         ),
         "bot_login": "${{ steps.auth.outputs.bot-login }}",
         "auth_mode": "${{ inputs.repo_write_auth }}",
@@ -5940,6 +5940,32 @@ def _expected_rejected_review_diagnostic_upload_step(
     }
 
 
+def _expected_review_candidate_upload_step(
+    contract: dict[str, str],
+) -> dict[str, object]:
+    reviewer = contract["reviewer"]
+    return {
+        "name": f"Upload {reviewer.capitalize()} review candidate",
+        "if": (
+            "${{ always() "
+            "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+            "&& steps.canonicalize-review.outcome != 'skipped' "
+            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+        ),
+        "uses": UPLOAD_ARTIFACT_ACTION,
+        "with": {
+            "name": (
+                f"{reviewer}-candidate-${{{{ github.run_id }}}}-"
+                "${{ github.run_attempt }}"
+            ),
+            "path": f"${{{{ github.workspace }}}}/{contract['raw']}",
+            "if-no-files-found": "ignore",
+            "retention-days": "1",
+            "overwrite": "false",
+        },
+    }
+
+
 def _verify_review_publication_contracts(
     documents: dict[str, dict], ref: str
 ) -> None:
@@ -5995,6 +6021,22 @@ def _verify_review_publication_contracts(
                 )
             ):
                 raise ValueError("rejected review diagnostic differs")
+            candidate_upload = None
+            if budget and contract["reviewer"] == "gemini":
+                candidate_upload = _named_step(
+                    job,
+                    f"Upload {contract['reviewer'].capitalize()} review candidate",
+                )
+                if candidate_upload != _expected_review_candidate_upload_step(
+                    contract
+                ):
+                    raise ValueError("review candidate upload differs")
+                if not (
+                    job["steps"].index(canonical_step)
+                    < job["steps"].index(candidate_upload)
+                    < job["steps"].index(rejected_diagnostic_upload)
+                ):
+                    raise ValueError("review candidate upload order differs")
             prepared_head_checkout = _named_step(job, "Checkout prepared review head")
             if prepared_head_checkout != _expected_prepared_head_checkout_step(
                 budget=budget
