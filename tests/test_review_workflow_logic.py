@@ -6799,10 +6799,33 @@ def test_dispatch_resolves_fallback_route_with_case_sensitive_model_comparison(
         assert _github_outputs(output) == {"enabled": expected}
 
 
+def _github_delimited_outputs(path: Path) -> dict[str, str]:
+    """`name<<DELIM ... DELIM` 형식만 쓰는 스텝 출력을 읽는다."""
+
+    values: dict[str, str] = {}
+    lines = path.read_text(encoding="utf-8").split("\n")
+    index = 0
+    while index < len(lines):
+        if "<<" in lines[index]:
+            name, delimiter = lines[index].split("<<", 1)
+            index += 1
+            body: list[str] = []
+            while index < len(lines) and lines[index] != delimiter:
+                body.append(lines[index])
+                index += 1
+            values[name] = "\n".join(body)
+        index += 1
+    return values
+
+
+RETRYABLE_PRIMARY_OUTCOMES = "'[\"failure\",\"cancelled\",\"timed_out\"]'"
+
+
 def test_dispatch_skips_identical_fallback_model_route():
     workflow = _load("gemini-dispatch.yml")
     expected = (
-        "steps.gemini_review_primary.outcome == 'failure' && "
+        f"contains(fromJSON({RETRYABLE_PRIMARY_OUTCOMES}), "
+        "steps.gemini_review_primary.outcome) && "
         "steps.gemini_review_fallback_route.outputs.enabled == 'true'"
     )
 
@@ -6811,6 +6834,85 @@ def test_dispatch_skips_identical_fallback_model_route():
         _step(workflow, "review", "Run Gemini pull request review (fallback)")["if"]
         == expected
     )
+
+
+def test_dispatch_falls_back_for_every_non_success_primary_outcome():
+    # 취소·타임아웃도 fallback 대상이다. 성공/건너뜀은 아니다.
+    workflow = _load("gemini-dispatch.yml")
+    invoke_expected = (
+        f"contains(fromJSON({RETRYABLE_PRIMARY_OUTCOMES}), "
+        "steps.gemini_invoke_primary.outcome) && vars.GEMINI_FALLBACK_MODEL != ''"
+    )
+
+    for name in (
+        "Log primary model failure",
+        "Run Gemini pull request review (fallback)",
+    ):
+        condition = _step(workflow, "review", name)["if"]
+        assert "cancelled" in condition, name
+        assert "timed_out" in condition, name
+        assert "'success'" not in condition, name
+
+    assert _step(workflow, "invoke", "Log primary model failure (invoke)")["if"] == (
+        invoke_expected
+    )
+    assert _step(workflow, "invoke", "Run Gemini CLI (fallback)")["if"] == invoke_expected
+
+    # 취소·타임아웃에서도 "무엇이 일어났는지"가 코멘트에 남아야 한다.
+    for job, name, step_id in (
+        ("review", "Log primary model failure", "gemini_review_primary"),
+        ("invoke", "Log primary model failure (invoke)", "gemini_invoke_primary"),
+    ):
+        step = _step(workflow, job, name)
+        assert step["env"]["PRIMARY_OUTCOME"] == f"${{{{ steps.{step_id}.outcome }}}}"
+        assert "**Primary Outcome:**" in step["run"]
+
+
+@pytest.mark.parametrize(
+    ("primary_outcome", "fallback_outcome", "expected_outcome", "expected_model"),
+    (
+        ("success", "skipped", "success", "primary-model"),
+        ("cancelled", "success", "success", "fallback-model"),
+        ("failure", "success", "success", "fallback-model"),
+        ("cancelled", "skipped", "failure", "primary-model"),
+        ("timed_out", "failure", "failure", "primary-model"),
+    ),
+)
+def test_dispatch_final_review_records_the_primary_and_fallback_outcomes(
+    tmp_path, primary_outcome, fallback_outcome, expected_outcome, expected_model
+):
+    workflow = _load("gemini-dispatch.yml")
+    final = _step(workflow, "review", "Set final review result")
+    output = tmp_path / "github-output"
+
+    result = subprocess.run(
+        ["bash", "-c", final["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PRIMARY_OUTCOME": primary_outcome,
+            "PRIMARY_MODEL": "primary-model",
+            "PRIMARY_RESPONSE": "PRIMARY BODY",
+            "PRIMARY_ERRORS": "",
+            "FALLBACK_OUTCOME": fallback_outcome,
+            "FALLBACK_MODEL": "fallback-model",
+            "FALLBACK_RESPONSE": "FALLBACK BODY",
+            "FALLBACK_ERRORS": "",
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    outputs = _github_delimited_outputs(output)
+    assert outputs["outcome"] == expected_outcome
+    assert outputs["model"] == expected_model
+    if expected_outcome == "failure":
+        # 취소·타임아웃은 오류 텍스트를 남기지 않으므로 실행 상태가 원인으로 남아야 한다.
+        assert f"primary={primary_outcome}" in outputs["errors"]
+        assert f"fallback={fallback_outcome}" in outputs["errors"]
 
 
 def _extract_gemini_python() -> str:

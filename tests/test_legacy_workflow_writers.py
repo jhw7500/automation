@@ -563,6 +563,7 @@ def test_failure_comments_propagate_adversarial_error_text_as_data(
         "GITHUB_TOKEN": "token",
         "ISSUE_NUMBER": "17",
         "PRIMARY_MODEL": model,
+        "PRIMARY_OUTCOME": "cancelled",
         "FALLBACK_MODEL": "fallback-model",
         "ERRORS": errors,
         "REPOSITORY": "jhw7500/example",
@@ -583,6 +584,8 @@ def test_failure_comments_propagate_adversarial_error_text_as_data(
     body = capture.read_text(encoding="utf-8")
     assert model in body
     assert errors in body
+    # 취소도 데이터로 그대로 전달돼야 한다 — "failed" 로 뭉뚱그리지 않는다.
+    assert "**Primary Outcome:** cancelled" in body
     assert "$PRIMARY_MODEL" not in body
     assert "$ERRORS" not in body
 
