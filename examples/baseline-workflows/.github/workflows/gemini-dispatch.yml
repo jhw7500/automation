@@ -1,4 +1,5 @@
 name: Gemini Dispatch
+run-name: jhw-review-comment-${{ github.event.comment.id || github.run_id }}
 
 on:
   pull_request_review_comment:
