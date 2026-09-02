@@ -662,12 +662,12 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
     "43f15d59df0f529e2fa4f06488e49dc5ff78280762ee8d7248dbecb45cbb609d"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
-    "claude": "d34dfc388a393a6679bfd6a38ac281cc2c14a843063a010e9f1303c68df58cc7",
+    "claude": "d4db53b86603a3a113999409e2e4e35c397adf276981e7f68c0ea57a6198faa2",
     "gemini": "531c91663071e8a4985c85d6bc123024c29ee9e9efefc834ea6f5b440ccca41b",
     "opencode": "c13a61cf3362586da6230f3de03f623fea8e50b9756f337408351c35d970c0f0",
 }
 EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256 = {
-    "claude": "2950d9dbf0923dfc463a872e8602e4d73ba2457a0df90ca3cca228ffb661343a",
+    "claude": "8e16c59b04aeaaf7419571b0bda3fb1e46a29da3b847bbb0409ab0437a1027d7",
     "gemini": "a395bbfe4ec6a09449812968b32716fe16cd23567820a612197238e57c24b8f7",
     "opencode": "947600cb0ae3d0564a59ba03f8eccc4b5fa991138b280152c24e18e61ecc25a2",
 }
@@ -1165,7 +1165,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
             "d2f1d2eab1e974bf05f184406e854cfe0861ab4b863520a4189d987ceccf27cc"
         ),
         "upsert_sha256_v147": (
-            "bc79b2db414640a7a707f9c5dfe6e13fd05a726aaad74ad163c6d46f71caf766"
+            "f23f444b3a9c7b04707779f3f8431da60107c8792558c02f5c011216ca93d805"
         ),
         "bot_login": "github-actions[bot]",
         "workflow_prefix": (
@@ -6024,7 +6024,7 @@ def _verify_review_publication_contracts(
             ):
                 raise ValueError("rejected review diagnostic differs")
             candidate_upload = None
-            if budget and contract["reviewer"] == "gemini":
+            if budget:
                 candidate_upload = _named_step(
                     job,
                     f"Upload {contract['reviewer'].capitalize()} review candidate",

@@ -4481,6 +4481,7 @@ def _claude_upsert(
     current_head: str | None = None,
     workflow_runs: list[dict] | None = None,
     workflow_run_attempt_sequences: dict[str, list[dict]] | None = None,
+    candidate_artifact: str = "success",
 ) -> list:
     workdir = tmp_path / ("with-review" if with_review else "without-review")
     workdir.mkdir()
@@ -4508,6 +4509,7 @@ def _claude_upsert(
         "NORMALIZED_COUNT": normalized_count,
         "FILTERED_MAX_SEVERITY": filtered_max_severity,
         "CANONICAL_FAILURE_REASON": canonical_failure_reason,
+        "CANDIDATE_ARTIFACT": candidate_artifact,
         "BUDGET_ALLOW_INVOCATION": budget_allow_invocation,
         "BOT_LOGIN": "github-actions[bot]",
     }
@@ -17312,6 +17314,88 @@ def test_gemini_success_comment_omits_the_raw_candidate_pointer(tmp_path):
     calls = _gemini_upsert(tmp_path, "success", [], with_review=True)
 
     assert "gemini-candidate-" not in _single_mutation_body(calls)
+
+
+
+def test_claude_uploads_the_raw_candidate_alongside_the_rejected_diagnostic():
+    workflow = _load("claude-code-review.yml")
+    names = [step.get("name") for step in workflow["jobs"]["claude-review"]["steps"]]
+    candidate = _step(workflow, "claude-review", "Upload Claude review candidate")
+
+    assert (
+        names.index("Canonicalize Claude review")
+        < names.index("Upload Claude review candidate")
+        < names.index("Upload rejected Claude review diagnostic")
+    )
+    assert candidate["id"] == "upload-candidate"
+    assert candidate["uses"] == (
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+    )
+    assert candidate["if"] == (
+        "${{ always() "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+        "&& steps.canonicalize-review.outcome != 'skipped' "
+        "&& steps.canonicalize-review.outputs.document-valid != 'true' "
+        "&& hashFiles('claude-review.md') != '' }}"
+    )
+    assert candidate["with"] == {
+        "name": "claude-candidate-${{ github.run_id }}-${{ github.run_attempt }}",
+        "path": "${{ github.workspace }}/claude-review.md",
+        "if-no-files-found": "ignore",
+        "retention-days": "1",
+        "overwrite": "false",
+    }
+
+
+def test_claude_upsert_receives_the_candidate_upload_outcome():
+    workflow = _load("claude-code-review.yml")
+    upsert = _step(workflow, "claude-review", "Upsert review comment")
+
+    assert upsert["env"]["CANDIDATE_ARTIFACT"] == (
+        "${{ steps.upload-candidate.outcome }}"
+    )
+
+
+@node_required
+def test_claude_rejected_candidate_failure_comment_names_the_raw_artifact(tmp_path):
+    calls = _claude_upsert(
+        tmp_path,
+        "success",
+        [],
+        with_review=False,
+        canonical_outcome="success",
+        document_valid="false",
+        canonical_failure_reason="ambiguous_document",
+    )
+
+    body = _single_mutation_body(calls)
+    assert "Claude review failed: `ambiguous_document`" in body
+    assert "Candidate (raw): artifact `claude-candidate-42-1`" in body
+
+
+@node_required
+def test_claude_missing_candidate_rejection_omits_the_pointer(tmp_path):
+    calls = _claude_upsert(
+        tmp_path,
+        "skipped",
+        [],
+        with_review=False,
+        canonical_outcome="success",
+        document_valid="false",
+        canonical_failure_reason="candidate_missing",
+        candidate_artifact="skipped",
+    )
+
+    body = _single_mutation_body(calls)
+    assert "- Status: failure" in body
+    assert "claude-candidate-" not in body
+
+
+@node_required
+def test_claude_success_comment_omits_the_raw_candidate_pointer(tmp_path):
+    calls = _claude_upsert(tmp_path, "success", [], with_review=True)
+
+    assert "claude-candidate-" not in _single_mutation_body(calls)
 
 
 if __name__ == "__main__":
