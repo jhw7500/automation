@@ -465,13 +465,14 @@ jobs:
             Keep the response concise and structured with clear headings.
 
       - name: Log primary model failure
-        if: steps.gemini_review_primary.outcome == 'failure' && steps.gemini_review_fallback_route.outputs.enabled == 'true'
+        if: contains(fromJSON('["failure","cancelled","timed_out"]'), steps.gemini_review_primary.outcome) && steps.gemini_review_fallback_route.outputs.enabled == 'true'
         env:
           GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
           FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
           ERRORS: '${{ steps.gemini_review_primary.outputs.error }}'
+          PRIMARY_OUTCOME: '${{ steps.gemini_review_primary.outcome }}'
           REPOSITORY: '${{ github.repository }}'
         run: |-
           error_comment="${RUNNER_TEMP}/gemini-review-primary-error.md"
@@ -479,6 +480,7 @@ jobs:
           {
             printf '%s\n\n' '## ⚠️ Primary Model Failed'
             printf '**Primary Model:** %s\n' "$PRIMARY_MODEL"
+            printf '**Primary Outcome:** %s\n' "$PRIMARY_OUTCOME"
             printf '**Attempting Fallback:** %s\n\n' "$FALLBACK_MODEL"
             printf '%s\n' '<details>' '<summary>Error Details</summary>' '' '```'
             printf '%s\n' "$ERRORS"
@@ -491,7 +493,7 @@ jobs:
 
       - name: Run Gemini pull request review (fallback)
         id: gemini_review_fallback
-        if: steps.gemini_review_primary.outcome == 'failure' && steps.gemini_review_fallback_route.outputs.enabled == 'true'
+        if: contains(fromJSON('["failure","cancelled","timed_out"]'), steps.gemini_review_primary.outcome) && steps.gemini_review_fallback_route.outputs.enabled == 'true'
         uses: google-github-actions/run-gemini-cli@v0
         continue-on-error: true
         env:
@@ -590,7 +592,12 @@ jobs:
             outcome='failure'
             model="$PRIMARY_MODEL"
             response=''
-            errors="$PRIMARY_ERRORS"
+            status="primary=${PRIMARY_OUTCOME:-unknown}; fallback=${FALLBACK_OUTCOME:-not_run}"
+            if [[ -n "$PRIMARY_ERRORS" ]]; then
+              errors="${status}"$'\n\n'"${PRIMARY_ERRORS}"
+            else
+              errors="$status"
+            fi
           fi
 
           write_output outcome "$outcome"
@@ -931,13 +938,14 @@ jobs:
           prompt: '/gemini-invoke'
 
       - name: Log primary model failure (invoke)
-        if: steps.gemini_invoke_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != ''
+        if: contains(fromJSON('["failure","cancelled","timed_out"]'), steps.gemini_invoke_primary.outcome) && vars.GEMINI_FALLBACK_MODEL != ''
         env:
           GITHUB_TOKEN: '${{ steps.auth.outputs.token }}'
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           PRIMARY_MODEL: '${{ vars.GEMINI_MODEL }}'
           FALLBACK_MODEL: '${{ vars.GEMINI_FALLBACK_MODEL }}'
           ERRORS: '${{ steps.gemini_invoke_primary.outputs.error }}'
+          PRIMARY_OUTCOME: '${{ steps.gemini_invoke_primary.outcome }}'
           REPOSITORY: '${{ github.repository }}'
         run: |-
           error_comment="${RUNNER_TEMP}/gemini-invoke-primary-error.md"
@@ -945,6 +953,7 @@ jobs:
           {
             printf '%s\n\n' '## ⚠️ Primary Model Failed'
             printf '**Primary Model:** %s\n' "$PRIMARY_MODEL"
+            printf '**Primary Outcome:** %s\n' "$PRIMARY_OUTCOME"
             printf '**Attempting Fallback:** %s\n\n' "$FALLBACK_MODEL"
             printf '%s\n' '<details>' '<summary>Error Details</summary>' '' '```'
             printf '%s\n' "$ERRORS"
@@ -957,7 +966,7 @@ jobs:
 
       - name: Run Gemini CLI (fallback)
         id: gemini_invoke_fallback
-        if: steps.gemini_invoke_primary.outcome == 'failure' && vars.GEMINI_FALLBACK_MODEL != ''
+        if: contains(fromJSON('["failure","cancelled","timed_out"]'), steps.gemini_invoke_primary.outcome) && vars.GEMINI_FALLBACK_MODEL != ''
         uses: google-github-actions/run-gemini-cli@v0
         env:
           TITLE: '${{ github.event.pull_request.title || github.event.issue.title }}'
