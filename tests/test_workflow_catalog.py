@@ -39,7 +39,7 @@ def test_catalog_and_profiles_are_closed() -> None:
     catalog = load_catalog(ROOT)
     config = load_fleet_config(ROOT, catalog)
     assert config.owner == "jhw7500"
-    assert config.automation_ref == "v1.52"
+    assert config.automation_ref == "v1.53"
     assert config.canonical_dir == PurePosixPath("examples/baseline-workflows/.github")
     assert set(config.profiles) == set(EXPECTED)
     for name, (optional, auth, bootstrap) in EXPECTED.items():
