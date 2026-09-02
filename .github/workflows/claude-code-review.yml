@@ -692,6 +692,19 @@ jobs:
           previous-sha: ${{ steps.prepare-review-input.outputs.previous_sha }}
           previous-review-file: ${{ steps.prepare-review-input.outputs.previous_sha != '' && format('{0}/claude-previous-review.md', runner.temp) || '' }}
 
+      # 거부된 후보의 원문이 없으면 프롬프트/포맷 회귀와 검증기 과잉을 구분할 수 없다.
+      # 노출을 최소화하기 위해 거부된 라운드에서만, 원문이 실제로 있을 때만 보존한다.
+      - name: Upload Claude review candidate
+        id: upload-candidate
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.document-valid != 'true' && hashFiles('claude-review.md') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: claude-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/claude-review.md
+          if-no-files-found: ignore
+          retention-days: 1
+          overwrite: false
+
       - name: Upload rejected Claude review diagnostic
         if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.document-valid != 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -729,6 +742,7 @@ jobs:
           NORMALIZED_COUNT: ${{ steps.canonicalize-review.outputs.normalized-count }}
           FILTERED_MAX_SEVERITY: ${{ steps.canonicalize-review.outputs.filtered-max-severity }}
           CANONICAL_FAILURE_REASON: ${{ steps.canonicalize-review.outputs.failure-reason }}
+          CANDIDATE_ARTIFACT: ${{ steps.upload-candidate.outcome }}
           BUDGET_ALLOW_INVOCATION: ${{ steps.review-budget-claim.outputs.allow-invocation }}
           BOT_LOGIN: 'github-actions[bot]'
         with:
@@ -1001,12 +1015,19 @@ jobs:
                 failureReason = 'candidate_oversize';
               }
             }
+            // 업로드 스텝이 성공한 라운드에만 안내한다. 후보 파일이 없으면 그 스텝은
+            // skipped 이므로, 존재하지 않는 아티팩트를 가리키지 않는다.
+            const candidateUploaded =
+              (process.env.CANDIDATE_ARTIFACT || '').toLowerCase() === 'success';
+            const candidatePointer = candidateUploaded
+              ? `\n\nCandidate (raw): artifact \`claude-candidate-${runId}-${runAttempt}\``
+              : '';
             const preserveSuccess = checkpointFailed && existing
               && sha1(existing.state.successful_head) && preservedProse.length > 0;
             const state = buildState(checkpointFailed, preserveSuccess);
             const content = checkpointFailed
               ? (preserveSuccess ? preservedProse
-                : `### Error\n\nClaude review failed: \`${failureReason}\`. (See run logs: ${runUrl})`)
+                : `### Error\n\nClaude review failed: \`${failureReason}\`. (See run logs: ${runUrl})${candidatePointer}`)
               : successBody;
             const body = envelope(state, content);
             if (checkpointFailed && Buffer.byteLength(body, 'utf8') > 65536) {
