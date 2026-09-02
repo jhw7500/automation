@@ -4773,6 +4773,7 @@ def _gemini_upsert(
     auth_mode: str = "github_token",
     publisher_app_id: str = "",
     budget_allow_invocation: str = "true",
+    candidate_artifact: str = "success",
 ) -> list:
     workdir = tmp_path / ("gemini-with-review" if with_review else "gemini-without-review")
     workdir.mkdir(parents=True)
@@ -4802,6 +4803,7 @@ def _gemini_upsert(
         "NORMALIZED_COUNT": normalized_count,
         "FILTERED_MAX_SEVERITY": filtered_max_severity,
         "CANONICAL_FAILURE_REASON": canonical_failure_reason,
+        "CANDIDATE_ARTIFACT": candidate_artifact,
         "BOT_LOGIN": bot_login,
         "AUTH_MODE": auth_mode,
         "PUBLISHER_APP_ID": publisher_app_id,
@@ -17226,11 +17228,13 @@ def test_gemini_uploads_the_raw_candidate_alongside_the_rejected_diagnostic():
     assert candidate["uses"] == (
         "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
     )
+    assert candidate["id"] == "upload-candidate"
     assert candidate["if"] == (
         "${{ always() "
         "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
         "&& steps.canonicalize-review.outcome != 'skipped' "
-        "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+        "&& steps.canonicalize-review.outputs.document-valid != 'true' "
+        "&& hashFiles('gemini_review.md') != '' }}"
     )
     assert candidate["with"] == {
         "name": "gemini-candidate-${{ github.run_id }}-${{ github.run_attempt }}",
@@ -17239,6 +17243,15 @@ def test_gemini_uploads_the_raw_candidate_alongside_the_rejected_diagnostic():
         "retention-days": "1",
         "overwrite": "false",
     }
+
+
+def test_gemini_upsert_receives_the_candidate_upload_outcome():
+    workflow = _load("gemini-auto-review.yml")
+    upsert = _step(workflow, "gemini-review", "Upsert review comment")
+
+    assert upsert["env"]["CANDIDATE_ARTIFACT"] == (
+        "${{ steps.upload-candidate.outcome }}"
+    )
 
 
 @node_required
@@ -17267,10 +17280,30 @@ def test_gemini_failure_without_a_rejected_candidate_omits_the_pointer(tmp_path)
         with_review=False,
         canonical_outcome="skipped",
         document_valid="false",
+        candidate_artifact="skipped",
     )
 
     body = _single_mutation_body(calls)
     assert "- Status: failure" in body
+    assert "gemini-candidate-" not in body
+
+
+@node_required
+def test_gemini_missing_candidate_rejection_omits_the_pointer(tmp_path):
+    calls = _gemini_upsert(
+        tmp_path,
+        "skipped",
+        [],
+        with_review=False,
+        canonical_outcome="success",
+        document_valid="false",
+        canonical_failure_reason="candidate_missing",
+        candidate_artifact="skipped",
+    )
+
+    body = _single_mutation_body(calls)
+    # gemini-review 가 건너뛰어져 원문이 없는 라운드 — 업로드도 함께 건너뛰어진다.
+    assert "Reason: provider_failed" in body
     assert "gemini-candidate-" not in body
 
 

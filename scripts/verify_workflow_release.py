@@ -663,12 +663,12 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d34dfc388a393a6679bfd6a38ac281cc2c14a843063a010e9f1303c68df58cc7",
-    "gemini": "16d400da3e074f3a4deb3c5c49089e300b61639aee239979235e63f1abc9c937",
+    "gemini": "531c91663071e8a4985c85d6bc123024c29ee9e9efefc834ea6f5b440ccca41b",
     "opencode": "c13a61cf3362586da6230f3de03f623fea8e50b9756f337408351c35d970c0f0",
 }
 EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256 = {
     "claude": "2950d9dbf0923dfc463a872e8602e4d73ba2457a0df90ca3cca228ffb661343a",
-    "gemini": "f20fc659d9023585cd3d2201d4fbe380e97c5796d0ea2bd442b9cf42457a51f1",
+    "gemini": "a395bbfe4ec6a09449812968b32716fe16cd23567820a612197238e57c24b8f7",
     "opencode": "947600cb0ae3d0564a59ba03f8eccc4b5fa991138b280152c24e18e61ecc25a2",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
@@ -1197,7 +1197,7 @@ REVIEW_PUBLICATION_CONTRACTS = {
             "cc81b9e370c357366a384a059c9d6e1fe02065f085985f30532b92410c49c43d"
         ),
         "upsert_sha256_v147": (
-            "dcd3ae4370bc4048dce767d89755102f17d1bf97a503bc0b73b52cc7676d9047"
+            "62f29ebd7ca5fe47f4449cfa43a03ebb5a04e6b051a170b2221a670986c04ea8"
         ),
         "bot_login": "${{ steps.auth.outputs.bot-login }}",
         "auth_mode": "${{ inputs.repo_write_auth }}",
@@ -5946,11 +5946,13 @@ def _expected_review_candidate_upload_step(
     reviewer = contract["reviewer"]
     return {
         "name": f"Upload {reviewer.capitalize()} review candidate",
+        "id": "upload-candidate",
         "if": (
             "${{ always() "
             "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
             "&& steps.canonicalize-review.outcome != 'skipped' "
-            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+            "&& steps.canonicalize-review.outputs.document-valid != 'true' "
+            f"&& hashFiles('{contract['raw']}') != '' }}}}"
         ),
         "uses": UPLOAD_ARTIFACT_ACTION,
         "with": {
