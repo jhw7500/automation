@@ -40,6 +40,11 @@ SELF_REVIEW_MODE_EXPRESSION = " ".join(
 )
 
 
+ISSUE_RUN_NAME_VALUE = "jhw-review-comment-${{ github.event.comment.id || github.run_id }}"
+ISSUE_RUN_NAME_LINE = f"run-name: {ISSUE_RUN_NAME_VALUE}"
+ISSUE_RUN_NAME_CALLERS = ("claude.yml", "gemini-dispatch.yml")
+
+
 EXPECTED_WORKFLOW_NAMES = {
     "auto-rereview-request",
     "claude",
@@ -517,3 +522,16 @@ def test_self_auto_review_callers_forward_label_review_mode() -> None:
         assert " ".join(job["with"]["review_mode"].split()) == SELF_REVIEW_MODE_EXPRESSION
         assert "github.event.pull_request.draft == false" in job["if"]
         assert job["with"]["force_review"] == "false"
+
+
+def test_comment_callers_carry_the_request_scoped_run_name() -> None:
+    for filename in ISSUE_RUN_NAME_CALLERS:
+        path = CANONICAL / "workflows" / filename
+        matches = [
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if re.sub(r"\s+#.*$", "", line) == ISSUE_RUN_NAME_LINE
+        ]
+
+        assert len(matches) == 1, filename
+        assert load_yaml(path)["run-name"] == ISSUE_RUN_NAME_VALUE, filename

@@ -53,6 +53,11 @@ HERMETIC_REMOTE_GIT_ENV = {
     "GIT_PROTOCOL_FROM_USER": "0",
     "GIT_CEILING_DIRECTORIES": "/",
 }
+REQUEST_SCOPED_RUN_NAME_LINE = (
+    "run-name: jhw-review-comment-${{ github.event.comment.id || github.run_id }}\n"
+)
+
+
 HARDENED_MANUAL_OUTPUT_BLOCK = """          write_output() {
             local name="$1"
             local value="$2"
@@ -138,6 +143,18 @@ def restore_historical_v140_manual_outputs(repo: Path) -> None:
     snapshot = fixture_root / "workflow-config-v1.40.json"
     (repo / "scripts/workflow-config.json").write_bytes(snapshot.read_bytes())
     root = repo / "examples/baseline-workflows/.github/workflows"
+    # 요청 범위 run-name 은 v1.40 이후에 추가됐다 — 정책 스냅샷 바이트를 맞추려면
+    # 태그 픽스처에서 그 줄을 제거해야 한다.
+    for filename in ("claude.yml", "gemini-dispatch.yml"):
+        path = root / filename
+        text = path.read_text(encoding="utf-8")
+        assert text.count(REQUEST_SCOPED_RUN_NAME_LINE) == 1, (
+            f"{filename} 에서 요청 범위 run-name 을 정확히 1회 찾지 못했습니다 — "
+            "라이브 워크플로우가 바뀌었으면 이 픽스처 상수를 함께 갱신하세요"
+        )
+        path.write_text(
+            text.replace(REQUEST_SCOPED_RUN_NAME_LINE, "", 1), encoding="utf-8"
+        )
     for filename in ("gemini-issue-triage.yml", "gemini-pr-review.yml"):
         path = root / filename
         text = path.read_text(encoding="utf-8")
