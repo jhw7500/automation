@@ -99,6 +99,7 @@ REVIEW_POLICY_RELEASE_FILES = (
     ".github/actions/resolve-review-policy/resolve_review_policy.py",
 )
 V1462_WORKFLOW_FIXTURE_COMMIT = "d42c28ddd827554e6e46a2ab49dfe34c838c0425"
+V158_REVIEW_POLICY_HELPER_COMMIT = "1b98172325533ef6ad37f3d2cfc3870073fac26d"
 V1462_WORKFLOW_FIXTURE_SHA256 = {
     "claude-code-review.yml": (
         "008bbdcdeacdaf7796c1e3b59d22194d3f1ce380735d36dada5efab8ff52d112"
@@ -294,7 +295,26 @@ def prepare_v147(repo: Path) -> str:
     )
 
 
-def prepare_v151(repo: Path) -> str:
+def restore_pre_v159_review_policy_helper(repo: Path) -> None:
+    """Restore the authenticated v1.51-v1.58 policy-helper bytes.
+
+    v1.59 flipped the unconfigured automatic decision to opt-in, so the worktree
+    helper no longer satisfies the earlier release line's pinned digest.
+    """
+
+    relative = ".github/actions/resolve-review-policy/resolve_review_policy.py"
+    tree = release_verifier.VerifiedCommitTree.open(
+        ROOT, V158_REVIEW_POLICY_HELPER_COMMIT
+    )
+    payload = tree.read_file(relative)
+    assert (
+        hashlib.sha256(payload).hexdigest()
+        == release_verifier.EXPECTED_REVIEW_POLICY_HELPER_SHA256
+    )
+    (repo / relative).write_bytes(payload)
+
+
+def copy_review_policy_release_files(repo: Path) -> None:
     for relative in (
         ".github/actions/resolve-review-policy/action.yml",
         ".github/actions/resolve-review-policy/resolve_review_policy.py",
@@ -317,7 +337,17 @@ def prepare_v151(repo: Path) -> str:
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+
+
+def prepare_v151(repo: Path) -> str:
+    copy_review_policy_release_files(repo)
+    restore_pre_v159_review_policy_helper(repo)
     return commit(repo, "v1.51 candidate")
+
+
+def prepare_v159(repo: Path) -> str:
+    copy_review_policy_release_files(repo)
+    return commit(repo, "v1.59 candidate")
 
 
 def verify_v147(repo: Path, message: str) -> str:
@@ -1714,6 +1744,35 @@ def test_v151_accepts_current_review_policy_release_contract(
     candidate = prepare_v151(repo)
 
     assert release_verifier.verify_commit_content(repo, "v1.51", candidate) == candidate
+
+
+def test_v159_accepts_current_review_policy_release_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v159(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.59", candidate) == candidate
+
+
+def test_v159_opt_in_helper_is_rejected_on_the_v151_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v159(repo)
+
+    with pytest.raises(ReleaseVerificationError, match="review-policy helper"):
+        release_verifier.verify_commit_content(repo, "v1.51", candidate)
+
+
+def test_pre_v159_helper_is_rejected_on_the_v159_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v151(repo)
+
+    with pytest.raises(ReleaseVerificationError, match="review-policy helper"):
+        release_verifier.verify_commit_content(repo, "v1.59", candidate)
 
 
 @pytest.mark.parametrize("relative", REVIEW_POLICY_RELEASE_FILES)

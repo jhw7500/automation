@@ -181,7 +181,7 @@ def _automatic_decision(request: PolicyRequest, head_sha: str) -> PolicyDecision
             f"review_auto_{str(automatic).lower()}",
             head_sha,
         )
-    return PolicyDecision(True, "auto", "default_auto_true", head_sha)
+    return PolicyDecision(False, "auto", "default_auto_false", head_sha)
 
 
 def _required_boolean(value: object, error: str) -> bool:
