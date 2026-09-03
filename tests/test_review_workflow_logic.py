@@ -17563,5 +17563,57 @@ def test_gemini_provider_error_is_uploaded_outside_the_canonicalizer_diagnostic(
     )
 
 
+
+def test_opencode_preserves_the_rejected_candidate_outside_the_sealed_artifact():
+    """계약 실패 라운드의 원문이 없으면 프롬프트 회귀와 검증기 과잉을 구분할 수 없다."""
+
+    workflow = _load("opencode-auto-review.yml")
+    job = workflow["jobs"]["opencode-review"]
+    names = [step.get("name") for step in job["steps"]]
+    materialize = _step(
+        workflow, "opencode-review", "Materialize sealed OpenCode candidate"
+    )["run"]
+    sealed = _step(workflow, "opencode-review", "Upload untrusted OpenCode candidate")
+    rejected = _step(workflow, "opencode-review", "Upload rejected OpenCode candidate")
+
+    # 실패 원문은 sealed 후보 디렉터리 밖으로 옮긴다 — clean 잡의 계약은 건드리지 않는다.
+    assert "opencode-rejected" in materialize
+    assert "rejected_candidate=" in materialize
+    assert sealed["with"]["path"] == "${{ runner.temp }}/opencode-candidate"
+
+    assert rejected["id"] == "upload-rejected-candidate"
+    assert rejected["if"] == (
+        "${{ always() "
+        "&& needs.opencode-prepare.outputs.allow_invocation == 'true' "
+        "&& steps.materialize-candidate.outputs.rejected_candidate == 'true' }}"
+    )
+    assert rejected["with"] == {
+        "name": (
+            "opencode-rejected-${{ github.run_id }}-${{ github.run_attempt }}"
+        ),
+        "path": "${{ runner.temp }}/opencode-rejected",
+        "if-no-files-found": "ignore",
+        "retention-days": "1",
+        "overwrite": "false",
+        "include-hidden-files": "false",
+    }
+    assert names.index("Materialize sealed OpenCode candidate") < names.index(
+        "Upload rejected OpenCode candidate"
+    )
+
+
+def test_opencode_rejected_candidate_preservation_is_symlink_safe():
+    workflow = _load("opencode-auto-review.yml")
+    materialize = _step(
+        workflow, "opencode-review", "Materialize sealed OpenCode candidate"
+    )["run"]
+    failure_branch = materialize.split("else:", 1)[1]
+
+    # 성공 경로와 같은 강도로 검사한 뒤에만 보존한다.
+    assert "S_ISREG" in failure_branch
+    assert "S_ISLNK" in failure_branch
+    assert "60_000" in failure_branch
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
