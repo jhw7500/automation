@@ -667,7 +667,7 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
     "43f15d59df0f529e2fa4f06488e49dc5ff78280762ee8d7248dbecb45cbb609d"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V160 = (
-    "ec3bbc3277acda9ca34dab0785656e17e65019f44ce0835a6f1e92c8aba7268b"
+    "d6a9dc0af9b6e340b6528911ac60a48e21fd8960e515167e2c6be4536f33f1a3"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d4db53b86603a3a113999409e2e4e35c397adf276981e7f68c0ea57a6198faa2",
@@ -4102,6 +4102,11 @@ def require_budget_helper_contract(source: str, rounds_variable: bool = False) -
     # v1.60 resolves the round budget through effective_budgets(), which renames the
     # owner of the round caps and adds three statements ahead of the ledger checks.
     rounds_owner = "budgets" if rounds_variable else "state.budgets"
+    claim_rounds = (
+        "effective_budgets(validated).max_rounds"
+        if rounds_variable
+        else "validated.budgets.max_rounds"
+    )
     shape_offset = 3 if rounds_variable else 0
     try:
         compile(
@@ -4530,7 +4535,7 @@ def require_budget_helper_contract(source: str, rounds_variable: bool = False) -
             "        override = choose_override(validated, request.override_events)\n"
             "        if override is None:\n"
             "            return refuse(validated, request, 'round_budget_exhausted')\n"
-            "    elif automatic_rounds(validated) >= validated.budgets.max_rounds:\n"
+            f"    elif automatic_rounds(validated) >= {claim_rounds}:\n"
             "        override = choose_override(validated, request.override_events)\n"
             "        if override is None:\n"
             "            return refuse(validated, request, 'round_budget_exhausted')\n"
@@ -4632,9 +4637,9 @@ def require_budget_helper_contract(source: str, rounds_variable: bool = False) -
             "if overrides:\n"
             "    item = overrides[0]\n"
             "    expected_automatic_rounds = ("
-            f"range(0, {rounds_owner}.max_rounds + 1) "
+            "range(0, state.budgets.max_rounds + 1) "
             "if item.caller_event == 'workflow_dispatch' "
-            f"else ({rounds_owner}.max_rounds,))\n"
+            "else (state.budgets.max_rounds,))\n"
             "    if (len(automatic) not in expected_automatic_rounds or "
             "state.invocations[-1] != item or "
             "item.round_number != len(automatic) + 1 or "

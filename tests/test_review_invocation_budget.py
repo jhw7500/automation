@@ -1102,3 +1102,42 @@ def test_effective_round_budget_is_the_higher_of_recorded_and_configured(
     budget._validate_state_shape(state)
 
     assert budget.effective_budgets(state).max_rounds == effective
+
+
+@pytest.mark.parametrize("raw", ("²", "٣", "１"))
+def test_round_budget_rejects_non_ascii_digits(monkeypatch, capsys, raw):
+    """str.isdigit() accepts superscripts and other scripts that int() may reject."""
+
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, raw)
+
+    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 2
+    assert budget.MAX_ROUNDS_VARIABLE in capsys.readouterr().err
+
+
+def overridden_state():
+    """Two automatic rounds recorded under a budget of two, then a label override."""
+
+    automatic = rounds(2)
+    override = invocation(
+        head=HEAD_C, full_hash=HASH_3, run_id=700, round_number=3, override_event_id=9001
+    )
+    return budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        "claude",
+        invocations=automatic + (override,),
+        consumed_override_event_ids=(9001,),
+    )
+
+
+def test_recorded_override_stays_valid_without_a_raised_round_budget():
+    budget._validate_state_shape(overridden_state())
+
+
+def test_recorded_override_survives_a_raised_round_budget(monkeypatch):
+    """A raise must not retroactively change when the override became eligible."""
+
+    state = overridden_state()
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "5")
+
+    budget._validate_state_shape(state)

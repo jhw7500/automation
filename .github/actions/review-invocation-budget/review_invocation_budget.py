@@ -85,14 +85,15 @@ def configured_max_rounds() -> int:
     """Read the automatic-round budget from the repository variable, fail-safe.
 
     An absent or empty variable keeps the authenticated default. Anything else that
-    is not a plain decimal integer inside 1..MAX_ROUNDS_CEILING is reported and
-    discarded, so a typo lowers cost rather than raising it.
+    is not a plain ASCII decimal integer inside 1..MAX_ROUNDS_CEILING is reported
+    and discarded, so a typo lowers cost rather than raising it. str.isdigit() alone
+    would accept superscripts and other scripts that int() then rejects.
     """
 
     raw = os.environ.get(MAX_ROUNDS_VARIABLE, "")
     if raw == "":
         return MAX_ROUNDS_DEFAULT
-    value = int(raw) if raw.isdigit() else None
+    value = int(raw) if raw.isascii() and raw.isdigit() else None
     if value is None or not 1 <= value <= MAX_ROUNDS_CEILING:
         print(
             f"{MAX_ROUNDS_VARIABLE}={raw!r} is not an integer in "
@@ -603,9 +604,9 @@ def _validate_state_shape(state: LedgerState) -> None:
     if overrides:
         item = overrides[0]
         expected_automatic_rounds = (
-            range(0, budgets.max_rounds + 1)
+            range(0, state.budgets.max_rounds + 1)
             if item.caller_event == "workflow_dispatch"
-            else (budgets.max_rounds,)
+            else (state.budgets.max_rounds,)
         )
         if (len(automatic) not in expected_automatic_rounds or state.invocations[-1] != item or
                 item.round_number != len(automatic) + 1 or
@@ -849,7 +850,6 @@ def validate_or_initialize(state: LedgerState | None, request: ClaimRequest,
     _validate_request(request)
     validated = LedgerState.initial(request.repository, request.pr, request.reviewer) if state is None else state
     _validate_state_shape(validated)
-    validated = replace(validated, budgets=effective_budgets(validated))
     if (validated.repository, validated.pr, validated.reviewer) != (request.repository, request.pr, request.reviewer):
         raise BudgetStateError("identity_mismatch")
     _validate_provenance(validated, request, provenances)
@@ -1013,7 +1013,7 @@ def claim(state: LedgerState | None, request: ClaimRequest,
         override = choose_override(validated, request.override_events)
         if override is None:
             return refuse(validated, request, "round_budget_exhausted")
-    elif automatic_rounds(validated) >= validated.budgets.max_rounds:
+    elif automatic_rounds(validated) >= effective_budgets(validated).max_rounds:
         override = choose_override(validated, request.override_events)
         if override is None:
             return refuse(validated, request, "round_budget_exhausted")
