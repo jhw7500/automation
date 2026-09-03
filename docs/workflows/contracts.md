@@ -952,3 +952,5 @@ normal CI, review, and GitHub merge controls. After merge, verify default-branch
 with `scripts/audit_workflow_fleet.py`. See
 [`docs/workflow-fleet-rollout.md`](../workflow-fleet-rollout.md) for exact commands,
 canaries, bootstrap, and recovery.
+
+<!-- codex connectivity smoke: 이 파일 변경은 확인용 일회성 PR 이며 머지하지 않는다 -->
