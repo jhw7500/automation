@@ -1460,6 +1460,7 @@ def test_claude_budget_claim_is_durable_before_provider_and_every_model_path_is_
         ),
         "model-route-json": "${{ steps.claude-budget-config.outputs.model_route_json }}",
         "effort": "final-review/default",
+        "max-rounds": "${{ vars.REVIEW_MAX_ROUNDS }}",
         "checkpoint-file": "${{ runner.temp }}/claude-review-budget-claim.json",
     }
     record = _step(
@@ -1727,6 +1728,7 @@ def test_claude_budget_finalizes_after_review_state_upsert_and_uploads_both_chec
         "remaining-finding-ids-json": (
             "${{ steps.review-budget-outcome.outputs.remaining_finding_ids_json }}"
         ),
+        "max-rounds": "${{ vars.REVIEW_MAX_ROUNDS }}",
         "checkpoint-file": "${{ runner.temp }}/claude-review-budget-final.json",
     }
 
@@ -1999,6 +2001,7 @@ def test_gemini_budget_claim_precedes_provider_and_guards_every_new_diff_path():
             "${{ steps.gemini-budget-config.outputs.model_route_json }}"
         ),
         "effort": "${{ steps.gemini-budget-config.outputs.effort }}",
+        "max-rounds": "${{ vars.REVIEW_MAX_ROUNDS }}",
         "checkpoint-file": "${{ runner.temp }}/gemini-review-budget-claim.json",
     }
 
@@ -8545,6 +8548,7 @@ def test_opencode_budget_claim_is_sealed_before_tokenless_model_job():
         "authenticated-review-json": "${{ steps.ctx.outputs.authenticated_review_json }}",
         "model-route-json": '["zai-coding-plan/glm-4.7"]',
         "effort": "final-review/default",
+        "max-rounds": "${{ vars.REVIEW_MAX_ROUNDS }}",
         "checkpoint-file": "${{ runner.temp }}/opencode-review-budget-claim.json",
     }
     assert review["permissions"] == {}
@@ -8724,6 +8728,7 @@ def test_opencode_budget_finalize_uses_only_attested_publication_outcome():
         "outcome": "${{ steps.opencode-budget-outcome.outputs.outcome }}",
         "stop-reason": "${{ steps.opencode-budget-outcome.outputs.stop_reason }}",
         "remaining-finding-ids-json": "${{ steps.opencode-budget-outcome.outputs.remaining_finding_ids_json }}",
+        "max-rounds": "${{ vars.REVIEW_MAX_ROUNDS }}",
         "checkpoint-file": "${{ runner.temp }}/opencode-review-budget-final.json",
     }
     assert any(step.get("name") == "Upload OpenCode review budget final checkpoint" for step in job["steps"])

@@ -478,6 +478,7 @@ jobs:
           model-route-json: '["zai-coding-plan/glm-4.7"]'
           effort: final-review/default
           checkpoint-file: ${{ runner.temp }}/opencode-review-budget-claim.json
+          max-rounds: ${{ vars.REVIEW_MAX_ROUNDS }}
 
       - name: Enforce force-review claim
         if: ${{ always() && !cancelled() && inputs.force_review && steps.review-budget-claim.outputs.allow-invocation != 'true' }}
@@ -5120,6 +5121,7 @@ jobs:
           stop-reason: ${{ steps.opencode-budget-outcome.outputs.stop_reason }}
           remaining-finding-ids-json: ${{ steps.opencode-budget-outcome.outputs.remaining_finding_ids_json }}
           checkpoint-file: ${{ runner.temp }}/opencode-review-budget-final.json
+          max-rounds: ${{ vars.REVIEW_MAX_ROUNDS }}
 
       - name: Upload OpenCode review budget final checkpoint
         if: ${{ always() && !cancelled() && steps.review-budget-finalize.outcome != 'skipped' }}

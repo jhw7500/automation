@@ -47,6 +47,7 @@ from scripts.workflow_release_inventory import (
     release_supports_prepare_review_diff,
     release_supports_review_invocation_budget,
     release_supports_review_optin,
+    release_supports_review_rounds_variable,
     release_supports_review_policy,
     validate_release_listing,
 )
@@ -659,8 +660,14 @@ REVIEWER_WORKFLOWS = {
 EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256 = (
     "70b50ce482ff0e54df9fff88d5126cd8e760ed8bdabfefcc2f2ccdc639cb693b"
 )
+EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256_V160 = (
+    "d9cb26a5c340abd20707483f05f4e071b436dac17a900f670aacbd05140b981e"
+)
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
     "43f15d59df0f529e2fa4f06488e49dc5ff78280762ee8d7248dbecb45cbb609d"
+)
+EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V160 = (
+    "ec3bbc3277acda9ca34dab0785656e17e65019f44ce0835a6f1e92c8aba7268b"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d4db53b86603a3a113999409e2e4e35c397adf276981e7f68c0ea57a6198faa2",
@@ -671,6 +678,13 @@ EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256 = {
     "claude": "8e16c59b04aeaaf7419571b0bda3fb1e46a29da3b847bbb0409ab0437a1027d7",
     "gemini": "ac48c84dbc60071e88f89d6ecadebb781b50d5beb7da0e0a1ec363fab5599ce8",
     "opencode": "08f2c4cc96d6ac6753fcde8ec9fda9778ed396b9546dd7f69273423940752b9e",
+}
+# v1.60 reads the automatic-round budget from REVIEW_MAX_ROUNDS, so the three
+# reusable review workflows changed bytes again.
+EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256 = {
+    "claude": "939d8ec9dab85d670881d93681d428af4486b410112a9e9af032a473923430ea",
+    "gemini": "a33c941b20dc1d9d14a221ee9360dd6cda90801c3c7dba2347971840df87b326",
+    "opencode": "caaefcdc244444718302cc230d4bb868651e697abc503afab3d75d786c6d29c0",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
@@ -1125,6 +1139,27 @@ runs:
         publish_outputs "$mutation_response"
 """,
     Loader=yaml.BaseLoader,
+)
+def _budget_action_with_round_variable(action: dict) -> dict:
+    """Derive the v1.60 budget action: one optional input bridged to the helper env.
+
+    Stating the delta keeps the two expectations from drifting apart, which a second
+    verbatim copy of the action document would invite.
+    """
+
+    updated = deepcopy(action)
+    updated["inputs"]["max-rounds"] = {"required": "false", "default": ""}
+    for step in updated["runs"]["steps"]:
+        if isinstance(step, dict) and isinstance(step.get("env"), dict):
+            step["env"]["REVIEW_MAX_ROUNDS"] = "${{ inputs.max-rounds }}"
+            break
+    else:
+        raise ValueError("budget action has no environment block")
+    return updated
+
+
+EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V160 = _budget_action_with_round_variable(
+    EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION
 )
 REVIEW_DIFF_DEPENDENCY_WORKFLOWS = (
     "claude-code-review.yml",
@@ -2305,6 +2340,7 @@ def verify_opencode_runtime(
     current_diagnostics_contract = workflow_sha256 in {
         EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256["opencode"],
         EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256["opencode"],
+        EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256["opencode"],
     }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
@@ -2336,6 +2372,7 @@ def verify_opencode_runtime(
             OPENCODE_AUTO_REVIEW_SHA256,
             EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256["opencode"],
             EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256["opencode"],
+            EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256["opencode"],
         }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
@@ -4059,9 +4096,13 @@ def _local_literal(function: ast.FunctionDef, name: str) -> object:
     return ast.literal_eval(matches[0])
 
 
-def require_budget_helper_contract(source: str) -> None:
+def require_budget_helper_contract(source: str, rounds_variable: bool = False) -> None:
     """Require the authenticated schema-1 helper and every fixed policy gate."""
 
+    # v1.60 resolves the round budget through effective_budgets(), which renames the
+    # owner of the round caps and adds three statements ahead of the ledger checks.
+    rounds_owner = "budgets" if rounds_variable else "state.budgets"
+    shape_offset = 3 if rounds_variable else 0
     try:
         compile(
             source,
@@ -4387,7 +4428,8 @@ def require_budget_helper_contract(source: str) -> None:
             or not _ast_statement_matches(
                 reviewer_policy.body[1],
                 "return cls("
-                "max_calls_per_round={'claude': 1, 'gemini': 3, "
+                + ("max_rounds=configured_max_rounds(), " if rounds_variable else "")
+                + "max_calls_per_round={'claude': 1, 'gemini': 3, "
                 "'opencode': 2}[reviewer], "
                 "max_wall_seconds_per_round={'claude': 1080, "
                 "'gemini': 600, 'opencode': 600}[reviewer])",
@@ -4581,8 +4623,8 @@ def require_budget_helper_contract(source: str) -> None:
             "all(getattr(item, attribute) not in duplicates "
             "for item in automatic)):\n"
             "        raise BudgetStateError(reason)\n"
-            "if len(automatic) > state.budgets.max_rounds or "
-            "len(overrides) > state.budgets.max_override_rounds:\n"
+            f"if len(automatic) > {rounds_owner}.max_rounds or "
+            f"len(overrides) > {rounds_owner}.max_override_rounds:\n"
             "    raise BudgetStateError('rounds_invalid')\n"
             "if [item.round_number for item in automatic] != "
             "list(range(1, len(automatic) + 1)):\n"
@@ -4590,9 +4632,9 @@ def require_budget_helper_contract(source: str) -> None:
             "if overrides:\n"
             "    item = overrides[0]\n"
             "    expected_automatic_rounds = ("
-            "range(0, state.budgets.max_rounds + 1) "
+            f"range(0, {rounds_owner}.max_rounds + 1) "
             "if item.caller_event == 'workflow_dispatch' "
-            "else (state.budgets.max_rounds,))\n"
+            f"else ({rounds_owner}.max_rounds,))\n"
             "    if (len(automatic) not in expected_automatic_rounds or "
             "state.invocations[-1] != item or "
             "item.round_number != len(automatic) + 1 or "
@@ -4602,7 +4644,7 @@ def require_budget_helper_contract(source: str) -> None:
             "    raise BudgetStateError('override_invalid')\n"
         ).body
         if ast.dump(
-            ast.Module(body=state_shape.body[9:17], type_ignores=[]),
+            ast.Module(body=state_shape.body[9 + shape_offset:17 + shape_offset], type_ignores=[]),
             include_attributes=False,
         ) != ast.dump(
             ast.Module(body=expected_duplicate_policy, type_ignores=[]),
@@ -4611,8 +4653,8 @@ def require_budget_helper_contract(source: str) -> None:
             raise ValueError("forced duplicate policy differs")
         for expression, reason in (
             (
-                "len(automatic) > state.budgets.max_rounds or "
-                "len(overrides) > state.budgets.max_override_rounds",
+                f"len(automatic) > {rounds_owner}.max_rounds or "
+                f"len(overrides) > {rounds_owner}.max_override_rounds",
                 "rounds_invalid",
             ),
             (
@@ -5534,7 +5576,12 @@ def _verify_review_invocation_budget(
             action_payload,
             reject_duplicate_keys=release_supports_review_policy(ref),
         )
-        if action != EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION:
+        expected_action = (
+            EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V160
+            if release_supports_review_rounds_variable(ref)
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION
+        )
+        if action != expected_action:
             raise ValueError("action differs")
     except (AttributeError, ReleaseVerificationError, TypeError, ValueError, yaml.YAMLError):
         raise ReleaseVerificationError(
@@ -5547,7 +5594,7 @@ def _verify_review_invocation_budget(
         raise ReleaseVerificationError(
             "invocation-budget helper contract is invalid"
         ) from None
-    require_budget_helper_contract(helper)
+    require_budget_helper_contract(helper, release_supports_review_rounds_variable(ref))
     for reviewer, workflow in REVIEWER_WORKFLOWS.items():
         require_budget_workflow_contract(
             tree,
@@ -5555,18 +5602,25 @@ def _verify_review_invocation_budget(
             reviewer,
             review_policy=release_supports_review_policy(ref),
         )
+    rounds_variable = release_supports_review_rounds_variable(ref)
     authenticated_digests = {
         action_path: (
             action_payload,
-            EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256,
+            EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256_V160
+            if rounds_variable
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256,
         ),
         REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix(): (
             helper_payload,
-            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256,
+            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V160
+            if rounds_variable
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256,
         ),
     }
     workflow_digests = (
-        EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256
+        EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256
+        if rounds_variable
+        else EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256
         if release_supports_review_policy(ref)
         else EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256
     )

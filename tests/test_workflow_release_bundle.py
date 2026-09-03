@@ -423,9 +423,9 @@ def test_review_invocation_budget_action_has_exact_safe_contract() -> None:
     document = yaml.load(payload, Loader=yaml.BaseLoader)
 
     assert hashlib.sha256(payload).hexdigest() == (
-        "70b50ce482ff0e54df9fff88d5126cd8e760ed8bdabfefcc2f2ccdc639cb693b"
+        "d9cb26a5c340abd20707483f05f4e071b436dac17a900f670aacbd05140b981e"
     )
-    assert document == release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION
+    assert document == release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V160
 
 
 def git(repo: Path, *args: str) -> str:

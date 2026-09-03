@@ -1022,3 +1022,83 @@ def test_stored_automatic_and_override_aggregate_boundaries():
         ),
     )
     assert_stored_state_rejected(above_override_limit, "input_budget_exhausted")
+
+
+# --- configurable automatic round budget (issue #114) ---
+
+
+@pytest.fixture(autouse=True)
+def isolate_round_budget_variable(monkeypatch):
+    """The round budget reads a repository variable, so keep it out of every other test."""
+
+    monkeypatch.delenv(budget.MAX_ROUNDS_VARIABLE, raising=False)
+
+
+def rounds(count):
+    return tuple(
+        invocation(
+            head=chr(ord("a") + index) * 40,
+            full_hash=str(index + 1) * 64,
+            run_id=600 + index,
+            round_number=index + 1,
+        )
+        for index in range(count)
+    )
+
+
+def test_round_budget_defaults_to_two_without_the_variable():
+    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 2
+
+
+@pytest.mark.parametrize("reviewer", ("claude", "gemini", "opencode"))
+@pytest.mark.parametrize("raw", ("1", "3", "5"))
+def test_round_budget_honours_the_configured_variable(monkeypatch, reviewer, raw):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, raw)
+
+    assert budget.BudgetPolicy.for_reviewer(reviewer).max_rounds == int(raw)
+
+
+def test_round_budget_ignores_an_empty_variable_without_warning(monkeypatch, capsys):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "")
+
+    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 2
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("raw", ("0", "6", "-1", "two", "3.0", " 3", "+3", "0x3"))
+def test_round_budget_falls_back_and_warns_on_an_unusable_variable(monkeypatch, capsys, raw):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, raw)
+
+    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 2
+    assert budget.MAX_ROUNDS_VARIABLE in capsys.readouterr().err
+
+
+def test_ledger_capacity_follows_the_configured_round_budget(monkeypatch):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "5")
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude", invocations=rounds(4))
+
+    budget._validate_state_shape(state)
+
+
+def test_ledger_capacity_still_rejects_more_rounds_than_budgeted():
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude", invocations=rounds(4))
+
+    with pytest.raises(budget.BudgetStateError):
+        budget._validate_state_shape(state)
+
+
+@pytest.mark.parametrize(
+    ("recorded", "configured", "effective"), ((2, 5, 5), (5, 2, 5), (2, 2, 2))
+)
+def test_effective_round_budget_is_the_higher_of_recorded_and_configured(
+    monkeypatch, recorded, configured, effective
+):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, str(configured))
+    state = replace(
+        budget.LedgerState.initial(REPOSITORY, PR, "claude"),
+        budgets=replace(budget.BudgetPolicy.for_reviewer("claude"), max_rounds=recorded),
+    )
+
+    budget._validate_state_shape(state)
+
+    assert budget.effective_budgets(state).max_rounds == effective

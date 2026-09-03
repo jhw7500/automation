@@ -43,6 +43,9 @@ inputs:
   remaining-finding-ids-json:
     required: false
     default: '[]'
+  max-rounds:
+    required: false
+    default: ''
 outputs:
   allow-invocation:
     value: ${{ steps.budget.outputs.allow-invocation }}
@@ -76,6 +79,7 @@ runs:
         EFFORT: ${{ inputs.effort }}
         ACTUAL_CALL_COUNT: ${{ inputs.actual-call-count }}
         ELAPSED_SECONDS: ${{ inputs.elapsed-seconds }}
+        REVIEW_MAX_ROUNDS: ${{ inputs.max-rounds }}
         REVIEW_OUTCOME: ${{ inputs.outcome }}
         STOP_REASON: ${{ inputs.stop-reason }}
         REMAINING_FINDING_IDS_JSON: ${{ inputs.remaining-finding-ids-json }}

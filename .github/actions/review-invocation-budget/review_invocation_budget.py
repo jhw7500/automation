@@ -9,6 +9,7 @@ import math
 import os
 import re
 import stat
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
@@ -75,6 +76,33 @@ def _exact_keys(value: object, keys: set[str], name: str) -> Mapping[str, object
     return value
 
 
+MAX_ROUNDS_VARIABLE = "REVIEW_MAX_ROUNDS"
+MAX_ROUNDS_DEFAULT = 2
+MAX_ROUNDS_CEILING = 5
+
+
+def configured_max_rounds() -> int:
+    """Read the automatic-round budget from the repository variable, fail-safe.
+
+    An absent or empty variable keeps the authenticated default. Anything else that
+    is not a plain decimal integer inside 1..MAX_ROUNDS_CEILING is reported and
+    discarded, so a typo lowers cost rather than raising it.
+    """
+
+    raw = os.environ.get(MAX_ROUNDS_VARIABLE, "")
+    if raw == "":
+        return MAX_ROUNDS_DEFAULT
+    value = int(raw) if raw.isdigit() else None
+    if value is None or not 1 <= value <= MAX_ROUNDS_CEILING:
+        print(
+            f"{MAX_ROUNDS_VARIABLE}={raw!r} is not an integer in "
+            f"1..{MAX_ROUNDS_CEILING}; using {MAX_ROUNDS_DEFAULT}",
+            file=sys.stderr,
+        )
+        return MAX_ROUNDS_DEFAULT
+    return value
+
+
 @dataclass(frozen=True)
 class BudgetPolicy:
     max_rounds: int = 2
@@ -89,6 +117,7 @@ class BudgetPolicy:
         if reviewer not in MARKERS:
             raise BudgetStateError("reviewer_invalid")
         return cls(
+            max_rounds=configured_max_rounds(),
             max_calls_per_round={"claude": 1, "gemini": 3, "opencode": 2}[reviewer],
             max_wall_seconds_per_round={
                 "claude": 1080, "gemini": 600, "opencode": 600,
@@ -500,14 +529,30 @@ class Transition:
     mutate_comment: bool
 
 
+def effective_budgets(state: LedgerState) -> BudgetPolicy:
+    """Take the higher of the recorded and configured round budgets.
+
+    Raising the variable therefore reaches pull requests that are already open, and
+    lowering it never invalidates a ledger that already spent more rounds.
+    """
+
+    return replace(
+        state.budgets,
+        max_rounds=max(state.budgets.max_rounds, configured_max_rounds()),
+    )
+
+
 def _validate_state_shape(state: LedgerState) -> None:
     if state.reviewer not in MARKERS or not isinstance(state.repository, str) or not state.repository:
         raise BudgetStateError("identity_invalid")
     _integer(state.pr, "pr", positive=True)
     BudgetPolicy.from_dict(state.budgets.to_dict())
-    if state.budgets != BudgetPolicy.for_reviewer(state.reviewer):
+    budgets = effective_budgets(state)
+    recorded = {key: value for key, value in state.budgets.to_dict().items() if key != "max_rounds"}
+    expected = {key: value for key, value in BudgetPolicy.for_reviewer(state.reviewer).to_dict().items() if key != "max_rounds"}
+    if recorded != expected or not 1 <= state.budgets.max_rounds <= MAX_ROUNDS_CEILING:
         raise BudgetStateError("budgets_invalid")
-    if len(state.invocations) > 3 or len(state.consumed_override_event_ids) != len(set(state.consumed_override_event_ids)):
+    if len(state.invocations) > budgets.max_rounds + budgets.max_override_rounds or len(state.consumed_override_event_ids) != len(set(state.consumed_override_event_ids)):
         raise BudgetStateError("ledger_invalid")
     if any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in state.consumed_override_event_ids):
         raise BudgetStateError("consumed_override_event_ids_invalid")
@@ -551,16 +596,16 @@ def _validate_state_shape(state: LedgerState) -> None:
             or all(getattr(item, attribute) not in duplicates for item in automatic)
         ):
             raise BudgetStateError(reason)
-    if len(automatic) > state.budgets.max_rounds or len(overrides) > state.budgets.max_override_rounds:
+    if len(automatic) > budgets.max_rounds or len(overrides) > budgets.max_override_rounds:
         raise BudgetStateError("rounds_invalid")
     if [item.round_number for item in automatic] != list(range(1, len(automatic) + 1)):
         raise BudgetStateError("rounds_invalid")
     if overrides:
         item = overrides[0]
         expected_automatic_rounds = (
-            range(0, state.budgets.max_rounds + 1)
+            range(0, budgets.max_rounds + 1)
             if item.caller_event == "workflow_dispatch"
-            else (state.budgets.max_rounds,)
+            else (budgets.max_rounds,)
         )
         if (len(automatic) not in expected_automatic_rounds or state.invocations[-1] != item or
                 item.round_number != len(automatic) + 1 or
@@ -804,6 +849,7 @@ def validate_or_initialize(state: LedgerState | None, request: ClaimRequest,
     _validate_request(request)
     validated = LedgerState.initial(request.repository, request.pr, request.reviewer) if state is None else state
     _validate_state_shape(validated)
+    validated = replace(validated, budgets=effective_budgets(validated))
     if (validated.repository, validated.pr, validated.reviewer) != (request.repository, request.pr, request.reviewer):
         raise BudgetStateError("identity_mismatch")
     _validate_provenance(validated, request, provenances)
