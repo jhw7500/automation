@@ -668,6 +668,10 @@ code_review:
 
 For repositories with Codex Code review, record operator confirmation that Code review remains enabled and Automatic reviews is disabled. Do not install a new App merely to satisfy this feature. Repositories without an App mark that channel `UNAVAILABLE`.
 
+> **Superseded 2026-09-03:** Codex Automatic reviews is now **enabled**, so Codex reviews every
+> pull request alongside the managed reviewers. The operator confirmation described below is no
+> longer required. See `docs/workflows/contracts.md` for the current policy.
+
 - [ ] **Step 5: Publish in bounded batches**
 
 Publish the fleet plan first to the already-proven jhw-notion canary, then batches of at most four repositories. For each rollout PR, verify immutable caller pins, `ready_for_review`, `review_mode`, unchanged auth profile, actionlint, and config preservation before merge. Stop the batch on any duplicate App review, provider invocation under skip/draft/conflict, label race, or verifier mismatch.

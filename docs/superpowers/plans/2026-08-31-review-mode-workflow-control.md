@@ -536,6 +536,10 @@ In `docs/workflows/contracts.md`, add sections that state:
 - labels control only managed Claude/Gemini/OpenCode workflows;
 - `/jhw:pr` posts `@codex review` and `/gemini review` after the final ready head;
 - Codex Code review remains enabled while Automatic reviews is disabled in ChatGPT Codex settings;
+
+> **Superseded 2026-09-03:** Codex Automatic reviews is now **enabled**, so Codex reviews every
+> pull request alongside the managed reviewers. The operator confirmation described below is no
+> longer required. See `docs/workflows/contracts.md` for the current policy.
 - Gemini uses only `pull_request_opened.code_review: false` and preserves all unrelated existing keys;
 - `review:skip` cannot cancel an already-started App or workflow review; and
 - fleet activation stops without Codex operator confirmation and mechanically verified Gemini config.

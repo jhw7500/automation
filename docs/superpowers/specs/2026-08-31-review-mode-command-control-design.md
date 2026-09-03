@@ -220,6 +220,10 @@ External Apps must not retain PR-open automatic review while command-level selec
 ### 9.1 Codex
 
 Keep repository Code review enabled, turn off **Automatic reviews** in Codex repository settings,
+
+> **Superseded 2026-09-03:** Codex Automatic reviews is now **enabled**, so Codex reviews every
+> pull request alongside the managed reviewers. The operator confirmation described below is no
+> longer required. See `docs/workflows/contracts.md` for the current policy.
 and use the documented `@codex review` PR comment for explicit requests. This separates App access
 from automatic invocation. The JHW command cannot safely mutate this account-level setting, so
 activation requires a one-time operator confirmation.

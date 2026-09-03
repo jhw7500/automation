@@ -178,8 +178,9 @@ their managed callers. These inventory and semantic checks apply only to `v1.51+
 earlier release retain their existing closed inventories and historical caller contracts.
 
 `/jhw:pr` posts `@codex review` and `/gemini review` after the final ready head, so manual
-App review remains available. Operators must keep Codex Code review enabled while disabling
-Automatic reviews in ChatGPT Codex settings. Gemini disables only PR-open automatic review:
+App review remains available. Codex keeps both Code review and **Automatic reviews** enabled in
+ChatGPT Codex settings, so Codex reviews every pull request like the managed reviewers do. Gemini
+disables only PR-open automatic review:
 
 ```yaml
 code_review:
@@ -192,10 +193,16 @@ and preserves unrelated existing Gemini configuration keys. `review:skip` cannot
 or managed-workflow review that has already started. Fleet activation stops unless an operator
 confirms the Codex setting and the Gemini configuration is mechanically verified.
 
+`review:skip` and `review:request` steer only the managed Actions reviewers. They do not reach
+Codex, whose automatic review is decided entirely in ChatGPT Codex settings, so a `review:skip`
+pull request still receives a Codex review. Codex also needs its repository registered under
+Codex code-review settings; a custom cloud environment is not required, because the default
+`universal` image serves review. An unregistered repository either answers a mention with
+"create an environment for this repo" or stays silent, and no review appears.
+
 To roll back the external-App opt-in, restore only Gemini's
-`pull_request_opened.code_review` value to `true` and re-enable Automatic reviews in ChatGPT
-Codex settings; keep Codex Code review enabled. No label or managed-workflow policy changes are
-needed for this rollback.
+`pull_request_opened.code_review` value to `true`; keep Codex Code review and Automatic reviews
+enabled. No label or managed-workflow policy changes are needed for this rollback.
 
 ## Deterministic automated-review input
 
