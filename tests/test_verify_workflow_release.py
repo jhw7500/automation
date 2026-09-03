@@ -232,6 +232,7 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copy2(source, target)
     restore_pre_v151_review_policy(repo)
     restore_pre_v160_round_budget(repo)
+    restore_pre_v161_cancel_guard(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -316,6 +317,42 @@ def restore_pre_v159_review_policy_helper(repo: Path) -> None:
     (repo / relative).write_bytes(payload)
 
 
+def restore_pre_v161_cancel_guard(repo: Path) -> None:
+    """Restore the broad cancel-in-progress the pre-v1.61 release lines pin.
+
+    This edits text rather than rewriting whole files so it composes with the
+    other historical restores, which transform the same workflows.
+    """
+
+    for filename in release_verifier.REVIEWER_WORKFLOWS.values():
+        path = repo / ".github/workflows" / filename
+        text = path.read_text(encoding="utf-8")
+        text = "".join(
+            line
+            for line in text.splitlines(keepends=True)
+            if "(issue #120)" not in line
+            and "Cancel only when a new commit supersedes this head" not in line
+            and "must not cancel an in-flight review" not in line
+            and "the invocation budget, so the replacement is refused" not in line
+        )
+        text = text.replace(
+            "cancel-in-progress: ${{ github.event.action == 'synchronize' }}\n",
+            "cancel-in-progress: true\n",
+        )
+        path.write_text(text, encoding="utf-8")
+
+
+def assert_pre_v161_workflow_bytes(repo: Path) -> None:
+    """The reverted workflows must be exactly the published v1.60 bytes."""
+
+    for reviewer, filename in release_verifier.REVIEWER_WORKFLOWS.items():
+        payload = (repo / ".github/workflows" / filename).read_bytes()
+        assert (
+            hashlib.sha256(payload).hexdigest()
+            == release_verifier.EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256[reviewer]
+        )
+
+
 def restore_pre_v160_round_budget(repo: Path) -> None:
     """Restore the authenticated pre-v1.60 invocation-budget wiring.
 
@@ -384,6 +421,7 @@ def copy_review_policy_release_files(repo: Path) -> None:
 
 def prepare_v151(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v161_cancel_guard(repo)
     restore_pre_v159_review_policy_helper(repo)
     restore_pre_v160_round_budget(repo)
     return commit(repo, "v1.51 candidate")
@@ -391,6 +429,7 @@ def prepare_v151(repo: Path) -> str:
 
 def prepare_v159(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v161_cancel_guard(repo)
     restore_pre_v160_round_budget(repo)
     assert_pre_v160_workflow_bytes(repo)
     return commit(repo, "v1.59 candidate")
@@ -398,6 +437,8 @@ def prepare_v159(repo: Path) -> str:
 
 def prepare_v160(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v161_cancel_guard(repo)
+    assert_pre_v161_workflow_bytes(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
@@ -1819,6 +1860,45 @@ def test_v159_opt_in_helper_is_rejected_on_the_v151_release_line(
 
     with pytest.raises(ReleaseVerificationError, match="review-policy helper"):
         release_verifier.verify_commit_content(repo, "v1.51", candidate)
+
+
+def prepare_v161(repo: Path) -> str:
+    copy_review_policy_release_files(repo)
+    for relative in (
+        ".github/actions/review-invocation-budget/action.yml",
+        ".github/actions/review-invocation-budget/review_invocation_budget.py",
+    ):
+        shutil.copy2(ROOT / relative, repo / relative)
+    return commit(repo, "v1.61 candidate")
+
+
+def test_v161_accepts_current_cancel_guard_release_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v161(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.61", candidate) == candidate
+
+
+def test_v161_cancel_guard_is_rejected_on_the_v160_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v161(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.60", candidate)
+
+
+def test_pre_v161_cancel_guard_is_rejected_on_the_v161_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v160(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.61", candidate)
 
 
 def test_v160_accepts_current_round_budget_release_contract(

@@ -149,6 +149,7 @@ REVIEW_INVOCATION_BUDGET_RELEASE = (1, 47)
 REVIEW_POLICY_RELEASE = (1, 51)
 REVIEW_OPTIN_RELEASE = (1, 59)
 REVIEW_ROUNDS_VARIABLE_RELEASE = (1, 60)
+SAME_HEAD_CANCEL_RELEASE = (1, 61)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -191,6 +192,12 @@ def release_supports_review_rounds_variable(ref: str) -> bool:
     """Return whether ``ref`` reads the automatic-round budget from a repository variable."""
 
     return _release_version(ref) >= REVIEW_ROUNDS_VARIABLE_RELEASE
+
+
+def release_supports_same_head_cancel_guard(ref: str) -> bool:
+    """Return whether ``ref`` cancels a review only when a new commit supersedes it."""
+
+    return _release_version(ref) >= SAME_HEAD_CANCEL_RELEASE
 
 
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:

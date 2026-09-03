@@ -28,9 +28,13 @@ on:
         description: 'Z.AI API key'
         required: true
 
+# Cancel only when a new commit supersedes this head. A same-head retrigger
+# must not cancel an in-flight review: the run has already claimed the head in
+# the invocation budget, so the replacement is refused as duplicate_head and no
+# review is produced at all (issue #120).
 concurrency:
   group: automation-opencode-auto-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event.action == 'synchronize' }}
 
 jobs:
   check-enabled:

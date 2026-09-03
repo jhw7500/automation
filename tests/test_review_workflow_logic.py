@@ -4073,7 +4073,7 @@ def test_gemini_canonical_v2_collection_and_shared_action_contract(tmp_path):
     assert action["with"]["context-lines"] == "20"
     assert job["concurrency"] == {
         "group": "automation-gemini-auto-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}",
-        "cancel-in-progress": "true",
+        "cancel-in-progress": "${{ github.event.action == 'synchronize' }}",
     }
 
 
@@ -6362,7 +6362,7 @@ def test_claude_review_concurrency_is_scoped_to_reviewer_repository_and_pr():
 
     assert job["concurrency"] == {
         "group": "automation-claude-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}",
-        "cancel-in-progress": "true",
+        "cancel-in-progress": "${{ github.event.action == 'synchronize' }}",
     }
 
 
@@ -17302,7 +17302,7 @@ def test_opencode_concurrency_and_rereview_marker_extraction_accept_v1_and_v2():
     workflow = _load("opencode-auto-review.yml")
     assert workflow["concurrency"] == {
         "group": "automation-opencode-auto-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
-        "cancel-in-progress": "true",
+        "cancel-in-progress": "${{ github.event.action == 'synchronize' }}",
     }
 
 
