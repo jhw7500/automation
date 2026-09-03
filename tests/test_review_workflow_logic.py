@@ -17500,5 +17500,68 @@ def test_claude_success_comment_omits_the_raw_candidate_pointer(tmp_path):
     assert "claude-candidate-" not in _single_mutation_body(calls)
 
 
+
+def test_gemini_provider_failure_never_writes_a_candidate_document(tmp_path):
+    """provider 오류를 후보 파일에 쓰면 정규화기가 그것을 문서 오류로 거부한다."""
+
+    (tmp_path / "gemini_review.py").write_text(
+        _extract_gemini_python(), encoding="utf-8"
+    )
+    _write_legacy_gemini_request_stub(
+        tmp_path,
+        "        raise RuntimeError(\"403 PERMISSION_DENIED. "
+        "{'error': {'message': 'Your project has been denied access.'}}\")\n",
+    )
+    _write_gemini_script_inputs(tmp_path)
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"],
+        cwd=tmp_path,
+        env=_gemini_script_env(tmp_path),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    # 후보 문서는 모델 출력만 담는다 — 없으면 candidate_missing 이 정확한 진단이다.
+    assert not (tmp_path / "gemini_review.md").exists()
+    provider_error = (tmp_path / "gemini_provider_error.txt").read_text(encoding="utf-8")
+    assert "403 PERMISSION_DENIED" in provider_error
+    assert (tmp_path / "gemini_failure_reason.txt").read_text().strip() != ""
+
+
+def test_gemini_provider_error_is_uploaded_outside_the_canonicalizer_diagnostic():
+    workflow = _load("gemini-auto-review.yml")
+    steps = workflow["jobs"]["gemini-review"]["steps"]
+    names = [step.get("name") for step in steps]
+    reset = _step(workflow, "gemini-review", "Reset Gemini review artifacts")
+    provider_error = _step(workflow, "gemini-review", "Upload Gemini provider error")
+    diagnostic = _step(
+        workflow, "gemini-review", "Upload rejected Gemini review diagnostic"
+    )
+
+    assert "gemini_provider_error.txt" in reset["run"]
+    # 정규화기 소유 진단은 bounded 결과 JSON 만 담는다 — untrusted 원문을 섞지 않는다.
+    assert diagnostic["with"]["path"] == (
+        "${{ github.workspace }}/gemini-review-result.json"
+    )
+    assert provider_error["with"] == {
+        "name": "gemini-provider-error-${{ github.run_id }}-${{ github.run_attempt }}",
+        "path": "${{ github.workspace }}/gemini_provider_error.txt",
+        "if-no-files-found": "ignore",
+        "retention-days": "1",
+        "overwrite": "false",
+    }
+    assert provider_error["if"] == (
+        "${{ always() "
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+        "&& hashFiles('gemini_provider_error.txt') != '' }}"
+    )
+    assert names.index("Upload Gemini provider error") < names.index(
+        "Upload rejected Gemini review diagnostic"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
