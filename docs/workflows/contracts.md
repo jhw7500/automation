@@ -215,6 +215,15 @@ Every review channel is off by default and requires an explicit opt-in:
 `/jhw:pr --review` applies the label and posts both mentions, so opting one pull request into all
 three channels is a single command.
 
+Managed-reviewer opt-in must be in place before the run starts. The callers subscribe to `opened`,
+`synchronize`, and `ready_for_review`, never `labeled`, so adding `review:request` to an
+already-open pull request starts no run by itself; and adding it while a run is already resolving
+fails that run closed with `review_mode_label_mismatch`, because the caller's `review_mode` input
+was read from an event payload that predates the label. Apply the label before the final ready
+head — `/jhw:pr --review` labels the draft and then marks it ready — or, on a pull request that is
+already open, start one authorized same-head review through a `workflow_dispatch` carrying
+`force_review: true`.
+
 `review:skip` and `review:request` steer only the managed Actions reviewers. They never reach
 Codex, whose automatic review is decided entirely in ChatGPT Codex settings, so neither label
 changes Codex behavior. Codex does require the repository to be registered under Codex code-review
