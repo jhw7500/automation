@@ -589,6 +589,7 @@ jobs:
             "$GITHUB_WORKSPACE/gemini-review-result.json" \
             "$GITHUB_WORKSPACE/gemini_review.py" \
             "$GITHUB_WORKSPACE/gemini_failure_reason.txt" \
+            "$GITHUB_WORKSPACE/gemini_provider_error.txt" \
             "$GITHUB_WORKSPACE/review_diff_truncated.txt"
 
       - name: Start Gemini review metrics
@@ -664,6 +665,7 @@ jobs:
               USING_CURRENT_SDK = False
 
           FAILURE_REASON_FILE = 'gemini_failure_reason.txt'
+          PROVIDER_ERROR_FILE = 'gemini_provider_error.txt'
 
           class ProviderFailure(RuntimeError):
               pass
@@ -1270,8 +1272,11 @@ jobs:
           except Exception as e:
               print(f"Error generating review: {e}")
               record_failure_reason(provider_failure_reason(e))
-              with open('gemini_review.md', 'w') as f:
-                  f.write(f"⚠️ Failed to generate Gemini review: {str(e)}")
+              # 후보 문서에는 모델 출력만 담는다. provider 오류를 여기에 쓰면
+              # 정규화기가 그것을 산문으로 읽어 ambiguous_document 로 거부하고,
+              # provider 실패가 문서 포맷 오류로 위장된다.
+              with open(PROVIDER_ERROR_FILE, 'w') as f:
+                  f.write(f"Failed to generate Gemini review: {str(e)}\n")
               exit(1)
           PYTHON_EOF
 
@@ -1300,7 +1305,7 @@ jobs:
           }; then
             review_exit=124
             printf '%s' 'provider_timeout' > gemini_failure_reason.txt
-            printf '%s\n' '⚠️ Failed to generate Gemini review: provider request exceeded the process deadline' > gemini_review.md
+            printf '%s\n' 'Failed to generate Gemini review: provider request exceeded the process deadline' > gemini_provider_error.txt
           fi
           printf 'diff_truncated=%s\n' "$(cat review_diff_truncated.txt 2>/dev/null || printf 'false')" >> "$GITHUB_OUTPUT"
           printf 'failure_reason=%s\n' "$(cat gemini_failure_reason.txt 2>/dev/null || printf 'provider_failed')" >> "$GITHUB_OUTPUT"
@@ -1417,6 +1422,18 @@ jobs:
         with:
           name: gemini-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ github.workspace }}/gemini_review.md
+          if-no-files-found: ignore
+          retention-days: 1
+          overwrite: false
+
+      # provider 오류 원문은 untrusted provider 출력이므로 정규화기 소유 진단과
+      # 섞지 않고 별도 아티팩트로 올린다.
+      - name: Upload Gemini provider error
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && hashFiles('gemini_provider_error.txt') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gemini-provider-error-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/gemini_provider_error.txt
           if-no-files-found: ignore
           retention-days: 1
           overwrite: false

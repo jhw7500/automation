@@ -663,12 +663,12 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d4db53b86603a3a113999409e2e4e35c397adf276981e7f68c0ea57a6198faa2",
-    "gemini": "531c91663071e8a4985c85d6bc123024c29ee9e9efefc834ea6f5b440ccca41b",
+    "gemini": "cbd69aba74ec0f3380591f14d0adcb6543faad5e237a855dbec246750e2b5206",
     "opencode": "c13a61cf3362586da6230f3de03f623fea8e50b9756f337408351c35d970c0f0",
 }
 EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256 = {
     "claude": "8e16c59b04aeaaf7419571b0bda3fb1e46a29da3b847bbb0409ab0437a1027d7",
-    "gemini": "a395bbfe4ec6a09449812968b32716fe16cd23567820a612197238e57c24b8f7",
+    "gemini": "ac48c84dbc60071e88f89d6ecadebb781b50d5beb7da0e0a1ec363fab5599ce8",
     "opencode": "947600cb0ae3d0564a59ba03f8eccc4b5fa991138b280152c24e18e61ecc25a2",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
@@ -5968,6 +5968,31 @@ def _expected_review_candidate_upload_step(
     }
 
 
+def _expected_provider_error_upload_step(
+    contract: dict[str, str],
+) -> dict[str, object]:
+    reviewer = contract["reviewer"]
+    return {
+        "name": f"Upload {reviewer.capitalize()} provider error",
+        "if": (
+            "${{ always() "
+            "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+            f"&& hashFiles('{reviewer}_provider_error.txt') != '' }}}}"
+        ),
+        "uses": UPLOAD_ARTIFACT_ACTION,
+        "with": {
+            "name": (
+                f"{reviewer}-provider-error-${{{{ github.run_id }}}}-"
+                "${{ github.run_attempt }}"
+            ),
+            "path": f"${{{{ github.workspace }}}}/{reviewer}_provider_error.txt",
+            "if-no-files-found": "ignore",
+            "retention-days": "1",
+            "overwrite": "false",
+        },
+    }
+
+
 def _verify_review_publication_contracts(
     documents: dict[str, dict], ref: str
 ) -> None:
@@ -6023,6 +6048,21 @@ def _verify_review_publication_contracts(
                 )
             ):
                 raise ValueError("rejected review diagnostic differs")
+            # provider 오류 원문은 정규화기 소유 진단과 신뢰 등급이 달라 별도
+            # 아티팩트로 올린다. gemini 만 provider 예외를 파일로 남긴다.
+            if budget and contract["reviewer"] == "gemini":
+                provider_error_upload = _named_step(
+                    job, f"Upload {contract['reviewer'].capitalize()} provider error"
+                )
+                if provider_error_upload != _expected_provider_error_upload_step(
+                    contract
+                ):
+                    raise ValueError("provider error upload differs")
+                if not (
+                    job["steps"].index(provider_error_upload)
+                    < job["steps"].index(rejected_diagnostic_upload)
+                ):
+                    raise ValueError("provider error upload order differs")
             candidate_upload = None
             if budget:
                 candidate_upload = _named_step(

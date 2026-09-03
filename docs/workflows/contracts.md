@@ -481,7 +481,16 @@ and it stays untrusted provider output that no program reads: the upsert program
 opens the raw file, and the failure comment cites only the artifact name, and only when that
 upload step reported success. The workspace path is safe because the reset step removes it with
 `rm -f --` before generation and the canonicalizer runs only after that reset succeeds, so no
-checkout-seeded symlink target survives. A missing result is ignored. The diagnostic is not authority: neither the upsert program nor later review state or
+checkout-seeded symlink target survives. A missing result is ignored.
+
+A Gemini provider failure or process-deadline timeout never writes into the candidate file.
+Writing it there made the canonicalizer read provider text as a document and report
+`ambiguous_document`/`preamble`, so a provider outage looked like a model format regression.
+The reason still travels through `gemini_failure_reason.txt` to the sticky comment, and the
+provider text is uploaded as its own one-day, non-overwriting `gemini-provider-error-<run>-<attempt>`
+artifact — never merged into the canonicalizer-owned diagnostic, which stays bounded schema-1
+output. With no candidate file the canonicalizer reports `candidate_missing`, which is what
+actually happened. The diagnostic is not authority: neither the upsert program nor later review state or
 carryover reads it. For `ambiguous_document`, logs expose only a fixed structural diagnostic code
 such as `preamble`, `unknown_section_before_document`,
 `unknown_section_after_document`, or `invalid_finding_heading`; candidate text is never copied into
