@@ -84,9 +84,13 @@ jobs:
   gemini-review:
     needs: check-enabled
     if: needs.check-enabled.outputs.enabled == 'true' && needs.check-enabled.outputs.policy_run == 'true'
+    # Cancel only when a new commit supersedes this head. A same-head retrigger
+    # must not cancel an in-flight review: the run has already claimed the head in
+    # the invocation budget, so the replacement is refused as duplicate_head and no
+    # review is produced at all (issue #120).
     concurrency:
       group: automation-gemini-auto-review-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}
-      cancel-in-progress: true
+      cancel-in-progress: ${{ github.event.action == 'synchronize' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

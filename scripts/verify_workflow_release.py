@@ -48,6 +48,7 @@ from scripts.workflow_release_inventory import (
     release_supports_review_invocation_budget,
     release_supports_review_optin,
     release_supports_review_rounds_variable,
+    release_supports_same_head_cancel_guard,
     release_supports_review_policy,
     validate_release_listing,
 )
@@ -685,6 +686,13 @@ EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256 = {
     "claude": "939d8ec9dab85d670881d93681d428af4486b410112a9e9af032a473923430ea",
     "gemini": "a33c941b20dc1d9d14a221ee9360dd6cda90801c3c7dba2347971840df87b326",
     "opencode": "caaefcdc244444718302cc230d4bb868651e697abc503afab3d75d786c6d29c0",
+}
+# v1.61 narrowed cancel-in-progress to superseding commits, changing the three
+# reusable review workflows again.
+EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256 = {
+    "claude": "b3b7d95cb8e87164470759f4c918f8c317e37a10d2c214ec915ac4a51963f04e",
+    "gemini": "3271f4f7dd4d13711b91d65ac191451703ead424fcb67299ff504b8a26b32e0f",
+    "opencode": "4a173036252929de6320da7e04436d67b9a4759ed4b9f60b6bdf2b3a3ecc1d5a",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
@@ -2341,6 +2349,7 @@ def verify_opencode_runtime(
         EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256["opencode"],
         EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256["opencode"],
         EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256["opencode"],
+        EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256["opencode"],
     }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
@@ -2373,6 +2382,7 @@ def verify_opencode_runtime(
             EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256["opencode"],
             EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256["opencode"],
             EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256["opencode"],
+            EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256["opencode"],
         }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
@@ -5623,7 +5633,9 @@ def _verify_review_invocation_budget(
         ),
     }
     workflow_digests = (
-        EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256
+        EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256
+        if release_supports_same_head_cancel_guard(ref)
+        else EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256
         if rounds_variable
         else EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256
         if release_supports_review_policy(ref)
