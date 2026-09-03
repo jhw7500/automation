@@ -100,6 +100,7 @@ REVIEW_POLICY_RELEASE_FILES = (
 )
 V1462_WORKFLOW_FIXTURE_COMMIT = "d42c28ddd827554e6e46a2ab49dfe34c838c0425"
 V158_REVIEW_POLICY_HELPER_COMMIT = "1b98172325533ef6ad37f3d2cfc3870073fac26d"
+V159_ROUND_BUDGET_COMMIT = "96d66e1d17952f01b19bb957057830a2b2a6318b"
 V1462_WORKFLOW_FIXTURE_SHA256 = {
     "claude-code-review.yml": (
         "008bbdcdeacdaf7796c1e3b59d22194d3f1ce380735d36dada5efab8ff52d112"
@@ -230,6 +231,7 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
         else:
             shutil.copy2(source, target)
     restore_pre_v151_review_policy(repo)
+    restore_pre_v160_round_budget(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -314,6 +316,47 @@ def restore_pre_v159_review_policy_helper(repo: Path) -> None:
     (repo / relative).write_bytes(payload)
 
 
+def restore_pre_v160_round_budget(repo: Path) -> None:
+    """Restore the authenticated pre-v1.60 invocation-budget wiring.
+
+    v1.60 reads the automatic-round budget from REVIEW_MAX_ROUNDS, which changed the
+    budget action, its helper, and the three reusable review workflows.
+    """
+
+    tree = release_verifier.VerifiedCommitTree.open(ROOT, V159_ROUND_BUDGET_COMMIT)
+    for relative, expected in (
+        (
+            ".github/actions/review-invocation-budget/action.yml",
+            release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256,
+        ),
+        (
+            ".github/actions/review-invocation-budget/review_invocation_budget.py",
+            release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256,
+        ),
+    ):
+        payload = tree.read_file(relative)
+        assert hashlib.sha256(payload).hexdigest() == expected
+        (repo / relative).write_bytes(payload)
+    for filename in release_verifier.REVIEWER_WORKFLOWS.values():
+        path = repo / ".github/workflows" / filename
+        text = path.read_text(encoding="utf-8")
+        path.write_text(
+            text.replace("          max-rounds: ${{ vars.REVIEW_MAX_ROUNDS }}\n", ""),
+            encoding="utf-8",
+        )
+
+
+def assert_pre_v160_workflow_bytes(repo: Path) -> None:
+    """The stripped workflows must be exactly the published v1.51-v1.59 bytes."""
+
+    for reviewer, filename in release_verifier.REVIEWER_WORKFLOWS.items():
+        payload = (repo / ".github/workflows" / filename).read_bytes()
+        assert (
+            hashlib.sha256(payload).hexdigest()
+            == release_verifier.EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256[reviewer]
+        )
+
+
 def copy_review_policy_release_files(repo: Path) -> None:
     for relative in (
         ".github/actions/resolve-review-policy/action.yml",
@@ -342,12 +385,25 @@ def copy_review_policy_release_files(repo: Path) -> None:
 def prepare_v151(repo: Path) -> str:
     copy_review_policy_release_files(repo)
     restore_pre_v159_review_policy_helper(repo)
+    restore_pre_v160_round_budget(repo)
     return commit(repo, "v1.51 candidate")
 
 
 def prepare_v159(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v160_round_budget(repo)
+    assert_pre_v160_workflow_bytes(repo)
     return commit(repo, "v1.59 candidate")
+
+
+def prepare_v160(repo: Path) -> str:
+    copy_review_policy_release_files(repo)
+    for relative in (
+        ".github/actions/review-invocation-budget/action.yml",
+        ".github/actions/review-invocation-budget/review_invocation_budget.py",
+    ):
+        shutil.copy2(ROOT / relative, repo / relative)
+    return commit(repo, "v1.60 candidate")
 
 
 def verify_v147(repo: Path, message: str) -> str:
@@ -1763,6 +1819,35 @@ def test_v159_opt_in_helper_is_rejected_on_the_v151_release_line(
 
     with pytest.raises(ReleaseVerificationError, match="review-policy helper"):
         release_verifier.verify_commit_content(repo, "v1.51", candidate)
+
+
+def test_v160_accepts_current_round_budget_release_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v160(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.60", candidate) == candidate
+
+
+def test_v160_round_budget_wiring_is_rejected_on_the_v159_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v160(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.59", candidate)
+
+
+def test_pre_v160_round_budget_wiring_is_rejected_on_the_v160_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v159(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.60", candidate)
 
 
 def test_pre_v159_helper_is_rejected_on_the_v159_release_line(

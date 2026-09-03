@@ -517,6 +517,7 @@ jobs:
           model-route-json: ${{ steps.gemini-budget-config.outputs.model_route_json }}
           effort: ${{ steps.gemini-budget-config.outputs.effort }}
           checkpoint-file: ${{ runner.temp }}/gemini-review-budget-claim.json
+          max-rounds: ${{ vars.REVIEW_MAX_ROUNDS }}
 
       - name: Clean Gemini budget input
         if: ${{ always() }}
@@ -1941,6 +1942,7 @@ jobs:
           stop-reason: ${{ steps.review-budget-outcome.outputs.stop_reason }}
           remaining-finding-ids-json: ${{ steps.review-budget-outcome.outputs.remaining_finding_ids_json }}
           checkpoint-file: ${{ runner.temp }}/gemini-review-budget-final.json
+          max-rounds: ${{ vars.REVIEW_MAX_ROUNDS }}
 
       - name: Upload Gemini review budget final checkpoint
         if: ${{ always() && !cancelled() && steps.review-budget-finalize.outcome != 'skipped' }}

@@ -342,6 +342,7 @@ def test_action_metadata_has_one_inert_environment_bridge():
         "force-review",
         "model-route-json", "effort", "checkpoint-file", "actual-call-count",
         "elapsed-seconds", "outcome", "stop-reason", "remaining-finding-ids-json",
+        "max-rounds",
     }
     assert {name for name, value in document["inputs"].items() if value["required"] == "true"} == {
         "github-token", "mode", "reviewer", "pr-number", "expected-head-sha",
@@ -355,6 +356,7 @@ def test_action_metadata_has_one_inert_environment_bridge():
         "outcome": "checkpoint_failure",
         "stop-reason": "",
         "remaining-finding-ids-json": "[]",
+        "max-rounds": "",
     }
     assert set(document["outputs"]) == {
         "allow-invocation", "decision", "round", "invocation-key", "checkpoint-sha256",
@@ -366,6 +368,7 @@ def test_action_metadata_has_one_inert_environment_bridge():
     assert step["id"] == "budget"
     assert step["shell"] == "bash"
     assert step["env"]["GH_TOKEN"] == "${{ inputs.github-token }}"
+    assert step["env"]["REVIEW_MAX_ROUNDS"] == "${{ inputs.max-rounds }}"
     assert "${{ inputs." not in step["run"]
     assert step["run"].index('cat -- "$budget_dir/summary.md" >> "$GITHUB_STEP_SUMMARY"') < step[
         "run"
