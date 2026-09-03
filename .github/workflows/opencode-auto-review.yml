@@ -3141,7 +3141,28 @@ jobs:
                   raise SystemExit("successful review candidate validation mismatch")
               review_path.chmod(0o600)
               failure_reason = "none"
+              rejected_candidate = False
           else:
+              # 계약 실패 라운드의 원문이 없으면 프롬프트/포맷 회귀와 검증기 과잉을
+              # 구분할 수 없다. sealed 후보 디렉터리 밖으로 옮겨 보존하되, 성공 경로와
+              # 같은 강도(정규 파일·비심링크·크기 상한)로 검사한 뒤에만 복사한다.
+              rejected_candidate = False
+              try:
+                  details = review_path.lstat()
+                  preserve = (
+                      stat.S_ISREG(details.st_mode)
+                      and not stat.S_ISLNK(details.st_mode)
+                      and 0 < details.st_size <= 60_000
+                  )
+              except OSError:
+                  preserve = False
+              if preserve:
+                  rejected_dir = Path(os.environ["RUNNER_TEMP"]) / "opencode-rejected"
+                  rejected_dir.mkdir(mode=0o700, exist_ok=True)
+                  rejected_path = rejected_dir / "review.md"
+                  rejected_path.write_bytes(review_path.read_bytes())
+                  rejected_path.chmod(0o600)
+                  rejected_candidate = True
               review_path.unlink(missing_ok=True)
               (candidate_dir / "review-repaired.md").unlink(missing_ok=True)
               if failure_reason not in allowed_reasons - {"none"}:
@@ -3176,6 +3197,11 @@ jobs:
           candidate_json.chmod(0o600)
           with output_path.open("a", encoding="utf-8") as output:
               output.write(f"review_call_count={call_count}\n")
+              output.write(
+                  "rejected_candidate="
+                  + ("true" if rejected_candidate else "false")
+                  + "\n"
+              )
               output.write(f"review_elapsed_seconds={elapsed_seconds}\n")
               output.write(
                   "review_model_route_json="
@@ -3183,6 +3209,19 @@ jobs:
                   + "\n"
               )
           PY
+
+      # 거부된 후보의 원문은 sealed handoff 와 신뢰 등급이 달라 별도 아티팩트로 올린다.
+      - name: Upload rejected OpenCode candidate
+        id: upload-rejected-candidate
+        if: ${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' && steps.materialize-candidate.outputs.rejected_candidate == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-rejected-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/opencode-rejected
+          if-no-files-found: ignore
+          overwrite: false
+          include-hidden-files: false
+          retention-days: 1
 
       - name: Upload untrusted OpenCode candidate
         id: upload-candidate

@@ -490,7 +490,14 @@ The reason still travels through `gemini_failure_reason.txt` to the sticky comme
 provider text is uploaded as its own one-day, non-overwriting `gemini-provider-error-<run>-<attempt>`
 artifact — never merged into the canonicalizer-owned diagnostic, which stays bounded schema-1
 output. With no candidate file the canonicalizer reports `candidate_missing`, which is what
-actually happened. The diagnostic is not authority: neither the upsert program nor later review state or
+actually happened.
+
+OpenCode keeps its rejected candidate too. A contract failure previously deleted `review.md`
+from the sealed candidate directory, so only the envelope's rule name and sha256 survived. The
+raw document is now copied to `$RUNNER_TEMP/opencode-rejected` before that deletion — after the
+same regular-file, non-symlink and 60,000-byte checks the success path applies — and uploaded as
+its own one-day, non-overwriting `opencode-rejected-<run>-<attempt>` artifact. The sealed handoff
+artifact keeps its exact inventory, so the clean job's verification is unchanged. The diagnostic is not authority: neither the upsert program nor later review state or
 carryover reads it. For `ambiguous_document`, logs expose only a fixed structural diagnostic code
 such as `preamble`, `unknown_section_before_document`,
 `unknown_section_after_document`, or `invalid_finding_heading`; candidate text is never copied into
