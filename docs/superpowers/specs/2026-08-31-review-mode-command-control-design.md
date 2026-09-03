@@ -25,6 +25,12 @@ Repository-managed PR workflows use two GitHub labels as the durable override co
 | neither | Use each workflow's existing `workflows.<name>.auto`, then `review.auto`, then compatibility default |
 | both | Configuration error; fail closed without invoking a model |
 
+> **Superseded 2026-09-03 (issue #109):** the compatibility default in the `neither` row is now
+> `false`. From `v1.59` the managed-workflow precedence is
+> `workflows.<name>.auto -> review.auto -> false`, so the absent-key case does not invoke a model.
+> This also supersedes the compatibility-default paragraph and precedence block in section 3.
+> Current policy: `docs/workflows/contracts.md`.
+
 The labels control repository-managed workflows. `/jhw:pr` applies the same effective policy to
 external GitHub Apps by posting their documented manual commands when review is requested. App
 automatic-review settings are disabled separately so PR-open events do not bypass the command

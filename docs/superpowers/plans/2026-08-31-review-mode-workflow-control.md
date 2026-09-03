@@ -20,6 +20,13 @@
 - `review:request` overrides automatic mode but never overrides `workflows.<name>.enabled`.
 - Automatic precedence remains `workflows.<name>.auto -> review.auto -> true`.
 - The baseline remains explicit `review.auto: false`.
+
+> **Superseded 2026-09-03 (issue #109):** from `v1.59` the automatic precedence ends in `false`,
+> not `true`. `_automatic_decision` returns `default_auto_false` when both keys are absent, so a
+> repository without a `review:` key now matches the baseline instead of reviewing every pull
+> request; `review:request` is the opt-in. This supersedes the precedence line above, the
+> `_automatic_decision` requirement in Step 3, and the `default_auto_true` entry in the
+> expected-literal list later in this plan. Current policy: `docs/workflows/contracts.md`.
 - Keep existing review prompts, finding grammar, quality schemas, and blocking thresholds unchanged.
 - Preserve historical releases; the new local action is required only for `v1.51+`.
 - Do not move or recreate an immutable release tag.

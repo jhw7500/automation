@@ -46,6 +46,7 @@ from scripts.workflow_release_inventory import (
     release_supports_canonicalize_review,
     release_supports_prepare_review_diff,
     release_supports_review_invocation_budget,
+    release_supports_review_optin,
     release_supports_review_policy,
     validate_release_listing,
 )
@@ -674,6 +675,9 @@ EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256 = {
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
 )
+EXPECTED_REVIEW_POLICY_HELPER_SHA256_V159 = (
+    "50a4cbaf364e326201c2572435ab4dc9dcac5e14ff4349cfd790a1b26f4092b7"
+)
 EXPECTED_REVIEW_POLICY_RECORDS = {
     "PolicyRequest": (
         ("workflow_name", "str"),
@@ -707,6 +711,11 @@ EXPECTED_REVIEW_POLICY_LITERALS = frozenset(
         "default_auto_true",
     }
 )
+# v1.59 flipped the unconfigured automatic decision to opt-in; every other
+# literal is unchanged, so the delta is stated rather than duplicated.
+EXPECTED_REVIEW_POLICY_LITERALS_V159 = (
+    EXPECTED_REVIEW_POLICY_LITERALS - {"default_auto_true"}
+) | {"default_auto_false"}
 EXPECTED_REVIEW_POLICY_ACTION = yaml.load(
     r"""name: Resolve Review Policy
 description: Resolve a deterministic review policy before model invocation.
@@ -2847,14 +2856,21 @@ def _class_function_headers(node: ast.ClassDef) -> dict[str, str]:
     return functions
 
 
-def require_review_policy_helper_contract(source: str) -> None:
+def require_review_policy_helper_contract(source: str, optin: bool) -> None:
     """Authenticate and statically validate the public policy-helper surface."""
 
+    expected_digest = (
+        EXPECTED_REVIEW_POLICY_HELPER_SHA256_V159
+        if optin
+        else EXPECTED_REVIEW_POLICY_HELPER_SHA256
+    )
+    expected_literals = (
+        EXPECTED_REVIEW_POLICY_LITERALS_V159
+        if optin
+        else EXPECTED_REVIEW_POLICY_LITERALS
+    )
     try:
-        if (
-            hashlib.sha256(source.encode("utf-8")).hexdigest()
-            != EXPECTED_REVIEW_POLICY_HELPER_SHA256
-        ):
+        if hashlib.sha256(source.encode("utf-8")).hexdigest() != expected_digest:
             raise ValueError("helper source digest differs")
         compile(
             source,
@@ -2886,7 +2902,7 @@ def require_review_policy_helper_contract(source: str) -> None:
             "def resolve_policy(request: PolicyRequest) -> PolicyDecision"
         ):
             raise ValueError("policy function differs")
-        direct_literals = EXPECTED_REVIEW_POLICY_LITERALS - {
+        direct_literals = expected_literals - {
             "workflow_auto_false",
             "review_auto_false",
         }
@@ -2951,7 +2967,7 @@ def _verify_review_policy_action(
         raise ReleaseVerificationError(
             "review-policy helper contract is invalid"
         ) from None
-    require_review_policy_helper_contract(helper)
+    require_review_policy_helper_contract(helper, release_supports_review_optin(ref))
 
 
 def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree) -> None:

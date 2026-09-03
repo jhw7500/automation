@@ -115,9 +115,34 @@ def test_request_does_not_override_disabled_workflow():
     assert (decision.run_review, decision.reason) == (False, "workflow_disabled")
 
 
-def test_automatic_mode_defaults_to_true_when_not_configured():
-    decision = resolve_policy(request())
-    assert (decision.run_review, decision.reason) == (True, "default_auto_true")
+@pytest.mark.parametrize(
+    "workflow_name",
+    ("claude-code-review", "gemini-auto-review", "opencode-auto-review"),
+)
+def test_automatic_mode_defaults_to_false_when_not_configured(workflow_name):
+    decision = resolve_policy(
+        PolicyRequest(
+            workflow_name=workflow_name,
+            review_mode="auto",
+            force_run=False,
+            force_review=False,
+            event_name="pull_request",
+            repository="jhw7500/example",
+            pr=base_pr(),
+            config={},
+        )
+    )
+    assert (decision.run_review, decision.reason) == (False, "default_auto_false")
+
+
+def test_request_label_opts_in_when_config_omits_review_auto():
+    decision = resolve_policy(request(labels=["review:request"], mode="request"))
+    assert (decision.run_review, decision.reason) == (True, "request")
+
+
+def test_skip_label_still_skips_when_config_omits_review_auto():
+    decision = resolve_policy(request(labels=["review:skip"], mode="skip"))
+    assert (decision.run_review, decision.reason) == (False, "skip")
 
 
 def test_action_uses_file_transport_with_expected_interface():

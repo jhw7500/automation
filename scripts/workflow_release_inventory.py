@@ -147,6 +147,7 @@ PREPARE_REVIEW_DIFF_RELEASE = (1, 45)
 CANONICALIZE_REVIEW_RELEASE = (1, 46)
 REVIEW_INVOCATION_BUDGET_RELEASE = (1, 47)
 REVIEW_POLICY_RELEASE = (1, 51)
+REVIEW_OPTIN_RELEASE = (1, 59)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -177,6 +178,12 @@ def release_supports_review_policy(ref: str) -> bool:
     """Return whether ``ref`` owns the deterministic review-policy action."""
 
     return _release_version(ref) >= REVIEW_POLICY_RELEASE
+
+
+def release_supports_review_optin(ref: str) -> bool:
+    """Return whether ``ref`` resolves an unconfigured automatic review to ``false``."""
+
+    return _release_version(ref) >= REVIEW_OPTIN_RELEASE
 
 
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:

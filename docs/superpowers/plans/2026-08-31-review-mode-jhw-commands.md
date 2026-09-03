@@ -187,6 +187,12 @@ assert.notEqual((await runMode("--review --no-review")).code, 0);
 
 Add global-config cases proving `review.auto: true`, `review.auto: false`, and missing config resolve to `true`, `false`, and compatibility `true`; a non-boolean value must fail before mutation.
 
+> **Pending change 2026-09-03 (issue #109):** automation's resolver defaults the absent-key case to
+> `false` from `v1.59`. The `jhw_pr_global_auto_enabled` compatibility default described here and in
+> Steps 3 and 6 still reads `true` and must stay `true` until the `v1.59` fleet rollout has landed on
+> every target; changing it earlier would describe neither the pre-rollout nor the post-rollout fleet.
+> The jhw-notion skill update is tracked in issue #109 as a separate, later pull request.
+
 Add a mutation-log fake `gh` and assert exact order for new and existing PRs:
 
 ```javascript

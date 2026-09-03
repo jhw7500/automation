@@ -148,6 +148,10 @@ review:
 ```
 
 For auto-review callers, `workflows.<name>.auto` takes precedence over `review.auto`.
+Beginning with `v1.59`, a repository that sets neither key resolves to `default_auto_false`, so
+the managed reviewers stay off until a pull request opts in. A repository that never adds the key
+therefore behaves exactly like one that copied the baseline above. Releases through `v1.58`
+resolved that same absent-key case to `default_auto_true`.
 Manual mention/comment and manual-dispatch behavior remains available when the applicable
 caller is enabled. The disabled bootstrap template uses `workflows.<name>.enabled: false`
 for every common caller; enabling any of them is a later repository-owned PR.
@@ -161,7 +165,8 @@ order: both labels are `conflict`; only `review:request` is `request`; only `rev
 `force_review` change `auto` to `request`. `conflict` fails before a model is invoked. Draft
 PRs, `skip`, unsafe forks, and closed PRs succeed without invoking a model. `request` never overrides
 `workflows.<name>.enabled: false`, and `workflows.<name>.auto` still takes precedence over the
-baseline `review.auto: false`.
+baseline `review.auto: false`. With neither label and neither configuration key, `auto` resolves
+to `default_auto_false` and no model is invoked; `review:request` is the per-pull-request opt-in.
 
 Beginning with `v1.51`, the closed release inventory also contains exactly these regular,
 non-executable `100644` files:
@@ -196,6 +201,26 @@ To roll back the external-App opt-in, restore only Gemini's
 `pull_request_opened.code_review` value to `true` and re-enable Automatic reviews in ChatGPT
 Codex settings; keep Codex Code review enabled. No label or managed-workflow policy changes are
 needed for this rollback.
+
+### Opt-in per review channel
+
+Every review channel is off by default and requires an explicit opt-in:
+
+| Channel | Default | Opt-in |
+| --- | --- | --- |
+| Managed Actions reviewers (Claude, Gemini, OpenCode) | off, from `default_auto_false` or the baseline `review.auto: false` | the `review:request` label, `workflows.<name>.auto: true`, or `review.auto: true` |
+| Codex Code review | off, because Automatic reviews stays disabled in ChatGPT Codex settings | a `@codex review` pull-request comment |
+| Gemini Code Assist App | off, from `pull_request_opened.code_review: false` | a `/gemini review` pull-request comment |
+
+`/jhw:pr --review` applies the label and posts both mentions, so opting one pull request into all
+three channels is a single command.
+
+`review:skip` and `review:request` steer only the managed Actions reviewers. They never reach
+Codex, whose automatic review is decided entirely in ChatGPT Codex settings, so neither label
+changes Codex behavior. Codex does require the repository to be registered under Codex code-review
+settings; a custom cloud environment is not required, because the default `universal` image serves
+review. An unregistered repository either answers a mention with "create an environment for this
+repo" or stays silent, and no review appears.
 
 ## Deterministic automated-review input
 
