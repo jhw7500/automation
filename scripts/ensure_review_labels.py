@@ -69,6 +69,10 @@ def label_inventory(owner: str, repo: str) -> dict[str, tuple[str, str]]:
         raise LabelInventoryError("GitHub returned malformed label inventory") from exc
     if not isinstance(data, list):
         raise LabelInventoryError("GitHub returned malformed label inventory")
+    if len(data) >= int(LIST_LIMIT):
+        # A full page truncates newest-first and could hide exactly the review labels;
+        # creating "missing" ones on that evidence would be wrong, so refuse instead.
+        raise LabelInventoryError("GitHub label inventory exceeds the page limit")
     inventory: dict[str, tuple[str, str]] = {}
     for item in data:
         if (

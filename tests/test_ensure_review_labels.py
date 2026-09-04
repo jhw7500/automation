@@ -117,3 +117,18 @@ def test_unknown_repository_and_malformed_inventory_fail_closed(fake_github, mon
     monkeypatch.setattr(workflow_fleet_git.subprocess, "run", broken_run)
     assert ensure.main(["--automation", str(ROOT), "--repo", "gstApp"]) == 1
     assert "ERROR gstApp:" in capsys.readouterr().out
+
+
+def test_a_full_label_page_fails_closed_instead_of_reporting_missing(fake_github, capsys) -> None:
+    """`gh label list` truncates newest-first, so a full page could hide the review labels."""
+
+    fake_github["labels"]["jhw7500/gstApp"] = [
+        {"name": f"label-{index}", "color": "000000", "description": ""} for index in range(300)
+    ]
+
+    assert ensure.main(["--automation", str(ROOT), "--repo", "gstApp", "--confirm"]) == 1
+
+    out = capsys.readouterr().out
+    assert "ERROR gstApp: GitHub label inventory exceeds the page limit" in out
+    assert "MISSING" not in out
+    assert fake_github["mutations"] == []
