@@ -103,6 +103,7 @@ V1462_WORKFLOW_FIXTURE_COMMIT = "d42c28ddd827554e6e46a2ab49dfe34c838c0425"
 V158_REVIEW_POLICY_HELPER_COMMIT = "1b98172325533ef6ad37f3d2cfc3870073fac26d"
 V159_ROUND_BUDGET_COMMIT = "96d66e1d17952f01b19bb957057830a2b2a6318b"
 V161_FILTER_SURFACE_COMMIT = "08f96e3244bfe8bdd569fb926b26d3086bab125d"
+V162_FINDING_DISMISSAL_COMMIT = "1cbb6df4590fb6be8a5012de31d98dc1f1cd3fa8"
 V1462_WORKFLOW_FIXTURE_SHA256 = {
     "claude-code-review.yml": (
         "008bbdcdeacdaf7796c1e3b59d22194d3f1ce380735d36dada5efab8ff52d112"
@@ -232,6 +233,7 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v163_finding_dismissal(repo)
     restore_pre_v151_review_policy(repo)
     restore_pre_v160_round_budget(repo)
     restore_pre_v162_filter_surface(repo)
@@ -267,6 +269,7 @@ def v1462_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v163_finding_dismissal(repo)
     restore_v1462_workflow_fixtures(repo)
     restore_pre_v162_filter_surface(repo)
     git(repo, "init", "-q")
@@ -319,6 +322,51 @@ def restore_pre_v159_review_policy_helper(repo: Path) -> None:
         == release_verifier.EXPECTED_REVIEW_POLICY_HELPER_SHA256
     )
     (repo / relative).write_bytes(payload)
+
+
+def restore_pre_v163_finding_dismissal(repo: Path, *, budget: bool = False) -> None:
+    """Restore the authenticated pre-v1.63 canonicalizer, budget action, and workflows.
+
+    v1.63 adds the dismissed-finding input to the shared canonicalizer and a matching
+    budget-action output. The workflow edit removes the wiring line as text so it
+    composes with the other historical restores, and it runs first (newest release
+    first) so no later whole-file restore is undone. ``budget`` re-restores both
+    invocation-budget files for the prepares that copy the current ones back in.
+    """
+
+    tree = release_verifier.VerifiedCommitTree.open(ROOT, V162_FINDING_DISMISSAL_COMMIT)
+    (repo / ".github/actions/canonicalize-review/action.yml").write_bytes(
+        tree.read_file(".github/actions/canonicalize-review/action.yml")
+    )
+    helper = tree.read_file(".github/actions/canonicalize-review/canonicalize_review.py")
+    assert (
+        hashlib.sha256(helper).hexdigest()
+        == release_verifier.EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V162
+    )
+    (repo / ".github/actions/canonicalize-review/canonicalize_review.py").write_bytes(helper)
+    if budget:
+        for relative, expected in (
+            (
+                ".github/actions/review-invocation-budget/action.yml",
+                release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256_V160,
+            ),
+            (
+                ".github/actions/review-invocation-budget/review_invocation_budget.py",
+                release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V162,
+            ),
+        ):
+            payload = tree.read_file(relative)
+            assert hashlib.sha256(payload).hexdigest() == expected
+            (repo / relative).write_bytes(payload)
+    wiring = (
+        "          dismissed-finding-ids: "
+        "${{ steps.review-budget-claim.outputs.dismissed-finding-ids }}\n"
+    )
+    for reviewer in ("claude", "gemini"):
+        path = repo / ".github/workflows" / release_verifier.REVIEWER_WORKFLOWS[reviewer]
+        text = path.read_text(encoding="utf-8")
+        assert text.count(wiring) == 1
+        path.write_text(text.replace(wiring, ""), encoding="utf-8")
 
 
 def restore_pre_v162_filter_surface(repo: Path, *, budget: bool = False) -> None:
@@ -465,6 +513,7 @@ def copy_review_policy_release_files(repo: Path) -> None:
 
 def prepare_v151(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v163_finding_dismissal(repo)
     restore_pre_v162_filter_surface(repo)
     restore_pre_v161_cancel_guard(repo)
     restore_pre_v159_review_policy_helper(repo)
@@ -474,6 +523,7 @@ def prepare_v151(repo: Path) -> str:
 
 def prepare_v159(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v163_finding_dismissal(repo)
     restore_pre_v162_filter_surface(repo)
     restore_pre_v161_cancel_guard(repo)
     restore_pre_v160_round_budget(repo)
@@ -488,6 +538,7 @@ def prepare_v160(repo: Path) -> str:
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v163_finding_dismissal(repo, budget=True)
     restore_pre_v162_filter_surface(repo, budget=True)
     restore_pre_v161_cancel_guard(repo)
     assert_pre_v161_workflow_bytes(repo)
@@ -1918,7 +1969,49 @@ def prepare_v162(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v163_finding_dismissal(repo, budget=True)
     return commit(repo, "v1.62 candidate")
+
+
+def prepare_v163(repo: Path) -> str:
+    copy_review_policy_release_files(repo)
+    for relative in (
+        ".github/actions/review-invocation-budget/action.yml",
+        ".github/actions/review-invocation-budget/review_invocation_budget.py",
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+    ):
+        shutil.copy2(ROOT / relative, repo / relative)
+    return commit(repo, "v1.63 candidate")
+
+
+def test_v163_accepts_current_finding_dismissal_release_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v163(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.63", candidate) == candidate
+
+
+def test_v163_finding_dismissal_is_rejected_on_the_v162_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v163(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.62", candidate)
+
+
+def test_pre_v163_finding_dismissal_is_rejected_on_the_v163_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v162(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.63", candidate)
 
 
 def test_v162_accepts_current_filter_surface_release_contract(
@@ -1957,6 +2050,7 @@ def prepare_v161(repo: Path) -> str:
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v163_finding_dismissal(repo, budget=True)
     restore_pre_v162_filter_surface(repo, budget=True)
     return commit(repo, "v1.61 candidate")
 

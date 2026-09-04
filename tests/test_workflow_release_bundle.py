@@ -77,6 +77,7 @@ def test_canonicalize_review_composite_action_has_exact_safe_shell_contract() ->
             "diff-mode": {"required": "true"},
             "previous-sha": {"required": "false", "default": ""},
             "previous-review-file": {"required": "false", "default": ""},
+            "dismissed-finding-ids": {"required": "false", "default": ""},
         },
         "outputs": {
             "document-valid": {"value": "${{ steps.canonicalize.outputs.document_valid }}"},
@@ -107,6 +108,7 @@ def test_canonicalize_review_composite_action_has_exact_safe_shell_contract() ->
                         "DIFF_MODE": "${{ inputs.diff-mode }}",
                         "PREVIOUS_SHA": "${{ inputs.previous-sha }}",
                         "PREVIOUS_REVIEW_FILE": "${{ inputs.previous-review-file }}",
+                        "DISMISSED_FINDING_IDS": "${{ inputs.dismissed-finding-ids }}",
                     },
                     "run": (
                         'python3 "$GITHUB_ACTION_PATH/canonicalize_review.py" '
@@ -119,6 +121,7 @@ def test_canonicalize_review_composite_action_has_exact_safe_shell_contract() ->
                         '--diff-mode "$DIFF_MODE" '
                         '--previous-sha "$PREVIOUS_SHA" '
                         '--previous-review-file "$PREVIOUS_REVIEW_FILE" '
+                        '--dismissed-finding-ids "$DISMISSED_FINDING_IDS" '
                         '--repository-root "$GITHUB_WORKSPACE" '
                         '--expected-repository "$GITHUB_REPOSITORY" '
                         '--github-output "$GITHUB_OUTPUT"'
@@ -158,6 +161,7 @@ def test_canonicalize_review_action_run_passes_quoted_environment_values_to_help
         "SCOPE_MANIFEST": hostile + " manifest",
         "SELECTED_DIFF": hostile + " diff",
         "PREVIOUS_REVIEW_FILE": hostile + " previous",
+        "DISMISSED_FINDING_IDS": hostile + " dismissed",
     }
     environment = {
         **os.environ,
@@ -191,6 +195,7 @@ def test_canonicalize_review_action_run_passes_quoted_environment_values_to_help
         "--diff-mode", "full",
         "--previous-sha", "-- sha ; λ value",
         "--previous-review-file", values["PREVIOUS_REVIEW_FILE"],
+        "--dismissed-finding-ids", values["DISMISSED_FINDING_IDS"],
         "--repository-root", str(workspace),
         "--expected-repository", "owner/repository ; λ",
         "--github-output", str(github_output),
@@ -426,9 +431,9 @@ def test_review_invocation_budget_action_has_exact_safe_contract() -> None:
     document = yaml.load(payload, Loader=yaml.BaseLoader)
 
     assert hashlib.sha256(payload).hexdigest() == (
-        "d9cb26a5c340abd20707483f05f4e071b436dac17a900f670aacbd05140b981e"
+        "b9ebc50e0959d9a2db82b1b11715be81309581ac45bb29b6dab02dccacedb91c"
     )
-    assert document == release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V160
+    assert document == release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V163
 
 
 def git(repo: Path, *args: str) -> str:

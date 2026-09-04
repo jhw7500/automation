@@ -645,8 +645,9 @@ def test_comment_summary_and_handoff_are_exact_and_workflow_owned():
         "- Automatic rounds: 1/2\n"
         "- Override rounds: 0/1\n"
         "- Current run: https://github.com/example/repo/actions/runs/700\n"
-        "- Stop reason: duplicate_head\n\n"
-        "Budget exhaustion is not review approval. Use the authenticated review checkpoint and remaining finding IDs before merge."
+        "- Stop reason: duplicate_head\n"
+        "- Dismissed findings: none\n\n"
+        f"{DISMISS_GUIDANCE}"
     )
     state_lines = (
         f"{budget.MARKERS['claude']}\n"
@@ -1164,3 +1165,301 @@ def test_override_is_refused_for_opencode():
     state = budget.LedgerState.initial(REPOSITORY, PR, "opencode")
 
     assert budget.choose_override(state, (override_event(),)) is None
+
+
+# --- A collaborator can dismiss a false-positive finding by comment (issue #112) ---
+
+
+FINDING_3 = "RVW-333333333333"
+DISMISS_GUIDANCE = (
+    "Budget exhaustion is not review approval. Use the authenticated review checkpoint and "
+    "remaining finding IDs before merge. A collaborator with write permission can dismiss a "
+    "false positive by commenting `dismiss RVW-<12 hex> <reason>` on this pull request; the "
+    "dismissal takes effect on the next review run and is revoked by deleting that comment."
+)
+
+
+def dismiss_event(event_id=200, finding_id=FINDING_1, permission="write"):
+    return budget.DismissEvent(event_id, finding_id, permission)
+
+
+def dismissed(finding_id=FINDING_1, comment_id=200):
+    return budget.DismissedFinding(finding_id, comment_id)
+
+
+def authenticated(remaining=(FINDING_1, FINDING_2), head=HEAD_A, full_hash=HASH_1):
+    return budget.AuthenticatedReview(True, head, full_hash, tuple(remaining))
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    (
+        ("dismiss RVW-111111111111 the cited constant table is wrong", FINDING_1),
+        ("dismiss RVW-111111111111 wrong\r\n", FINDING_1),
+        ("dismiss RVW-111111111111 사유는 어느 언어로 써도 된다", FINDING_1),
+        ("dismiss RVW-111111111111 punctuation: `code`, <tags>, -- fine", FINDING_1),
+        ("dismiss RVW-111111111111", None),
+        ("dismiss RVW-111111111111 ", None),
+        ("dismiss RVW-111111111111   ", None),
+        ("dismiss RVW-111111111111  double space", None),
+        ("Dismiss RVW-111111111111 reason", None),
+        ("dismiss rvw-111111111111 reason", None),
+        ("dismiss RVW-11111111111 reason", None),
+        ("dismiss RVW-1111111111111 reason", None),
+        ("dismiss RVW-11111111111g reason", None),
+        ("dismiss RVW-111111111111 reason\nsecond line", None),
+        ("dismiss RVW-111111111111 reason\r\nsecond line", None),
+        ("please dismiss RVW-111111111111 reason", None),
+        (" dismiss RVW-111111111111 reason", None),
+        ("dismiss  RVW-111111111111 reason", None),
+        ("dismiss\tRVW-111111111111 reason", None),
+        ("", None),
+        ("dismiss", None),
+    ),
+)
+def test_dismiss_command_grammar_is_fixed(body, expected):
+    assert budget.parse_dismiss_command(body) == expected
+
+
+def test_dismissals_require_write_permission_and_bind_the_earliest_comment():
+    events = (
+        dismiss_event(300, FINDING_1, "write"),
+        dismiss_event(200, FINDING_1, "admin"),
+        dismiss_event(400, FINDING_2, "read"),
+        dismiss_event(500, FINDING_2, "triage"),
+        dismiss_event(501, FINDING_2, None),
+        dismiss_event(600, FINDING_3, "maintain"),
+    )
+
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude")
+
+    assert budget.choose_dismissals(state, events) == (dismissed(FINDING_1, 200), dismissed(FINDING_3, 600))
+    assert budget.choose_dismissals(state, ()) == ()
+
+
+def test_dismissals_beyond_the_ledger_bound_fail_closed():
+    """The bound is a documented contract value, so the test names the literal."""
+
+    assert budget.MAX_DISMISSED_FINDINGS == 16
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude")
+    events = tuple(dismiss_event(1000 + index, f"RVW-{index:012x}", "write") for index in range(17))
+
+    with pytest.raises(budget.BudgetStateError, match="dismissed_findings_invalid"):
+        budget.choose_dismissals(state, events)
+    assert len(budget.choose_dismissals(state, events[1:])) == 16
+
+
+def test_dismissals_are_ignored_for_opencode():
+    """OpenCode derives no RVW- IDs, so a dismissal can never name one of its findings."""
+
+    state = budget.LedgerState.initial(REPOSITORY, PR, "opencode")
+
+    assert budget.choose_dismissals(state, (dismiss_event(),)) == ()
+    claim_request = request(reviewer="opencode", dismiss_events=(dismiss_event(),))
+    claimed = budget.claim(None, claim_request, claim_provenances(None, claim_request)).state
+    assert claimed.dismissed_findings == ()
+    assert budget.render_summary(claimed) == (
+        "## OpenCode review invocation budget\n"
+        "- Decision: claimed\n"
+        "- Automatic rounds: 1/2\n"
+        "- Override rounds: 0/1\n"
+        "- Current run: https://github.com/example/repo/actions/runs/700\n"
+        "- Stop reason: claimed\n\n"
+        "Budget exhaustion is not review approval. Use the authenticated review checkpoint and "
+        "remaining finding IDs before merge."
+    )
+
+
+def test_a_present_but_empty_dismissal_list_is_not_a_ledger_shape():
+    payload = budget.LedgerState.initial(REPOSITORY, PR, "claude").to_dict()
+    payload["dismissed_findings"] = []
+
+    with pytest.raises(budget.BudgetStateError, match="dismissed_findings_invalid"):
+        budget.LedgerState.from_dict(payload)
+
+
+def test_ledger_serializes_dismissals_only_when_present():
+    """A ledger without dismissals keeps the pre-v1.63 bytes, so open PRs stay valid."""
+
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude")
+    with_dismissal = replace(state, dismissed_findings=(dismissed(),))
+
+    assert "dismissed_findings" not in state.to_dict()
+    assert with_dismissal.to_dict()["dismissed_findings"] == [
+        {"comment_id": 200, "finding_id": FINDING_1},
+    ]
+    assert budget.LedgerState.from_dict(with_dismissal.to_dict()) == with_dismissal
+    for candidate in (state, with_dismissal):
+        assert budget.parse_ledger(
+            ledger_body(candidate), repository=REPOSITORY, pr=PR, reviewer="claude",
+        ) == candidate
+        assert budget.load_checkpoint(budget.render_checkpoint(candidate)) == candidate
+
+
+@pytest.mark.parametrize(
+    "entries",
+    (
+        (dismissed(FINDING_1, 200), dismissed(FINDING_1, 300)),
+        (dismissed(FINDING_2, 200), dismissed(FINDING_1, 300)),
+        (dismissed(FINDING_1, 200), dismissed(FINDING_2, 200)),
+        (dismissed("RVW-not-a-finding", 200),),
+        (dismissed(FINDING_1, 0),),
+        (dismissed(FINDING_1, True),),
+        tuple(
+            dismissed(f"RVW-{index:012x}", 1000 + index)
+            for index in range(budget.MAX_DISMISSED_FINDINGS + 1)
+        ),
+    ),
+)
+def test_stored_dismissals_are_validated(entries):
+    state = replace(budget.LedgerState.initial(REPOSITORY, PR, "claude"), dismissed_findings=entries)
+
+    assert_stored_state_rejected(state, "dismissed_findings_invalid")
+
+
+def test_the_dismissal_bound_is_pinned_to_the_documented_literal():
+    assert budget.MAX_DISMISSED_FINDINGS == 16
+    assert budget.MAX_PERMISSION_ACTORS == 16
+
+
+def test_a_dismissed_id_can_never_remain_in_the_handoff():
+    state = claimed_state()
+    finalized = budget.finalize(
+        state, finalize_request(remaining=(FINDING_1, FINDING_2)), current_provenances(state),
+    ).state
+    assert finalized.handoff.remaining_finding_ids == (FINDING_1, FINDING_2)
+
+    stale = replace(finalized, dismissed_findings=(dismissed(FINDING_1),))
+
+    assert_stored_state_rejected(stale, "handoff_mismatch")
+
+
+def test_claim_rejects_malformed_dismiss_events():
+    malformed = request(dismiss_events=(("not", "an", "event"),))
+
+    transition = budget.claim(None, malformed, claim_provenances(None, malformed))
+
+    assert (transition.decision, transition.stop_reason) == ("state_invalid", "dismiss_events_invalid")
+
+
+def test_claim_records_authorized_dismissals_and_drops_them_from_remaining_ids():
+    state = claimed_state()
+    first = budget.finalize(
+        state, finalize_request(remaining=(FINDING_1, FINDING_2)), current_provenances(state),
+    ).state
+    second = request(
+        head=HEAD_B, full_hash=HASH_2, run_id=701, authenticated_review=authenticated(),
+        dismiss_events=(dismiss_event(200, FINDING_1, "write"), dismiss_event(201, FINDING_2, "read")),
+    )
+
+    transition = budget.claim(first, second, claim_provenances(first, second))
+
+    assert transition.decision == "claimed"
+    assert transition.state.dismissed_findings == (dismissed(FINDING_1, 200),)
+    assert transition.state.handoff.remaining_finding_ids == (FINDING_2,)
+    budget.serialize_ledger(transition.state)
+
+
+def test_refused_claim_still_records_dismissals_and_updates_the_handoff():
+    """The issue #112 shape: both rounds are spent, then a human dismisses the false positive."""
+
+    state = claimed_state()
+    first = budget.finalize(
+        state, finalize_request(remaining=(FINDING_1, FINDING_2)), current_provenances(state),
+    ).state
+    second_request = request(head=HEAD_B, full_hash=HASH_2, run_id=701, authenticated_review=authenticated())
+    second = budget.claim(first, second_request, claim_provenances(first, second_request)).state
+    second = budget.finalize(
+        second,
+        finalize_request(
+            head=HEAD_B, full_hash=HASH_2, run_id=701, remaining=(FINDING_1, FINDING_2),
+            authenticated_review=authenticated(),
+        ),
+        current_provenances(second),
+    ).state
+    third_request = request(
+        head=HEAD_C, full_hash=HASH_3, run_id=702,
+        authenticated_review=authenticated(head=HEAD_B, full_hash=HASH_2),
+        dismiss_events=(dismiss_event(200, FINDING_1, "write"),),
+    )
+
+    refused = budget.claim(second, third_request, claim_provenances(second, third_request))
+
+    assert (refused.decision, refused.mutate_comment) == ("round_budget_exhausted", True)
+    assert refused.state.dismissed_findings == (dismissed(FINDING_1, 200),)
+    assert refused.state.handoff.remaining_finding_ids == (FINDING_2,)
+    budget.serialize_ledger(refused.state)
+
+
+def test_dismissal_is_revoked_when_the_comment_no_longer_exists():
+    state = claimed_state()
+    first = budget.finalize(
+        state, finalize_request(remaining=(FINDING_1, FINDING_2)), current_provenances(state),
+    ).state
+    dismissing = request(
+        head=HEAD_B, full_hash=HASH_2, run_id=701, authenticated_review=authenticated(),
+        dismiss_events=(dismiss_event(),),
+    )
+    with_dismissal = budget.claim(first, dismissing, claim_provenances(first, dismissing)).state
+    assert with_dismissal.handoff.remaining_finding_ids == (FINDING_2,)
+    revoking = request(head=HEAD_C, full_hash=HASH_3, run_id=702, authenticated_review=authenticated())
+
+    revoked = budget.claim(with_dismissal, revoking, claim_provenances(with_dismissal, revoking)).state
+
+    assert revoked.dismissed_findings == ()
+    assert revoked.handoff.remaining_finding_ids == (FINDING_1, FINDING_2)
+
+
+def test_finalize_refreshes_dismissals_and_never_records_a_dismissed_id_as_remaining():
+    claim_request = request(dismiss_events=(dismiss_event(200, FINDING_1),))
+    state = budget.claim(None, claim_request, claim_provenances(None, claim_request)).state
+    assert state.dismissed_findings == (dismissed(FINDING_1, 200),)
+
+    finalized = budget.finalize(
+        state,
+        finalize_request(
+            remaining=(FINDING_1, FINDING_2),
+            dismiss_events=(dismiss_event(200, FINDING_1), dismiss_event(300, FINDING_2)),
+        ),
+        current_provenances(state),
+    ).state
+
+    assert finalized.dismissed_findings == (dismissed(FINDING_1, 200), dismissed(FINDING_2, 300))
+    assert finalized.invocations[-1].remaining_finding_ids == ()
+    assert finalized.handoff.remaining_finding_ids == ()
+    budget.serialize_ledger(finalized)
+
+
+def test_comment_summary_lists_dismissals_and_documents_the_command():
+    claim_request = request(dismiss_events=(dismiss_event(200, FINDING_1), dismiss_event(300, FINDING_2)))
+    state = budget.claim(None, claim_request, claim_provenances(None, claim_request)).state
+
+    assert budget.render_summary(state) == (
+        "## Claude review invocation budget\n"
+        "- Decision: claimed\n"
+        "- Automatic rounds: 1/2\n"
+        "- Override rounds: 0/1\n"
+        "- Current run: https://github.com/example/repo/actions/runs/700\n"
+        "- Stop reason: claimed\n"
+        "- Dismissed findings: "
+        "[RVW-111111111111](https://github.com/example/repo/pull/52#issuecomment-200), "
+        "[RVW-222222222222](https://github.com/example/repo/pull/52#issuecomment-300)\n\n"
+        f"{DISMISS_GUIDANCE}"
+    )
+
+
+def test_invalid_claim_after_a_dismissal_still_renders_a_checkpoint():
+    """A refusal that keeps the validated state must not leave a handoff naming a dismissed ID."""
+
+    state = claimed_state()
+    finalized = budget.finalize(
+        state, finalize_request(remaining=(FINDING_1, FINDING_2)), current_provenances(state),
+    ).state
+    conflicting = request(head=HEAD_B, full_hash=HASH_2, dismiss_events=(dismiss_event(),))
+
+    transition = budget.claim(finalized, conflicting, valid_provenances(finalized))
+
+    assert (transition.decision, transition.stop_reason) == ("state_invalid", "duplicate_run_identity")
+    assert transition.state.dismissed_findings == (dismissed(),)
+    assert transition.state.handoff.remaining_finding_ids == (FINDING_2,)
+    budget.render_checkpoint(transition.state)

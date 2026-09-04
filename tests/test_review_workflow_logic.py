@@ -2538,6 +2538,7 @@ def test_claude_uses_one_shared_canonicalizer_and_upsert_reads_only_canonical_fi
             "${{ steps.prepare-review-input.outputs.previous_sha != '' "
             "&& format('{0}/claude-previous-review.md', runner.temp) || '' }}"
         ),
+        "dismissed-finding-ids": "${{ steps.review-budget-claim.outputs.dismissed-finding-ids }}",
     }
     assert action["if"] == (
         "${{ always() && steps.reset-claude-artifacts.outcome == 'success' "
@@ -2585,6 +2586,7 @@ def test_gemini_uses_the_same_canonicalizer_contract_as_claude():
             "${{ steps.pr-details.outputs.previous_sha != '' "
             "&& format('{0}/gemini-previous-review.md', runner.temp) || '' }}"
         ),
+        "dismissed-finding-ids": "${{ steps.review-budget-claim.outputs.dismissed-finding-ids }}",
     }
     assert action["if"] == (
         "${{ always() && steps.reset-gemini-artifacts.outcome == 'success' "

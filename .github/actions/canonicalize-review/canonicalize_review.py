@@ -27,6 +27,7 @@ SOFT_REASONS = frozenset({
     "invalid_impact_class", "missing_material_impact",
     "unsupported_performance_basis", "non_actionable_category",
     "unknown_prior_id", "duplicate_prior_binding", "missing_fix_anchor",
+    "dismissed_prior_id",
 })
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
 IMPACT_CLASSES = frozenset({"runtime", "security", "data-integrity", "user-visible", "performance"})
@@ -35,6 +36,7 @@ MAX_CANONICAL_BYTES = 64_000
 MAX_PREVIOUS_CANONICAL_BYTES = 65_536
 MAX_CANDIDATE_BLOCKS = 512
 MAX_SAFE_INTEGER = (1 << 53) - 1
+FINDING_ID = re.compile(r"RVW-[0-9a-f]{12}\Z")
 PROOF_DEFICIT = re.compile(
     r"\b(?:plausible(?:\s+but)?\s+unconfirmed|cannot\s+(?:confirm|verify)|"
     r"not\s+confirmed|pending\s+confirmation|unverified\s+external)\b",
@@ -91,6 +93,10 @@ class CanonicalizationRequest:
     previous_sha: str
     previous_review_file: Path | None
     expected_repository: str
+    # Finding IDs a collaborator dismissed through the review budget ledger. A dismissed
+    # prior finding leaves the active set, and neither a carryover binding nor a verbatim
+    # re-emission under New findings can bring it back while the dismissal stands.
+    dismissed_finding_ids: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -840,6 +846,13 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                         expected_repository=request.expected_repository,
                     )
                     prior_active = _load_prior_active(request)
+                    dismissed = request.dismissed_finding_ids
+                    # The per-block checks below already stop a dismissed ID from binding
+                    # or re-entering; removing it from the active set as well keeps that
+                    # set authoritative for any later consumer of prior_active.
+                    for finding_id in list(prior_active):
+                        if finding_id in dismissed:
+                            del prior_active[finding_id]
                 except ScopeValidationError:
                     result = _hard("scope_invalid")
                 except ValueError as error:
@@ -891,6 +904,10 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                     duplicated = {finding_id for finding_id, blocks in bound.items() if len(blocks) > 1}
                     for section in ("Still open", "Resolved", "Retracted"):
                         for block in sections[section]:
+                            if block.finding_id in dismissed:
+                                normalized += 1
+                                reasons.append(_claim_reason(block, "normalized", "dismissed_prior_id"))
+                                continue
                             prior = prior_active.get(block.finding_id or "")
                             if prior is None:
                                 normalized += 1
@@ -929,6 +946,10 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                         finding_id = stable_finding_id(
                             request.reviewer, finding.anchor, finding.severity, finding.title,
                         )
+                        if finding_id in dismissed:
+                            normalized += 1
+                            reasons.append(_claim_reason(block, "normalized", "dismissed_prior_id"))
+                            continue
                         if finding_id in active_ids:
                             normalized += 1
                             reasons.append(_claim_reason(
@@ -1005,6 +1026,16 @@ def _summary(result: CanonicalizationResult) -> list[str]:
     return lines
 
 
+def _dismissed_finding_ids(value: str) -> frozenset[str]:
+    """Parse the workflow-owned comma-separated dismissal list; anything else is a wiring bug."""
+    if value == "":
+        return frozenset()
+    finding_ids = value.split(",")
+    if any(FINDING_ID.fullmatch(item) is None for item in finding_ids):
+        raise argparse.ArgumentTypeError("dismissed finding IDs must be comma-separated RVW-<12 hex> values")
+    return frozenset(finding_ids)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--reviewer", required=True, choices=("claude", "gemini"))
@@ -1020,6 +1051,7 @@ def _parser() -> argparse.ArgumentParser:
         "--previous-review-file", type=lambda value: None if value == "" else Path(value)
     )
     parser.add_argument("--expected-repository", required=True)
+    parser.add_argument("--dismissed-finding-ids", type=_dismissed_finding_ids, default=frozenset())
     parser.add_argument("--github-output", type=Path)
     return parser
 
@@ -1030,6 +1062,7 @@ def main(argv: list[str] | None = None) -> int:
         args.reviewer, args.candidate_file, args.canonical_file, args.result_file,
         args.scope_manifest, args.selected_diff, args.repository_root, args.diff_mode,
         args.previous_sha, args.previous_review_file, args.expected_repository,
+        args.dismissed_finding_ids,
     )
     try:
         result = canonicalize(request)

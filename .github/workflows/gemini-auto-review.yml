@@ -1417,6 +1417,7 @@ jobs:
           diff-mode: ${{ steps.prepare-diff.outputs.diff-mode }}
           previous-sha: ${{ steps.pr-details.outputs.previous_sha }}
           previous-review-file: ${{ steps.pr-details.outputs.previous_sha != '' && format('{0}/gemini-previous-review.md', runner.temp) || '' }}
+          dismissed-finding-ids: ${{ steps.review-budget-claim.outputs.dismissed-finding-ids }}
 
       # 필터된 finding 의 사유가 런 로그에만 남으면 왜 빠졌는지 확인하는 비용이 크다.
       # 사유 코드는 정규화기 소유의 고정 어휘라 요약에 실어도 비신뢰 텍스트가 아니며,

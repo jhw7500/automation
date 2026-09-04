@@ -133,6 +133,7 @@ class ReviewCase:
             result_file=self.result, scope_manifest=manifest, selected_diff=selected_diff,
             repository_root=base, diff_mode="full", previous_sha="",
             previous_review_file=None, expected_repository="example/repo",
+            dismissed_finding_ids=frozenset(),
         )
 
     def run(self) -> tuple[object, str | None]:
@@ -217,6 +218,7 @@ class ReviewQualityRepo:
     def _request(
         self, text: str, *, reviewer: str, head: str, diff_mode: str = "full",
         previous_sha: str = "", previous_review: str | None = None,
+        dismissed_finding_ids: frozenset[str] = frozenset(),
     ) -> CanonicalizationRequest:
         _git(self.repository, "checkout", "--quiet", head)
         self.candidate.write_text(text, encoding="utf-8")
@@ -241,31 +243,41 @@ class ReviewQualityRepo:
             result_file=self.result, scope_manifest=manifest, selected_diff=selected_diff,
             repository_root=self.repository, diff_mode=diff_mode, previous_sha=previous_sha,
             previous_review_file=previous_file, expected_repository="example/repo",
+            dismissed_finding_ids=dismissed_finding_ids,
         )
 
     def _run(self, request: CanonicalizationRequest) -> tuple[object, str]:
         result = canonicalize(request)
         return result, self.canonical.read_text(encoding="utf-8") if self.canonical.exists() else ""
 
-    def run_fixture(self, name: str, reviewer: str = "claude") -> tuple[object, str]:
+    def run_fixture(
+        self, name: str, reviewer: str = "claude", dismissed_finding_ids: frozenset[str] = frozenset(),
+    ) -> tuple[object, str]:
         return self._run(self._request(
             (self.fixtures / name).read_text(encoding="utf-8"), reviewer=reviewer,
-            head=self.review_head,
+            head=self.review_head, dismissed_finding_ids=dismissed_finding_ids,
         ))
 
     def run_text(self, text: str, reviewer: str = "claude") -> tuple[object, str]:
         return self._run(self._request(text, reviewer=reviewer, head=self.review_head))
 
-    def run_delta(self, previous_review: str, candidate: str) -> tuple[object, str]:
+    def run_delta(
+        self, previous_review: str, candidate: str,
+        dismissed_finding_ids: frozenset[str] = frozenset(),
+    ) -> tuple[object, str]:
         return self._run(self._request(
             candidate, reviewer="gemini", head=self.fixed_head, diff_mode="delta",
             previous_sha=self.review_head, previous_review=previous_review,
+            dismissed_finding_ids=dismissed_finding_ids,
         ))
 
-    def run_carryover(self, previous_review: str, candidate: str) -> tuple[object, str]:
+    def run_carryover(
+        self, previous_review: str, candidate: str,
+        dismissed_finding_ids: frozenset[str] = frozenset(),
+    ) -> tuple[object, str]:
         return self._run(self._request(
             candidate, reviewer="gemini", head=self.review_head, previous_sha=self.review_head,
-            previous_review=previous_review,
+            previous_review=previous_review, dismissed_finding_ids=dismissed_finding_ids,
         ))
 
 
@@ -550,6 +562,7 @@ def test_clean_candidate_accepts_a_tree_equivalent_empty_full_scope(tmp_path: Pa
         previous_sha="",
         previous_review_file=None,
         expected_repository="example/repo",
+        dismissed_finding_ids=frozenset(),
     ))
 
     assert result == canonicalize_review.CanonicalizationResult(
@@ -737,7 +750,9 @@ def test_clean_canonical_output_round_trips_with_summary_prose(case_factory):
     assert round_trip == canonical
 
 
-def _cli_args(case: ReviewCase, github_output: Path | None = None) -> list[str]:
+def _cli_args(
+    case: ReviewCase, github_output: Path | None = None, dismissed: str | None = None,
+) -> list[str]:
     args = [
         sys.executable, str(MODULE_PATH), "--reviewer", "claude",
         "--candidate-file", str(case.candidate), "--canonical-file", str(case.canonical),
@@ -747,6 +762,8 @@ def _cli_args(case: ReviewCase, github_output: Path | None = None) -> list[str]:
     ]
     if github_output is not None:
         args.extend(("--github-output", str(github_output)))
+    if dismissed is not None:
+        args.extend(("--dismissed-finding-ids", dismissed))
     return args
 
 
@@ -1844,3 +1861,116 @@ def test_visible_text_canonicalization_is_idempotent(raw, expected):
     once = canonicalize_review._canonical_visible_text(raw)
     assert once == expected
     assert canonicalize_review._canonical_visible_text(once) == expected
+
+
+# --- A human dismissal removes a finding from carryover and from re-emission (issue #112) ---
+
+DISMISSED_PLAN_ID = "RVW-3253866a28c6"
+CLEAN_DOCUMENT = "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+def test_dismissed_prior_id_is_a_soft_normalization_reason():
+    assert "dismissed_prior_id" in canonicalize_review.SOFT_REASONS
+
+
+@pytest.mark.parametrize(
+    ("runner", "candidate", "section", "claimed"),
+    (
+        ("run_delta", valid_still_open_candidate(), "Still open", "MEDIUM"),
+        ("run_delta", resolved_rejected_plan_candidate(), "Resolved", "HIGH"),
+        ("run_carryover", retracted_rejected_plan_candidate(), "Retracted", "HIGH"),
+    ),
+)
+def test_dismissed_prior_finding_is_normalized_out_of_every_carryover_section(
+    review_quality_repo, runner, candidate, section, claimed,
+):
+    result, canonical = getattr(review_quality_repo, runner)(
+        accepted_rejected_plan_review(), candidate,
+        dismissed_finding_ids=frozenset({DISMISSED_PLAN_ID}),
+    )
+
+    assert result == canonicalize_review.CanonicalizationResult(
+        True, 0, 0, 1, "none", "",
+        (CandidateReason(0, section, "normalized", "dismissed_prior_id", claimed),), (),
+    )
+    assert canonical == CLEAN_DOCUMENT
+
+
+def test_dismissed_prior_finding_omitted_by_the_model_is_simply_gone(review_quality_repo):
+    result, canonical = review_quality_repo.run_delta(
+        accepted_rejected_plan_review(), "### New findings\nNone\n",
+        dismissed_finding_ids=frozenset({DISMISSED_PLAN_ID}),
+    )
+
+    assert result == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
+    assert canonical == CLEAN_DOCUMENT
+
+
+def test_a_repeated_new_finding_whose_id_is_dismissed_is_normalized(review_quality_repo):
+    """The issue #112 shape: the model re-emits the dismissed finding verbatim."""
+
+    result, canonical = review_quality_repo.run_fixture(
+        "rejected-plan.md", reviewer="gemini", dismissed_finding_ids=frozenset({DISMISSED_PLAN_ID}),
+    )
+
+    assert (result.accepted_count, result.filtered_count, result.normalized_count) == (0, 0, 1)
+    assert result.candidate_reasons == (
+        CandidateReason(0, "New findings", "normalized", "dismissed_prior_id", "HIGH"),
+    )
+    assert DISMISSED_PLAN_ID not in canonical
+    assert canonical == CLEAN_DOCUMENT
+
+
+def test_an_unrelated_dismissal_leaves_the_finding_accepted(review_quality_repo):
+    result, canonical = review_quality_repo.run_fixture(
+        "rejected-plan.md", reviewer="gemini", dismissed_finding_ids=frozenset({"RVW-000000000000"}),
+    )
+
+    assert (result.accepted_count, result.normalized_count) == (1, 0)
+    assert DISMISSED_PLAN_ID in canonical
+
+
+def _dismissable_case(case_factory) -> ReviewCase:
+    return case_factory(b"""### New findings
+
+#### [MEDIUM] Broad ValueError catch hides invalid configuration
+- Changed anchor: {"path":"review_cases.py","line":26}
+- Trigger evidence: {"path":"review_cases.py","line":25,"quote":"        return int(value)"}
+- Impact class: runtime
+- Material impact: An invalid numeric configuration is converted into a normal result.
+""")
+
+
+def test_cli_dismissed_ids_are_a_comma_separated_list(case_factory):
+    case = _dismissable_case(case_factory)
+    github_output = case.root / "github-output.txt"
+
+    completed = subprocess.run(
+        _cli_args(case, github_output, dismissed="RVW-000000000000,RVW-61d4cd9ac260"),
+        cwd=ACTION_DIR, capture_output=True, text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "accepted_count=0\nfiltered_count=0\nnormalized_count=1\n" in github_output.read_text(encoding="utf-8")
+    assert "candidate[0]: section=New findings outcome=normalized reason=dismissed_prior_id claimed_severity=MEDIUM" in completed.stdout
+    assert case.canonical.read_text(encoding="utf-8") == CLEAN_DOCUMENT
+
+
+def test_cli_empty_dismissed_ids_change_nothing(case_factory):
+    case = _dismissable_case(case_factory)
+
+    completed = subprocess.run(_cli_args(case, dismissed=""), cwd=ACTION_DIR, capture_output=True, text=True)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "RVW-61d4cd9ac260 [MEDIUM] Broad ValueError catch" in case.canonical.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("dismissed", ("RVW-61d4cd9ac26", "rvw-61d4cd9ac260", "RVW-61d4cd9ac260,", " RVW-61d4cd9ac260", "RVW-61d4cd9ac260 RVW-000000000000"))
+def test_cli_rejects_a_malformed_dismissal_list_before_reading_the_candidate(case_factory, dismissed):
+    case = _dismissable_case(case_factory)
+
+    completed = subprocess.run(_cli_args(case, dismissed=dismissed), cwd=ACTION_DIR, capture_output=True, text=True)
+
+    assert completed.returncode == 2
+    assert not case.canonical.exists()
+    assert not case.result.exists()
