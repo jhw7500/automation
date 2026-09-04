@@ -80,7 +80,7 @@ def test_catalog_and_profiles_are_closed() -> None:
     }
     for entry in callers.values():
         assert entry.trigger["pull_request"]["types"] == [
-            "opened", "synchronize", "ready_for_review",
+            "opened", "synchronize", "ready_for_review", "labeled",
         ]
         assert "review_mode" in entry.caller_jobs[0].with_keys
 

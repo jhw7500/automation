@@ -34,9 +34,70 @@ V145_PREPARE_DIFF_FIXTURE = (
 )
 
 
+LABELED_TRIGGER_TYPES = "    types: [opened, synchronize, ready_for_review, labeled]\n"
+PRE_V164_TRIGGER_TYPES = "    types: [opened, synchronize, ready_for_review]\n"
+LABELED_GUARD_LINES = (
+    "      github.event.pull_request.draft == false &&\n"
+    "      (github.event.action != 'labeled' || github.event.label.name == 'review:request')) ||\n"
+)
+PRE_V164_GUARD_LINES = "      github.event.pull_request.draft == false) ||\n"
+OVERRIDE_DESCRIPTION = (
+    "        description: Perform one authorized same-HEAD override round; "
+    "requires the review-budget-override label\n"
+)
+PRE_V164_DESCRIPTION = "        description: Perform one authorized same-HEAD review\n"
+CATALOG_LABELED_TYPES = '            "synchronize",\n            "ready_for_review",\n            "labeled"\n'
+CATALOG_PRE_V164_TYPES = '            "synchronize",\n            "ready_for_review"\n'
+CATALOG_OVERRIDE_DESCRIPTION = (
+    '"description": "Perform one authorized same-HEAD override round; '
+    'requires the review-budget-override label"'
+)
+CATALOG_PRE_V164_DESCRIPTION = '"description": "Perform one authorized same-HEAD review"'
+
+
+def restore_pre_v164_label_trigger(repo: Path) -> None:
+    """Restore the pre-v1.64 review callers and catalog triggers by text.
+
+    v1.64 subscribes the three managed review callers to `labeled`, guards that
+    event on `review:request`, and describes `force_review` as the override round;
+    the catalog `trigger` blocks change with them. This runs first (newest release
+    first) so the older restores still find the text they assert on.
+    """
+
+    # Idempotent: a fixture that already restored (or never had) the v1.64 text is
+    # left alone, so this can also run first inside the older restore chains.
+    for workflow in ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"):
+        path = repo / "examples/baseline-workflows/.github/workflows" / workflow
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for current, historical in (
+            (LABELED_TRIGGER_TYPES, PRE_V164_TRIGGER_TYPES),
+            (LABELED_GUARD_LINES, PRE_V164_GUARD_LINES),
+            (OVERRIDE_DESCRIPTION, PRE_V164_DESCRIPTION),
+        ):
+            # 0 is legitimate: trees older than v1.51 carry neither form and are
+            # restored further by the callers below.
+            assert text.count(current) <= 1, (workflow, current)
+            text = text.replace(current, historical)
+        path.write_text(text, encoding="utf-8")
+    catalog = repo / "scripts/workflow-catalog.json"
+    if catalog.exists():
+        text = catalog.read_text(encoding="utf-8")
+        for current, historical in (
+            (CATALOG_LABELED_TYPES, CATALOG_PRE_V164_TYPES),
+            (CATALOG_OVERRIDE_DESCRIPTION, CATALOG_PRE_V164_DESCRIPTION),
+        ):
+            assert text.count(current) in (0, 3), current
+            text = text.replace(current, historical)
+        catalog.write_text(text, encoding="utf-8")
+
+
+
 def restore_pre_v151_review_policy_callers(repo: Path) -> None:
     """Remove only the v1.51 caller policy surface from historical fixtures."""
 
+    restore_pre_v164_label_trigger(repo)
     baseline_root = repo / "examples/baseline-workflows/.github/workflows"
     review_mode = (
         "      review_mode: >-\n"

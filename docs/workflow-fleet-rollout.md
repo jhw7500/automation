@@ -422,8 +422,8 @@ as an implicit bootstrap opportunity. Audit reports `current`, `drift`, or `bloc
 each configured target.
 
 The manifest and operator output identify the default target and include
-the observed base SHA, release commit, required secret and variable **names**, and managed
-diff paths. The manifest is a convenience report, not an approval token; publish always
+the observed base SHA, release commit, required secret, variable, and (from `v1.64`) review-label
+**names**, and managed diff paths. The manifest is a convenience report, not an approval token; publish always
 refetches and recomputes.
 
 ### 2. Publish independent PRs
@@ -591,13 +591,35 @@ After merge, use a **GitHub-native revert** PR (or a normal reviewed PR containi
 `git revert`). Never move an immutable automation tag. Repair a bad central release with a
 new immutable release and new consumer PRs.
 
+## Review labels
+
+From `v1.64` the plan, publish, and audit tools also read each repository's label names and
+block a repository that lacks `review:request`, `review:skip`, or `review-budget-override`
+(`missing labels: ...`), because the shipped review policy is opt-in through those labels. The
+tools never create labels. Create or repair them with the explicit operator step, which is
+read-only without `--confirm`:
+
+```bash
+python3 "$AUTOMATION_RELEASE_ROOT/scripts/ensure_review_labels.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT"                        # report per repository
+python3 "$AUTOMATION_RELEASE_ROOT/scripts/ensure_review_labels.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" --confirm              # create the missing labels
+python3 "$AUTOMATION_RELEASE_ROOT/scripts/ensure_review_labels.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" --confirm --normalize  # also repair color/description
+```
+
+Use repeated `--repo NAME` arguments to narrow it. Labels are per repository, so the operator
+step checks a multi-branch repository such as `wlan-driver-v2` once, while plan and audit read
+the names once per branch target. Color or description drift is reported but never blocks a
+rollout; only a missing name does.
+
 ## Token synchronization
 
 Workflow PR rollout and credential lifecycle are separate operations. The workflow tools
-may inspect required secret and variable **names** as preconditions, but they never read a
-provider value, consume a local provider file, or call a secret/variable mutation API.
-Missing names block the affected repository until an independently reviewed credential
-process resolves them.
+may inspect required secret, variable, and review-label **names** as preconditions, but they
+never read a provider value, consume a local provider file, or call a secret/variable/label
+mutation API. Missing names block the affected repository until an independently reviewed
+credential process (or the label step above) resolves them.
 
 Claude token rotation remains owned by `personal-ops/claude-token-sync`, including its
 inventory, locking, health checks, and deployment lifecycle. Other provider-key changes

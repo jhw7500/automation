@@ -560,6 +560,7 @@ def validate_managed_result(
                 profile,
                 set(plan.required_secrets),
                 set(plan.required_variables),
+                label_names=set(plan.required_labels),
             )
             if result.status != "current":
                 raise CommandError(f"catalog audit failed: {result.detail}")
@@ -1081,6 +1082,7 @@ def _render(
         bundle.commit,
         set(snapshot.secret_names),
         set(snapshot.variable_names),
+        label_names=set(snapshot.label_names),
         bootstrap=bootstrap,
         observed_revision=snapshot.base_sha,
     )
@@ -1515,6 +1517,7 @@ def _plan_record(prepared: PreparedRepo, commit: str) -> dict[str, object]:
             "reason": prepared.outcome.detail,
             "required_secrets": sorted(plan.required_secrets) if plan else [],
             "required_variables": sorted(plan.required_variables) if plan else [],
+            "required_labels": sorted(plan.required_labels) if plan else [],
             "managed_diff_paths": list(_changed_paths(plan)) if plan else [],
         }
     )

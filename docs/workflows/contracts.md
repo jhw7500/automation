@@ -215,17 +215,42 @@ Every review channel is off by default and requires an explicit opt-in:
 `/jhw:pr --review` applies the label and posts both mentions, so opting one pull request into all
 three channels is a single command.
 
-Managed-reviewer opt-in must be in place before the run starts. The callers subscribe to `opened`,
-`synchronize`, and `ready_for_review`, never `labeled`, so adding `review:request` to an
-already-open pull request starts no run by itself; and adding it while a run is already resolving
-fails that run closed with `review_mode_label_mismatch`, because the caller's `review_mode` input
-was read from an event payload that predates the label. Apply the label before the final ready
-head — `/jhw:pr --review` labels the draft and then marks it ready — or, on a pull request that is
-already open, start one authorized same-head review through a `workflow_dispatch` carrying
-`force_review: true`.
+The labels themselves are a fleet precondition. Every configured repository must define
+`review:request` (`0E8A16`, "Explicitly request AI review"), `review:skip` (`BFDADC`,
+"Explicitly skip AI review"), and `review-budget-override` (`D93F0B`, "Authorize one bounded
+reviewer override round"). From `v1.64` the rollout plan, publish, and audit tools read the
+repository's label names next to its secret and variable names and report a repository whose
+names are missing as `blocked` with `missing labels: ...`; the tools never create labels. The
+explicit, idempotent operator step is `scripts/ensure_review_labels.py`, which reports missing
+labels and color/description drift, creates the missing ones with `--confirm`, and repairs drift
+with `--confirm --normalize`.
+
+From `v1.64` the managed callers also subscribe to `labeled`, guarded so that only the
+`review:request` label starts a run: `github.event.action != 'labeled' ||
+github.event.label.name == 'review:request'`. Adding `review:request` to an already-open,
+non-draft pull request therefore starts one review of its current head without a new commit,
+a ready transition, or a dispatch, provided that workflow is enabled in
+`.github/workflow-config.yml`; the `labeled` payload carries the updated label list, so the
+caller's `review_mode` resolves to `request`. Unrelated labels start nothing, and the event is
+never a cancellation trigger. Three consequences follow from contracts that did not change:
+adding the label while another run is still resolving fails that run closed with
+`review_mode_label_mismatch` — so labeling a non-draft pull request right after opening it
+leaves one red `opened` run beside the `labeled` run that reviews, which is the expected
+steady state of that sequence; adding it to a pull request that already carries `review:skip`
+starts a run that fails closed with `review_label_conflict` before any model is invoked, so
+remove `review:skip` first and re-add `review:request`; and a head that a reviewer already
+reviewed is refused with `duplicate_head` — the label reviews each head once, and a same-head
+re-review still needs the override round below. On draft pull requests the label starts nothing
+until the pull request is marked ready. Before `v1.64` the callers subscribed to `opened`,
+`synchronize`, and `ready_for_review` only, so the label had to be applied before the final
+ready head — `/jhw:pr --review` labels the draft and then marks it ready — or an already-open
+pull request needed a `workflow_dispatch` carrying `force_review: true`.
 
 A bounded override round (`review-budget-override` plus a `workflow_dispatch` carrying
-`force_review: true`) is available for Claude and Gemini only. From `v1.62` the budget refuses it
+`force_review: true`) is available for Claude and Gemini only; from `v1.64` the callers'
+`force_review` input says so ("Perform one authorized same-HEAD override round; requires the
+review-budget-override label"), because a dispatch without the label is refused as
+`round_budget_exhausted` even on a first review. From `v1.62` the budget refuses it
 for OpenCode, because that canonicalizer authenticates `pull_request` provenance throughout and a
 dispatch round can never publish: spending the override there consumed it and lost the verdict.
 

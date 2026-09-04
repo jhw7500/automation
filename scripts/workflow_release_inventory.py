@@ -152,6 +152,7 @@ REVIEW_ROUNDS_VARIABLE_RELEASE = (1, 60)
 SAME_HEAD_CANCEL_RELEASE = (1, 61)
 FILTER_REASON_SURFACE_RELEASE = (1, 62)
 FINDING_DISMISSAL_RELEASE = (1, 63)
+LABEL_REVIEW_TRIGGER_RELEASE = (1, 64)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -212,6 +213,12 @@ def release_supports_finding_dismissal(ref: str) -> bool:
     """Return whether ``ref`` lets a write collaborator dismiss a finding by comment."""
 
     return _release_version(ref) >= FINDING_DISMISSAL_RELEASE
+
+
+def release_supports_label_review_trigger(ref: str) -> bool:
+    """Return whether ``ref``'s managed callers start a review when `review:request` is added."""
+
+    return _release_version(ref) >= LABEL_REVIEW_TRIGGER_RELEASE
 
 
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:

@@ -50,6 +50,7 @@ from scripts.workflow_release_inventory import (
     release_supports_review_rounds_variable,
     release_supports_filter_reason_surface,
     release_supports_finding_dismissal,
+    release_supports_label_review_trigger,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
     validate_release_listing,
@@ -6048,10 +6049,18 @@ def _verify_review_policy_workflows(documents: dict[str, dict]) -> None:
         ) from None
 
 
-def _verify_review_policy_callers(tree: VerifiedCommitTree) -> None:
+def _verify_review_policy_callers(tree: VerifiedCommitTree, ref: str) -> None:
+    # v1.64 subscribes the callers to `labeled`, guards that event on the
+    # `review:request` label so unrelated labels start no run, and describes
+    # `force_review` as the override round that needs `review-budget-override`.
+    label_trigger = release_supports_label_review_trigger(ref)
     trigger = {
         "pull_request": {
-            "types": ["opened", "synchronize", "ready_for_review"]
+            "types": (
+                ["opened", "synchronize", "ready_for_review", "labeled"]
+                if label_trigger
+                else ["opened", "synchronize", "ready_for_review"]
+            )
         },
         "workflow_dispatch": {
             "inputs": {
@@ -6061,7 +6070,12 @@ def _verify_review_policy_callers(tree: VerifiedCommitTree) -> None:
                     "required": "true",
                 },
                 "force_review": {
-                    "description": "Perform one authorized same-HEAD review",
+                    "description": (
+                        "Perform one authorized same-HEAD override round; "
+                        "requires the review-budget-override label"
+                        if label_trigger
+                        else "Perform one authorized same-HEAD review"
+                    ),
                     "type": "boolean",
                     "required": "false",
                     "default": "false",
@@ -6073,8 +6087,14 @@ def _verify_review_policy_callers(tree: VerifiedCommitTree) -> None:
         "(github.event_name == 'pull_request' && "
         "github.event.pull_request.head.repo.fork == false && "
         "github.event.pull_request.head.repo.full_name == github.repository && "
-        "github.event.pull_request.draft == false) || "
-        "(github.event_name == 'workflow_dispatch' && inputs.force_review)"
+        + (
+            "github.event.pull_request.draft == false && "
+            "(github.event.action != 'labeled' || "
+            "github.event.label.name == 'review:request')) || "
+            if label_trigger
+            else "github.event.pull_request.draft == false) || "
+        )
+        + "(github.event_name == 'workflow_dispatch' && inputs.force_review)"
     )
     review_mode = (
         "${{\n"
@@ -6958,7 +6978,7 @@ def _verify_commit_content(
         _verify_canonicalize_review_action(tree, ref)
     if release_supports_review_policy(ref):
         _verify_review_policy_action(tree, ref)
-        _verify_review_policy_callers(tree)
+        _verify_review_policy_callers(tree, ref)
     _verify_approved_v140_policy(tree, ref)
     _verify_manual_gemini_output_contract(tree, ref)
     catalog = _verify_tag_catalog(tree, ref)

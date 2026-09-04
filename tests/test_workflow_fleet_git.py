@@ -336,6 +336,8 @@ def test_clone_reads_only_metadata_and_prerequisite_names(
             return completed(args, '[{"name":"CLAUDE_CODE_OAUTH_TOKEN"}]')
         if args[:3] == ["gh", "variable", "list"]:
             return completed(args, '[{"name":"APP_ID"}]')
+        if args[:3] == ["gh", "label", "list"]:
+            return completed(args, '[{"name":"review:request"}]')
         payload = git_payload(args)
         if payload[0] == "clone":
             Path(payload[-1]).mkdir()
@@ -361,6 +363,7 @@ def test_clone_reads_only_metadata_and_prerequisite_names(
         secret_names=frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}),
         variable_names=frozenset({"APP_ID"}),
         base_branch="main",
+        label_names=frozenset({"review:request"}),
     )
     clone = next(
         git_payload(args) for args, _ in calls if args[0] == "git" and "clone" in args
@@ -402,6 +405,17 @@ def test_clone_reads_only_metadata_and_prerequisite_names(
             "--json",
             "name",
         ],
+        [
+            "gh",
+            "label",
+            "list",
+            "-R",
+            "jhw7500/wlan-package",
+            "--json",
+            "name",
+            "--limit",
+            "300",
+        ],
     ]
 
 
@@ -423,7 +437,7 @@ def test_clone_branch_retains_repository_default_and_selected_base(
                     }
                 ),
             )
-        if args[:3] in (["gh", "secret", "list"], ["gh", "variable", "list"]):
+        if args[:3] in (["gh", "secret", "list"], ["gh", "variable", "list"], ["gh", "label", "list"]):
             return completed(args, "[]")
         payload = git_payload(args)
         if payload[0] == "clone":
@@ -1549,3 +1563,85 @@ def test_adapter_exposes_no_merge_revert_or_prerequisite_write_api() -> None:
         "refetch_default",
         "remote_branch_sha",
     }
+
+
+def test_clone_reads_label_names_with_the_prerequisite_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Labels are read like secret and variable names: names only, with a page limit."""
+
+    root = workspace(tmp_path)
+    label_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["gh", "repo", "view"]:
+            return completed(args, json.dumps({
+                "defaultBranchRef": {"name": "main"},
+                "url": "https://github.com/jhw7500/wlan-package",
+            }))
+        if args[:3] == ["gh", "secret", "list"]:
+            return completed(args, '[{"name":"CLAUDE_CODE_OAUTH_TOKEN"}]')
+        if args[:3] == ["gh", "variable", "list"]:
+            return completed(args, '[{"name":"APP_ID"}]')
+        if args[:3] == ["gh", "label", "list"]:
+            label_calls.append(args)
+            return completed(args, '[{"name":"review:request"},{"name":"bug"}]')
+        payload = git_payload(args)
+        if payload[0] == "clone":
+            Path(payload[-1]).mkdir()
+            (Path(payload[-1]) / ".git").mkdir()
+            return completed(args)
+        if payload in [
+            ["remote", "get-url", "--all", "origin"],
+            ["remote", "get-url", "--push", "--all", "origin"],
+        ]:
+            return completed(args, "https://github.com/jhw7500/wlan-package.git\n")
+        if payload == ["rev-parse", "HEAD"]:
+            return completed(args, f"{SHA}\n")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
+
+    result = workflow_fleet_git.clone_default_branch("jhw7500", "wlan-package", root)
+
+    assert result.label_names == frozenset({"review:request", "bug"})
+    assert label_calls == [[
+        "gh", "label", "list", "-R", "jhw7500/wlan-package", "--json", "name", "--limit", "300",
+    ]]
+
+
+def test_clone_fails_closed_when_the_label_page_is_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`gh label list` truncates newest-first, so a full page could hide the review labels."""
+
+    root = workspace(tmp_path)
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["gh", "repo", "view"]:
+            return completed(args, json.dumps({
+                "defaultBranchRef": {"name": "main"},
+                "url": "https://github.com/jhw7500/wlan-package",
+            }))
+        if args[:3] in (["gh", "secret", "list"], ["gh", "variable", "list"]):
+            return completed(args, "[]")
+        if args[:3] == ["gh", "label", "list"]:
+            return completed(args, json.dumps([{"name": f"label-{index}"} for index in range(300)]))
+        payload = git_payload(args)
+        if payload[0] == "clone":
+            Path(payload[-1]).mkdir()
+            (Path(payload[-1]) / ".git").mkdir()
+            return completed(args)
+        if payload in [
+            ["remote", "get-url", "--all", "origin"],
+            ["remote", "get-url", "--push", "--all", "origin"],
+        ]:
+            return completed(args, "https://github.com/jhw7500/wlan-package.git\n")
+        if payload == ["rev-parse", "HEAD"]:
+            return completed(args, f"{SHA}\n")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
+
+    with pytest.raises(workflow_fleet_git.FleetGitError, match="label inventory exceeds the page limit"):
+        workflow_fleet_git.clone_default_branch("jhw7500", "wlan-package", root)

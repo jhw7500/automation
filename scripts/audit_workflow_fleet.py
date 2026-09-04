@@ -64,6 +64,7 @@ def audit_repository(
     secret_names: set[str],
     variable_names: set[str],
     *,
+    label_names: set[str],
     observed_revision: str | None = None,
     base_branch: str = "",
 ) -> AuditResult:
@@ -79,6 +80,7 @@ def audit_repository(
             bundle.commit,
             secret_names,
             variable_names,
+            label_names=label_names,
             bootstrap=False,
             observed_revision=observed_revision,
         )
@@ -225,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
                                 profile,
                                 set(snapshot.secret_names),
                                 set(snapshot.variable_names),
+                                label_names=set(snapshot.label_names),
                                 observed_revision=base_sha,
                                 base_branch=selected_base,
                                 ),
