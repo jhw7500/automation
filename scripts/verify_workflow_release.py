@@ -51,6 +51,7 @@ from scripts.workflow_release_inventory import (
     release_supports_filter_reason_surface,
     release_supports_finding_dismissal,
     release_supports_label_review_trigger,
+    release_supports_skip_reason_notice,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
     validate_release_listing,
@@ -774,6 +775,11 @@ EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256 = {
 EXPECTED_FINDING_DISMISSAL_WORKFLOW_SHA256 = {
     "claude": "b32973a2434b7f3314c26d764f91715fc5f0770b5c26be6c2327212457f54ae2",
     "gemini": "3ea5ef5d0c3f05beadb4fbf6dcf605840286b603123a5dac918cec3bd92414fe",
+    "opencode": "4a173036252929de6320da7e04436d67b9a4759ed4b9f60b6bdf2b3a3ecc1d5a",
+}
+EXPECTED_SKIP_REASON_WORKFLOW_SHA256 = {
+    "claude": "4fe4bf0be84f3b155ec948d6628bf557babb6fff6bdc05ce2344d72c208a4a53",
+    "gemini": "c05f48186aefe8058fd26c4084f51202cc52649a3c97f853b85bae34335e1882",
     "opencode": "4a173036252929de6320da7e04436d67b9a4759ed4b9f60b6bdf2b3a3ecc1d5a",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
@@ -5878,7 +5884,9 @@ def _verify_review_invocation_budget(
         ),
     }
     workflow_digests = (
-        EXPECTED_FINDING_DISMISSAL_WORKFLOW_SHA256
+        EXPECTED_SKIP_REASON_WORKFLOW_SHA256
+        if release_supports_skip_reason_notice(ref)
+        else EXPECTED_FINDING_DISMISSAL_WORKFLOW_SHA256
         if dismissals
         else EXPECTED_FILTER_REASON_WORKFLOW_SHA256
         if release_supports_filter_reason_surface(ref)

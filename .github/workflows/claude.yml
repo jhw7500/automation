@@ -69,6 +69,12 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
+          # Off by default. This path takes the trigger comment as its prompt and
+          # pins no allowed-tools list, so full output is opt-in per repository:
+          # set the CLAUDE_DEBUG (or ACTIONS_STEP_DEBUG) variable to reproduce a
+          # failure. Without it a failed run reports only its duration.
+          show_full_output: ${{ vars.CLAUDE_DEBUG == 'true' || vars.ACTIONS_STEP_DEBUG == 'true' }}
+
           # This is an optional setting that allows Claude to read CI results on PRs
           additional_permissions: |
             actions: read

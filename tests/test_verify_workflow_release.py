@@ -29,6 +29,7 @@ from release_fixture_helpers import (
     restore_pre_force_review_callers,
     restore_pre_v151_review_policy,
     restore_pre_v164_label_trigger,
+    restore_pre_v165_skip_reason_notice,
     restore_v145_review_workflows,
 )
 
@@ -234,6 +235,7 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
     restore_pre_v163_finding_dismissal(repo)
     restore_pre_v151_review_policy(repo)
@@ -271,6 +273,7 @@ def v1462_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
     restore_pre_v163_finding_dismissal(repo)
     restore_v1462_workflow_fixtures(repo)
@@ -516,6 +519,7 @@ def copy_review_policy_release_files(repo: Path) -> None:
 
 def prepare_v151(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
     restore_pre_v163_finding_dismissal(repo)
     restore_pre_v162_filter_surface(repo)
@@ -527,6 +531,7 @@ def prepare_v151(repo: Path) -> str:
 
 def prepare_v159(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
     restore_pre_v163_finding_dismissal(repo)
     restore_pre_v162_filter_surface(repo)
@@ -538,6 +543,7 @@ def prepare_v159(repo: Path) -> str:
 
 def prepare_v160(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
@@ -1968,6 +1974,7 @@ def test_v159_opt_in_helper_is_rejected_on_the_v151_release_line(
 
 def prepare_v162(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
@@ -1982,6 +1989,7 @@ def prepare_v162(repo: Path) -> str:
 
 def prepare_v163(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
@@ -1995,6 +2003,7 @@ def prepare_v163(repo: Path) -> str:
 
 def prepare_v164(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v165_skip_reason_notice(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
@@ -2003,6 +2012,47 @@ def prepare_v164(repo: Path) -> str:
     ):
         shutil.copy2(ROOT / relative, repo / relative)
     return commit(repo, "v1.64 candidate")
+
+
+def prepare_v165(repo: Path) -> str:
+    copy_review_policy_release_files(repo)
+    for relative in (
+        ".github/actions/review-invocation-budget/action.yml",
+        ".github/actions/review-invocation-budget/review_invocation_budget.py",
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+    ):
+        shutil.copy2(ROOT / relative, repo / relative)
+    return commit(repo, "v1.65 candidate")
+
+
+def test_v165_accepts_current_skip_reason_release_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v165(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.65", candidate) == candidate
+
+
+def test_v165_skip_reason_notice_is_rejected_on_the_v164_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v165(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.64", candidate)
+
+
+def test_pre_v165_notices_are_rejected_on_the_v165_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v164(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.65", candidate)
 
 
 def test_v164_accepts_current_label_trigger_release_contract(
@@ -2094,6 +2144,7 @@ def test_pre_v162_filter_surface_is_rejected_on_the_v162_release_line(
 
 def prepare_v161(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",

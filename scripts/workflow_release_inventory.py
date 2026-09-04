@@ -153,6 +153,7 @@ SAME_HEAD_CANCEL_RELEASE = (1, 61)
 FILTER_REASON_SURFACE_RELEASE = (1, 62)
 FINDING_DISMISSAL_RELEASE = (1, 63)
 LABEL_REVIEW_TRIGGER_RELEASE = (1, 64)
+SKIP_REASON_NOTICE_RELEASE = (1, 65)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -219,6 +220,12 @@ def release_supports_label_review_trigger(ref: str) -> bool:
     """Return whether ``ref``'s managed callers start a review when `review:request` is added."""
 
     return _release_version(ref) >= LABEL_REVIEW_TRIGGER_RELEASE
+
+
+def release_supports_skip_reason_notice(ref: str) -> bool:
+    """Return whether ``ref``'s skipped notices name the reason the review declined."""
+
+    return _release_version(ref) >= SKIP_REASON_NOTICE_RELEASE
 
 
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:

@@ -97,6 +97,7 @@ def restore_pre_v164_label_trigger(repo: Path) -> None:
 def restore_pre_v151_review_policy_callers(repo: Path) -> None:
     """Remove only the v1.51 caller policy surface from historical fixtures."""
 
+    restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
     baseline_root = repo / "examples/baseline-workflows/.github/workflows"
     review_mode = (
@@ -629,3 +630,34 @@ def restore_v145_review_workflows(repo: Path) -> None:
     prepare = repo / ".github/actions/prepare-review-diff/action.yml"
     prepare.parent.mkdir(parents=True, exist_ok=True)
     prepare.write_bytes(V145_PREPARE_DIFF_FIXTURE.read_bytes())
+
+
+PRE_V165_SKIPPED_JOBS = {
+    'claude-code-review.yml': (
+        '  skipped:\n    name: Workflow Skipped\n    needs: check-enabled\n    if: needs.check-enabled.outputs.enabled != \'true\' || needs.check-enabled.outputs.policy_run != \'true\'\n    runs-on: ubuntu-latest\n    steps:\n      - name: Notice\n        # 이 잡은 두 가지 이유로 돌 수 있으므로 하나로 단정하지 않는다. enabled 는\n        # workflow-config.yml 이 끈 경우이고, policy_reason 은 리졸버가 내는 고정\n        # 어휘라 비신뢰 텍스트가 아니다. 정규식이 어휘 밖 값을 막고, 매핑에 없는\n        # 값은 사유를 그대로 보여 준다.\n        env:\n          WORKFLOW_ENABLED: ${{ needs.check-enabled.outputs.enabled }}\n          POLICY_REASON: ${{ needs.check-enabled.outputs.policy_reason }}\n        run: |\n          set -euo pipefail\n          [[ "$POLICY_REASON" =~ ^[a-z_]*$ ]]\n          if [[ "$WORKFLOW_ENABLED" != "true" ]]; then\n            detail="claude-code-review is disabled in .github/workflow-config.yml"\n          else\n            case "$POLICY_REASON" in\n              default_auto_false|workflow_auto_false|review_auto_false)\n                detail="automatic review is off for this repository; add the review:request label to run one" ;;\n              skip) detail="the review:skip label is present" ;;\n              draft) detail="the pull request is a draft" ;;\n              closed) detail="the pull request is not open" ;;\n              unsafe_pr) detail="the pull request head is not in this repository" ;;\n              workflow_disabled) detail="claude-code-review is disabled in .github/workflow-config.yml" ;;\n              "") detail="the review policy produced no reason; see the Check if enabled job" ;;\n              *) detail="the review policy declined with reason $POLICY_REASON" ;;\n            esac\n          fi\n          echo "::notice::Claude Code Review did not run because $detail"\n          {\n            printf \'## Workflow Skipped\\n\'\n            printf \'Claude Code Review did not run because %s.\\n\' "$detail"\n          } >> "$GITHUB_STEP_SUMMARY"\n',
+        '  skipped:\n    name: Workflow Skipped\n    needs: check-enabled\n    if: needs.check-enabled.outputs.enabled != \'true\' || needs.check-enabled.outputs.policy_run != \'true\'\n    runs-on: ubuntu-latest\n    steps:\n      - name: Notice\n        run: |\n          echo "::notice::Claude Code Review workflow is disabled in .github/workflow-config.yml"\n          echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY\n          echo "Claude Code Review is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY\n',
+    ),
+    'gemini-auto-review.yml': (
+        '  skipped:\n    permissions: {}\n    name: Workflow Skipped\n    needs: check-enabled\n    if: needs.check-enabled.outputs.enabled != \'true\' || needs.check-enabled.outputs.policy_run != \'true\'\n    runs-on: ubuntu-latest\n    steps:\n      - name: Notice\n        # 이 잡은 두 가지 이유로 돌 수 있으므로 하나로 단정하지 않는다. enabled 는\n        # workflow-config.yml 이 끈 경우이고, policy_reason 은 리졸버가 내는 고정\n        # 어휘라 비신뢰 텍스트가 아니다. 정규식이 어휘 밖 값을 막고, 매핑에 없는\n        # 값은 사유를 그대로 보여 준다.\n        env:\n          WORKFLOW_ENABLED: ${{ needs.check-enabled.outputs.enabled }}\n          POLICY_REASON: ${{ needs.check-enabled.outputs.policy_reason }}\n        run: |\n          set -euo pipefail\n          [[ "$POLICY_REASON" =~ ^[a-z_]*$ ]]\n          if [[ "$WORKFLOW_ENABLED" != "true" ]]; then\n            detail="gemini-auto-review is disabled in .github/workflow-config.yml"\n          else\n            case "$POLICY_REASON" in\n              default_auto_false|workflow_auto_false|review_auto_false)\n                detail="automatic review is off for this repository; add the review:request label to run one" ;;\n              skip) detail="the review:skip label is present" ;;\n              draft) detail="the pull request is a draft" ;;\n              closed) detail="the pull request is not open" ;;\n              unsafe_pr) detail="the pull request head is not in this repository" ;;\n              workflow_disabled) detail="gemini-auto-review is disabled in .github/workflow-config.yml" ;;\n              "") detail="the review policy produced no reason; see the Check if enabled job" ;;\n              *) detail="the review policy declined with reason $POLICY_REASON" ;;\n            esac\n          fi\n          echo "::notice::Gemini Auto PR Review did not run because $detail"\n          {\n            printf \'## Workflow Skipped\\n\'\n            printf \'Gemini Auto PR Review did not run because %s.\\n\' "$detail"\n          } >> "$GITHUB_STEP_SUMMARY"\n',
+        '  skipped:\n    permissions: {}\n    name: Workflow Skipped\n    needs: check-enabled\n    if: needs.check-enabled.outputs.enabled != \'true\' || needs.check-enabled.outputs.policy_run != \'true\'\n    runs-on: ubuntu-latest\n    steps:\n      - name: Notice\n        run: |\n          echo "::notice::Gemini Auto PR Review workflow is disabled in .github/workflow-config.yml"\n          echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY\n          echo "Gemini Auto PR Review is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY\n',
+    ),
+}
+
+
+def restore_pre_v165_skip_reason_notice(repo: Path) -> None:
+    """Restore the pre-v1.65 skipped notices in the two managed review workflows.
+
+    v1.65 makes the skipped job name the reason the review declined instead of
+    always blaming workflow-config.yml. This runs first (newest release first) so
+    the older restores still find the text they assert on.
+    """
+
+    # Idempotent: a tree that already restored (or never had) the v1.65 job is
+    # left alone, so this can also run first inside the older restore chains.
+    for workflow, (current, historical) in PRE_V165_SKIPPED_JOBS.items():
+        path = repo / ".github/workflows" / workflow
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        assert text.count(current) <= 1, workflow
+        path.write_text(text.replace(current, historical), encoding="utf-8")
