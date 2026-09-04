@@ -115,6 +115,34 @@ class ActionPinsTest(unittest.TestCase):
             references,
         )
 
+    def test_manual_claude_path_exposes_full_output_behind_a_repository_variable(
+        self,
+    ) -> None:
+        """The manual @claude path must be diagnosable without defaulting to on.
+
+        `claude.yml` receives the trigger comment as its prompt and pins no
+        allowed-tools list, so its output is not equivalent to the review path's.
+        Gate it on the repository debug variables this repository already uses,
+        so a failure can be reproduced on demand while staying off by default.
+        """
+
+        workflow = yaml.load(
+            (ROOT / ".github/workflows/claude.yml").read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+        steps = [
+            step
+            for job in workflow["jobs"].values()
+            for step in job.get("steps", [])
+            if str(step.get("uses", "")).startswith("anthropics/claude-code-action@")
+        ]
+        self.assertEqual(1, len(steps))
+        self.assertEqual(
+            "${{ vars.CLAUDE_DEBUG == 'true' "
+            "|| vars.ACTIONS_STEP_DEBUG == 'true' }}",
+            steps[0].get("with", {}).get("show_full_output"),
+        )
+
     def test_opencode_workflows_pin_cli_archive_and_cache_action(self) -> None:
         for filename, job_name, run_name in (
             ("opencode.yml", "opencode", "Run opencode"),
