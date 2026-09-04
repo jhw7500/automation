@@ -1,0 +1,17 @@
+name: Probe labeled payload
+on:
+  pull_request:
+    types: [labeled]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Show payload
+        env:
+          LABEL: ${{ github.event.label.name }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          ACTION: ${{ github.event.action }}
+          REQUESTED: ${{ contains(github.event.pull_request.labels.*.name, 'review:request') }}
+        run: |
+          echo "PROBE action=$ACTION label=$LABEL requested=$REQUESTED labels=$LABELS"
