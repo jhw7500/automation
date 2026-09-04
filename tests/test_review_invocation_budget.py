@@ -1141,3 +1141,26 @@ def test_recorded_override_survives_a_raised_round_budget(monkeypatch):
     monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "5")
 
     budget._validate_state_shape(state)
+
+
+# --- OpenCode cannot publish a dispatch round, so it must not spend one (issue #118) ---
+
+
+def override_event(event_id: int = 9101):
+    return budget.OverrideEvent(event_id, "labeled", "review-budget-override", "write")
+
+
+@pytest.mark.parametrize("reviewer", ("claude", "gemini"))
+def test_override_stays_available_for_the_publishing_reviewers(reviewer):
+    state = budget.LedgerState.initial(REPOSITORY, PR, reviewer)
+
+    assert budget.choose_override(state, (override_event(),)) is not None
+
+
+def test_override_is_refused_for_opencode():
+    """OpenCode's canonicalizer only accepts pull_request provenance, so a dispatch
+    round can never publish. Spending the override there loses the verdict."""
+
+    state = budget.LedgerState.initial(REPOSITORY, PR, "opencode")
+
+    assert budget.choose_override(state, (override_event(),)) is None

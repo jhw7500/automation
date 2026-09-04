@@ -32,6 +32,8 @@ outputs:
     value: ${{ steps.canonicalize.outputs.normalized_count }}
   filtered-max-severity:
     value: ${{ steps.canonicalize.outputs.filtered_max_severity }}
+  filtered-reasons:
+    value: ${{ steps.canonicalize.outputs.filtered_reasons }}
   failure-reason:
     value: ${{ steps.canonicalize.outputs.failure_reason }}
 runs:

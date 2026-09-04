@@ -1418,6 +1418,27 @@ jobs:
           previous-sha: ${{ steps.pr-details.outputs.previous_sha }}
           previous-review-file: ${{ steps.pr-details.outputs.previous_sha != '' && format('{0}/gemini-previous-review.md', runner.temp) || '' }}
 
+      # 필터된 finding 의 사유가 런 로그에만 남으면 왜 빠졌는지 확인하는 비용이 크다.
+      # 사유 코드는 정규화기 소유의 고정 어휘라 요약에 실어도 비신뢰 텍스트가 아니며,
+      # 아래 정규식이 그 어휘 밖의 값을 fail-closed 로 막는다.
+      - name: Summarize filtered Gemini findings
+        if: ${{ always() && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.filtered-count != '' && steps.canonicalize-review.outputs.filtered-count != '0' }}
+        shell: bash
+        env:
+          FILTERED_COUNT: ${{ steps.canonicalize-review.outputs.filtered-count }}
+          FILTERED_MAX_SEVERITY: ${{ steps.canonicalize-review.outputs.filtered-max-severity }}
+          FILTERED_REASONS: ${{ steps.canonicalize-review.outputs.filtered-reasons }}
+        run: |
+          set -euo pipefail
+          [[ "$FILTERED_COUNT" =~ ^[0-9]+$ ]]
+          [[ "$FILTERED_MAX_SEVERITY" =~ ^(none|MEDIUM|HIGH|CRITICAL)$ ]]
+          [[ "$FILTERED_REASONS" =~ ^[a-z_]+(,[a-z_]+)*$ ]]
+          {
+            printf '### Gemini filtered findings\n\n'
+            printf -- '- Filtered: `%s` (max severity `%s`)\n' "$FILTERED_COUNT" "$FILTERED_MAX_SEVERITY"
+            printf -- '- Reasons: `%s`\n' "$FILTERED_REASONS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # 거부된 후보의 원문이 없으면 프롬프트/포맷 회귀와 검증기 과잉을 구분할 수 없다.
       # 노출을 최소화하기 위해 거부된 라운드에서만, 진단과 같은 조건으로 보존한다.
       - name: Upload Gemini review candidate

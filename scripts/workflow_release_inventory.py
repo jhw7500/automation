@@ -150,6 +150,7 @@ REVIEW_POLICY_RELEASE = (1, 51)
 REVIEW_OPTIN_RELEASE = (1, 59)
 REVIEW_ROUNDS_VARIABLE_RELEASE = (1, 60)
 SAME_HEAD_CANCEL_RELEASE = (1, 61)
+FILTER_REASON_SURFACE_RELEASE = (1, 62)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -198,6 +199,12 @@ def release_supports_same_head_cancel_guard(ref: str) -> bool:
     """Return whether ``ref`` cancels a review only when a new commit supersedes it."""
 
     return _release_version(ref) >= SAME_HEAD_CANCEL_RELEASE
+
+
+def release_supports_filter_reason_surface(ref: str) -> bool:
+    """Return whether ``ref`` surfaces filtered-finding reasons and refuses OpenCode overrides."""
+
+    return _release_version(ref) >= FILTER_REASON_SURFACE_RELEASE
 
 
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:

@@ -17622,3 +17622,25 @@ def test_opencode_rejected_candidate_preservation_is_symlink_safe():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# --- filtered-finding reasons reach the run summary (issue #117) ---
+
+
+@pytest.mark.parametrize(
+    ("workflow", "job", "name"),
+    (
+        ("claude-code-review.yml", "claude-review", "Summarize filtered Claude findings"),
+        ("gemini-auto-review.yml", "gemini-review", "Summarize filtered Gemini findings"),
+    ),
+)
+def test_filtered_findings_reach_the_run_summary(workflow, job, name):
+    step = _step(_load(workflow), job, name)
+
+    assert step["env"]["FILTERED_REASONS"] == (
+        "${{ steps.canonicalize-review.outputs.filtered-reasons }}"
+    )
+    # A fixed canonicalizer vocabulary is the only thing allowed through.
+    assert '[[ "$FILTERED_REASONS" =~ ^[a-z_]+(,[a-z_]+)*$ ]]' in step["run"]
+    assert '>> "$GITHUB_STEP_SUMMARY"' in step["run"]
+    assert "filtered-count != '0'" in step["if"]

@@ -87,6 +87,9 @@ def test_canonicalize_review_composite_action_has_exact_safe_shell_contract() ->
                 "value": "${{ steps.canonicalize.outputs.filtered_max_severity }}"
             },
             "failure-reason": {"value": "${{ steps.canonicalize.outputs.failure_reason }}"},
+            "filtered-reasons": {
+                "value": "${{ steps.canonicalize.outputs.filtered_reasons }}"
+            },
         },
         "runs": {
             "using": "composite",

@@ -908,6 +908,11 @@ def _build_handoff(
 
 
 def choose_override(state: LedgerState, events: Sequence[OverrideEvent]) -> OverrideEvent | None:
+    # The OpenCode canonicalizer only accepts pull_request provenance, so a dispatch
+    # round can never publish. Refusing here keeps the override unspent instead of
+    # consuming it for a verdict that is then thrown away.
+    if state.reviewer == "opencode":
+        return None
     if any(item.override_event_id is not None for item in state.invocations):
         return None
     eligible: list[OverrideEvent] = []
