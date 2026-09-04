@@ -41,6 +41,14 @@ _FINDING = re.compile(r"RVW-[0-9a-f]{12}\Z")
 _CALLER_WORKFLOW = re.compile(r"\.github/workflows/[A-Za-z0-9_./-]+\.ya?ml\Z")
 _WORKFLOW_REF = re.compile(r"[^\x00-\x20\x7f]{1,256}\Z")
 _OUTCOMES = {"success", "provider_failure", "quality_filtered", "checkpoint_failure", "wall_time_exhausted"}
+# A collaborator dismisses one finding per comment with this exact grammar. Comment bodies
+# stay outside the trust boundary: nothing but the finding ID is read from them, and only
+# after the author's repository permission has been fetched from the collaborators API.
+_DISMISS_COMMAND = re.compile(r"dismiss (RVW-[0-9a-f]{12}) (\S[^\r\n]*)\Z")
+_DISMISS_PERMISSIONS = frozenset({"admin", "maintain", "write"})
+MAX_DISMISSED_FINDINGS = 16
+# Anyone who can comment can add a permission lookup, so the actor list is bounded too.
+MAX_PERMISSION_ACTORS = 16
 
 
 class BudgetStateError(ValueError):
@@ -159,6 +167,41 @@ class OverrideEvent:
     event: str
     label: str | None
     actor_permission: str | None
+
+
+@dataclass(frozen=True)
+class DismissEvent:
+    event_id: int
+    finding_id: str
+    actor_permission: str | None
+
+
+@dataclass(frozen=True)
+class DismissedFinding:
+    finding_id: str
+    comment_id: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {"comment_id": self.comment_id, "finding_id": self.finding_id}
+
+    @classmethod
+    def from_dict(cls, value: object) -> "DismissedFinding":
+        if not isinstance(value, dict) or set(value) != {"comment_id", "finding_id"}:
+            raise BudgetStateError("dismissed_findings_invalid")
+        finding_id = value["finding_id"]
+        comment_id = value["comment_id"]
+        if (not isinstance(finding_id, str) or _FINDING.fullmatch(finding_id) is None or
+                isinstance(comment_id, bool) or not isinstance(comment_id, int) or comment_id <= 0):
+            raise BudgetStateError("dismissed_findings_invalid")
+        return cls(finding_id, comment_id)
+
+
+def parse_dismiss_command(body: object) -> str | None:
+    """Return the finding ID named by an exact `dismiss RVW-<12 hex> <reason>` comment."""
+    if not isinstance(body, str):
+        return None
+    match = _DISMISS_COMMAND.fullmatch(body.rstrip())
+    return None if match is None else match.group(1)
 
 
 @dataclass(frozen=True)
@@ -443,6 +486,7 @@ class LedgerState:
     consumed_override_event_ids: tuple[int, ...] = ()
     last_decision: DecisionRecord = field(default_factory=DecisionRecord)
     handoff: Handoff = field(default_factory=Handoff)
+    dismissed_findings: tuple[DismissedFinding, ...] = ()
 
     @classmethod
     def initial(cls, repository: str, pr: int, reviewer: Reviewer, *, invocations: tuple[Invocation, ...] = (),
@@ -450,17 +494,28 @@ class LedgerState:
         return cls(repository, pr, reviewer, BudgetPolicy.for_reviewer(reviewer), invocations, consumed_override_event_ids)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "budgets": self.budgets.to_dict(), "consumed_override_event_ids": list(self.consumed_override_event_ids),
             "handoff": self.handoff.to_dict(), "invocations": [item.to_dict() for item in self.invocations],
             "last_decision": self.last_decision.to_dict(), "pr": self.pr, "repository": self.repository,
             "reviewer": self.reviewer, "schema": SCHEMA,
         }
+        # The key is written only when a dismissal exists, so a ledger without one keeps the
+        # exact pre-v1.63 bytes and every open pull request stays valid across the upgrade.
+        if self.dismissed_findings:
+            payload["dismissed_findings"] = [item.to_dict() for item in self.dismissed_findings]
+        return payload
 
     @classmethod
     def from_dict(cls, value: object) -> "LedgerState":
         keys = {"schema", "repository", "pr", "reviewer", "budgets", "invocations", "consumed_override_event_ids", "last_decision", "handoff"}
-        value = _exact_keys(value, keys, "ledger")
+        if not isinstance(value, dict) or not keys <= set(value) <= keys | {"dismissed_findings"}:
+            raise BudgetStateError("ledger_invalid")
+        dismissed: list[object] = []
+        if "dismissed_findings" in value:
+            dismissed = value["dismissed_findings"]
+            if not isinstance(dismissed, list) or not dismissed:
+                raise BudgetStateError("dismissed_findings_invalid")
         if _integer(value["schema"], "schema", positive=True) != SCHEMA:
             raise BudgetStateError("schema_invalid")
         reviewer = _string(value["reviewer"], "reviewer")
@@ -476,6 +531,7 @@ class LedgerState:
             invocations=tuple(Invocation.from_dict(item) for item in invocations),
             consumed_override_event_ids=tuple(_integer(item, "consumed_override_event_id", positive=True) for item in consumed),
             last_decision=DecisionRecord.from_dict(value["last_decision"]), handoff=Handoff.from_dict(value["handoff"]),
+            dismissed_findings=tuple(DismissedFinding.from_dict(item) for item in dismissed),
         )
         _validate_state_shape(state)
         return state
@@ -498,6 +554,7 @@ class ClaimRequest:
     effort: str
     call_unit: str
     force_review: bool = False
+    dismiss_events: tuple[DismissEvent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -517,6 +574,7 @@ class FinalizeRequest:
     stop_reason: str
     authenticated_review: AuthenticatedReview
     remaining_finding_ids: tuple[str, ...]
+    dismiss_events: tuple[DismissEvent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -622,6 +680,7 @@ def _validate_state_shape(state: LedgerState) -> None:
         total_limit += state.budgets.max_estimated_tokens_per_round
     if sum(item.estimated_input_tokens for item in state.invocations) > total_limit:
         raise BudgetStateError("total_usage_budget_exhausted")
+    _validate_dismissed_findings(state.dismissed_findings)
     DecisionRecord.from_dict(state.last_decision.to_dict())
     handoff = Handoff.from_dict(state.handoff.to_dict())
     if handoff.repository is not None:
@@ -658,6 +717,69 @@ def _validate_state_shape(state: LedgerState) -> None:
             handoff.outcome != expected_outcome
         ):
             raise BudgetStateError("handoff_mismatch")
+        if set(handoff.remaining_finding_ids) & _dismissed_ids(state):
+            raise BudgetStateError("handoff_mismatch")
+
+
+def _dismissed_ids(state: LedgerState) -> frozenset[str]:
+    return frozenset(item.finding_id for item in state.dismissed_findings)
+
+
+def _validate_dismissed_findings(entries: object) -> None:
+    if (not isinstance(entries, tuple) or len(entries) > MAX_DISMISSED_FINDINGS or
+            not all(isinstance(item, DismissedFinding) for item in entries)):
+        raise BudgetStateError("dismissed_findings_invalid")
+    for item in entries:
+        DismissedFinding.from_dict(item.to_dict())
+    finding_ids = [item.finding_id for item in entries]
+    comment_ids = [item.comment_id for item in entries]
+    if finding_ids != sorted(set(finding_ids)) or len(comment_ids) != len(set(comment_ids)):
+        raise BudgetStateError("dismissed_findings_invalid")
+
+
+def _validate_dismiss_events(events: object) -> None:
+    if not isinstance(events, tuple):
+        raise BudgetStateError("dismiss_events_invalid")
+    for event in events:
+        if (not isinstance(event, DismissEvent) or isinstance(event.event_id, bool) or
+                not isinstance(event.event_id, int) or event.event_id <= 0 or
+                not isinstance(event.finding_id, str) or _FINDING.fullmatch(event.finding_id) is None or
+                (event.actor_permission is not None and not isinstance(event.actor_permission, str))):
+            raise BudgetStateError("dismiss_events_invalid")
+
+
+def choose_dismissals(
+        state: LedgerState, events: Sequence[DismissEvent]) -> tuple[DismissedFinding, ...]:
+    """Bind each dismissed finding to the earliest authorizing comment, bounded and sorted."""
+    _validate_dismiss_events(tuple(events))
+    # OpenCode assigns no RVW- IDs, so a dismissal can never name one of its findings;
+    # recording one would advertise a path that nothing downstream consumes.
+    if state.reviewer == "opencode":
+        return ()
+    earliest: dict[str, int] = {}
+    for event in events:
+        if event.actor_permission not in _DISMISS_PERMISSIONS:
+            continue
+        if event.finding_id not in earliest or event.event_id < earliest[event.finding_id]:
+            earliest[event.finding_id] = event.event_id
+    chosen = tuple(DismissedFinding(finding_id, earliest[finding_id]) for finding_id in sorted(earliest))
+    _validate_dismissed_findings(chosen)
+    return chosen
+
+
+def _apply_dismissals(state: LedgerState, events: Sequence[DismissEvent]) -> LedgerState:
+    """Replace the recorded snapshot: a deleted dismissal comment revokes its dismissal.
+
+    The recorded handoff drops the newly dismissed IDs at the same time, so a refusal that
+    keeps this state without rebuilding the handoff still satisfies the ledger invariant.
+    """
+    updated = replace(state, dismissed_findings=choose_dismissals(state, events))
+    if updated.handoff.repository is None:
+        return updated
+    return replace(updated, handoff=replace(
+        updated.handoff,
+        remaining_finding_ids=_without_dismissed(updated, updated.handoff.remaining_finding_ids),
+    ))
 
 
 def serialize_ledger(state: LedgerState) -> str:
@@ -733,6 +855,7 @@ def _validate_request(request: ClaimRequest) -> None:
                 not isinstance(event.event, str) or (event.label is not None and not isinstance(event.label, str)) or
                 (event.actor_permission is not None and not isinstance(event.actor_permission, str))):
             raise BudgetStateError("override_events_invalid")
+    _validate_dismiss_events(request.dismiss_events)
     if not isinstance(request.model_route, tuple) or not request.model_route or not all(isinstance(item, str) and item for item in request.model_route):
         raise BudgetStateError("model_route_invalid")
     _string(request.effort, "effort")
@@ -890,6 +1013,7 @@ def _build_handoff(
             remaining_finding_ids = review.remaining_finding_ids
         else:
             remaining_finding_ids = prior.remaining_finding_ids
+    remaining_finding_ids = _without_dismissed(state, remaining_finding_ids)
     return Handoff(
         repository=state.repository, pr=state.pr, reviewer=state.reviewer,
         current_head_sha=request.head_sha, current_full_diff_sha256=request.full_diff_sha256,
@@ -905,6 +1029,11 @@ def _build_handoff(
         authenticated_review_full_diff_sha256=authenticated_hash,
         remaining_finding_ids=remaining_finding_ids,
     )
+
+
+def _without_dismissed(state: LedgerState, finding_ids: Sequence[str]) -> tuple[str, ...]:
+    dismissed = _dismissed_ids(state)
+    return tuple(item for item in finding_ids if item not in dismissed)
 
 
 def choose_override(state: LedgerState, events: Sequence[OverrideEvent]) -> OverrideEvent | None:
@@ -986,6 +1115,7 @@ def claim(state: LedgerState | None, request: ClaimRequest,
           provenances: Mapping[tuple[int, int], RunProvenance]) -> Transition:
     try:
         validated = validate_or_initialize(state, request, provenances)
+        validated = _apply_dismissals(validated, request.dismiss_events)
     except BudgetStateError as exc:
         return _invalid_transition(state, request, str(exc))
     same_run = [item for item in validated.invocations if (item.run_id, item.run_attempt) == (request.run_id, request.run_attempt)]
@@ -1069,6 +1199,7 @@ def _validate_finalize_request(request: FinalizeRequest) -> None:
     if (not isinstance(findings, tuple) or len(findings) > 8 or len(findings) != len(set(findings)) or
             not all(isinstance(item, str) and _FINDING.fullmatch(item) for item in findings)):
         raise BudgetStateError("remaining_finding_ids_invalid")
+    _validate_dismiss_events(request.dismiss_events)
 
 
 def _finalize_remaining_ids(state: LedgerState, request: FinalizeRequest) -> tuple[str, ...]:
@@ -1100,6 +1231,7 @@ def finalize(
                 request.repository, request.pr, request.reviewer):
             raise BudgetStateError("identity_mismatch")
         _validate_provenance(state, request, provenances)
+        state = _apply_dismissals(state, request.dismiss_events)
     except BudgetStateError as exc:
         return _finalization_refusal(state, request, str(exc))
 
@@ -1128,7 +1260,7 @@ def finalize(
         outcome, stop_reason = "checkpoint_failure", "call_budget_exhausted"
     elif request.elapsed_seconds > state.budgets.max_wall_seconds_per_round:
         outcome, stop_reason = "wall_time_exhausted", "wall_time_exhausted"
-    remaining = _finalize_remaining_ids(state, request)
+    remaining = _without_dismissed(state, _finalize_remaining_ids(state, request))
     completed = replace(
         entry, status="finalized", outcome=outcome, stop_reason=stop_reason,
         call_count=request.call_count, elapsed_seconds=request.elapsed_seconds,
@@ -1163,16 +1295,31 @@ def _summary(state: LedgerState, *, server_url: str) -> str:
         raise BudgetStateError("handoff_missing")
     if not isinstance(server_url, str) or not server_url or "\n" in server_url or "\r" in server_url:
         raise BudgetStateError("server_url_invalid")
-    run_url = f"{server_url.rstrip('/')}/{state.repository}/actions/runs/{handoff.current_run_id}"
+    base_url = server_url.rstrip('/')
+    run_url = f"{base_url}/{state.repository}/actions/runs/{handoff.current_run_id}"
+    dismissed_line = ""
+    dismissal_guidance = ""
+    if state.reviewer != "opencode":
+        dismissed = ", ".join(
+            f"[{item.finding_id}]({base_url}/{state.repository}/pull/{state.pr}#issuecomment-{item.comment_id})"
+            for item in state.dismissed_findings
+        ) or "none"
+        dismissed_line = f"- Dismissed findings: {dismissed}\n"
+        dismissal_guidance = (
+            " A collaborator with write permission can dismiss a false positive by commenting "
+            "`dismiss RVW-<12 hex> <reason>` on this pull request; the dismissal takes effect on "
+            "the next review run and is revoked by deleting that comment."
+        )
     return (
         f"## {_REVIEWER_TITLES[state.reviewer]} review invocation budget\n"
         f"- Decision: {handoff.decision}\n"
         f"- Automatic rounds: {handoff.automatic_rounds}/{state.budgets.max_rounds}\n"
         f"- Override rounds: {handoff.override_rounds}/{state.budgets.max_override_rounds}\n"
         f"- Current run: {run_url}\n"
-        f"- Stop reason: {handoff.stop_reason}\n\n"
+        f"- Stop reason: {handoff.stop_reason}\n"
+        f"{dismissed_line}\n"
         "Budget exhaustion is not review approval. Use the authenticated review checkpoint and "
-        "remaining finding IDs before merge."
+        f"remaining finding IDs before merge.{dismissal_guidance}"
     )
 
 
@@ -1393,7 +1540,8 @@ def _remaining_findings(request: Mapping[str, object]) -> tuple[str, ...]:
 
 def _base_claim_request(
         request: Mapping[str, object], *, estimated_input_tokens: int = 0,
-        override_events: tuple[OverrideEvent, ...] = ()) -> ClaimRequest:
+        override_events: tuple[OverrideEvent, ...] = (),
+        dismiss_events: tuple[DismissEvent, ...] = ()) -> ClaimRequest:
     return ClaimRequest(
         repository=request["repository"], pr=request["pr"], reviewer=request["reviewer"],
         run_id=request["run_id"], run_attempt=request["run_attempt"],
@@ -1404,10 +1552,13 @@ def _base_claim_request(
         model_route=_model_route(request), effort=request["effort"],
         call_unit=_CALL_UNITS[request["reviewer"]],
         force_review=request["force_review"],
+        dismiss_events=dismiss_events,
     )
 
 
-def _finalize_request(request: Mapping[str, object]) -> FinalizeRequest:
+def _finalize_request(
+        request: Mapping[str, object], *, dismiss_events: tuple[DismissEvent, ...] = (),
+) -> FinalizeRequest:
     outcome = request["outcome"]
     stop_reason = request["stop_reason"] or outcome
     return FinalizeRequest(
@@ -1420,6 +1571,7 @@ def _finalize_request(request: Mapping[str, object]) -> FinalizeRequest:
         outcome=outcome, stop_reason=stop_reason,
         authenticated_review=_authenticated_review(request),
         remaining_finding_ids=_remaining_findings(request),
+        dismiss_events=dismiss_events,
     )
 
 
@@ -1499,6 +1651,7 @@ def _write_diagnostic(
         "mutate-comment": False,
         "mutation": "none",
         "round": "",
+        "dismissed-finding-ids": "",
     }
     write_private(output_directory / "checkpoint.json", checkpoint)
     write_private(output_directory / "summary.md", summary)
@@ -1566,30 +1719,60 @@ def _ledger_comment(
     return state, comment
 
 
+def _is_override_label(item: Mapping[str, object]) -> bool:
+    label = item.get("label")
+    return (item.get("event") == "labeled" and isinstance(label, dict) and
+            label.get("name") == "review-budget-override")
+
+
+def _dismissed_finding_id(item: Mapping[str, object]) -> str | None:
+    if item.get("event") != "commented":
+        return None
+    return parse_dismiss_command(item.get("body"))
+
+
+def _timeline_actor_login(item: Mapping[str, object], reason: str) -> str:
+    actor = item.get("actor")
+    login = actor.get("login") if isinstance(actor, dict) else None
+    if not isinstance(login, str) or not login:
+        raise TransportError(reason)
+    return login
+
+
 def _timeline_permission_actors(output_directory: Path) -> list[dict[str, object]]:
+    """Name every actor whose repository permission must be fetched before a decision.
+
+    Override labels and dismissal comments share one permission lookup, so a comment
+    author is only ever trusted through the same collaborators API as a label actor.
+    """
     actors: list[dict[str, object]] = []
     seen: set[str] = set()
     for item in _read_pages(output_directory / "timeline.json", "timeline"):
-        if not isinstance(item, dict) or item.get("event") != "labeled":
+        if not isinstance(item, dict):
             continue
-        label = item.get("label")
-        if not isinstance(label, dict) or label.get("name") != "review-budget-override":
+        if _is_override_label(item):
+            login = _timeline_actor_login(item, "override_actor_invalid")
+        elif _dismissed_finding_id(item) is not None:
+            login = _timeline_actor_login(item, "dismiss_actor_invalid")
+        else:
             continue
-        actor = item.get("actor")
-        login = actor.get("login") if isinstance(actor, dict) else None
-        if not isinstance(login, str) or not login:
-            raise TransportError("override_actor_invalid")
         if login in seen:
             continue
+        if len(seen) >= MAX_PERMISSION_ACTORS:
+            raise TransportError("permission_actors_exceeded")
         seen.add(login)
         actors.append({"index": len(actors), "login": login, "encoded_login": quote(login, safe="")})
     return actors
 
 
-def _override_events(output_directory: Path) -> tuple[OverrideEvent, ...]:
+def _actor_permissions(output_directory: Path) -> dict[str, str]:
     manifest = _read_json(output_directory / "run-identities.json", "run_identities")
     if not isinstance(manifest, dict) or not isinstance(manifest.get("permission_actors"), list):
         raise TransportError("run_identities_invalid")
+    # An actor collection that failed closed left no permissions to bind; surface its own
+    # reason instead of the misleading "unknown actor" that would follow.
+    if isinstance(manifest.get("error"), str) and manifest["error"]:
+        raise TransportError(manifest["error"])
     permissions: dict[str, str] = {}
     for actor in manifest["permission_actors"]:
         actor = _exact_keys(actor, {"index", "login", "encoded_login"}, "permission_actor")
@@ -1603,21 +1786,46 @@ def _override_events(output_directory: Path) -> tuple[OverrideEvent, ...]:
                 "admin", "maintain", "write", "triage", "read", "none"}:
             raise TransportError("permission_invalid")
         permissions[actor["login"]] = payload["permission"]
+    return permissions
+
+
+def _timeline_event_id(item: Mapping[str, object], reason: str) -> int:
+    event_id = item.get("id")
+    if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id <= 0:
+        raise TransportError(reason)
+    return event_id
+
+
+def _override_events(output_directory: Path) -> tuple[OverrideEvent, ...]:
+    permissions = _actor_permissions(output_directory)
     events: list[OverrideEvent] = []
     for item in _read_pages(output_directory / "timeline.json", "timeline"):
-        if not isinstance(item, dict) or item.get("event") != "labeled":
-            continue
-        label = item.get("label")
-        if not isinstance(label, dict) or label.get("name") != "review-budget-override":
+        if not isinstance(item, dict) or not _is_override_label(item):
             continue
         actor = item.get("actor")
         login = actor.get("login") if isinstance(actor, dict) else None
-        event_id = item.get("id")
-        if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id <= 0:
-            raise TransportError("override_event_invalid")
+        event_id = _timeline_event_id(item, "override_event_invalid")
         if not isinstance(login, str) or login not in permissions:
             raise TransportError("override_actor_invalid")
         events.append(OverrideEvent(event_id, "labeled", "review-budget-override", permissions[login]))
+    return tuple(events)
+
+
+def _dismiss_events(output_directory: Path) -> tuple[DismissEvent, ...]:
+    permissions = _actor_permissions(output_directory)
+    events: list[DismissEvent] = []
+    for item in _read_pages(output_directory / "timeline.json", "timeline"):
+        if not isinstance(item, dict):
+            continue
+        finding_id = _dismissed_finding_id(item)
+        if finding_id is None:
+            continue
+        actor = item.get("actor")
+        login = actor.get("login") if isinstance(actor, dict) else None
+        event_id = _timeline_event_id(item, "dismiss_event_invalid")
+        if not isinstance(login, str) or login not in permissions:
+            raise TransportError("dismiss_actor_invalid")
+        events.append(DismissEvent(event_id, finding_id, permissions[login]))
     return tuple(events)
 
 
@@ -1768,6 +1976,9 @@ def _write_transition(
         "prior-comment-id": comment_id,
         "prior-comment-body": None if prior_comment is None else prior_comment["body"],
         "marker": MARKERS[request["reviewer"]],
+        "dismissed-finding-ids": ",".join(
+            item.finding_id for item in transition.state.dismissed_findings
+        ),
     }
     write_private(output_directory / "state.json", _json_bytes(transition.state.to_dict()))
     write_private(
@@ -1845,9 +2056,12 @@ def _run_transition(
         _verify_pr(request, output_directory)
         state, comment = _ledger_comment(comments_file, request)
         provenances = _run_provenances(state, request, output_directory)
+        dismissals = _dismiss_events(output_directory)
         if request["operation"] == "claim":
             events = _override_events(output_directory)
-            preliminary_request = _base_claim_request(request, override_events=events)
+            preliminary_request = _base_claim_request(
+                request, override_events=events, dismiss_events=dismissals,
+            )
             preliminary = claim(state, preliminary_request, provenances)
             if preliminary.decision in {
                     "claimed", "round_budget_exhausted", "total_usage_budget_exhausted"}:
@@ -1860,6 +2074,7 @@ def _run_transition(
         else:
             if state is None:
                 raise TransportError("ledger_missing")
+            request_object = _finalize_request(request, dismiss_events=dismissals)
             transition = finalize(state, request_object, provenances)
         if transition.state.handoff.repository is None:
             transition = _recorded_refusal(state, request_object, transition.stop_reason)

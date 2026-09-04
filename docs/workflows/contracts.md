@@ -500,6 +500,17 @@ The model never assigns authoritative IDs. For each accepted new finding the wor
 reviewer, changed path, changed line, severity, and whitespace-normalized, case-folded title. That
 derivation makes later carryover bindings reproducible while keeping them under workflow ownership.
 
+From `v1.63` the canonicalizer also receives the finding IDs a collaborator dismissed through the
+review invocation budget (see [Dismissing a finding](#dismissing-a-finding)). A dismissed ID
+leaves the authenticated active set before binding: a `Still open`, `Resolved`, or `Retracted`
+block naming it is normalized with `dismissed_prior_id`, and a new finding whose derived ID is
+dismissed — the model repeating the same claim verbatim — is normalized the same way instead of
+re-entering the document. The finding therefore disappears from the canonical Markdown, from
+`accepted-count`, and from the remaining finding IDs for as long as the dismissal stands. The
+audit trail is the budget ledger, not the review document. OpenCode derives no `RVW-` IDs — its
+canonicalizer binds carryover by exact heading text — so a dismissal cannot name an OpenCode
+finding until that reviewer assigns IDs.
+
 ### Hard checkpoints and soft finding filters
 
 The canonicalizer fails the whole document for exactly these hard reasons: `candidate_missing`,
@@ -549,7 +560,8 @@ Once the document boundary and trusted scope are valid, a bad individual block d
 valid siblings. It is filtered or normalized with exactly one of `invalid_anchor`,
 `invalid_trigger_evidence`, `invalid_severity`, `invalid_impact_class`,
 `missing_material_impact`, `unsupported_performance_basis`, `non_actionable_category`,
-`unknown_prior_id`, `duplicate_prior_binding`, or `missing_fix_anchor`. Rejected prose is absent
+`unknown_prior_id`, `duplicate_prior_binding`, `missing_fix_anchor`, or (from `v1.63`)
+`dismissed_prior_id`. Rejected prose is absent
 from canonical Markdown, result JSON, workflow state, and the PR comment; only bounded counts,
 claimed maximum severity, and fixed reason codes are observable. From `v1.62` the Claude and
 Gemini workflows write those reason codes to the run summary whenever `filtered-count` is not zero,
@@ -988,6 +1000,59 @@ handoff and validates them before model execution and canonical finalization.
 Budget exhaustion is not approval: the ledger cannot publish findings, report CLEAN,
 or authorize merge. `/jhw:ship` polls existing review comments and CI signals
 deterministically and does not parse this budget ledger as review evidence.
+
+### Dismissing a finding
+
+From `v1.63` a collaborator can retire a false-positive finding without spending a round and
+without a model retraction. The trust path is the one the override label already uses: the
+budget action reads the PR timeline, uses the fixed grammar below only to decide whose
+repository permission to fetch through the collaborators API, and lets a comment count only
+after that permission has been verified. At most sixteen distinct label or comment actors are
+looked up per timeline; more fails closed with `permission_actors_exceeded`, because anyone who
+can comment can add an actor. GitHub serializes a `commented` timeline event with both `actor`
+and `user` naming the comment author; the action reads `actor`, the same field the label path
+already trusts.
+
+A dismissal is one issue comment on the pull request whose whole body is exactly
+
+```text
+dismiss RVW-<12 lowercase hex> <reason>
+```
+
+— the word `dismiss`, one space, the finding ID as printed in the review comment, one space, and
+a non-empty single-line reason. Trailing whitespace is ignored; any other leading text, casing,
+spacing, or a second line makes the comment inert. The reason is for human readers and is never
+copied into the ledger or the bot comment: the ledger records only the finding ID and the comment
+ID, and the summary links to the comment, so the audit trail lives in the collaborator's own
+words on the pull request.
+
+Only comments whose author holds `write`, `maintain`, or `admin` permission count. Each `claim`
+and `finalize` replaces the ledger's dismissal snapshot with the current timeline, binding every
+dismissed ID to its earliest authorizing comment, sorted by ID and bounded at sixteen entries.
+More than sixteen distinct dismissed IDs fails the whole round closed with
+`dismissed_findings_invalid` and records no snapshot at all, so every dismissal on that pull
+request stops applying until enough comments are deleted; the bound is twice the eight-ID
+remaining-finding cap and is not expected to be reached in normal use. Deleting a comment
+revokes its dismissal on the next run; editing it re-targets it. A refused claim — including
+`round_budget_exhausted` after every round is spent — still records the snapshot and rewrites the
+ledger comment, so a dismissal takes effect without a new model round. The OpenCode ledger
+ignores dismissal comments entirely and keeps the pre-`v1.63` summary text, because that
+reviewer assigns no `RVW-` IDs for a dismissal to name.
+
+The ledger key `dismissed_findings` is written only when at least one dismissal exists; a ledger
+without one keeps its exact pre-`v1.63` bytes, so every open pull request stays valid across the
+upgrade. A dismissed ID is never listed in the handoff's `remaining_finding_ids`, and a round
+finalized after the dismissal records its remaining IDs without it; a ledger whose handoff
+violates this fails closed with `handoff_mismatch`. Rounds finalized before the dismissal keep
+their historical lists. The action exposes the snapshot as the comma-separated `dismissed-finding-ids` output, which the
+Claude and Gemini workflows hand to the shared canonicalizer so the next round cannot carry the
+finding over or re-emit it (see [Candidate and carryover grammar](#candidate-and-carryover-grammar)).
+The bot comment lists each dismissal as `- Dismissed findings:` with a link to the comment and
+documents the grammar in its closing guidance.
+
+A dismissal is not approval either: it removes one finding from the active set and nothing else.
+The known limit is that finding IDs derive from the anchor line and title, so a reworded or
+re-anchored repeat of the same claim receives a new ID and must be dismissed again.
 
 ## Adoption and recovery
 

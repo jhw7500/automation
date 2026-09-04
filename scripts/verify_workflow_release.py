@@ -49,6 +49,7 @@ from scripts.workflow_release_inventory import (
     release_supports_review_optin,
     release_supports_review_rounds_variable,
     release_supports_filter_reason_surface,
+    release_supports_finding_dismissal,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
     validate_release_listing,
@@ -488,6 +489,27 @@ def _canonicalize_action_with_filter_reasons(action: dict) -> dict:
 EXPECTED_CANONICALIZE_REVIEW_ACTION_V162 = _canonicalize_action_with_filter_reasons(
     EXPECTED_CANONICALIZE_REVIEW_ACTION
 )
+
+
+def _canonicalize_action_with_dismissals(action: dict) -> dict:
+    """Derive the v1.63 canonicalizer action: one optional input bridged to one flag."""
+
+    updated = deepcopy(action)
+    updated["inputs"]["dismissed-finding-ids"] = {"required": "false", "default": ""}
+    step = updated["runs"]["steps"][0]
+    step["env"]["DISMISSED_FINDING_IDS"] = "${{ inputs.dismissed-finding-ids }}"
+    anchor = '--repository-root "$GITHUB_WORKSPACE" '
+    if step["run"].count(anchor) != 1:
+        raise ValueError("canonicalize action run block differs")
+    step["run"] = step["run"].replace(
+        anchor, '--dismissed-finding-ids "$DISMISSED_FINDING_IDS" ' + anchor
+    )
+    return updated
+
+
+EXPECTED_CANONICALIZE_REVIEW_ACTION_V163 = _canonicalize_action_with_dismissals(
+    EXPECTED_CANONICALIZE_REVIEW_ACTION_V162
+)
 EXPECTED_CANONICALIZER_HARD_REASONS = frozenset(
     {
         "candidate_missing",
@@ -512,11 +534,18 @@ EXPECTED_CANONICALIZER_SOFT_REASONS = frozenset(
         "missing_fix_anchor",
     }
 )
+# v1.63 normalizes a carryover or re-emission of a finding a collaborator dismissed.
+EXPECTED_CANONICALIZER_SOFT_REASONS_V163 = EXPECTED_CANONICALIZER_SOFT_REASONS | {
+    "dismissed_prior_id",
+}
 EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256 = (
     "eb4ba827d3b03e3c9169cd95e9194d49b2b8b9b6956e7317b5c9cc9b7bb04fc5"
 )
 EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V162 = (
     "d814b42568e38a2f46f1772d00a5a713a467bba067d8865cf4f7657a38ac0739"
+)
+EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163 = (
+    "36a2a9301e60f806c4ee32441a0bb98fccad091d96dfb63b6ca25773d3a28b3e"
 )
 EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
     "68779c9038c31aa09a846b643bc0178b147798527e1a34ee5821ab539f10b19a"
@@ -576,6 +605,13 @@ EXPECTED_CANONICALIZER_RECORDS = {
         ("failure_reason", "str"),
         ("candidate_reasons", "tuple[CandidateReason, ...]"),
         ("candidate_validations", "tuple[CandidateValidation, ...]"),
+    ),
+}
+# v1.63 hands the canonicalizer the finding IDs a collaborator dismissed.
+EXPECTED_CANONICALIZER_RECORDS_V163 = {
+    **EXPECTED_CANONICALIZER_RECORDS,
+    "CanonicalizationRequest": EXPECTED_CANONICALIZER_RECORDS["CanonicalizationRequest"] + (
+        ("dismissed_finding_ids", "frozenset[str]"),
     ),
 }
 EXPECTED_SCOPE_RECORDS = {
@@ -686,6 +722,9 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256 = (
 EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256_V160 = (
     "d9cb26a5c340abd20707483f05f4e071b436dac17a900f670aacbd05140b981e"
 )
+EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256_V163 = (
+    "b9ebc50e0959d9a2db82b1b11715be81309581ac45bb29b6dab02dccacedb91c"
+)
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
     "43f15d59df0f529e2fa4f06488e49dc5ff78280762ee8d7248dbecb45cbb609d"
 )
@@ -694,6 +733,9 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V160 = (
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V162 = (
     "deda9f65bbe853860fa06599ce303b15cd63b15b5dad645896c8c76aae7e9b03"
+)
+EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V163 = (
+    "2123326a018589644cd9f5e1e49bdb33eaca8096272bd8396583da2f0f9518b7"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d4db53b86603a3a113999409e2e4e35c397adf276981e7f68c0ea57a6198faa2",
@@ -724,6 +766,13 @@ EXPECTED_FILTER_REASON_WORKFLOW_SHA256 = {
 EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256 = {
     "claude": "b3b7d95cb8e87164470759f4c918f8c317e37a10d2c214ec915ac4a51963f04e",
     "gemini": "3271f4f7dd4d13711b91d65ac191451703ead424fcb67299ff504b8a26b32e0f",
+    "opencode": "4a173036252929de6320da7e04436d67b9a4759ed4b9f60b6bdf2b3a3ecc1d5a",
+}
+# v1.63 hands the budget action's dismissed finding IDs to the shared canonicalizer in
+# the Claude and Gemini workflows; OpenCode derives no finding IDs and is unchanged.
+EXPECTED_FINDING_DISMISSAL_WORKFLOW_SHA256 = {
+    "claude": "b32973a2434b7f3314c26d764f91715fc5f0770b5c26be6c2327212457f54ae2",
+    "gemini": "3ea5ef5d0c3f05beadb4fbf6dcf605840286b603123a5dac918cec3bd92414fe",
     "opencode": "4a173036252929de6320da7e04436d67b9a4759ed4b9f60b6bdf2b3a3ecc1d5a",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
@@ -1200,6 +1249,39 @@ def _budget_action_with_round_variable(action: dict) -> dict:
 
 EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V160 = _budget_action_with_round_variable(
     EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION
+)
+
+
+def _budget_action_with_dismissals(action: dict) -> dict:
+    """Derive the v1.63 budget action: one output naming the dismissed finding IDs.
+
+    The publisher inside the run block gains the matching value and its closed pattern;
+    every other byte of the action is the v1.60 document.
+    """
+
+    updated = deepcopy(action)
+    updated["outputs"]["dismissed-finding-ids"] = {
+        "value": "${{ steps.budget.outputs.dismissed-finding-ids }}"
+    }
+    step = updated["runs"]["steps"][0]
+    for anchor, addition in (
+        (
+            '    "comment-id": comment_id,\n}\n',
+            '    "dismissed-finding-ids": output["dismissed-finding-ids"],\n',
+        ),
+        (
+            '    "comment-id": r"[0-9]*",\n}\n',
+            '    "dismissed-finding-ids": r"(?:RVW-[0-9a-f]{12}(?:,RVW-[0-9a-f]{12})*)?",\n',
+        ),
+    ):
+        if step["run"].count(anchor) != 1:
+            raise ValueError("budget action run block differs")
+        step["run"] = step["run"].replace(anchor, anchor[: -len("}\n")] + addition + "}\n")
+    return updated
+
+
+EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V163 = _budget_action_with_dismissals(
+    EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V160
 )
 REVIEW_DIFF_DEPENDENCY_WORKFLOWS = (
     "claude-code-review.yml",
@@ -3060,7 +3142,9 @@ def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree, ref: str) -> N
         if (
             hashlib.sha256(canonical_source).hexdigest()
             != (
-                EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V162
+                EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163
+                if release_supports_finding_dismissal(ref)
+                else EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V162
                 if release_supports_filter_reason_surface(ref)
                 else EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256
             )
@@ -3076,9 +3160,14 @@ def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree, ref: str) -> N
         canonical_module = ast.parse(canonical_text, filename=canonical_path)
         scope_module = ast.parse(scope_text, filename=scope_path)
 
+        dismissals = release_supports_finding_dismissal(ref)
         canonical_literals = {
             "HARD_REASONS": EXPECTED_CANONICALIZER_HARD_REASONS,
-            "SOFT_REASONS": EXPECTED_CANONICALIZER_SOFT_REASONS,
+            "SOFT_REASONS": (
+                EXPECTED_CANONICALIZER_SOFT_REASONS_V163
+                if dismissals
+                else EXPECTED_CANONICALIZER_SOFT_REASONS
+            ),
             "SEVERITIES": ("CRITICAL", "HIGH", "MEDIUM"),
             "IMPACT_CLASSES": frozenset(
                 {
@@ -3131,7 +3220,10 @@ def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree, ref: str) -> N
         if _static_literal(scope_module, "GIT_ENV") != EXPECTED_SCOPE_GIT_ENV:
             raise ValueError("scope Git environment differs")
 
-        for name, expected in EXPECTED_CANONICALIZER_RECORDS.items():
+        expected_records = (
+            EXPECTED_CANONICALIZER_RECORDS_V163 if dismissals else EXPECTED_CANONICALIZER_RECORDS
+        )
+        for name, expected in expected_records.items():
             if _record_fields(_class_node(canonical_module, name)) != expected:
                 raise ValueError("canonical record differs")
         for name, expected in EXPECTED_SCOPE_RECORDS.items():
@@ -3200,7 +3292,9 @@ def _verify_canonicalize_review_action(
             "canonicalize-review action contract is invalid"
         ) from None
     expected_action = (
-        EXPECTED_CANONICALIZE_REVIEW_ACTION_V162
+        EXPECTED_CANONICALIZE_REVIEW_ACTION_V163
+        if release_supports_finding_dismissal(ref)
+        else EXPECTED_CANONICALIZE_REVIEW_ACTION_V162
         if release_supports_filter_reason_surface(ref)
         else EXPECTED_CANONICALIZE_REVIEW_ACTION
     )
@@ -4150,7 +4244,10 @@ def _local_literal(function: ast.FunctionDef, name: str) -> object:
 
 
 def require_budget_helper_contract(
-    source: str, rounds_variable: bool = False, filter_reasons: bool = False
+    source: str,
+    rounds_variable: bool = False,
+    filter_reasons: bool = False,
+    dismissals: bool = False,
 ) -> None:
     """Require the authenticated schema-1 helper and every fixed policy gate."""
 
@@ -4197,11 +4294,25 @@ def require_budget_helper_contract(
                 "opencode": "opencode run session",
             },
         }
+        dismissal_bindings: set[str] = set()
+        if dismissals:
+            # v1.63: who may dismiss, and how many dismissals and actor lookups a
+            # pull request may carry, are policy and stay structurally pinned.
+            expected_literals.update({
+                "_DISMISS_PERMISSIONS": frozenset({"admin", "maintain", "write"}),
+                "MAX_DISMISSED_FINDINGS": 16,
+                "MAX_PERMISSION_ACTORS": 16,
+            })
+            dismissal_bindings = {
+                "_DISMISS_COMMAND", "DismissEvent", "DismissedFinding",
+                "parse_dismiss_command", "choose_dismissals",
+            }
         _require_unique_module_bindings(
             module,
             frozenset(
                 {
                     *expected_literals,
+                    *dismissal_bindings,
                     "BudgetPolicy",
                     "LedgerState",
                     "ClaimRequest",
@@ -4371,6 +4482,33 @@ def require_budget_helper_contract(
                 ("handoff", "Handoff", "field(default_factory=Handoff)"),
             ),
         }
+        if dismissals:
+            # v1.63 carries the dismissal comments into the claim and the bounded
+            # snapshot into the ledger; a ledger without one keeps the v1.47 bytes.
+            expected_records["ClaimRequest"] += (
+                ("dismiss_events", "tuple[DismissEvent, ...]", "()"),
+            )
+            expected_records["LedgerState"] += (
+                ("dismissed_findings", "tuple[DismissedFinding, ...]", "()"),
+            )
+            expected_records["FinalizeRequest"] = (
+                ("repository", "str", None),
+                ("pr", "int", None),
+                ("reviewer", "Reviewer", None),
+                ("run_id", "int", None),
+                ("run_attempt", "int", None),
+                ("head_sha", "str", None),
+                ("full_diff_sha256", "str", None),
+                ("model_route", "tuple[str, ...]", None),
+                ("effort", "str", None),
+                ("call_count", "int", None),
+                ("elapsed_seconds", "int", None),
+                ("outcome", "Outcome", None),
+                ("stop_reason", "str", None),
+                ("authenticated_review", "AuthenticatedReview", None),
+                ("remaining_finding_ids", "tuple[str, ...]", None),
+                ("dismiss_events", "tuple[DismissEvent, ...]", "()"),
+            )
         if any(
             _record_shape(_class_node(module, name))
             != _expected_record_shape(fields)
@@ -4513,6 +4651,27 @@ def require_budget_helper_contract(
             )
         ):
             raise ValueError("finding identity differs")
+        if dismissals:
+            command_bindings = [
+                item.value
+                for item in module.body
+                if isinstance(item, ast.Assign)
+                and len(item.targets) == 1
+                and isinstance(item.targets[0], ast.Name)
+                and item.targets[0].id == "_DISMISS_COMMAND"
+            ]
+            if (
+                len(command_bindings) != 1
+                or ast.dump(command_bindings[0], include_attributes=False)
+                != ast.dump(
+                    ast.parse(
+                        're.compile(r"dismiss (RVW-[0-9a-f]{12}) (\\S[^\\r\\n]*)\\Z")',
+                        mode="eval",
+                    ).body,
+                    include_attributes=False,
+                )
+            ):
+                raise ValueError("dismiss grammar differs")
         functions = _module_function_headers(module)
         required_functions = {
             "serialize_ledger": "def serialize_ledger(state: LedgerState) -> str",
@@ -4542,16 +4701,32 @@ def require_budget_helper_contract(
                 "def load_checkpoint(payload: bytes) -> LedgerState"
             ),
         }
+        if dismissals:
+            required_functions.update({
+                "parse_dismiss_command": (
+                    "def parse_dismiss_command(body: object) -> str | None"
+                ),
+                "choose_dismissals": (
+                    "def choose_dismissals(state: LedgerState, "
+                    "events: Sequence[DismissEvent]) -> tuple[DismissedFinding, ...]"
+                ),
+            })
         if any(
             functions.get(name) != header
             for name, header in required_functions.items()
         ):
             raise ValueError("public helper function differs")
         claim_function = _function_node(module, "claim")
+        dismissal_snapshot = (
+            "        validated = _apply_dismissals(validated, request.dismiss_events)\n"
+            if dismissals
+            else ""
+        )
         expected_claim = ast.parse(
             "def expected(state, request, provenances):\n"
             "    try:\n"
             "        validated = validate_or_initialize(state, request, provenances)\n"
+            f"{dismissal_snapshot}"
             "    except BudgetStateError as exc:\n"
             "        return _invalid_transition(state, request, str(exc))\n"
             "    same_run = [item for item in validated.invocations "
@@ -5647,7 +5822,9 @@ def _verify_review_invocation_budget(
             reject_duplicate_keys=release_supports_review_policy(ref),
         )
         expected_action = (
-            EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V160
+            EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V163
+            if release_supports_finding_dismissal(ref)
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V160
             if release_supports_review_rounds_variable(ref)
             else EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION
         )
@@ -5668,6 +5845,7 @@ def _verify_review_invocation_budget(
         helper,
         release_supports_review_rounds_variable(ref),
         release_supports_filter_reason_surface(ref),
+        release_supports_finding_dismissal(ref),
     )
     for reviewer, workflow in REVIEWER_WORKFLOWS.items():
         require_budget_workflow_contract(
@@ -5677,16 +5855,21 @@ def _verify_review_invocation_budget(
             review_policy=release_supports_review_policy(ref),
         )
     rounds_variable = release_supports_review_rounds_variable(ref)
+    dismissals = release_supports_finding_dismissal(ref)
     authenticated_digests = {
         action_path: (
             action_payload,
-            EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256_V160
+            EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256_V163
+            if dismissals
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256_V160
             if rounds_variable
             else EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_SHA256,
         ),
         REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix(): (
             helper_payload,
-            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V162
+            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V163
+            if dismissals
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V162
             if release_supports_filter_reason_surface(ref)
             else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V160
             if rounds_variable
@@ -5694,7 +5877,9 @@ def _verify_review_invocation_budget(
         ),
     }
     workflow_digests = (
-        EXPECTED_FILTER_REASON_WORKFLOW_SHA256
+        EXPECTED_FINDING_DISMISSAL_WORKFLOW_SHA256
+        if dismissals
+        else EXPECTED_FILTER_REASON_WORKFLOW_SHA256
         if release_supports_filter_reason_surface(ref)
         else EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256
         if release_supports_same_head_cancel_guard(ref)
@@ -5998,7 +6183,7 @@ def _named_step(job: object, name: str) -> dict:
 
 
 def _expected_canonicalize_step(
-    contract: dict[str, str], *, budget: bool = False
+    contract: dict[str, str], *, budget: bool = False, dismissals: bool = False
 ) -> dict[str, object]:
     reviewer = contract["reviewer"]
     reset = contract["reset"]
@@ -6034,6 +6219,16 @@ def _expected_canonicalize_step(
             "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
             "previous-sha": contract["previous_sha"],
             "previous-review-file": contract["previous_file"],
+            # v1.63 hands the budget claim's dismissed finding IDs to the canonicalizer.
+            **(
+                {
+                    "dismissed-finding-ids": (
+                        "${{ steps.review-budget-claim.outputs.dismissed-finding-ids }}"
+                    ),
+                }
+                if dismissals
+                else {}
+            ),
         },
     }
 
@@ -6185,7 +6380,9 @@ def _verify_review_publication_contracts(
             if job.get("permissions", {}).get("actions") != "read":
                 raise ValueError("review run provenance permission differs")
             canonical_step = _named_step(job, contract["canonical_step"])
-            if canonical_step != _expected_canonicalize_step(contract, budget=budget):
+            if canonical_step != _expected_canonicalize_step(
+                contract, budget=budget, dismissals=release_supports_finding_dismissal(ref)
+            ):
                 raise ValueError("canonicalizer call differs")
             rejected_diagnostic_upload = _named_step(
                 job,

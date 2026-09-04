@@ -21,6 +21,9 @@ inputs:
   previous-review-file:
     required: false
     default: ''
+  dismissed-finding-ids:
+    required: false
+    default: ''
 outputs:
   document-valid:
     value: ${{ steps.canonicalize.outputs.document_valid }}
@@ -51,6 +54,7 @@ runs:
         DIFF_MODE: ${{ inputs.diff-mode }}
         PREVIOUS_SHA: ${{ inputs.previous-sha }}
         PREVIOUS_REVIEW_FILE: ${{ inputs.previous-review-file }}
+        DISMISSED_FINDING_IDS: ${{ inputs.dismissed-finding-ids }}
       run: >-
         python3 "$GITHUB_ACTION_PATH/canonicalize_review.py"
         --reviewer "$REVIEWER"
@@ -62,6 +66,7 @@ runs:
         --diff-mode "$DIFF_MODE"
         --previous-sha "$PREVIOUS_SHA"
         --previous-review-file "$PREVIOUS_REVIEW_FILE"
+        --dismissed-finding-ids "$DISMISSED_FINDING_IDS"
         --repository-root "$GITHUB_WORKSPACE"
         --expected-repository "$GITHUB_REPOSITORY"
         --github-output "$GITHUB_OUTPUT"

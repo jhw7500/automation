@@ -133,7 +133,7 @@ elif "/issues/comments/" in endpoint:
         comment = {**comment, "body": comment["body"] + "\nchanged"}
     response = comment
 elif endpoint.endswith("/issues/52/timeline?per_page=100"):
-    response = []
+    response = config.get("timeline", [])
 elif "/actions/runs/501/attempts/1" in endpoint:
     response = {
         "id": 501,
@@ -187,7 +187,8 @@ elif "/actions/runs/700/attempts/1" in endpoint:
     elif config["scenario"] == "current-run-reference-wrong-sha":
         response["referenced_workflows"][0]["sha"] = "not-a-sha"
 elif "/collaborators/" in endpoint and endpoint.endswith("/permission"):
-    response = {"permission": "write", "user": {"login": "maintainer"}}
+    login = endpoint.split("/collaborators/", 1)[1].rsplit("/permission", 1)[0]
+    response = {"permission": config.get("permissions", {}).get(login, "write"), "user": {"login": login}}
 elif method in {"POST", "PATCH"}:
     input_path = Path(args[args.index("--input") + 1])
     response = {"id": 101 if method == "POST" else 80, "body": json.loads(input_path.read_text())["body"]}
@@ -220,6 +221,7 @@ class FakeGitHub:
     def run_action(
         self, *, mode: str, scenario: str, hostile: bool = False,
         diff_mode: str = "full", env_overrides: dict[str, str] | None = None,
+        timeline: list[dict] | None = None, permissions: dict[str, str] | None = None,
     ) -> ActionResult:
         document = yaml.load(ACTION.read_text(), Loader=yaml.BaseLoader)
         run = document["runs"]["steps"][0]["run"]
@@ -266,7 +268,10 @@ class FakeGitHub:
             comments = [_bot_comment(prior, login="octocat")]
 
         config = self.tmp_path / "config.json"
-        config.write_text(json.dumps({"scenario": scenario, "head": head, "comments": comments}))
+        config.write_text(json.dumps({
+            "scenario": scenario, "head": head, "comments": comments,
+            "timeline": timeline or [], "permissions": permissions or {},
+        }))
         output = self.tmp_path / "github-output"
         summary = self.tmp_path / "summary"
         checkpoint = workspace / "checkpoint.json"
@@ -360,7 +365,7 @@ def test_action_metadata_has_one_inert_environment_bridge():
     }
     assert set(document["outputs"]) == {
         "allow-invocation", "decision", "round", "invocation-key", "checkpoint-sha256",
-        "comment-id",
+        "comment-id", "dismissed-finding-ids",
     }
     assert document["runs"]["using"] == "composite"
     assert len(document["runs"]["steps"]) == 1
@@ -714,3 +719,144 @@ def test_input_paths_are_bounded_by_the_runner_workspace_environment(tmp_path, m
     }
     with pytest.raises(budget.TransportError, match="workspace_identity_mismatch"):
         budget._validated_input_paths(request)
+
+
+# --- Dismissal comments travel through the same timeline and permission transport (issue #112) ---
+
+
+def _timeline_comment(comment_id: int, login: str, body: str) -> dict:
+    return {
+        "id": comment_id, "event": "commented", "actor": {"login": login},
+        "user": {"login": login}, "author_association": "NONE", "body": body,
+    }
+
+
+def test_timeline_permission_actors_include_dismiss_comment_authors(tmp_path):
+    (tmp_path / "timeline.json").write_text(json.dumps([
+        {
+            "id": 9001,
+            "event": "labeled",
+            "label": {"name": "review-budget-override"},
+            "actor": {"login": "maintainer"},
+        },
+        _timeline_comment(5001, "reviewer", "dismiss RVW-111111111111 the cited constant is wrong"),
+        _timeline_comment(5002, "maintainer", "dismiss RVW-222222222222 stale"),
+        _timeline_comment(5003, "stranger", "looks good to me"),
+        _timeline_comment(5004, "stranger", "please dismiss RVW-333333333333 for me"),
+        _timeline_comment(5005, "reviewer", "dismiss RVW-444444444444 second comment, same author"),
+    ]))
+
+    assert budget._timeline_permission_actors(tmp_path) == [
+        {"index": 0, "login": "maintainer", "encoded_login": "maintainer"},
+        {"index": 1, "login": "reviewer", "encoded_login": "reviewer"},
+    ]
+
+
+def _write_permission_fixture(tmp_path, timeline, permissions):
+    (tmp_path / "timeline.json").write_text(json.dumps(timeline))
+    actors = [
+        {"index": index, "login": login, "encoded_login": login}
+        for index, login in enumerate(permissions)
+    ]
+    (tmp_path / "run-identities.json").write_text(json.dumps({
+        "error": None, "permission_actors": actors, "runs": [],
+    }))
+    for actor in actors:
+        (tmp_path / f"permission-{actor['index']}.json").write_text(json.dumps({
+            "permission": permissions[actor["login"]], "user": {"login": actor["login"]},
+        }))
+
+
+def test_dismiss_events_bind_timeline_comments_to_fetched_permissions(tmp_path):
+    _write_permission_fixture(tmp_path, [
+        _timeline_comment(5001, "reviewer", "dismiss RVW-111111111111 the cited constant is wrong"),
+        _timeline_comment(5002, "maintainer", "dismiss RVW-222222222222 stale\r\n"),
+        _timeline_comment(5003, "maintainer", "not a command"),
+        {"id": 9001, "event": "labeled", "label": {"name": "review-budget-override"},
+         "actor": {"login": "maintainer"}},
+    ], {"reviewer": "read", "maintainer": "write"})
+
+    assert budget._dismiss_events(tmp_path) == (
+        budget.DismissEvent(5001, "RVW-111111111111", "read"),
+        budget.DismissEvent(5002, "RVW-222222222222", "write"),
+    )
+
+
+def test_dismiss_events_fail_closed_on_an_unverified_author(tmp_path):
+    _write_permission_fixture(tmp_path, [
+        _timeline_comment(5001, "ghost", "dismiss RVW-111111111111 unverified"),
+    ], {"maintainer": "write"})
+
+    with pytest.raises(budget.TransportError, match="dismiss_actor_invalid"):
+        budget._dismiss_events(tmp_path)
+
+
+def test_claim_records_a_dismissal_from_a_write_collaborator_comment(fake_github):
+    result = fake_github.run_action(
+        mode="claim", scenario="dismiss-comment",
+        timeline=[
+            _timeline_comment(5001, "maintainer", "dismiss RVW-111111111111 the cited constant is wrong"),
+            _timeline_comment(5002, "visitor", "dismiss RVW-222222222222 drive-by"),
+        ],
+        permissions={"visitor": "read"},
+    )
+
+    assert result.outputs["decision"] == "claimed"
+    assert result.outputs["dismissed-finding-ids"] == "RVW-111111111111"
+    assert result.checkpoint["ledger"]["dismissed_findings"] == [
+        {"comment_id": 5001, "finding_id": "RVW-111111111111"},
+    ]
+    looked_up = sorted(
+        part.split("/collaborators/", 1)[1].split("/", 1)[0]
+        for call in result.calls for part in call if "/collaborators/" in part
+    )
+    assert looked_up == ["maintainer", "visitor"]
+
+
+def test_claim_without_dismissals_publishes_an_empty_list(fake_github):
+    result = fake_github.run_action(mode="claim", scenario="first-comment-create")
+
+    assert result.outputs["dismissed-finding-ids"] == ""
+    assert "dismissed_findings" not in result.checkpoint["ledger"]
+
+
+def test_finalize_refreshes_the_dismissal_snapshot_from_the_timeline(fake_github):
+    result = fake_github.run_action(
+        mode="finalize", scenario="finalize-trusted-comment",
+        timeline=[_timeline_comment(5001, "maintainer", "dismiss RVW-111111111111 wrong constant")],
+    )
+
+    assert result.outputs["decision"] == "finalized"
+    assert result.outputs["dismissed-finding-ids"] == "RVW-111111111111"
+    assert result.checkpoint["ledger"]["dismissed_findings"] == [
+        {"comment_id": 5001, "finding_id": "RVW-111111111111"},
+    ]
+    assert result.checkpoint["handoff"]["remaining_finding_ids"] == []
+
+
+def test_permission_lookups_are_bounded_per_timeline(tmp_path):
+    """Any commenter can add a lookup, so the actor list fails closed past the bound."""
+
+    assert budget.MAX_PERMISSION_ACTORS == 16
+    comments = [
+        _timeline_comment(5000 + index, f"user{index}", "dismiss RVW-111111111111 same finding")
+        for index in range(17)
+    ]
+    (tmp_path / "timeline.json").write_text(json.dumps(comments))
+
+    with pytest.raises(budget.TransportError, match="permission_actors_exceeded"):
+        budget._timeline_permission_actors(tmp_path)
+    (tmp_path / "timeline.json").write_text(json.dumps(comments[1:]))
+    assert len(budget._timeline_permission_actors(tmp_path)) == 16
+
+
+def test_dismiss_events_surface_the_recorded_manifest_error(tmp_path):
+    (tmp_path / "timeline.json").write_text(json.dumps([
+        _timeline_comment(5001, "maintainer", "dismiss RVW-111111111111 wrong constant"),
+    ]))
+    (tmp_path / "run-identities.json").write_text(json.dumps({
+        "error": "permission_actors_exceeded", "permission_actors": [], "runs": [],
+    }))
+
+    with pytest.raises(budget.TransportError, match="permission_actors_exceeded"):
+        budget._dismiss_events(tmp_path)

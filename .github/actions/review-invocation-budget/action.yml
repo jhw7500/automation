@@ -59,6 +59,8 @@ outputs:
     value: ${{ steps.budget.outputs.checkpoint-sha256 }}
   comment-id:
     value: ${{ steps.budget.outputs.comment-id }}
+  dismissed-finding-ids:
+    value: ${{ steps.budget.outputs.dismissed-finding-ids }}
 runs:
   using: composite
   steps:
@@ -115,6 +117,7 @@ runs:
             "invocation-key": output["invocation-key"],
             "checkpoint-sha256": output["checkpoint-sha256"],
             "comment-id": comment_id,
+            "dismissed-finding-ids": output["dismissed-finding-ids"],
         }
         patterns = {
             "allow-invocation": r"(?:true|false)",
@@ -123,6 +126,7 @@ runs:
             "invocation-key": r"[0-9:]*",
             "checkpoint-sha256": r"[0-9a-f]{64}",
             "comment-id": r"[0-9]*",
+            "dismissed-finding-ids": r"(?:RVW-[0-9a-f]{12}(?:,RVW-[0-9a-f]{12})*)?",
         }
         with Path(sys.argv[3]).open("a", encoding="utf-8") as stream:
             for key, value in values.items():
