@@ -36,6 +36,7 @@ ALL_SECRETS = {
     "APP_PRIVATE_KEY",
 }
 ALL_VARIABLES = {"APP_ID"}
+ALL_LABELS = {"review:request", "review:skip", "review-budget-override"}
 
 
 def make_existing_repo(
@@ -62,6 +63,7 @@ def render_fixture(root: Path, *, auth: str) -> RenderPlan:
         COMMIT,
         ALL_SECRETS,
         ALL_VARIABLES,
+        label_names=ALL_LABELS,
     )
 
 
@@ -76,6 +78,7 @@ def render_existing(root: Path, *, config: bytes) -> RenderPlan:
         COMMIT,
         ALL_SECRETS,
         ALL_VARIABLES,
+        label_names=ALL_LABELS,
     )
 
 
@@ -90,6 +93,7 @@ def render_profile(repo: Path, name: str, *, bootstrap: bool = False) -> RenderP
         ALL_SECRETS,
         ALL_VARIABLES,
         bootstrap=bootstrap,
+        label_names=ALL_LABELS,
     )
 
 
@@ -370,6 +374,7 @@ def test_canonical_root_symlink_blocks_rendering(tmp_path: Path) -> None:
         COMMIT,
         ALL_SECRETS,
         ALL_VARIABLES,
+        label_names=ALL_LABELS,
     )
 
     assert plan.status == "blocked"
@@ -397,6 +402,7 @@ def test_canonical_intermediate_directory_symlink_blocks_rendering(
         COMMIT,
         ALL_SECRETS,
         ALL_VARIABLES,
+        label_names=ALL_LABELS,
     )
 
     assert plan.status == "blocked"
@@ -450,6 +456,7 @@ def test_rendered_config_must_still_be_valid_yaml(tmp_path: Path) -> None:
         COMMIT,
         ALL_SECRETS,
         ALL_VARIABLES,
+        label_names=ALL_LABELS,
     )
     assert plan.status == "blocked"
     assert plan.changes == ()
@@ -492,6 +499,7 @@ def test_missing_prerequisite_names_block_normal_repositories(tmp_path: Path) ->
         COMMIT,
         {"CLAUDE_CODE_OAUTH_TOKEN"},
         set(),
+        label_names=ALL_LABELS,
     )
     assert plan.status == "blocked"
     assert plan.changes == ()
@@ -519,6 +527,7 @@ def test_allowed_disabled_bootstrap_renders_required_callers_and_config_only(
         set(),
         set(),
         bootstrap=True,
+        label_names=ALL_LABELS,
     )
     assert plan.status == "bootstrap_required"
     paths = {change.path for change in plan.changes}
@@ -598,6 +607,7 @@ def test_provider_secret_values_never_enter_plan_bytes_repr_or_errors(
         COMMIT,
         set(sentinels),
         ALL_VARIABLES,
+        label_names=ALL_LABELS,
     )
     exposed = repr(plan) + plan.reason
     exposed += "".join(
@@ -617,6 +627,7 @@ def test_provider_secret_values_never_enter_plan_bytes_repr_or_errors(
             "not-a-commit",
             set(sentinels),
             ALL_VARIABLES,
+            label_names=ALL_LABELS,
         )
     assert not any(value in str(error.value) for value in sentinels.values())
 
@@ -747,3 +758,55 @@ def test_file_change_and_render_plan_are_immutable() -> None:
     assert plan.after(".github/workflows/x.yml") == b"x\n"
     with pytest.raises(dataclasses.FrozenInstanceError):
         change.after = b"y\n"  # type: ignore[misc]
+
+
+# --- issue #115: the opt-in labels are a fleet precondition, like secret and variable names ---
+
+
+def test_required_review_labels_are_the_fixed_fleet_contract() -> None:
+    from scripts.prepare_workflow_rollout import REQUIRED_REVIEW_LABELS, REQUIRED_REVIEW_LABEL_NAMES
+
+    assert [(label.name, label.color, label.description) for label in REQUIRED_REVIEW_LABELS] == [
+        ("review:request", "0E8A16", "Explicitly request AI review"),
+        ("review:skip", "BFDADC", "Explicitly skip AI review"),
+        ("review-budget-override", "D93F0B", "Authorize one bounded reviewer override round"),
+    ]
+    assert REQUIRED_REVIEW_LABEL_NAMES == frozenset(ALL_LABELS)
+
+
+def test_missing_label_names_block_normal_repositories(tmp_path: Path) -> None:
+    repo = make_existing_repo(tmp_path / "repo")
+    plan = render_repository(
+        repo,
+        CANONICAL,
+        CATALOG,
+        PROFILES["wlan-package"],
+        "v1.40",
+        COMMIT,
+        ALL_SECRETS,
+        ALL_VARIABLES,
+        label_names={"review:request"},
+    )
+    assert plan.status == "blocked"
+    assert plan.changes == ()
+    assert plan.required_labels == frozenset(ALL_LABELS)
+    assert plan.reason == "missing labels: review-budget-override, review:skip"
+
+
+def test_missing_label_names_are_non_blocking_for_explicit_bootstrap(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".github/workflows").mkdir(parents=True)
+    plan = render_repository(
+        repo,
+        CANONICAL,
+        CATALOG,
+        PROFILES["wpa-supplicant"],
+        "v1.40",
+        COMMIT,
+        ALL_SECRETS,
+        ALL_VARIABLES,
+        label_names=set(),
+        bootstrap=True,
+    )
+    assert plan.status == "bootstrap_required"
+    assert "non-blocking prerequisites: missing labels: review-budget-override, review:request, review:skip" in plan.reason

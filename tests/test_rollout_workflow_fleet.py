@@ -33,6 +33,7 @@ ALL_SECRETS = frozenset(
     {"CLAUDE_CODE_OAUTH_TOKEN", "GEMINI_API_KEY", "ZHIPU_API_KEY", "APP_PRIVATE_KEY"}
 )
 ALL_VARIABLES = frozenset({"APP_ID"})
+ALL_LABELS = frozenset({"review:request", "review:skip", "review-budget-override"})
 CATALOG = load_catalog(ROOT)
 
 
@@ -660,6 +661,7 @@ def test_plan_prevalidates_all_repositories_and_never_enters_publish(
     assert all(item["release_commit"] == COMMIT for item in report)
     assert report[0]["observed_base"] == BASE
     assert report[0]["required_secrets"] == ["CLAUDE_CODE_OAUTH_TOKEN"]
+    assert report[0]["required_labels"] == ["review-budget-override", "review:request", "review:skip"]
     assert report[0]["managed_diff_paths"] == [".github/workflows/claude.yml"]
 
 
@@ -1219,7 +1221,7 @@ def snapshot(tmp_path: Path) -> RepositorySnapshot:
     (repo / ".github/workflows").mkdir(parents=True)
     (repo / ".git").mkdir()
     (repo / ".github/workflows/a.yml").write_bytes(b"new\n")
-    return RepositorySnapshot(repo, "main", BASE, ALL_SECRETS, ALL_VARIABLES)
+    return RepositorySnapshot(repo, "main", BASE, ALL_SECRETS, ALL_VARIABLES, label_names=ALL_LABELS)
 
 
 def exact_pr(
@@ -1519,7 +1521,7 @@ def initialized_repository(tmp_path: Path) -> tuple[RepositorySnapshot, RenderPl
             for entry in CATALOG.entries
         ),
     )
-    return RepositorySnapshot(repo, "main", base, frozenset(), frozenset()), plan
+    return RepositorySnapshot(repo, "main", base, frozenset(), frozenset(), label_names=ALL_LABELS), plan
 
 
 def initialized_canonical_fleet_repository(
@@ -1541,6 +1543,7 @@ def initialized_canonical_fleet_repository(
         bundle.commit,
         set(ALL_SECRETS),
         set(ALL_VARIABLES),
+        label_names=ALL_LABELS,
     )
     assert initial.status == "drift"
     apply_render_plan(repo, initial)
@@ -1561,7 +1564,8 @@ def initialized_canonical_fleet_repository(
         stdout=subprocess.PIPE,
     ).stdout.strip()
     return RepositorySnapshot(
-        repo, "main", base, ALL_SECRETS, ALL_VARIABLES
+        repo, "main", base, ALL_SECRETS, ALL_VARIABLES,
+        label_names=ALL_LABELS,
     )
 
 
@@ -1673,7 +1677,8 @@ def test_real_rollout_repairs_content_and_separate_mode_drift_and_attests_all_ma
     )
     base = commit_managed_fixture(snap.path, "content and mode drift")
     snap = RepositorySnapshot(
-        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names
+        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names,
+        label_names=ALL_LABELS,
     )
     assert tree_entry(snap.path, base, mode_path)[:2] == ("100755", "blob")
 
@@ -1704,7 +1709,8 @@ def test_real_mode_only_drift_is_planned_audited_and_published_as_a_repair(
     )
     base = commit_managed_fixture(snap.path, "mode-only drift")
     snap = RepositorySnapshot(
-        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names
+        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names,
+        label_names=ALL_LABELS,
     )
 
     plan = rollout._render(snap, bundle, snap.path.name, bootstrap=False)
@@ -1715,6 +1721,7 @@ def test_real_mode_only_drift_is_planned_audited_and_published_as_a_repair(
         set(snap.secret_names),
         set(snap.variable_names),
         observed_revision=base,
+        label_names=ALL_LABELS,
     )
 
     assert plan.status == "drift"
@@ -1816,7 +1823,8 @@ def test_real_tracked_nonregular_managed_entry_blocks_before_checkout_bytes_are_
         )
         base = commit_managed_fixture(snap.path, f"{object_type} type drift")
     snap = RepositorySnapshot(
-        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names
+        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names,
+        label_names=ALL_LABELS,
     )
     assert tree_entry(snap.path, base, relative)[:2] == (mode, object_type)
     # Deliberately leave canonical regular bytes in the checkout: only the observed
@@ -1865,7 +1873,8 @@ def test_real_tracked_nonregular_managed_ancestor_blocks_before_checkout_scan(
         oid,
     )
     snap = RepositorySnapshot(
-        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names
+        snap.path, snap.default_branch, base, snap.secret_names, snap.variable_names,
+        label_names=ALL_LABELS,
     )
     assert tree_entry(snap.path, base, workflows)[:2] == (mode, object_type)
     assert (snap.path / ".github/workflows/claude.yml").is_file()
@@ -2318,6 +2327,7 @@ def test_managed_result_passes_yaml_catalog_diff_and_local_actionlint_gates(
         set(ALL_SECRETS),
         set(ALL_VARIABLES),
         bootstrap=False,
+        label_names=ALL_LABELS,
     )
     assert plan.status == "drift"
 
@@ -2744,3 +2754,17 @@ def test_git_wrapper_rejects_forbidden_commands_before_child(
         with pytest.raises(rollout.CommandError, match="not permitted"):
             rollout.git(args)
         child.assert_not_called()
+
+
+def test_render_blocks_when_a_required_label_is_missing(tmp_path: Path, bundle) -> None:
+    snap = initialized_canonical_fleet_repository(tmp_path, bundle)
+    snap = RepositorySnapshot(
+        snap.path, snap.default_branch, snap.base_sha, snap.secret_names, snap.variable_names,
+        base_branch=snap.base_branch, label_names=frozenset({"review:request", "review:skip"}),
+    )
+
+    plan = rollout._render(snap, bundle, snap.path.name, bootstrap=False)
+
+    assert plan.status == "blocked"
+    assert plan.changes == ()
+    assert plan.reason == "missing labels: review-budget-override"

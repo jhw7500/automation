@@ -17646,3 +17646,43 @@ def test_filtered_findings_reach_the_run_summary(workflow, job, name):
     assert '[[ "$FILTERED_REASONS" =~ ^[a-z_]+(,[a-z_]+)*$ ]]' in step["run"]
     assert '>> "$GITHUB_STEP_SUMMARY"' in step["run"]
     assert "filtered-count != '0'" in step["if"]
+
+
+# --- v1.64: the request label starts a review on an already-open pull request (issue #111) ---
+
+REVIEW_CALLERS = (
+    ("examples/baseline-workflows/.github/workflows/claude-code-review.yml", "claude-review"),
+    ("examples/baseline-workflows/.github/workflows/gemini-auto-review.yml", "gemini-review"),
+    ("examples/baseline-workflows/.github/workflows/opencode-auto-review.yml", "opencode-review"),
+    (".github/workflows/_self-claude-review.yml", "claude-review"),
+    (".github/workflows/_self-gemini-auto-review.yml", "gemini-review"),
+    (".github/workflows/_self-opencode-auto-review.yml", "opencode-review"),
+)
+LABELED_GUARD = "(github.event.action != 'labeled' || github.event.label.name == 'review:request')"
+FORCE_REVIEW_DESCRIPTION = (
+    "Perform one authorized same-HEAD override round; requires the review-budget-override label"
+)
+
+
+@pytest.mark.parametrize(("path", "job"), REVIEW_CALLERS)
+def test_review_callers_start_on_the_request_label_only(path, job):
+    """`labeled` must start a run for `review:request` alone, so unrelated labels add no runs."""
+
+    document = yaml.load((ROOT / path).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+    assert document["on"]["pull_request"]["types"] == [
+        "opened", "synchronize", "ready_for_review", "labeled",
+    ]
+    condition = " ".join(document["jobs"][job]["if"].split())
+    assert LABELED_GUARD in condition
+    assert condition.index("github.event.pull_request.draft == false") < condition.index(LABELED_GUARD)
+    assert condition.index(LABELED_GUARD) < condition.index("github.event_name == 'workflow_dispatch'")
+
+
+@pytest.mark.parametrize(("path", "job"), REVIEW_CALLERS)
+def test_review_callers_describe_force_review_as_the_override_round(path, job):
+    document = yaml.load((ROOT / path).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    inputs = document["on"]["workflow_dispatch"]["inputs"]
+
+    assert inputs["force_review"]["description"] == FORCE_REVIEW_DESCRIPTION
+    assert inputs["force_review"]["default"] == "false"

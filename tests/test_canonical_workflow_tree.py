@@ -86,7 +86,7 @@ EXPECTED_TRIGGERS: dict[str, object] = {
         "issues": {"types": ["opened", "assigned"]},
     },
     "claude-code-review.yml": {
-        "pull_request": {"types": ["opened", "synchronize", "ready_for_review"]},
+        "pull_request": {"types": ["opened", "synchronize", "ready_for_review", "labeled"]},
         "workflow_dispatch": {
             "inputs": {
                 "pr_number": {
@@ -95,7 +95,7 @@ EXPECTED_TRIGGERS: dict[str, object] = {
                     "required": "true",
                 },
                 "force_review": {
-                    "description": "Perform one authorized same-HEAD review",
+                    "description": "Perform one authorized same-HEAD override round; requires the review-budget-override label",
                     "type": "boolean",
                     "required": "false",
                     "default": "false",
@@ -104,7 +104,7 @@ EXPECTED_TRIGGERS: dict[str, object] = {
         },
     },
     "gemini-auto-review.yml": {
-        "pull_request": {"types": ["opened", "synchronize", "ready_for_review"]},
+        "pull_request": {"types": ["opened", "synchronize", "ready_for_review", "labeled"]},
         "workflow_dispatch": {
             "inputs": {
                 "pr_number": {
@@ -113,7 +113,7 @@ EXPECTED_TRIGGERS: dict[str, object] = {
                     "required": "true",
                 },
                 "force_review": {
-                    "description": "Perform one authorized same-HEAD review",
+                    "description": "Perform one authorized same-HEAD override round; requires the review-budget-override label",
                     "type": "boolean",
                     "required": "false",
                     "default": "false",
@@ -255,7 +255,7 @@ EXPECTED_TRIGGERS: dict[str, object] = {
         "pull_request_review_comment": {"types": ["created"]},
     },
     "opencode-auto-review.yml": {
-        "pull_request": {"types": ["opened", "synchronize", "ready_for_review"]},
+        "pull_request": {"types": ["opened", "synchronize", "ready_for_review", "labeled"]},
         "workflow_dispatch": {
             "inputs": {
                 "pr_number": {
@@ -264,7 +264,7 @@ EXPECTED_TRIGGERS: dict[str, object] = {
                     "required": "true",
                 },
                 "force_review": {
-                    "description": "Perform one authorized same-HEAD review",
+                    "description": "Perform one authorized same-HEAD override round; requires the review-budget-override label",
                     "type": "boolean",
                     "required": "false",
                     "default": "false",
@@ -500,8 +500,9 @@ def test_auto_review_callers_forward_the_resolved_review_mode() -> None:
         job = caller["jobs"][job_name]
 
         assert caller["on"]["pull_request"]["types"] == [
-            "opened", "synchronize", "ready_for_review",
+            "opened", "synchronize", "ready_for_review", "labeled",
         ]
+        assert "(github.event.action != 'labeled' || github.event.label.name == 'review:request')" in " ".join(job["if"].split())
         assert " ".join(job["with"]["review_mode"].split()) == REVIEW_MODE_EXPRESSION
         assert "github.event.pull_request.draft == false" in job["if"]
 
@@ -517,8 +518,9 @@ def test_self_auto_review_callers_forward_label_review_mode() -> None:
         job = caller["jobs"][job_name]
 
         assert caller["on"]["pull_request"]["types"] == [
-            "opened", "synchronize", "ready_for_review",
+            "opened", "synchronize", "ready_for_review", "labeled",
         ]
+        assert "(github.event.action != 'labeled' || github.event.label.name == 'review:request')" in " ".join(job["if"].split())
         assert " ".join(job["with"]["review_mode"].split()) == REVIEW_MODE_EXPRESSION
         assert "github.event.pull_request.draft == false" in job["if"]
 

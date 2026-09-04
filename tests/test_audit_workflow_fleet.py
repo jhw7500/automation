@@ -27,6 +27,7 @@ ALL_SECRETS = {
     "APP_PRIVATE_KEY",
 }
 ALL_VARIABLES = {"APP_ID"}
+ALL_LABELS = {"review:request", "review:skip", "review-budget-override"}
 COMMIT = "1" * 40
 BASE = "2" * 40
 
@@ -79,6 +80,7 @@ def apply_bundle(repo: Path, bundle: ReleaseBundle, profile) -> None:
         ALL_SECRETS,
         ALL_VARIABLES,
         bootstrap=False,
+        label_names=ALL_LABELS,
     )
     assert plan.status == "drift"
     apply_render_plan(repo, plan)
@@ -88,7 +90,8 @@ def test_audit_classifies_content_not_history(
     repo: Path, bundle: ReleaseBundle, profile
 ) -> None:
     result = audit_repository(
-        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main",
+        label_names=ALL_LABELS,
     )
     assert result.status == "drift"
     assert result.repo == "gstApp"
@@ -98,7 +101,8 @@ def test_audit_classifies_content_not_history(
     apply_bundle(repo, bundle, profile)
     assert (
         audit_repository(
-            repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+            repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main",
+            label_names=ALL_LABELS,
         ).status
         == "current"
     )
@@ -107,7 +111,8 @@ def test_audit_classifies_content_not_history(
     )
     assert (
         audit_repository(
-            repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+            repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main",
+            label_names=ALL_LABELS,
         ).status
         == "current"
     )
@@ -120,7 +125,8 @@ def test_audit_reports_managed_byte_mismatch_as_drift(
     managed = repo / ".github/workflows/claude.yml"
     managed.write_bytes(managed.read_bytes() + b"# drift\n")
     result = audit_repository(
-        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main",
+        label_names=ALL_LABELS,
     )
     assert result.status == "drift"
     assert ".github/workflows/claude.yml" in result.changed_paths
@@ -133,7 +139,8 @@ def test_audit_reports_unknown_or_malformed_content_as_blocked(
         "jobs:\n  call:\n    uses: jhw7500/automation/.github/workflows/claude.yml@v1.40\n"
     )
     result = audit_repository(
-        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main",
+        label_names=ALL_LABELS,
     )
     assert result == AuditResult(
         "gstApp",
@@ -148,7 +155,8 @@ def test_audit_reports_unknown_or_malformed_content_as_blocked(
         "automation_ref:\n  nested: value\n"
     )
     result = audit_repository(
-        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main"
+        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, base_branch="main",
+        label_names=ALL_LABELS,
     )
     assert result.status == "blocked"
     assert "automation_ref must be a scalar" in result.detail
@@ -157,7 +165,7 @@ def test_audit_reports_unknown_or_malformed_content_as_blocked(
 def test_audit_reports_missing_prerequisite_names_as_blocked(
     repo: Path, bundle: ReleaseBundle, profile
 ) -> None:
-    result = audit_repository(repo, bundle, profile, set(), set(), base_branch="main")
+    result = audit_repository(repo, bundle, profile, set(), set(), base_branch="main", label_names=ALL_LABELS)
     assert result.status == "blocked"
     assert "missing secrets" in result.detail
     assert "missing variables" in result.detail
@@ -203,6 +211,7 @@ def test_fleet_cli_audits_all_profiles_with_refetch_and_no_remote_write(
             frozenset(ALL_SECRETS),
             frozenset(ALL_VARIABLES),
             branch or "main",
+            label_names=ALL_LABELS,
         )
 
     def refetch(snapshot: RepositorySnapshot) -> str:
@@ -277,7 +286,7 @@ def test_fleet_cli_selects_repositories_and_blocks_only_on_blocked(
         path = root / repo
         path.mkdir()
         (path / ".git").mkdir()
-        return RepositorySnapshot(path, "main", BASE, frozenset(), frozenset(), branch or "main")
+        return RepositorySnapshot(path, "main", BASE, frozenset(), frozenset(), branch or "main", label_names=ALL_LABELS)
 
     with (
         mock.patch.object(
@@ -325,7 +334,8 @@ def test_selected_repository_audits_main_and_ported_and_ported_drift_prevents_al
         path.mkdir()
         (path / ".git").mkdir()
         return RepositorySnapshot(
-            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), branch or "main"
+            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), branch or "main",
+            label_names=ALL_LABELS,
         )
 
     def classify(path, _bundle, _profile, _secrets, _variables, *, base_branch, **_kwargs):
@@ -369,7 +379,8 @@ def test_target_clone_failure_blocks_only_the_exact_target_and_stays_in_totals(
         path.mkdir()
         (path / ".git").mkdir()
         return RepositorySnapshot(
-            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), "main"
+            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), "main",
+            label_names=ALL_LABELS,
         )
 
     with (
@@ -423,7 +434,8 @@ def test_unresolved_implicit_default_has_a_label_distinct_from_a_valid_branch_na
         path.mkdir()
         (path / ".git").mkdir()
         return RepositorySnapshot(
-            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), branch
+            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), branch,
+            label_names=ALL_LABELS,
         )
 
     with (
@@ -471,7 +483,8 @@ def test_target_refetch_failure_blocks_only_ported_and_keeps_main_visible(
         path.mkdir()
         (path / ".git").mkdir()
         return RepositorySnapshot(
-            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), branch or "main"
+            path, "main", BASE, frozenset(ALL_SECRETS), frozenset(ALL_VARIABLES), branch or "main",
+            label_names=ALL_LABELS,
         )
 
     def refetch(snapshot: RepositorySnapshot) -> str:
@@ -539,6 +552,7 @@ def test_inconsistent_resolved_targets_are_blocked_without_hiding_target_rows(
             frozenset(ALL_SECRETS),
             frozenset(ALL_VARIABLES),
             default_branch if branch is None else branch,
+            label_names=ALL_LABELS,
         )
 
     with (
@@ -587,3 +601,13 @@ def test_audit_git_wrapper_rejects_every_mutation_before_child(
         with pytest.raises(audit.FleetGitError, match="not permitted"):
             audit.git(args)
         child.assert_not_called()
+
+
+def test_audit_reports_missing_label_names_as_blocked(
+    repo: Path, bundle: ReleaseBundle, profile
+) -> None:
+    result = audit_repository(
+        repo, bundle, profile, ALL_SECRETS, ALL_VARIABLES, label_names=set(), base_branch="main",
+    )
+    assert result.status == "blocked"
+    assert result.detail == "missing labels: review-budget-override, review:request, review:skip"

@@ -93,6 +93,29 @@ class GitTreeEntry:
 
 
 @dataclass(frozen=True)
+class ReviewLabel:
+    name: str
+    color: str
+    description: str
+
+
+# Issue #115: v1.59 made `review:request` the per-pull-request opt-in and the override
+# round needs `review-budget-override`, so a repository without these labels cannot use
+# the shipped review policy. They are inspected as names, like secret and variable
+# names; `scripts/ensure_review_labels.py` is the explicit operator step that creates them.
+REQUIRED_REVIEW_LABELS: tuple[ReviewLabel, ...] = (
+    ReviewLabel("review:request", "0E8A16", "Explicitly request AI review"),
+    ReviewLabel("review:skip", "BFDADC", "Explicitly skip AI review"),
+    ReviewLabel(
+        "review-budget-override", "D93F0B", "Authorize one bounded reviewer override round"
+    ),
+)
+REQUIRED_REVIEW_LABEL_NAMES: frozenset[str] = frozenset(
+    label.name for label in REQUIRED_REVIEW_LABELS
+)
+
+
+@dataclass(frozen=True)
 class RenderPlan:
     status: Literal["current", "drift", "bootstrap_required", "blocked"]
     reason: str
@@ -101,6 +124,7 @@ class RenderPlan:
     required_variables: frozenset[str]
     managed_results: tuple[ManagedResult, ...] = ()
     observed_revision: str | None = None
+    required_labels: frozenset[str] = REQUIRED_REVIEW_LABEL_NAMES
 
     def after(self, path: str) -> bytes | None:
         requested = PurePosixPath(path)
@@ -607,14 +631,19 @@ def _prerequisite_reason(
     required_variables: frozenset[str],
     secret_names: set[str],
     variable_names: set[str],
+    required_labels: frozenset[str],
+    label_names: set[str],
 ) -> str:
     parts: list[str] = []
     missing_secrets = sorted(required_secrets - secret_names)
     missing_variables = sorted(required_variables - variable_names)
+    missing_labels = sorted(required_labels - label_names)
     if missing_secrets:
         parts.append(f"missing secrets: {', '.join(missing_secrets)}")
     if missing_variables:
         parts.append(f"missing variables: {', '.join(missing_variables)}")
+    if missing_labels:
+        parts.append(f"missing labels: {', '.join(missing_labels)}")
     return "; ".join(parts)
 
 
@@ -628,6 +657,7 @@ def render_repository(
     secret_names: set[str],
     variable_names: set[str],
     *,
+    label_names: set[str],
     bootstrap: bool = False,
     observed_revision: str | None = None,
 ) -> RenderPlan:
@@ -720,6 +750,8 @@ def render_repository(
             required_variables,
             secret_names,
             variable_names,
+            REQUIRED_REVIEW_LABEL_NAMES,
+            label_names,
         )
         if missing:
             return block(missing)
@@ -812,6 +844,8 @@ def render_repository(
             required_variables,
             secret_names,
             variable_names,
+            REQUIRED_REVIEW_LABEL_NAMES,
+            label_names,
         )
         reason = "disabled bootstrap required"
         if prerequisites:

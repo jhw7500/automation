@@ -62,6 +62,7 @@ class RepositorySnapshot:
     secret_names: frozenset[str]
     variable_names: frozenset[str]
     base_branch: str | None = None
+    label_names: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -362,10 +363,20 @@ def _snapshot_base_branch(snapshot: RepositorySnapshot) -> str:
     return branch
 
 
+LABEL_PAGE_LIMIT = 300
+
+
 def _inventory(owner: str, repo: str, kind: str) -> frozenset[str]:
-    data = _json(["gh", kind, "list", "-R", f"{owner}/{repo}", "--json", "name"])
+    args = ["gh", kind, "list", "-R", f"{owner}/{repo}", "--json", "name"]
+    if kind == "label":
+        # `gh label list` pages at 30 by default and truncates newest-first, so a full
+        # page could hide exactly the review labels; refuse to trust one.
+        args += ["--limit", str(LABEL_PAGE_LIMIT)]
+    data = _json(args)
     if not isinstance(data, list):
         raise FleetGitError("GitHub returned malformed prerequisite inventory")
+    if kind == "label" and len(data) >= LABEL_PAGE_LIMIT:
+        raise FleetGitError("GitHub label inventory exceeds the page limit")
     names: set[str] = set()
     for item in data:
         if not isinstance(item, dict):
@@ -442,6 +453,7 @@ def clone_branch(
     base_sha = _validate_object_id(_git(["rev-parse", "HEAD"], cwd=target))
     secret_names = _inventory(owner, repo, "secret")
     variable_names = _inventory(owner, repo, "variable")
+    label_names = _inventory(owner, repo, "label")
     return RepositorySnapshot(
         path=target,
         default_branch=default_branch,
@@ -449,6 +461,7 @@ def clone_branch(
         secret_names=secret_names,
         variable_names=variable_names,
         base_branch=base_branch,
+        label_names=label_names,
     )
 
 

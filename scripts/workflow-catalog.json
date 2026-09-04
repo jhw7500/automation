@@ -53,7 +53,8 @@
           "types": [
             "opened",
             "synchronize",
-            "ready_for_review"
+            "ready_for_review",
+            "labeled"
           ]
         },
         "workflow_dispatch": {
@@ -64,7 +65,7 @@
               "required": "true"
             },
             "force_review": {
-              "description": "Perform one authorized same-HEAD review",
+              "description": "Perform one authorized same-HEAD override round; requires the review-budget-override label",
               "type": "boolean",
               "required": "false",
               "default": "false"
@@ -104,7 +105,8 @@
           "types": [
             "opened",
             "synchronize",
-            "ready_for_review"
+            "ready_for_review",
+            "labeled"
           ]
         },
         "workflow_dispatch": {
@@ -115,7 +117,7 @@
               "required": "true"
             },
             "force_review": {
-              "description": "Perform one authorized same-HEAD review",
+              "description": "Perform one authorized same-HEAD override round; requires the review-budget-override label",
               "type": "boolean",
               "required": "false",
               "default": "false"
@@ -612,7 +614,8 @@
           "types": [
             "opened",
             "synchronize",
-            "ready_for_review"
+            "ready_for_review",
+            "labeled"
           ]
         },
         "workflow_dispatch": {
@@ -623,7 +626,7 @@
               "required": "true"
             },
             "force_review": {
-              "description": "Perform one authorized same-HEAD review",
+              "description": "Perform one authorized same-HEAD override round; requires the review-budget-override label",
               "type": "boolean",
               "required": "false",
               "default": "false"
