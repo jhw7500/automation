@@ -771,7 +771,7 @@ def test_cli_writes_bounded_schema_result_scalar_outputs_and_metadata_only_logs(
     assert secret not in case.result.read_text(encoding="utf-8")
     assert secret not in completed.stdout
     assert completed.stdout == "review-canonicalization: document_valid=true accepted=0 filtered=1 normalized=0 filtered_max=HIGH failure_reason=\ncandidate[0]: section=New findings outcome=filtered reason=invalid_anchor claimed_severity=HIGH\n"
-    assert github_output.read_text(encoding="utf-8") == "document_valid=true\naccepted_count=0\nfiltered_count=1\nnormalized_count=0\nfiltered_max_severity=HIGH\nfailure_reason=\n"
+    assert github_output.read_text(encoding="utf-8") == "document_valid=true\naccepted_count=0\nfiltered_count=1\nnormalized_count=0\nfiltered_max_severity=HIGH\nfailure_reason=\nfiltered_reasons=invalid_anchor\n"
     assert case.canonical.read_text(encoding="utf-8") == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
 
 
@@ -842,6 +842,7 @@ def test_cli_action_first_round_empty_previous_review_file_writes_runner_outputs
         "normalized_count=0\n"
         "filtered_max_severity=none\n"
         "failure_reason=\n"
+        "filtered_reasons=\n"
     )
     assert case.canonical.is_file() and not case.canonical.is_symlink()
     assert case.result.is_file() and not case.result.is_symlink()

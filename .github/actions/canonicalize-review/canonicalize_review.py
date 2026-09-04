@@ -1046,10 +1046,16 @@ def main(argv: list[str] | None = None) -> int:
         _write_atomic(args.result_file, payload)
         if args.github_output is not None:
             scalar = result.to_dict()
-            output = "".join(
+            # Reason codes come from a fixed canonicalizer vocabulary, so surfacing them
+            # carries no untrusted text and lets a reader see why a finding was dropped
+            # without opening the run log.
+            filtered_reasons = ",".join(sorted({
+                item.reason for item in result.candidate_reasons if item.outcome == "filtered"
+            }))
+            output = ("".join(
                 f"{name}={str(scalar[name]).lower() if isinstance(scalar[name], bool) else scalar[name]}\n"
                 for name in ("document_valid", "accepted_count", "filtered_count", "normalized_count", "filtered_max_severity", "failure_reason")
-            ).encode("utf-8")
+            ) + f"filtered_reasons={filtered_reasons}\n").encode("utf-8")
             _write_atomic(args.github_output, output)
     except OSError:
         return 1

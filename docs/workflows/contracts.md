@@ -224,6 +224,11 @@ head — `/jhw:pr --review` labels the draft and then marks it ready — or, on 
 already open, start one authorized same-head review through a `workflow_dispatch` carrying
 `force_review: true`.
 
+A bounded override round (`review-budget-override` plus a `workflow_dispatch` carrying
+`force_review: true`) is available for Claude and Gemini only. From `v1.62` the budget refuses it
+for OpenCode, because that canonicalizer authenticates `pull_request` provenance throughout and a
+dispatch round can never publish: spending the override there consumed it and lost the verdict.
+
 `review:skip` and `review:request` steer only the managed Actions reviewers. They never reach
 Codex, whose automatic review is decided entirely in ChatGPT Codex settings, so neither label
 changes Codex behavior. Codex does require the repository to be registered under Codex code-review
@@ -279,10 +284,12 @@ The composite interface has exactly nine inputs:
 | `previous-sha` | Optional authenticated prior successful head; default empty on a first round, but it may remain set when delta safely falls back to full. |
 | `previous-review-file` | Optional authenticated prior canonical body; default empty. |
 
-It exposes exactly six scalar outputs: `document-valid`, `accepted-count`, `filtered-count`,
-`normalized-count`, `filtered-max-severity`, and `failure-reason`. The first is `true` or `false`;
-the three counts are non-negative integers; `filtered-max-severity` is `none`, `MEDIUM`, `HIGH`, or
-`CRITICAL`; and `failure-reason` is empty on a document-valid result or one fixed hard reason.
+It exposes exactly seven scalar outputs: `document-valid`, `accepted-count`, `filtered-count`,
+`normalized-count`, `filtered-max-severity`, `failure-reason`, and, from `v1.62`,
+`filtered-reasons`. The first is `true` or `false`; the three counts are non-negative integers;
+`filtered-max-severity` is `none`, `MEDIUM`, `HIGH`, or `CRITICAL`; `failure-reason` is empty on a
+document-valid result or one fixed hard reason; and `filtered-reasons` is the sorted, comma-joined
+set of fixed reason codes for the filtered blocks, empty when none were filtered.
 
 The action captures validated PR base/head metadata, prepares `review-full.diff`, optionally
 prepares `review-delta.diff`, and writes `review-scope.json`. Its composite outputs are
@@ -544,7 +551,11 @@ valid siblings. It is filtered or normalized with exactly one of `invalid_anchor
 `missing_material_impact`, `unsupported_performance_basis`, `non_actionable_category`,
 `unknown_prior_id`, `duplicate_prior_binding`, or `missing_fix_anchor`. Rejected prose is absent
 from canonical Markdown, result JSON, workflow state, and the PR comment; only bounded counts,
-claimed maximum severity, and fixed reason codes are observable. `accepted-count` counts accepted
+claimed maximum severity, and fixed reason codes are observable. From `v1.62` the Claude and
+Gemini workflows write those reason codes to the run summary whenever `filtered-count` is not zero,
+so a reader can see why a block was dropped without opening the run log. The step validates the
+codes against the fixed vocabulary and fails closed on anything else. The sticky comment is
+unchanged; it still carries counts only. `accepted-count` counts accepted
 new and still-open actionable blocks, `filtered-count` counts soft-rejected blocks, and
 `normalized-count` counts carryover blocks omitted without becoming actionable, including an
 unknown or duplicate prior binding or missing transition proof.

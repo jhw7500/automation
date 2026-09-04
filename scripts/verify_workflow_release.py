@@ -48,6 +48,7 @@ from scripts.workflow_release_inventory import (
     release_supports_review_invocation_budget,
     release_supports_review_optin,
     release_supports_review_rounds_variable,
+    release_supports_filter_reason_surface,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
     validate_release_listing,
@@ -469,6 +470,24 @@ EXPECTED_CANONICALIZE_REVIEW_ACTION = {
         ],
     },
 }
+
+
+def _canonicalize_action_with_filter_reasons(action: dict) -> dict:
+    """Derive the v1.62 canonicalizer action: one added scalar output.
+
+    Stating the delta keeps the two expectations from drifting apart.
+    """
+
+    updated = deepcopy(action)
+    updated["outputs"]["filtered-reasons"] = {
+        "value": "${{ steps.canonicalize.outputs.filtered_reasons }}"
+    }
+    return updated
+
+
+EXPECTED_CANONICALIZE_REVIEW_ACTION_V162 = _canonicalize_action_with_filter_reasons(
+    EXPECTED_CANONICALIZE_REVIEW_ACTION
+)
 EXPECTED_CANONICALIZER_HARD_REASONS = frozenset(
     {
         "candidate_missing",
@@ -495,6 +514,9 @@ EXPECTED_CANONICALIZER_SOFT_REASONS = frozenset(
 )
 EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256 = (
     "eb4ba827d3b03e3c9169cd95e9194d49b2b8b9b6956e7317b5c9cc9b7bb04fc5"
+)
+EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V162 = (
+    "d814b42568e38a2f46f1772d00a5a713a467bba067d8865cf4f7657a38ac0739"
 )
 EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
     "68779c9038c31aa09a846b643bc0178b147798527e1a34ee5821ab539f10b19a"
@@ -670,6 +692,9 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V160 = (
     "d6a9dc0af9b6e340b6528911ac60a48e21fd8960e515167e2c6be4536f33f1a3"
 )
+EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V162 = (
+    "deda9f65bbe853860fa06599ce303b15cd63b15b5dad645896c8c76aae7e9b03"
+)
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d4db53b86603a3a113999409e2e4e35c397adf276981e7f68c0ea57a6198faa2",
     "gemini": "cbd69aba74ec0f3380591f14d0adcb6543faad5e237a855dbec246750e2b5206",
@@ -689,6 +714,13 @@ EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256 = {
 }
 # v1.61 narrowed cancel-in-progress to superseding commits, changing the three
 # reusable review workflows again.
+# v1.62 writes filtered-finding reasons to the run summary for Claude and Gemini;
+# the OpenCode workflow is unchanged on this line.
+EXPECTED_FILTER_REASON_WORKFLOW_SHA256 = {
+    "claude": "03f2208f44a84e3c726903c5ed707d2b9a5ebab9cf934cf2aa19ddd8182c3f14",
+    "gemini": "07bf3ace69eeeca2bf8243d52b0e35dfafcdd2689f40fe9afd211a597095d1b4",
+    "opencode": "4a173036252929de6320da7e04436d67b9a4759ed4b9f60b6bdf2b3a3ecc1d5a",
+}
 EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256 = {
     "claude": "b3b7d95cb8e87164470759f4c918f8c317e37a10d2c214ec915ac4a51963f04e",
     "gemini": "3271f4f7dd4d13711b91d65ac191451703ead424fcb67299ff504b8a26b32e0f",
@@ -2350,6 +2382,7 @@ def verify_opencode_runtime(
         EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256["opencode"],
         EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256["opencode"],
         EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256["opencode"],
+        EXPECTED_FILTER_REASON_WORKFLOW_SHA256["opencode"],
     }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
@@ -2383,6 +2416,7 @@ def verify_opencode_runtime(
             EXPECTED_REVIEW_POLICY_WORKFLOW_SHA256["opencode"],
             EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256["opencode"],
             EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256["opencode"],
+            EXPECTED_FILTER_REASON_WORKFLOW_SHA256["opencode"],
         }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
@@ -3017,7 +3051,7 @@ def _verify_review_policy_action(
     require_review_policy_helper_contract(helper, release_supports_review_optin(ref))
 
 
-def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree) -> None:
+def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree, ref: str) -> None:
     canonical_path = CANONICALIZE_REVIEW_HELPER_ROOT.path.as_posix()
     scope_path = REVIEW_SCOPE_HELPER_ROOT.path.as_posix()
     try:
@@ -3025,7 +3059,11 @@ def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree) -> None:
         scope_source = tree.read_file(scope_path)
         if (
             hashlib.sha256(canonical_source).hexdigest()
-            != EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256
+            != (
+                EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V162
+                if release_supports_filter_reason_surface(ref)
+                else EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256
+            )
             or hashlib.sha256(scope_source).hexdigest()
             != EXPECTED_REVIEW_SCOPE_HELPER_SHA256
         ):
@@ -3161,11 +3199,16 @@ def _verify_canonicalize_review_action(
         raise ReleaseVerificationError(
             "canonicalize-review action contract is invalid"
         ) from None
-    if document != EXPECTED_CANONICALIZE_REVIEW_ACTION:
+    expected_action = (
+        EXPECTED_CANONICALIZE_REVIEW_ACTION_V162
+        if release_supports_filter_reason_surface(ref)
+        else EXPECTED_CANONICALIZE_REVIEW_ACTION
+    )
+    if document != expected_action:
         raise ReleaseVerificationError(
             "canonicalize-review action contract is invalid"
         )
-    _verify_canonicalize_review_helpers(tree)
+    _verify_canonicalize_review_helpers(tree, ref)
 
 
 def _verify_claude_code_action_pin(
@@ -4106,7 +4149,9 @@ def _local_literal(function: ast.FunctionDef, name: str) -> object:
     return ast.literal_eval(matches[0])
 
 
-def require_budget_helper_contract(source: str, rounds_variable: bool = False) -> None:
+def require_budget_helper_contract(
+    source: str, rounds_variable: bool = False, filter_reasons: bool = False
+) -> None:
     """Require the authenticated schema-1 helper and every fixed policy gate."""
 
     # v1.60 resolves the round budget through effective_budgets(), which renames the
@@ -4899,16 +4944,26 @@ def require_budget_helper_contract(source: str, rounds_variable: bool = False) -
             raise ValueError("run identity manifest differs")
 
         choose_override = _function_node(module, "choose_override")
+        # v1.62 refuses the OpenCode override up front, which adds one guard ahead of
+        # the eligibility loop.
+        override_offset = 1 if rounds_variable and filter_reasons else 0
         if (
-            len(choose_override.body) != 4
-            or not isinstance(choose_override.body[2], ast.For)
-            or not _ast_expression_matches(
-                choose_override.body[2].iter, "events"
+            len(choose_override.body) != 4 + override_offset
+            or (
+                filter_reasons
+                and not _ast_statement_matches(
+                    choose_override.body[0],
+                    "if state.reviewer == 'opencode':\n    return None",
+                )
             )
-            or len(choose_override.body[2].body) != 1
-            or not isinstance(choose_override.body[2].body[0], ast.If)
+            or not isinstance(choose_override.body[2 + override_offset], ast.For)
             or not _ast_expression_matches(
-                choose_override.body[2].body[0].test,
+                choose_override.body[2 + override_offset].iter, "events"
+            )
+            or len(choose_override.body[2 + override_offset].body) != 1
+            or not isinstance(choose_override.body[2 + override_offset].body[0], ast.If)
+            or not _ast_expression_matches(
+                choose_override.body[2 + override_offset].body[0].test,
                 "isinstance(event, OverrideEvent) "
                 "and isinstance(event.event_id, int) "
                 "and not isinstance(event.event_id, bool) "
@@ -4920,11 +4975,11 @@ def require_budget_helper_contract(source: str, rounds_variable: bool = False) -
                 "state.consumed_override_event_ids",
             )
             or not _ast_statement_matches(
-                choose_override.body[2].body[0].body[0],
+                choose_override.body[2 + override_offset].body[0].body[0],
                 "eligible.append(event)",
             )
             or not _ast_statement_matches(
-                choose_override.body[3],
+                choose_override.body[3 + override_offset],
                 "return max(eligible, key=lambda item: item.event_id, "
                 "default=None)",
             )
@@ -5609,7 +5664,11 @@ def _verify_review_invocation_budget(
         raise ReleaseVerificationError(
             "invocation-budget helper contract is invalid"
         ) from None
-    require_budget_helper_contract(helper, release_supports_review_rounds_variable(ref))
+    require_budget_helper_contract(
+        helper,
+        release_supports_review_rounds_variable(ref),
+        release_supports_filter_reason_surface(ref),
+    )
     for reviewer, workflow in REVIEWER_WORKFLOWS.items():
         require_budget_workflow_contract(
             tree,
@@ -5627,13 +5686,17 @@ def _verify_review_invocation_budget(
         ),
         REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix(): (
             helper_payload,
-            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V160
+            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V162
+            if release_supports_filter_reason_surface(ref)
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V160
             if rounds_variable
             else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256,
         ),
     }
     workflow_digests = (
-        EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256
+        EXPECTED_FILTER_REASON_WORKFLOW_SHA256
+        if release_supports_filter_reason_surface(ref)
+        else EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256
         if release_supports_same_head_cancel_guard(ref)
         else EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256
         if rounds_variable
