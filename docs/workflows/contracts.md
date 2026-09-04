@@ -261,6 +261,22 @@ settings; a custom cloud environment is not required, because the default `unive
 review. An unregistered repository either answers a mention with "create an environment for this
 repo" or stays silent, and no review appears.
 
+### When to add the label
+
+`review:request` may be added to an already-open pull request from `v1.64`, but not while the
+`opened` runs are still resolving. Those runs were triggered without the label, so `REVIEW_MODE`
+is `auto` for them; if the resolver reads the pull request after the label lands, trigger-time and
+read-time disagree and the `v1.51` guard fails the `Check if enabled` job closed with
+`review_mode_label_mismatch`. Every reviewer triggered by the same event fails together, and a
+re-run reproduces it because the replayed payload still carries the original mode.
+
+Label after the `opened` runs reach a conclusion, or open the pull request as a draft, label it,
+and then mark it ready. The `labeled` run itself is unaffected: it is triggered with the label
+present, so trigger-time and read-time agree.
+
+A run that failed this way reviewed nothing. The verdict for that head comes from the `labeled`
+run, not from the failed one.
+
 ### Why a managed reviewer did not run
 
 From `v1.65` the `skipped` job of `claude-code-review.yml` and `gemini-auto-review.yml` names the
