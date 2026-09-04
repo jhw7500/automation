@@ -1009,7 +1009,9 @@ budget action reads the PR timeline, uses the fixed grammar below only to decide
 repository permission to fetch through the collaborators API, and lets a comment count only
 after that permission has been verified. At most sixteen distinct label or comment actors are
 looked up per timeline; more fails closed with `permission_actors_exceeded`, because anyone who
-can comment can add an actor.
+can comment can add an actor. GitHub serializes a `commented` timeline event with both `actor`
+and `user` naming the comment author; the action reads `actor`, the same field the label path
+already trusts.
 
 A dismissal is one issue comment on the pull request whose whole body is exactly
 
