@@ -17686,3 +17686,111 @@ def test_review_callers_describe_force_review_as_the_override_round(path, job):
 
     assert inputs["force_review"]["description"] == FORCE_REVIEW_DESCRIPTION
     assert inputs["force_review"]["default"] == "false"
+
+
+# ---------------------------------------------------------------------------
+# skipped job: the notice must name the reason the reviewer did not run (#132)
+# ---------------------------------------------------------------------------
+
+SKIPPED_NOTICE_WORKFLOWS = (
+    ("claude-code-review.yml", "Claude Code Review", "claude-code-review"),
+    ("gemini-auto-review.yml", "Gemini Auto PR Review", "gemini-auto-review"),
+)
+
+
+def _run_skipped_notice(workflow_name, tmp_path, *, enabled, reason):
+    step = _step(_load(workflow_name), "skipped", "Notice")
+    summary = tmp_path / "step-summary"
+    summary.write_text("", encoding="utf-8")
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "WORKFLOW_ENABLED": enabled,
+            "POLICY_REASON": reason,
+            "GITHUB_STEP_SUMMARY": str(summary),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout + summary.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(("workflow_name", "label", "config_key"), SKIPPED_NOTICE_WORKFLOWS)
+def test_skipped_notice_blames_the_config_only_when_the_config_disabled_it(
+    workflow_name, label, config_key, tmp_path
+):
+    """A policy decline must not be reported as a workflow-config.yml setting.
+
+    The notice is the first place a person looks when a reviewer does not run,
+    and since reviews became opt-in a decline is the ordinary path. Pointing at
+    workflow-config.yml for a decline sends them to a file whose contents are
+    already correct.
+    """
+
+    disabled = _run_skipped_notice(
+        workflow_name, tmp_path, enabled="false", reason="workflow_disabled"
+    )
+    assert "workflow-config.yml" in disabled
+    assert config_key in disabled
+
+    declined = _run_skipped_notice(
+        workflow_name, tmp_path, enabled="true", reason="default_auto_false"
+    )
+    assert "workflow-config.yml" not in declined
+    assert "review:request" in declined
+    assert label in declined
+
+
+@pytest.mark.parametrize(("workflow_name", "label", "config_key"), SKIPPED_NOTICE_WORKFLOWS)
+def test_skipped_notice_distinguishes_every_declining_policy_reason(
+    workflow_name, label, config_key, tmp_path
+):
+    expected = {
+        "workflow_auto_false": "review:request",
+        "review_auto_false": "review:request",
+        "skip": "review:skip",
+        "draft": "draft",
+        "closed": "not open",
+        "unsafe_pr": "not in this repository",
+    }
+    for reason, fragment in expected.items():
+        rendered = _run_skipped_notice(
+            workflow_name, tmp_path, enabled="true", reason=reason
+        )
+        assert fragment in rendered, (reason, rendered)
+        assert "workflow-config.yml" not in rendered, reason
+
+    unknown = _run_skipped_notice(workflow_name, tmp_path, enabled="true", reason="")
+    assert "Check if enabled" in unknown
+
+
+@pytest.mark.parametrize(("workflow_name", "label", "config_key"), SKIPPED_NOTICE_WORKFLOWS)
+def test_skipped_notice_takes_the_reason_through_env_and_rejects_stray_text(
+    workflow_name, label, config_key, tmp_path
+):
+    step = _step(_load(workflow_name), "skipped", "Notice")
+    assert step["env"] == {
+        "WORKFLOW_ENABLED": "${{ needs.check-enabled.outputs.enabled }}",
+        "POLICY_REASON": "${{ needs.check-enabled.outputs.policy_reason }}",
+    }
+    assert "${{" not in step["run"]
+
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "WORKFLOW_ENABLED": "true",
+            "POLICY_REASON": 'x"; touch must-not-exist; #',
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert not (tmp_path / "must-not-exist").exists()

@@ -2005,7 +2005,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Notice
+        # 이 잡은 두 가지 이유로 돌 수 있으므로 하나로 단정하지 않는다. enabled 는
+        # workflow-config.yml 이 끈 경우이고, policy_reason 은 리졸버가 내는 고정
+        # 어휘라 비신뢰 텍스트가 아니다. 정규식이 어휘 밖 값을 막고, 매핑에 없는
+        # 값은 사유를 그대로 보여 준다.
+        env:
+          WORKFLOW_ENABLED: ${{ needs.check-enabled.outputs.enabled }}
+          POLICY_REASON: ${{ needs.check-enabled.outputs.policy_reason }}
         run: |
-          echo "::notice::Gemini Auto PR Review workflow is disabled in .github/workflow-config.yml"
-          echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY
-          echo "Gemini Auto PR Review is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          [[ "$POLICY_REASON" =~ ^[a-z_]*$ ]]
+          if [[ "$WORKFLOW_ENABLED" != "true" ]]; then
+            detail="gemini-auto-review is disabled in .github/workflow-config.yml"
+          else
+            case "$POLICY_REASON" in
+              default_auto_false|workflow_auto_false|review_auto_false)
+                detail="automatic review is off for this repository; add the review:request label to run one" ;;
+              skip) detail="the review:skip label is present" ;;
+              draft) detail="the pull request is a draft" ;;
+              closed) detail="the pull request is not open" ;;
+              unsafe_pr) detail="the pull request head is not in this repository" ;;
+              workflow_disabled) detail="gemini-auto-review is disabled in .github/workflow-config.yml" ;;
+              "") detail="the review policy produced no reason; see the Check if enabled job" ;;
+              *) detail="the review policy declined with reason $POLICY_REASON" ;;
+            esac
+          fi
+          echo "::notice::Gemini Auto PR Review did not run because $detail"
+          {
+            printf '## Workflow Skipped\n'
+            printf 'Gemini Auto PR Review did not run because %s.\n' "$detail"
+          } >> "$GITHUB_STEP_SUMMARY"

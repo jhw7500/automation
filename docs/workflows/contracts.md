@@ -261,6 +261,34 @@ settings; a custom cloud environment is not required, because the default `unive
 review. An unregistered repository either answers a mention with "create an environment for this
 repo" or stays silent, and no review appears.
 
+### Why a managed reviewer did not run
+
+From `v1.65` the `skipped` job of `claude-code-review.yml` and `gemini-auto-review.yml` names the
+reason instead of always citing `workflow-config.yml`. It reads the `enabled` and `policy_reason`
+outputs of `check-enabled` through the environment, rejects anything outside the resolver's fixed
+`^[a-z_]*$` vocabulary, and reports:
+
+| Condition | Reported as |
+| --- | --- |
+| `enabled` is not `true` | disabled in `.github/workflow-config.yml` |
+| `default_auto_false`, `workflow_auto_false`, `review_auto_false` | automatic review is off; add the `review:request` label |
+| `skip` | the `review:skip` label is present |
+| `draft` | the pull request is a draft |
+| `closed` | the pull request is not open |
+| `unsafe_pr` | the head is not in this repository |
+| empty | no reason was produced; read the `Check if enabled` job |
+| anything else | the reason verbatim |
+
+Since reviews became opt-in a decline is the ordinary path, so the notice is the first place a
+person looks. Before `v1.65` every one of these said the workflow was disabled in
+`workflow-config.yml`, which sent them to a file whose contents were already correct.
+
+`opencode-auto-review.yml` keeps its own wording and is not part of this contract.
+
+The `skipped` job's `if:` condition is unchanged: it still covers both causes, and the release
+verifier requires it to keep testing `policy_run != 'true'`.
+
+
 ## Deterministic automated-review input
 
 Claude, Gemini, and OpenCode call the same composite action:
