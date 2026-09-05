@@ -17980,3 +17980,95 @@ def test_dispatch_final_result_names_an_unavailable_diff(tmp_path):
     outputs = _github_delimited_outputs(out)
     assert outputs["outcome"] == "failure"
     assert outputs["errors"] == "review diff unavailable: diff_too_large"
+
+
+# ---------------------------------------------------------------------------
+# dispatch review notes: the requester's questions must reach the model (#133)
+# ---------------------------------------------------------------------------
+
+def _run_dispatch_notes(tmp_path, out, notes, limit="4000"):
+    step = _step(_load("gemini-dispatch.yml"), "review", "Prepare review request notes")
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "GITHUB_OUTPUT": str(out),
+            "REQUEST_NOTES": notes,
+            "MAX_NOTES_BYTES": limit,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = dict(_github_outputs(out))
+    outputs.update(_github_delimited_outputs(out))
+    return outputs, result
+
+
+def test_dispatch_review_notes_reach_the_model_as_untrusted_data(tmp_path):
+    """The five questions #133 reported were never delivered, not ignored.
+
+    They are passed the way the diff is, as a file the prompt points at, because
+    a reply also carries the parent comment whose author the command's permission
+    check never saw.
+    """
+
+    outputs, _ = _run_dispatch_notes(
+        tmp_path, tmp_path / "out", "Does the 360p path stay clean?"
+    )
+
+    assert outputs["notes_file"] == "review-request-notes.md"
+    assert "review-request-notes.md" in outputs["notes_hint"]
+    body = (tmp_path / outputs["notes_file"]).read_text(encoding="utf-8")
+    assert "UNTRUSTED DATA" in body
+    assert "BEGIN_UNTRUSTED_REQUEST_NOTES" in body
+    assert "END_UNTRUSTED_REQUEST_NOTES" in body
+    assert "Does the 360p path stay clean?" in body
+
+
+@pytest.mark.parametrize("notes", ["", "   \n\t ", "\n"])
+def test_dispatch_review_notes_stay_silent_without_a_request(tmp_path, notes):
+    outputs, _ = _run_dispatch_notes(tmp_path, tmp_path / "out", notes)
+
+    assert outputs.get("notes_hint", "") == ""
+    assert not (tmp_path / outputs["notes_file"]).exists()
+
+
+def test_dispatch_review_notes_mark_a_truncation(tmp_path):
+    outputs, _ = _run_dispatch_notes(
+        tmp_path, tmp_path / "out", "q" * 900, limit="500"
+    )
+
+    body = (tmp_path / outputs["notes_file"]).read_text(encoding="utf-8")
+    assert "were cut here" in body
+    assert "q" * 500 in body
+    assert "q" * 501 not in body
+    assert "truncated" in outputs["notes_hint"]
+
+
+def test_dispatch_review_notes_never_execute_what_the_requester_wrote(tmp_path):
+    """A command substitution in the notes must land as text, not run."""
+
+    outputs, result = _run_dispatch_notes(
+        tmp_path, tmp_path / "out", "$(touch must-not-exist) `touch also-not` ${GITHUB_TOKEN}"
+    )
+
+    assert not (tmp_path / "must-not-exist").exists()
+    assert not (tmp_path / "also-not").exists()
+    body = (tmp_path / outputs["notes_file"]).read_text(encoding="utf-8")
+    assert "$(touch must-not-exist)" in body
+    assert "${GITHUB_TOKEN}" in body
+
+
+@pytest.mark.parametrize("step_name", DISPATCH_MODEL_STEPS)
+def test_dispatch_prompts_carry_the_request_notes_hint(step_name):
+    step = _step(_load("gemini-dispatch.yml"), "review", step_name)
+    assert "${{ steps.review_notes.outputs.notes_hint }}" in step["with"]["prompt"]
+
+
+def test_dispatch_review_notes_step_takes_the_text_only_through_env():
+    step = _step(_load("gemini-dispatch.yml"), "review", "Prepare review request notes")
+    assert step["env"]["REQUEST_NOTES"] == "${{ needs.dispatch.outputs.additional_context }}"
+    assert "${{" not in step["run"]

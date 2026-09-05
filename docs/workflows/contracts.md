@@ -312,6 +312,27 @@ The `skipped` job's `if:` condition is unchanged: it still covers both causes, a
 verifier requires it to keep testing `policy_run != 'true'`.
 
 
+### What the requester asked
+
+Text written after `@gemini-cli /review` reached no prompt until `v1.68`. A request that listed five
+specific questions got an answer to none of them, and the questions had not been ignored: they were
+never delivered.
+
+They now travel the way the diff does. A step writes them to a file in the workspace, wrapped in an
+`UNTRUSTED DATA` header and `BEGIN_UNTRUSTED_REQUEST_NOTES` / `END_UNTRUSTED_REQUEST_NOTES` markers,
+and the prompt names the file rather than carrying the text. Nothing is interpolated into the
+script: the text arrives through the environment, so a command substitution a requester types lands
+as characters in the file.
+
+The framing is not politeness. On a reply the dispatch job prepends the parent comment's body, and
+the parent comment's author is not the one the command's `OWNER`/`MEMBER`/`COLLABORATOR` check saw.
+The notes can therefore carry text from someone who was never authorised to invoke a review.
+
+Notes longer than `GEMINI_MAX_NOTES_BYTES` (4000 by default) are cut, the cut is stated inside the
+file, and the prompt says the notes were truncated. A request with no notes produces no file and no
+mention of one.
+
+
 ### What a manual `/review` sees
 
 `@gemini-cli /review` is handled by the `review` job of `gemini-dispatch.yml`. Until `v1.67` that
