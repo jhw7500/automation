@@ -53,6 +53,7 @@ from scripts.workflow_release_inventory import (
     release_supports_label_review_trigger,
     release_supports_skip_reason_notice,
     release_supports_label_mismatch_decline,
+    release_supports_dispatch_review_diff,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
     validate_release_listing,
@@ -6768,6 +6769,57 @@ def _verify_token_mapping(
     return sinks
 
 
+def _verify_dispatch_review_diff(tree: "VerifiedCommitTree", ref: str) -> None:
+    """Require the manual review path to build and read the diff it reviews.
+
+    Nothing described this path before v1.67, so the reviewer could be left with a
+    bare checkout and the whole suite would still pass. The release now refuses a
+    tree where the diff step is gone or the model no longer waits for it.
+    """
+
+    name = ".github/workflows/gemini-dispatch.yml"
+    document = yaml.load(tree.read_text(name), Loader=yaml.BaseLoader)
+    try:
+        steps = document["jobs"]["review"]["steps"]
+    except (KeyError, TypeError) as exc:
+        raise ReleaseVerificationError(f"{name} has no review job") from exc
+    by_name = {step.get("name"): step for step in steps if isinstance(step, dict)}
+    prepare = by_name.get("Prepare review diff")
+    if prepare is None or prepare.get("id") != "review_diff":
+        raise ReleaseVerificationError(
+            f"{name} review job does not prepare a diff for the manual review"
+        )
+    script = prepare.get("run", "")
+    for fragment in ("git diff", "diff_ready", "diff_reason", "MAX_DIFF_BYTES"):
+        if fragment not in script:
+            raise ReleaseVerificationError(
+                f"{name} review diff step is missing {fragment}"
+            )
+    model_steps = [
+        step
+        for step in steps
+        if isinstance(step, dict)
+        and str(step.get("uses", "")).startswith("google-github-actions/run-gemini-cli@")
+    ]
+    if len(model_steps) != 2:
+        raise ReleaseVerificationError(
+            f"{name} review job must invoke exactly two review models"
+        )
+    for step in model_steps:
+        prompt = (step.get("with") or {}).get("prompt", "")
+        if "steps.review_diff.outputs.diff_file" not in prompt:
+            raise ReleaseVerificationError(
+                f"{name} review prompt does not read the prepared diff"
+            )
+    primary = by_name.get("Run Gemini pull request review (primary)")
+    if primary is None or primary.get("if") != (
+        "steps.review_diff.outputs.diff_ready == 'true'"
+    ):
+        raise ReleaseVerificationError(
+            f"{name} review model does not wait for a ready diff"
+        )
+
+
 def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
     try:
         call = document["on"]["workflow_call"]
@@ -7010,6 +7062,8 @@ def _verify_commit_content(
         _verify_review_policy_callers(tree, ref)
     _verify_approved_v140_policy(tree, ref)
     _verify_manual_gemini_output_contract(tree, ref)
+    if release_supports_dispatch_review_diff(ref):
+        _verify_dispatch_review_diff(tree, ref)
     catalog = _verify_tag_catalog(tree, ref)
     names = [entry.path.as_posix() for entry in tree.files(".github/workflows")]
     workflows = [name for name in names if name.endswith((".yml", ".yaml"))]
