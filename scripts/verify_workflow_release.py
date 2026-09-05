@@ -52,6 +52,7 @@ from scripts.workflow_release_inventory import (
     release_supports_finding_dismissal,
     release_supports_label_review_trigger,
     release_supports_skip_reason_notice,
+    release_supports_label_mismatch_decline,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
     validate_release_listing,
@@ -782,8 +783,16 @@ EXPECTED_SKIP_REASON_WORKFLOW_SHA256 = {
     "gemini": "c05f48186aefe8058fd26c4084f51202cc52649a3c97f853b85bae34335e1882",
     "opencode": "4a173036252929de6320da7e04436d67b9a4759ed4b9f60b6bdf2b3a3ecc1d5a",
 }
+EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256 = {
+    "claude": "a6116cf542876a46e8401e26471324a586772398ad5d21360155e686123104be",
+    "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
+    "opencode": "a74b0b0948467e46bebf223fc2b5f2bfcd3824c317a908dbacbb7e7cd2ec6fbc",
+}
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
+)
+EXPECTED_REVIEW_POLICY_HELPER_SHA256_V166 = (
+    "9a8d79dc6838f036ff7694dea947726f8a111086aaa967b41d27a9a55c8f84b5"
 )
 EXPECTED_REVIEW_POLICY_HELPER_SHA256_V159 = (
     "50a4cbaf364e326201c2572435ab4dc9dcac5e14ff4349cfd790a1b26f4092b7"
@@ -2472,6 +2481,7 @@ def verify_opencode_runtime(
         EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256["opencode"],
         EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256["opencode"],
         EXPECTED_FILTER_REASON_WORKFLOW_SHA256["opencode"],
+        EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256["opencode"],
     }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
@@ -2506,6 +2516,7 @@ def verify_opencode_runtime(
             EXPECTED_REVIEW_ROUNDS_VARIABLE_WORKFLOW_SHA256["opencode"],
             EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256["opencode"],
             EXPECTED_FILTER_REASON_WORKFLOW_SHA256["opencode"],
+            EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256["opencode"],
         }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
@@ -3026,11 +3037,15 @@ def _class_function_headers(node: ast.ClassDef) -> dict[str, str]:
     return functions
 
 
-def require_review_policy_helper_contract(source: str, optin: bool) -> None:
+def require_review_policy_helper_contract(
+    source: str, optin: bool, decline: bool = False
+) -> None:
     """Authenticate and statically validate the public policy-helper surface."""
 
     expected_digest = (
-        EXPECTED_REVIEW_POLICY_HELPER_SHA256_V159
+        EXPECTED_REVIEW_POLICY_HELPER_SHA256_V166
+        if decline
+        else EXPECTED_REVIEW_POLICY_HELPER_SHA256_V159
         if optin
         else EXPECTED_REVIEW_POLICY_HELPER_SHA256
     )
@@ -3137,7 +3152,11 @@ def _verify_review_policy_action(
         raise ReleaseVerificationError(
             "review-policy helper contract is invalid"
         ) from None
-    require_review_policy_helper_contract(helper, release_supports_review_optin(ref))
+    require_review_policy_helper_contract(
+        helper,
+        release_supports_review_optin(ref),
+        release_supports_label_mismatch_decline(ref),
+    )
 
 
 def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree, ref: str) -> None:
@@ -5884,7 +5903,9 @@ def _verify_review_invocation_budget(
         ),
     }
     workflow_digests = (
-        EXPECTED_SKIP_REASON_WORKFLOW_SHA256
+        EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256
+        if release_supports_label_mismatch_decline(ref)
+        else EXPECTED_SKIP_REASON_WORKFLOW_SHA256
         if release_supports_skip_reason_notice(ref)
         else EXPECTED_FINDING_DISMISSAL_WORKFLOW_SHA256
         if dismissals

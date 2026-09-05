@@ -154,6 +154,7 @@ FILTER_REASON_SURFACE_RELEASE = (1, 62)
 FINDING_DISMISSAL_RELEASE = (1, 63)
 LABEL_REVIEW_TRIGGER_RELEASE = (1, 64)
 SKIP_REASON_NOTICE_RELEASE = (1, 65)
+LABEL_MISMATCH_DECLINE_RELEASE = (1, 66)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -226,6 +227,12 @@ def release_supports_skip_reason_notice(ref: str) -> bool:
     """Return whether ``ref``'s skipped notices name the reason the review declined."""
 
     return _release_version(ref) >= SKIP_REASON_NOTICE_RELEASE
+
+
+def release_supports_label_mismatch_decline(ref: str) -> bool:
+    """Return whether ``ref`` declines, rather than fails, an event-triggered label change."""
+
+    return _release_version(ref) >= LABEL_MISMATCH_DECLINE_RELEASE
 
 
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:

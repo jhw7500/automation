@@ -17695,6 +17695,7 @@ def test_review_callers_describe_force_review_as_the_override_round(path, job):
 SKIPPED_NOTICE_WORKFLOWS = (
     ("claude-code-review.yml", "Claude Code Review", "claude-code-review"),
     ("gemini-auto-review.yml", "Gemini Auto PR Review", "gemini-auto-review"),
+    ("opencode-auto-review.yml", "OpenCode Auto PR Review", "opencode-auto-review"),
 )
 
 
@@ -17756,6 +17757,7 @@ def test_skipped_notice_distinguishes_every_declining_policy_reason(
         "draft": "draft",
         "closed": "not open",
         "unsafe_pr": "not in this repository",
+        "review_mode_label_mismatch": "label changed",
     }
     for reason, fragment in expected.items():
         rendered = _run_skipped_notice(

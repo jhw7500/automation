@@ -62,7 +62,16 @@ def resolve_policy(request: PolicyRequest) -> PolicyDecision:
     if request.review_mode != label_mode and not (
         manual_request and label_mode == "auto"
     ):
-        raise PolicyError("review_mode_label_mismatch")
+        # A label that moved between the trigger and this read declines the run.
+        # No review happens under either outcome, so failing would only report a
+        # broken reviewer for an ordinary opt-in race, and the labeled event that
+        # follows carries the real verdict. A manual dispatch has no such follow-up
+        # and its request would vanish, so that one still fails.
+        if manual_request:
+            raise PolicyError("review_mode_label_mismatch")
+        return PolicyDecision(
+            False, request.review_mode, "review_mode_label_mismatch", ""
+        )
     head_sha = _validated_head(request.pr, request.repository)
     if request.pr.get("state") != "open":
         return PolicyDecision(False, request.review_mode, "closed", head_sha)
