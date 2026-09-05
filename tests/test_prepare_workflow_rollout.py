@@ -794,3 +794,41 @@ def test_missing_label_names_are_non_blocking_for_explicit_bootstrap(tmp_path: P
     )
     assert plan.status == "bootstrap_required"
     assert "non-blocking prerequisites: missing labels: review-budget-override, review:request, review:skip" in plan.reason
+
+
+def test_a_retired_caller_left_in_a_consumer_is_deleted_not_blocked(
+    tmp_path: Path,
+) -> None:
+    """A consumer still carrying a retired caller must be planned, not refused.
+
+    The catalogue knows the path; it just no longer names a central workflow for
+    it. Treating that as an unknown caller blocks every target in the fleet on
+    the one rollout that is supposed to take the file away.
+    """
+
+    repo = make_existing_repo(tmp_path)
+    retired = repo / ".github/workflows/gemini-pr-review.yml"
+    retired.write_bytes(
+        b"name: Gemini PR Review\n"
+        b"on:\n  workflow_dispatch:\n"
+        b"jobs:\n"
+        b"  review:\n"
+        b"    uses: jhw7500/automation/.github/workflows/gemini-review.yml@"
+        + COMMIT.encode()
+        + b"\n"
+    )
+
+    plan = render_repository(
+        repo,
+        CANONICAL,
+        CATALOG,
+        PROFILES["wlan-package"],
+        "v1.40",
+        COMMIT,
+        ALL_SECRETS,
+        ALL_VARIABLES,
+        label_names=ALL_LABELS,
+    )
+
+    assert plan.status != "blocked", plan.reason
+    assert plan.after(".github/workflows/gemini-pr-review.yml") is None

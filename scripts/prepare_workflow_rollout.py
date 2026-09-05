@@ -722,9 +722,11 @@ def render_repository(
         central_callers = _scan_central_callers(repo, catalog)
     except RolloutError as exc:
         return block(str(exc))
-    catalog_caller_paths = frozenset(entry.path for entry in catalog.callers)
+    # A retired entry keeps its path but no longer names a central workflow, so
+    # comparing against callers alone would call a file the catalogue manages an
+    # unknown one and block the very rollout that takes it away.
     unknown = tuple(
-        path for path, _ in central_callers if path not in catalog_caller_paths
+        path for path, _ in central_callers if path not in catalog.managed_paths
     )
     if unknown:
         return block(f"unknown central caller path: {unknown[0]}")
