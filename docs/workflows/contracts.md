@@ -312,6 +312,47 @@ The `skipped` job's `if:` condition is unchanged: it still covers both causes, a
 verifier requires it to keep testing `policy_run != 'true'`.
 
 
+### What a manual `/review` sees
+
+`@gemini-cli /review` is handled by the `review` job of `gemini-dispatch.yml`. Until `v1.67` that
+job had no diff: it checked out the reviewed commit and told the model to look beyond the change,
+so the model could only answer with general architecture advice and never named anything the pull
+request had touched.
+
+The job now builds the diff itself, in a plain step rather than through the shared
+`prepare-review-diff` action. That action resolves the live head, which would contradict
+`/review commit=<sha>`, and it deletes its output while still exiting zero, so a failure would be
+indistinguishable from having no diff at all.
+
+| Input | Source |
+| --- | --- |
+| head | `reviewed_sha`, so `commit=<sha>` is honoured |
+| base | `base_sha`, taken from the pull request the dispatch job already fetched |
+| incremental base | `last_success_sha`, when `incremental=true` and it is an ancestor of the head |
+
+The `issue_comment` event that carries `/review` has no `pull_request` object, so the base cannot
+be read from the payload. It comes from the `pulls.get` call the dispatch job already makes.
+
+The range is `base...head`, so `commit=<sha>` reviews everything the pull request accumulated up
+to that commit rather than that commit alone. `incremental=true` is how a single round is asked
+for, and it falls back to the pull request base with a notice when the recorded head is not an
+ancestor.
+
+The diff is written into the workspace and the prompt names the file, the range, and an inline
+`git diff --stat`. The summary is there so that a model which cannot read the file still knows
+what changed, rather than reproducing the failure this contract removes.
+
+**A diff that cannot be produced stops the round.** The step reports `diff_ready=false` with one of
+`reviewed_sha_invalid`, `base_sha_invalid`, `max_bytes_invalid`, `base_commit_unavailable`, or
+`diff_too_large`, writes no diff behind it, and the model steps do not run. The reason reaches the
+sticky comment, because a silent skip would look like the original defect. The checkout carries no
+credentials, so a base object missing from the local history is reported rather than fetched.
+
+`GEMINI_MAX_READ_BYTES` bounds both the diff written here and what the model may read, so the job
+cannot leave behind a file too large to be read. Measured pull requests across two repositories sit
+at a median near 9 KB, with about 7% above the 200,000-byte default.
+
+
 ## Deterministic automated-review input
 
 Claude, Gemini, and OpenCode call the same composite action:
