@@ -81,9 +81,24 @@ def test_noneligible_pr_never_runs(change, reason):
     assert decision.reason == reason
 
 
-def test_pull_request_mode_must_match_labels():
-    with pytest.raises(PolicyError, match="review_mode_label_mismatch"):
-        resolve_policy(request(labels=["review:skip"], mode="request"))
+@pytest.mark.parametrize(("labels", "mode"), [
+    (["review:request"], "auto"),
+    (["review:skip"], "request"),
+    ([], "request"),
+    (["review:request"], "skip"),
+])
+def test_event_triggered_label_change_declines_instead_of_failing(labels, mode):
+    """A label that moved after the trigger must decline, not fail the job.
+
+    The run does not review under either outcome, so failing only reports a
+    broken reviewer for what is an ordinary opt-in race. Declining lets the
+    skipped job say which reason declined it.
+    """
+
+    decision = resolve_policy(request(labels=labels, mode=mode))
+    assert decision.run_review is False
+    assert decision.reason == "review_mode_label_mismatch"
+    assert decision.effective_mode == mode
 
 
 def test_manual_force_review_allows_request_without_label():

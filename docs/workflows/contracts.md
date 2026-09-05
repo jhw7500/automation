@@ -263,19 +263,23 @@ repo" or stays silent, and no review appears.
 
 ### When to add the label
 
-`review:request` may be added to an already-open pull request from `v1.64`, but not while the
-`opened` runs are still resolving. Those runs were triggered without the label, so `REVIEW_MODE`
-is `auto` for them; if the resolver reads the pull request after the label lands, trigger-time and
-read-time disagree and the `v1.51` guard fails the `Check if enabled` job closed with
-`review_mode_label_mismatch`. Every reviewer triggered by the same event fails together, and a
-re-run reproduces it because the replayed payload still carries the original mode.
+`review:request` may be added to an already-open pull request from `v1.64`. A label that moves
+while the `opened` runs are still resolving still disagrees with them: those runs were triggered
+without the label, so `REVIEW_MODE` is `auto` for them, and the resolver reads the pull request
+afterwards.
 
-Label after the `opened` runs reach a conclusion, or open the pull request as a draft, label it,
-and then mark it ready. The `labeled` run itself is unaffected: it is triggered with the label
-present, so trigger-time and read-time agree.
+From `v1.66` that disagreement **declines** the run rather than failing it. The resolver returns
+`run-review=false` with reason `review_mode_label_mismatch`, and the `skipped` job says the label
+changed after the run was triggered. Nothing is reviewed under either outcome, so failing only
+reported a broken reviewer for an ordinary opt-in race, and the run started by the label carries
+the verdict. Before `v1.66` all three reviewers failed together and a re-run reproduced it,
+because the replayed payload still carries the original mode.
 
-A run that failed this way reviewed nothing. The verdict for that head comes from the `labeled`
-run, not from the failed one.
+**A manual dispatch still fails.** `workflow_dispatch` with `force_review` has no follow-up run,
+so declining would drop an explicit request; a label that contradicts it is a `PolicyError`.
+
+Labelling after the `opened` runs conclude, or draft → label → ready, avoids the extra runs
+entirely. The `labeled` run is unaffected either way: it is triggered with the label present.
 
 ### Why a managed reviewer did not run
 
@@ -292,6 +296,7 @@ outputs of `check-enabled` through the environment, rejects anything outside the
 | `draft` | the pull request is a draft |
 | `closed` | the pull request is not open |
 | `unsafe_pr` | the head is not in this repository |
+| `review_mode_label_mismatch` | the label changed after the run was triggered; the labelled run carries the verdict |
 | empty | no reason was produced; read the `Check if enabled` job |
 | anything else | the reason verbatim |
 
@@ -299,7 +304,9 @@ Since reviews became opt-in a decline is the ordinary path, so the notice is the
 person looks. Before `v1.65` every one of these said the workflow was disabled in
 `workflow-config.yml`, which sent them to a file whose contents were already correct.
 
-`opencode-auto-review.yml` keeps its own wording and is not part of this contract.
+From `v1.66` `opencode-auto-review.yml` reports the same way. It previously named the
+cross-repository case in a fixed sentence, which the shared vocabulary keeps as `unsafe_pr`;
+leaving it behind would have let it answer a declined label change with three false causes.
 
 The `skipped` job's `if:` condition is unchanged: it still covers both causes, and the release
 verifier requires it to keep testing `policy_run != 'true'`.
