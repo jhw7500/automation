@@ -97,6 +97,7 @@ def restore_pre_v164_label_trigger(repo: Path) -> None:
 def restore_pre_v151_review_policy_callers(repo: Path) -> None:
     """Remove only the v1.51 caller policy surface from historical fixtures."""
 
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
@@ -708,3 +709,58 @@ def restore_pre_v166_label_mismatch_decline(repo: Path) -> None:
         current, historical = PRE_V166_MISMATCH_HUNK
         assert text.count(current) <= 1
         helper.write_text(text.replace(current, historical), encoding="utf-8")
+
+
+RETIRED_MANUAL_PR_REVIEW_ENTRIES = {'.github/workflows/gemini-pr-review.yml': {'path': '.github/workflows/gemini-pr-review.yml', 'kind': 'required', 'central_workflow': 'gemini-review.yml', 'auth_family': 'gemini', 'profile_axis': 'repo_write_auth', 'trigger': {'workflow_dispatch': {'inputs': {'pr_number': {'description': 'Pull request number to review (e.g. 45)', 'required': 'true', 'type': 'string'}, 'additional_context': {'description': 'Optional extra context for the review prompt', 'required': 'false', 'type': 'string'}}}}, 'caller_jobs': [{'name': 'review', 'permissions': {'contents': 'read', 'issues': 'write', 'pull-requests': 'write'}, 'with': ['additional_context', 'app_id', 'issue_body', 'issue_title', 'pr_number', 'repo_write_auth'], 'secrets': ['APP_PRIVATE_KEY', 'GEMINI_API_KEY']}]}, '.github/workflows/gemini-review.yml': {'path': '.github/workflows/gemini-review.yml', 'kind': 'required', 'central_workflow': 'gemini-review.yml', 'auth_family': 'gemini', 'profile_axis': 'repo_write_auth', 'trigger': {'workflow_call': {'inputs': {'pr_number': {'type': 'string', 'description': 'Pull request number', 'required': 'true'}, 'issue_title': {'type': 'string', 'description': 'Pull request title', 'required': 'true'}, 'issue_body': {'type': 'string', 'description': 'Pull request body', 'required': 'true'}, 'additional_context': {'type': 'string', 'description': 'Any additional context from the request', 'required': 'false'}}}}, 'caller_jobs': [{'name': 'review', 'permissions': {'contents': 'read', 'issues': 'write', 'pull-requests': 'write'}, 'with': ['additional_context', 'app_id', 'issue_body', 'issue_title', 'pr_number', 'repo_write_auth'], 'secrets': ['APP_PRIVATE_KEY', 'GEMINI_API_KEY']}]}}
+
+RETIRED_MANUAL_PR_REVIEW_CALLERS = {
+    'gemini-pr-review.yml': (
+        'name: Gemini Manual PR Review\n\non:\n  workflow_dispatch:\n    inputs:\n      pr_number:\n        description: \'Pull request number to review (e.g. 45)\'\n        required: true\n        type: string\n      additional_context:\n        description: \'Optional extra context for the review prompt\'\n        required: false\n        type: string\n\njobs:\n  prepare:\n    runs-on: ubuntu-latest\n    permissions:\n      pull-requests: read\n    outputs:\n      pr_title: ${{ steps.pr.outputs.title }}\n      pr_body: ${{ steps.pr.outputs.body }}\n    steps:\n      - name: Validate pr_number\n        shell: bash\n        env:\n          PR_NUMBER: ${{ inputs.pr_number }}\n        run: |\n          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then\n            echo "pr_number must be a positive integer"\n            exit 1\n          fi\n\n      - name: Fetch PR\n        id: pr\n        shell: bash\n        env:\n          GH_TOKEN: ${{ github.token }}\n          REPO: ${{ github.repository }}\n          PR_NUMBER: ${{ inputs.pr_number }}\n        run: |\n          title="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json title --jq .title)"\n          body="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body --jq .body)"\n\n          write_output() {\n            local name="$1"\n            local value="$2"\n            local delimiter=\'__AUTOMATION_OUTPUT__\'\n            while [[ "$value" == *"$delimiter"* ]]; do\n              delimiter="${delimiter}_X"\n            done\n            {\n              printf \'%s<<%s\\n\' "$name" "$delimiter"\n              printf \'%s\\n\' "$value"\n              printf \'%s\\n\' "$delimiter"\n            } >> "$GITHUB_OUTPUT"\n          }\n\n          write_output title "$title"\n          write_output body "$body"\n\n  review:\n    needs: prepare\n    permissions:\n      contents: read\n      issues: write\n      pull-requests: write\n    uses: jhw7500/automation/.github/workflows/gemini-review.yml@__AUTOMATION_COMMIT__\n    with:\n      pr_number: ${{ inputs.pr_number }}\n      issue_title: ${{ needs.prepare.outputs.pr_title }}\n      issue_body: ${{ needs.prepare.outputs.pr_body }}\n      additional_context: ${{ inputs.additional_context }}\n      repo_write_auth: github_app\n      app_id: ${{ vars.APP_ID }}\n    secrets:\n      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}\n      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}\n'
+    ),
+    'gemini-review.yml': (
+        'name: Gemini Review\n\non:\n  workflow_call:\n    inputs:\n      pr_number:\n        type: string\n        description: Pull request number\n        required: true\n      issue_title:\n        type: string\n        description: Pull request title\n        required: true\n      issue_body:\n        type: string\n        description: Pull request body\n        required: true\n      additional_context:\n        type: string\n        description: Any additional context from the request\n        required: false\n\njobs:\n  review:\n    permissions:\n      contents: read\n      issues: write\n      pull-requests: write\n    uses: jhw7500/automation/.github/workflows/gemini-review.yml@__AUTOMATION_COMMIT__\n    with:\n      pr_number: ${{ inputs.pr_number }}\n      issue_title: ${{ inputs.issue_title }}\n      issue_body: ${{ inputs.issue_body }}\n      additional_context: ${{ inputs.additional_context }}\n      repo_write_auth: github_app\n      app_id: ${{ vars.APP_ID }}\n    secrets:\n      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}\n      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}\n'
+    ),
+}
+
+
+def restore_retired_manual_pr_review(repo: Path) -> None:
+    """Put back the callers v1.68 withdrew, for fixtures on older release lines.
+
+    v1.68 retires the workflow_dispatch pull-request review, but a release before
+    it still shipped both callers and the manual-output contract still describes
+    them. This runs first (newest release first) like the other restores.
+    """
+
+    root = repo / "examples/baseline-workflows/.github/workflows"
+    if not root.exists():
+        return
+    for name, body in RETIRED_MANUAL_PR_REVIEW_CALLERS.items():
+        path = root / name
+        # Idempotent: a fixture that still carries the caller is left alone.
+        if not path.exists():
+            path.write_text(body, encoding="utf-8")
+    catalog = repo / "scripts/workflow-catalog.json"
+    if not catalog.exists():
+        return
+    # The canonical tree is checked against the catalog in the same tree, so the
+    # entries have to come back with the files.
+    data = json.loads(catalog.read_text(encoding="utf-8"))
+    changed = False
+    for entry in data.get("entries", []):
+        historical = RETIRED_MANUAL_PR_REVIEW_ENTRIES.get(entry.get("path"))
+        if historical is not None and entry.get("kind") == "retired":
+            entry.clear()
+            entry.update(historical)
+            changed = True
+    if changed:
+        catalog.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    config = repo / "examples/baseline-workflows/.github/workflow-config.yml"
+    if not config.exists():
+        return
+    # The bootstrap contract requires an entry for every managed workflow, so the
+    # disabled keys come back with the callers.
+    text = config.read_text(encoding="utf-8")
+    anchor = "  gemini-scheduled-triage:\n"
+    keys = "  gemini-pr-review:\n    enabled: false\n  gemini-review:\n    enabled: false\n"
+    if anchor in text and "  gemini-pr-review:\n" not in text:
+        config.write_text(text.replace(anchor, keys + anchor, 1), encoding="utf-8")

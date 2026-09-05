@@ -305,103 +305,21 @@
     },
     {
       "path": ".github/workflows/gemini-pr-review.yml",
-      "kind": "required",
-      "central_workflow": "gemini-review.yml",
-      "auth_family": "gemini",
-      "profile_axis": "repo_write_auth",
-      "trigger": {
-        "workflow_dispatch": {
-          "inputs": {
-            "pr_number": {
-              "description": "Pull request number to review (e.g. 45)",
-              "required": "true",
-              "type": "string"
-            },
-            "additional_context": {
-              "description": "Optional extra context for the review prompt",
-              "required": "false",
-              "type": "string"
-            }
-          }
-        }
-      },
-      "caller_jobs": [
-        {
-          "name": "review",
-          "permissions": {
-            "contents": "read",
-            "issues": "write",
-            "pull-requests": "write"
-          },
-          "with": [
-            "additional_context",
-            "app_id",
-            "issue_body",
-            "issue_title",
-            "pr_number",
-            "repo_write_auth"
-          ],
-          "secrets": [
-            "APP_PRIVATE_KEY",
-            "GEMINI_API_KEY"
-          ]
-        }
-      ]
+      "kind": "retired",
+      "central_workflow": null,
+      "auth_family": "none",
+      "profile_axis": null,
+      "trigger": {},
+      "caller_jobs": []
     },
     {
       "path": ".github/workflows/gemini-review.yml",
-      "kind": "required",
-      "central_workflow": "gemini-review.yml",
-      "auth_family": "gemini",
-      "profile_axis": "repo_write_auth",
-      "trigger": {
-        "workflow_call": {
-          "inputs": {
-            "pr_number": {
-              "type": "string",
-              "description": "Pull request number",
-              "required": "true"
-            },
-            "issue_title": {
-              "type": "string",
-              "description": "Pull request title",
-              "required": "true"
-            },
-            "issue_body": {
-              "type": "string",
-              "description": "Pull request body",
-              "required": "true"
-            },
-            "additional_context": {
-              "type": "string",
-              "description": "Any additional context from the request",
-              "required": "false"
-            }
-          }
-        }
-      },
-      "caller_jobs": [
-        {
-          "name": "review",
-          "permissions": {
-            "contents": "read",
-            "issues": "write",
-            "pull-requests": "write"
-          },
-          "with": [
-            "additional_context",
-            "app_id",
-            "issue_body",
-            "issue_title",
-            "pr_number",
-            "repo_write_auth"
-          ],
-          "secrets": [
-            "APP_PRIVATE_KEY",
-            "GEMINI_API_KEY"
-          ]
-        }
-      ]
+      "kind": "retired",
+      "central_workflow": null,
+      "auth_family": "none",
+      "profile_axis": null,
+      "trigger": {},
+      "caller_jobs": []
     },
     {
       "path": ".github/workflows/gemini-scheduled-triage.yml",

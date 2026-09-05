@@ -54,8 +54,6 @@ EXPECTED_WORKFLOW_NAMES = {
     "gemini-dispatch",
     "gemini-invoke",
     "gemini-issue-triage",
-    "gemini-pr-review",
-    "gemini-review",
     "gemini-scheduled-triage",
     "gemini-triage",
     "opencode",
@@ -181,48 +179,6 @@ EXPECTED_TRIGGERS: dict[str, object] = {
             }
         }
     },
-    "gemini-pr-review.yml": {
-        "workflow_dispatch": {
-            "inputs": {
-                "pr_number": {
-                    "description": "Pull request number to review (e.g. 45)",
-                    "required": "true",
-                    "type": "string",
-                },
-                "additional_context": {
-                    "description": "Optional extra context for the review prompt",
-                    "required": "false",
-                    "type": "string",
-                },
-            }
-        }
-    },
-    "gemini-review.yml": {
-        "workflow_call": {
-            "inputs": {
-                "pr_number": {
-                    "type": "string",
-                    "description": "Pull request number",
-                    "required": "true",
-                },
-                "issue_title": {
-                    "type": "string",
-                    "description": "Pull request title",
-                    "required": "true",
-                },
-                "issue_body": {
-                    "type": "string",
-                    "description": "Pull request body",
-                    "required": "true",
-                },
-                "additional_context": {
-                    "type": "string",
-                    "description": "Any additional context from the request",
-                    "required": "false",
-                },
-            }
-        }
-    },
     "gemini-scheduled-triage.yml": {"workflow_dispatch": ""},
     "gemini-triage.yml": {
         "workflow_call": {
@@ -318,8 +274,6 @@ EXPECTED_CALLER_PERMISSIONS = {
     "gemini-dispatch.yml": ("dispatch", STANDARD_WRITE_PERMISSIONS),
     "gemini-invoke.yml": ("invoke", STANDARD_WRITE_PERMISSIONS),
     "gemini-issue-triage.yml": ("triage", STANDARD_WRITE_PERMISSIONS),
-    "gemini-pr-review.yml": ("review", STANDARD_WRITE_PERMISSIONS),
-    "gemini-review.yml": ("review", STANDARD_WRITE_PERMISSIONS),
     "gemini-scheduled-triage.yml": ("triage", STANDARD_WRITE_PERMISSIONS),
     "gemini-triage.yml": ("triage", STANDARD_WRITE_PERMISSIONS),
     "opencode.yml": ("opencode", STANDARD_WRITE_PERMISSIONS),

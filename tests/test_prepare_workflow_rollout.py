@@ -156,31 +156,15 @@ def test_app_and_token_profiles_differ_only_by_declared_auth_lines(
 ) -> None:
     app = render_fixture(tmp_path / "app", auth="github_app")
     token = render_fixture(tmp_path / "token", auth="github_token")
-    template = (CANONICAL / "workflows/gemini-review.yml").read_bytes()
-    assert template.count(b"@__AUTOMATION_COMMIT__") == 1
-    app_expected = template.replace(
-        b"@__AUTOMATION_COMMIT__", f"@{COMMIT}".encode()
-    )
-    assert app.after(".github/workflows/gemini-review.yml") == app_expected
-
-    assert app_expected.count(b"repo_write_auth: github_app") == 1
-    assert app_expected.count(b"      app_id: ${{ vars.APP_ID }}\n") == 1
-    assert (
-        app_expected.count(
-            b"      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}\n"
-        )
-        == 1
-    )
-    token_expected = (
-        app_expected.replace(
-            b"repo_write_auth: github_app", b"repo_write_auth: github_token"
-        )
-        .replace(b"      app_id: ${{ vars.APP_ID }}\n", b"")
-        .replace(
-            b"      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}\n", b""
-        )
-    )
-    assert token.after(".github/workflows/gemini-review.yml") == token_expected
+    # v1.68 retired the workflow_dispatch pull-request review, so a rollout must
+    # take the caller away rather than render it. gemini-auto-review below still
+    # covers the app/token profile difference this test was written for.
+    retired = {
+        PurePosixPath(f".github/workflows/{name}")
+        for name in ("gemini-pr-review.yml", "gemini-review.yml")
+    }
+    for plan in (app, token):
+        assert not retired & {change.path for change in plan.changes}
 
     auto_template = (CANONICAL / "workflows/gemini-auto-review.yml").read_bytes()
     auto_app = auto_template.replace(

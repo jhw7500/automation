@@ -156,6 +156,7 @@ LABEL_REVIEW_TRIGGER_RELEASE = (1, 64)
 SKIP_REASON_NOTICE_RELEASE = (1, 65)
 LABEL_MISMATCH_DECLINE_RELEASE = (1, 66)
 DISPATCH_REVIEW_DIFF_RELEASE = (1, 67)
+MANUAL_PR_REVIEW_RETIRED_RELEASE = (1, 68)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -240,6 +241,12 @@ def release_supports_dispatch_review_diff(ref: str) -> bool:
     """Return whether ``ref``'s manual `/review` reviews a diff instead of the bare checkout."""
 
     return _release_version(ref) >= DISPATCH_REVIEW_DIFF_RELEASE
+
+
+def release_retires_manual_pr_review(ref: str) -> bool:
+    """Return whether ``ref`` has withdrawn the workflow_dispatch pull-request review."""
+
+    return _release_version(ref) >= MANUAL_PR_REVIEW_RETIRED_RELEASE
 
 
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:

@@ -54,6 +54,7 @@ from scripts.workflow_release_inventory import (
     release_supports_skip_reason_notice,
     release_supports_label_mismatch_decline,
     release_supports_dispatch_review_diff,
+    release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
     validate_release_listing,
@@ -3573,7 +3574,14 @@ def _verify_manual_gemini_output_contract(
     if _release_version(ref) < (1, 40, 2):
         return
     root = "examples/baseline-workflows/.github/workflows"
+    # v1.68 withdrew the workflow_dispatch pull-request review, so its contract
+    # describes a file the release no longer ships.
+    retired = (
+        {"gemini-pr-review.yml"} if release_retires_manual_pr_review(ref) else set()
+    )
     for filename, contract in MANUAL_GEMINI_FETCH_CONTRACTS.items():
+        if filename in retired:
+            continue
         path = f"{root}/{filename}"
         try:
             document = _load_release_yaml(

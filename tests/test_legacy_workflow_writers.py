@@ -415,7 +415,6 @@ def _parse_github_outputs(text: str) -> dict[str, str]:
     ("filename", "step_name"),
     (
         ("gemini-issue-triage.yml", "Fetch issue"),
-        ("gemini-pr-review.yml", "Fetch PR"),
     ),
 )
 def test_manual_gemini_fetch_preserves_hostile_multiline_outputs(

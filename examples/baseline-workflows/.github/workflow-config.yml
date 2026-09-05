@@ -19,10 +19,6 @@ workflows:
     enabled: false
   gemini-issue-triage:
     enabled: false
-  gemini-pr-review:
-    enabled: false
-  gemini-review:
-    enabled: false
   gemini-scheduled-triage:
     enabled: false
   gemini-triage:

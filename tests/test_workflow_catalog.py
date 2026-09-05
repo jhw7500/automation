@@ -54,7 +54,6 @@ def test_catalog_and_profiles_are_closed() -> None:
     assert by_kind["required"] == {
         "claude.yml", "claude-code-review.yml", "gemini-auto-review.yml",
         "gemini-dispatch.yml", "gemini-invoke.yml", "gemini-issue-triage.yml",
-        "gemini-pr-review.yml", "gemini-review.yml",
         "gemini-scheduled-triage.yml", "gemini-triage.yml",
     }
     assert by_kind["optional"] == {
@@ -62,7 +61,11 @@ def test_catalog_and_profiles_are_closed() -> None:
         "opencode.yml", "opencode-auto-review.yml",
     }
     assert by_kind["config"] == {"workflow-config.yml"}
-    assert by_kind["retired"] == {"bump-automation-ref.yml"}
+    # v1.68 withdrew the workflow_dispatch pull-request review: it had produced no
+    # successful review since January, blocked by its own PATH override.
+    assert by_kind["retired"] == {
+        "bump-automation-ref.yml", "gemini-pr-review.yml", "gemini-review.yml",
+    }
 
     callers = {
         entry.path.name: entry
