@@ -29,6 +29,7 @@ from release_fixture_helpers import (
     restore_pre_force_review_callers,
     restore_pre_v151_review_policy,
     restore_pre_v164_label_trigger,
+    restore_retired_manual_pr_review,
     restore_pre_v166_label_mismatch_decline,
     restore_pre_v165_skip_reason_notice,
     restore_v145_review_workflows,
@@ -150,6 +151,9 @@ def restore_historical_v140_manual_outputs(repo: Path) -> None:
     fixture_root = Path(__file__).parent / "fixtures"
     snapshot = fixture_root / "workflow-config-v1.40.json"
     (repo / "scripts/workflow-config.json").write_bytes(snapshot.read_bytes())
+    # v1.68 withdrew the manual pull-request review; a v1.40 fixture still
+    # ships it, so put the caller back before rewriting its bytes.
+    restore_retired_manual_pr_review(repo)
     root = repo / "examples/baseline-workflows/.github/workflows"
     # 요청 범위 run-name 은 v1.40 이후에 추가됐다 — 정책 스냅샷 바이트를 맞추려면
     # 태그 픽스처에서 그 줄을 제거해야 한다.
@@ -236,6 +240,7 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
@@ -275,6 +280,7 @@ def v1462_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
@@ -522,6 +528,7 @@ def copy_review_policy_release_files(repo: Path) -> None:
 
 def prepare_v151(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
@@ -535,6 +542,7 @@ def prepare_v151(repo: Path) -> str:
 
 def prepare_v159(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
@@ -548,6 +556,7 @@ def prepare_v159(repo: Path) -> str:
 
 def prepare_v160(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
@@ -1980,6 +1989,7 @@ def test_v159_opt_in_helper_is_rejected_on_the_v151_release_line(
 
 def prepare_v162(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
@@ -1996,6 +2006,7 @@ def prepare_v162(repo: Path) -> str:
 
 def prepare_v163(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)
@@ -2011,6 +2022,7 @@ def prepare_v163(repo: Path) -> str:
 
 def prepare_v164(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
     for relative in (
@@ -2025,6 +2037,7 @@ def prepare_v164(repo: Path) -> str:
 
 def prepare_v165(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
@@ -2038,6 +2051,7 @@ def prepare_v165(repo: Path) -> str:
 
 def prepare_v166(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_retired_manual_pr_review(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
@@ -2051,6 +2065,7 @@ def prepare_v166(repo: Path) -> str:
 
 def prepare_v167(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_retired_manual_pr_review(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
@@ -2061,6 +2076,59 @@ def prepare_v167(repo: Path) -> str:
     ):
         shutil.copy2(ROOT / relative, repo / relative)
     return commit(repo, "v1.67 candidate")
+
+
+def prepare_v168(repo: Path) -> str:
+    copy_review_policy_release_files(repo)
+    for relative in (
+        ".github/actions/review-invocation-budget/action.yml",
+        ".github/actions/review-invocation-budget/review_invocation_budget.py",
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+        ".github/actions/resolve-review-policy/resolve_review_policy.py",
+        ".github/workflows/gemini-dispatch.yml",
+    ):
+        shutil.copy2(ROOT / relative, repo / relative)
+    for name in ("gemini-pr-review.yml", "gemini-review.yml"):
+        (repo / "examples/baseline-workflows/.github/workflows" / name).unlink(
+            missing_ok=True
+        )
+    config = repo / "examples/baseline-workflows/.github/workflow-config.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  gemini-pr-review:\n    enabled: false\n"
+            "  gemini-review:\n    enabled: false\n",
+            "",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    shutil.copy2(ROOT / "scripts/workflow-catalog.json", repo / "scripts/workflow-catalog.json")
+    return commit(repo, "v1.68 candidate")
+
+
+def test_v168_accepts_the_retired_manual_pull_request_review(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v168(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.68", candidate) == candidate
+
+
+def test_v167_still_requires_the_manual_pull_request_review(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    """A release before v1.68 still ships the caller it retires.
+
+    Without this the retirement would read as a contract that never existed.
+    """
+
+    repo, _ = current_release_repo
+    candidate = prepare_v168(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.67", candidate)
 
 
 def test_v167_accepts_current_dispatch_review_diff_contract(
@@ -2259,6 +2327,7 @@ def test_pre_v162_filter_surface_is_rejected_on_the_v162_release_line(
 
 def prepare_v161(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
     restore_pre_v164_label_trigger(repo)

@@ -26,6 +26,7 @@ from scripts.workflow_release_inventory import EXACT_RELEASE_ROOTS, RELEASE_PATH
 from release_fixture_helpers import (
     restore_historical_automation_ref,
     restore_historical_review_workflows,
+    restore_retired_manual_pr_review,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -527,6 +528,7 @@ def release_repo(tmp_path: Path) -> tuple[Path, str]:
     # restore_historical_v140_manual_outputs 와 달리 config 값만 되돌린다 — 이 파일의
     # 태그(v1.40.2)는 manual-output contract 게이트(>=1.40.2) 대상이라 hardened 블록을
     # 유지해야 하기 때문이다(전체 v1.40 복원을 쓰면 검증이 실패한다).
+    restore_retired_manual_pr_review(repo)
     restore_historical_automation_ref(repo, "v1.40")
     # v1.40.2 predates the shared review action; use genuine committed v1.44
     # central workflow bytes rather than deleting dependencies from live workflows.
