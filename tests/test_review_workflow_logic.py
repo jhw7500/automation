@@ -6695,7 +6695,12 @@ def test_dispatch_resolves_current_pr_head_and_validates_requested_commit_member
     current_head = "ab" * 20
     older_commit = "cd" * 20
     fixture_files = {default_head: "default-only", current_head: "pr-head-only"}
-    pull_request = {"number": 7, "head": {"sha": current_head}}
+    base_sha = "ba" * 20
+    pull_request = {
+        "number": 7,
+        "head": {"sha": current_head},
+        "base": {"sha": base_sha},
+    }
     pull_commits = [{"sha": older_commit}, {"sha": current_head}]
     for name in ("current", "commit", "foreign"):
         (tmp_path / name).mkdir()
@@ -6717,6 +6722,9 @@ def test_dispatch_resolves_current_pr_head_and_validates_requested_commit_member
     ]
     assert current_head != default_head
     assert fixture_files[reviewed[0][2]] == "pr-head-only"
+    # The issue_comment payload that carries /review has no pull_request object,
+    # so the diff step's base can only come from this call.
+    assert ["output", "base_sha", base_sha] in current_calls
 
     commit_calls = _run_upsert(
         tmp_path / "commit",
@@ -17796,3 +17804,179 @@ def test_skipped_notice_takes_the_reason_through_env_and_rejects_stray_text(
     )
     assert result.returncode != 0
     assert not (tmp_path / "must-not-exist").exists()
+
+
+# ---------------------------------------------------------------------------
+# dispatch review diff: the manual /review path must see the change (#133)
+# ---------------------------------------------------------------------------
+
+DISPATCH_MODEL_STEPS = (
+    "Run Gemini pull request review (primary)",
+    "Run Gemini pull request review (fallback)",
+)
+
+
+def _dispatch_diff_step() -> dict:
+    return _step(_load("gemini-dispatch.yml"), "review", "Prepare review diff")
+
+
+def _run_dispatch_diff(tmp_path, out, env):
+    step = _dispatch_diff_step()
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "GITHUB_OUTPUT": str(out),
+            "RUNNER_TEMP": str(tmp_path),
+            "INCREMENTAL": "false",
+            "LAST_SUCCESS_SHA": "",
+            "MAX_DIFF_BYTES": "200000",
+            **env,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = dict(_github_outputs(out))
+    outputs.update(_github_delimited_outputs(out))
+    return outputs, result
+
+
+def test_dispatch_review_prepares_a_diff_for_the_reviewed_sha(tmp_path):
+    """Removing this step leaves the model with no record of what changed.
+
+    That is exactly the state issue #133 reported: the review ran, reported
+    success, and never mentioned anything the pull request had touched.
+    """
+
+    base, head = _two_commit_repo(tmp_path)
+    outputs, _ = _run_dispatch_diff(
+        tmp_path, tmp_path / "out", {"BASE_SHA": base, "REVIEWED_SHA": head}
+    )
+
+    assert outputs["diff_ready"] == "true"
+    assert outputs["diff_reason"] == "ok"
+    assert outputs["diff_range"] == f"{base[:12]}...{head[:12]}"
+    body = (tmp_path / outputs["diff_file"]).read_text(encoding="utf-8")
+    assert "a.py" in body and "b.py" in body
+    assert "print('v2')" in body
+    assert "a.py" in outputs["diff_stat"]
+
+
+def test_dispatch_review_diff_honours_an_incremental_base(tmp_path):
+    base, head = _two_commit_repo(tmp_path)
+    outputs, _ = _run_dispatch_diff(
+        tmp_path,
+        tmp_path / "out",
+        {
+            "BASE_SHA": base,
+            "REVIEWED_SHA": head,
+            "INCREMENTAL": "true",
+            "LAST_SUCCESS_SHA": base,
+        },
+    )
+    assert outputs["diff_ready"] == "true"
+    assert outputs["diff_range"] == f"{base[:12]}...{head[:12]}"
+
+    unrelated = "0" * 40
+    outputs, result = _run_dispatch_diff(
+        tmp_path,
+        tmp_path / "out2",
+        {
+            "BASE_SHA": base,
+            "REVIEWED_SHA": head,
+            "INCREMENTAL": "true",
+            "LAST_SUCCESS_SHA": unrelated,
+        },
+    )
+    assert outputs["diff_ready"] == "true"
+    assert "fell back to the pull request base" in result.stdout
+
+
+@pytest.mark.parametrize(("env", "reason"), [
+    ({"MAX_DIFF_BYTES": "1000", "_big": "1"}, "diff_too_large"),
+    ({"BASE_SHA": "0" * 40}, "base_commit_unavailable"),
+    ({"BASE_SHA": "nope"}, "base_sha_invalid"),
+    ({"REVIEWED_SHA": "nope"}, "reviewed_sha_invalid"),
+    ({"MAX_DIFF_BYTES": "0"}, "max_bytes_invalid"),
+])
+def test_dispatch_review_diff_declines_with_a_named_reason(tmp_path, env, reason):
+    """An unreadable diff must be named, not left for the model to trip over.
+
+    A file the model cannot read looks the same to a reader as no diff at all,
+    so every refusal reports which one it was and writes no diff behind it.
+    """
+
+    base, head = _two_commit_repo(tmp_path)
+    env = dict(env)
+    if env.pop("_big", None):
+        (tmp_path / "big.txt").write_text("padding line\n" * 400, encoding="utf-8")
+        _git(tmp_path, "add", "big.txt")
+        _git(tmp_path, "commit", "-qm", "big")
+        head = _git(tmp_path, "rev-parse", "HEAD")
+    outputs, _ = _run_dispatch_diff(
+        tmp_path, tmp_path / "out", {"BASE_SHA": base, "REVIEWED_SHA": head, **env}
+    )
+
+    assert outputs["diff_ready"] == "false"
+    assert outputs["diff_reason"] == reason
+    assert not (tmp_path / outputs["diff_file"]).exists()
+
+
+@pytest.mark.parametrize("step_name", DISPATCH_MODEL_STEPS)
+def test_dispatch_model_steps_read_the_prepared_diff(step_name):
+    workflow = _load("gemini-dispatch.yml")
+    step = _step(workflow, "review", step_name)
+    prompt = step["with"]["prompt"]
+
+    assert "${{ steps.review_diff.outputs.diff_file }}" in prompt
+    assert "${{ steps.review_diff.outputs.diff_stat }}" in prompt
+    assert "${{ steps.review_diff.outputs.diff_range }}" in prompt
+    assert "Review that diff first" in prompt
+    assert "Do NOT repeat change-specific findings" not in prompt
+
+
+def test_dispatch_primary_model_waits_for_a_ready_diff():
+    step = _step(_load("gemini-dispatch.yml"), "review", DISPATCH_MODEL_STEPS[0])
+    assert step["if"] == "steps.review_diff.outputs.diff_ready == 'true'"
+
+
+def test_dispatch_base_sha_is_published_for_the_review_job():
+    workflow = _load("gemini-dispatch.yml")
+    assert workflow["jobs"]["dispatch"]["outputs"]["base_sha"] == (
+        "${{ steps.resolve_review_target.outputs.base_sha }}"
+    )
+    resolve = _step(workflow, "dispatch", "Resolve review target")
+    assert "core.setOutput('base_sha', baseSha)" in resolve["with"]["script"]
+
+
+def test_dispatch_final_result_names_an_unavailable_diff(tmp_path):
+    step = _step(_load("gemini-dispatch.yml"), "review", "Set final review result")
+    out = tmp_path / "out"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "GITHUB_OUTPUT": str(out),
+            "PRIMARY_OUTCOME": "skipped",
+            "PRIMARY_MODEL": "m",
+            "PRIMARY_RESPONSE": "",
+            "PRIMARY_ERRORS": "",
+            "FALLBACK_OUTCOME": "",
+            "FALLBACK_MODEL": "f",
+            "FALLBACK_RESPONSE": "",
+            "FALLBACK_ERRORS": "",
+            "DIFF_READY": "false",
+            "DIFF_REASON": "diff_too_large",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = _github_delimited_outputs(out)
+    assert outputs["outcome"] == "failure"
+    assert outputs["errors"] == "review diff unavailable: diff_too_large"
