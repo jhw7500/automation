@@ -2049,6 +2049,69 @@ def prepare_v166(repo: Path) -> str:
     return commit(repo, "v1.66 candidate")
 
 
+def prepare_v167(repo: Path) -> str:
+    copy_review_policy_release_files(repo)
+    for relative in (
+        ".github/actions/review-invocation-budget/action.yml",
+        ".github/actions/review-invocation-budget/review_invocation_budget.py",
+        ".github/actions/canonicalize-review/action.yml",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+        ".github/actions/resolve-review-policy/resolve_review_policy.py",
+        ".github/workflows/gemini-dispatch.yml",
+    ):
+        shutil.copy2(ROOT / relative, repo / relative)
+    return commit(repo, "v1.67 candidate")
+
+
+def test_v167_accepts_current_dispatch_review_diff_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v167(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.67", candidate) == candidate
+
+
+def test_v167_rejects_a_dispatch_review_that_prepares_no_diff(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    """Deleting the diff step must fail the release, not pass quietly.
+
+    Nothing described this path before, so the reviewer could be handed a bare
+    checkout while every existing contract stayed green.
+    """
+
+    repo, _ = current_release_repo
+    candidate = prepare_v167(repo)
+    workflow = repo / ".github/workflows/gemini-dispatch.yml"
+    text = workflow.read_text(encoding="utf-8")
+    start = text.index("      - name: Prepare review diff\n")
+    end = text.index("      - name: Run Gemini pull request review (primary)\n")
+    workflow.write_text(text[:start] + text[end:], encoding="utf-8")
+    candidate = commit(repo, "v1.67 without the diff step")
+
+    with pytest.raises(ReleaseVerificationError, match="does not prepare a diff"):
+        release_verifier.verify_commit_content(repo, "v1.67", candidate)
+
+
+def test_v167_rejects_a_review_model_that_ignores_the_prepared_diff(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    prepare_v167(repo)
+    workflow = repo / ".github/workflows/gemini-dispatch.yml"
+    workflow.write_text(
+        workflow.read_text(encoding="utf-8").replace(
+            "${{ steps.review_diff.outputs.diff_file }}", "review.diff", 1
+        ),
+        encoding="utf-8",
+    )
+    candidate = commit(repo, "v1.67 with an unwired prompt")
+
+    with pytest.raises(ReleaseVerificationError, match="does not read the prepared diff"):
+        release_verifier.verify_commit_content(repo, "v1.67", candidate)
+
+
 def test_v166_accepts_current_label_mismatch_release_contract(
     current_release_repo: tuple[Path, str],
 ) -> None:

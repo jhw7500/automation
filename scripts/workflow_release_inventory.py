@@ -155,6 +155,7 @@ FINDING_DISMISSAL_RELEASE = (1, 63)
 LABEL_REVIEW_TRIGGER_RELEASE = (1, 64)
 SKIP_REASON_NOTICE_RELEASE = (1, 65)
 LABEL_MISMATCH_DECLINE_RELEASE = (1, 66)
+DISPATCH_REVIEW_DIFF_RELEASE = (1, 67)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -233,6 +234,12 @@ def release_supports_label_mismatch_decline(ref: str) -> bool:
     """Return whether ``ref`` declines, rather than fails, an event-triggered label change."""
 
     return _release_version(ref) >= LABEL_MISMATCH_DECLINE_RELEASE
+
+
+def release_supports_dispatch_review_diff(ref: str) -> bool:
+    """Return whether ``ref``'s manual `/review` reviews a diff instead of the bare checkout."""
+
+    return _release_version(ref) >= DISPATCH_REVIEW_DIFF_RELEASE
 
 
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:
