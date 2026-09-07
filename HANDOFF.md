@@ -2,18 +2,25 @@
 
 _2026-09-07 · claude-code · 브랜치 `feat/128-opencode-finding-ids` · **#128 Phase 1 구현 완료, 검증 중**_
 
-## 체크포인트 — #128 Phase 1 (OpenCode finding 에 RVW- ID 부여)
-- **완료·검증됨**: OpenCode 정규화기가 finding heading 에 `RVW-<12hex>` 를 발행한다.
-  `tests/test_review_workflow_logic.py` **1667 passed**(기준선 1650 + 신규 17), 릴리스 게이트
-  v1.70 3종 통과, actionlint exit 0. 새 테스트는 전부 **양쪽 arm 검증** — 깨끗한 main 에 대고
-  돌려 4건 빨강(`remaining_finding_ids` `[]` → `['RVW-…']`), 나머지는 개별 변형으로 확인.
-- **다음 액션 1개**: 남은 스위트(`test_verify_workflow_release.py` 전체 + 그 외 전체) 초록 확인
-  → 커밋 → PR(리뷰 라운드) → **v1.70 릴리스 + 17타깃 롤아웃** → `automation_ref` 범프 PR.
-- **제약**: `gh`·`git push` 는 `env -u GITHUB_TOKEN`. 롤아웃은 `--actionlint /tmp/actionlint-v1.7.12/actionlint`.
-  actionlint 는 `-shellcheck= -pyflakes=` 로만. 스위트는 3분할(`--ignore` 큰 둘 + 각각 단독).
-  **워크플로를 1바이트라도 더 고치면** `EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256["opencode"]`
-  (`scripts/verify_workflow_release.py:800`) 를 `sha256sum` 으로 다시 맞춰야 한다.
-- **열린 이슈**: #128(작업 중) · #145 · #133 잔여 · #125 · #106 · #93 · #83. #112 는 **Phase 2 에서 닫힌다**.
+## 체크포인트 — #128 Phase 1, PR #151 리뷰 라운드 종료
+- **완료·검증됨**: 커밋 `7b19fc7`, PR **#151**. 전체 스위트 **3105 passed / 0 failed**
+  (part1 832 · part2 1667 · part3 606), actionlint OK. 신규 테스트 20건 전부 양쪽 arm 검증.
+  리뷰 라운드: **Claude·Gemini 지적 0건**, OpenCode 는 `wall_time_exhausted` 로 실패.
+- **OpenCode 실패는 이 변경과 무관**: 후보 아티팩트가 `elapsed_seconds: 610`(잡 상한 10분),
+  `review_sha256: null`, `candidate_validations: []` — 모델이 62KB diff 에서 잘렸고 후보 자체가
+  없었다. 내 변경은 후보가 생긴 뒤의 렌더 경로다. 실패 경로는 프로덕션에서 정상 동작 확인됨
+  (`provider_failed` 스티키를 내 수정본이 게시). **아직 못 본 것은 성공 경로의 ID 렌더링뿐이다.**
+- **같은 head 재시도는 설계상 불가**: `contracts.md:249-255` — override 라운드는 Claude·Gemini
+  전용이고 v1.62 부터 OpenCode 는 거절된다(dispatch 라운드는 발행할 수 없으므로). override 는
+  소비되지 않았다(0/1). 재시도하려면 **새 head** 가 필요하다(#145 와 같은 규칙).
+- **다음 액션 1개**: PR #151 머지 → **v1.70 릴리스 + 17타깃 롤아웃** → `automation_ref` 범프 PR.
+  ID 렌더링 실기 확인은 범프 PR(작은 diff)에서 자연히 이뤄진다.
+- **제약**: `gh`·`git push` 는 `env -u GITHUB_TOKEN`. actionlint 는 `-shellcheck= -pyflakes=`.
+  스위트 3분할. 워크플로를 1바이트라도 고치면
+  `EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256["opencode"]`(`verify_workflow_release.py:800`) 재계산.
+- **열린 이슈**: #128(작업 중) · #150 · #145 · #133 잔여 · #125 · #106 · #93 · #83. #112 는 Phase 2 에서 닫힌다.
+  **신규 관측**: 62KB diff 에서 600초 벽시계 한도가 부족하다 — #145(77초 빈 스트림)와 증상이 달라
+  별도 기록 대상이다.
 
 ## #128 설계 결정 (접근 검증 리뷰 판정 C 반영)
 - **이슈의 7단계 중 2번(캐리오버 결속을 ID 키로 전환)은 연기**한다 — 영구 기각이 아니라
