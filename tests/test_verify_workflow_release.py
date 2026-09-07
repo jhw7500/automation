@@ -4006,7 +4006,8 @@ def test_v145_review_fixtures_match_the_immutable_release_blobs(
     assert hashlib.sha1(
         f"blob {len(payload)}\0".encode("ascii") + payload
     ).hexdigest() == oid
-    assert path.stat().st_mode & 0o777 == 0o644
+    # Mode is deliberately unasserted: no consumer of this root reads it, and
+    # path.stat() mixes the checkout's umask with the one bit Git records.
 
 
 def test_v145_review_workflows_restore_without_invoking_git(
