@@ -55,6 +55,7 @@ from scripts.workflow_release_inventory import (
     release_supports_label_mismatch_decline,
     release_supports_dispatch_review_diff,
     release_supports_opencode_finding_ids,
+    release_supports_opencode_dismissals,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
@@ -743,6 +744,12 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V162 = (
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V163 = (
     "2123326a018589644cd9f5e1e49bdb33eaca8096272bd8396583da2f0f9518b7"
 )
+# v1.71 stops excluding OpenCode from dismissals: that reviewer gained `RVW-` identifiers in
+# v1.70, so the guard that skipped it — and the one that hid the dismissal line from its ledger
+# comment — no longer describe anything true.
+EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V171 = (
+    "0435025c49ec29357220ee934abc9946440c7019a6d5a47e1586632851de1cbd"
+)
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d4db53b86603a3a113999409e2e4e35c397adf276981e7f68c0ea57a6198faa2",
     "gemini": "cbd69aba74ec0f3380591f14d0adcb6543faad5e237a855dbec246750e2b5206",
@@ -798,6 +805,13 @@ EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256 = {
     "claude": "a6116cf542876a46e8401e26471324a586772398ad5d21360155e686123104be",
     "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
     "opencode": "218292d680481a85ece7f118c0d4c38f855682c4ebe6941322d5fee2799143d0",
+}
+# v1.71 applies dismissals in the OpenCode canonicalizer and validates carryover anchors one
+# block at a time. Claude and Gemini are unchanged.
+EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256 = {
+    "claude": "a6116cf542876a46e8401e26471324a586772398ad5d21360155e686123104be",
+    "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
+    "opencode": "3803e294dc7975af1a2b6812639fd11ee55c97d6f92258281d2df770c8d6c433",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
@@ -2494,6 +2508,7 @@ def verify_opencode_runtime(
         EXPECTED_FILTER_REASON_WORKFLOW_SHA256["opencode"],
         EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256["opencode"],
         EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256["opencode"],
+        EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256["opencode"],
     }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
@@ -2530,6 +2545,7 @@ def verify_opencode_runtime(
             EXPECTED_FILTER_REASON_WORKFLOW_SHA256["opencode"],
             EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256["opencode"],
             EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256["opencode"],
+            EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256["opencode"],
         }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
@@ -5913,7 +5929,9 @@ def _verify_review_invocation_budget(
         ),
         REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix(): (
             helper_payload,
-            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V163
+            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V171
+            if release_supports_opencode_dismissals(ref)
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V163
             if dismissals
             else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V162
             if release_supports_filter_reason_surface(ref)
@@ -5923,7 +5941,9 @@ def _verify_review_invocation_budget(
         ),
     }
     workflow_digests = (
-        EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256
+        EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256
+        if release_supports_opencode_dismissals(ref)
+        else EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256
         if release_supports_opencode_finding_ids(ref)
         else EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256
         if release_supports_label_mismatch_decline(ref)
@@ -7430,10 +7450,29 @@ def _verify_commit_content(
             )
             == 1
             and (
-                "${validationSummary}${filteredCandidateSummary}"
-                "${!succeeded"
+                (
+                    "${validationSummary}${carryoverSummary}"
+                    "${filteredCandidateSummary}${!succeeded"
+                )
+                if release_supports_opencode_dismissals(ref)
+                else "${validationSummary}${filteredCandidateSummary}${!succeeded"
             )
             in canonical_script
+            and (
+                not release_supports_opencode_dismissals(ref)
+                or (
+                    canonical_script.count(
+                        "? `\\n- Normalization: normalized_blocks="
+                        "${normalizedCarryover.length};`"
+                    )
+                    == 1
+                    and (
+                        "- Normalization: normalized_blocks=[1-9][0-9]*; "
+                        "reasons=[a-z_,]+$"
+                    )
+                    in canonical_script
+                )
+            )
             and (
                 "- Filtered candidate \\(raw\\): artifact "
                 "`opencode-candidate-[1-9][0-9]*-[1-9][0-9]*` → "
