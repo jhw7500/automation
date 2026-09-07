@@ -2,19 +2,23 @@
 
 _2026-09-07 · claude-code · main = `dbd2a6e` · **v1.70 릴리스 완료** (#128 Phase 1)_
 
-## 체크포인트 — v1.70 완료, 다음은 #128 Phase 2
-- **완료·검증됨**: 태그 `v1.70`(tag `ed154b6f…` → commit `0989944`), 플릿 **17/17**,
-  기본 `automation_ref` = v1.70(범프 PR #153, `dbd2a6e`). 마지막 감사는 `--ref` 없이
-  `total=17 current=17 drift=0 blocked=0`. 로컬 스위트 **3105 passed / 0 failed**.
-- **다음 액션 1개**: **#128 Phase 2 — 기각 배선**. `dismissed-finding-ids` 를 봉인 handoff 로
-  OpenCode 캐노니컬라이저까지 나르고, `review_invocation_budget.py:755-758` 의 opencode 가드를
-  해제하고, `dismissed_prior_id` 정규화를 넣는다. **#112 는 이때 닫힌다.**
-- **제약**: `gh`·`git push` 는 `env -u GITHUB_TOKEN`. actionlint 는 `-shellcheck= -pyflakes=`.
-  스위트 3분할. 워크플로를 1바이트라도 고치면
-  `EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256["opencode"]`(`verify_workflow_release.py:800`) 재계산.
-  **호스트 메모리 빠듯 — BG 감시자가 이 세션에서 5회 강제종료됐다**(codex 프로세스 4개가 약 4.1GB).
-  긴 BG 폴링 대신 직접 조회로 확인할 것.
-- **열린 이슈**: #152(신규) · #150 · #145 · #133 잔여 · #125 · #106 · #93 · #83. #112 는 Phase 2 대기.
+## 체크포인트 — #128 Phase 2 구현 완료, PR 전 트리뷰널 재실행 대기
+- **완료·검증됨**: 브랜치 `feat/128-opencode-dismissals`, 커밋 `f0becf2` + `d664472`.
+  전체 스위트 **3113 passed / 0 failed** (part1 832 · part2 1672 · part3 609), actionlint OK.
+  기각이 OpenCode 에 적용되고(#112), 블록 하나 때문에 리뷰 전체가 버려지지 않는다.
+- **PR 생성은 `pre-pr-tribunal` 훅이 막는다.** 라운드 1 은 A/B/C 3인 병렬로 돌렸고
+  **HIGH 1건**(A-R1-001 = B-R1-001: 기각이 한 라운드만 유효)을 잡아 수정했다. 그 외 A·B·C 가
+  지적한 계약 위반 2건(prev_context strip 누락, 이월 시 거부된 앵커로 ID 파생)도 함께 고쳤다.
+- **라운드 1 은 finalize 에서 `TEXT_INVALID` 로 막혔다** — 스키마가 텍스트 필드에서 `Cc` 문자를
+  전부 금지하는데(`model.py:374-377`, 개행·탭 포함) 리뷰어들이 여러 줄 rationale 을 냈다.
+  레퍼런스에 명시가 없어 디스패치 프롬프트에서 빠졌다. 스킬이 보고서 수리를 금지하므로 재실행이 정답.
+- **다음 액션 1개**: 새 HEAD 에서 **트리뷰널 라운드 1 재실행** — 프롬프트에
+  "텍스트 필드는 한 줄, 개행·탭 금지"를 명시할 것. 통과하면 PR → v1.71 릴리스 + 17타깃 롤아웃.
+- **제약**: `gh`·`git push` 는 `env -u GITHUB_TOKEN`. 트리뷰널 보고서 파일은 **`chmod 600`**
+  (CLI 가 `st_mode & 0o077` 을 거부). `.review/`·`.omc/`·`.serena/` 는 `.git/info/exclude` 에 넣어
+  워크트리를 clean 으로 유지했다(`.gitignore` 를 쓰면 PR diff 가 오염된다).
+  워크플로나 예산 헬퍼를 고치면 `verify_workflow_release.py` 의 v1.71 다이제스트 2개를 다시 맞춘다.
+- **열린 이슈**: #152 · #150 · #145 · #133 잔여 · #125 · #106 · #93 · #83. #112 는 이 PR 이 닫는다.
 
 ## #128 Phase 1 에서 확정된 것 (Phase 2 에서 재사용)
 - **캐리오버 결속은 heading 원문 문자열이다 — 바꾸지 말 것.** 이슈 #128 의 2번(ID 키 전환)을
