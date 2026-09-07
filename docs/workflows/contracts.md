@@ -579,17 +579,24 @@ ledger's remaining IDs as if it had been fixed. A prior body this job cannot re-
 block to fall back on and still fails the whole document, which preserves every open finding through
 `failureBody`. Infrastructure failures — a missing manifest or invalid artifacts — stay hard.
 
-Carryover normalization is counted and reported apart from the New findings filter, as
-`- Carryover: normalized_carryover_blocks=N; reasons=<sorted>`. Sharing one counter would report a
-round that only rewrote a carryover as `quality_filtered` and make the
-`filtered_invalid_new_findings=` label untrue. Both lines are workflow-owned and reserved, so a
-model cannot forge either and neither re-enters a later round's context.
+Normalization is counted and reported apart from the New findings filter, as
+`- Normalization: normalized_blocks=N; reasons=<sorted>`. Sharing one counter would report a round
+that only rewrote a carryover as `quality_filtered` and make the `filtered_invalid_new_findings=`
+label untrue. Both lines are workflow-owned: the reserved pattern stops a model from forging either,
+and both are stripped from the previous-round and human-comment context a later round is given.
+
+A carried-forward block publishes the prior round's heading bytes unchanged rather than re-deriving
+an identifier. The entry's evidence still describes the model block that was discarded, so
+re-deriving would seed the identifier from the very anchor this round rejected.
 
 From `v1.71` OpenCode also honors dismissals. The dismissed IDs travel in the budget checkpoint the
 canonicalizer already hash-binds through `handoff.files['review-budget-claim.json']`, so no extra
 handoff field or artifact carries them. A carryover block naming a dismissed ID is normalized with
 `dismissed_prior_id` before any binding check, and omitting it from the published body is what
-retires the finding. Valid blocks—including `[HIGH]` blocks—keep
+retires the finding. A new finding whose derived ID is dismissed is normalized the same way: the
+removal that retires a finding also drops its ID from the next round's prior set, so without this
+the model re-reporting the identical defect would resurrect it under the dismissed ID and the
+dismissal would hold for exactly one round. Valid blocks—including `[HIGH]` blocks—keep
 their evidence and prose unchanged and are republished with the identifier described next.
 
 From `v1.70` OpenCode publishes a workflow-owned identifier in each finding heading, so a

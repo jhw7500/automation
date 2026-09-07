@@ -14576,6 +14576,133 @@ def test_opencode_dismissed_finding_leaves_the_active_set(tmp_path):
 
 
 @node_required
+def test_opencode_dismissal_survives_the_round_that_retires_the_finding(tmp_path):
+    """기각은 한 라운드가 아니라 기각이 서 있는 동안 계속 유효해야 한다 (#112).
+
+    라운드 N 이 기각된 finding 을 발행 본문에서 지우면, 그 지움이 곧 라운드 N+1 의
+    `priorActiveIds` 에서도 그 ID 를 없앤다. 모델이 같은 결함을 New finding 으로 다시
+    보고하면 동일 ID 가 파생되므로, 파생 ID 도 기각 목록과 대조해야 한다. 공유 정규화기는
+    `canonicalize_review.py:949` 에서 이미 그렇게 한다.
+    """
+    head = "ab" * 20
+    anchor_json = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    title = "Dismissed as a false positive"
+    finding_id = _opencode_finding_id(OPENCODE_SCOPE_PATH, 1, "HIGH", title)
+    # 라운드 N 이 이미 은퇴시킨 뒤의 상태: prior 본문에 그 finding 이 없다.
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), "### New findings\nNone"),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        f"#### [HIGH] {title}\n- Changed anchor: {anchor_json}\n"
+        '- Current line: "added line 1"\nConcrete impact.'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+        dismissed_findings=[{"comment_id": 555, "finding_id": finding_id}],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+
+    assert state["attempt_status"] == "success"
+    assert finding_id not in body
+    assert title not in body
+    assert json.loads(outputs["remaining_finding_ids_json"]) == []
+
+
+@node_required
+def test_opencode_carried_forward_block_keeps_its_prior_heading(tmp_path):
+    """이월된 블록은 prior heading 을 원문 그대로 발행한다 (#128 Phase 2).
+
+    이월은 모델의 앵커를 거부하고 이전 라운드의 캐노니컬 블록을 되싣는 것이다. 그런데
+    heading 을 다시 렌더하면 **거부된 그 앵커**로 ID 를 파생하게 된다 — prior 가 v1.70
+    이전이라 heading 에 ID 가 없을 때가 정확히 그 창이다.
+    """
+    head = "ab" * 20
+    in_scope = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    out_of_scope = json.dumps(
+        {"path": ".github/workflows/gemini-auto-review.yml", "line": 74},
+        separators=(",", ":"),
+    )
+    title = "Legacy finding without an id"
+    prior_body = (
+        "### New findings\n"
+        f"#### [HIGH] {title}\n- Changed anchor: {in_scope}\nprior evidence"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Still open\n#### [HIGH] {title}\n"
+        f"- Changed anchor: {out_of_scope}\n"
+        '- Current line: "      publisher_app_id: x"\nstill present'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    rejected_id = _opencode_finding_id(
+        ".github/workflows/gemini-auto-review.yml", 74, "HIGH", title
+    )
+
+    assert state["attempt_status"] == "success"
+    # prior heading 원문 그대로 — 거부된 앵커에서 파생한 ID 가 아니다.
+    assert f"#### [HIGH] {title}" in body
+    assert rejected_id not in body
+    assert json.loads(outputs["remaining_finding_ids_json"]) == []
+
+
+def test_opencode_carryover_summary_never_re_enters_model_context(tmp_path):
+    """`- Carryover:` 줄은 워크플로 소유이므로 다음 라운드 컨텍스트에 재진입하지 않는다.
+
+    `contracts.md` 가 그렇게 단언하고 있고, 이 줄이 모델에게 새는 것은 하필
+    "검증 불가한 캐리오버 앵커가 이제 소프트 정규화된다" 는 신호다.
+    """
+    meta = (
+        "- Validation: filtered_invalid_new_findings=1; reasons=finding_grammar_invalid\n"
+        "- Normalization: normalized_blocks=1; reasons=invalid_anchor\n"
+    )
+    published = _opencode_v2_body(
+        _state_line("opencode", 7, 1, "ab" * 20),
+        "### New findings\nNone",
+    )
+    # 워크플로가 붙이는 메타 줄을 실제 위치(첫 `###` 섹션 직전)에 넣는다. 여기서 삽입이
+    # 빗나가면 테스트가 아무것도 검증하지 않은 채 통과한다.
+    marker = "### New findings"
+    assert marker in published
+    body = published.replace(marker, meta + "\n" + marker, 1)
+    assert "- Normalization: normalized_blocks=" in body
+    output = _run_opencode_ctx(tmp_path, [_bot("github-actions[bot]", body, 1)])
+
+    assert "- Validation: filtered_invalid_new_findings=" not in output
+    assert "- Normalization: normalized_blocks=" not in output
+
+
+@node_required
 def test_opencode_out_of_scope_carryover_anchor_no_longer_kills_the_review(tmp_path):
     """캐리오버 앵커 하나가 범위 밖이어도 리뷰 전체가 사라지지 않는다 (#128 Phase 2).
 
@@ -14636,7 +14763,7 @@ def test_opencode_out_of_scope_carryover_anchor_no_longer_kills_the_review(tmp_p
     # 캐리오버 정규화는 New findings 필터와 **별개 카운터**로 보고된다. 하나로 세면
     # New finding 0건 + 캐리오버 1건이 `quality_filtered` 로 오기록되고, 발행 라벨의
     # `filtered_invalid_new_findings=` 가 거짓이 된다.
-    assert "- Carryover: normalized_carryover_blocks=1; reasons=invalid_anchor" in body
+    assert "- Normalization: normalized_blocks=1; reasons=invalid_anchor" in body
     assert "filtered_invalid_new_findings" not in body
 
 

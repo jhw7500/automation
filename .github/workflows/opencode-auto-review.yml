@@ -387,7 +387,7 @@ jobs:
           PREV_SUCCESSFUL_HEAD="$(printf '%s\n' "$PREV_RECORD" | jq -r '.state.successful_head // ""')"
           PREV_FULL_HASH="$(printf '%s\n' "$PREV_RECORD" | jq -r '.state.full_diff_sha256 // ""')"
           # Reserved workflow-owned text is never model input, even from a validated record.
-          PREV_REVIEW="$(printf '%s\n' "$PREV_REVIEW" | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Filtered candidate \(raw\): |- Last attempt: )' || true)"
+          PREV_REVIEW="$(printf '%s\n' "$PREV_REVIEW" | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Normalization: |- Filtered candidate \(raw\): |- Last attempt: )' || true)"
           # A first failure has no checkpoint and must not become re-review context. A stale
           # failure is useful only when it retained a validated successful checkpoint/body.
           if ! [[ "$PREV_SUCCESSFUL_HEAD" =~ ^[0-9a-f]{40}$ ]] \
@@ -403,7 +403,7 @@ jobs:
             '[.[] | select((.user.type // "") != "Bot")] | .[-10:]
              | map("@" + (.user.login // "ghost") + " (" + (.created_at // "") + "):\n" + ((.body // "") | .[0:1500]))
              | join("\n\n---\n\n")' "$COMMENTS" \
-            | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Filtered candidate \(raw\): |- Last attempt: )' || true)"
+            | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Normalization: |- Filtered candidate \(raw\): |- Last attempt: )' || true)"
 
           clip() {
             local text="$1"
@@ -4106,7 +4106,7 @@ jobs:
               }
               return true;
             };
-            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Validation: filtered_invalid_new_findings=[1-9][0-9]*; reasons=[a-z_,]+$|- Carryover: normalized_carryover_blocks=[1-9][0-9]*; reasons=[a-z_,]+$|- Filtered candidate \(raw\): artifact `opencode-candidate-[1-9][0-9]*-[1-9][0-9]*` → `review\.md`$|- Last attempt: failure \(https?:\/\/\S+\)$|- Reason: [a-z_]+$)/;
+            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Validation: filtered_invalid_new_findings=[1-9][0-9]*; reasons=[a-z_,]+$|- Normalization: normalized_blocks=[1-9][0-9]*; reasons=[a-z_,]+$|- Filtered candidate \(raw\): artifact `opencode-candidate-[1-9][0-9]*-[1-9][0-9]*` → `review\.md`$|- Last attempt: failure \(https?:\/\/\S+\)$|- Reason: [a-z_]+$)/;
             const clean = (body) => {
               const rawLines = (body || '').split('\n');
               // OpenCode can include tool/thinking traces in the final text event. Only an exact
@@ -4411,7 +4411,8 @@ jobs:
                   // to nothing. Normalizing it out here keeps that from failing the whole
                   // document, and omitting it from the published body is what actually
                   // retires it: the body is the active set the next round reads back.
-                  const carriedId = CARRIED_FINDING_HEADING.exec(block.heading);
+                  const carriedId = section.name === 'New findings'
+                    ? null : CARRIED_FINDING_HEADING.exec(block.heading);
                   if (carriedId && dismissedFindingIds.has(carriedId[1])) {
                     normalizedBlocks.push({ block, reason: 'dismissed_prior_id' });
                     continue;
@@ -4751,6 +4752,10 @@ jobs:
               ['opencode', path, String(line), severity, normalizeTitle(title)].join('\0')
             ).slice(0, 12);
             const renderHeading = (entry) => {
+              // A carried-forward block is prior-round canonical text that was already validated
+              // and attested. Re-deriving its id here would seed it from the very anchor this
+              // round rejected, because entry.evidence still describes the discarded model block.
+              if (entry.carriedForward) return entry.block.heading;
               const parts = FINDING_HEADING.exec(entry.block.heading);
               if (!parts) return entry.block.heading;
               const anchor = entry.evidence.anchors[0];
@@ -4801,7 +4806,19 @@ jobs:
                 }
                 const findingId = blockFindingId(
                   entry.block.heading, entry.evidence.anchors[0]);
-                if (findingId === null || !priorActiveIds.has(findingId)) continue;
+                if (findingId === null) continue;
+                // A dismissal has to outlive the round that retires the finding. Removing the
+                // block from the published body is what retires it, and that same removal drops
+                // the id from the next round's prior set — so re-reporting the identical defect
+                // as a new finding would otherwise resurrect it under the dismissed id.
+                if (dismissedFindingIds.has(findingId)) {
+                  duplicatePriorEntries.add(entry);
+                  // Dropped, not carried forward: a dismissed finding must leave the
+                  // published body, which is the active set the next round reads back.
+                  normalizedCarryover.push({ entry, reason: 'dismissed_prior_id', dropped: true });
+                  continue;
+                }
+                if (!priorActiveIds.has(findingId)) continue;
                 duplicatePriorEntries.add(entry);
                 filteredNewFindings.push({ entry, reason: 'duplicate_prior_id' });
               }
@@ -4835,6 +4852,7 @@ jobs:
                 const priorBlock = priorActiveBlocks.get(entry.block.heading);
                 if (!priorBlock) { anchorValidationFailed = true; break; }
                 entry.block = priorBlock;
+                entry.carriedForward = true;
                 // A disposition the model cannot prove is discarded rather than believed. The
                 // finding returns to `Still open`: leaving it under `Resolved`/`Retracted` would
                 // publish an unproven fix, and omitting it would retire a finding nothing fixed,
@@ -4852,7 +4870,10 @@ jobs:
                 normalizedCarryover.push({ entry, reason: 'invalid_anchor' });
               }
             }
-            const filteredEntries = new Set(filteredNewFindings.map((item) => item.entry));
+            const filteredEntries = new Set([
+              ...filteredNewFindings.map((item) => item.entry),
+              ...normalizedCarryover.filter((item) => item.dropped).map((item) => item.entry),
+            ]);
             const canonicalReview = parsedReview
               ? parsedReview.sections.map((section, sectionIndex) => {
                   const retained = parsedReview.blocks.filter((entry) =>
@@ -4911,7 +4932,7 @@ jobs:
             const normalizedReasons = [...new Set(normalizedCarryover.map((item) => item.reason))]
               .sort().join(',');
             const carryoverSummary = modelSucceeded && normalizedCarryover.length > 0
-              ? `\n- Carryover: normalized_carryover_blocks=${normalizedCarryover.length};`
+              ? `\n- Normalization: normalized_blocks=${normalizedCarryover.length};`
                 + ` reasons=${normalizedReasons}`
               : '';
             const filteredCandidateSummary = modelSucceeded && filteredNewFindings.length > 0

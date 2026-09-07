@@ -811,7 +811,7 @@ EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256 = {
 EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256 = {
     "claude": "a6116cf542876a46e8401e26471324a586772398ad5d21360155e686123104be",
     "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
-    "opencode": "041a2eb53f528b2d66f6c81e303ef5d79633b47fc53ce8ca158019996d66238a",
+    "opencode": "3803e294dc7975af1a2b6812639fd11ee55c97d6f92258281d2df770c8d6c433",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
@@ -7462,12 +7462,12 @@ def _verify_commit_content(
                 not release_supports_opencode_dismissals(ref)
                 or (
                     canonical_script.count(
-                        "? `\\n- Carryover: normalized_carryover_blocks="
+                        "? `\\n- Normalization: normalized_blocks="
                         "${normalizedCarryover.length};`"
                     )
                     == 1
                     and (
-                        "- Carryover: normalized_carryover_blocks=[1-9][0-9]*; "
+                        "- Normalization: normalized_blocks=[1-9][0-9]*; "
                         "reasons=[a-z_,]+$"
                     )
                     in canonical_script
