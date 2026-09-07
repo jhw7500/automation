@@ -573,9 +573,21 @@ the whole review including that round's new findings. A carryover block whose an
 of scope keeps the finding and discards only the model's claim about it: the prior round's canonical
 block is republished in its place with reason `invalid_anchor`, and a `Resolved` or `Retracted`
 block is additionally returned to `Still open`, because an unproven disposition must neither be
-believed nor silently retire the finding. Omitting the block is never the soft outcome: the
-published body is the active set the next round reads back, so an omitted finding leaves the budget
-ledger's remaining IDs as if it had been fixed. A prior body this job cannot re-parse leaves no
+believed nor silently retire the finding. Omitting the block is never the outcome this job *chooses*:
+the published body is the active set the next round reads back, so an omitted finding leaves the
+budget ledger's remaining IDs as if it had been fixed.
+
+That constraint binds this job's own normalization, not the model. Nothing requires every prior
+active finding to reappear in the candidate, so a model that emits `### New findings` / `None`
+retires every open finding with `attempt_status: success`, and one that carries some findings over
+retires exactly the ones it left out — observed once, on the `v1.71` change, where the same body is
+produced byte-for-byte at that change's base and head. The soft carryover path above closed the
+route that retires a finding through a *bad* block; it does not close the cheaper route of omitting
+the block entirely. Closing that route is not a free tightening, because omission is the same
+mechanism a dismissal retires through (below), and every republished block re-enters the next
+round's model context in full against a 6,000-character clip that truncates silently. See #157.
+
+A prior body this job cannot re-parse leaves no
 block to fall back on and still fails the whole document, which preserves every open finding through
 `failureBody`. Infrastructure failures — a missing manifest or invalid artifacts — stay hard.
 
