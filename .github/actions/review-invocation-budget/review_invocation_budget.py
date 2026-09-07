@@ -752,10 +752,6 @@ def choose_dismissals(
         state: LedgerState, events: Sequence[DismissEvent]) -> tuple[DismissedFinding, ...]:
     """Bind each dismissed finding to the earliest authorizing comment, bounded and sorted."""
     _validate_dismiss_events(tuple(events))
-    # OpenCode assigns no RVW- IDs, so a dismissal can never name one of its findings;
-    # recording one would advertise a path that nothing downstream consumes.
-    if state.reviewer == "opencode":
-        return ()
     earliest: dict[str, int] = {}
     for event in events:
         if event.actor_permission not in _DISMISS_PERMISSIONS:
@@ -1297,19 +1293,16 @@ def _summary(state: LedgerState, *, server_url: str) -> str:
         raise BudgetStateError("server_url_invalid")
     base_url = server_url.rstrip('/')
     run_url = f"{base_url}/{state.repository}/actions/runs/{handoff.current_run_id}"
-    dismissed_line = ""
-    dismissal_guidance = ""
-    if state.reviewer != "opencode":
-        dismissed = ", ".join(
-            f"[{item.finding_id}]({base_url}/{state.repository}/pull/{state.pr}#issuecomment-{item.comment_id})"
-            for item in state.dismissed_findings
-        ) or "none"
-        dismissed_line = f"- Dismissed findings: {dismissed}\n"
-        dismissal_guidance = (
-            " A collaborator with write permission can dismiss a false positive by commenting "
-            "`dismiss RVW-<12 hex> <reason>` on this pull request; the dismissal takes effect on "
-            "the next review run and is revoked by deleting that comment."
-        )
+    dismissed = ", ".join(
+        f"[{item.finding_id}]({base_url}/{state.repository}/pull/{state.pr}#issuecomment-{item.comment_id})"
+        for item in state.dismissed_findings
+    ) or "none"
+    dismissed_line = f"- Dismissed findings: {dismissed}\n"
+    dismissal_guidance = (
+        " A collaborator with write permission can dismiss a false positive by commenting "
+        "`dismiss RVW-<12 hex> <reason>` on this pull request; the dismissal takes effect on "
+        "the next review run and is revoked by deleting that comment."
+    )
     return (
         f"## {_REVIEWER_TITLES[state.reviewer]} review invocation budget\n"
         f"- Decision: {handoff.decision}\n"

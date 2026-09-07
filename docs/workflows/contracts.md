@@ -565,7 +565,31 @@ identifier is omitted with reason `model_assigned_id`, because identifiers are w
 model-chosen one would decide what the budget ledger records as remaining. A block whose derived
 identifier equals one an authenticated active prior finding already holds is omitted with reason
 `duplicate_prior_id`; before identifiers existed the identical heading text alone stopped the model
-from re-reporting a finding it was also carrying over. Valid blocks—including `[HIGH]` blocks—keep
+from re-reporting a finding it was also carrying over.
+
+From `v1.71` a carryover block is checked on its own instead of with every other carryover anchor at
+once, because one stale anchor — routine once the head advances past an earlier finding — discarded
+the whole review including that round's new findings. A carryover block whose anchor evidence is out
+of scope keeps the finding and discards only the model's claim about it: the prior round's canonical
+block is republished in its place with reason `invalid_anchor`, and a `Resolved` or `Retracted`
+block is additionally returned to `Still open`, because an unproven disposition must neither be
+believed nor silently retire the finding. Omitting the block is never the soft outcome: the
+published body is the active set the next round reads back, so an omitted finding leaves the budget
+ledger's remaining IDs as if it had been fixed. A prior body this job cannot re-parse leaves no
+block to fall back on and still fails the whole document, which preserves every open finding through
+`failureBody`. Infrastructure failures — a missing manifest or invalid artifacts — stay hard.
+
+Carryover normalization is counted and reported apart from the New findings filter, as
+`- Carryover: normalized_carryover_blocks=N; reasons=<sorted>`. Sharing one counter would report a
+round that only rewrote a carryover as `quality_filtered` and make the
+`filtered_invalid_new_findings=` label untrue. Both lines are workflow-owned and reserved, so a
+model cannot forge either and neither re-enters a later round's context.
+
+From `v1.71` OpenCode also honors dismissals. The dismissed IDs travel in the budget checkpoint the
+canonicalizer already hash-binds through `handoff.files['review-budget-claim.json']`, so no extra
+handoff field or artifact carries them. A carryover block naming a dismissed ID is normalized with
+`dismissed_prior_id` before any binding check, and omitting it from the published body is what
+retires the finding. Valid blocks—including `[HIGH]` blocks—keep
 their evidence and prose unchanged and are republished with the identifier described next.
 
 From `v1.70` OpenCode publishes a workflow-owned identifier in each finding heading, so a
@@ -674,10 +698,10 @@ dismissed — the model repeating the same claim verbatim — is normalized the 
 re-entering the document. The finding therefore disappears from the canonical Markdown, from
 `accepted-count`, and from the remaining finding IDs for as long as the dismissal stands. The
 audit trail is the budget ledger, not the review document. From `v1.70` OpenCode derives its own
-`RVW-` IDs (see [Changed-anchor contract](#changed-anchor-contract)) while its canonicalizer still
-binds carryover by exact heading text, but it does not yet receive the dismissal list, so a
-dismissal cannot retire an OpenCode finding; the IDs it now publishes are what a later version lets
-a dismissal name.
+`RVW-` IDs and from `v1.71` its canonicalizer applies dismissals too (see
+[Changed-anchor contract](#changed-anchor-contract)), reading them from the sealed budget checkpoint
+rather than a separate input. It still binds carryover by exact heading text, so a dismissed ID is
+matched on the identifier the heading carries.
 
 ### Hard checkpoints and soft finding filters
 
@@ -1203,10 +1227,10 @@ request stops applying until enough comments are deleted; the bound is twice the
 remaining-finding cap and is not expected to be reached in normal use. Deleting a comment
 revokes its dismissal on the next run; editing it re-targets it. A refused claim — including
 `round_budget_exhausted` after every round is spent — still records the snapshot and rewrites the
-ledger comment, so a dismissal takes effect without a new model round. The OpenCode ledger
-ignores dismissal comments entirely and keeps the pre-`v1.63` summary text: from `v1.70` that
-reviewer publishes `RVW-` IDs, but its three-job canonicalizer does not yet carry the dismissal
-list across its sealed handoff.
+ledger comment, so a dismissal takes effect without a new model round. From `v1.71` the OpenCode
+ledger records and reports dismissals like every other reviewer; until `v1.70` gave that reviewer
+`RVW-` identifiers there was nothing for a dismissal to name, and the exclusion has no reason to
+survive that.
 
 The ledger key `dismissed_findings` is written only when at least one dismissal exists; a ledger
 without one keeps its exact pre-`v1.63` bytes, so every open pull request stays valid across the

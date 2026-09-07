@@ -1249,25 +1249,25 @@ def test_dismissals_beyond_the_ledger_bound_fail_closed():
     assert len(budget.choose_dismissals(state, events[1:])) == 16
 
 
-def test_dismissals_are_ignored_for_opencode():
-    """OpenCode derives no RVW- IDs, so a dismissal can never name one of its findings."""
+def test_dismissals_apply_to_opencode_like_every_other_reviewer():
+    """OpenCode 도 기각을 받는다 — v1.70 이 그 finding 에 ID 를 부여했기 때문이다 (#112).
+
+    ID 가 없던 동안에는 기각이 가리킬 대상이 없어 이 리뷰어만 제외돼 있었다. 이제
+    제외할 이유가 사라졌고, 제외를 유지하면 사람이 OpenCode 오탐을 기각할 방법이
+    끝내 생기지 않는다.
+    """
 
     state = budget.LedgerState.initial(REPOSITORY, PR, "opencode")
 
-    assert budget.choose_dismissals(state, (dismiss_event(),)) == ()
+    assert budget.choose_dismissals(state, (dismiss_event(),)) == (dismissed(FINDING_1, 200),)
     claim_request = request(reviewer="opencode", dismiss_events=(dismiss_event(),))
     claimed = budget.claim(None, claim_request, claim_provenances(None, claim_request)).state
-    assert claimed.dismissed_findings == ()
-    assert budget.render_summary(claimed) == (
-        "## OpenCode review invocation budget\n"
-        "- Decision: claimed\n"
-        "- Automatic rounds: 1/2\n"
-        "- Override rounds: 0/1\n"
-        "- Current run: https://github.com/example/repo/actions/runs/700\n"
-        "- Stop reason: claimed\n\n"
-        "Budget exhaustion is not review approval. Use the authenticated review checkpoint and "
-        "remaining finding IDs before merge."
-    )
+    assert claimed.dismissed_findings == (dismissed(FINDING_1, 200),)
+
+    summary = budget.render_summary(claimed)
+    # 원장 코멘트가 기각 내역과 문법을 보여주지 않으면 사람은 이 경로의 존재를 알 수 없다.
+    assert f"- Dismissed findings: [{FINDING_1}](" in summary
+    assert "dismiss RVW-<12 hex> <reason>" in summary
 
 
 def test_a_present_but_empty_dismissal_list_is_not_a_ledger_shape():

@@ -3397,6 +3397,7 @@ jobs:
               GIT_ASKPASS: '/bin/false', SSH_ASKPASS: '/bin/false', GIT_EXTERNAL_DIFF: '',
             };
             let before, sealedEvidence, handoff;
+            let dismissedFindingIds = new Set();
             try {
               const { data: artifact } = await github.rest.actions.getArtifact({
                 owner: context.repo.owner, repo: context.repo.repo,
@@ -3495,6 +3496,22 @@ jobs:
                 || claimCheckpoint.handoff.stop_reason !== budgetDecision) {
                 throw new Error('sealed budget claim checkpoint identity mismatch');
               }
+              // The dismissal list rides in the sealed budget checkpoint this job already
+              // hash-binds (handoff.files['review-budget-claim.json']), so it needs no extra
+              // handoff field and no second copy. Its shape is validated here because the
+              // ledger is the budget action's output rather than this workflow's: an
+              // unexpected shape must fail closed instead of silently dropping a dismissal.
+              const ledgerDismissals = claimCheckpoint.ledger.dismissed_findings ?? [];
+              if (!Array.isArray(ledgerDismissals) || ledgerDismissals.length > 16
+                || ledgerDismissals.some((item) => !item || typeof item !== 'object'
+                  || Array.isArray(item)
+                  || JSON.stringify(Object.keys(item).sort()) !== '["comment_id","finding_id"]'
+                  || !Number.isSafeInteger(item.comment_id) || item.comment_id <= 0
+                  || typeof item.finding_id !== 'string'
+                  || !/^RVW-[0-9a-f]{12}$/.test(item.finding_id))) {
+                throw new Error('dismissed findings invalid');
+              }
+              dismissedFindingIds = new Set(ledgerDismissals.map((item) => item.finding_id));
               const exactClaims = Array.isArray(claimCheckpoint.ledger.invocations)
                 ? claimCheckpoint.ledger.invocations.filter((item) => item.run_id === runId
                   && item.run_attempt === handoff.run_attempt
@@ -4089,7 +4106,7 @@ jobs:
               }
               return true;
             };
-            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Validation: filtered_invalid_new_findings=[1-9][0-9]*; reasons=[a-z_,]+$|- Filtered candidate \(raw\): artifact `opencode-candidate-[1-9][0-9]*-[1-9][0-9]*` → `review\.md`$|- Last attempt: failure \(https?:\/\/\S+\)$|- Reason: [a-z_]+$)/;
+            const reserved = /^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-candidate:|<!-- automation-state:|- Status: (success|failure|stale)$|- Run: https?:\/\/\S+$|- Attestation: [1-9][0-9]*$|- Reviewed: [0-9a-f]{40}$|- Validation: filtered_invalid_new_findings=[1-9][0-9]*; reasons=[a-z_,]+$|- Carryover: normalized_carryover_blocks=[1-9][0-9]*; reasons=[a-z_,]+$|- Filtered candidate \(raw\): artifact `opencode-candidate-[1-9][0-9]*-[1-9][0-9]*` → `review\.md`$|- Last attempt: failure \(https?:\/\/\S+\)$|- Reason: [a-z_]+$)/;
             const clean = (body) => {
               const rawLines = (body || '').split('\n');
               // OpenCode can include tool/thinking traces in the final text event. Only an exact
@@ -4355,6 +4372,7 @@ jobs:
             };
             const priorActiveHeadings = new Map();
             const priorActiveEvidence = new Map();
+            const priorActiveBlocks = new Map();
             if (priorSuccess) {
               const priorSections = splitSections(previousBody);
               if (priorSections) {
@@ -4368,6 +4386,7 @@ jobs:
                       const evidence = priorActiveEvidence.get(block.heading) || [];
                       evidence.push(parseBlockEvidence(block));
                       priorActiveEvidence.set(block.heading, evidence);
+                      priorActiveBlocks.set(block.heading, block);
                     }
                   }
                 }
@@ -4380,6 +4399,7 @@ jobs:
               if (carryover.length && !priorSuccess) return null;
               const parsedBlocks = [];
               const filteredNewFindings = [];
+              const normalizedBlocks = [];
               const currentHeadings = new Set();
               for (const [sectionIndex, section] of sections.entries()) {
                 const sectionFindingBlocks = sectionBlocks(section);
@@ -4387,6 +4407,15 @@ jobs:
                 for (const block of sectionFindingBlocks) {
                   if (currentHeadings.has(block.heading)) return null;
                   currentHeadings.add(block.heading);
+                  // A dismissed finding left the active set, so the model repeating it binds
+                  // to nothing. Normalizing it out here keeps that from failing the whole
+                  // document, and omitting it from the published body is what actually
+                  // retires it: the body is the active set the next round reads back.
+                  const carriedId = CARRIED_FINDING_HEADING.exec(block.heading);
+                  if (carriedId && dismissedFindingIds.has(carriedId[1])) {
+                    normalizedBlocks.push({ block, reason: 'dismissed_prior_id' });
+                    continue;
+                  }
                   const priorMatches = priorActiveHeadings.get(block.heading) || 0;
                   if (section.name === 'New findings' && priorMatches !== 0) return null;
                   if (section.name !== 'New findings' && priorMatches !== 1) return null;
@@ -4436,7 +4465,7 @@ jobs:
                     evidence: { anchors: [], removals: [removal] } });
                 }
               }
-              return { blocks: parsedBlocks, sections, filteredNewFindings };
+              return { blocks: parsedBlocks, sections, filteredNewFindings, normalizedBlocks };
             };
 
             const changedPathValidation = new Map();
@@ -4754,6 +4783,8 @@ jobs:
             const parsedReview = review ? parseReview(review) : null;
             const filteredNewFindings = parsedReview
               ? [...parsedReview.filteredNewFindings] : [];
+            const normalizedCarryover = parsedReview
+              ? [...parsedReview.normalizedBlocks] : [];
             let anchorValidationFailed = false;
             if (parsedReview) {
               const newFindings = parsedReview.blocks.filter((entry) =>
@@ -4787,14 +4818,38 @@ jobs:
               }
               const carryover = parsedReview.blocks.filter((entry) =>
                 entry.section !== 'New findings');
-              if (!anchorValidationFailed && carryover.length > 0) {
-                const carryoverEvidence = {
-                  anchors: carryover.flatMap((entry) => entry.evidence.anchors),
-                  removals: carryover.flatMap((entry) => entry.evidence.removals),
-                };
-                if (validateAnchorEvidence(carryoverEvidence) !== 'valid') {
-                  anchorValidationFailed = true;
+              // Carryover anchors are checked one block at a time. Aggregating them meant a
+              // single stale anchor — normal once the head advances past a previous finding —
+              // discarded the whole review including this round's new findings.
+              for (const entry of carryover) {
+                if (anchorValidationFailed) break;
+                const result = validateAnchorEvidence(entry.evidence);
+                if (result === 'valid') continue;
+                if (result !== 'invalid') { anchorValidationFailed = true; break; }
+                // The model's evidence is out of scope, but nothing proved the finding fixed.
+                // Dropping the block would retire it: the published body is the active set the
+                // next round reads back, so an omitted finding leaves the budget ledger's
+                // remaining IDs. Republish the prior round's canonical block instead — it was
+                // already validated and attested. A prior body this job could not parse leaves
+                // the map empty, which fails closed exactly as it did before.
+                const priorBlock = priorActiveBlocks.get(entry.block.heading);
+                if (!priorBlock) { anchorValidationFailed = true; break; }
+                entry.block = priorBlock;
+                // A disposition the model cannot prove is discarded rather than believed. The
+                // finding returns to `Still open`: leaving it under `Resolved`/`Retracted` would
+                // publish an unproven fix, and omitting it would retire a finding nothing fixed,
+                // because the published body is the active set the next round reads back.
+                if (entry.section !== 'Still open') {
+                  let stillOpenIndex = parsedReview.sections
+                    .findIndex((item) => item.name === 'Still open');
+                  if (stillOpenIndex === -1) {
+                    stillOpenIndex = parsedReview.sections.length;
+                    parsedReview.sections.push({ name: 'Still open', lines: [] });
+                  }
+                  entry.section = 'Still open';
+                  entry.sectionIndex = stillOpenIndex;
                 }
+                normalizedCarryover.push({ entry, reason: 'invalid_anchor' });
               }
             }
             const filteredEntries = new Set(filteredNewFindings.map((item) => item.entry));
@@ -4802,7 +4857,7 @@ jobs:
               ? parsedReview.sections.map((section, sectionIndex) => {
                   const retained = parsedReview.blocks.filter((entry) =>
                     entry.sectionIndex === sectionIndex && !filteredEntries.has(entry));
-                  const sectionBody = section.name === 'New findings' && retained.length === 0
+                  const sectionBody = retained.length === 0
                     ? 'None'
                     : retained.map((entry) => [renderHeading(entry), ...entry.block.lines]
                       .join('\n').trim()).join('\n\n');
@@ -4850,6 +4905,15 @@ jobs:
             const validationSummary = modelSucceeded && filteredNewFindings.length > 0
               ? `\n- Validation: filtered_invalid_new_findings=${filteredNewFindings.length}; reasons=${filteredReasons}`
               : '';
+            // Carryover normalization is counted apart from the New findings filter. Sharing one
+            // counter would report a round that only rewrote a carryover as `quality_filtered`
+            // and make the `filtered_invalid_new_findings=` label untrue.
+            const normalizedReasons = [...new Set(normalizedCarryover.map((item) => item.reason))]
+              .sort().join(',');
+            const carryoverSummary = modelSucceeded && normalizedCarryover.length > 0
+              ? `\n- Carryover: normalized_carryover_blocks=${normalizedCarryover.length};`
+                + ` reasons=${normalizedReasons}`
+              : '';
             const filteredCandidateSummary = modelSucceeded && filteredNewFindings.length > 0
               ? `\n- Filtered candidate (raw): artifact \`opencode-candidate-${runId}-${runAttempt}\` → \`review.md\``
               : '';
@@ -4858,7 +4922,7 @@ jobs:
                 && !filteredEntries.has(entry)).length : 0;
             const qualityFiltered = modelSucceeded && filteredNewFindings.length > 0
               && retainedNewFindingCount === 0;
-            const bodyFor = (attestationId) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${attestationId}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${validationSummary}${filteredCandidateSummary}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})\n- Reason: ${failureReason}` : ''}\n\n${displayBody}`;
+            const bodyFor = (attestationId) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n${legacyMarker}\n\n- Status: ${status}\n- Run: ${process.env.RUN_URL}\n- Attestation: ${attestationId}${succeeded ? `\n- Reviewed: ${attemptHead}` : ''}${validationSummary}${carryoverSummary}${filteredCandidateSummary}${!succeeded ? `\n- Last attempt: failure (${process.env.RUN_URL})\n- Reason: ${failureReason}` : ''}\n\n${displayBody}`;
             if (Buffer.byteLength(bodyFor(Number.MAX_SAFE_INTEGER), 'utf8') > 65536) {
               throw new Error('canonical OpenCode comment exceeds 65,536-byte publication limit');
             }

@@ -13586,6 +13586,7 @@ def _run_opencode_canonicalize(
     candidate_review: str | None = None,
     failure_reason: str = "",
     candidate_envelope_changes: dict | None = None,
+    dismissed_findings: list | None = None,
     node_preload: Path | None = None,
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
@@ -13777,6 +13778,11 @@ def _run_opencode_canonicalize(
                     "reviewer": "opencode",
                     "invocations": budget_invocations,
                     "handoff": budget_handoff,
+                    **(
+                        {"dismissed_findings": dismissed_findings}
+                        if dismissed_findings
+                        else {}
+                    ),
                 },
                 "handoff": budget_handoff,
             },
@@ -14518,6 +14524,123 @@ def test_opencode_filters_a_new_finding_that_assigns_its_own_id(tmp_path):
 
 
 @node_required
+def test_opencode_dismissed_finding_leaves_the_active_set(tmp_path):
+    """협업자가 기각한 OpenCode finding 은 다음 라운드에 살아남지 않는다 (#112, #128 Phase 2).
+
+    v1.63 의 기각 경로는 예산 원장에 기각 ID 를 적지만, OpenCode 캐노니컬라이저는 그것을
+    읽은 적이 없었다. 기각 목록은 이미 봉인된 `review-budget-claim.json` 의
+    `ledger.dismissed_findings` 안에 있으므로 새 배선 없이 읽을 수 있다.
+    """
+    head = "ab" * 20
+    anchor_json = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    title = "Dismissed as a false positive"
+    finding_id = _opencode_finding_id(OPENCODE_SCOPE_PATH, 1, "HIGH", title)
+    prior_body = (
+        "### New findings\n"
+        f"#### {finding_id} [HIGH] {title}\n- Changed anchor: {anchor_json}\nprior evidence"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Still open\n#### {finding_id} [HIGH] {title}\n"
+        f"- Changed anchor: {anchor_json}\n"
+        '- Current line: "added line 1"\nstill present'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+        dismissed_findings=[{"comment_id": 555, "finding_id": finding_id}],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+
+    assert state["attempt_status"] == "success"
+    # 기각된 finding 은 발행 본문에서 사라지고, 따라서 예산 원장의 잔존 목록에서도 빠진다.
+    assert finding_id not in body
+    assert json.loads(outputs["remaining_finding_ids_json"]) == []
+    # 비워진 캐리오버 섹션은 `None` 으로 남아야 한다 — 빈 본문 섹션은 다음 라운드에
+    # `splitSections` 가 문서 전체를 거절해 그 PR 의 리뷰를 영구히 실패시킨다.
+    assert "### Still open\nNone" in body
+
+
+@node_required
+def test_opencode_out_of_scope_carryover_anchor_no_longer_kills_the_review(tmp_path):
+    """캐리오버 앵커 하나가 범위 밖이어도 리뷰 전체가 사라지지 않는다 (#128 Phase 2).
+
+    head 가 전진해 이전 finding 의 앵커가 이번 범위 밖으로 나가는 것은 정상 운영이다.
+    지금은 캐리오버 앵커를 전부 한 덩어리로 검증해 하나만 어긋나도 문서 전체가 실패하고,
+    그 라운드의 New findings 까지 통째로 사라진다.
+
+    모델의 주장은 버리되 finding 은 **은퇴시키지 않는다** — 발행 본문이 곧 active 집합이라
+    블록을 빼면 예산 원장이 그 finding 을 해결된 것으로 기록한다.
+    """
+    head = "ab" * 20
+    in_scope = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    out_of_scope = json.dumps(
+        {"path": ".github/workflows/gemini-auto-review.yml", "line": 74},
+        separators=(",", ":"),
+    )
+    carried = "RVW-aaaaaaaaaaaa"
+    prior_body = (
+        "### New findings\n"
+        f"#### {carried} [HIGH] Persisting problem\n"
+        f"- Changed anchor: {in_scope}\nprior evidence"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        f"#### [MEDIUM] Fresh finding this round\n- Changed anchor: {in_scope}\n"
+        '- Current line: "added line 1"\nConcrete impact.\n'
+        f"### Still open\n#### {carried} [HIGH] Persisting problem\n"
+        f"- Changed anchor: {out_of_scope}\n"
+        '- Current line: "      publisher_app_id: ${{ vars.APP_ID }}"\nstill present'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+
+    assert state["attempt_status"] == "success"
+    # 이번 라운드의 정상 finding 은 발행된다.
+    assert "Fresh finding this round" in body
+    # 캐리오버는 은퇴하지 않는다 — 이전 라운드가 캐노니컬라이즈·attest 한 텍스트가 유지된다.
+    assert f"#### {carried} [HIGH] Persisting problem" in body
+    assert "prior evidence" in body
+    # 모델이 낸 범위 밖 앵커는 발행되지 않는다.
+    assert "gemini-auto-review.yml" not in body
+    # 캐리오버 정규화는 New findings 필터와 **별개 카운터**로 보고된다. 하나로 세면
+    # New finding 0건 + 캐리오버 1건이 `quality_filtered` 로 오기록되고, 발행 라벨의
+    # `filtered_invalid_new_findings=` 가 거짓이 된다.
+    assert "- Carryover: normalized_carryover_blocks=1; reasons=invalid_anchor" in body
+    assert "filtered_invalid_new_findings" not in body
+
+
+@node_required
 @pytest.mark.parametrize("section", ["Resolved", "Retracted"])
 def test_opencode_rereview_rejects_carryover_without_current_evidence(
     tmp_path, section
@@ -14665,31 +14788,31 @@ def test_opencode_rereview_rejects_noncanonical_duplicate_evidence_field(
             "base = True\nvulnerable = True\ntail = True\nunrelated = True\n",
             None,
             None,
-            "failure",
+            "demoted",
         ),
         (
             "base = True\ntail = True\nvulnerable = True\n",
             None,
             None,
-            "failure",
+            "demoted",
         ),
         (
             "base = True\nvulnerable = True\ntail = True\n",
             "src/moved.py",
             None,
-            "failure",
+            "demoted",
         ),
         (
             "base = True\ntail = True\nrenamed = True\n",
             "src/moved.py",
             None,
-            "failure",
+            "demoted",
         ),
         (
             "base = True\ntail = True\n",
             None,
             "src/moved.py",
-            "failure",
+            "demoted",
         ),
     ),
     ids=(
@@ -14812,11 +14935,21 @@ def test_opencode_rereview_verifies_authenticated_removed_line(
     state = json.loads(
         re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1)
     )
-    assert state["attempt_status"] == expected_status
+    assert state["attempt_status"] == (
+        "success" if expected_status == "demoted" else expected_status
+    )
     if expected_status == "success":
         assert "- Removed line: \"vulnerable = True\"" in body
     else:
-        assert "Reason: anchor_out_of_scope" in body
+        # 증명되지 않은 Resolved 주장은 믿지 않는다. 예전에는 문서 전체를 실패시켰지만,
+        # 그러면 그 라운드의 정상 finding 까지 사라진다. 이제는 finding 을 `Still open`
+        # 으로 강등해 active 로 남기고 모델이 낸 removal 근거만 버린다 — 블록을 빼면
+        # 발행 본문이 곧 active 집합이라 아무것도 고치지 않은 finding 이 은퇴한다.
+        assert "### Still open" in body
+        assert "#### Deleted defect" in body
+        assert "prior evidence" in body
+        assert "- Removed line:" not in body
+        assert "### Resolved\nNone" in body
 
 
 @node_required
