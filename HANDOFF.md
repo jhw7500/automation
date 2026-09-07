@@ -1,49 +1,101 @@
 # Handoff — automation
 
-_2026-09-07 · claude-code · main = `dbd2a6e` · **v1.70 릴리스 완료** (#128 Phase 1)_
+_2026-09-07 · **#128 Phase 2 머지 완료, #112 CLOSED** · main = `a5fbc88` · 다음: v1.71 릴리스_
 
-## 체크포인트 — #128 Phase 2 구현 완료, PR 전 트리뷰널 재실행 대기
-- **완료·검증됨**: 브랜치 `feat/128-opencode-dismissals`, 커밋 `f0becf2` + `d664472`.
-  전체 스위트 **3113 passed / 0 failed** (part1 832 · part2 1672 · part3 609), actionlint OK.
-  기각이 OpenCode 에 적용되고(#112), 블록 하나 때문에 리뷰 전체가 버려지지 않는다.
-- **PR 생성은 `pre-pr-tribunal` 훅이 막는다.** 라운드 1 은 A/B/C 3인 병렬로 돌렸고
-  **HIGH 1건**(A-R1-001 = B-R1-001: 기각이 한 라운드만 유효)을 잡아 수정했다. 그 외 A·B·C 가
-  지적한 계약 위반 2건(prev_context strip 누락, 이월 시 거부된 앵커로 ID 파생)도 함께 고쳤다.
-- **라운드 1 은 finalize 에서 `TEXT_INVALID` 로 막혔다** — 스키마가 텍스트 필드에서 `Cc` 문자를
-  전부 금지하는데(`model.py:374-377`, 개행·탭 포함) 리뷰어들이 여러 줄 rationale 을 냈다.
-  레퍼런스에 명시가 없어 디스패치 프롬프트에서 빠졌다. 스킬이 보고서 수리를 금지하므로 재실행이 정답.
-- **다음 액션 1개**: 새 HEAD 에서 **트리뷰널 라운드 1 재실행** — 프롬프트에
-  "텍스트 필드는 한 줄, 개행·탭 금지"를 명시할 것. 통과하면 PR → v1.71 릴리스 + 17타깃 롤아웃.
-- **제약**: `gh`·`git push` 는 `env -u GITHUB_TOKEN`. 트리뷰널 보고서 파일은 **`chmod 600`**
-  (CLI 가 `st_mode & 0o077` 을 거부). `.review/`·`.omc/`·`.serena/` 는 `.git/info/exclude` 에 넣어
-  워크트리를 clean 으로 유지했다(`.gitignore` 를 쓰면 PR diff 가 오염된다).
-  워크플로나 예산 헬퍼를 고치면 `verify_workflow_release.py` 의 v1.71 다이제스트 2개를 다시 맞춘다.
-- **열린 이슈**: #152 · #150 · #145 · #133 잔여 · #125 · #106 · #93 · #83. #112 는 이 PR 이 닫는다.
+> 이 문서는 **도구 비의존**으로 쓴다. 다음 세션이 Codex 든 Claude Code 든 이것만 읽고 이어갈 수 있어야 한다.
+> Claude Code 전용 사항은 그렇게 표시한다.
 
-## #128 Phase 1 에서 확정된 것 (Phase 2 에서 재사용)
-- **캐리오버 결속은 heading 원문 문자열이다 — 바꾸지 말 것.** 이슈 #128 의 2번(ID 키 전환)을
-  변형으로 시험했더니 구형식 prior 를 가진 라운드가 `attempt_status: failure` 로 **문서 전체 실패**했다.
-  문자열 결속만이 롤아웃을 가로지르는 PR 을 흡수한다. 2번은 소프트 정규화 프리미티브가 선행돼야 하는
-  **목적지**이지 영구 기각이 아니다.
-- **severity 는 읽되 요구하지 않는다.** `:4196`(`/^#### \S.*$/`) 불변. 못 읽으면 heading 원문 그대로,
-  ID 없음 — 오늘 발행되는 finding 과 바이트 동일.
-- **ID 는 한 번 부여하고 캐리오버가 승계한다**(재파생 금지). 재파생하면 앵커 이동 때마다 ID 가 바뀌어
-  이미 제출된 기각이 무효가 된다.
-- **Phase 2 의 함정**: 기각으로 캐리오버 섹션의 잔존 블록이 0 이 되면 빈 섹션이 발행되고,
-  다음 라운드에 `splitSections`(`:4183-4185`)가 문서를 `null` 처리해 **그 PR 의 OpenCode 리뷰가 영구 실패**한다.
-  잔존 0 인 캐리오버 섹션은 드롭할 것. `### New findings` 만 `None` 으로 유지한다.
-- **실기 확인 상태**: 성공 경로(재렌더)는 PR #153 에서 확인됨(`attempt_status: success`).
-  **ID 렌더링 자체는 아직 미관측** — OpenCode 가 지적을 실제로 내는 PR 이 나와야 확인된다.
+## 체크포인트
 
-## 재사용할 사실 (이전 사이클)
-- **폐기·삭제를 처음 하는 경로는 스위트 통과로 검증되지 않는다** — 반드시 실제 plan 을 돌려 본다.
-- **정본 트리는 카탈로그와 정확히 일치해야 한다** — 파일·카탈로그 항목·설정 키를 함께 지운다.
-- **OpenCode 재시도에는 새 head 가 필요하다** — override 라운드는 Claude·Gemini 전용이고
-  v1.62 부터 OpenCode 는 거절된다(`contracts.md:249-255`). `gh run rerun --failed` 도 모델을 다시 부르지 않는다.
-- **`candidate_contract_failed` 는 계약 위반이 아닐 수 있다** — 후보 아티팩트의 `candidate_validations`
-  (빈 배열이면 검사 미실행)와 `review_sha256`(null)로 판별한다.
-- **BG 테스트가 읽는 파일을 실행 중에 편집하지 않는다** — 이번 세션에서 릴리스 검증 4건이 그렇게 오염됐고,
-  실패 이름이 무관해 보여 기존 결함으로 오분류될 뻔했다. `pytest ... | tail` 의 종료 코드는 tail 의 것이다.
+- **완료·검증됨**: `a5fbc88` (PR #155 머지). OpenCode 리뷰어가 기각을 적용하고(#112 **CLOSED**),
+  블록 하나 때문에 리뷰 전체가 버려지지 않는다. 전체 스위트 **3113 passed / 0 failed**, actionlint OK.
+- **다음 액션 1개**: **v1.71 릴리스 + 17타깃 롤아웃 → `automation_ref` 범프 PR.**
+  현재 태그는 `v1.70` 까지, `automation_ref = v1.70`. 절차는 아래 "릴리스 절차" 그대로.
+- **열린 PR 없음.** 작업 트리 clean.
+
+## 릴리스 절차 (v1.70 에서 그대로 반복)
+
+```bash
+cd /home/jhw/ai/opencode/projects/automation
+MERGE=$(git rev-parse origin/main)                      # a5fbc88...
+python3 -m scripts.verify_workflow_release --ref v1.71 --expected-commit "$MERGE" --commit-only
+git tag -a v1.71 -m "v1.71: apply dismissals to OpenCode and stop discarding a review over one block (#128)" "$MERGE"
+env -u GITHUB_TOKEN git push origin v1.71
+python3 -m scripts.verify_workflow_release --ref v1.71 --expected-commit "$MERGE"
+```
+
+그 다음 `docs/workflow-fleet-rollout.md` 의 절차를 v1.71 로 치환해 수행한다 — 하드닝된
+`public_git`/`release_git` 클론 검증 블록(문서 :308-380)을 건너뛰지 말 것.
+
+```bash
+export AUTOMATION_RELEASE_ROOT=/tmp/automation-v1.71-public
+export FLEET_WORKSPACE=/tmp/automation-v1.71-fleet
+export ACTIONLINT=/tmp/actionlint-v1.7.12/actionlint
+# plan (읽기 전용) → blocked=0 확인 후 배치로 publish → 전 PR 머지 → audit
+env -u GITHUB_TOKEN python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
+  --automation "$AUTOMATION_RELEASE_ROOT" --workspace "$FLEET_WORKSPACE" \
+  --initialize-workspace --mode plan --ref v1.71 --actionlint "$ACTIONLINT"
+```
+
+마지막에 `scripts/workflow-config.json` 의 `automation_ref` 와
+`tests/test_workflow_catalog.py` 의 단언을 **함께** v1.71 로 올리는 범프 PR 을 낸다(한쪽만 바꾸면
+`test_catalog_and_profiles_are_closed` 가 실패한다 — 양쪽 arm 확인됨).
+
+## 제약 (반드시 지킬 것)
+
+- `gh` 와 `git push` 는 **항상** `env -u GITHUB_TOKEN` 으로.
+- actionlint 는 `-shellcheck= -pyflakes=` 플래그로만.
+- 스위트는 3분할: `tests/ --ignore=tests/test_verify_workflow_release.py --ignore=tests/test_review_workflow_logic.py`(832),
+  `tests/test_review_workflow_logic.py`(1672, ~9분), `tests/test_verify_workflow_release.py`(609, ~4분).
+- **워크플로나 예산 헬퍼를 1바이트라도 고치면** `scripts/verify_workflow_release.py` 의
+  `EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256["opencode"]` 와
+  `EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V171` 을 `sha256sum` 으로 다시 맞춘다.
+  그리고 `tests/release_fixture_helpers.py` 의 `PRE_V171_OPENCODE_DISMISSAL_HUNKS` 를 재생성해
+  왕복이 v1.70 핀(`218292d6…`, `2123326a…`)을 재현하는지 확인한다.
+- **BG 테스트가 읽는 파일을 실행 중에 편집하지 않는다.** 이 세션에서 두 번 오염됐다.
+  `pytest ... | tail` 의 종료 코드는 tail 의 것이므로 판정은 요약 줄로 한다.
+- **호스트 메모리 빠듯** — codex 프로세스들이 약 4GB 를 쓰고 있어 긴 BG 감시자가 이 세션에서 6회 강제종료됐다.
+  긴 폴링 대신 짧은 확인을 반복한다.
+- **(Claude Code 전용)** `gh pr create` 는 `pre-pr-tribunal` 훅이 막는다. 리뷰어 3인 트리뷰널을
+  돌려 `finalize` 가 pass 해야 통과된다. 보고서 파일은 **`chmod 600`**(CLI 가 `st_mode & 0o077` 거부),
+  텍스트 필드는 **한 줄**이어야 한다(스키마가 개행·탭 등 `Cc` 문자를 전부 거부 — 레퍼런스에 미기재).
+  `.review/`·`.omc/`·`.serena/` 는 `.git/info/exclude` 에 넣어 워크트리를 clean 으로 유지했다.
+  Codex 세션에는 이 훅이 없다.
+
+## #128 을 열어 둔 이유
+
+Phase 1(v1.70, ID 부여)과 Phase 2(v1.71, 기각 적용)가 모두 머지됐지만, 이슈 본문의 7단계 중
+**2번(캐리오버 결속을 heading 문자열에서 ID 키로 전환)은 의도적으로 하지 않았다.**
+실측 근거: ID 결속을 요구하는 변형에서 구형식 prior 를 가진 라운드가 `attempt_status: failure` 로
+문서 전체가 실패했다. 소프트 정규화 프리미티브가 선행돼야 하는 목적지이고, Phase 2 가 그
+프리미티브를 만들었으므로 이제 착수 가능하다.
+
+## 트리뷰널이 남긴 후속 이슈 (전부 비블로킹, 실행 증거 있음)
+
+- **#156** 기각이 닿지 않는 경로 2 — severity 없는 heading 은 영구 기각 불가(공유 정규화기는
+  `invalid_severity` 로 거름), `unchanged` 재사용 라운드는 기각된 finding 을 재발행(다음 모델 라운드에 자가치유)
+- **#157** 발행 본문이 정직한 active 집합이 아니다 — 캐리오버를 **생략**하는 것만으로 finding 이 은퇴.
+  base 와 head 에서 동일(기존 성질). 소프트 경로는 "잘못된 블록" 경로만 막았다
+- **#158** 캐리오버 블록별 검증이 저장소 전체 `git diff` 를 블록 수만큼 반복(이전엔 1회). 600초 예산 잠식
+- **#159** 릴리스 픽스처의 "복사 뒤 복원 재호출" 규칙 제거 — 이 세션에서 두 번 밟은 함정. C 가 재배치
+  대안으로 v163·v168·v170·v171 통과를 확인했다
+- **#152** 크기 가설은 **반증됐다** — 92KB/358초 성공. 남는 것은 진단 가능성(repair 산출물 미보존,
+  정규화만 한 라운드의 원문 포인터 부재)
+
+## 확정된 사실 (재사용할 것)
+
+- **발행 본문이 곧 active 집합이다.** `priorActiveHeadings` 는 매 라운드 `previousBody` 에서 재도출되고
+  `remaining_finding_ids` 는 발행 본문을 스크레이핑한다. 블록을 빼면 finding 이 은퇴한다 — 소프트 경로에서
+  드롭이 아니라 **이월/강등**을 택한 이유다.
+- **기각은 캐리오버만으로 부족하다.** 라운드 N 의 제거가 라운드 N+1 의 prior 에서 ID 를 없애므로,
+  New finding 의 **파생 ID** 도 기각 목록과 대조해야 한다. 이것이 트리뷰널이 잡은 HIGH 였다.
+- **severity 는 읽되 요구하지 않는다.** 문법(`/^#### \S.*$/`)은 불변. 못 읽으면 heading 원문 그대로,
+  ID 없음 — 오늘 발행되는 finding 과 바이트 동일. 대가는 #156.
+- **OpenCode 재시도에는 새 head 가 필요하다.** override 라운드는 Claude·Gemini 전용이고 v1.62 부터
+  OpenCode 는 거절된다(`contracts.md:249-255`). `gh run rerun --failed` 는 모델을 다시 부르지 않는다.
+- **Codex 는 전역 설정이 아니라 저장소별 등록**이고 자동 리뷰는 의도적으로 꺼져 있다.
+  트리거는 `@codex review` 코멘트(`/jhw:pr` 이 자동 게시). 연동은 살아 있다(2026-09-07 실측).
+  플릿 스캔 원자료: `scratchpad/codex-findings.md`.
 
 ## 완료된 릴리스
 - v1.70 (#128 Phase 1: OpenCode finding ID) · v1.69 · v1.68(태그만) · v1.67 · v1.66 · v1.65.
