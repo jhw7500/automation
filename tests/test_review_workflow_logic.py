@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import hashlib
 import html.entities
+import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import unicodedata
 from pathlib import Path
 
@@ -8478,6 +8480,21 @@ def test_opencode_prompt_requires_one_canonical_anchor_per_finding():
     assert "without adding another Changed anchor or Current line field" in prompt
 
 
+def test_opencode_prompt_states_that_the_workflow_owns_finding_ids():
+    """프롬프트가 severity 허용값과 ID 소유권을 명시한다 (#128).
+
+    severity 를 읽을 수 없는 heading 에는 워크플로가 ID 를 붙이지 않는다. 허용값을
+    프롬프트가 말해 주지 않으면 그 finding 을 기각할 수 있는지가 모델의 임의 표기에
+    달리게 된다.
+    """
+    workflow = _load("opencode-auto-review.yml")
+    prompt = _step(workflow, "opencode-review", "Run OpenCode PR review")["env"]["PROMPT"]
+
+    assert "exactly one of `CRITICAL`, `HIGH`, or `MEDIUM`" in prompt
+    assert "never write one yourself" in prompt
+    assert "copy it unchanged" in prompt
+
+
 def test_opencode_shared_diff_wiring_and_model_gates_are_exact():
     workflow = _load("opencode-auto-review.yml")
     job = workflow["jobs"]["opencode-prepare"]
@@ -14150,6 +14167,356 @@ def test_opencode_rereview_accepts_exact_still_open_resolved_and_retracted_bindi
     assert "#### Was incorrect" in body
 
 
+def _shared_stable_finding_id(
+    reviewer: str, path: str, line: int, severity: str, title: str
+) -> str:
+    """공유 정규화기의 ID 레시피를 그대로 호출한다.
+
+    OpenCode 의 인라인 JS 포팅이 이 값과 어긋나면 두 리뷰어가 서로 다른 레시피를
+    갖게 되므로, 기대값을 리터럴로 적지 않고 공유 구현에서 가져온다.
+    """
+    action_dir = ROOT / ".github" / "actions" / "canonicalize-review"
+
+    def _load_module(name: str, module_path: Path):
+        spec = importlib.util.spec_from_file_location(name, module_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    scope = _load_module("review_scope", action_dir / "review_scope.py")
+    shared = _load_module("canonicalize_review", action_dir / "canonicalize_review.py")
+    return shared.stable_finding_id(
+        reviewer, scope.SourceAnchor(path, line), severity, title
+    )
+
+
+def _opencode_finding_id(path: str, line: int, severity: str, title: str) -> str:
+    """OpenCode 인라인 JS 의 ID 레시피를 파이썬으로 독립 구현한 것.
+
+    구성은 공유 정규화기와 같다 — NUL 로 구분한 (reviewer, path, line, severity,
+    정규화 제목) 을 sha256 하고 앞 12 hex 에 `RVW-` 를 붙인다. 제목 정규화만 다르다:
+    JavaScript 에는 유니코드 casefold 가 없으므로 `toLowerCase()` 상당을 쓰고,
+    공유 구현의 가시 텍스트 이스케이프를 적용하지 않는다 — OpenCode 는 제목을 원문
+    그대로 발행하므로 이스케이프할 대상이 없기 때문이다.
+    """
+    normalized = " ".join(title.split()).lower()
+    identity = "\0".join(("opencode", path, str(line), severity, normalized))
+    return "RVW-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+
+
+def test_opencode_finding_id_matches_the_shared_recipe_for_plain_titles():
+    """평범한 제목에서는 OpenCode 레시피가 공유 레시피와 같은 값을 낸다 (#128).
+
+    두 구현이 갈리는 지점을 여기서 못박는다 — 갈리는 경우는 제목이 공유 구현의 가시
+    텍스트 이스케이프를 촉발하거나, casefold 와 lowercase 가 다른 문자를 포함할 때뿐이다.
+    """
+    for title in (
+        "Broad ValueError catch hides invalid configuration",
+        "Broad   ValueError CATCH hides invalid configuration",
+        "설정이 잘못돼도 예외가 삼켜진다 😀",
+    ):
+        assert _opencode_finding_id(OPENCODE_SCOPE_PATH, 1, "MEDIUM", title) == (
+            _shared_stable_finding_id("opencode", OPENCODE_SCOPE_PATH, 1, "MEDIUM", title)
+        ), title
+
+    # casefold != lowercase, so the shared recipe folds 'ß' to 'ss' and OpenCode does not.
+    assert _opencode_finding_id(OPENCODE_SCOPE_PATH, 1, "MEDIUM", "Straße") != (
+        _shared_stable_finding_id("opencode", OPENCODE_SCOPE_PATH, 1, "MEDIUM", "Straße")
+    )
+
+
+@node_required
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Broad ValueError catch hides invalid configuration",
+        "Broad   ValueError CATCH hides invalid configuration",
+        "설정이 잘못돼도 예외가 삼켜진다 😀",
+        "Straße größer ÄÖÜ",
+        "comment marker <!-- inside --> the title",
+        "#### looks like a heading",
+        "- Status: success",
+    ],
+)
+def test_opencode_new_finding_heading_receives_shared_recipe_id(tmp_path, title):
+    """OpenCode 는 New finding 에 공유 레시피로 RVW- ID 를 부여한다 (#128).
+
+    ID 가 없으면 사람의 기각 코멘트(`dismiss RVW-<12hex> <사유>`)가 OpenCode
+    finding 을 가리킬 수 없고, 발행 본문을 훑는 `remaining_finding_ids` 도 항상
+    비어 있다. 제목 정규화가 인라인 JS 와 공유 파이썬 구현 사이에서 갈리면 두
+    리뷰어가 서로 다른 레시피를 갖게 되므로, 기대값은 공유 구현에서 가져온다.
+    """
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        f"#### [MEDIUM] {title}\n"
+        f"- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\n'
+        "material impact"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [_bot("github-actions[bot]", review, 10, updated="u2")]
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+    expected_id = _opencode_finding_id(OPENCODE_SCOPE_PATH, 1, "MEDIUM", title)
+    assert f"#### {expected_id} [MEDIUM] {title}" in body
+
+
+@node_required
+@pytest.mark.parametrize(
+    "heading",
+    ["Finding without severity", "[LOW] Style nit", "[medium] lowercase severity"],
+)
+def test_opencode_heading_without_known_severity_keeps_exact_bytes(tmp_path, heading):
+    """severity 를 읽을 수 없는 heading 은 ID 없이 원문 그대로 발행된다 (#128).
+
+    OpenCode 문법은 severity 를 요구한 적이 없다 (`/^#### \\S.*$/`). ID 를 붙이려고
+    문법을 조이면 오늘 통과하던 finding 이 소비자 저장소에서 조용히 탈락한다.
+    """
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        f"#### {heading}\n"
+        f"- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\n'
+        "material impact"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [_bot("github-actions[bot]", review, 10, updated="u2")]
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+    assert f"#### {heading}\n" in body
+    assert "RVW-" not in body
+
+
+@node_required
+def test_opencode_rejects_new_finding_repeating_an_active_prior_id(tmp_path):
+    """캐리오버 중인 finding 을 New findings 로 다시 보고하면 걸러진다 (#128).
+
+    ID 부여 전에는 prior 와 heading 문자열이 같아 `priorMatches !== 0` 가 이것을
+    막았다. prior heading 만 ID 를 얻으면 그 가드가 조용히 통과되므로, 파생 ID 를
+    prior active ID 와 대조해 다시 막는다.
+    """
+    head = "ab" * 20
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    title = "Duplicated claim"
+    finding_id = _shared_stable_finding_id(
+        "opencode", OPENCODE_SCOPE_PATH, 1, "HIGH", title
+    )
+    prior_body = (
+        "### New findings\n"
+        f"#### {finding_id} [HIGH] {title}\n- Changed anchor: {anchor}\nprior evidence"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        f"#### [HIGH] {title}\n- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\nre-reported as new\n'
+        f"### Still open\n#### {finding_id} [HIGH] {title}\n"
+        f"- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\nstill present'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+    assert body.count(f"#### {finding_id} [HIGH] {title}") == 1
+    assert "reasons=duplicate_prior_id" in body
+
+
+@node_required
+def test_opencode_carryover_inherits_the_prior_finding_id(tmp_path):
+    """캐리오버는 prior heading 의 ID 를 승계한다 — 재파생하지 않는다 (#128).
+
+    ID 는 finding 이 새로 등장할 때 한 번 부여되고 이후 라운드는 모델이 그대로 복사한
+    heading 을 통해 물려받는다. 매 라운드 재파생하면 앵커가 움직일 때마다 ID 가 바뀌어
+    이미 제출된 기각이 조용히 무효가 된다.
+    """
+    head = "ab" * 20
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    title = "Persisting problem"
+    carried_id = "RVW-aaaaaaaaaaaa"
+    derived_id = _shared_stable_finding_id(
+        "opencode", OPENCODE_SCOPE_PATH, 1, "HIGH", title
+    )
+    assert carried_id != derived_id
+    prior_body = (
+        "### New findings\n"
+        f"#### {carried_id} [HIGH] {title}\n- Changed anchor: {anchor}\nprior evidence"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Still open\n#### {carried_id} [HIGH] {title}\n"
+        f"- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\nstill present'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+    assert f"#### {carried_id} [HIGH] {title}" in body
+    assert derived_id not in body
+
+
+@node_required
+def test_opencode_carryover_from_an_id_less_prior_review_still_binds(tmp_path):
+    """ID 부여 이전에 게시된 prior 스티키에서도 캐리오버가 결속된다 (#128).
+
+    결속 키를 heading 문자열로 유지하는 이유가 이것이다 — 롤아웃 시점에 진행 중인 PR 의
+    prior 스티키에는 ID 가 없다. ID 를 결속 키로 요구했다면 그 라운드가 통째로 실패한다.
+    """
+    head = "ab" * 20
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    title = "Legacy finding without an id"
+    prior_body = (
+        "### New findings\n"
+        f"#### [HIGH] {title}\n- Changed anchor: {anchor}\nprior evidence"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Still open\n#### [HIGH] {title}\n"
+        f"- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\nstill present'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    assert state["attempt_status"] == "success"
+    derived_id = _shared_stable_finding_id(
+        "opencode", OPENCODE_SCOPE_PATH, 1, "HIGH", title
+    )
+    assert f"#### {derived_id} [HIGH] {title}" in body
+
+
+@node_required
+def test_opencode_publishes_remaining_finding_ids_for_the_budget_ledger(tmp_path):
+    """발행된 finding 의 ID 가 예산 원장 출력으로 흘러간다 (#128).
+
+    ID 생성기가 없는 동안 `remaining_finding_ids` 는 리더 정규식이 아무것도 매치하지
+    못해 항상 빈 배열이었다. 그래서 사람의 기각 코멘트가 가리킬 대상이 없었다.
+    """
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    title = "Unclosed file handle leaks on the error path"
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        f"#### [HIGH] {title}\n"
+        f"- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\n'
+        "Concrete, blocking impact."
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [_bot("github-actions[bot]", review, 10, updated="u2")]
+    )
+
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+    expected_id = _shared_stable_finding_id(
+        "opencode", OPENCODE_SCOPE_PATH, 1, "HIGH", title
+    )
+    assert json.loads(outputs["remaining_finding_ids_json"]) == [expected_id]
+    assert json.loads(outputs["authenticated_review_json"])[
+        "remaining_finding_ids"
+    ] == [expected_id]
+
+
+@node_required
+def test_opencode_filters_a_new_finding_that_assigns_its_own_id(tmp_path):
+    """모델이 스스로 붙인 RVW- ID 는 발행되지 않는다 (#128).
+
+    ID 는 워크플로 소유다. 모델이 지어낸 ID 를 그대로 실으면 발행 본문을 훑는
+    `remaining_finding_ids` 가 모델이 고른 값을 원장으로 넘기게 된다.
+    """
+    anchor = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    review = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        "#### RVW-deadbeefcafe [HIGH] Invented identifier\n"
+        f"- Changed anchor: {anchor}\n"
+        '- Current line: "added line 1"\n'
+        "Concrete, blocking impact."
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [], [_bot("github-actions[bot]", review, 10, updated="u2")]
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+    assert "RVW-deadbeefcafe" not in body
+    assert "Invented identifier" not in body
+    assert json.loads(outputs["remaining_finding_ids_json"]) == []
+    assert "reasons=model_assigned_id" in body
+
+
 @node_required
 @pytest.mark.parametrize("section", ["Resolved", "Retracted"])
 def test_opencode_rereview_rejects_carryover_without_current_evidence(
@@ -14954,7 +15321,10 @@ def test_opencode_filters_out_of_scope_new_finding_but_keeps_valid_high(tmp_path
     )
 
     assert state["attempt_status"] == "success"
-    assert "#### [HIGH] Real regression" in body
+    retained_id = _shared_stable_finding_id(
+        "opencode", OPENCODE_SCOPE_PATH, 1, "HIGH", "Real regression"
+    )
+    assert f"#### {retained_id} [HIGH] Real regression" in body
     assert "Concrete, blocking impact." in body
     assert "Potential parameter duplication typo" not in body
     assert (
@@ -15025,7 +15395,10 @@ def test_opencode_filters_malformed_new_finding_but_keeps_valid_sibling(tmp_path
     )
 
     assert state["attempt_status"] == "success"
-    assert "#### [HIGH] Real regression" in body
+    retained_id = _shared_stable_finding_id(
+        "opencode", OPENCODE_SCOPE_PATH, 1, "HIGH", "Real regression"
+    )
+    assert f"#### {retained_id} [HIGH] Real regression" in body
     assert "Concrete, blocking impact." in body
     assert "Malformed evidence" not in body
     assert (

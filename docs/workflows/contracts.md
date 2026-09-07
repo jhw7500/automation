@@ -560,7 +560,35 @@ After the top-level document and section grammar validates, OpenCode checks each
 block independently. A block with malformed, missing, mixed, or noncanonical evidence fields is
 omitted with reason `finding_grammar_invalid`. A syntactically valid block whose path is absent or
 removed, whose line is not an actual added-side line, or whose quoted current line does not match is
-omitted with reason `anchor_out_of_scope`. Valid blocks—including `[HIGH]` blocks—remain unchanged.
+omitted with reason `anchor_out_of_scope`. A block whose heading already carries an `RVW-`
+identifier is omitted with reason `model_assigned_id`, because identifiers are workflow-owned and a
+model-chosen one would decide what the budget ledger records as remaining. A block whose derived
+identifier equals one an authenticated active prior finding already holds is omitted with reason
+`duplicate_prior_id`; before identifiers existed the identical heading text alone stopped the model
+from re-reporting a finding it was also carrying over. Valid blocks—including `[HIGH]` blocks—keep
+their evidence and prose unchanged and are republished with the identifier described next.
+
+From `v1.70` OpenCode publishes a workflow-owned identifier in each finding heading, so a
+collaborator's dismissal comment has something to name. The canonical body is re-rendered on every
+successful round rather than only when a block was filtered; that re-render normalizes section
+spacing and is otherwise the accepted document. A `New findings` heading of the exact form
+`#### [SEVERITY] title`, where `SEVERITY` is `CRITICAL`, `HIGH`, or `MEDIUM`, is republished as
+`#### RVW-<12 lowercase hex> [SEVERITY] title`. The identifier is `RVW-` plus the first 12 lowercase
+hexadecimal characters of SHA-256 over the NUL-separated reviewer `opencode`, changed path, changed
+line, severity, and whitespace-collapsed, lowercased title. That construction is the shared
+canonicalizer's; the two differ only in title normalization, because OpenCode publishes the title
+verbatim and so applies neither the shared implementation's visible-text escaping nor its Unicode
+case folding.
+
+An identifier is assigned once, when the finding is new, and every later round inherits it through
+the heading the model copies: a heading that already carries one is republished unchanged and never
+re-derived, so a moved anchor cannot silently void a dismissal naming it. Carryover binding is
+unchanged and still keys on exact heading text, so a review published before this version—whose
+headings carry no identifier—still binds, and its findings receive an identifier on the first round
+after the upgrade, derived from the anchor they hold at that moment. A heading whose severity is
+absent or outside the closed set keeps its exact bytes and receives no identifier: such a finding
+cannot be named by a dismissal, and nothing that publishes today changes shape. `Resolved` and
+`Retracted` blocks leave the active set and are republished unchanged.
 If every new block is omitted, the canonical section becomes exactly `### New findings` followed by
 `None`; the successful attested comment reports `filtered_invalid_new_findings=N` and the sorted
 set of filtering reasons on its visible validation line. Whenever that count is nonzero, the next
@@ -645,9 +673,11 @@ block naming it is normalized with `dismissed_prior_id`, and a new finding whose
 dismissed — the model repeating the same claim verbatim — is normalized the same way instead of
 re-entering the document. The finding therefore disappears from the canonical Markdown, from
 `accepted-count`, and from the remaining finding IDs for as long as the dismissal stands. The
-audit trail is the budget ledger, not the review document. OpenCode derives no `RVW-` IDs — its
-canonicalizer binds carryover by exact heading text — so a dismissal cannot name an OpenCode
-finding until that reviewer assigns IDs.
+audit trail is the budget ledger, not the review document. From `v1.70` OpenCode derives its own
+`RVW-` IDs (see [Changed-anchor contract](#changed-anchor-contract)) while its canonicalizer still
+binds carryover by exact heading text, but it does not yet receive the dismissal list, so a
+dismissal cannot retire an OpenCode finding; the IDs it now publishes are what a later version lets
+a dismissal name.
 
 ### Hard checkpoints and soft finding filters
 
@@ -1174,8 +1204,9 @@ remaining-finding cap and is not expected to be reached in normal use. Deleting 
 revokes its dismissal on the next run; editing it re-targets it. A refused claim — including
 `round_budget_exhausted` after every round is spent — still records the snapshot and rewrites the
 ledger comment, so a dismissal takes effect without a new model round. The OpenCode ledger
-ignores dismissal comments entirely and keeps the pre-`v1.63` summary text, because that
-reviewer assigns no `RVW-` IDs for a dismissal to name.
+ignores dismissal comments entirely and keeps the pre-`v1.63` summary text: from `v1.70` that
+reviewer publishes `RVW-` IDs, but its three-job canonicalizer does not yet carry the dismissal
+list across its sealed handoff.
 
 The ledger key `dismissed_findings` is written only when at least one dismissal exists; a ledger
 without one keeps its exact pre-`v1.63` bytes, so every open pull request stays valid across the

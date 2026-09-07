@@ -54,6 +54,7 @@ from scripts.workflow_release_inventory import (
     release_supports_skip_reason_notice,
     release_supports_label_mismatch_decline,
     release_supports_dispatch_review_diff,
+    release_supports_opencode_finding_ids,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
@@ -789,6 +790,14 @@ EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256 = {
     "claude": "a6116cf542876a46e8401e26471324a586772398ad5d21360155e686123104be",
     "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
     "opencode": "a74b0b0948467e46bebf223fc2b5f2bfcd3824c317a908dbacbb7e7cd2ec6fbc",
+}
+# v1.70 stamps a stable RVW- identifier on every published OpenCode finding so a dismissal
+# comment has something to name. Claude and Gemini derive theirs in the shared canonicalizer
+# and are unchanged, so they keep the digests the label-mismatch release approved.
+EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256 = {
+    "claude": "a6116cf542876a46e8401e26471324a586772398ad5d21360155e686123104be",
+    "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
+    "opencode": "218292d680481a85ece7f118c0d4c38f855682c4ebe6941322d5fee2799143d0",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
@@ -2484,6 +2493,7 @@ def verify_opencode_runtime(
         EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256["opencode"],
         EXPECTED_FILTER_REASON_WORKFLOW_SHA256["opencode"],
         EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256["opencode"],
+        EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256["opencode"],
     }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
@@ -2519,6 +2529,7 @@ def verify_opencode_runtime(
             EXPECTED_SAME_HEAD_CANCEL_WORKFLOW_SHA256["opencode"],
             EXPECTED_FILTER_REASON_WORKFLOW_SHA256["opencode"],
             EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256["opencode"],
+            EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256["opencode"],
         }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
@@ -5912,7 +5923,9 @@ def _verify_review_invocation_budget(
         ),
     }
     workflow_digests = (
-        EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256
+        EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256
+        if release_supports_opencode_finding_ids(ref)
+        else EXPECTED_LABEL_MISMATCH_WORKFLOW_SHA256
         if release_supports_label_mismatch_decline(ref)
         else EXPECTED_SKIP_REASON_WORKFLOW_SHA256
         if release_supports_skip_reason_notice(ref)
