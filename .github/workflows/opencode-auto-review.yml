@@ -876,6 +876,11 @@ jobs:
             choose the single added-side line that most directly causes it and describe supporting
             lines in prose without adding another Changed anchor or Current line field.
 
+            The severity in a New finding heading is exactly one of `CRITICAL`, `HIGH`, or `MEDIUM`,
+            spelled that way inside square brackets. The workflow assigns each published finding
+            a stable `RVW-` identifier and prints it in the heading; never write one yourself.
+            A re-review carryover heading already carries that identifier — copy it unchanged.
+
             TRUSTED REVIEW SCOPE (final authority): `review-full.diff` and `review-scope.json`
             are the exclusive set of changes under review. Always read `review-full.diff`, including when the prepared
             mode is delta. Do not use an unnumbered or model-side diff fallback, another diff file,
@@ -4700,6 +4705,50 @@ jobs:
               return 'valid';
             };
 
+            // A finding carries a workflow-owned RVW- id so a collaborator's dismissal comment
+            // can name it. The construction is the shared canonicalizer's — NUL-separated
+            // reviewer, path, line, severity and normalized title, sha256, first 12 hex — with
+            // reviewer 'opencode'. Only the title normalization differs: this one collapses
+            // whitespace and lowercases, and applies neither the shared implementation's
+            // visible-text escaping nor its Unicode case folding, because OpenCode publishes the
+            // title verbatim and JavaScript has no case folding. Ids are namespaced by reviewer,
+            // so nothing compares the two. Severity is read from the heading rather than required
+            // by the grammar: a heading whose severity is absent or unrecognized keeps its exact
+            // bytes and receives no id, which leaves every finding published today byte-identical.
+            const FINDING_HEADING = /^#### \[(CRITICAL|HIGH|MEDIUM)\] (\S.*)$/;
+            const CARRIED_FINDING_HEADING = /^#### (RVW-[0-9a-f]{12}) \[(CRITICAL|HIGH|MEDIUM)\] (\S.*)$/;
+            const normalizeTitle = (title) => title.trim().split(/\s+/).join(' ').toLowerCase();
+            const deriveFindingId = (path, line, severity, title) => 'RVW-' + sha256(
+              ['opencode', path, String(line), severity, normalizeTitle(title)].join('\0')
+            ).slice(0, 12);
+            const renderHeading = (entry) => {
+              const parts = FINDING_HEADING.exec(entry.block.heading);
+              if (!parts) return entry.block.heading;
+              const anchor = entry.evidence.anchors[0];
+              if (!anchor) return entry.block.heading;
+              return `#### ${deriveFindingId(anchor.path, anchor.line, parts[1], parts[2])}`
+                + ` [${parts[1]}] ${parts[2]}`;
+            };
+            // An id is assigned once, when the finding is new, and every later round inherits
+            // it through the heading the model copies verbatim. Re-deriving would move the id
+            // whenever the anchor moves and silently void a dismissal that names it.
+            const blockFindingId = (heading, anchor) => {
+              const carried = CARRIED_FINDING_HEADING.exec(heading);
+              if (carried) return carried[1];
+              const parts = FINDING_HEADING.exec(heading);
+              if (!parts || !anchor) return null;
+              return deriveFindingId(anchor.path, anchor.line, parts[1], parts[2]);
+            };
+            // Before ids existed the heading string alone stopped the model from re-reporting a
+            // finding it was also carrying over (`priorMatches !== 0` below). Once a prior
+            // heading gains an id and the model's new heading has none, the two strings differ,
+            // so the derived id has to enforce that same rule.
+            const priorActiveIds = new Set();
+            for (const [heading, evidenceList] of priorActiveEvidence) {
+              const priorId = blockFindingId(
+                heading, evidenceList[0] && evidenceList[0].changedAnchors[0]);
+              if (priorId) priorActiveIds.add(priorId);
+            }
             const candidate = candidateArtifactValid ? { body: candidateReview } : null;
             const review = candidate ? clean(candidate.body) : '';
             const parsedReview = review ? parseReview(review) : null;
@@ -4709,7 +4758,24 @@ jobs:
             if (parsedReview) {
               const newFindings = parsedReview.blocks.filter((entry) =>
                 entry.section === 'New findings');
+              const duplicatePriorEntries = new Set();
               for (const entry of newFindings) {
+                // Ids belong to the workflow. A new heading that already carries one was
+                // written by the model, and publishing it would let the model choose what the
+                // budget ledger records as a remaining finding.
+                if (CARRIED_FINDING_HEADING.test(entry.block.heading)) {
+                  duplicatePriorEntries.add(entry);
+                  filteredNewFindings.push({ entry, reason: 'model_assigned_id' });
+                  continue;
+                }
+                const findingId = blockFindingId(
+                  entry.block.heading, entry.evidence.anchors[0]);
+                if (findingId === null || !priorActiveIds.has(findingId)) continue;
+                duplicatePriorEntries.add(entry);
+                filteredNewFindings.push({ entry, reason: 'duplicate_prior_id' });
+              }
+              for (const entry of newFindings) {
+                if (duplicatePriorEntries.has(entry)) continue;
                 const result = validateAnchorEvidence(entry.evidence);
                 if (result === 'valid') continue;
                 if (result === 'invalid') {
@@ -4732,13 +4798,13 @@ jobs:
               }
             }
             const filteredEntries = new Set(filteredNewFindings.map((item) => item.entry));
-            const canonicalReview = parsedReview && filteredEntries.size > 0
+            const canonicalReview = parsedReview
               ? parsedReview.sections.map((section, sectionIndex) => {
                   const retained = parsedReview.blocks.filter((entry) =>
                     entry.sectionIndex === sectionIndex && !filteredEntries.has(entry));
                   const sectionBody = section.name === 'New findings' && retained.length === 0
                     ? 'None'
-                    : retained.map((entry) => [entry.block.heading, ...entry.block.lines]
+                    : retained.map((entry) => [renderHeading(entry), ...entry.block.lines]
                       .join('\n').trim()).join('\n\n');
                   return `### ${section.name}\n${sectionBody}`;
                 }).join('\n\n')

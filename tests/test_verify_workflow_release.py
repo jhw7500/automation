@@ -29,6 +29,7 @@ from release_fixture_helpers import (
     restore_pre_force_review_callers,
     restore_pre_v151_review_policy,
     restore_pre_v164_label_trigger,
+    restore_pre_v170_opencode_finding_ids,
     restore_retired_manual_pr_review,
     restore_pre_v166_label_mismatch_decline,
     restore_pre_v165_skip_reason_notice,
@@ -153,6 +154,7 @@ def restore_historical_v140_manual_outputs(repo: Path) -> None:
     (repo / "scripts/workflow-config.json").write_bytes(snapshot.read_bytes())
     # v1.68 withdrew the manual pull-request review; a v1.40 fixture still
     # ships it, so put the caller back before rewriting its bytes.
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     root = repo / "examples/baseline-workflows/.github/workflows"
     # 요청 범위 run-name 은 v1.40 이후에 추가됐다 — 정책 스냅샷 바이트를 맞추려면
@@ -240,6 +242,7 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
@@ -280,6 +283,7 @@ def v1462_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
@@ -528,6 +532,7 @@ def copy_review_policy_release_files(repo: Path) -> None:
 
 def prepare_v151(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
@@ -542,6 +547,7 @@ def prepare_v151(repo: Path) -> str:
 
 def prepare_v159(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
@@ -556,6 +562,7 @@ def prepare_v159(repo: Path) -> str:
 
 def prepare_v160(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
@@ -1989,6 +1996,7 @@ def test_v159_opt_in_helper_is_rejected_on_the_v151_release_line(
 
 def prepare_v162(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
@@ -2006,6 +2014,7 @@ def prepare_v162(repo: Path) -> str:
 
 def prepare_v163(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
@@ -2022,6 +2031,7 @@ def prepare_v163(repo: Path) -> str:
 
 def prepare_v164(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
@@ -2037,6 +2047,7 @@ def prepare_v164(repo: Path) -> str:
 
 def prepare_v165(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     for relative in (
@@ -2051,6 +2062,7 @@ def prepare_v165(repo: Path) -> str:
 
 def prepare_v166(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
@@ -2065,6 +2077,7 @@ def prepare_v166(repo: Path) -> str:
 
 def prepare_v167(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
@@ -2080,6 +2093,7 @@ def prepare_v167(repo: Path) -> str:
 
 def prepare_v168(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
@@ -2105,6 +2119,49 @@ def prepare_v168(repo: Path) -> str:
     )
     shutil.copy2(ROOT / "scripts/workflow-catalog.json", repo / "scripts/workflow-catalog.json")
     return commit(repo, "v1.68 candidate")
+
+
+def prepare_v170(repo: Path) -> str:
+    prepare_v168(repo)
+    shutil.copy2(
+        ROOT / ".github/workflows/opencode-auto-review.yml",
+        repo / ".github/workflows/opencode-auto-review.yml",
+    )
+    return commit(repo, "v1.70 candidate")
+
+
+def test_v170_accepts_current_opencode_finding_id_release_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v170(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.70", candidate) == candidate
+
+
+def test_v170_opencode_finding_ids_are_rejected_on_the_v169_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v170(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.69", candidate)
+
+
+def test_pre_v170_opencode_findings_are_rejected_on_the_v170_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    """A release that publishes no finding identifier cannot pass the v1.70 line.
+
+    Without this the identifier would read as a contract that never existed.
+    """
+
+    repo, _ = current_release_repo
+    candidate = prepare_v168(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.70", candidate)
 
 
 def test_v168_accepts_the_retired_manual_pull_request_review(
@@ -2327,6 +2384,7 @@ def test_pre_v162_filter_surface_is_rejected_on_the_v162_release_line(
 
 def prepare_v161(repo: Path) -> str:
     copy_review_policy_release_files(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
