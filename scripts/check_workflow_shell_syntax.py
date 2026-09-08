@@ -29,6 +29,12 @@ def _display_path(path: Path) -> str:
 
 
 def _neutralize_expressions(program: str) -> str:
+    token = EXPRESSION_TOKEN
+    suffix = 0
+    while token in program:
+        suffix += 1
+        token = f"__GITHUB_EXPRESSION_{suffix}__"
+
     output: list[str] = []
     cursor = 0
     while True:
@@ -53,7 +59,7 @@ def _neutralize_expressions(program: str) -> str:
                 index += 1
                 continue
             if not in_string and program.startswith("}}", index):
-                output.append(EXPRESSION_TOKEN)
+                output.append(token)
                 cursor = index + 2
                 break
             index += 1
@@ -77,19 +83,62 @@ def _configured_shell(document: object) -> str | None:
 def _uses_bash(shell: str | None) -> bool:
     if shell is None:
         return True
+    if "${{" in shell:
+        raise WorkflowSyntaxError("shell setting is dynamic; use a literal shell")
     try:
-        words = shlex.split(_neutralize_expressions(shell))
+        words = shlex.split(shell)
     except ValueError as error:
         raise WorkflowSyntaxError(f"invalid shell setting: {error}") from error
-    return bool(words) and Path(words[0]).name == "bash"
+    if not words:
+        return False
+    executable = 0
+    if Path(words[0]).name == "env":
+        executable = 1
+        while executable < len(words):
+            name, separator, _ = words[executable].partition("=")
+            if separator and name.isidentifier():
+                executable += 1
+                continue
+            break
+        if executable == len(words):
+            return False
+        if words[executable].startswith("-"):
+            raise WorkflowSyntaxError(
+                "env-wrapped shell is ambiguous; use a direct shell command"
+            )
+    return Path(words[executable]).name == "bash"
+
+
+def _runner_labels(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    if isinstance(value, dict):
+        return _runner_labels(value.get("labels"))
+    return []
 
 
 def _runs_on_windows(value: object) -> bool:
-    labels = value if isinstance(value, list) else [value]
+    return any("windows" in label.casefold() for label in _runner_labels(value))
+
+
+def _runs_on_bash_host(value: object) -> bool:
+    bash_labels = ("ubuntu", "linux", "macos")
     return any(
-        isinstance(label, str) and "windows" in label.casefold()
-        for label in labels
+        any(name in label.casefold() for name in bash_labels)
+        for label in _runner_labels(value)
     )
+
+
+def _contains_expression(value: object) -> bool:
+    if isinstance(value, str):
+        return "${{" in value
+    if isinstance(value, list):
+        return any(_contains_expression(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_expression(item) for item in value.values())
+    return False
 
 
 def _bash_blocks(document: object) -> Iterator[tuple[str, str]]:
@@ -122,8 +171,20 @@ def _bash_blocks(document: object) -> Iterator[tuple[str, str]]:
                 raise WorkflowSyntaxError(
                     f"jobs.{job_id}.steps[{index}].shell must be a string"
                 )
-            if shell is None and _runs_on_windows(job.get("runs-on")):
-                continue
+            if shell is None:
+                if job.get("container") is not None:
+                    continue
+                runs_on = job.get("runs-on")
+                if _contains_expression(runs_on):
+                    raise WorkflowSyntaxError(
+                        "implicit shell is ambiguous; set a literal shell"
+                    )
+                if _runs_on_windows(runs_on):
+                    continue
+                if not _runs_on_bash_host(runs_on):
+                    raise WorkflowSyntaxError(
+                        "implicit shell is ambiguous; set a literal shell"
+                    )
             if _uses_bash(shell):
                 yield f"jobs.{job_id}.steps[{index}]", run
 
