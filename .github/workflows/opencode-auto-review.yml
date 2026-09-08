@@ -444,23 +444,27 @@ jobs:
               return
             fi
             printf '%s\n' "$text" | awk -v limit="$MAX_PREV_REVIEW_CHARS" '
+              # No apostrophes anywhere below. This whole awk program is one single-quoted
+              # shell string, so a single apostrophe closes it and breaks the entire step.
+              # actionlint does not catch that: -shellcheck= disables shell parsing.
               { lines[NR] = $0; cum[NR] = (NR > 1 ? cum[NR - 1] : 0) + length($0) + 1 }
               /^#### / { heads[++hc] = NR }
               END {
                 # The awk only runs once the caller has found the text over budget, so the
-                # trailer always fires. Keying it off `cut` rather than the heading count is
-                # what keeps that true for a body carrying no finding blocks, which would
-                # otherwise be cut to nothing in silence.
+                # trailer always fires — including for a body carrying no finding blocks,
+                # which would otherwise be cut to nothing in silence.
                 cut = 0; dropped = hc
                 for (j = 1; j <= hc; j++) {
                   if (cum[heads[j] - 1] <= limit) { cut = heads[j] - 1; dropped = hc - (j - 1) }
                 }
                 for (i = 1; i <= cut; i++) print lines[i]
                 # The cut takes the tail, so it spends whichever section renders last. Only
-                # `New findings` has a pinned position; the model chooses the relative order
-                # of Still open, Resolved and Retracted, so the count can mix open and
-                # retracted findings and must not claim a status for either.
-                # (No apostrophes below this line: awk runs inside a single-quoted string.)
+                # `New findings` has a pinned position. Resolved is stripped upstream and
+                # never arrives here, so the tail is Still open or Retracted, and Still open
+                # can land last two ways: the model ordered it there, or the canonicalizer
+                # appended a Still open section at the end for a carryover block whose anchor
+                # failed. The count can therefore mix open and retracted findings and must
+                # not claim a status for either.
                 printf "\n- Context: previous review truncated to fit the budget; %d finding(s) omitted, do not treat them as resolved\n", dropped
               }'
           }

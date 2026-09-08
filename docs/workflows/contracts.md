@@ -592,26 +592,31 @@ one that bounds human comments, and it is cut at a finding boundary: a partial b
 the model copy a truncated heading, and a carryover heading that matches no prior one fails the
 whole document. When blocks do not fit, the context reports how many were left out and asserts no
 status for them: the cut takes the tail, so it spends whichever section renders last. Which one
-that is, is not guaranteed. Only `New findings` has a pinned position — the candidate contract
-requires it first and each other section at most once, and nothing there fixes the relative order
-of `Still open`, `Resolved`, and `Retracted`, so the model chooses it. (The composite
-`canonicalize-review` action does pin the full order, but it serves `claude-code-review.yml` and
-`gemini-auto-review.yml`; this workflow's own canonicalizer is separate and does not.) The count
-therefore mixes whatever the tail reached, and the notice says only that those findings must not
-be treated as resolved. The notice is workflow-owned, and both reserved-line filters strip it on
-read-back by matching the fixed opening of the sentence itself — not a bare `- Context: ` prefix,
-which is deliberately left free so that a finding's own prose may begin that way and survive. Nothing rejects a model
-publishing a copy: the authoring-time `reserved` set does not carry it, so the read-back filter is
-the whole guard, and it removes anything starting with that opening rather than a byte-exact line.
-`Resolved` blocks are dropped from that context entirely — they left the active set,
+that is, is not guaranteed, and two separate things decide it. First, only `New findings` has a
+pinned position — the candidate contract requires it first and each other section at most once,
+and nothing there fixes the relative order of `Still open`, `Resolved`, and `Retracted`, so the
+model may render them in any order. (The composite `canonicalize-review` action does pin the full
+order, but it serves `claude-code-review.yml` and `gemini-auto-review.yml`; this workflow's own
+canonicalizer is separate and does not.) Second, and independent of the model, the canonicalizer
+itself appends `Still open` at the END of the section list when a carryover block fails anchor
+validation and the model published no `Still open` section of its own. A stale anchor is normal
+once the head advances past a previous finding, so this is a routine path, not an edge case: the
+workflow can author a body ordered `New findings`, `Retracted`, `Still open`, and the tail cut
+then spends the active set first. The count therefore mixes whatever the tail reached, and the
+notice says only that those findings must not be treated as resolved. That honesty is the whole
+mitigation — do not read a rarity argument into the budget size.
+
+The notice is workflow-owned, and both reserved-line filters strip it on read-back by matching
+the fixed opening of the sentence itself — not a bare `- Context: ` prefix, which is deliberately
+left free so that a finding's own prose may begin that way and survive. Nothing rejects a model
+publishing a copy: the authoring-time `reserved` set does not carry it, so the read-back filter
+is the whole guard, and it removes anything starting with that opening rather than a byte-exact
+line. `Resolved` blocks are dropped from that context entirely — they left the active set,
 carrying one over is rejected outright, and their bytes would otherwise compete with the blocks
-that must survive. `Retracted` blocks stay in that context, because a disproven finding may be
-re-raised at most once and that rule needs the memory of what was already retracted — but only
-until the budget
-binds. Because the order is the model's, a review that renders `Retracted` before `Still open`
-spends open blocks first; the budget is sized so that binding at all is the exception, and the
-notice is what keeps the outcome honest either way. None of this closes the
-omission route above: it lowers how often truncation forces the model into it.
+that must survive; they are stripped before the cut, so they never reach it. `Retracted` blocks
+stay in that context, because a disproven finding may be re-raised at most once and that rule
+needs the memory of what was already retracted — but only until the budget binds. None of this
+closes the omission route above: it lowers how often truncation forces the model into it.
 
 A prior body this job cannot re-parse leaves no
 block to fall back on and still fails the whole document, which preserves every open finding through

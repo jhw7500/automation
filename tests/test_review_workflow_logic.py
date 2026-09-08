@@ -14764,8 +14764,9 @@ def test_opencode_previous_review_is_clipped_at_a_finding_boundary(tmp_path):
 
     assert "finding(s) omitted, do not treat them as resolved" in output
     # 생략된 것에 상태를 단언하지 않는다. 꼬리 절단은 마지막에 렌더된 섹션을 먹는데,
-    # New findings 만 위치가 고정이고 Still open/Resolved/Retracted 의 상대 순서는
-    # 모델이 정한다 — 그래서 생략된 블록이 전부 열려 있다고도, 전부 철회됐다고도 못 한다.
+    # New findings 만 위치가 고정이다. Still open 이 마지막에 올 경로는 둘 — 모델이 그렇게
+    # 렌더했거나, 앵커 검증에 실패한 캐리오버 블록 때문에 canonicalizer 가 Still open 을
+    # 끝에 덧붙였거나. 그래서 생략된 블록이 전부 열려 있다고도, 전부 철회됐다고도 못 한다.
     assert "they are still open" not in output
     # 잘린 지점 뒤로는 아무 블록 조각도 남지 않는다: 마지막으로 보이는 heading 의 블록은
     # 증거 줄까지 온전해야 한다.
