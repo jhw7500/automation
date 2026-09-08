@@ -585,7 +585,17 @@ produced byte-for-byte at that change's base and head. The soft carryover path a
 route that retires a finding through a *bad* block; it does not close the cheaper route of omitting
 the block entirely. Closing that route is not a free tightening, because omission is the same
 mechanism a dismissal retires through (below), and every republished block re-enters the next
-round's model context in full against a 6,000-character clip that truncates silently. See #157.
+round's model context in full. See #157.
+
+From `v1.72` the previous review reaches the model under its own budget rather than sharing the
+one that bounds human comments, and it is cut at a finding boundary: a partial block would have
+the model copy a truncated heading, and a carryover heading that matches no prior one fails the
+whole document. When blocks do not fit, the context says how many were left out and that they
+remain open. `Resolved` blocks are dropped from that context entirely — they left the active set,
+carrying one over is rejected outright, and their bytes would otherwise compete with the blocks
+that must survive. `Retracted` blocks stay, because a disproven finding may be re-raised at most
+once and that rule needs the memory of what was already retracted. None of this closes the
+omission route above: it lowers how often truncation forces the model into it.
 
 A prior body this job cannot re-parse leaves no
 block to fall back on and still fails the whole document, which preserves every open finding through

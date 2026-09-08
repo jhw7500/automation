@@ -711,6 +711,61 @@ def restore_pre_v166_label_mismatch_decline(repo: Path) -> None:
         helper.write_text(text.replace(current, historical), encoding="utf-8")
 
 
+PRE_V172_OPENCODE_CONTEXT_BUDGET_HUNKS = {
+    '.github/workflows/opencode-auto-review.yml': (
+        (
+            "          MAX_SECTION_CHARS: '6000'\n          # The previous review gets its own budget. MAX_SECTION_CHARS also bounds the\n          # human-comment section, which already admits 10 comments of 1,500 characters,\n          # so raising the shared value to make room for carryover would quadruple that\n          # too.\n          MAX_PREV_REVIEW_CHARS: '20000'\n",
+            "          MAX_SECTION_CHARS: '6000'\n",
+        ),
+        (
+            '          # `Resolved` blocks left the active set and are republished by the canonicalizer,\n          # so carrying them over is rejected outright and re-reading them buys the model\n          # nothing — while they compete for the same context budget as the blocks that must\n          # survive. `Retracted` stays: a disproven finding may be re-raised at most once, and\n          # that rule needs the memory of what was already retracted.\n          PREV_REVIEW="$(printf \'%s\\n\' "$PREV_REVIEW" | awk \'/^### /{drop = ($0 == "### Resolved")} !drop\')"\n          # A first failure has no checkpoint and must not become re-review context. A stale\n',
+            '          # A first failure has no checkpoint and must not become re-review context. A stale\n',
+        ),
+        (
+            '          }\n\n          # The previous review is cut at a finding boundary, never mid-block. A half block\n          # invites the model to copy a truncated heading or evidence line, and a carryover\n          # heading that does not match a prior one fails the whole document.\n          clip_review() {\n            local text="$1"\n            if [ "${#text}" -le "$MAX_PREV_REVIEW_CHARS" ]; then\n              printf \'%s\' "$text"\n              return\n            fi\n            printf \'%s\\n\' "$text" | awk -v limit="$MAX_PREV_REVIEW_CHARS" \'\n              { lines[NR] = $0; cum[NR] = (NR > 1 ? cum[NR - 1] : 0) + length($0) + 1 }\n              /^#### / { heads[++hc] = NR }\n              END {\n                cut = 0; dropped = hc\n                for (j = 1; j <= hc; j++) {\n                  if (cum[heads[j] - 1] <= limit) { cut = heads[j] - 1; dropped = hc - (j - 1) }\n                }\n                if (cum[NR] <= limit) { cut = NR; dropped = 0 }\n                for (i = 1; i <= cut; i++) print lines[i]\n                if (dropped > 0) {\n                  printf "\\n[...%d finding(s) omitted to fit the context budget; they are still open]\\n", dropped\n                }\n              }\'\n          }\n',
+            '          }\n',
+        ),
+        (
+            '              "$(clip_review "$PREV_REVIEW")" "$(clip "${HUMAN_COMMENTS:-(none)}")")"\n',
+            '              "$(clip "$PREV_REVIEW")" "$(clip "${HUMAN_COMMENTS:-(none)}")")"\n',
+        ),
+        (
+            "            const changedPathValidation = new Map();\n            // The removal branch probes `previousHead..attemptHead`, which changedPathValidation\n            // above never covers — that map holds `merge_base..head` ranges, so reusing it would\n            // validate removal evidence against the wrong range and fail silently. These two are\n            // its own. Only success is cached, matching changedPathValidation: the callers break\n            // on the first 'error', so a cached failure could never be read anyway.\n            let removalScope = null;\n            const removalPathRanges = new Map();\n            const validateAnchorEvidence = (evidence) => {\n",
+            '            const changedPathValidation = new Map();\n            const validateAnchorEvidence = (evidence) => {\n',
+        ),
+        (
+            "              // Three whole-tree probes that depend only on the revision pair. Carrying the\n              // pair in the cache keeps that correct here rather than resting on an invariant\n              // established hundreds of lines away.\n              if (!removalScope || removalScope.previousHead !== previousHead\n                || removalScope.attemptHead !== attemptHead) {\n                removalScope = null;\n                removalPathRanges.clear();\n                const ancestor = spawnSync('/usr/bin/git', [\n                  '--no-replace-objects', 'merge-base', '--is-ancestor', previousHead, attemptHead,\n                ], { cwd: trustedWorkspace, env: gitEnv });\n                if (ancestor.error || ancestor.status !== 0) return 'error';\n                const previousNameStatus = spawnSync('/usr/bin/git', [\n                  '--no-replace-objects', '--literal-pathspecs', '-c', 'diff.external=',\n                  'diff', '--no-ext-diff', '--no-textconv', '--name-status', '-z',\n                  '--find-renames=50%', '--ignore-submodules=none',\n                  `${previousHead}..${attemptHead}`,\n                ], { cwd: trustedWorkspace, env: gitEnv });\n                if (previousNameStatus.error || previousNameStatus.status !== 0) return 'error';\n                const records = parseNameStatus(previousNameStatus.stdout);\n                if (!records) return 'error';\n                const previousContentDiff = spawnSync('/usr/bin/git', [\n                  '--no-replace-objects', '--literal-pathspecs', '-c', 'diff.external=',\n                  'diff', '--no-ext-diff', '--no-textconv', '--text', '--find-renames=50%',\n                  '--ignore-submodules=none', '--inter-hunk-context=0', '--no-color', '-U0',\n                  '--output-indicator-new=%', `${previousHead}..${attemptHead}`,\n                ], {\n                  encoding: 'utf8', cwd: trustedWorkspace,\n                  env: gitEnv,\n                });\n                if (previousContentDiff.error || previousContentDiff.status !== 0\n                  || typeof previousContentDiff.stdout !== 'string') return 'error';\n                const globallyAddedLines = new Set(previousContentDiff.stdout.split('\\n')\n                  .filter((line) => line.startsWith('%')).map((line) => line.slice(1)));\n                removalScope = { previousHead, attemptHead, records, globallyAddedLines };\n              }\n              const previousRecords = removalScope.records;\n              const globallyAddedLines = removalScope.globallyAddedLines;\n",
+            "              const ancestor = spawnSync('/usr/bin/git', [\n                '--no-replace-objects', 'merge-base', '--is-ancestor', previousHead, attemptHead,\n              ], { cwd: trustedWorkspace, env: gitEnv });\n              if (ancestor.error || ancestor.status !== 0) return 'error';\n              const previousNameStatus = spawnSync('/usr/bin/git', [\n                '--no-replace-objects', '--literal-pathspecs', '-c', 'diff.external=',\n                'diff', '--no-ext-diff', '--no-textconv', '--name-status', '-z',\n                '--find-renames=50%', '--ignore-submodules=none',\n                `${previousHead}..${attemptHead}`,\n              ], { cwd: trustedWorkspace, env: gitEnv });\n              if (previousNameStatus.error || previousNameStatus.status !== 0) return 'error';\n              const previousRecords = parseNameStatus(previousNameStatus.stdout);\n              if (!previousRecords) return 'error';\n              const previousContentDiff = spawnSync('/usr/bin/git', [\n                '--no-replace-objects', '--literal-pathspecs', '-c', 'diff.external=',\n                'diff', '--no-ext-diff', '--no-textconv', '--text', '--find-renames=50%',\n                '--ignore-submodules=none', '--inter-hunk-context=0', '--no-color', '-U0',\n                '--output-indicator-new=%', `${previousHead}..${attemptHead}`,\n              ], {\n                encoding: 'utf8', cwd: trustedWorkspace,\n                env: gitEnv,\n              });\n              if (previousContentDiff.error || previousContentDiff.status !== 0\n                || typeof previousContentDiff.stdout !== 'string') return 'error';\n              const globallyAddedLines = new Set(previousContentDiff.stdout.split('\\n')\n                .filter((line) => line.startsWith('%')).map((line) => line.slice(1)));\n",
+        ),
+        (
+            "                let ranges = removalPathRanges.get(removal.path);\n                if (!ranges) {\n                  const result = spawnSync('/usr/bin/git', [\n                    '--no-replace-objects', '--literal-pathspecs', '-c', 'diff.external=',\n                    'diff', '--no-ext-diff', '--no-textconv', '--find-renames=50%',\n                    '--ignore-submodules=none', '--inter-hunk-context=0', '--no-color', '-U0',\n                    `${previousHead}..${attemptHead}`, '--', removal.path,\n                  ], {\n                    encoding: 'utf8', cwd: trustedWorkspace,\n                    env: gitEnv,\n                  });\n                  if (result.error || result.status !== 0\n                    || typeof result.stdout !== 'string') return 'error';\n                  ranges = parseAddedRanges(result.stdout);\n                  if (!ranges || !(ranges.addedLines instanceof Map)\n                    || !(ranges.removedLines instanceof Map)) return 'error';\n                  removalPathRanges.set(removal.path, ranges);\n                }\n",
+            "                const result = spawnSync('/usr/bin/git', [\n                  '--no-replace-objects', '--literal-pathspecs', '-c', 'diff.external=',\n                  'diff', '--no-ext-diff', '--no-textconv', '--find-renames=50%',\n                  '--ignore-submodules=none', '--inter-hunk-context=0', '--no-color', '-U0',\n                  `${previousHead}..${attemptHead}`, '--', removal.path,\n                ], {\n                  encoding: 'utf8', cwd: trustedWorkspace,\n                  env: gitEnv,\n                });\n                if (result.error || result.status !== 0\n                  || typeof result.stdout !== 'string') return 'error';\n                const ranges = parseAddedRanges(result.stdout);\n                if (!ranges || !(ranges.addedLines instanceof Map)\n                  || !(ranges.removedLines instanceof Map)) return 'error';\n",
+        ),
+    ),
+}
+
+
+def restore_pre_v172_opencode_context_budget(repo: Path) -> None:
+    """Restore the pre-v1.72 OpenCode prompt context and anchor probes.
+
+    v1.72 gives the previous review its own context budget, cuts it at a finding
+    boundary, drops `Resolved` blocks from it, and computes the removal branch's
+    whole-tree probes once per run instead of once per block. This runs first
+    (newest release first) so the older restores still find their text.
+    """
+
+    for relative, hunks in PRE_V172_OPENCODE_CONTEXT_BUDGET_HUNKS.items():
+        path = repo / relative
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        # Idempotent, and applied bottom-up so neighbouring hunks keep the context they
+        # match on: a tree that already restored (or never had) the v1.72 text is left alone.
+        for current, historical in reversed(hunks):
+            assert text.count(current) <= 1, relative
+            text = text.replace(current, historical)
+        path.write_text(text, encoding="utf-8")
+
 PRE_V171_OPENCODE_DISMISSAL_HUNKS = {
     '.github/workflows/opencode-auto-review.yml': (
         (
