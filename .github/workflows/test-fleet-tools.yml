@@ -95,6 +95,14 @@ jobs:
         run: |
           # Keep schema/expression validation deterministic and independent of
           # optional host ShellCheck/Pyflakes installations.
+          mapfile -d '' workflow_files < <(
+            find \
+              .github/workflows \
+              examples/baseline-workflows/.github/workflows \
+              -maxdepth 1 -type f \
+              \( -name '*.yml' -o -name '*.yaml' \) \
+              -print0 | sort -z
+          )
+          (( ${#workflow_files[@]} > 0 ))
           "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes= \
-            .github/workflows/*.yml \
-            examples/baseline-workflows/.github/workflows/*.yml
+            "${workflow_files[@]}"

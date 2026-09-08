@@ -395,3 +395,21 @@ def test_fleet_ci_wires_the_bash_syntax_gate_once() -> None:
         "\\",
         "examples/baseline-workflows/.github/workflows",
     ]
+
+
+def test_fleet_ci_lints_both_workflow_extensions() -> None:
+    workflow = yaml.load(
+        CI_WORKFLOW.read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    matching_steps = [
+        step
+        for step in workflow["jobs"]["pytest"]["steps"]
+        if step.get("name") == "Lint central and canonical caller workflows"
+    ]
+
+    assert len(matching_steps) == 1
+    run = matching_steps[0]["run"]
+    assert "-name '*.yml'" in run
+    assert "-name '*.yaml'" in run
+    assert '"${workflow_files[@]}"' in run
