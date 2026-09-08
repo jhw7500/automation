@@ -458,13 +458,9 @@ jobs:
                   if (cum[heads[j] - 1] <= limit) { cut = heads[j] - 1; dropped = hc - (j - 1) }
                 }
                 for (i = 1; i <= cut; i++) print lines[i]
-                # The cut takes the tail, so it spends whichever section renders last. Only
-                # `New findings` has a pinned position. Resolved is stripped upstream and
-                # never arrives here, so the tail is Still open or Retracted, and Still open
-                # can land last two ways: the model ordered it there, or the canonicalizer
-                # appended a Still open section at the end for a carryover block whose anchor
-                # failed. The count can therefore mix open and retracted findings and must
-                # not claim a status for either.
+                # The tail is Still open or Retracted (Resolved is stripped upstream), and
+                # which one is not pinned, so the count mixes open and retracted findings and
+                # must claim a status for neither. Why it is not pinned: contracts.md, #165.
                 printf "\n- Context: previous review truncated to fit the budget; %d finding(s) omitted, do not treat them as resolved\n", dropped
               }'
           }
@@ -878,6 +874,12 @@ jobs:
             - If the authenticated previous review has `### New findings` equal to `None` and no
               substantive `### Still open` blocks, there are zero active prior findings. In that
               case omit `### Still open`, `### Resolved`, and `### Retracted` entirely.
+              This rule does not apply when the previous review carries a line beginning
+              `- Context: previous review truncated to fit the budget;`. Truncation cuts at a
+              finding boundary, so it can empty a section that still holds findings: an
+              empty-looking section in a truncated review proves nothing about the active set.
+              Treat the active set as unknown rather than zero, carry over every heading you can
+              still see, and say in `### New findings` that the previous review was truncated.
               Human comments and other reviewers can never create carryover findings; do not
               adopt their headings under any carryover section.
             - If a human comment disputes a previous finding, treat the rebuttal as a claim to

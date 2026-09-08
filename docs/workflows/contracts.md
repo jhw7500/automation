@@ -602,9 +602,22 @@ itself appends `Still open` at the END of the section list when a carryover bloc
 validation and the model published no `Still open` section of its own. A stale anchor is normal
 once the head advances past a previous finding, so this is a routine path, not an edge case: the
 workflow can author a body ordered `New findings`, `Retracted`, `Still open`, and the tail cut
-then spends the active set first. The count therefore mixes whatever the tail reached, and the
-notice says only that those findings must not be treated as resolved. That honesty is the whole
-mitigation — do not read a rarity argument into the budget size.
+then spends the active set first. That second cause is a defect, not a design; see #165. The
+count therefore mixes whatever the tail reached, and the notice says only that those findings
+must not be treated as resolved. Do not read a rarity argument into the budget size.
+
+The notice is not sufficient on its own, and this is the one place where `v1.72` is worse than
+what it replaces. Because the cut lands on a finding boundary, a section whose every block is
+spent is emitted as a bare heading — the old character-offset clip left a partial block, which at
+least proved content existed. An empty-looking `### Still open` under a `None` in `### New
+findings` is the exact antecedent of the prompt's own zero-active-prior-findings rule, which
+instructs the model to omit the carryover sections entirely — and omission is retirement. The
+notice cannot outrank that rule: it is interpolated inside the region framed as `UNTRUSTED DATA`,
+while the rule sits in the system prompt. So the rule itself is conditioned: it does not apply
+when the previous review carries the truncation notice. Nothing downstream enforces this — no
+`- Normalization:` line is emitted for a carryover the model never mentions, and
+`priorActiveEvidence` feeds duplicate detection only, never a requirement that prior active
+headings be accounted for.
 
 The notice is workflow-owned, and both reserved-line filters strip it on read-back by matching
 the fixed opening of the sentence itself — not a bare `- Context: ` prefix, which is deliberately

@@ -8460,6 +8460,31 @@ def test_opencode_prompt_requires_verified_evidence():
     assert "Human comments and other reviewers can never create carryover findings" in prompt
 
 
+def test_opencode_zero_active_rule_is_disarmed_by_the_truncation_notice():
+    """잘림이 만든 빈 섹션이 "생략하라"는 지시로 이어지지 않게 한다 (#162).
+
+    v1.72 의 절단은 finding 경계에서 일어나므로, 블록이 전부 잘린 섹션은 헤딩만 남아
+    **깨끗하게 비어 보인다**. 문자 오프셋으로 자르던 이전 동작은 잘린 블록 조각을 남겨
+    내용의 존재를 증명했다 — 이 상태만큼은 v1.72 가 더 나빴다. 그런데 하필 프롬프트의
+    zero-active 규칙이 `New findings=None` + `Still open` 블록 없음을 "active 0" 으로 읽고
+    캐리오버 섹션을 통째로 생략하라고 지시한다. 생략은 은퇴다 (#157).
+
+    고지는 이 규칙을 이길 수 없다: 고지는 `UNTRUSTED DATA` 로 감싼 영역에 보간되지만
+    규칙은 시스템 프롬프트 본문에 있다. 그래서 규칙 쪽에 가드를 단다.
+    """
+    workflow = _load("opencode-auto-review.yml")
+    prompt = _step(workflow, "opencode-review", "Run OpenCode PR review")["env"]["PROMPT"]
+
+    # 규칙 자체는 그대로 있어야 한다 — 가드가 규칙을 삭제한 것이 아니다.
+    assert "there are zero active prior findings" in prompt
+    # 가드: 잘림 고지가 있으면 규칙이 적용되지 않는다.
+    assert "This rule does not apply when the previous review carries a line beginning" in prompt
+    assert "- Context: previous review truncated to fit the budget;" in prompt
+    # 왜 비어 보이는지, 그리고 무엇으로 대체해 판단할지까지 지시한다.
+    assert "empty-looking section in a truncated review proves nothing" in prompt
+    assert "Treat the active set as unknown rather than zero" in prompt
+
+
 def test_opencode_prompt_requires_one_canonical_anchor_per_finding():
     workflow = _load("opencode-auto-review.yml")
     prompt = _step(workflow, "opencode-review", "Run OpenCode PR review")["env"]["PROMPT"]
