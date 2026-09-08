@@ -160,6 +160,7 @@ MANUAL_PR_REVIEW_RETIRED_RELEASE = (1, 68)
 OPENCODE_FINDING_ID_RELEASE = (1, 70)
 OPENCODE_DISMISSAL_RELEASE = (1, 71)
 OPENCODE_CONTEXT_BUDGET_RELEASE = (1, 72)
+OPENCODE_ACTIVE_SECTION_ORDER_RELEASE = (1, 73)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -262,6 +263,12 @@ def release_supports_opencode_context_budget(ref: str) -> bool:
     """Return whether ``ref`` gives the previous review its own clipped context budget."""
 
     return _release_version(ref) >= OPENCODE_CONTEXT_BUDGET_RELEASE
+
+
+def release_supports_opencode_active_section_order(ref: str) -> bool:
+    """Return whether ``ref`` renders a synthesized active section before inactive ones."""
+
+    return _release_version(ref) >= OPENCODE_ACTIVE_SECTION_ORDER_RELEASE
 
 
 def release_retires_manual_pr_review(ref: str) -> bool:

@@ -1,6 +1,6 @@
 # Handoff — automation
 
-_2026-09-08 · **v1.72 릴리스 완료, 플릿 롤아웃 대기** · main = `b18f992` · `automation_ref = v1.71`_
+_2026-09-08 · **v1.73 후보 작업 중 (#165 + #159), #166 합류 후 릴리스** · main = `6edfc6d` · `automation_ref = v1.72`_
 
 > 도구 비의존으로 쓴다. 다음 세션이 Codex 든 Claude Code 든 이것만 읽고 이어갈 수 있어야 한다.
 
@@ -13,30 +13,21 @@ _2026-09-08 · **v1.72 릴리스 완료, 플릿 롤아웃 대기** · main = `b1
     `python3 -m scripts.verify_workflow_release --ref v1.72 --expected-commit b18f9925…` → **PASS**.
   - CI 전체 통과(전체 스위트 + actionlint). 로컬 실측 3122 passed / 48 subtests.
   - 트리뷰널 5라운드, 최종 `pass / blocking_count 0`.
+  - v1.72 플릿 롤아웃 **17/17 머지**, audit `current=17 drift=0 blocked=0`.
+  - automation 기본 `automation_ref`를 v1.72로 올린 PR **#170** 머지
+    (`6edfc6d727c74b8df27b5bcb91fcefba4a56d791`).
   - Notion 저장 6건(KB 5 + DecisionLog 1).
 
 - **다음 구체 액션 1개**
-  **17타깃 플릿 롤아웃.** 절차 전문은 `docs/workflow-fleet-rollout.md` — 그대로 따르면 된다.
-  v1.72 고유 값만 바꾼다:
-  ```
-  export AUTOMATION_RELEASE_ROOT=/tmp/automation-v1.72-public
-  export FLEET_WORKSPACE=/tmp/automation-v1.72-fleet
-  export ACTIONLINT=/tmp/actionlint-v1.7.12/actionlint
-  ```
-  `--ref v1.72` 로 `--mode plan` → 매니페스트 확인 → `--mode publish`.
-  이어서 `automation_ref` 기본값을 v1.71 → v1.72 로 올리는 PR.
+  **#165 + #159 후보를 검증·머지한 뒤 #166을 별도 PR로 합류시킨다.**
+  세 변경이 main에 모이기 전에는 v1.73 태그를 만들지 않는다. 태그 검증이 통과하면
+  `docs/workflow-fleet-rollout.md` 절차로 v1.73 플릿 롤아웃을 한 번만 수행한다.
 
-- **먼저 결정할 것 (롤아웃 전)**
+- **결정 완료**
 
-  v1.72 는 **알려진 결함 #165 를 안고 나간다.** 롤아웃하면 17개 저장소가 그 코드를 실행한다.
-  두 갈래 중 하나를 고르고 시작할 것:
-
-  1. **#165 를 먼저 고쳐 v1.73 으로 묶어 롤아웃** — 배포 1회로 끝나지만 릴리스가 늦어진다.
-  2. **v1.72 를 지금 롤아웃하고 #165 는 v1.73 으로** — #162/#158 이익을 먼저 얻지만,
-     예산이 바인딩되는 PR 에서는 active set 이 먼저 잘릴 수 있는 상태로 운영된다.
-
-  판단 근거: #165 는 예산이 실제로 바인딩될 때만(이전 리뷰 20,000자 초과) 드러난다.
-  빈도는 측정된 바 없다 — 리뷰어도 "메커니즘은 주장하되 빈도는 주장하지 않는다"고 명시했다.
+  v1.72를 먼저 플릿에 배포했고, #165 수정은 #159 릴리스 픽스처 정리 및 #166 shell 문법
+  게이트와 함께 **v1.73 릴리스 한 번**으로 묶는다. #165와 #159는 파일 중첩이 커서 같은
+  구현 PR, #166은 독립 CI 경계라 별도 PR로 유지한다.
 
 ## 이 작업에서 생성한 이슈 2건 (독립 착수 가능)
 

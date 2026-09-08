@@ -57,6 +57,7 @@ from scripts.workflow_release_inventory import (
     release_supports_opencode_finding_ids,
     release_supports_opencode_dismissals,
     release_supports_opencode_context_budget,
+    release_supports_opencode_active_section_order,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
@@ -821,6 +822,13 @@ EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256 = {
     "claude": "a6116cf542876a46e8401e26471324a586772398ad5d21360155e686123104be",
     "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
     "opencode": "9c7dfd5afc5ce5dea9fcaf51c1e3c0c362ef93ebca757621e82ba12c0bc12263",
+}
+# v1.73 keeps a workflow-synthesized active section ahead of inactive sections and
+# renders block membership by section name. Claude and Gemini are unchanged.
+EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256 = {
+    "claude": "a6116cf542876a46e8401e26471324a586772398ad5d21360155e686123104be",
+    "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
+    "opencode": "f81db9665847aea815c8691caea7c6458011595cbed28c13809f051c381b5e91",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
@@ -2519,6 +2527,7 @@ def verify_opencode_runtime(
         EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256["opencode"],
         EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256["opencode"],
         EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256["opencode"],
+        EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256["opencode"],
     }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
@@ -2557,6 +2566,7 @@ def verify_opencode_runtime(
             EXPECTED_OPENCODE_FINDING_ID_WORKFLOW_SHA256["opencode"],
             EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256["opencode"],
             EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256["opencode"],
+            EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256["opencode"],
         }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
@@ -5952,7 +5962,9 @@ def _verify_review_invocation_budget(
         ),
     }
     workflow_digests = (
-        EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256
+        EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256
+        if release_supports_opencode_active_section_order(ref)
+        else EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256
         if release_supports_opencode_context_budget(ref)
         else EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256
         if release_supports_opencode_dismissals(ref)

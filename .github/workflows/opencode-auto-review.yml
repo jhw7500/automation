@@ -4940,11 +4940,14 @@ jobs:
                   let stillOpenIndex = parsedReview.sections
                     .findIndex((item) => item.name === 'Still open');
                   if (stillOpenIndex === -1) {
-                    stillOpenIndex = parsedReview.sections.length;
-                    parsedReview.sections.push({ name: 'Still open', lines: [] });
+                    const firstInactiveIndex = parsedReview.sections.findIndex((item) =>
+                      item.name === 'Resolved' || item.name === 'Retracted');
+                    stillOpenIndex = firstInactiveIndex === -1
+                      ? parsedReview.sections.length : firstInactiveIndex;
+                    parsedReview.sections.splice(
+                      stillOpenIndex, 0, { name: 'Still open', lines: [] });
                   }
                   entry.section = 'Still open';
-                  entry.sectionIndex = stillOpenIndex;
                 }
                 normalizedCarryover.push({ entry, reason: 'invalid_anchor' });
               }
@@ -4954,9 +4957,9 @@ jobs:
               ...normalizedCarryover.filter((item) => item.dropped).map((item) => item.entry),
             ]);
             const canonicalReview = parsedReview
-              ? parsedReview.sections.map((section, sectionIndex) => {
+              ? parsedReview.sections.map((section) => {
                   const retained = parsedReview.blocks.filter((entry) =>
-                    entry.sectionIndex === sectionIndex && !filteredEntries.has(entry));
+                    entry.section === section.name && !filteredEntries.has(entry));
                   const sectionBody = retained.length === 0
                     ? 'None'
                     : retained.map((entry) => [renderHeading(entry), ...entry.block.lines]
