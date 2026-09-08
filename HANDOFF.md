@@ -1,6 +1,6 @@
 # Handoff — automation
 
-_2026-09-08 · **v1.71 완료 + #157/#161 처리** · main = `5f6a69c` · `automation_ref = v1.71`_
+_2026-09-08 · **v1.72 구현 완료, PR 대기** · main = `affdad0` · `automation_ref = v1.71`_
 
 > 이 문서는 **도구 비의존**으로 쓴다. 다음 세션이 Codex 든 Claude Code 든 이것만 읽고 이어갈 수 있어야 한다.
 > Claude Code 전용 사항은 그렇게 표시한다.
@@ -19,12 +19,12 @@ _2026-09-08 · **v1.71 완료 + #157/#161 처리** · main = `5f6a69c` · `autom
     인덱스가 아니라 작업 트리를 읽으므로 `& 0o111 == 0` 로 바꿔도 `core.fileMode=false` 에서
     같은 결함이 되살아난다. 잃는 것은 "바이트는 맞는데 `stat()` 권한 비트가 0644가 아닌 경로"뿐이고,
     그 탐지는 원래 우연적·타깃 의존적이었다(심링크는 타깃 모드에 따라 잡히거나 안 잡혔다).
-- **다음 액션 (택 1)**
-  1. **#162 + #158 을 v1.72 한 릴리스에 묶는다 (권장)** — 둘 다 워크플로 바이트를 바꾸므로
-     롤아웃 예산을 공유한다. #162 는 6,000자 프롬프트 클립이 prior finding 을 조용히 감추는 문제로,
-     **#157 의 어느 해결책을 택하든 선행되어야 한다**. #158 은 블록별 `git diff` 반복(600초 예산 잠식).
-  2. **#128 2단계** — 착수하지 않기로 판정됨(이슈 코멘트). 재개하려면 거기 적은 4가지 조건이 서야 한다.
-  3. **#156** — severity 없는 heading 은 영구적으로 ID 가 없어 기각이 닿지 않는다.
+  - **v1.72 (#158 + #162) 구현 완료** — 브랜치 `feat/172-opencode-context-budget` (`e166292`),
+    전체 스위트 **3119 passed**, actionlint clean. 세 변경을 각각 되돌려 자기 테스트만 빨개지는 것까지 확인.
+- **다음 액션 1개**: **`feat/172-opencode-context-budget` 트리뷰널 → PR → 머지 → v1.72 태그 → 17타깃 롤아웃
+  → `automation_ref` 범프.** 릴리스 절차는 아래 그대로.
+- **그다음 후보**: #156(severity 없는 heading 은 영구적으로 ID 없음 → 기각 불가),
+  #157(생략에 의한 은퇴 — v1.72 가 빈도를 낮췄을 뿐 경로는 열려 있다), #159, #163.
 - **열린 PR 없음.** 작업 트리 clean.
 
 ## 릴리스 절차 (v1.71 에서 그대로 반복)
@@ -72,6 +72,13 @@ env -u GITHUB_TOKEN python3 "$AUTOMATION_RELEASE_ROOT/scripts/audit_workflow_fle
   mtime+size 기반 `.pyc` 캐시를 재사용해 **한 단계 전 상태를 채점한다.** 되돌림 검증을 할 때는
   `PYTHONDONTWRITEBYTECODE=1` + `-p no:cacheprovider` + `__pycache__` 삭제를 붙여라.
   (이 세션에서 실제로 arm 결과가 한 칸씩 밀려 나왔다.)
+- **새 릴리스 라인은 핀을 *교체*하지 말고 사다리에 *추가*한다.** 기존 상수를 덮어쓰면 그 릴리스
+  자신의 바이트가 `verify_opencode_runtime` 의 두 allowlist(`:2503`, `:2539`)에서 빠져 이전 라인
+  테스트가 무더기로 깨진다(이번에 29건). 한 칸을 올릴 때 손대는 곳: 새 `EXPECTED_*_SHA256` 상수,
+  두 allowlist, `workflow_digests` 사다리 top, `workflow_release_inventory.py` 의 `*_RELEASE` +
+  술어, `PRE_V17X_*_HUNKS` + 복원 함수, `prepare_v17X`, 그리고 **직전 `prepare_v17(X-1)` 에
+  복사 *뒤* 복원 추가**(복사가 먼저 오면 복원이 조용히 지워진다 — 이 저장소가 세 번 밟았다).
+  hunk 를 만든 뒤에는 **왕복이 직전 릴리스의 핀 다이제스트를 재현하는지** 반드시 확인한다.
 - **워크플로나 예산 헬퍼를 1바이트라도 고치면** `scripts/verify_workflow_release.py` 의
   `EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256["opencode"]` 와
   `EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V171` 을 `sha256sum` 으로 다시 맞춘다.
