@@ -2044,7 +2044,6 @@ def prepare_v163(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
-    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     return commit(repo, "v1.63 candidate")
 
@@ -2064,7 +2063,6 @@ def prepare_v164(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
-    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     return commit(repo, "v1.64 candidate")
 
@@ -2083,7 +2081,6 @@ def prepare_v165(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
-    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     return commit(repo, "v1.65 candidate")
 
@@ -2102,7 +2099,6 @@ def prepare_v166(repo: Path) -> str:
         ".github/actions/resolve-review-policy/resolve_review_policy.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
-    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     return commit(repo, "v1.66 candidate")
 
@@ -2122,7 +2118,6 @@ def prepare_v167(repo: Path) -> str:
         ".github/workflows/gemini-dispatch.yml",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
-    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     return commit(repo, "v1.67 candidate")
 
@@ -2156,7 +2151,6 @@ def prepare_v168(repo: Path) -> str:
         encoding="utf-8",
     )
     shutil.copy2(ROOT / "scripts/workflow-catalog.json", repo / "scripts/workflow-catalog.json")
-    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     return commit(repo, "v1.68 candidate")
 
