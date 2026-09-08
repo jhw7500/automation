@@ -711,6 +711,58 @@ def restore_pre_v166_label_mismatch_decline(repo: Path) -> None:
         helper.write_text(text.replace(current, historical), encoding="utf-8")
 
 
+PRE_V173_OPENCODE_ACTIVE_SECTION_ORDER_HUNKS = (
+    (
+        """                  let stillOpenIndex = parsedReview.sections
+                    .findIndex((item) => item.name === 'Still open');
+                  if (stillOpenIndex === -1) {
+                    const firstInactiveIndex = parsedReview.sections.findIndex((item) =>
+                      item.name === 'Resolved' || item.name === 'Retracted');
+                    stillOpenIndex = firstInactiveIndex === -1
+                      ? parsedReview.sections.length : firstInactiveIndex;
+                    parsedReview.sections.splice(
+                      stillOpenIndex, 0, { name: 'Still open', lines: [] });
+                  }
+                  entry.section = 'Still open';
+""",
+        """                  let stillOpenIndex = parsedReview.sections
+                    .findIndex((item) => item.name === 'Still open');
+                  if (stillOpenIndex === -1) {
+                    stillOpenIndex = parsedReview.sections.length;
+                    parsedReview.sections.push({ name: 'Still open', lines: [] });
+                  }
+                  entry.section = 'Still open';
+                  entry.sectionIndex = stillOpenIndex;
+""",
+    ),
+    (
+        """            const canonicalReview = parsedReview
+              ? parsedReview.sections.map((section) => {
+                  const retained = parsedReview.blocks.filter((entry) =>
+                    entry.section === section.name && !filteredEntries.has(entry));
+""",
+        """            const canonicalReview = parsedReview
+              ? parsedReview.sections.map((section, sectionIndex) => {
+                  const retained = parsedReview.blocks.filter((entry) =>
+                    entry.sectionIndex === sectionIndex && !filteredEntries.has(entry));
+""",
+    ),
+)
+
+
+def restore_pre_v173_opencode_active_section_order(repo: Path) -> None:
+    """Restore the v1.72 positional renderer and append-only active section."""
+
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8")
+    for current, historical in reversed(PRE_V173_OPENCODE_ACTIVE_SECTION_ORDER_HUNKS):
+        assert text.count(current) <= 1
+        text = text.replace(current, historical)
+    path.write_text(text, encoding="utf-8")
+
+
 PRE_V172_OPENCODE_CONTEXT_BUDGET_HUNKS = {
     '.github/workflows/opencode-auto-review.yml': (
         (
@@ -766,6 +818,7 @@ def restore_pre_v172_opencode_context_budget(repo: Path) -> None:
     (newest release first) so the older restores still find their text.
     """
 
+    restore_pre_v173_opencode_active_section_order(repo)
     for relative, hunks in PRE_V172_OPENCODE_CONTEXT_BUDGET_HUNKS.items():
         path = repo / relative
         if not path.exists():

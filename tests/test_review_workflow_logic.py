@@ -14925,6 +14925,136 @@ def test_opencode_out_of_scope_carryover_anchor_no_longer_kills_the_review(tmp_p
 
 
 @node_required
+def test_opencode_invalid_anchor_synthesizes_still_open_before_inactive_sections(
+    tmp_path,
+):
+    """A synthesized active section must precede inactive sections without stealing blocks."""
+    head = "ab" * 20
+    in_scope = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    out_of_scope = json.dumps(
+        {"path": ".github/workflows/gemini-auto-review.yml", "line": 74},
+        separators=(",", ":"),
+    )
+    active = "RVW-aaaaaaaaaaaa"
+    inactive = "RVW-bbbbbbbbbbbb"
+    prior_body = (
+        "### New findings\n"
+        f"#### {active} [HIGH] Persisting problem\n"
+        f"- Changed anchor: {in_scope}\nprior active evidence\n\n"
+        f"#### {inactive} [MEDIUM] Unrelated disproven problem\n"
+        f"- Changed anchor: {in_scope}\nprior inactive evidence"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Retracted\n#### {active} [HIGH] Persisting problem\n"
+        f"- Changed anchor: {out_of_scope}\n"
+        '- Current line: "outside line"\n'
+        "unsupported disposition\n\n"
+        f"#### {inactive} [MEDIUM] Unrelated disproven problem\n"
+        f"- Changed anchor: {in_scope}\n"
+        '- Current line: "added line 1"\n'
+        "verified retraction evidence"
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    assert body.index("### New findings") < body.index("### Still open")
+    assert body.index("### Still open") < body.index("### Retracted")
+    still_open = body.split("### Still open", 1)[1].split("### Retracted", 1)[0]
+    retracted = body.split("### Retracted", 1)[1]
+    assert "Persisting problem" in still_open
+    assert "Unrelated disproven problem" in retracted
+    assert "Unrelated disproven problem" not in still_open
+
+
+@node_required
+def test_opencode_demoted_carryover_survives_previous_review_budget(tmp_path):
+    """Tail clipping must spend inactive blocks before a workflow-demoted active block."""
+    head = "ab" * 20
+    in_scope = json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    out_of_scope = json.dumps(
+        {"path": ".github/workflows/gemini-auto-review.yml", "line": 74},
+        separators=(",", ":"),
+    )
+    active = "RVW-aaaaaaaaaaaa"
+    filler_count = 60
+    prior_fillers = "\n\n".join(
+        f"#### RVW-{index:012x} [MEDIUM] Retracted filler {index}\n"
+        f"- Changed anchor: {in_scope}\nprior filler evidence {index}"
+        for index in range(1, filler_count + 1)
+    )
+    prior_body = (
+        "### New findings\n"
+        f"#### {active} [HIGH] Persisting problem\n"
+        f"- Changed anchor: {in_scope}\nprior active evidence\n\n"
+        f"{prior_fillers}"
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    filler_prose = "Retraction evidence remains available for audit. " * 12
+    current_fillers = "\n\n".join(
+        f"#### RVW-{index:012x} [MEDIUM] Retracted filler {index}\n"
+        f"- Changed anchor: {in_scope}\n"
+        '- Current line: "added line 1"\n'
+        f"{filler_prose}{index}"
+        for index in range(1, filler_count + 1)
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Retracted\n#### {active} [HIGH] Persisting problem\n"
+        f"- Changed anchor: {out_of_scope}\n"
+        '- Current line: "outside line"\n'
+        "unsupported disposition\n\n"
+        f"{current_fillers}"
+    )
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+    published = next(call[1]["body"] for call in calls if call[0] == "create")
+    published_comment = _bot(
+        "github-actions[bot]", published, 20, updated="u3"
+    )
+    attestation_id = int(
+        re.search(r"^- Attestation: ([1-9][0-9]*)$", published, re.MULTILINE).group(1)
+    )
+
+    context = _run_opencode_ctx(
+        tmp_path,
+        [published_comment],
+        check_runs=[
+            _opencode_attestation(published_comment, check_id=attestation_id)
+        ],
+    )
+
+    assert "previous review truncated to fit the budget" in context
+    assert "Persisting problem" in context
+    assert "Retracted filler 59" not in context
+
+
+@node_required
 @pytest.mark.parametrize("section", ["Resolved", "Retracted"])
 def test_opencode_rereview_rejects_carryover_without_current_evidence(
     tmp_path, section

@@ -31,6 +31,7 @@ from release_fixture_helpers import (
     restore_pre_v164_label_trigger,
     restore_pre_v171_opencode_dismissals,
     restore_pre_v172_opencode_context_budget,
+    restore_pre_v173_opencode_active_section_order,
     restore_pre_v170_opencode_finding_ids,
     restore_retired_manual_pr_review,
     restore_pre_v166_label_mismatch_decline,
@@ -2030,9 +2031,6 @@ def prepare_v162(repo: Path) -> str:
 
 def prepare_v163(repo: Path) -> str:
     copy_review_policy_release_files(repo)
-    restore_pre_v172_opencode_context_budget(repo)
-    restore_pre_v171_opencode_dismissals(repo)
-    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
@@ -2044,15 +2042,14 @@ def prepare_v163(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     return commit(repo, "v1.63 candidate")
 
 
 def prepare_v164(repo: Path) -> str:
     copy_review_policy_release_files(repo)
-    restore_pre_v172_opencode_context_budget(repo)
-    restore_pre_v171_opencode_dismissals(repo)
-    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     restore_pre_v165_skip_reason_notice(repo)
@@ -2063,15 +2060,14 @@ def prepare_v164(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     return commit(repo, "v1.64 candidate")
 
 
 def prepare_v165(repo: Path) -> str:
     copy_review_policy_release_files(repo)
-    restore_pre_v172_opencode_context_budget(repo)
-    restore_pre_v171_opencode_dismissals(repo)
-    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     restore_pre_v166_label_mismatch_decline(repo)
     for relative in (
@@ -2081,15 +2077,14 @@ def prepare_v165(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     return commit(repo, "v1.65 candidate")
 
 
 def prepare_v166(repo: Path) -> str:
     copy_review_policy_release_files(repo)
-    restore_pre_v172_opencode_context_budget(repo)
-    restore_pre_v171_opencode_dismissals(repo)
-    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
@@ -2099,15 +2094,14 @@ def prepare_v166(repo: Path) -> str:
         ".github/actions/resolve-review-policy/resolve_review_policy.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     return commit(repo, "v1.66 candidate")
 
 
 def prepare_v167(repo: Path) -> str:
     copy_review_policy_release_files(repo)
-    restore_pre_v172_opencode_context_budget(repo)
-    restore_pre_v171_opencode_dismissals(repo)
-    restore_pre_v170_opencode_finding_ids(repo)
     restore_retired_manual_pr_review(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
@@ -2118,15 +2112,14 @@ def prepare_v167(repo: Path) -> str:
         ".github/workflows/gemini-dispatch.yml",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     return commit(repo, "v1.67 candidate")
 
 
 def prepare_v168(repo: Path) -> str:
     copy_review_policy_release_files(repo)
-    restore_pre_v172_opencode_context_budget(repo)
-    restore_pre_v171_opencode_dismissals(repo)
-    restore_pre_v170_opencode_finding_ids(repo)
     for relative in (
         ".github/actions/review-invocation-budget/action.yml",
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
@@ -2151,7 +2144,9 @@ def prepare_v168(repo: Path) -> str:
         encoding="utf-8",
     )
     shutil.copy2(ROOT / "scripts/workflow-catalog.json", repo / "scripts/workflow-catalog.json")
+    restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
+    restore_pre_v170_opencode_finding_ids(repo)
     return commit(repo, "v1.68 candidate")
 
 
@@ -2186,7 +2181,18 @@ def prepare_v172(repo: Path) -> str:
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v173_opencode_active_section_order(repo)
     return commit(repo, "v1.72 candidate")
+
+
+def prepare_v173(repo: Path) -> str:
+    prepare_v168(repo)
+    for relative in (
+        ".github/workflows/opencode-auto-review.yml",
+        ".github/actions/review-invocation-budget/review_invocation_budget.py",
+    ):
+        shutil.copy2(ROOT / relative, repo / relative)
+    return commit(repo, "v1.73 candidate")
 
 
 def test_v171_accepts_current_opencode_dismissal_release_contract(
@@ -2205,6 +2211,46 @@ def test_v172_accepts_current_opencode_context_budget_release_contract(
     candidate = prepare_v172(repo)
 
     assert release_verifier.verify_commit_content(repo, "v1.72", candidate) == candidate
+
+
+def test_opencode_active_section_order_release_boundary() -> None:
+    assert (
+        release_inventory.release_supports_opencode_active_section_order("v1.72")
+        is False
+    )
+    assert (
+        release_inventory.release_supports_opencode_active_section_order("v1.73")
+        is True
+    )
+
+
+def test_v173_accepts_current_opencode_active_section_order_release_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v173(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.73", candidate) == candidate
+
+
+def test_v173_opencode_active_section_order_is_rejected_on_the_v172_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v173(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.72", candidate)
+
+
+def test_pre_v173_opencode_section_order_is_rejected_on_the_v173_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v172(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.73", candidate)
 
 
 def test_v172_opencode_context_budget_is_rejected_on_the_v171_release_line(

@@ -606,6 +606,15 @@ then spends the active set first. That second cause is a defect, not a design; s
 count therefore mixes whatever the tail reached, and the notice says only that those findings
 must not be treated as resolved. Do not read a rarity argument into the budget size.
 
+From `v1.73` the workflow-owned second cause is removed. When anchor normalization has to create
+a missing `Still open` section, it inserts that section before the first `Resolved` or
+`Retracted` section, and canonical rendering binds each block by section name rather than by the
+array position that the insertion changes. The demoted active block therefore stays in
+`Still open`, ahead of the inactive tail the budget spends first. This does not reorder a
+`Still open` section the model already supplied: the candidate grammar still leaves its relative
+position free, so model-authored ordering can still put either `Still open` or `Retracted` in
+the tail. The truncation count therefore remains status-neutral.
+
 The notice is not sufficient on its own, and this is the one place where `v1.72` is worse than
 what it replaces. Because the cut lands on a finding boundary, a section whose every block is
 spent is emitted as a bare heading — the old character-offset clip left a partial block, which at
