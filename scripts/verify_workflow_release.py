@@ -814,10 +814,13 @@ EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256 = {
     "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
     "opencode": "3803e294dc7975af1a2b6812639fd11ee55c97d6f92258281d2df770c8d6c433",
 }
+# v1.72 gives the OpenCode previous review its own context budget, cuts it at a finding
+# boundary, drops `Resolved` from it, and probes the removal branch once per run. Claude and
+# Gemini are unchanged.
 EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256 = {
     "claude": "a6116cf542876a46e8401e26471324a586772398ad5d21360155e686123104be",
     "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
-    "opencode": "5306152bf57cec631407bbf451ab1bb08c0e4a8de05b0d8f59ab224ed0c78446",
+    "opencode": "7c0032d8f4f246940884c118c993b135ef97c1ed6a1897db49cc4b7ee962f6ad",
 }
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
