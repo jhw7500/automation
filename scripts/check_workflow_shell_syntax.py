@@ -28,6 +28,27 @@ def _display_path(path: Path) -> str:
         return path.name
 
 
+def _literal_expression_value(expression: str) -> str | None:
+    expression = expression.strip()
+    if len(expression) < 2 or expression[0] != "'" or expression[-1] != "'":
+        return None
+
+    value: list[str] = []
+    index = 1
+    end = len(expression) - 1
+    while index < end:
+        if expression[index] != "'":
+            value.append(expression[index])
+            index += 1
+            continue
+        if index + 1 < end and expression[index + 1] == "'":
+            value.append("'")
+            index += 2
+            continue
+        return None
+    return "".join(value)
+
+
 def _neutralize_expressions(program: str) -> str:
     token = EXPRESSION_TOKEN
     suffix = 0
@@ -59,7 +80,9 @@ def _neutralize_expressions(program: str) -> str:
                 index += 1
                 continue
             if not in_string and program.startswith("}}", index):
-                output.append(token)
+                expression = program[start + 3 : index]
+                literal = _literal_expression_value(expression)
+                output.append(token if literal is None else literal)
                 cursor = index + 2
                 break
             index += 1
@@ -96,7 +119,7 @@ def _uses_bash(shell: str | None) -> bool:
         executable = 1
         while executable < len(words):
             name, separator, _ = words[executable].partition("=")
-            if separator and name.isidentifier():
+            if separator and name and not words[executable].startswith("-"):
                 executable += 1
                 continue
             break
@@ -119,16 +142,21 @@ def _runner_labels(value: object) -> list[str]:
     return []
 
 
-def _runs_on_windows(value: object) -> bool:
-    return any("windows" in label.casefold() for label in _runner_labels(value))
-
-
-def _runs_on_bash_host(value: object) -> bool:
-    bash_labels = ("ubuntu", "linux", "macos")
-    return any(
-        any(name in label.casefold() for name in bash_labels)
-        for label in _runner_labels(value)
-    )
+def _runner_platforms(value: object) -> set[str]:
+    platforms: set[str] = set()
+    for label in _runner_labels(value):
+        normalized = label.casefold()
+        if normalized in {"linux", "macos"} or normalized.startswith(
+            ("ubuntu-", "macos-")
+        ):
+            platforms.add("bash")
+        windows_suffix = normalized.removeprefix("windows-")
+        if normalized == "windows" or (
+            normalized.startswith("windows-")
+            and (windows_suffix == "latest" or windows_suffix[:1].isdigit())
+        ):
+            platforms.add("windows")
+    return platforms
 
 
 def _contains_expression(value: object) -> bool:
@@ -179,9 +207,10 @@ def _bash_blocks(document: object) -> Iterator[tuple[str, str]]:
                     raise WorkflowSyntaxError(
                         "implicit shell is ambiguous; set a literal shell"
                     )
-                if _runs_on_windows(runs_on):
+                platforms = _runner_platforms(runs_on)
+                if platforms == {"windows"}:
                     continue
-                if not _runs_on_bash_host(runs_on):
+                if platforms != {"bash"}:
                     raise WorkflowSyntaxError(
                         "implicit shell is ambiguous; set a literal shell"
                     )

@@ -171,6 +171,29 @@ jobs:
     assert "collision.yml:jobs.check.steps[0]: Bash syntax error" in result.stderr
 
 
+def test_literal_expression_shell_grammar_is_checked(tmp_path: Path) -> None:
+    workflow = tmp_path / "literal-expression.yml"
+    workflow.write_text(
+        """
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: ${{ 'if true; then' }}
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = run_checker(workflow)
+
+    assert result.returncode == 2
+    assert (
+        "literal-expression.yml:jobs.check.steps[0]: Bash syntax error"
+        in result.stderr
+    )
+
+
 def test_expression_derived_shell_fails_closed(tmp_path: Path) -> None:
     workflow = tmp_path / "dynamic-shell.yml"
     workflow.write_text(
@@ -277,6 +300,32 @@ jobs:
     )
 
 
+def test_env_non_identifier_assignment_wrapped_bash_is_checked(
+    tmp_path: Path,
+) -> None:
+    workflow = tmp_path / "wrapped-bash-non-identifier-env.yml"
+    workflow.write_text(
+        """
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: /usr/bin/env BUILD-MODE=ci bash {0}
+        run: |
+          if true; then
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = run_checker(workflow)
+
+    assert result.returncode == 2
+    assert (
+        "wrapped-bash-non-identifier-env.yml:jobs.check.steps[0]: Bash syntax error"
+        in result.stderr
+    )
+
+
 def test_unclassified_env_wrapper_fails_closed(tmp_path: Path) -> None:
     workflow = tmp_path / "wrapped-bash-option.yml"
     workflow.write_text(
@@ -335,6 +384,50 @@ jobs:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == "PASS: checked 0 Bash workflow run blocks\n"
+
+
+def test_custom_label_containing_windows_does_not_override_linux(
+    tmp_path: Path,
+) -> None:
+    workflow = tmp_path / "linux-with-windows-tooling.yml"
+    workflow.write_text(
+        """
+jobs:
+  check:
+    runs-on: [self-hosted, linux, windows-sdk]
+    steps:
+      - run: |
+          if true; then
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = run_checker(workflow)
+
+    assert result.returncode == 2
+    assert (
+        "linux-with-windows-tooling.yml:jobs.check.steps[0]: Bash syntax error"
+        in result.stderr
+    )
+
+
+def test_conflicting_runner_os_labels_fail_closed(tmp_path: Path) -> None:
+    workflow = tmp_path / "conflicting-runner.yml"
+    workflow.write_text(
+        """
+jobs:
+  check:
+    runs-on: [self-hosted, linux, windows]
+    steps:
+      - run: echo conflicting-default-shell
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = run_checker(workflow)
+
+    assert result.returncode == 2
+    assert "conflicting-runner.yml: implicit shell is ambiguous" in result.stderr
 
 
 def test_dynamic_mapping_runner_implicit_shell_fails_closed(
