@@ -585,7 +585,55 @@ produced byte-for-byte at that change's base and head. The soft carryover path a
 route that retires a finding through a *bad* block; it does not close the cheaper route of omitting
 the block entirely. Closing that route is not a free tightening, because omission is the same
 mechanism a dismissal retires through (below), and every republished block re-enters the next
-round's model context in full against a 6,000-character clip that truncates silently. See #157.
+round's model context in full. See #157.
+
+From `v1.72` the previous review reaches the model under its own budget rather than sharing the
+one that bounds human comments, and it is cut at a finding boundary: a partial block would have
+the model copy a truncated heading, and a carryover heading that matches no prior one fails the
+whole document. When blocks do not fit, the context reports how many were left out and asserts no
+status for them: the cut takes the tail, so it spends whichever section renders last. Which one
+that is, is not guaranteed, and two separate things decide it. First, only `New findings` has a
+pinned position — the candidate contract requires it first and each other section at most once,
+and nothing there fixes the relative order of `Still open`, `Resolved`, and `Retracted`, so the
+model may render them in any order. (The composite `canonicalize-review` action does pin the full
+order, but it serves `claude-code-review.yml` and `gemini-auto-review.yml`; this workflow's own
+canonicalizer is separate and does not.) Second, and independent of the model, the canonicalizer
+itself appends `Still open` at the END of the section list when a carryover block fails anchor
+validation and the model published no `Still open` section of its own. A stale anchor is normal
+once the head advances past a previous finding, so this is a routine path, not an edge case: the
+workflow can author a body ordered `New findings`, `Retracted`, `Still open`, and the tail cut
+then spends the active set first. That second cause is a defect, not a design; see #165. The
+count therefore mixes whatever the tail reached, and the notice says only that those findings
+must not be treated as resolved. Do not read a rarity argument into the budget size.
+
+The notice is not sufficient on its own, and this is the one place where `v1.72` is worse than
+what it replaces. Because the cut lands on a finding boundary, a section whose every block is
+spent is emitted as a bare heading — the old character-offset clip left a partial block, which at
+least proved content existed. An empty-looking `### Still open` under a `None` in `### New
+findings` is the exact antecedent of the prompt's own zero-active-prior-findings rule, which
+instructs the model to omit the carryover sections entirely — and omission is retirement. The
+notice cannot outrank that rule: it is interpolated inside the region framed as `UNTRUSTED DATA`,
+while the rule sits in the system prompt. So the rule itself is conditioned: it does not apply
+when the previous review carries the truncation notice. Nothing downstream enforces this — no
+`- Normalization:` line is emitted for a carryover the model never mentions, and
+`priorActiveEvidence` feeds duplicate detection only, never a requirement that prior active
+headings be accounted for.
+
+The notice is workflow-owned, and both reserved-line filters strip it on read-back by matching
+the fixed opening of the sentence through its semicolon — not a bare `- Context: ` prefix, which
+is deliberately left free so that a finding's own prose may begin that way and survive. Nothing
+rejects a model publishing a copy: the authoring-time `reserved` set does not carry it, so the
+read-back filter is the whole guard. It removes every line starting with that opening, not a
+byte-exact line, and the opening ends at the semicolon rather than the space after it so that the
+bare sentence is covered too. Both patterns are anchored at `^`, so a copy that is indented or
+blockquoted survives — the prompt guard keys on the same text and a reader may not treat a leading
+`> ` as significant, so the guard can still fire on a review that was never truncated. That
+outcome is conservative, since the guard only stops the model concluding the active set is empty. `Resolved` blocks are dropped from that context entirely — they left the active set,
+carrying one over is rejected outright, and their bytes would otherwise compete with the blocks
+that must survive; they are stripped before the cut, so they never reach it. `Retracted` blocks
+stay in that context, because a disproven finding may be re-raised at most once and that rule
+needs the memory of what was already retracted — but only until the budget binds. None of this
+closes the omission route above: it lowers how often truncation forces the model into it.
 
 A prior body this job cannot re-parse leaves no
 block to fall back on and still fails the whole document, which preserves every open finding through
