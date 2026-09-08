@@ -392,7 +392,7 @@ jobs:
           PREV_SUCCESSFUL_HEAD="$(printf '%s\n' "$PREV_RECORD" | jq -r '.state.successful_head // ""')"
           PREV_FULL_HASH="$(printf '%s\n' "$PREV_RECORD" | jq -r '.state.full_diff_sha256 // ""')"
           # Reserved workflow-owned text is never model input, even from a validated record.
-          PREV_REVIEW="$(printf '%s\n' "$PREV_REVIEW" | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Normalization: |- Filtered candidate \(raw\): |- Last attempt: |- Attestation: |- Reason: |- Context: )' || true)"
+          PREV_REVIEW="$(printf '%s\n' "$PREV_REVIEW" | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Normalization: |- Filtered candidate \(raw\): |- Last attempt: |- Attestation: |- Reason: |- Context: previous review truncated to fit the budget; [0-9]+ finding\(s\) omitted, do not treat them as resolved$)' || true)"
           # `Resolved` blocks left the active set and are republished by the canonicalizer,
           # so carrying them over is rejected outright and re-reading them buys the model
           # nothing — while they compete for the same context budget as the blocks that must
@@ -414,7 +414,7 @@ jobs:
             '[.[] | select((.user.type // "") != "Bot")] | .[-10:]
              | map("@" + (.user.login // "ghost") + " (" + (.created_at // "") + "):\n" + ((.body // "") | .[0:1500]))
              | join("\n\n---\n\n")' "$COMMENTS" \
-            | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Normalization: |- Filtered candidate \(raw\): |- Last attempt: |- Attestation: |- Reason: |- Context: )' || true)"
+            | grep -vE '^(## OpenCode Review \(latest\)|<!-- automation:|<!-- automation-state:|- Status: |- Run: |- Reviewed: |- Validation: |- Normalization: |- Filtered candidate \(raw\): |- Last attempt: |- Attestation: |- Context: previous review truncated to fit the budget; [0-9]+ finding\(s\) omitted, do not treat them as resolved$)' || true)"
 
           clip() {
             local text="$1"
@@ -438,10 +438,10 @@ jobs:
               { lines[NR] = $0; cum[NR] = (NR > 1 ? cum[NR - 1] : 0) + length($0) + 1 }
               /^#### / { heads[++hc] = NR }
               END {
-                # The awk only runs once the caller has already found the text over budget, so
-                # something is always dropped and the trailer always fires. Driving both off
-                # `cut` rather than the heading count keeps that true for a body that carries
-                # no finding blocks at all, which would otherwise be cut to nothing in silence.
+                # The awk only runs once the caller has found the text over budget, so the
+                # trailer always fires. Keying it off `cut` rather than the heading count is
+                # what keeps that true for a body carrying no finding blocks, which would
+                # otherwise be cut to nothing in silence.
                 cut = 0; dropped = hc
                 for (j = 1; j <= hc; j++) {
                   if (cum[heads[j] - 1] <= limit) { cut = heads[j] - 1; dropped = hc - (j - 1) }
@@ -452,11 +452,7 @@ jobs:
                 # model cannot see is a block it cannot carry over. The count therefore mixes
                 # open and retracted findings and must not claim a status for either.
                 if (cut < NR) {
-                  if (dropped > 0) {
-                    printf "\n- Context: %d finding(s) omitted to fit the budget; do not treat them as resolved\n", dropped
-                  } else {
-                    printf "\n- Context: previous review truncated to fit the budget\n"
-                  }
+                  printf "\n- Context: previous review truncated to fit the budget; %d finding(s) omitted, do not treat them as resolved\n", dropped
                 }
               }'
           }

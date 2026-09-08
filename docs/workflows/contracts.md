@@ -590,11 +590,18 @@ round's model context in full. See #157.
 From `v1.72` the previous review reaches the model under its own budget rather than sharing the
 one that bounds human comments, and it is cut at a finding boundary: a partial block would have
 the model copy a truncated heading, and a carryover heading that matches no prior one fails the
-whole document. When blocks do not fit, the context says how many were left out and that they
-remain open. `Resolved` blocks are dropped from that context entirely — they left the active set,
+whole document. When blocks do not fit, the context reports how many were left out and asserts no
+status for them: sections render `New findings`, `Still open`, `Resolved`, `Retracted`, so a tail
+cut spends `Retracted` before anything active. That order is deliberate — a block the model cannot
+see is a block it cannot carry over, so the active set survives first — but it means the count
+mixes open and retracted findings, and the notice says only that they must not be treated as
+resolved. The notice is workflow-owned: it carries the reserved `- Context: ` prefix and both
+reserved-line filters strip it on read-back, so a model-authored look-alike cannot return as ours.
+`Resolved` blocks are dropped from that context entirely — they left the active set,
 carrying one over is rejected outright, and their bytes would otherwise compete with the blocks
-that must survive. `Retracted` blocks stay, because a disproven finding may be re-raised at most
-once and that rule needs the memory of what was already retracted. None of this closes the
+that must survive. `Retracted` blocks stay in that context, because a disproven finding may be re-raised at most
+once and that rule needs the memory of what was already retracted — but only until the budget
+binds, since they render last and the tail cut reaches them first. None of this closes the
 omission route above: it lowers how often truncation forces the model into it.
 
 A prior body this job cannot re-parse leaves no
