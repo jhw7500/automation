@@ -66,6 +66,12 @@ jobs:
                   assert isinstance(document, dict), path
           print("PASS: all workflow YAML parsed")
           PY
+      - name: Check Bash syntax in workflow run blocks
+        shell: bash
+        run: |
+          python3 scripts/check_workflow_shell_syntax.py \
+            .github/workflows \
+            examples/baseline-workflows/.github/workflows
       - name: Install digest-verified actionlint 1.7.12
         shell: bash
         run: |
