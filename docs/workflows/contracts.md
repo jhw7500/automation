@@ -624,11 +624,11 @@ the fixed opening of the sentence through its semicolon — not a bare `- Contex
 is deliberately left free so that a finding's own prose may begin that way and survive. Nothing
 rejects a model publishing a copy: the authoring-time `reserved` set does not carry it, so the
 read-back filter is the whole guard. It removes every line starting with that opening, not a
-byte-exact line, and the opening deliberately ends at the semicolon rather than the space after
-it: the guard in the prompt keys on the same text, so anything that can trigger the guard is also
-something the filters remove. A trailing space in the pattern would have left the bare form
-`- Context: previous review truncated to fit the budget;` able to reach the model from a human
-comment. `Resolved` blocks are dropped from that context entirely — they left the active set,
+byte-exact line, and the opening ends at the semicolon rather than the space after it so that the
+bare sentence is covered too. Both patterns are anchored at `^`, so a copy that is indented or
+blockquoted survives — the prompt guard keys on the same text and a reader may not treat a leading
+`> ` as significant, so the guard can still fire on a review that was never truncated. That
+outcome is conservative, since the guard only stops the model concluding the active set is empty. `Resolved` blocks are dropped from that context entirely — they left the active set,
 carrying one over is rejected outright, and their bytes would otherwise compete with the blocks
 that must survive; they are stripped before the cut, so they never reach it. `Retracted` blocks
 stay in that context, because a disproven finding may be re-raised at most once and that rule
