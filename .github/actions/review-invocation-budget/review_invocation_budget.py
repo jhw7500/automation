@@ -85,8 +85,9 @@ def _exact_keys(value: object, keys: set[str], name: str) -> Mapping[str, object
 
 
 MAX_ROUNDS_VARIABLE = "REVIEW_MAX_ROUNDS"
-MAX_ROUNDS_DEFAULT = 2
+MAX_ROUNDS_DEFAULT = 5
 MAX_ROUNDS_CEILING = 5
+MAX_OVERRIDE_ROUNDS = 2
 
 
 def configured_max_rounds() -> int:
@@ -114,8 +115,8 @@ def configured_max_rounds() -> int:
 
 @dataclass(frozen=True)
 class BudgetPolicy:
-    max_rounds: int = 2
-    max_override_rounds: int = 1
+    max_rounds: int = 5
+    max_override_rounds: int = 2
     max_calls_per_round: int = 1
     max_wall_seconds_per_round: int = 600
     max_estimated_tokens_per_round: int = 200_000
@@ -433,7 +434,10 @@ class Handoff:
                 not all(isinstance(item, str) and _FINDING.fullmatch(item) for item in findings)):
             raise BudgetStateError("handoff_invalid")
         usage = value["round_usage"]
-        if not isinstance(usage, list) or len(usage) > 3:
+        if (
+            not isinstance(usage, list)
+            or len(usage) > MAX_ROUNDS_CEILING + MAX_OVERRIDE_ROUNDS
+        ):
             raise BudgetStateError("handoff_invalid")
         parsed_usage: list[tuple[int, int, int, int]] = []
         for item in usage:
@@ -598,6 +602,10 @@ def effective_budgets(state: LedgerState) -> BudgetPolicy:
     return replace(
         state.budgets,
         max_rounds=max(state.budgets.max_rounds, configured_max_rounds()),
+        max_override_rounds=max(
+            state.budgets.max_override_rounds,
+            MAX_OVERRIDE_ROUNDS,
+        ),
     )
 
 
@@ -607,9 +615,22 @@ def _validate_state_shape(state: LedgerState) -> None:
     _integer(state.pr, "pr", positive=True)
     BudgetPolicy.from_dict(state.budgets.to_dict())
     budgets = effective_budgets(state)
-    recorded = {key: value for key, value in state.budgets.to_dict().items() if key != "max_rounds"}
-    expected = {key: value for key, value in BudgetPolicy.for_reviewer(state.reviewer).to_dict().items() if key != "max_rounds"}
-    if recorded != expected or not 1 <= state.budgets.max_rounds <= MAX_ROUNDS_CEILING:
+    variable_budgets = {"max_rounds", "max_override_rounds"}
+    recorded = {
+        key: value
+        for key, value in state.budgets.to_dict().items()
+        if key not in variable_budgets
+    }
+    expected = {
+        key: value
+        for key, value in BudgetPolicy.for_reviewer(state.reviewer).to_dict().items()
+        if key not in variable_budgets
+    }
+    if (
+        recorded != expected
+        or not 1 <= state.budgets.max_rounds <= MAX_ROUNDS_CEILING
+        or not 1 <= state.budgets.max_override_rounds <= MAX_OVERRIDE_ROUNDS
+    ):
         raise BudgetStateError("budgets_invalid")
     if len(state.invocations) > budgets.max_rounds + budgets.max_override_rounds or len(state.consumed_override_event_ids) != len(set(state.consumed_override_event_ids)):
         raise BudgetStateError("ledger_invalid")
@@ -639,36 +660,45 @@ def _validate_state_shape(state: LedgerState) -> None:
         raise BudgetStateError("duplicate_run_identity")
     automatic = [item for item in state.invocations if item.override_event_id is None]
     overrides = [item for item in state.invocations if item.override_event_id is not None]
-    forced_override = next(
-        (item for item in overrides if item.caller_event == "workflow_dispatch"), None
-    )
+    if state.reviewer == "opencode" and overrides:
+        raise BudgetStateError("override_invalid")
     for attribute, reason in (
         ("head_sha", "duplicate_head"),
         ("full_diff_sha256", "duplicate_effective_diff"),
     ):
         values = [getattr(item, attribute) for item in state.invocations]
         duplicates = {value for value in values if values.count(value) > 1}
-        if duplicates and (
-            forced_override is None
-            or any(values.count(value) != 2 for value in duplicates)
-            or any(getattr(forced_override, attribute) != value for value in duplicates)
-            or all(getattr(item, attribute) not in duplicates for item in automatic)
-        ):
-            raise BudgetStateError(reason)
+        for value in duplicates:
+            repeated = [
+                item
+                for item in state.invocations
+                if getattr(item, attribute) == value
+            ]
+            if any(
+                item.override_event_id is None
+                or item.caller_event != "workflow_dispatch"
+                for item in repeated[1:]
+            ):
+                raise BudgetStateError(reason)
     if len(automatic) > budgets.max_rounds or len(overrides) > budgets.max_override_rounds:
         raise BudgetStateError("rounds_invalid")
     if [item.round_number for item in automatic] != list(range(1, len(automatic) + 1)):
         raise BudgetStateError("rounds_invalid")
     if overrides:
-        item = overrides[0]
+        first_override = overrides[0]
         expected_automatic_rounds = (
-            range(0, state.budgets.max_rounds + 1)
-            if item.caller_event == "workflow_dispatch"
-            else (state.budgets.max_rounds,)
+            range(0, budgets.max_rounds + 1)
+            if first_override.caller_event == "workflow_dispatch"
+            else range(state.budgets.max_rounds, budgets.max_rounds + 1)
         )
-        if (len(automatic) not in expected_automatic_rounds or state.invocations[-1] != item or
-                item.round_number != len(automatic) + 1 or
-                item.override_event_id not in state.consumed_override_event_ids):
+        if (
+            len(automatic) not in expected_automatic_rounds
+            or tuple(state.invocations) != tuple(automatic + overrides)
+            or [item.round_number for item in overrides]
+            != list(range(len(automatic) + 1, len(state.invocations) + 1))
+            or tuple(item.override_event_id for item in overrides)
+            != state.consumed_override_event_ids
+        ):
             raise BudgetStateError("override_invalid")
     if len(state.consumed_override_event_ids) != len(overrides):
         raise BudgetStateError("override_invalid")
@@ -676,8 +706,7 @@ def _validate_state_shape(state: LedgerState) -> None:
     total_limit = state.budgets.max_estimated_tokens_total
     if automatic_total > total_limit:
         raise BudgetStateError("total_usage_budget_exhausted")
-    if overrides:
-        total_limit += state.budgets.max_estimated_tokens_per_round
+    total_limit += len(overrides) * state.budgets.max_estimated_tokens_per_round
     if sum(item.estimated_input_tokens for item in state.invocations) > total_limit:
         raise BudgetStateError("total_usage_budget_exhausted")
     _validate_dismissed_findings(state.dismissed_findings)
@@ -1038,7 +1067,10 @@ def choose_override(state: LedgerState, events: Sequence[OverrideEvent]) -> Over
     # consuming it for a verdict that is then thrown away.
     if state.reviewer == "opencode":
         return None
-    if any(item.override_event_id is not None for item in state.invocations):
+    if (
+        sum(item.override_event_id is not None for item in state.invocations)
+        >= effective_budgets(state).max_override_rounds
+    ):
         return None
     eligible: list[OverrideEvent] = []
     for event in events:
@@ -1137,10 +1169,11 @@ def claim(state: LedgerState | None, request: ClaimRequest,
         return refuse(validated, request, "duplicate_effective_diff")
     if request.estimated_input_tokens > validated.budgets.max_estimated_tokens_per_round:
         return refuse(validated, request, "input_budget_exhausted")
+    override_count = sum(
+        item.override_event_id is not None for item in validated.invocations
+    )
     override = None
-    if any(item.override_event_id is not None for item in validated.invocations):
-        return refuse(validated, request, "round_budget_exhausted")
-    if request.force_review:
+    if override_count or request.force_review:
         override = choose_override(validated, request.override_events)
         if override is None:
             return refuse(validated, request, "round_budget_exhausted")
@@ -1148,7 +1181,11 @@ def claim(state: LedgerState | None, request: ClaimRequest,
         override = choose_override(validated, request.override_events)
         if override is None:
             return refuse(validated, request, "round_budget_exhausted")
-    total_limit = 600_000 if override is not None else 400_000
+    total_limit = (
+        validated.budgets.max_estimated_tokens_total
+        + (override_count + int(override is not None))
+        * validated.budgets.max_estimated_tokens_per_round
+    )
     if estimated_total(validated) + request.estimated_input_tokens > total_limit:
         return refuse(validated, request, "total_usage_budget_exhausted")
     return append_claim(
@@ -1287,6 +1324,8 @@ _REVIEWER_TITLES = {"claude": "Claude", "gemini": "Gemini", "opencode": "OpenCod
 def _summary(state: LedgerState, *, server_url: str) -> str:
     _validate_state_shape(state)
     handoff = state.handoff
+    budgets = effective_budgets(state)
+    override_limit = 0 if state.reviewer == "opencode" else budgets.max_override_rounds
     if handoff.repository is None:
         raise BudgetStateError("handoff_missing")
     if not isinstance(server_url, str) or not server_url or "\n" in server_url or "\r" in server_url:
@@ -1306,8 +1345,8 @@ def _summary(state: LedgerState, *, server_url: str) -> str:
     return (
         f"## {_REVIEWER_TITLES[state.reviewer]} review invocation budget\n"
         f"- Decision: {handoff.decision}\n"
-        f"- Automatic rounds: {handoff.automatic_rounds}/{state.budgets.max_rounds}\n"
-        f"- Override rounds: {handoff.override_rounds}/{state.budgets.max_override_rounds}\n"
+        f"- Automatic rounds: {handoff.automatic_rounds}/{budgets.max_rounds}\n"
+        f"- Override rounds: {handoff.override_rounds}/{override_limit}\n"
         f"- Current run: {run_url}\n"
         f"- Stop reason: {handoff.stop_reason}\n"
         f"{dismissed_line}\n"
@@ -2030,7 +2069,7 @@ def _list_run_identities(
     current = {"run_id": request["run_id"], "run_attempt": request["run_attempt"]}
     if current not in runs:
         runs.append(current)
-    if len(runs) > 4:
+    if len(runs) > MAX_ROUNDS_CEILING + MAX_OVERRIDE_ROUNDS:
         error = "ledger_invalid"
         runs = []
     write_private(output_directory / "run-identities.json", _json_bytes({

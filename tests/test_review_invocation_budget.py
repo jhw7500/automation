@@ -190,6 +190,13 @@ def claim_provenances(state, claim_request):
     return provenances
 
 
+def force_claim_provenances(state, claim_request):
+    provenances = claim_provenances(state, claim_request)
+    key = (claim_request.run_id, claim_request.run_attempt)
+    provenances[key] = replace(provenances[key], caller_event="workflow_dispatch")
+    return provenances
+
+
 def ledger_body(state):
     payload = json.dumps(state.to_dict(), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return f"{budget.MARKERS[state.reviewer]}\n{budget.STATE_PREFIX}{payload}{budget.STATE_SUFFIX}"
@@ -205,7 +212,8 @@ def assert_stored_state_rejected(state, reason):
 
 
 @pytest.fixture
-def two_round_state():
+def two_round_state(monkeypatch):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "2")
     return state_for("two-successes")
 
 
@@ -224,7 +232,8 @@ def unchanged_request():
     return request(diff_mode="unchanged")
 
 
-def test_fixed_claim_vectors():
+def test_fixed_claim_vectors(monkeypatch):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "2")
     vectors = json.loads((Path(__file__).parent / "fixtures/review-invocation-budget/cases.json").read_text())
     for vector in (item for item in vectors if item.get("kind", "claim") == "claim"):
         events = ()
@@ -448,6 +457,35 @@ def test_force_review_claims_same_head_once_with_dispatch_and_authorized_overrid
     assert result.state.invocations[-1].caller_event == "workflow_dispatch"
 
 
+def test_two_early_force_reviews_on_the_same_head_use_distinct_events():
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude")
+    first_request = request(
+        run_id=700,
+        force_review=True,
+        override_events=(override_event(9001),),
+    )
+    first = budget.claim(
+        state,
+        first_request,
+        force_claim_provenances(state, first_request),
+    )
+    second_request = request(
+        run_id=701,
+        force_review=True,
+        override_events=(override_event(9002),),
+    )
+
+    second = budget.claim(
+        first.state,
+        second_request,
+        force_claim_provenances(first.state, second_request),
+    )
+
+    assert second.allow_invocation
+    assert second.state.consumed_override_event_ids == (9001, 9002)
+    assert budget.load_checkpoint(budget.render_checkpoint(second.state)) == second.state
+
+
 def test_force_review_fails_closed_without_dispatch_or_authorized_override():
     existing = budget.LedgerState.initial(
         REPOSITORY,
@@ -642,8 +680,8 @@ def test_comment_summary_and_handoff_are_exact_and_workflow_owned():
     visible = (
         "## Claude review invocation budget\n"
         "- Decision: duplicate_head\n"
-        "- Automatic rounds: 1/2\n"
-        "- Override rounds: 0/1\n"
+        "- Automatic rounds: 1/5\n"
+        "- Override rounds: 0/2\n"
         "- Current run: https://github.com/example/repo/actions/runs/700\n"
         "- Stop reason: duplicate_head\n"
         "- Dismissed findings: none\n\n"
@@ -1012,6 +1050,14 @@ def test_stored_automatic_and_override_aggregate_boundaries():
         REPOSITORY, PR, "claude", invocations=(first, second, third),
         consumed_override_event_ids=(9001,),
     )
+    override_limit = replace(
+        override_limit,
+        budgets=replace(
+            override_limit.budgets,
+            max_rounds=2,
+            max_override_rounds=1,
+        ),
+    )
     assert budget.parse_ledger(
         ledger_body(override_limit), repository=REPOSITORY, pr=PR, reviewer="claude",
     ) == override_limit
@@ -1047,8 +1093,34 @@ def rounds(count):
     )
 
 
-def test_round_budget_defaults_to_two_without_the_variable():
-    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 2
+def test_round_budget_defaults_to_five_without_the_variable():
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude", invocations=rounds(4))
+    fifth_request = request(head="e" * 40, full_hash="5" * 64, run_id=604)
+
+    fifth = budget.claim(
+        state,
+        fifth_request,
+        claim_provenances(state, fifth_request),
+    )
+
+    assert fifth.allow_invocation
+    assert fifth.round_number == 5
+
+    at_limit = budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        "claude",
+        invocations=rounds(5),
+    )
+    sixth_request = request(head="0" * 40, full_hash="6" * 64, run_id=605)
+    sixth = budget.claim(
+        at_limit,
+        sixth_request,
+        claim_provenances(at_limit, sixth_request),
+    )
+
+    assert not sixth.allow_invocation
+    assert sixth.decision == "round_budget_exhausted"
 
 
 @pytest.mark.parametrize("reviewer", ("claude", "gemini", "opencode"))
@@ -1062,7 +1134,7 @@ def test_round_budget_honours_the_configured_variable(monkeypatch, reviewer, raw
 def test_round_budget_ignores_an_empty_variable_without_warning(monkeypatch, capsys):
     monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "")
 
-    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 2
+    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 5
     assert capsys.readouterr().err == ""
 
 
@@ -1070,7 +1142,7 @@ def test_round_budget_ignores_an_empty_variable_without_warning(monkeypatch, cap
 def test_round_budget_falls_back_and_warns_on_an_unusable_variable(monkeypatch, capsys, raw):
     monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, raw)
 
-    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 2
+    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 5
     assert budget.MAX_ROUNDS_VARIABLE in capsys.readouterr().err
 
 
@@ -1081,8 +1153,51 @@ def test_ledger_capacity_follows_the_configured_round_budget(monkeypatch):
     budget._validate_state_shape(state)
 
 
+def test_fourth_claim_checkpoint_round_trips(monkeypatch):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "5")
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude", invocations=rounds(3))
+    fourth_request = request(
+        head="d" * 40,
+        full_hash="4" * 64,
+        run_id=703,
+    )
+
+    claimed = budget.claim(
+        state,
+        fourth_request,
+        claim_provenances(state, fourth_request),
+    )
+
+    assert claimed.allow_invocation
+    assert claimed.round_number == 4
+    assert budget.load_checkpoint(budget.render_checkpoint(claimed.state)) == claimed.state
+
+
+def test_legacy_ledger_can_finish_the_raised_automatic_budget_before_override(monkeypatch):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "2")
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude")
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "5")
+    state = replace(state, invocations=rounds(5))
+    override_request = request(
+        head="f" * 40,
+        full_hash="6" * 64,
+        run_id=705,
+        override_events=(override_event(9001),),
+    )
+
+    claimed = budget.claim(
+        state,
+        override_request,
+        claim_provenances(state, override_request),
+    )
+
+    assert claimed.allow_invocation
+    assert claimed.round_number == 6
+    assert budget.load_checkpoint(budget.render_checkpoint(claimed.state)) == claimed.state
+
+
 def test_ledger_capacity_still_rejects_more_rounds_than_budgeted():
-    state = budget.LedgerState.initial(REPOSITORY, PR, "claude", invocations=rounds(4))
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude", invocations=rounds(6))
 
     with pytest.raises(budget.BudgetStateError):
         budget._validate_state_shape(state)
@@ -1111,7 +1226,7 @@ def test_round_budget_rejects_non_ascii_digits(monkeypatch, capsys, raw):
 
     monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, raw)
 
-    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 2
+    assert budget.BudgetPolicy.for_reviewer("claude").max_rounds == 5
     assert budget.MAX_ROUNDS_VARIABLE in capsys.readouterr().err
 
 
@@ -1122,12 +1237,20 @@ def overridden_state():
     override = invocation(
         head=HEAD_C, full_hash=HASH_3, run_id=700, round_number=3, override_event_id=9001
     )
-    return budget.LedgerState.initial(
+    state = budget.LedgerState.initial(
         REPOSITORY,
         PR,
         "claude",
         invocations=automatic + (override,),
         consumed_override_event_ids=(9001,),
+    )
+    return replace(
+        state,
+        budgets=replace(
+            state.budgets,
+            max_rounds=2,
+            max_override_rounds=1,
+        ),
     )
 
 
@@ -1144,6 +1267,29 @@ def test_recorded_override_survives_a_raised_round_budget(monkeypatch):
     budget._validate_state_shape(state)
 
 
+def test_legacy_ledger_uses_the_expanded_budget_for_a_second_approval():
+    state = overridden_state()
+    second_request = request(
+        head=HEAD_C,
+        full_hash=HASH_3,
+        run_id=701,
+        override_events=(override_event(9002),),
+        force_review=True,
+    )
+
+    second = budget.claim(
+        state,
+        second_request,
+        force_claim_provenances(state, second_request),
+    )
+
+    assert second.allow_invocation
+    assert second.state.consumed_override_event_ids == (9001, 9002)
+    assert "- Automatic rounds: 2/5\n- Override rounds: 2/2\n" in budget.render_summary(
+        second.state
+    )
+
+
 # --- OpenCode cannot publish a dispatch round, so it must not spend one (issue #118) ---
 
 
@@ -1158,6 +1304,59 @@ def test_override_stays_available_for_the_publishing_reviewers(reviewer):
     assert budget.choose_override(state, (override_event(),)) is not None
 
 
+def test_two_distinct_override_events_each_unlock_one_extra_round(monkeypatch):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "5")
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude", invocations=rounds(5))
+    first_request = request(
+        head="e" * 40,
+        full_hash="5" * 64,
+        run_id=706,
+        override_events=(override_event(9101),),
+        force_review=True,
+    )
+
+    first = budget.claim(state, first_request, force_claim_provenances(state, first_request))
+
+    assert first.allow_invocation
+    assert first.round_number == 6
+    assert first.state.consumed_override_event_ids == (9101,)
+
+    first_state = replace(first.state, handoff=budget.Handoff())
+    second_request = request(
+        head="e" * 40,
+        full_hash="5" * 64,
+        run_id=707,
+        override_events=(override_event(9102),),
+        force_review=True,
+    )
+    second = budget.claim(
+        first_state,
+        second_request,
+        force_claim_provenances(first_state, second_request),
+    )
+
+    assert second.allow_invocation
+    assert second.round_number == 7
+    assert second.state.consumed_override_event_ids == (9101, 9102)
+
+    reused_request = request(
+        head="e" * 40,
+        full_hash="5" * 64,
+        run_id=708,
+        override_events=(override_event(9102),),
+        force_review=True,
+    )
+    reused = budget.claim(
+        second.state,
+        reused_request,
+        force_claim_provenances(second.state, reused_request),
+    )
+
+    assert not reused.allow_invocation
+    assert reused.decision == "round_budget_exhausted"
+    assert reused.state.consumed_override_event_ids == (9101, 9102)
+
+
 def test_override_is_refused_for_opencode():
     """OpenCode's canonicalizer only accepts pull_request provenance, so a dispatch
     round can never publish. Spending the override there loses the verdict."""
@@ -1165,6 +1364,43 @@ def test_override_is_refused_for_opencode():
     state = budget.LedgerState.initial(REPOSITORY, PR, "opencode")
 
     assert budget.choose_override(state, (override_event(),)) is None
+
+
+def test_stored_override_is_invalid_for_opencode():
+    automatic = tuple(
+        invocation(
+            reviewer="opencode",
+            head=chr(ord("a") + index) * 40,
+            full_hash=str(index + 1) * 64,
+            run_id=800 + index,
+            round_number=index + 1,
+        )
+        for index in range(5)
+    )
+    override = invocation(
+        reviewer="opencode",
+        head="f" * 40,
+        full_hash="6" * 64,
+        run_id=805,
+        round_number=6,
+        override_event_id=9201,
+    )
+    state = budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        "opencode",
+        invocations=automatic + (override,),
+        consumed_override_event_ids=(9201,),
+    )
+
+    with pytest.raises(budget.BudgetStateError, match="override_invalid"):
+        budget._validate_state_shape(state)
+
+
+def test_opencode_summary_reports_no_override_capacity():
+    state = claimed_state("opencode")
+
+    assert "- Override rounds: 0/0\n" in budget.render_summary(state)
 
 
 # --- A collaborator can dismiss a false-positive finding by comment (issue #112) ---
@@ -1360,9 +1596,10 @@ def test_claim_records_authorized_dismissals_and_drops_them_from_remaining_ids()
     budget.serialize_ledger(transition.state)
 
 
-def test_refused_claim_still_records_dismissals_and_updates_the_handoff():
+def test_refused_claim_still_records_dismissals_and_updates_the_handoff(monkeypatch):
     """The issue #112 shape: both rounds are spent, then a human dismisses the false positive."""
 
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "2")
     state = claimed_state()
     first = budget.finalize(
         state, finalize_request(remaining=(FINDING_1, FINDING_2)), current_provenances(state),
@@ -1437,8 +1674,8 @@ def test_comment_summary_lists_dismissals_and_documents_the_command():
     assert budget.render_summary(state) == (
         "## Claude review invocation budget\n"
         "- Decision: claimed\n"
-        "- Automatic rounds: 1/2\n"
-        "- Override rounds: 0/1\n"
+        "- Automatic rounds: 1/5\n"
+        "- Override rounds: 0/2\n"
         "- Current run: https://github.com/example/repo/actions/runs/700\n"
         "- Stop reason: claimed\n"
         "- Dismissed findings: "

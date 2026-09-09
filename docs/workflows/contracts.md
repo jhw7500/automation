@@ -247,7 +247,9 @@ ready head — `/jhw:pr --review` labels the draft and then marks it ready — o
 pull request needed a `workflow_dispatch` carrying `force_review: true`.
 
 A bounded override round (`review-budget-override` plus a `workflow_dispatch` carrying
-`force_review: true`) is available for Claude and Gemini only; from `v1.64` the callers'
+`force_review: true`) is available for Claude and Gemini only. Starting with `v1.74`, each
+reviewer may consume at most two such rounds, and each round requires a distinct unconsumed
+label timeline-event ID. From `v1.64` the callers'
 `force_review` input says so ("Perform one authorized same-HEAD override round; requires the
 review-budget-override label"), because a dispatch without the label is refused as
 `round_budget_exhausted` even on a first review. From `v1.62` the budget refuses it
@@ -1198,14 +1200,19 @@ comment may match a reviewer marker. Invalid, duplicate, or provenance-unverifia
 state fails closed. The effective-diff identity is the SHA-256 of the immutable
 `review-full.diff`, including when a provider consumes a delta. A normal invocation by
 the same reviewer with the same head SHA or full-diff hash is an absolute zero-call
-gate. Only the explicit force-review contract below may consume the one override round
+gate. Only the explicit force-review contract below may consume an override round
 to review that input again.
 
-A round is one distinct effective diff claimed by one reviewer. Each reviewer has two
-automatic rounds. One `review-budget-override` label timeline-event ID can authorize
-one additional round for that PR/reviewer and is consumed exactly once. Estimated
+A round is one distinct effective diff claimed by one reviewer. The automatic-round default
+is five and `REVIEW_MAX_ROUNDS` may lower it to 1 through 5. Claude and Gemini may consume
+up to two additional rounds; each requires a different `review-budget-override` label
+timeline-event ID and each ID is consumed exactly once. Once the first override is consumed,
+automatic rounds do not resume: another round requires another explicit approval event.
+OpenCode remains automatic-only because its canonicalizer cannot publish a dispatch override.
+Estimated
 input is `ceil(sum(input_file_bytes) / 4) + 20_000`, capped at 200,000 tokens per
-round, 400,000 across automatic rounds, and 600,000 only after the override. Every
+round, 400,000 across automatic rounds, 600,000 after the first override, and 800,000
+after the second. Every
 round has a 600-second provider wall-time cap. Call units and caps are one Claude
 action session, three Gemini `generate_content` requests across primary, retries, and
 configured same-reviewer fallback, and two OpenCode `opencode run` sessions including
@@ -1216,8 +1223,9 @@ Claude and Gemini baseline callers expose a `workflow_dispatch` input pair:
 when the run event is `workflow_dispatch` and the PR timeline contains an unconsumed
 `review-budget-override` label event created by an actor with write, maintain, or admin permission.
 It prepares the current full PR diff, binds publication and budget state to the fetched current
-head plus the exact run ID/attempt, consumes the override immediately, and is terminal for that
-reviewer budget. A label alone never bypasses the normal same-head zero-call gate.
+head plus the exact run ID/attempt, and consumes one approval event immediately. A label alone
+never bypasses the normal same-head zero-call gate. The next override needs a new `labeled`
+timeline event; an earlier event is never reused or carried forward automatically.
 
 `/jhw:ship` or an operator uses the stable sequence below, substituting the repository, PR, and
 caller filename. The Gemini caller uses `gemini-auto-review.yml` with the same inputs.
@@ -1227,6 +1235,9 @@ gh pr edit 26 --repo OWNER/REPO --add-label review-budget-override
 gh workflow run claude-code-review.yml --repo OWNER/REPO \
   -f pr_number=26 -f force_review=true
 ```
+
+For a second override, remove and re-add `review-budget-override` to create a distinct approval
+event, then dispatch the reviewer again. Re-running with only an already-consumed event is refused.
 
 The caller job is skipped when `force_review` is omitted or false. A missing, unauthorized,
 already-consumed, or otherwise unavailable override returns `round_budget_exhausted` and performs

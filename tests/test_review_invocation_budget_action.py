@@ -31,31 +31,39 @@ sys.modules[SPEC.name] = budget
 SPEC.loader.exec_module(budget)
 
 
-def _prior_comment() -> str:
-    invocation = budget.Invocation(
-        run_id=501,
-        run_attempt=1,
-        head_sha=HEAD_A,
-        full_diff_sha256=HASH_1,
-        caller_workflow_path=".github/workflows/claude-review-caller.yml",
-        caller_event="pull_request",
-        referenced_workflow_path=CENTRAL_PATH,
-        referenced_workflow_ref=CENTRAL_REF,
-        referenced_workflow_sha=CENTRAL_SHA,
-        round_number=1,
-        override_event_id=None,
-        model_route=("route-v1",),
-        effort="medium",
-        call_unit="claude-code-action review session",
-        call_count=1,
-        estimated_input_tokens=20_002,
-        elapsed_seconds=12,
-        status="finalized",
-        outcome="provider_failure",
-        stop_reason="provider_failure",
-        remaining_finding_ids=(),
+def _prior_comment(round_count: int = 1) -> str:
+    invocations = tuple(
+        budget.Invocation(
+            run_id=501 + index,
+            run_attempt=1,
+            head_sha=chr(ord("a") + index) * 40,
+            full_diff_sha256=str(index + 1) * 64,
+            caller_workflow_path=".github/workflows/claude-review-caller.yml",
+            caller_event="pull_request",
+            referenced_workflow_path=CENTRAL_PATH,
+            referenced_workflow_ref=CENTRAL_REF,
+            referenced_workflow_sha=CENTRAL_SHA,
+            round_number=index + 1,
+            override_event_id=None,
+            model_route=("route-v1",),
+            effort="medium",
+            call_unit="claude-code-action review session",
+            call_count=1,
+            estimated_input_tokens=20_002,
+            elapsed_seconds=12,
+            status="finalized",
+            outcome="provider_failure",
+            stop_reason="provider_failure",
+            remaining_finding_ids=(),
+        )
+        for index in range(round_count)
     )
-    state = budget.LedgerState.initial("example/repo", 52, "claude", invocations=(invocation,))
+    state = budget.LedgerState.initial(
+        "example/repo",
+        52,
+        "claude",
+        invocations=invocations,
+    )
     return (
         f"{budget.MARKERS['claude']}\n"
         f"{budget.STATE_PREFIX}{budget.serialize_ledger(state)}{budget.STATE_SUFFIX}\n\nprior"
@@ -568,6 +576,31 @@ def test_cli_uses_only_file_based_transport_operations(tmp_path):
         assert parsed.operation == operation
     with pytest.raises(SystemExit):
         parser.parse_args(["claim", "--request", "{}"])
+
+
+def test_run_identity_manifest_allows_a_fifth_automatic_claim(tmp_path):
+    comments_file = tmp_path / "comments.json"
+    comments_file.write_text(json.dumps([_bot_comment(_prior_comment(4))]))
+    (tmp_path / "timeline.json").write_text("[]")
+    request = {
+        "repository": "example/repo",
+        "pr": 52,
+        "reviewer": "claude",
+        "run_id": 700,
+        "run_attempt": 1,
+    }
+
+    budget._list_run_identities(request, comments_file, tmp_path)
+
+    manifest = json.loads((tmp_path / "run-identities.json").read_text())
+    assert manifest["error"] is None
+    assert manifest["runs"] == [
+        {"run_id": 501, "run_attempt": 1},
+        {"run_id": 502, "run_attempt": 1},
+        {"run_id": 503, "run_attempt": 1},
+        {"run_id": 504, "run_attempt": 1},
+        {"run_id": 700, "run_attempt": 1},
+    ]
 
 
 def test_direct_main_invalid_request_writes_canonical_refusal(tmp_path, monkeypatch):

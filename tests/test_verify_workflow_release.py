@@ -112,6 +112,7 @@ V158_REVIEW_POLICY_HELPER_COMMIT = "1b98172325533ef6ad37f3d2cfc3870073fac26d"
 V159_ROUND_BUDGET_COMMIT = "96d66e1d17952f01b19bb957057830a2b2a6318b"
 V161_FILTER_SURFACE_COMMIT = "08f96e3244bfe8bdd569fb926b26d3086bab125d"
 V162_FINDING_DISMISSAL_COMMIT = "1cbb6df4590fb6be8a5012de31d98dc1f1cd3fa8"
+V173_REVIEW_BUDGET_COMMIT = "ac406e263f9bdc6d83e3d135d1c31b257ed57fa9"
 V1462_WORKFLOW_FIXTURE_SHA256 = {
     "claude-code-review.yml": (
         "008bbdcdeacdaf7796c1e3b59d22194d3f1ce380735d36dada5efab8ff52d112"
@@ -501,6 +502,19 @@ def restore_pre_v160_round_budget(repo: Path) -> None:
             text.replace("          max-rounds: ${{ vars.REVIEW_MAX_ROUNDS }}\n", ""),
             encoding="utf-8",
         )
+
+
+def restore_pre_v174_expanded_review_budget(repo: Path) -> None:
+    """Restore the authenticated v1.73 invocation-budget helper bytes."""
+
+    relative = ".github/actions/review-invocation-budget/review_invocation_budget.py"
+    tree = release_verifier.VerifiedCommitTree.open(ROOT, V173_REVIEW_BUDGET_COMMIT)
+    payload = tree.read_file(relative)
+    assert (
+        hashlib.sha256(payload).hexdigest()
+        == release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V171
+    )
+    (repo / relative).write_bytes(payload)
 
 
 def assert_pre_v160_workflow_bytes(repo: Path) -> None:
@@ -2042,6 +2056,7 @@ def prepare_v163(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     restore_pre_v170_opencode_finding_ids(repo)
@@ -2060,6 +2075,7 @@ def prepare_v164(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     restore_pre_v170_opencode_finding_ids(repo)
@@ -2077,6 +2093,7 @@ def prepare_v165(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     restore_pre_v170_opencode_finding_ids(repo)
@@ -2094,6 +2111,7 @@ def prepare_v166(repo: Path) -> str:
         ".github/actions/resolve-review-policy/resolve_review_policy.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     restore_pre_v170_opencode_finding_ids(repo)
@@ -2112,6 +2130,7 @@ def prepare_v167(repo: Path) -> str:
         ".github/workflows/gemini-dispatch.yml",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     restore_pre_v170_opencode_finding_ids(repo)
@@ -2129,6 +2148,7 @@ def prepare_v168(repo: Path) -> str:
         ".github/workflows/gemini-dispatch.yml",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v174_expanded_review_budget(repo)
     for name in ("gemini-pr-review.yml", "gemini-review.yml"):
         (repo / "examples/baseline-workflows/.github/workflows" / name).unlink(
             missing_ok=True
@@ -2168,6 +2188,7 @@ def prepare_v171(repo: Path) -> str:
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v174_expanded_review_budget(repo)
     # The copy above brings in the current tree, which is v1.72. Restore after it, not
     # before: a restore that runs first is silently undone by the copy.
     restore_pre_v172_opencode_context_budget(repo)
@@ -2181,6 +2202,7 @@ def prepare_v172(repo: Path) -> str:
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v173_opencode_active_section_order(repo)
     return commit(repo, "v1.72 candidate")
 
@@ -2192,7 +2214,15 @@ def prepare_v173(repo: Path) -> str:
         ".github/actions/review-invocation-budget/review_invocation_budget.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v174_expanded_review_budget(repo)
     return commit(repo, "v1.73 candidate")
+
+
+def prepare_v174(repo: Path) -> str:
+    prepare_v173(repo)
+    relative = ".github/actions/review-invocation-budget/review_invocation_budget.py"
+    shutil.copy2(ROOT / relative, repo / relative)
+    return commit(repo, "v1.74 candidate")
 
 
 def test_v171_accepts_current_opencode_dismissal_release_contract(
@@ -2224,6 +2254,11 @@ def test_opencode_active_section_order_release_boundary() -> None:
     )
 
 
+def test_review_budget_expansion_release_boundary() -> None:
+    assert release_inventory.release_supports_expanded_review_budget("v1.73") is False
+    assert release_inventory.release_supports_expanded_review_budget("v1.74") is True
+
+
 def test_v173_accepts_current_opencode_active_section_order_release_contract(
     current_release_repo: tuple[Path, str],
 ) -> None:
@@ -2231,6 +2266,35 @@ def test_v173_accepts_current_opencode_active_section_order_release_contract(
     candidate = prepare_v173(repo)
 
     assert release_verifier.verify_commit_content(repo, "v1.73", candidate) == candidate
+
+
+def test_v174_accepts_expanded_review_budget_release_contract(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v174(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.74", candidate) == candidate
+
+
+def test_v174_expanded_review_budget_is_rejected_on_the_v173_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v174(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.73", candidate)
+
+
+def test_pre_v174_review_budget_is_rejected_on_the_v174_release_line(
+    current_release_repo: tuple[Path, str],
+) -> None:
+    repo, _ = current_release_repo
+    candidate = prepare_v173(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.74", candidate)
 
 
 def test_v173_opencode_active_section_order_is_rejected_on_the_v172_release_line(
@@ -3115,7 +3179,13 @@ def test_v147_budget_helper_semantics_reject_authenticated_mutations(
     with pytest.raises(
         ReleaseVerificationError, match="invocation-budget helper contract"
     ):
-        release_verifier.require_budget_helper_contract(source)
+        release_verifier.require_budget_helper_contract(
+            source,
+            rounds_variable=True,
+            filter_reasons=True,
+            dismissals=True,
+            expanded_budget=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -3236,7 +3306,13 @@ def test_v147_budget_helper_semantics_bind_live_ast_relationships(
     with pytest.raises(
         ReleaseVerificationError, match="invocation-budget helper contract"
     ):
-        release_verifier.require_budget_helper_contract(source)
+        release_verifier.require_budget_helper_contract(
+            source,
+            rounds_variable=True,
+            filter_reasons=True,
+            dismissals=True,
+            expanded_budget=True,
+        )
 
 
 @pytest.mark.parametrize(
