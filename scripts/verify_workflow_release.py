@@ -58,6 +58,7 @@ from scripts.workflow_release_inventory import (
     release_supports_opencode_dismissals,
     release_supports_opencode_context_budget,
     release_supports_opencode_active_section_order,
+    release_supports_expanded_review_budget,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
@@ -751,6 +752,9 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V163 = (
 # comment — no longer describe anything true.
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V171 = (
     "0435025c49ec29357220ee934abc9946440c7019a6d5a47e1586632851de1cbd"
+)
+EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V174 = (
+    "9be3f16b8254a3268788ffecdf653cd821a3ed3452022dceebed67e1c90f1aad"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d4db53b86603a3a113999409e2e4e35c397adf276981e7f68c0ea57a6198faa2",
@@ -4331,6 +4335,7 @@ def require_budget_helper_contract(
     rounds_variable: bool = False,
     filter_reasons: bool = False,
     dismissals: bool = False,
+    expanded_budget: bool = False,
 ) -> None:
     """Require the authenticated schema-1 helper and every fixed policy gate."""
 
@@ -4390,6 +4395,12 @@ def require_budget_helper_contract(
                 "_DISMISS_COMMAND", "DismissEvent", "DismissedFinding",
                 "parse_dismiss_command", "choose_dismissals",
             }
+        if expanded_budget:
+            expected_literals.update({
+                "MAX_ROUNDS_DEFAULT": 5,
+                "MAX_ROUNDS_CEILING": 5,
+                "MAX_OVERRIDE_ROUNDS": 2,
+            })
         _require_unique_module_bindings(
             module,
             frozenset(
@@ -4450,9 +4461,11 @@ def require_budget_helper_contract(
             and isinstance(item.target, ast.Name)
             and item.value is not None
         }
+        expected_max_rounds = 5 if expanded_budget else 2
+        expected_max_override_rounds = 2 if expanded_budget else 1
         if policy_defaults != {
-            "max_rounds": 2,
-            "max_override_rounds": 1,
+            "max_rounds": expected_max_rounds,
+            "max_override_rounds": expected_max_override_rounds,
             "max_calls_per_round": 1,
             "max_wall_seconds_per_round": 600,
             "max_estimated_tokens_per_round": 200_000,
@@ -4461,8 +4474,12 @@ def require_budget_helper_contract(
             raise ValueError("budget defaults differ")
         expected_records = {
             "BudgetPolicy": (
-                ("max_rounds", "int", "2"),
-                ("max_override_rounds", "int", "1"),
+                ("max_rounds", "int", str(expected_max_rounds)),
+                (
+                    "max_override_rounds",
+                    "int",
+                    str(expected_max_override_rounds),
+                ),
                 ("max_calls_per_round", "int", "1"),
                 ("max_wall_seconds_per_round", "int", "600"),
                 ("max_estimated_tokens_per_round", "int", "200_000"),
@@ -4805,6 +4822,37 @@ def require_budget_helper_contract(
             if dismissals
             else ""
         )
+        claim_budget_policy = (
+            "    override_count = sum(item.override_event_id is not None "
+            "for item in validated.invocations)\n"
+            "    override = None\n"
+            "    needs_override = (override_count > 0 or request.force_review or "
+            f"automatic_rounds(validated) >= {claim_rounds})\n"
+            "    if needs_override:\n"
+            "        if not request.force_review:\n"
+            "            return refuse(validated, request, 'round_budget_exhausted')\n"
+            "        override = choose_override(validated, request.override_events)\n"
+            "        if override is None:\n"
+            "            return refuse(validated, request, 'round_budget_exhausted')\n"
+            "    total_limit = (validated.budgets.max_estimated_tokens_total "
+            "+ (override_count + int(override is not None)) * "
+            "validated.budgets.max_estimated_tokens_per_round)\n"
+            if expanded_budget
+            else
+            "    override = None\n"
+            "    if any(item.override_event_id is not None "
+            "for item in validated.invocations):\n"
+            "        return refuse(validated, request, 'round_budget_exhausted')\n"
+            "    if request.force_review:\n"
+            "        override = choose_override(validated, request.override_events)\n"
+            "        if override is None:\n"
+            "            return refuse(validated, request, 'round_budget_exhausted')\n"
+            f"    elif automatic_rounds(validated) >= {claim_rounds}:\n"
+            "        override = choose_override(validated, request.override_events)\n"
+            "        if override is None:\n"
+            "            return refuse(validated, request, 'round_budget_exhausted')\n"
+            "    total_limit = 600_000 if override is not None else 400_000\n"
+        )
         expected_claim = ast.parse(
             "def expected(state, request, provenances):\n"
             "    try:\n"
@@ -4840,19 +4888,7 @@ def require_budget_helper_contract(
             "    if request.estimated_input_tokens > "
             "validated.budgets.max_estimated_tokens_per_round:\n"
             "        return refuse(validated, request, 'input_budget_exhausted')\n"
-            "    override = None\n"
-            "    if any(item.override_event_id is not None "
-            "for item in validated.invocations):\n"
-            "        return refuse(validated, request, 'round_budget_exhausted')\n"
-            "    if request.force_review:\n"
-            "        override = choose_override(validated, request.override_events)\n"
-            "        if override is None:\n"
-            "            return refuse(validated, request, 'round_budget_exhausted')\n"
-            f"    elif automatic_rounds(validated) >= {claim_rounds}:\n"
-            "        override = choose_override(validated, request.override_events)\n"
-            "        if override is None:\n"
-            "            return refuse(validated, request, 'round_budget_exhausted')\n"
-            "    total_limit = 600_000 if override is not None else 400_000\n"
+            f"{claim_budget_policy}"
             "    if estimated_total(validated) + request.estimated_input_tokens "
             "> total_limit:\n"
             "        return refuse(validated, request, "
@@ -4922,7 +4958,52 @@ def require_budget_helper_contract(
             != ast.dump(expected_invocation_loop, include_attributes=False)
         ):
             raise ValueError("stored cap policy differs")
-        expected_duplicate_policy = ast.parse(
+        expanded_duplicate_policy = (
+            "automatic = [item for item in state.invocations "
+            "if item.override_event_id is None]\n"
+            "overrides = [item for item in state.invocations "
+            "if item.override_event_id is not None]\n"
+            "if state.reviewer == 'opencode' and overrides:\n"
+            "    raise BudgetStateError('override_invalid')\n"
+            "for attribute, reason in (('head_sha', 'duplicate_head'), "
+            "('full_diff_sha256', 'duplicate_effective_diff')):\n"
+            "    values = [getattr(item, attribute) for item in state.invocations]\n"
+            "    duplicates = {value for value in values "
+            "if values.count(value) > 1}\n"
+            "    for value in duplicates:\n"
+            "        repeated = [item for item in state.invocations "
+            "if getattr(item, attribute) == value]\n"
+            "        if any(item.override_event_id is None or "
+            "item.caller_event != 'workflow_dispatch' "
+            "for item in repeated[1:]):\n"
+            "            raise BudgetStateError(reason)\n"
+            f"if len(automatic) > {rounds_owner}.max_rounds or "
+            f"len(overrides) > {rounds_owner}.max_override_rounds:\n"
+            "    raise BudgetStateError('rounds_invalid')\n"
+            "if [item.round_number for item in automatic] != "
+            "list(range(1, len(automatic) + 1)):\n"
+            "    raise BudgetStateError('rounds_invalid')\n"
+            "if overrides:\n"
+            "    first_override = overrides[0]\n"
+            "    expected_automatic_rounds = ("
+            "range(0, budgets.max_rounds + 1) "
+            "if first_override.caller_event == 'workflow_dispatch' "
+            "else range(state.budgets.max_rounds, budgets.max_rounds + 1))\n"
+            "    if (len(automatic) not in expected_automatic_rounds or "
+            "tuple(state.invocations) != tuple(automatic + overrides) or "
+            "[item.round_number for item in overrides] != "
+            "list(range(len(automatic) + 1, len(state.invocations) + 1)) or "
+            "tuple(item.override_event_id for item in overrides) != "
+            "state.consumed_override_event_ids):\n"
+            "        raise BudgetStateError('override_invalid')\n"
+            "if len(state.consumed_override_event_ids) != len(overrides):\n"
+            "    raise BudgetStateError('override_invalid')\n"
+            "if any(current <= previous for previous, current in zip("
+            "state.consumed_override_event_ids, "
+            "state.consumed_override_event_ids[1:])):\n"
+            "    raise BudgetStateError('override_invalid')\n"
+        )
+        legacy_duplicate_policy = (
             "automatic = [item for item in state.invocations "
             "if item.override_event_id is None]\n"
             "overrides = [item for item in state.invocations "
@@ -4960,9 +5041,19 @@ def require_budget_helper_contract(
             "        raise BudgetStateError('override_invalid')\n"
             "if len(state.consumed_override_event_ids) != len(overrides):\n"
             "    raise BudgetStateError('override_invalid')\n"
+        )
+        expected_duplicate_policy = ast.parse(
+            expanded_duplicate_policy
+            if expanded_budget
+            else legacy_duplicate_policy
         ).body
+        duplicate_policy_start = 13 if expanded_budget else 9 + shape_offset
+        duplicate_policy_end = 22 if expanded_budget else 17 + shape_offset
         if ast.dump(
-            ast.Module(body=state_shape.body[9 + shape_offset:17 + shape_offset], type_ignores=[]),
+            ast.Module(
+                body=state_shape.body[duplicate_policy_start:duplicate_policy_end],
+                type_ignores=[],
+            ),
             include_attributes=False,
         ) != ast.dump(
             ast.Module(body=expected_duplicate_policy, type_ignores=[]),
@@ -5181,6 +5272,11 @@ def require_budget_helper_contract(
             "input_files_empty",
         )
         list_identities = _function_node(module, "_list_run_identities")
+        run_identity_limit = (
+            "MAX_ROUNDS_CEILING + MAX_OVERRIDE_ROUNDS + 1"
+            if expanded_budget
+            else "4"
+        )
         if (
             len(list_identities.body) != 8
             or not _ast_statement_matches(
@@ -5194,7 +5290,7 @@ def require_budget_helper_contract(
             )
             or not _ast_statement_matches(
                 list_identities.body[6],
-                "if len(runs) > 4:\n"
+                f"if len(runs) > {run_identity_limit}:\n"
                 "    error = 'ledger_invalid'\n"
                 "    runs = []",
             )
@@ -5205,8 +5301,10 @@ def require_budget_helper_contract(
         # v1.62 refuses the OpenCode override up front, which adds one guard ahead of
         # the eligibility loop.
         override_offset = 1 if rounds_variable and filter_reasons else 0
+        override_loop_index = 4 if expanded_budget else 2 + override_offset
+        override_return_index = 5 if expanded_budget else 3 + override_offset
         if (
-            len(choose_override.body) != 4 + override_offset
+            len(choose_override.body) != (6 if expanded_budget else 4 + override_offset)
             or (
                 filter_reasons
                 and not _ast_statement_matches(
@@ -5214,14 +5312,32 @@ def require_budget_helper_contract(
                     "if state.reviewer == 'opencode':\n    return None",
                 )
             )
-            or not isinstance(choose_override.body[2 + override_offset], ast.For)
-            or not _ast_expression_matches(
-                choose_override.body[2 + override_offset].iter, "events"
+            or (
+                expanded_budget
+                and not _ast_statement_matches(
+                    choose_override.body[1],
+                    "if sum(item.override_event_id is not None "
+                    "for item in state.invocations) >= "
+                    "effective_budgets(state).max_override_rounds:\n"
+                    "    return None",
+                )
             )
-            or len(choose_override.body[2 + override_offset].body) != 1
-            or not isinstance(choose_override.body[2 + override_offset].body[0], ast.If)
+            or (
+                expanded_budget
+                and not _ast_statement_matches(
+                    choose_override.body[2],
+                    "newest_consumed = max("
+                    "state.consumed_override_event_ids, default=0)",
+                )
+            )
+            or not isinstance(choose_override.body[override_loop_index], ast.For)
             or not _ast_expression_matches(
-                choose_override.body[2 + override_offset].body[0].test,
+                choose_override.body[override_loop_index].iter, "events"
+            )
+            or len(choose_override.body[override_loop_index].body) != 1
+            or not isinstance(choose_override.body[override_loop_index].body[0], ast.If)
+            or not _ast_expression_matches(
+                choose_override.body[override_loop_index].body[0].test,
                 "isinstance(event, OverrideEvent) "
                 "and isinstance(event.event_id, int) "
                 "and not isinstance(event.event_id, bool) "
@@ -5229,15 +5345,18 @@ def require_budget_helper_contract(
                 "and event.event == 'labeled' "
                 "and event.label == 'review-budget-override' "
                 "and event.actor_permission in {'admin', 'maintain', 'write'} "
-                "and event.event_id not in "
-                "state.consumed_override_event_ids",
+                + (
+                    "and event.event_id > newest_consumed"
+                    if expanded_budget
+                    else "and event.event_id not in state.consumed_override_event_ids"
+                ),
             )
             or not _ast_statement_matches(
-                choose_override.body[2 + override_offset].body[0].body[0],
+                choose_override.body[override_loop_index].body[0].body[0],
                 "eligible.append(event)",
             )
             or not _ast_statement_matches(
-                choose_override.body[3 + override_offset],
+                choose_override.body[override_return_index],
                 "return max(eligible, key=lambda item: item.event_id, "
                 "default=None)",
             )
@@ -5929,6 +6048,7 @@ def _verify_review_invocation_budget(
         release_supports_review_rounds_variable(ref),
         release_supports_filter_reason_surface(ref),
         release_supports_finding_dismissal(ref),
+        release_supports_expanded_review_budget(ref),
     )
     for reviewer, workflow in REVIEWER_WORKFLOWS.items():
         require_budget_workflow_contract(
@@ -5950,7 +6070,9 @@ def _verify_review_invocation_budget(
         ),
         REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix(): (
             helper_payload,
-            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V171
+            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V174
+            if release_supports_expanded_review_budget(ref)
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V171
             if release_supports_opencode_dismissals(ref)
             else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V163
             if dismissals
