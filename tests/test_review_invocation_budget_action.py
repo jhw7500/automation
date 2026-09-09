@@ -36,15 +36,15 @@ def _prior_comment(round_count: int = 1) -> str:
         budget.Invocation(
             run_id=501 + index,
             run_attempt=1,
-            head_sha=chr(ord("a") + index) * 40,
+            head_sha="abcdef0"[index] * 40,
             full_diff_sha256=str(index + 1) * 64,
             caller_workflow_path=".github/workflows/claude-review-caller.yml",
-            caller_event="pull_request",
+            caller_event="workflow_dispatch" if index >= 5 else "pull_request",
             referenced_workflow_path=CENTRAL_PATH,
             referenced_workflow_ref=CENTRAL_REF,
             referenced_workflow_sha=CENTRAL_SHA,
             round_number=index + 1,
-            override_event_id=None,
+            override_event_id=9001 + index - 5 if index >= 5 else None,
             model_route=("route-v1",),
             effort="medium",
             call_unit="claude-code-action review session",
@@ -63,13 +63,14 @@ def _prior_comment(round_count: int = 1) -> str:
         52,
         "claude",
         invocations=invocations,
+        consumed_override_event_ids=tuple(
+            9001 + index for index in range(max(0, round_count - 5))
+        ),
     )
     return (
         f"{budget.MARKERS['claude']}\n"
         f"{budget.STATE_PREFIX}{budget.serialize_ledger(state)}{budget.STATE_SUFFIX}\n\nprior"
     )
-
-
 def _claimed_comment() -> str:
     invocation = budget.Invocation(
         run_id=700,
@@ -601,6 +602,26 @@ def test_run_identity_manifest_allows_a_fifth_automatic_claim(tmp_path):
         {"run_id": 504, "run_attempt": 1},
         {"run_id": 700, "run_attempt": 1},
     ]
+
+
+def test_run_identity_manifest_allows_current_request_after_seven_stored_rounds(tmp_path):
+    comments_file = tmp_path / "comments.json"
+    comments_file.write_text(json.dumps([_bot_comment(_prior_comment(7))]))
+    (tmp_path / "timeline.json").write_text("[]")
+    request = {
+        "repository": "example/repo",
+        "pr": 52,
+        "reviewer": "claude",
+        "run_id": 700,
+        "run_attempt": 1,
+    }
+
+    budget._list_run_identities(request, comments_file, tmp_path)
+
+    manifest = json.loads((tmp_path / "run-identities.json").read_text())
+    assert manifest["error"] is None
+    assert len(manifest["runs"]) == 8
+    assert manifest["runs"][-1] == {"run_id": 700, "run_attempt": 1}
 
 
 def test_direct_main_invalid_request_writes_canonical_refusal(tmp_path, monkeypatch):

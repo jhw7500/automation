@@ -243,9 +243,15 @@ def test_fixed_claim_vectors(monkeypatch):
         claim_request = request(
             head=vector["head"], full_hash=vector["full_hash"],
             override_events=events,
+            force_review=bool(events),
+        )
+        provenances = (
+            force_claim_provenances(prior_state, claim_request)
+            if events
+            else claim_provenances(prior_state, claim_request)
         )
         result = budget.claim(
-            prior_state, claim_request, claim_provenances(prior_state, claim_request),
+            prior_state, claim_request, provenances,
         )
         assert result.decision == vector["expected"], vector["name"]
         assert result.allow_invocation is vector["allow"], vector["name"]
@@ -1183,12 +1189,13 @@ def test_legacy_ledger_can_finish_the_raised_automatic_budget_before_override(mo
         full_hash="6" * 64,
         run_id=705,
         override_events=(override_event(9001),),
+        force_review=True,
     )
 
     claimed = budget.claim(
         state,
         override_request,
-        claim_provenances(state, override_request),
+        force_claim_provenances(state, override_request),
     )
 
     assert claimed.allow_invocation
@@ -1355,6 +1362,120 @@ def test_two_distinct_override_events_each_unlock_one_extra_round(monkeypatch):
     assert not reused.allow_invocation
     assert reused.decision == "round_budget_exhausted"
     assert reused.state.consumed_override_event_ids == (9101, 9102)
+
+
+def test_second_override_requires_an_explicit_force_dispatch():
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude")
+    first_request = request(
+        run_id=706,
+        force_review=True,
+        override_events=(override_event(9101),),
+    )
+    first = budget.claim(
+        state,
+        first_request,
+        force_claim_provenances(state, first_request),
+    )
+    second_request = request(
+        head=HEAD_B,
+        full_hash=HASH_2,
+        run_id=707,
+        override_events=(override_event(9102),),
+    )
+
+    second = budget.claim(
+        first.state,
+        second_request,
+        claim_provenances(first.state, second_request),
+    )
+
+    assert not second.allow_invocation
+    assert second.decision == "round_budget_exhausted"
+    assert second.state.consumed_override_event_ids == (9101,)
+
+
+def test_exhausted_automatic_budget_requires_force_to_consume_an_approval(monkeypatch):
+    monkeypatch.setenv(budget.MAX_ROUNDS_VARIABLE, "2")
+    state = budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        "claude",
+        invocations=rounds(2),
+    )
+    claim_request = request(
+        head=HEAD_C,
+        full_hash=HASH_3,
+        run_id=703,
+        override_events=(override_event(9101),),
+    )
+
+    claimed = budget.claim(
+        state,
+        claim_request,
+        claim_provenances(state, claim_request),
+    )
+
+    assert not claimed.allow_invocation
+    assert claimed.decision == "round_budget_exhausted"
+    assert claimed.state.consumed_override_event_ids == ()
+
+
+def test_older_unconsumed_approval_cannot_follow_a_newer_consumed_event():
+    state = budget.LedgerState.initial(REPOSITORY, PR, "claude")
+    first_request = request(
+        run_id=706,
+        force_review=True,
+        override_events=(override_event(9101), override_event(9102)),
+    )
+    first = budget.claim(
+        state,
+        first_request,
+        force_claim_provenances(state, first_request),
+    )
+    second_request = request(
+        head=HEAD_B,
+        full_hash=HASH_2,
+        run_id=707,
+        force_review=True,
+        override_events=(override_event(9101),),
+    )
+
+    second = budget.claim(
+        first.state,
+        second_request,
+        force_claim_provenances(first.state, second_request),
+    )
+
+    assert not second.allow_invocation
+    assert second.decision == "round_budget_exhausted"
+    assert second.state.consumed_override_event_ids == (9102,)
+
+
+def test_stored_override_events_must_be_consumed_in_increasing_order():
+    first = replace(
+        invocation(round_number=1, override_event_id=9102),
+        caller_event="workflow_dispatch",
+    )
+    second = replace(
+        invocation(
+            head=HEAD_B,
+            full_hash=HASH_2,
+            run_id=502,
+            round_number=2,
+            override_event_id=9101,
+        ),
+        caller_event="workflow_dispatch",
+    )
+    state = budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        "claude",
+        invocations=(first, second),
+        consumed_override_event_ids=(9102, 9101),
+    )
+
+    with pytest.raises(budget.BudgetStateError, match="override_invalid"):
+        budget._validate_state_shape(state)
 
 
 def test_override_is_refused_for_opencode():

@@ -702,6 +702,14 @@ def _validate_state_shape(state: LedgerState) -> None:
             raise BudgetStateError("override_invalid")
     if len(state.consumed_override_event_ids) != len(overrides):
         raise BudgetStateError("override_invalid")
+    if any(
+        current <= previous
+        for previous, current in zip(
+            state.consumed_override_event_ids,
+            state.consumed_override_event_ids[1:],
+        )
+    ):
+        raise BudgetStateError("override_invalid")
     automatic_total = sum(item.estimated_input_tokens for item in automatic)
     total_limit = state.budgets.max_estimated_tokens_total
     if automatic_total > total_limit:
@@ -1072,11 +1080,13 @@ def choose_override(state: LedgerState, events: Sequence[OverrideEvent]) -> Over
         >= effective_budgets(state).max_override_rounds
     ):
         return None
+    newest_consumed = max(state.consumed_override_event_ids, default=0)
     eligible: list[OverrideEvent] = []
     for event in events:
         if (isinstance(event, OverrideEvent) and isinstance(event.event_id, int) and not isinstance(event.event_id, bool) and
                 event.event_id > 0 and event.event == "labeled" and event.label == "review-budget-override" and
-                event.actor_permission in {"admin", "maintain", "write"} and event.event_id not in state.consumed_override_event_ids):
+                event.actor_permission in {"admin", "maintain", "write"} and
+                event.event_id > newest_consumed):
             eligible.append(event)
     return max(eligible, key=lambda item: item.event_id, default=None)
 
@@ -1173,11 +1183,14 @@ def claim(state: LedgerState | None, request: ClaimRequest,
         item.override_event_id is not None for item in validated.invocations
     )
     override = None
-    if override_count or request.force_review:
-        override = choose_override(validated, request.override_events)
-        if override is None:
+    needs_override = (
+        override_count > 0
+        or request.force_review
+        or automatic_rounds(validated) >= effective_budgets(validated).max_rounds
+    )
+    if needs_override:
+        if not request.force_review:
             return refuse(validated, request, "round_budget_exhausted")
-    elif automatic_rounds(validated) >= effective_budgets(validated).max_rounds:
         override = choose_override(validated, request.override_events)
         if override is None:
             return refuse(validated, request, "round_budget_exhausted")
@@ -2069,7 +2082,7 @@ def _list_run_identities(
     current = {"run_id": request["run_id"], "run_attempt": request["run_attempt"]}
     if current not in runs:
         runs.append(current)
-    if len(runs) > MAX_ROUNDS_CEILING + MAX_OVERRIDE_ROUNDS:
+    if len(runs) > MAX_ROUNDS_CEILING + MAX_OVERRIDE_ROUNDS + 1:
         error = "ledger_invalid"
         runs = []
     write_private(output_directory / "run-identities.json", _json_bytes({

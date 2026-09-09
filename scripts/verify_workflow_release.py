@@ -754,7 +754,7 @@ EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V171 = (
     "0435025c49ec29357220ee934abc9946440c7019a6d5a47e1586632851de1cbd"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V174 = (
-    "d70f6a0be5e1168c192d62388f210af6efed8fe3272e071b7baad49803faee6f"
+    "9be3f16b8254a3268788ffecdf653cd821a3ed3452022dceebed67e1c90f1aad"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_WORKFLOW_SHA256 = {
     "claude": "d4db53b86603a3a113999409e2e4e35c397adf276981e7f68c0ea57a6198faa2",
@@ -4826,11 +4826,11 @@ def require_budget_helper_contract(
             "    override_count = sum(item.override_event_id is not None "
             "for item in validated.invocations)\n"
             "    override = None\n"
-            "    if override_count or request.force_review:\n"
-            "        override = choose_override(validated, request.override_events)\n"
-            "        if override is None:\n"
+            "    needs_override = (override_count > 0 or request.force_review or "
+            f"automatic_rounds(validated) >= {claim_rounds})\n"
+            "    if needs_override:\n"
+            "        if not request.force_review:\n"
             "            return refuse(validated, request, 'round_budget_exhausted')\n"
-            f"    elif automatic_rounds(validated) >= {claim_rounds}:\n"
             "        override = choose_override(validated, request.override_events)\n"
             "        if override is None:\n"
             "            return refuse(validated, request, 'round_budget_exhausted')\n"
@@ -4998,6 +4998,10 @@ def require_budget_helper_contract(
             "        raise BudgetStateError('override_invalid')\n"
             "if len(state.consumed_override_event_ids) != len(overrides):\n"
             "    raise BudgetStateError('override_invalid')\n"
+            "if any(current <= previous for previous, current in zip("
+            "state.consumed_override_event_ids, "
+            "state.consumed_override_event_ids[1:])):\n"
+            "    raise BudgetStateError('override_invalid')\n"
         )
         legacy_duplicate_policy = (
             "automatic = [item for item in state.invocations "
@@ -5044,7 +5048,7 @@ def require_budget_helper_contract(
             else legacy_duplicate_policy
         ).body
         duplicate_policy_start = 13 if expanded_budget else 9 + shape_offset
-        duplicate_policy_end = 21 if expanded_budget else 17 + shape_offset
+        duplicate_policy_end = 22 if expanded_budget else 17 + shape_offset
         if ast.dump(
             ast.Module(
                 body=state_shape.body[duplicate_policy_start:duplicate_policy_end],
@@ -5269,7 +5273,7 @@ def require_budget_helper_contract(
         )
         list_identities = _function_node(module, "_list_run_identities")
         run_identity_limit = (
-            "MAX_ROUNDS_CEILING + MAX_OVERRIDE_ROUNDS"
+            "MAX_ROUNDS_CEILING + MAX_OVERRIDE_ROUNDS + 1"
             if expanded_budget
             else "4"
         )
@@ -5297,8 +5301,10 @@ def require_budget_helper_contract(
         # v1.62 refuses the OpenCode override up front, which adds one guard ahead of
         # the eligibility loop.
         override_offset = 1 if rounds_variable and filter_reasons else 0
+        override_loop_index = 4 if expanded_budget else 2 + override_offset
+        override_return_index = 5 if expanded_budget else 3 + override_offset
         if (
-            len(choose_override.body) != 4 + override_offset
+            len(choose_override.body) != (6 if expanded_budget else 4 + override_offset)
             or (
                 filter_reasons
                 and not _ast_statement_matches(
@@ -5316,14 +5322,22 @@ def require_budget_helper_contract(
                     "    return None",
                 )
             )
-            or not isinstance(choose_override.body[2 + override_offset], ast.For)
-            or not _ast_expression_matches(
-                choose_override.body[2 + override_offset].iter, "events"
+            or (
+                expanded_budget
+                and not _ast_statement_matches(
+                    choose_override.body[2],
+                    "newest_consumed = max("
+                    "state.consumed_override_event_ids, default=0)",
+                )
             )
-            or len(choose_override.body[2 + override_offset].body) != 1
-            or not isinstance(choose_override.body[2 + override_offset].body[0], ast.If)
+            or not isinstance(choose_override.body[override_loop_index], ast.For)
             or not _ast_expression_matches(
-                choose_override.body[2 + override_offset].body[0].test,
+                choose_override.body[override_loop_index].iter, "events"
+            )
+            or len(choose_override.body[override_loop_index].body) != 1
+            or not isinstance(choose_override.body[override_loop_index].body[0], ast.If)
+            or not _ast_expression_matches(
+                choose_override.body[override_loop_index].body[0].test,
                 "isinstance(event, OverrideEvent) "
                 "and isinstance(event.event_id, int) "
                 "and not isinstance(event.event_id, bool) "
@@ -5331,15 +5345,18 @@ def require_budget_helper_contract(
                 "and event.event == 'labeled' "
                 "and event.label == 'review-budget-override' "
                 "and event.actor_permission in {'admin', 'maintain', 'write'} "
-                "and event.event_id not in "
-                "state.consumed_override_event_ids",
+                + (
+                    "and event.event_id > newest_consumed"
+                    if expanded_budget
+                    else "and event.event_id not in state.consumed_override_event_ids"
+                ),
             )
             or not _ast_statement_matches(
-                choose_override.body[2 + override_offset].body[0].body[0],
+                choose_override.body[override_loop_index].body[0].body[0],
                 "eligible.append(event)",
             )
             or not _ast_statement_matches(
-                choose_override.body[3 + override_offset],
+                choose_override.body[override_return_index],
                 "return max(eligible, key=lambda item: item.event_id, "
                 "default=None)",
             )
