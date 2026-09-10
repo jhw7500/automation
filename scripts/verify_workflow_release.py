@@ -59,6 +59,7 @@ from scripts.workflow_release_inventory import (
     release_supports_opencode_context_budget,
     release_supports_opencode_active_section_order,
     release_supports_expanded_review_budget,
+    release_supports_claude_workflow_validation,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
@@ -834,6 +835,16 @@ EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256 = {
     "gemini": "33c15251ac3e7dd97a3c0d30c77dd40e6ac58fe087d93078ce468dba473027b2",
     "opencode": "f81db9665847aea815c8691caea7c6458011595cbed28c13809f051c381b5e91",
 }
+EXPECTED_CLAUDE_VALIDATION_WORKFLOW_SHA256 = {
+    **EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256,
+    "claude": "63c672654918c95de9636062f68d33d43845d64c4a674ff54c03bf90ec3d48ce",
+}
+EXPECTED_CLAUDE_CALLER_VALIDATION_SHA256 = (
+    "c723636ffdf202b3888c7903704353edb6367630a46b50e77412389b43d566db"
+)
+EXPECTED_CLAUDE_EXECUTION_SHA256 = (
+    "ad617b4bab75d0259ff4fe9fcd0b0f9476a7f783b336b4b977cf497cbcf816bf"
+)
 EXPECTED_REVIEW_POLICY_HELPER_SHA256 = (
     "3e0fd3c86b1dc40dc35213ca41c3d63122c9ebf757042f5a2c86f4fc1e99ac8a"
 )
@@ -1394,6 +1405,9 @@ REVIEW_PUBLICATION_CONTRACTS = {
         ),
         "upsert_sha256_v147": (
             "f23f444b3a9c7b04707779f3f8431da60107c8792558c02f5c011216ca93d805"
+        ),
+        "upsert_sha256_v175": (
+            "8678623c52a06eedea3d250fbd27ec058098ed5d3faf87b29c74dc3b92a08f07"
         ),
         "bot_login": "github-actions[bot]",
         "workflow_prefix": (
@@ -5386,12 +5400,69 @@ def require_budget_helper_contract(
         ) from None
 
 
+def _require_claude_validation_contract(job: dict, claim: dict, provider: dict) -> None:
+    validation = _named_step(job, "Validate Claude caller workflow")
+    execution = _named_step(job, "Resolve Claude execution")
+    validation_script = validation.get("with", {}).get("script", "")
+    execution_script = execution.get("run", "")
+    if validation != {
+        "name": "Validate Claude caller workflow",
+        "id": "claude-workflow-validation",
+        "if": (
+            "${{ always() && steps.prepare-review-input.outcome == 'success' "
+            "&& steps.prepare-diff.outputs.diff-ready == 'true' "
+            "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' }}"
+        ),
+        "uses": "actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea",
+        "env": {
+            "WORKFLOW_REF": "${{ github.workflow_ref }}",
+            "WORKFLOW_SHA": "${{ github.workflow_sha }}",
+        },
+        "with": {"github-token": "${{ github.token }}", "script": validation_script},
+    } or hashlib.sha256(validation_script.encode()).hexdigest() != EXPECTED_CLAUDE_CALLER_VALIDATION_SHA256:
+        raise ValueError("Claude caller validation differs")
+    if execution != {
+        "name": "Resolve Claude execution",
+        "id": "claude-execution",
+        "if": "${{ always() }}",
+        "shell": "bash",
+        "env": {
+            "ACTION_OUTCOME": "${{ steps.claude-review.outcome }}",
+            "EXECUTION_CONCLUSION": "${{ steps.claude-review.outputs.conclusion }}",
+        },
+        "run": execution_script,
+    } or hashlib.sha256(execution_script.encode()).hexdigest() != EXPECTED_CLAUDE_EXECUTION_SHA256:
+        raise ValueError("Claude execution classification differs")
+    steps = job["steps"]
+    metrics = _named_step(job, "Validate Claude review metrics")
+    canonical = _named_step(job, "Canonicalize Claude review")
+    upsert = _named_step(job, "Upsert review comment")
+    outcome = _named_step(job, "Resolve Claude budget outcome")
+    if not (
+        steps.index(validation) < steps.index(claim) < steps.index(provider)
+        < steps.index(execution) < steps.index(metrics) < steps.index(canonical)
+        < steps.index(upsert) < steps.index(outcome)
+    ):
+        raise ValueError("Claude execution validation order differs")
+    resolved = "${{ steps.claude-execution.outputs.provider_outcome }}"
+    if (
+        upsert.get("env", {}).get("REVIEW_OUTCOME") != resolved
+        or outcome.get("env", {}).get("PROVIDER_OUTCOME") != resolved
+        or upsert.get("env", {}).get("PROVIDER_FAILURE_REASON") != (
+            "${{ steps.claude-workflow-validation.outputs.reason "
+            "|| steps.claude-execution.outputs.failure_reason }}"
+        )
+    ):
+        raise ValueError("Claude execution publication differs")
+
+
 def require_budget_workflow_contract(
     tree: VerifiedCommitTree,
     workflow: str,
     reviewer: str,
     *,
     review_policy: bool = False,
+    claude_validation: bool = False,
 ) -> None:
     """Require reviewer semantics from authenticated commit-tree workflow bytes."""
 
@@ -5434,7 +5505,13 @@ def require_budget_workflow_contract(
             "claude": (
                 "${{ always() && "
                 "steps.prepare-review-input.outcome == 'success' && "
-                "steps.stage-claude-budget-input.outcome == 'success' }}"
+                "steps.stage-claude-budget-input.outcome == 'success'"
+                + (
+                    " && (steps.prepare-diff.outputs.diff-ready != 'true' "
+                    "|| steps.prepare-diff.outputs.diff-mode == 'unchanged' "
+                    "|| steps.claude-workflow-validation.outputs.allowed == 'true') }}"
+                    if claude_validation else " }}"
+                )
             ),
             "gemini": (
                 "${{ always() && steps.pr-details.outcome == 'success' && "
@@ -5740,6 +5817,8 @@ def require_budget_workflow_contract(
                 raise ValueError("OpenCode sealed handoff validation differs")
 
         if reviewer == "claude":
+            if claude_validation:
+                _require_claude_validation_contract(claim_job, claim_step, provider)
             metrics_start = _named_step(
                 claim_job, "Start Claude review metrics"
             )
@@ -5753,7 +5832,9 @@ def require_budget_workflow_contract(
                 "shell": "bash",
                 "run": (
                     "set -euo pipefail\n"
-                    "printf 'call_count=1\\n' >> \"$GITHUB_OUTPUT\"\n"
+                    + ("" if claude_validation else
+                       "printf 'call_count=1\\n' >> \"$GITHUB_OUTPUT\"\n")
+                    +
                     "printf 'started_at=%s\\n' \"$(date +%s)\" "
                     ">> \"$GITHUB_OUTPUT\"\n"
                 ),
@@ -5796,6 +5877,8 @@ def require_budget_workflow_contract(
                 "shell": "bash",
                 "env": {
                     "CALL_COUNT": (
+                        "${{ steps.claude-execution.outputs.call_count }}"
+                        if claude_validation else
                         "${{ steps.claude-budget-metrics-start.outputs.call_count }}"
                     ),
                     "ELAPSED_SECONDS": (
@@ -6056,6 +6139,7 @@ def _verify_review_invocation_budget(
             workflow,
             reviewer,
             review_policy=release_supports_review_policy(ref),
+            claude_validation=release_supports_claude_workflow_validation(ref),
         )
     rounds_variable = release_supports_review_rounds_variable(ref)
     dismissals = release_supports_finding_dismissal(ref)
@@ -6084,7 +6168,9 @@ def _verify_review_invocation_budget(
         ),
     }
     workflow_digests = (
-        EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256
+        EXPECTED_CLAUDE_VALIDATION_WORKFLOW_SHA256
+        if release_supports_claude_workflow_validation(ref)
+        else EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256
         if release_supports_opencode_active_section_order(ref)
         else EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256
         if release_supports_opencode_context_budget(ref)
@@ -6421,7 +6507,8 @@ def _named_step(job: object, name: str) -> dict:
 
 
 def _expected_canonicalize_step(
-    contract: dict[str, str], *, budget: bool = False, dismissals: bool = False
+    contract: dict[str, str], *, budget: bool = False, dismissals: bool = False,
+    claude_validation: bool = False,
 ) -> dict[str, object]:
     reviewer = contract["reviewer"]
     reset = contract["reset"]
@@ -6433,10 +6520,13 @@ def _expected_canonicalize_step(
             "steps.prepare-diff.outputs.diff-ready == 'true' && "
             "steps.prepare-diff.outputs.diff-mode != 'unchanged'"
             + (
-                " && steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+                " && steps.review-budget-claim.outputs.allow-invocation == 'true'"
                 if budget
-                else " }}"
+                else ""
             )
+            + (" && steps.claude-execution.outputs.call_count == '1'"
+               if claude_validation and reviewer == "claude" else "")
+            + " }}"
         ),
         "uses": CANONICALIZE_REVIEW_ACTION,
         "with": {
@@ -6619,7 +6709,8 @@ def _verify_review_publication_contracts(
                 raise ValueError("review run provenance permission differs")
             canonical_step = _named_step(job, contract["canonical_step"])
             if canonical_step != _expected_canonicalize_step(
-                contract, budget=budget, dismissals=release_supports_finding_dismissal(ref)
+                contract, budget=budget, dismissals=release_supports_finding_dismissal(ref),
+                claude_validation=release_supports_claude_workflow_validation(ref),
             ):
                 raise ValueError("canonicalizer call differs")
             rejected_diagnostic_upload = _named_step(
@@ -6778,7 +6869,11 @@ def _verify_review_publication_contracts(
                     f"${{{{ !cancelled() && steps.{collector_id}.outcome == 'success' && "
                     + "(steps.prepare-diff.outputs.diff-ready != 'true' || "
                     "steps.prepare-diff.outputs.diff-mode == 'unchanged' || "
-                    "steps.review-budget-claim.outputs.allow-invocation == 'true') }}"
+                    "steps.review-budget-claim.outputs.allow-invocation == 'true'"
+                    + (" || steps.claude-workflow-validation.outcome == 'failure'"
+                       if contract["reviewer"] == "claude"
+                       and release_supports_claude_workflow_validation(ref) else "")
+                    + ") }}"
                 )
             if upsert.get("if") != expected_upsert_if:
                 raise ValueError("upsert prior-state guard differs")
@@ -6793,6 +6888,9 @@ def _verify_review_publication_contracts(
             if (
                 hashlib.sha256(upsert_script.encode("utf-8")).hexdigest()
                 != contract[
+                    "upsert_sha256_v175"
+                    if contract["reviewer"] == "claude"
+                    and release_supports_claude_workflow_validation(ref) else
                     "upsert_sha256_v147" if budget else "upsert_sha256"
                 ]
             ):

@@ -403,6 +403,82 @@ jobs:
           context-lines: '3'
           output-directory: ${{ runner.temp }}
 
+      # The App validates the caller against the current default branch. Check
+      # before reserving a round, using workflow identity rather than PR checkout.
+      # This is a prediction only; the upstream App remains the authority.
+      - name: Validate Claude caller workflow
+        id: claude-workflow-validation
+        if: ${{ always() && steps.prepare-review-input.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            core.setOutput('allowed', 'false');
+            core.setOutput('reason', 'workflow_validation_unavailable');
+            const stop = (reason) => {
+              core.setOutput('reason', reason);
+              core.setFailed(reason);
+            };
+            const { owner, repo } = context.repo;
+            const prefix = `${owner}/${repo}/`;
+            const workflowRef = process.env.WORKFLOW_REF || '';
+            const workflowSha = process.env.WORKFLOW_SHA || '';
+            const sha1 = (value) => /^[0-9a-f]{40}$/.test(value || '');
+            const relative = workflowRef.startsWith(prefix) ? workflowRef.slice(prefix.length) : '';
+            const match = relative.match(/^(\.github\/workflows\/[^/@]+\.ya?ml)@refs\/.+$/);
+            if (!match || !sha1(workflowSha)) {
+              stop('workflow_validation_unavailable');
+              return;
+            }
+            const path = match[1];
+            const options = { owner, repo, request: { timeout: 15000 } };
+            try {
+              const { data: repository } = await github.rest.repos.get(options);
+              if (typeof repository.default_branch !== 'string' || !repository.default_branch) {
+                stop('workflow_validation_unavailable');
+                return;
+              }
+              const { data: branch } = await github.rest.repos.getBranch({
+                ...options, branch: repository.default_branch,
+              });
+              const defaultSha = branch?.commit?.sha;
+              if (!sha1(defaultSha)) {
+                stop('workflow_validation_unavailable');
+                return;
+              }
+              const { data: current } = await github.rest.repos.getContent({
+                ...options, path, ref: workflowSha,
+              });
+              let baseline;
+              try {
+                const response = await github.rest.repos.getContent({
+                  ...options, path, ref: defaultSha,
+                });
+                baseline = response.data;
+              } catch (error) {
+                stop(Number(error?.status) === 404
+                  ? 'workflow_validation_mismatch' : 'workflow_validation_unavailable');
+                return;
+              }
+              const regular = (file) => file?.type === 'file' && file.path === path
+                && !file.target && !file.submodule_git_url && sha1(file.sha);
+              if (!regular(current) || !regular(baseline)) {
+                stop('workflow_validation_unavailable');
+                return;
+              }
+              if (current.sha !== baseline.sha) {
+                stop('workflow_validation_mismatch');
+                return;
+              }
+              core.setOutput('reason', '');
+              core.setOutput('allowed', 'true');
+            } catch {
+              stop('workflow_validation_unavailable');
+            }
+
       - name: Resolve Claude budget metadata
         id: claude-budget-config
         if: ${{ always() && steps.prepare-review-input.outcome == 'success' }}
@@ -454,7 +530,7 @@ jobs:
 
       - name: Claim Claude review budget
         id: review-budget-claim
-        if: ${{ always() && steps.prepare-review-input.outcome == 'success' && steps.stage-claude-budget-input.outcome == 'success' }}
+        if: ${{ always() && steps.prepare-review-input.outcome == 'success' && steps.stage-claude-budget-input.outcome == 'success' && (steps.prepare-diff.outputs.diff-ready != 'true' || steps.prepare-diff.outputs.diff-mode == 'unchanged' || steps.claude-workflow-validation.outputs.allowed == 'true') }}
         uses: $/.github/actions/review-invocation-budget
         with:
           github-token: ${{ github.token }}
@@ -548,7 +624,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf 'call_count=1\n' >> "$GITHUB_OUTPUT"
           printf 'started_at=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code Review
@@ -652,12 +727,41 @@ jobs:
           (( now >= STARTED_AT ))
           printf 'elapsed_seconds=%s\n' "$((now - STARTED_AT))" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve Claude execution
+        id: claude-execution
+        if: ${{ always() }}
+        shell: bash
+        env:
+          ACTION_OUTCOME: ${{ steps.claude-review.outcome }}
+          EXECUTION_CONCLUSION: ${{ steps.claude-review.outputs.conclusion }}
+        run: |
+          set -euo pipefail
+          # v1.0.204 returns success without a conclusion when preparation skips.
+          # An action failure without a conclusion is uncertain: retain the
+          # conservative one-call reservation instead of granting a false refund.
+          case "$ACTION_OUTCOME:$EXECUTION_CONCLUSION" in
+            success:success) call_count=1; provider_outcome=success; failure_reason='' ;;
+            success:failure|failure:*) call_count=1; provider_outcome=failure; failure_reason=provider_failure ;;
+            success:) call_count=0; provider_outcome=skipped; failure_reason=provider_not_executed ;;
+            skipped:|:) call_count=0; provider_outcome=skipped; failure_reason='' ;;
+            *) echo '::error::provider_execution_unavailable'; exit 1 ;;
+          esac
+          {
+            printf 'call_count=%s\n' "$call_count"
+            printf 'provider_outcome=%s\n' "$provider_outcome"
+            printf 'failure_reason=%s\n' "$failure_reason"
+          } >> "$GITHUB_OUTPUT"
+          if [[ -n "$failure_reason" ]]; then
+            printf '::error::%s\n' "$failure_reason"
+            exit 1
+          fi
+
       - name: Validate Claude review metrics
         id: claude-budget-metrics
         if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
         shell: bash
         env:
-          CALL_COUNT: ${{ steps.claude-budget-metrics-start.outputs.call_count }}
+          CALL_COUNT: ${{ steps.claude-execution.outputs.call_count }}
           ELAPSED_SECONDS: ${{ steps.claude-budget-elapsed.outputs.elapsed_seconds }}
           MODEL_ROUTE_JSON: ${{ steps.claude-budget-config.outputs.model_route_json }}
         run: |
@@ -684,7 +788,7 @@ jobs:
 
       - name: Canonicalize Claude review
         id: canonicalize-review
-        if: ${{ always() && steps.reset-claude-artifacts.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' }}
+        if: ${{ always() && steps.reset-claude-artifacts.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.claude-execution.outputs.call_count == '1' }}
         uses: $/.github/actions/canonicalize-review
         with:
           reviewer: claude
@@ -747,14 +851,15 @@ jobs:
       # !cancelled(): 취소된 런이 정상 sticky를 에러로 덮어쓰지 않게 한다(always()는 취소에도 true).
       - name: Upsert review comment
         id: upsert-review-comment
-        if: ${{ !cancelled() && steps.prepare-review-input.outcome == 'success' && (steps.prepare-diff.outputs.diff-ready != 'true' || steps.prepare-diff.outputs.diff-mode == 'unchanged' || steps.review-budget-claim.outputs.allow-invocation == 'true') }}
+        if: ${{ !cancelled() && steps.prepare-review-input.outcome == 'success' && (steps.prepare-diff.outputs.diff-ready != 'true' || steps.prepare-diff.outputs.diff-mode == 'unchanged' || steps.review-budget-claim.outputs.allow-invocation == 'true' || steps.claude-workflow-validation.outcome == 'failure') }}
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SERVER_URL: ${{ github.server_url }}
           REPOSITORY: ${{ github.repository }}
-          REVIEW_OUTCOME: ${{ steps.claude-review.outcome }}
+          REVIEW_OUTCOME: ${{ steps.claude-execution.outputs.provider_outcome }}
+          PROVIDER_FAILURE_REASON: ${{ steps.claude-workflow-validation.outputs.reason || steps.claude-execution.outputs.failure_reason }}
           DIFF_READY: ${{ steps.prepare-diff.outputs.diff-ready }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -805,6 +910,11 @@ jobs:
             const diffMode = process.env.DIFF_MODE || (diffReady ? 'full' : 'unavailable');
             const unchangedSincePrevious = process.env.UNCHANGED_SINCE_PREVIOUS === 'true';
             const canonicalFailureReason = process.env.CANONICAL_FAILURE_REASON || '';
+            const providerFailureReason = process.env.PROVIDER_FAILURE_REASON || '';
+            const nonexecutionReasons = new Set([
+              'workflow_validation_mismatch', 'workflow_validation_unavailable',
+              'provider_not_executed',
+            ]);
             const hardReasons = new Set([
               'candidate_missing', 'invalid_utf8', 'candidate_oversize',
               'ambiguous_document', 'scope_invalid', 'canonicalizer_error',
@@ -991,7 +1101,8 @@ jobs:
               && qualityValid && review.length > 0 && reviewedInputIsValid;
             let checkpointFailed = !(currentSuccess || unchangedInputIsValid);
             let failureReason = !diffReady ? 'diff_unavailable'
-              : !ok ? 'provider_failure'
+              : !modelStepEntered && nonexecutionReasons.has(providerFailureReason) ? providerFailureReason
+                : !ok ? 'provider_failure'
                 : hardReasons.has(canonicalFailureReason) ? canonicalFailureReason
                   : 'canonicalizer_error';
             const stateDiffMode = ['full', 'delta', 'unchanged', 'unavailable'].includes(diffMode)
@@ -1078,7 +1189,7 @@ jobs:
         if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.claude-budget-metrics.outputs.metrics_valid == 'true' }}
         shell: bash
         env:
-          PROVIDER_OUTCOME: ${{ steps.claude-review.outcome }}
+          PROVIDER_OUTCOME: ${{ steps.claude-execution.outputs.provider_outcome }}
           CANONICAL_OUTCOME: ${{ steps.canonicalize-review.outcome }}
           DOCUMENT_VALID: ${{ steps.canonicalize-review.outputs.document-valid }}
           ACCEPTED_COUNT: ${{ steps.canonicalize-review.outputs.accepted-count }}
