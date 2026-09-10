@@ -179,8 +179,12 @@ def render_caller(
         text = template.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise RolloutError(f"{entry.path}: canonical caller is not UTF-8") from exc
-    if text.count("@__AUTOMATION_COMMIT__") != 1:
-        raise RolloutError(f"{entry.path}: expected one commit placeholder")
+    expected_targets = _caller_targets(entry)
+    uses = tuple(CENTRAL_USE.finditer(text))
+    if (text.count("@__AUTOMATION_COMMIT__") != len(expected_targets)
+        or tuple(match.group("name") for match in uses) != expected_targets
+        or any(match.group("ref") != "__AUTOMATION_COMMIT__" for match in uses)):
+        raise RolloutError(f"{entry.path}: unexpected central target or commit placeholder")
     text = text.replace("@__AUTOMATION_COMMIT__", f"@{release_commit}")
     if entry.auth_family == "gemini" and profile.repo_write_auth == "github_token":
         text = replace_once(
@@ -411,6 +415,14 @@ def _canonical_bytes(canonical: Path, entry: CatalogEntry) -> bytes:
         raise RolloutError(f"{entry.path}: cannot read canonical file: {exc}") from exc
 
 
+def _caller_targets(entry: CatalogEntry) -> tuple[str | None, ...]:
+    if (entry.path.as_posix() == ".github/workflows/opencode-auto-review.yml"
+        and entry.central_workflow == "opencode-auto-review.yml"
+        and tuple(job.name for job in entry.caller_jobs) == ("opencode-recovery", "opencode-review")):
+        return ("opencode-recover-finalization.yml", "opencode-auto-review.yml")
+    return (entry.central_workflow,)
+
+
 def _validate_caller(
     rendered: bytes, entry: CatalogEntry, profile: RepoProfile
 ) -> None:
@@ -430,8 +442,9 @@ def _validate_caller(
         raise RolloutError(f"{entry.path}: rendered caller jobs violate the catalog")
     uses = tuple(CENTRAL_USE.finditer(rendered.decode("utf-8")))
     if (
-        len(uses) != 1
-        or uses[0].group("name") != entry.central_workflow
+        tuple(match.group("name") for match in uses) != _caller_targets(entry)
+        or len({match.group("ref") for match in uses}) != 1
+        or any(SHA40.fullmatch(match.group("ref")) is None for match in uses)
     ):
         raise RolloutError(f"{entry.path}: rendered central target violates the catalog")
 

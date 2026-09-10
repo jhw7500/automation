@@ -129,12 +129,17 @@ REVIEW_POLICY_ROOTS = (
     REVIEW_POLICY_ACTION_ROOT,
     REVIEW_POLICY_HELPER_ROOT,
 )
+OPENCODE_RECOVERY_ROOTS = tuple(
+    ReleaseRoot(PurePosixPath(f".github/actions/recover-opencode-review/{name}"), "file", "100644")
+    for name in ("evidence.py", "replay.js", "receipt.js", "transport.py")
+)
 RELEASE_ROOTS = (
     HISTORICAL_RELEASE_ROOTS
     + PREPARE_REVIEW_DIFF_ROOTS
     + CANONICALIZE_REVIEW_ROOTS
     + REVIEW_INVOCATION_BUDGET_ROOTS
     + REVIEW_POLICY_ROOTS
+    + OPENCODE_RECOVERY_ROOTS
 )
 RELEASE_PATHS = tuple(root.path.as_posix() for root in RELEASE_ROOTS)
 EXACT_RELEASE_ROOTS = tuple(root for root in RELEASE_ROOTS if root.kind == "file")
@@ -163,6 +168,7 @@ OPENCODE_CONTEXT_BUDGET_RELEASE = (1, 72)
 OPENCODE_ACTIVE_SECTION_ORDER_RELEASE = (1, 73)
 EXPANDED_REVIEW_BUDGET_RELEASE = (1, 74)
 CLAUDE_WORKFLOW_VALIDATION_RELEASE = (1, 75)
+OPENCODE_RECOVERY_RELEASE = (1, 76)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -285,6 +291,11 @@ def release_supports_claude_workflow_validation(ref: str) -> bool:
     return _release_version(ref) >= CLAUDE_WORKFLOW_VALIDATION_RELEASE
 
 
+def release_supports_opencode_recovery(ref: str) -> bool:
+    """Return whether the release owns original-attempt finalization recovery."""
+    return _release_version(ref) >= OPENCODE_RECOVERY_RELEASE
+
+
 def release_retires_manual_pr_review(ref: str) -> bool:
     """Return whether ``ref`` has withdrawn the workflow_dispatch pull-request review."""
 
@@ -302,6 +313,8 @@ def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:
         roots += REVIEW_INVOCATION_BUDGET_ROOTS
     if release_supports_review_policy(ref):
         roots += REVIEW_POLICY_ROOTS
+    if release_supports_opencode_recovery(ref):
+        roots += OPENCODE_RECOVERY_ROOTS
     return roots
 
 

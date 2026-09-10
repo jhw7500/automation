@@ -32,6 +32,7 @@ from release_fixture_helpers import (
     restore_pre_v171_opencode_dismissals,
     restore_pre_v172_opencode_context_budget,
     restore_pre_v173_opencode_active_section_order,
+    restore_pre_v176_opencode_recovery,
     restore_pre_v170_opencode_finding_ids,
     restore_retired_manual_pr_review,
     restore_pre_v166_label_mismatch_decline,
@@ -40,6 +41,119 @@ from release_fixture_helpers import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+RECOVERY_RELEASE_FILES = (
+    ".github/actions/recover-opencode-review/evidence.py",
+    ".github/actions/recover-opencode-review/replay.js",
+    ".github/actions/recover-opencode-review/receipt.js",
+    ".github/actions/recover-opencode-review/transport.py",
+)
+
+
+@pytest.fixture
+def recovery_release_repo(tmp_path):
+    repo = tmp_path / "recovery-release"
+    repo.mkdir()
+    for relative in (*RELEASE_PATHS, *RECOVERY_RELEASE_FILES):
+        source, target = ROOT / relative, repo / relative
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            shutil.copy2(source, target)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    return repo, commit(repo, "v1.76 recovery candidate")
+
+
+def test_v176_accepts_recovery_and_rejects_old_release_identity(recovery_release_repo):
+    repo, candidate = recovery_release_repo
+    assert release_verifier.verify_commit_content(repo, "v1.76", candidate) == candidate
+    for ref in ("v1.74", "v1.75"):
+        with pytest.raises(ReleaseVerificationError):
+            release_verifier.verify_commit_content(repo, ref, candidate)
+
+
+def test_v176_inventory_owns_all_recovery_executables_only_from_v176(recovery_release_repo):
+    repo, candidate = recovery_release_repo
+    tree = release_verifier.VerifiedCommitTree.open(repo, candidate)
+    paths = release_inventory.release_paths_for("v1.76")
+    assert set(RECOVERY_RELEASE_FILES) <= set(paths)
+    for ref in ("v1.74", "v1.75"):
+        assert not set(RECOVERY_RELEASE_FILES) & set(release_inventory.release_paths_for(ref))
+    listing = tree.listing(paths)
+    blobs = release_inventory.validate_release_listing(
+        listing, release_inventory.release_roots_for("v1.76")
+    )
+    assert set(RECOVERY_RELEASE_FILES) <= {blob.path.as_posix() for blob in blobs}
+
+
+@pytest.mark.parametrize("relative", RECOVERY_RELEASE_FILES)
+def test_v176_rejects_recovery_executable_byte_drift(recovery_release_repo, relative):
+    repo, _ = recovery_release_repo
+    path = repo / relative
+    path.write_bytes(path.read_bytes() + b"\n# unapproved executable change\n")
+    bad = commit(repo, "mutate recovery executable")
+    with pytest.raises(ReleaseVerificationError, match="recovery.*digest"):
+        release_verifier.verify_commit_content(repo, "v1.76", bad)
+
+
+@pytest.mark.parametrize(("old", "new"), [
+    ("cancel-in-progress: false", "cancel-in-progress: true"),
+    ("automation-opencode-auto-review-", "unserialized-recovery-"),
+    ("      contents: read", "      contents: write"),
+    ("ref: ${{ steps.driver.outputs.central_sha }}", "ref: main"),
+    ("repository: jhw7500/automation", "repository: ${{ github.repository }}"),
+    ("persist-credentials: false", "persist-credentials: true"),
+    ("Number.isSafeInteger(Number(value))", "true"),
+    ("refs[0].path !== prefix + refs[0].sha", "false"),
+    ("working-directory: automation-recovery", "working-directory: review-target"),
+    ("          GH_TOKEN: ${{ github.token }}", "          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}"),
+])
+def test_v176_recovery_security_gates_survive_raw_digest_reseal(
+    recovery_release_repo, monkeypatch, old, new
+):
+    repo, _ = recovery_release_repo
+    relative = ".github/workflows/opencode-recover-finalization.yml"
+    path = repo / relative
+    replace(path, old, new, count=1)
+    monkeypatch.setitem(release_verifier.EXPECTED_OPENCODE_RECOVERY_SHA256,
+                        relative, hashlib.sha256(path.read_bytes()).hexdigest())
+    bad = commit(repo, "weaken recovery execution contract")
+    with pytest.raises(ReleaseVerificationError, match="recovery execution/caller contract"):
+        release_verifier.verify_commit_content(repo, "v1.76", bad)
+
+
+@pytest.mark.parametrize(("old", "new"), [
+    ("!inputs.force_review", "true"),
+    ("!inputs.recovery_original_run_id", "true"),
+    ("opencode-recover-finalization.yml@__AUTOMATION_COMMIT__", "opencode-auto-review.yml@__AUTOMATION_COMMIT__"),
+    ("      pull-requests: read", "      pull-requests: write"),
+    ("      original_run_attempt: ${{ inputs.recovery_original_run_attempt }}", "      original_run_attempt: '2'"),
+])
+def test_v176_rejects_caller_mode_or_identity_drift(recovery_release_repo, old, new):
+    repo, _ = recovery_release_repo
+    replace(repo / release_verifier.RECOVERY_CALLER, old, new, count=1)
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.76", commit(repo, "weaken caller routing"))
+
+
+def test_v176_rejects_relaxed_ordinary_failed_run_trust(recovery_release_repo):
+    repo, _ = recovery_release_repo
+    path = repo / ".github/workflows/opencode-auto-review.yml"
+    replace(path, "if (run.conclusion !== 'success')", "if (false)", count=1)
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.76", commit(repo, "trust ordinary failed run"))
+
+
+def test_v176_rejects_unowned_recovery_executable(recovery_release_repo):
+    repo, _ = recovery_release_repo
+    (repo / ".github/actions/recover-opencode-review/unowned.py").write_text("print('unexpected')\n")
+    with pytest.raises(ReleaseVerificationError, match="recovery inventory is not closed"):
+        release_verifier.verify_commit_content(repo, "v1.76", commit(repo, "add unowned helper"))
 
 CANONICAL_REMOTE = "https://github.com/jhw7500/automation.git"
 HERMETIC_LOCAL_GIT_ENV = {
@@ -530,6 +644,7 @@ def assert_pre_v160_workflow_bytes(repo: Path) -> None:
 
 
 def restore_pre_v175_claude_validation(repo: Path) -> None:
+    restore_pre_v176_opencode_recovery(repo)
     tree = release_verifier.VerifiedCommitTree.open(
         ROOT, "eb460b7e547a85f831820f8f25d30f134b2c6254"
     )
@@ -2229,6 +2344,7 @@ def prepare_v173(repo: Path) -> str:
     ):
         shutil.copy2(ROOT / relative, repo / relative)
     restore_pre_v174_expanded_review_budget(repo)
+    restore_pre_v176_opencode_recovery(repo)
     return commit(repo, "v1.73 candidate")
 
 
@@ -2236,6 +2352,7 @@ def prepare_v174(repo: Path) -> str:
     prepare_v173(repo)
     relative = ".github/actions/review-invocation-budget/review_invocation_budget.py"
     shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v176_opencode_recovery(repo)
     return commit(repo, "v1.74 candidate")
 
 
@@ -3296,6 +3413,11 @@ def test_v147_budget_helper_semantics_bind_live_ast_relationships(
             "        return refuse(validated, request, \"duplicate_head\")\n",
         )
     elif mutation == "final-cap-dead-decoy":
+        # Mutate the ordinary finalize function, not the independent recovery
+        # reconstruction which applies the same cap to the original invocation.
+        start = source.index("def finalize(")
+        end = source.index("\ndef ", start + 1)
+        prefix, source, suffix = source[:start], source[start:end], source[end:]
         substitute(
             "    if request.call_count > state.budgets.max_calls_per_round:\n"
             "        outcome, stop_reason = \"checkpoint_failure\", "
@@ -3308,6 +3430,7 @@ def test_v147_budget_helper_semantics_bind_live_ast_relationships(
             "        outcome, stop_reason = \"provider_failure\", "
             "\"provider_failure\"\n",
         )
+        source = prefix + source + suffix
     elif mutation == "rvw-bound-dead-decoy":
         count = source.count("len(findings) > 8")
         assert count > 1

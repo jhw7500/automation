@@ -14,8 +14,59 @@ on:
         type: boolean
         required: false
         default: false
+      recover_finalization:
+        description: Finalize a successful original review with zero additional provider calls
+        type: boolean
+        required: false
+        default: false
+      recovery_original_run_id:
+        description: Original failed Actions run ID
+        type: string
+        required: false
+      recovery_original_run_attempt:
+        description: Exact original Actions attempt
+        type: string
+        required: false
+      recovery_expected_head_sha:
+        description: Exact reviewed PR HEAD (40 lowercase hex)
+        type: string
+        required: false
+      recovery_expected_base_sha:
+        description: Exact original PR base (40 lowercase hex)
+        type: string
+        required: false
 
 jobs:
+  reject-conflicting-dispatch:
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.force_review &&
+      (inputs.recover_finalization || inputs.recovery_original_run_id ||
+      inputs.recovery_original_run_attempt || inputs.recovery_expected_head_sha ||
+      inputs.recovery_expected_base_sha)
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Reject conflicting recovery and force-review inputs
+        run: exit 1
+  opencode-recovery:
+    if: >-
+      github.event_name == 'workflow_dispatch' && !inputs.force_review &&
+      (inputs.recover_finalization || inputs.recovery_original_run_id ||
+      inputs.recovery_original_run_attempt || inputs.recovery_expected_head_sha ||
+      inputs.recovery_expected_base_sha)
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+      issues: write
+      pull-requests: read
+    uses: jhw7500/automation/.github/workflows/opencode-recover-finalization.yml@__AUTOMATION_COMMIT__
+    with:
+      pr_number: ${{ format('{0}', inputs.pr_number) }}
+      original_run_id: ${{ inputs.recovery_original_run_id }}
+      original_run_attempt: ${{ inputs.recovery_original_run_attempt }}
+      expected_head_sha: ${{ inputs.recovery_expected_head_sha }}
+      expected_base_sha: ${{ inputs.recovery_expected_base_sha }}
   opencode-review:
     if: >-
       (github.event_name == 'pull_request' &&
@@ -23,7 +74,10 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.draft == false &&
       (github.event.action != 'labeled' || github.event.label.name == 'review:request')) ||
-      (github.event_name == 'workflow_dispatch' && inputs.force_review)
+      (github.event_name == 'workflow_dispatch' && inputs.force_review &&
+      !inputs.recover_finalization && !inputs.recovery_original_run_id &&
+      !inputs.recovery_original_run_attempt && !inputs.recovery_expected_head_sha &&
+      !inputs.recovery_expected_base_sha)
     permissions:
       actions: read
       checks: write

@@ -109,47 +109,12 @@ jobs:
           # job is isolated from the model and its read-only token never crosses jobs.
           persist-credentials: true
 
-      - name: Load trusted recovery receipt verifier
-        id: load-recovery-helper
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const attempt = Number(process.env.GITHUB_RUN_ATTEMPT);
-            if (!Number.isSafeInteger(context.runId) || context.runId < 1
-              || !Number.isSafeInteger(attempt) || attempt < 1) throw new Error('invalid current run identity');
-            const {data: run} = await github.rest.actions.getWorkflowRunAttempt({
-              ...context.repo, run_id: context.runId, attempt_number: attempt,
-            });
-            const prefix = 'jhw7500/automation/.github/workflows/opencode-auto-review.yml@';
-            const refs = (run.referenced_workflows || []).filter((r) =>
-              typeof r.path === 'string' && r.path.startsWith(prefix) && r.path.length > prefix.length);
-            if (run.id !== context.runId || run.run_attempt !== attempt || refs.length !== 1
-              || !/^[0-9a-f]{40}$/.test(refs[0].sha || '')) throw new Error('unresolved central workflow SHA');
-            const helperPath = '.github/actions/recover-opencode-review/receipt.js';
-            const {data: file} = await github.rest.repos.getContent({
-              owner: 'jhw7500', repo: 'automation', path: helperPath, ref: refs[0].sha,
-            });
-            if (file?.type !== 'file' || file.path !== helperPath || file.encoding !== 'base64'
-              || !Number.isSafeInteger(file.size) || file.size < 1 || file.size > 1000000
-              || typeof file.content !== 'string' || file.content.length > 1400000
-              || file.symlink || file.submodule_git_url) throw new Error('invalid trusted recovery helper file');
-            const encoded = file.content.replace(/\n/g, '');
-            const bytes = Buffer.from(encoded, 'base64');
-            if (bytes.length !== file.size || bytes.toString('base64') !== encoded) throw new Error('invalid recovery helper encoding');
-            const target = path.join(process.env.RUNNER_TEMP, 'opencode-recovery-receipt.js');
-            const fd = fs.openSync(target, 'wx', 0o600);
-            try { fs.fchmodSync(fd, 0o600); fs.writeFileSync(fd, bytes); } finally { fs.closeSync(fd); }
-
       # Context and the review input are prepared before the CLI starts. Only an exact v2
       # envelope is state; the legacy marker exists solely for OpenCode's sticky-comment
       # compatibility and for identifying this run's raw output after the CLI returns.
       - name: Collect previous review context
         id: ctx
         env:
-          OPENCODE_RECOVERY_HELPER: ${{ runner.temp }}/opencode-recovery-receipt.js
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
           HEADER: '## OpenCode Review (latest)'
@@ -377,45 +342,7 @@ jobs:
             });
             if (valid) ids.push(comment.id);
           }
-          (async () => {
-            const claimed = comments.filter((comment) => {
-              if (ids.includes(comment.id) || comment.user?.type !== 'Bot') return false;
-              const lines = (comment.body || '').split('\n');
-              if (lines[0] !== '## OpenCode Review (latest)' || lines[1] !== '<!-- automation:opencode-auto-review:v2 -->') return false;
-              const match = (lines[2] || '').match(/^<!-- automation-state:(\{.*\}) -->$/);
-              if (!match || lines.filter((l) => /^- Attestation: [1-9][0-9]*$/.test(l)).length !== 1) return false;
-              let state;
-              try { state = JSON.parse(match[1]); } catch { return false; }
-              return state?.schema === 2 && state.reviewer === 'opencode' && state.pr === Number(prRaw)
-                && JSON.stringify(Object.keys(state).sort()) === JSON.stringify(['attempt_head','attempt_status','diff_mode','full_diff_sha256','pr','reviewer','run_attempt','run_id','schema','successful_head'])
-                && Number.isSafeInteger(state.run_id) && state.run_id > 0
-                && Number.isSafeInteger(state.run_attempt) && state.run_attempt > 0
-                && /^[0-9a-f]{40}$/.test(state.attempt_head || '')
-                && state.attempt_status === 'success' && state.successful_head === state.attempt_head
-                && /^[0-9a-f]{64}$/.test(state.full_diff_sha256 || '')
-                && ['full','delta','unchanged'].includes(state.diff_mode)
-                && lines.includes(`- Run: ${process.env.SERVER_URL}/${repository}/actions/runs/${state.run_id}`);
-            });
-            if (claimed.length) {
-              const {execFileSync} = require('child_process');
-              const get = (route, params = {}) => {
-                const args = ['api', `repos/${repository}/${route}`, '--method', 'GET'];
-                for (const [key, value] of Object.entries(params)) args.push('-f', `${key}=${value}`);
-                return {data: JSON.parse(execFileSync('gh', args, {encoding: 'utf8', maxBuffer: 16000000}))};
-              };
-              const github = {rest: {
-                actions: {
-                  listWorkflowRunsForRepo: ({event, per_page, page}) => get('actions/runs', {event, per_page, page}),
-                  getWorkflowRunAttempt: ({run_id, attempt_number}) => get(`actions/runs/${run_id}/attempts/${attempt_number}`),
-                  listJobsForWorkflowRunAttempt: ({run_id, attempt_number, per_page, page}) => get(`actions/runs/${run_id}/attempts/${attempt_number}/jobs`, {per_page, page}),
-                },
-                checks: {listForRef: ({ref, check_name, status, filter, per_page, page}) => get(`commits/${ref}/check-runs`, {check_name, status, filter, per_page, page})},
-              }};
-              const recovered = await require(process.env.OPENCODE_RECOVERY_HELPER).authenticateRecovery({github, repository, pr: Number(prRaw), comments});
-              for (const record of recovered) if (!ids.includes(record.comment.id)) ids.push(record.comment.id);
-            }
-            fs.writeFileSync(outputPath, JSON.stringify(ids));
-          })().catch((error) => { console.error(error); process.exitCode = 1; });
+          fs.writeFileSync(outputPath, JSON.stringify(ids));
           NODE
           PREV_RECORD="$(jq -c \
             --arg header "$HEADER" \
@@ -3421,47 +3348,11 @@ jobs:
           path: ${{ runner.temp }}/opencode-candidate
           merge-multiple: true
 
-      - name: Load trusted recovery receipt verifier
-        id: load-recovery-helper
-        if: ${{ always() }}
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const attempt = Number(process.env.GITHUB_RUN_ATTEMPT);
-            if (!Number.isSafeInteger(context.runId) || context.runId < 1
-              || !Number.isSafeInteger(attempt) || attempt < 1) throw new Error('invalid current run identity');
-            const {data: run} = await github.rest.actions.getWorkflowRunAttempt({
-              ...context.repo, run_id: context.runId, attempt_number: attempt,
-            });
-            const prefix = 'jhw7500/automation/.github/workflows/opencode-auto-review.yml@';
-            const refs = (run.referenced_workflows || []).filter((r) =>
-              typeof r.path === 'string' && r.path.startsWith(prefix) && r.path.length > prefix.length);
-            if (run.id !== context.runId || run.run_attempt !== attempt || refs.length !== 1
-              || !/^[0-9a-f]{40}$/.test(refs[0].sha || '')) throw new Error('unresolved central workflow SHA');
-            const helperPath = '.github/actions/recover-opencode-review/receipt.js';
-            const {data: file} = await github.rest.repos.getContent({
-              owner: 'jhw7500', repo: 'automation', path: helperPath, ref: refs[0].sha,
-            });
-            if (file?.type !== 'file' || file.path !== helperPath || file.encoding !== 'base64'
-              || !Number.isSafeInteger(file.size) || file.size < 1 || file.size > 1000000
-              || typeof file.content !== 'string' || file.content.length > 1400000
-              || file.symlink || file.submodule_git_url) throw new Error('invalid trusted recovery helper file');
-            const encoded = file.content.replace(/\n/g, '');
-            const bytes = Buffer.from(encoded, 'base64');
-            if (bytes.length !== file.size || bytes.toString('base64') !== encoded) throw new Error('invalid recovery helper encoding');
-            const target = path.join(process.env.RUNNER_TEMP, 'opencode-recovery-receipt.js');
-            const fd = fs.openSync(target, 'wx', 0o600);
-            try { fs.fchmodSync(fd, 0o600); fs.writeFileSync(fd, bytes); } finally { fs.closeSync(fd); }
-
       - name: Canonicalize OpenCode review
         id: canonicalize-opencode-review
-        if: ${{ always() && steps.load-recovery-helper.outcome == 'success' && (needs.opencode-prepare.outputs.allow_invocation == 'true' || needs.opencode-prepare.outputs.budget_decision == 'authenticated_reuse') }}
+        if: ${{ always() && (needs.opencode-prepare.outputs.allow_invocation == 'true' || needs.opencode-prepare.outputs.budget_decision == 'authenticated_reuse') }}
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
-          OPENCODE_RECOVERY_HELPER: ${{ runner.temp }}/opencode-recovery-receipt.js
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_ID: ${{ github.run_id }}
@@ -4083,16 +3974,6 @@ jobs:
                   authenticatedLiveIds.add(record.comment.id);
                   authenticatedLiveRecords.set(record.comment.id, record);
                   records.push(record);
-                }
-              }
-              if (claimed.some((record) => !records.some((trusted) => trusted.comment.id === record.comment.id))) {
-                const recovered = await require(process.env.OPENCODE_RECOVERY_HELPER).authenticateRecovery({
-                  github, repository, pr: issueNumber, comments,
-                });
-                for (const record of recovered) {
-                  authenticatedLiveIds.add(record.comment.id);
-                  authenticatedLiveRecords.set(record.comment.id, record);
-                  if (!records.some((trusted) => trusted.comment.id === record.comment.id)) records.push(record);
                 }
               }
               return records.sort((a, b) => a.state.run_id - b.state.run_id

@@ -85,7 +85,7 @@ def test_catalog_and_profiles_are_closed() -> None:
         assert entry.trigger["pull_request"]["types"] == [
             "opened", "synchronize", "ready_for_review", "labeled",
         ]
-        assert "review_mode" in entry.caller_jobs[0].with_keys
+        assert "review_mode" in entry.caller_jobs[-1].with_keys
 
 
 def test_live_configures_ordered_additional_branch_targets() -> None:

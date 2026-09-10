@@ -20,6 +20,7 @@ from scripts.prepare_workflow_rollout import (  # noqa: E402
     RolloutError,
     apply_render_plan,
     render_repository,
+    render_caller,
 )
 from scripts.workflow_catalog import load_catalog, load_fleet_config  # noqa: E402
 
@@ -124,7 +125,9 @@ def test_every_profile_renders_exactly_its_canonical_caller_bytes(
     for entry in selected:
         canonical_path = CANONICAL / entry.path.relative_to(".github")
         template = canonical_path.read_bytes()
-        assert template.count(b"@__AUTOMATION_COMMIT__") == 1
+        assert template.count(b"@__AUTOMATION_COMMIT__") == (
+            2 if entry.path.name == "opencode-auto-review.yml" else 1
+        )
         expected = template.replace(
             b"@__AUTOMATION_COMMIT__", f"@{COMMIT}".encode()
         )
@@ -316,6 +319,31 @@ def test_selected_optional_callers_are_created(tmp_path: Path) -> None:
     plan = render_profile(make_existing_repo(tmp_path / "repo"), "wlan-package")
     assert plan.after(".github/workflows/opencode.yml") is not None
     assert plan.after(".github/workflows/opencode-auto-review.yml") is not None
+
+
+def test_recovery_and_normal_callers_render_the_same_immutable_commit(tmp_path):
+    import yaml
+
+    plan = render_profile(make_existing_repo(tmp_path / "repo"), "wlan-package")
+    assert plan.status == "drift", plan.reason
+    jobs = yaml.safe_load(plan.after(".github/workflows/opencode-auto-review.yml"))["jobs"]
+    assert jobs["opencode-review"]["uses"] == (
+        "jhw7500/automation/.github/workflows/opencode-auto-review.yml@" + COMMIT
+    )
+    assert jobs["opencode-recovery"]["uses"] == (
+        "jhw7500/automation/.github/workflows/opencode-recover-finalization.yml@" + COMMIT
+    )
+    assert "secrets" not in jobs["opencode-recovery"]
+
+
+@pytest.mark.parametrize("replacement", ["opencode.yml", "gemini-auto-review.yml"])
+def test_recovery_render_rejects_foreign_second_target(replacement):
+    entry = next(e for e in CATALOG.callers if e.path.name == "opencode-auto-review.yml")
+    template = (CANONICAL / "workflows/opencode-auto-review.yml").read_bytes().replace(
+        b"opencode-recover-finalization.yml@", replacement.encode() + b"@"
+    )
+    with pytest.raises(RolloutError):
+        render_caller(template, entry, PROFILES["wlan-package"], COMMIT)
 
 
 def test_unselected_optional_caller_is_deleted(tmp_path: Path) -> None:

@@ -12620,6 +12620,7 @@ def _run_opencode_ctx(
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir()
     env["RUNNER_TEMP"] = str(runner_temp)
+    env["OPENCODE_RECOVERY_HELPER"] = str(ROOT / ".github/actions/recover-opencode-review/receipt.js")
     result = subprocess.run(
         ["bash", "-c", run], cwd=tmp_path, env=env, check=False,
         capture_output=True, text=True,
@@ -12755,7 +12756,9 @@ def test_opencode_collector_server_discovery_ignores_many_forged_receipt_ids(tmp
     assert f"previous_sha={attempt_head}" in text
     assert f"previous_full_hash={full_hash}" in text
     calls = (tmp_path / "gh-calls.log").read_text(encoding="utf-8").splitlines()
-    assert sum("/actions/runs --method GET" in call for call in calls) == 1
+    # Untrusted strict records also trigger one bounded, server-first recovery horizon.
+    assert sum("/actions/runs --method GET" in call and "event=pull_request" in call for call in calls) == 1
+    assert sum("/actions/runs --method GET" in call and "event=workflow_dispatch" in call for call in calls) == 1
     assert sum("/commits/" in call and "/check-runs --method GET" in call for call in calls) <= 20
     assert not any(re.search(r"/check-runs/[1-9][0-9]*", call) for call in calls)
     exact_attempts = [call for call in calls if re.search(r"/actions/runs/[1-9][0-9]*/attempts/[1-9][0-9]* --method GET", call)]
@@ -13968,6 +13971,7 @@ def _run_opencode_canonicalize(
         elif candidate_artifact_case == "tampered":
             candidate_path.write_bytes(b"\xff")
     env = {
+        "OPENCODE_RECOVERY_HELPER": str(ROOT / ".github/actions/recover-opencode-review/receipt.js"),
         "PR_NUMBER": "7",
         "RUN_URL": f"https://github.com/example/repo/actions/runs/{run_id}",
         "RUN_ID": run_id,
@@ -16384,7 +16388,9 @@ def test_opencode_many_new_v2_claims_are_quarantined_without_selecting_receipt_i
     assert len({comment["id"] for comment in forged} & quarantined) == 20
     assert len([call for call in calls if call[0] in {"update", "delete"}]) <= 42
     assert any(call[0] == "create-check" for call in calls)
-    assert sum(call[0] == "list-runs" for call in calls) <= 4
+    # Each transaction refresh has an ordinary and a recovery server horizon.
+    for event in ("pull_request", "workflow_dispatch"):
+        assert sum(call[0] == "list-runs" and call[1].get("event") == event for call in calls) <= 4
     assert not any(call[0] == "get-check" and call[1]["check_run_id"] in {
         900000 + comment["id"] for comment in forged
     } for call in calls)

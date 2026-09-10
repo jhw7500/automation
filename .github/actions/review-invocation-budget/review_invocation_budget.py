@@ -1331,6 +1331,119 @@ def finalize(
     )
 
 
+def _expected_recovered_invocation(
+        state: LedgerState, original_claim: Invocation,
+        request: FinalizeRequest) -> Invocation:
+    outcome = request.outcome
+    stop_reason = request.stop_reason
+    if request.call_count > state.budgets.max_calls_per_round:
+        outcome, stop_reason = "checkpoint_failure", "call_budget_exhausted"
+    elif request.elapsed_seconds > state.budgets.max_wall_seconds_per_round:
+        outcome, stop_reason = "wall_time_exhausted", "wall_time_exhausted"
+    # Recovery accepts only a successful authenticated publication. Findings come
+    # from that original request, never from the entry/handoff being verified.
+    remaining = _without_dismissed(state, request.remaining_finding_ids)
+    return replace(
+        original_claim,
+        status="finalized",
+        outcome=outcome,
+        stop_reason=stop_reason,
+        call_count=request.call_count,
+        elapsed_seconds=request.elapsed_seconds,
+        model_route=request.model_route,
+        effort=request.effort,
+        remaining_finding_ids=remaining,
+    )
+
+
+def recover_finalize(
+        state: LedgerState, original_claim: Invocation, request: FinalizeRequest,
+        provenances: Mapping[tuple[int, int], RunProvenance]) -> Transition:
+    """Finalize one authenticated original OpenCode claim, idempotently.
+
+    Recovery callers authenticate the evidence before reaching this pure transition.
+    This function additionally proves that the supplied original claim still selects
+    the latest live ledger generation and that live run provenance remains valid.
+    """
+
+    try:
+        _validate_finalize_request(request)
+        _validate_state_shape(state)
+        if not isinstance(original_claim, Invocation):
+            raise BudgetStateError("original_claim_invalid")
+        Invocation.from_dict(original_claim.to_dict())
+        if original_claim.status != "claimed" or original_claim.remaining_finding_ids:
+            raise BudgetStateError("original_claim_invalid")
+    except (AttributeError, BudgetStateError) as exc:
+        return _invalid_transition(state, request, str(exc))
+
+    if state.reviewer != "opencode" or request.reviewer != "opencode":
+        return _invalid_transition(state, request, "recovery_reviewer_invalid")
+    if (state.repository, state.pr, state.reviewer) != (
+            request.repository, request.pr, request.reviewer):
+        return _invalid_transition(state, request, "identity_mismatch")
+    if (request.run_id, request.run_attempt, request.head_sha, request.full_diff_sha256) != (
+            original_claim.run_id, original_claim.run_attempt,
+            original_claim.head_sha, original_claim.full_diff_sha256):
+        return _invalid_transition(state, request, "recovery_request_mismatch")
+    if (request.outcome not in {"success", "quality_filtered"}
+            or not request.authenticated_review.success
+            or request.authenticated_review.head_sha != request.head_sha
+            or request.authenticated_review.full_diff_sha256 != request.full_diff_sha256):
+        return _invalid_transition(state, request, "recovery_finalization_conflict")
+
+    matching = [
+        (index, item)
+        for index, item in enumerate(state.invocations)
+        if (item.run_id, item.run_attempt) == (
+            original_claim.run_id, original_claim.run_attempt,
+        )
+    ]
+    if len(matching) != 1:
+        return _invalid_transition(state, request, "original_claim_mismatch")
+    index, current = matching[0]
+    if index != len(state.invocations) - 1:
+        return _invalid_transition(state, request, "newer_invocation_exists")
+
+    immutable_fields = (
+        "run_id", "run_attempt", "head_sha", "full_diff_sha256",
+        "caller_workflow_path", "caller_event", "referenced_workflow_path",
+        "referenced_workflow_ref", "referenced_workflow_sha", "round_number",
+        "override_event_id", "call_unit", "estimated_input_tokens",
+    )
+    if current.status == "claimed":
+        original_matches = current == original_claim
+    else:
+        original_matches = all(
+            getattr(current, field_name) == getattr(original_claim, field_name)
+            for field_name in immutable_fields
+        )
+    if not original_matches:
+        return _invalid_transition(state, request, "original_claim_mismatch")
+
+    try:
+        _validate_stored_provenance_identity(original_claim, "opencode")
+        _validate_provenance(state, request, provenances)
+    except BudgetStateError as exc:
+        return _invalid_transition(state, request, str(exc))
+
+    if request.model_route[0] != original_claim.model_route[0]:
+        return _invalid_transition(state, request, "model_route_unknown")
+
+    if current.status == "claimed":
+        return finalize(state, request, provenances)
+
+    if choose_dismissals(state, request.dismiss_events) != state.dismissed_findings:
+        return _invalid_transition(state, request, "recovery_finalization_conflict")
+    expected = _expected_recovered_invocation(state, original_claim, request)
+    if current != expected:
+        return _invalid_transition(state, request, "recovery_finalization_conflict")
+    return Transition(
+        state, False, "finalized", current.stop_reason, current.round_number,
+        f"{current.run_id}:{current.run_attempt}", False,
+    )
+
+
 _REVIEWER_TITLES = {"claude": "Claude", "gemini": "Gemini", "opencode": "OpenCode"}
 
 
