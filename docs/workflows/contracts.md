@@ -888,6 +888,10 @@ Claude/Gemini schema 3 additionally emits `review_execution` and the quality fie
 `filtered_max_severity`. `review_execution` is `performed` when this attempt entered the model
 step, `reused` only for authenticated unchanged reuse, and `not_performed` when the attempt failed
 before a model call. Existing schema-3 records without this additive field remain readable.
+From v1.75, Claude uses the pinned action's execution `conclusion`, because a successful
+action step can return during preparation without running Claude. Such a skip is
+`not_performed`, never a successful review. An action failure with no conclusion remains
+conservatively counted as one attempted session; it is not evidence for a zero-call refund.
 The same value appears in the trusted `- Execution:` metadata line, so a reused success cannot be
 presented as a new model review. `quality_schema` is always `1`. On full or delta
 success the counts are non-negative safe integers and the maximum is `none`, `MEDIUM`, `HIGH`, or
@@ -1217,6 +1221,32 @@ round has a 600-second provider wall-time cap. Call units and caps are one Claud
 action session, three Gemini `generate_content` requests across primary, retries, and
 configured same-reviewer fallback, and two OpenCode `opencode run` sessions including
 format repair.
+
+From v1.75, Claude compares the caller identified by `github.workflow_ref` and
+`github.workflow_sha` with the same file at a freshly resolved default-branch commit,
+before reserving a full/delta review round. Equal blob IDs allow admission even when
+the commits differ. A missing default caller or different blob fails with
+`workflow_validation_mismatch`; invalid identity or an uncertain API lookup fails with
+`workflow_validation_unavailable`. Neither path claims a round, consumes an override
+event, or invokes Claude. Authenticated unchanged reuse keeps its existing zero-call path.
+This preflight predicts a known App rejection; it does not replace or bypass upstream
+OIDC/App workflow validation.
+
+At the pinned Claude action version, a successful action step with no execution
+`conclusion` returns before Claude runs. The workflow records zero calls and
+`provider_not_executed`, skips candidate canonicalization, and fails the run. Actual
+execution with a missing candidate retains `candidate_missing`. Failures preserve a
+previous authenticated successful review instead of replacing its findings.
+
+The default branch can change between the preflight and the upstream App exchange.
+If that race causes a post-claim skip, the zero-call final checkpoint preserves the
+reservation and its original approval event; it does not refund the round. Likewise,
+historical v1.74-or-earlier `candidate_missing`/one-call records are not proof that a
+model did or did not run. Do not edit/delete the ledger, replay a consumed override,
+or rerun blindly. Preserve exact run/attempt, head/diff, claim and execution evidence;
+restoring those rounds requires a separately authenticated recovery contract. This
+change prevents known caller mismatches at admission and corrects new skip reporting;
+it does not repair already consumed canary budgets or authorize merging a blocked PR.
 
 Claude and Gemini baseline callers expose a `workflow_dispatch` input pair:
 `pr_number` (required) and `force_review` (boolean, default `false`). A force claim is accepted only

@@ -1439,7 +1439,10 @@ def test_claude_budget_claim_is_durable_before_provider_and_every_model_path_is_
     claim = _step(workflow, "claude-review", "Claim Claude review budget")
     assert claim["if"] == (
         "${{ always() && steps.prepare-review-input.outcome == 'success' "
-        "&& steps.stage-claude-budget-input.outcome == 'success' }}"
+        "&& steps.stage-claude-budget-input.outcome == 'success' "
+        "&& (steps.prepare-diff.outputs.diff-ready != 'true' "
+        "|| steps.prepare-diff.outputs.diff-mode == 'unchanged' "
+        "|| steps.claude-workflow-validation.outputs.allowed == 'true') }}"
     )
     assert claim["with"] == {
         "github-token": "${{ github.token }}",
@@ -2433,7 +2436,8 @@ def test_claude_model_step_requires_prepared_diff_but_upsert_can_stamp_failure_a
         "${{ !cancelled() && steps.prepare-review-input.outcome == 'success' "
         "&& (steps.prepare-diff.outputs.diff-ready != 'true' "
         "|| steps.prepare-diff.outputs.diff-mode == 'unchanged' "
-        "|| steps.review-budget-claim.outputs.allow-invocation == 'true') }}"
+        "|| steps.review-budget-claim.outputs.allow-invocation == 'true' "
+        "|| steps.claude-workflow-validation.outcome == 'failure') }}"
     )
 
 
@@ -2462,7 +2466,8 @@ def test_claude_cleanup_rejects_seeded_candidate_when_provider_writes_nothing(tm
         "${{ always() && steps.reset-claude-artifacts.outcome == 'success' "
         "&& steps.prepare-diff.outputs.diff-ready == 'true' "
         "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
-        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+        "&& steps.claude-execution.outputs.call_count == '1' }}"
     )
 
     workspace = tmp_path / "workspace"
@@ -2546,7 +2551,8 @@ def test_claude_uses_one_shared_canonicalizer_and_upsert_reads_only_canonical_fi
         "${{ always() && steps.reset-claude-artifacts.outcome == 'success' "
         "&& steps.prepare-diff.outputs.diff-ready == 'true' "
         "&& steps.prepare-diff.outputs.diff-mode != 'unchanged' "
-        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' }}"
+        "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
+        "&& steps.claude-execution.outputs.call_count == '1' }}"
     )
     upsert = _step(workflow, "claude-review", "Upsert review comment")
     script = upsert["with"]["script"]
@@ -4489,6 +4495,7 @@ def _claude_upsert(
     workflow_runs: list[dict] | None = None,
     workflow_run_attempt_sequences: dict[str, list[dict]] | None = None,
     candidate_artifact: str = "success",
+    provider_failure_reason: str = "",
 ) -> list:
     workdir = tmp_path / ("with-review" if with_review else "without-review")
     workdir.mkdir()
@@ -4502,6 +4509,7 @@ def _claude_upsert(
         "SERVER_URL": "https://github.com",
         "REPOSITORY": "example/repo",
         "REVIEW_OUTCOME": outcome,
+        "PROVIDER_FAILURE_REASON": provider_failure_reason,
         "DIFF_READY": diff_ready,
         "RUN_ID": run_id,
         "RUN_ATTEMPT": run_attempt,

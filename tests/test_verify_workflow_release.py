@@ -248,6 +248,7 @@ def current_release_repo(tmp_path: Path) -> tuple[Path, str]:
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v175_claude_validation(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
     restore_pre_v170_opencode_finding_ids(repo)
@@ -528,6 +529,18 @@ def assert_pre_v160_workflow_bytes(repo: Path) -> None:
         )
 
 
+def restore_pre_v175_claude_validation(repo: Path) -> None:
+    tree = release_verifier.VerifiedCommitTree.open(
+        ROOT, "eb460b7e547a85f831820f8f25d30f134b2c6254"
+    )
+    relative = ".github/workflows/claude-code-review.yml"
+    payload = tree.read_file(relative)
+    assert hashlib.sha256(payload).hexdigest() == (
+        "a6116cf542876a46e8401e26471324a586772398ad5d21360155e686123104be"
+    )
+    (repo / relative).write_bytes(payload)
+
+
 def copy_review_policy_release_files(repo: Path) -> None:
     for relative in (
         ".github/actions/resolve-review-policy/action.yml",
@@ -551,6 +564,7 @@ def copy_review_policy_release_files(repo: Path) -> None:
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+    restore_pre_v175_claude_validation(repo)
 
 
 def prepare_v151(repo: Path) -> str:
@@ -2275,6 +2289,46 @@ def test_v174_accepts_expanded_review_budget_release_contract(
     candidate = prepare_v174(repo)
 
     assert release_verifier.verify_commit_content(repo, "v1.74", candidate) == candidate
+
+
+def prepare_v175(repo: Path) -> str:
+    prepare_v174(repo)
+    relative = ".github/workflows/claude-code-review.yml"
+    shutil.copy2(ROOT / relative, repo / relative)
+    return commit(repo, "v1.75 candidate")
+
+
+def test_v175_accepts_claude_validation_without_changing_v174(current_release_repo):
+    repo, _ = current_release_repo
+    old = prepare_v174(repo)
+    candidate = prepare_v175(repo)
+    assert release_verifier.verify_commit_content(repo, "v1.74", old) == old
+    assert release_verifier.verify_commit_content(repo, "v1.75", candidate) == candidate
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.75", old)
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.74", candidate)
+
+
+@pytest.mark.parametrize(("step", "old", "new"), [
+    ("Claim Claude review budget", "steps.claude-workflow-validation.outputs.allowed == 'true'", "true"),
+    ("Validate Claude caller workflow", "ref: workflowSha", "ref: 'HEAD'"),
+    ("Validate Claude caller workflow", "current.sha !== baseline.sha", "false"),
+    ("Resolve Claude execution", "success:) call_count=0", "success:) call_count=1"),
+    ("Validate Claude review metrics", "steps.claude-execution.outputs.call_count", "steps.claude-budget-metrics-start.outputs.call_count"),
+    ("Upsert review comment", "steps.claude-execution.outputs.provider_outcome", "steps.claude-review.outcome"),
+])
+def test_v175_rejects_claude_validation_wiring_drift(current_release_repo, monkeypatch, step, old, new):
+    repo, _ = current_release_repo
+    prepare_v175(repo)
+    path = repo / ".github/workflows/claude-code-review.yml"
+    mutate_named_step_text(path, step, old, new)
+    bad = commit(repo, "weaken Claude validation")
+    # A digest re-seal alone must not authorize weaker execution semantics.
+    digests = getattr(release_verifier, "EXPECTED_CLAUDE_VALIDATION_WORKFLOW_SHA256", {})
+    monkeypatch.setitem(digests, "claude", hashlib.sha256(path.read_bytes()).hexdigest())
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.75", bad)
 
 
 def test_v174_expanded_review_budget_is_rejected_on_the_v173_release_line(
