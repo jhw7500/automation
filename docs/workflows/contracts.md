@@ -42,6 +42,68 @@ The renderer may update only these two scalars in an existing
 An explicitly approved bootstrap creates the canonical disabled config. Never hand-edit a
 caller to use a moving tag or branch.
 
+## OpenCode original-attempt finalization recovery (v1.76)
+
+The separate `opencode-recover-finalization.yml` reusable workflow repairs only an
+authenticated original OpenCode attempt whose provider execution, candidate validation,
+canonical publication and outcome resolution succeeded, but budget finalization failed.
+It finalizes the existing invocation and adds zero provider calls and zero review rounds.
+Normal claim/finalize rules remain strict; an ordinary failed Actions run remains untrusted.
+
+| Identity | Preserved or recorded fields |
+| --- | --- |
+| Original provider invocation | Run ID/attempt, caller and central SHA, HEAD/full diff, round, estimated input usage, original actual calls and elapsed time |
+| Recovery driver | Its own run ID/attempt, caller/head and immutable central SHA; never a provider invocation |
+| Recovery receipt | Original invocation digest, canonical comment/Check and evidence digests, plus both provenance chains |
+
+```text
+original failed finalizer -> authenticate original evidence -> finalize original entry
+                                                          -> verify ledger readback
+                                                          -> recovery Check + successful driver job
+                                                          -> authenticated zero-call reuse
+```
+
+Both normal OpenCode collectors discover the distinct
+`automation/opencode-finalization-recovery` Check from bounded server run evidence.
+They require the exact recovery run and `opencode-recover-finalization` job to finish
+successfully and validate the original canonical bytes and finalized invocation.
+Generation ordering uses the original provider run/attempt. Later unrelated ledger
+handoff changes do not invalidate the original invocation digest. Checks have the
+existing trust ceiling: they are not signatures against unrelated workflows with
+`checks:write` authority.
+
+Recovery shares the normal `automation-opencode-auto-review-<repository>-<PR>`
+concurrency group with `cancel-in-progress: false`. The transport rereads PR HEAD/base,
+canonical comment/Check and ledger immediately before writing. This is a bounded
+prewrite comparison under Actions serialization, not atomic compare-and-swap protection
+against arbitrary external writers. It sends at most one ledger PATCH; a lost response
+permits one readback, never a blind second PATCH. Exact already-finalized state is a
+no-op; a later authenticated retry can finish missing receipt publication.
+
+Initial recovery requires the live, unexpired original handoff, claim checkpoint and
+candidate artifacts, with exact API identity/digests and bounded safe ZIP contents.
+Expired or unavailable evidence refuses without writes or a budget refund. Local
+archives cannot substitute for live artifacts. A completed, fully authenticated recovery
+receipt may support later reuse or an identical already-recovered no-op after expiry;
+it cannot authorize a new target or write.
+
+Adopting the caller is a separate immutable release adoption. Its ordinary and recovery
+`uses:` targets must carry the same verified 40-character automation commit. Manual
+recovery supplies `pr_number`, `recovery_original_run_id`,
+`recovery_original_run_attempt`, `recovery_expected_head_sha` and
+`recovery_expected_base_sha`; `recover_finalization` selects the recovery route.
+Any recovery input routes away from normal review, malformed inputs fail before writes,
+and `force_review` combined with any recovery input is rejected. The recovery job passes
+no model secrets and executes trusted helpers from the API-verified central SHA; the
+target checkout and downloaded artifacts are data only.
+
+The recovery job grants exactly `actions:read`, `contents:read`, `issues:write`,
+`pull-requests:read` and `checks:write`, with no workflow-level permission grant.
+Release v1.76 owns and seals all four recovery helpers, the recovery workflow and caller,
+the updated normal receipt collectors and budget helper. Immutable v1.74/v1.75
+acceptance remains unchanged. This implementation pass performs no release publication,
+consumer adoption, live recovery or provider execution; those remain separate actions.
+
 ## Same-name credential mappings
 
 Model credential names are fixed by authentication family, and every mapping uses the

@@ -1,0 +1,119 @@
+name: Recover OpenCode finalization
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        required: true
+      original_run_id:
+        type: string
+        required: true
+      original_run_attempt:
+        type: string
+        required: true
+      expected_head_sha:
+        type: string
+        required: true
+      expected_base_sha:
+        type: string
+        required: true
+
+concurrency:
+  group: automation-opencode-auto-review-${{ github.repository }}-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  opencode-recover-finalization:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Validate recovery driver and immutable central revision
+        id: driver
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
+        env:
+          RECOVERY_PR: ${{ inputs.pr_number }}
+          ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+          ORIGINAL_RUN_ATTEMPT: ${{ inputs.original_run_attempt }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          EXPECTED_BASE_SHA: ${{ inputs.expected_base_sha }}
+        with:
+          script: |
+            const positive = (value) => typeof value === 'string'
+              && /^[1-9][0-9]*$/.test(value) && Number.isSafeInteger(Number(value));
+            if (context.eventName !== 'workflow_dispatch'
+              || process.env.GITHUB_SERVER_URL !== 'https://github.com'
+              || ![process.env.RECOVERY_PR, process.env.ORIGINAL_RUN_ID,
+                process.env.ORIGINAL_RUN_ATTEMPT, process.env.GITHUB_RUN_ID,
+                process.env.GITHUB_RUN_ATTEMPT].every(positive)
+              || ![process.env.EXPECTED_HEAD_SHA, process.env.EXPECTED_BASE_SHA]
+                .every((v) => /^[0-9a-f]{40}$/.test(v || ''))) {
+              throw new Error('recovery_input_invalid');
+            }
+            const {data: run} = await github.rest.actions.getWorkflowRunAttempt({
+              ...context.repo, run_id: Number(process.env.GITHUB_RUN_ID),
+              attempt_number: Number(process.env.GITHUB_RUN_ATTEMPT),
+            });
+            const prefix = 'jhw7500/automation/.github/workflows/opencode-recover-finalization.yml@';
+            const refs = (run.referenced_workflows || []).filter((r) => r.path?.startsWith(prefix));
+            if (run.id !== Number(process.env.GITHUB_RUN_ID)
+              || run.run_attempt !== Number(process.env.GITHUB_RUN_ATTEMPT)
+              || run.event !== 'workflow_dispatch' || run.status !== 'in_progress'
+              || run.repository?.full_name !== process.env.GITHUB_REPOSITORY
+              || !/^[0-9a-f]{40}$/.test(run.head_sha || '')
+              || !/^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(run.path || '')
+              || run.path.includes('..') || refs.length !== 1
+              || !/^[0-9a-f]{40}$/.test(refs[0].sha || '')
+              || refs[0].path !== prefix + refs[0].sha) {
+              throw new Error('recovery_driver_invalid');
+            }
+            core.setOutput('central_sha', refs[0].sha);
+      - name: Checkout trusted recovery implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jhw7500/automation
+          ref: ${{ steps.driver.outputs.central_sha }}
+          path: automation-recovery
+          persist-credentials: false
+      - name: Checkout exact reviewed Git objects
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.expected_head_sha }}
+          path: review-target
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recover original finalization with zero provider calls
+        working-directory: automation-recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECOVERY_PR: ${{ inputs.pr_number }}
+          ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+          ORIGINAL_RUN_ATTEMPT: ${{ inputs.original_run_attempt }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          EXPECTED_BASE_SHA: ${{ inputs.expected_base_sha }}
+          RECOVERY_CENTRAL_SHA: ${{ steps.driver.outputs.central_sha }}
+          TARGET_WORKSPACE: ${{ github.workspace }}/review-target
+          RECOVERY_CHECKPOINT: ${{ runner.temp }}/opencode-recovery-checkpoint.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e 'if (Number(process.versions.node.split(".")[0]) < 20) process.exit(1)'
+          python3 .github/actions/recover-opencode-review/transport.py \
+            --workspace "$TARGET_WORKSPACE" --checkpoint "$RECOVERY_CHECKPOINT"
+      - name: Upload recovery checkpoint
+        if: ${{ always() && steps.driver.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/opencode-recovery-checkpoint.json
+          if-no-files-found: ignore
+          retention-days: 7

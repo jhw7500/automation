@@ -9,6 +9,32 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import hashlib
+
+
+def restore_pre_v176_opencode_recovery(repo: Path) -> None:
+    """Restore authenticated pre-recovery bytes only when new recovery markers exist."""
+    from scripts.verify_workflow_release import VerifiedCommitTree
+
+    root = Path(__file__).resolve().parents[1]
+    tree = None
+    for relative, marker in (
+        (".github/workflows/opencode-auto-review.yml", b"recover-opencode-review"),
+        (".github/actions/review-invocation-budget/review_invocation_budget.py", b"def recover_finalize("),
+        ("examples/baseline-workflows/.github/workflows/opencode-auto-review.yml", b"recover_finalization:"),
+        ("scripts/workflow-catalog.json", b'"opencode-recovery"'),
+    ):
+        path = repo / relative
+        if path.is_file() and marker in path.read_bytes():
+            if tree is None:
+                tree = VerifiedCommitTree.open(root, "6dc5934ecd6bd1c298e8b7fb869b412b0828ff7c")
+            payload = tree.read_file(relative)
+            if relative == ".github/workflows/opencode-auto-review.yml":
+                assert hashlib.sha256(payload).hexdigest() == "f81db9665847aea815c8691caea7c6458011595cbed28c13809f051c381b5e91"
+            if relative.endswith("review_invocation_budget.py"):
+                assert hashlib.sha256(payload).hexdigest() == "9be3f16b8254a3268788ffecdf653cd821a3ed3452022dceebed67e1c90f1aad"
+            path.write_bytes(payload)
+    (repo / ".github/workflows/opencode-recover-finalization.yml").unlink(missing_ok=True)
 
 
 HISTORICAL_REVIEW_FIXTURE_ROOT = (
@@ -64,6 +90,7 @@ def restore_pre_v164_label_trigger(repo: Path) -> None:
     first) so the older restores still find the text they assert on.
     """
 
+    restore_pre_v176_opencode_recovery(repo)
     # Idempotent: a fixture that already restored (or never had) the v1.64 text is
     # left alone, so this can also run first inside the older restore chains.
     for workflow in ("claude-code-review.yml", "gemini-auto-review.yml", "opencode-auto-review.yml"):
@@ -578,6 +605,7 @@ def restore_historical_review_workflows(
     Keeping them in the test tree makes historical fixtures independent of Git history.
     """
 
+    restore_pre_v176_opencode_recovery(repo)
     for filename in filenames:
         relative = f".github/workflows/{filename}"
         (repo / relative).write_bytes(
@@ -753,6 +781,7 @@ PRE_V173_OPENCODE_ACTIVE_SECTION_ORDER_HUNKS = (
 def restore_pre_v173_opencode_active_section_order(repo: Path) -> None:
     """Restore the v1.72 positional renderer and append-only active section."""
 
+    restore_pre_v176_opencode_recovery(repo)
     path = repo / ".github/workflows/opencode-auto-review.yml"
     if not path.exists():
         return

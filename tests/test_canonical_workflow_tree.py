@@ -230,6 +230,30 @@ EXPECTED_TRIGGERS: dict[str, object] = {
     },
 }
 
+EXPECTED_TRIGGERS["opencode-auto-review.yml"]["workflow_dispatch"]["inputs"].update({
+    "recover_finalization": {
+        "description": "Finalize a successful original review with zero additional provider calls",
+        "type": "boolean", "required": "false", "default": "false",
+    },
+    "recovery_original_run_id": {
+        "description": "Original failed Actions run ID", "type": "string", "required": "false",
+    },
+    "recovery_original_run_attempt": {
+        "description": "Exact original Actions attempt", "type": "string", "required": "false",
+    },
+    "recovery_expected_head_sha": {
+        "description": "Exact reviewed PR HEAD (40 lowercase hex)", "type": "string", "required": "false",
+    },
+    "recovery_expected_base_sha": {
+        "description": "Exact original PR base (40 lowercase hex)", "type": "string", "required": "false",
+    },
+})
+
+OPENCODE_RECOVERY_PERMISSIONS = {
+    "actions": "read", "checks": "write", "contents": "read",
+    "issues": "write", "pull-requests": "read",
+}
+
 CLAUDE_COMMAND_PERMISSIONS = {
     "actions": "read",
     "contents": "read",
@@ -301,21 +325,32 @@ def caller_job_contracts(
 
 def central_accepts(entry: CatalogEntry, central_root: Path) -> bool:
     assert entry.central_workflow is not None
-    central = load_yaml(central_root / entry.central_workflow)
-    call = central["on"]["workflow_call"]
-    declared_inputs = set(call.get("inputs", {}))
-    declared_secrets = call.get("secrets", {})
-    required_secrets = {
-        name
-        for name, value in declared_secrets.items()
-        if value.get("required", "false") == "true"
-    }
-    return all(
-        set(job.with_keys) <= declared_inputs
-        and set(job.secrets) <= set(declared_secrets)
-        and required_secrets <= set(job.secrets)
-        for job in entry.caller_jobs
-    )
+    caller = load_yaml(CANONICAL / entry.path.relative_to(".github"))
+    for job in entry.caller_jobs:
+        target = entry.central_workflow
+        if (entry.path.as_posix() == ".github/workflows/opencode-auto-review.yml"
+            and job.name == "opencode-recovery"):
+            target = "opencode-recover-finalization.yml"
+        assert caller["jobs"][job.name]["uses"] == (
+            f"jhw7500/automation/.github/workflows/{target}@__AUTOMATION_COMMIT__"
+        )
+        call = load_yaml(central_root / target)["on"]["workflow_call"]
+        declared_inputs = call.get("inputs", {})
+        required_inputs = {
+            name for name, value in declared_inputs.items()
+            if value.get("required", "false") == "true"
+        }
+        declared_secrets = call.get("secrets", {})
+        required_secrets = {
+            name for name, value in declared_secrets.items()
+            if value.get("required", "false") == "true"
+        }
+        if not (set(job.with_keys) <= set(declared_inputs)
+                and required_inputs <= set(job.with_keys)
+                and set(job.secrets) <= set(declared_secrets)
+                and required_secrets <= set(job.secrets)):
+            return False
+    return True
 
 
 def test_canonical_tree_is_exactly_catalogued() -> None:
@@ -379,10 +414,12 @@ def test_triggers_and_permissions_match_the_approved_policy() -> None:
         assert workflow["on"] == expected_trigger, filename
 
         contracts = caller_job_contracts(workflow)
-        assert len(contracts) == 1, filename
         expected_name, expected_permissions = EXPECTED_CALLER_PERMISSIONS[filename]
-        assert contracts[0].name == expected_name, filename
-        assert dict(contracts[0].permissions) == expected_permissions, filename
+        expected = [(expected_name, expected_permissions)]
+        if filename == "opencode-auto-review.yml":
+            expected.insert(0, ("opencode-recovery", OPENCODE_RECOVERY_PERMISSIONS))
+            assert workflow["jobs"]["reject-conflicting-dispatch"]["permissions"] == {}
+        assert [(job.name, dict(job.permissions)) for job in contracts] == expected, filename
 
 
 def test_canonical_callers_match_catalog_and_central_contracts() -> None:
@@ -411,14 +448,22 @@ def test_canonical_callers_use_only_the_selected_auth_contract() -> None:
         assert reusable_ref.search(text) is None, path
 
         reusable_jobs = [
-            job
-            for job in workflow["jobs"].values()
+            (name, job)
+            for name, job in workflow["jobs"].items()
             if isinstance(job, dict)
             and "jhw7500/automation/.github/workflows/" in job.get("uses", "")
         ]
         assert reusable_jobs, path
-        for job in reusable_jobs:
-            if entry.auth_family == "gemini":
+        for name, job in reusable_jobs:
+            if (entry.path.as_posix() == ".github/workflows/opencode-auto-review.yml"
+                and name == "opencode-recovery"):
+                assert job["uses"] == (
+                    "jhw7500/automation/.github/workflows/"
+                    "opencode-recover-finalization.yml@__AUTOMATION_COMMIT__"
+                )
+                assert job["permissions"] == OPENCODE_RECOVERY_PERMISSIONS
+                assert "secrets" not in job
+            elif entry.auth_family == "gemini":
                 assert job["with"]["repo_write_auth"] == "github_app"
                 assert job["with"]["app_id"] == "${{ vars.APP_ID }}"
                 if entry.central_workflow == "gemini-auto-review.yml":

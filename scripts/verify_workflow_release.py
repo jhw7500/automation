@@ -60,6 +60,7 @@ from scripts.workflow_release_inventory import (
     release_supports_opencode_active_section_order,
     release_supports_expanded_review_budget,
     release_supports_claude_workflow_validation,
+    release_supports_opencode_recovery,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
@@ -839,6 +840,48 @@ EXPECTED_CLAUDE_VALIDATION_WORKFLOW_SHA256 = {
     **EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256,
     "claude": "63c672654918c95de9636062f68d33d43845d64c4a674ff54c03bf90ec3d48ce",
 }
+# v1.76 adds a separate zero-provider recovery path. These literal seals are
+# reviewed release inputs, never learned from the candidate tree at runtime.
+EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256 = {
+    **EXPECTED_CLAUDE_VALIDATION_WORKFLOW_SHA256,
+    "opencode": "9cc171e9c11de4c6719d73922fed0373c5db0281feae7488c55c7447025bf0ab",
+}
+EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176 = "3e8decf2bf21d007d40c0dc011b173ed0af6b2e15ae8827ae51f6986e90b813f"
+EXPECTED_OPENCODE_RECOVERY_SHA256 = {
+    ".github/actions/recover-opencode-review/evidence.py": "3b43f256e77c89fbd123cc155dc8931cf02701d2a642bf280cbc795253ea81b8",
+    ".github/actions/recover-opencode-review/replay.js": "1756d715e529dbe66dbea0674b2ca157a80fee5069309ec902eec7de19556a3b",
+    ".github/actions/recover-opencode-review/receipt.js": "65566b1625775a6b9917207c6ddfd10fb4e60f72e7dce7bdf3405a3c4cc2eb35",
+    ".github/actions/recover-opencode-review/transport.py": "045c8b49c6ffe78eeabe878586d0206468dd904c12e0783ae1365dad81c5b676",
+    ".github/workflows/opencode-recover-finalization.yml": "fe20cac47531cb43d7b924686be0154b5c5aa988462c509800a9966c9dd64270",
+    "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml": "8b0751992dacd8d70cb300f66983ecd08ae9e3af9c7bf92a9130a1c7ce661761",
+}
+RECOVERY_WORKFLOW = "opencode-recover-finalization.yml"
+RECOVERY_CALLER = "examples/baseline-workflows/.github/workflows/opencode-auto-review.yml"
+RECOVERY_PERMISSIONS = {
+    "actions": "read", "checks": "write", "contents": "read",
+    "issues": "write", "pull-requests": "read",
+}
+RECOVERY_INPUTS = (
+    "pr_number", "original_run_id", "original_run_attempt",
+    "expected_head_sha", "expected_base_sha",
+)
+RECOVERY_DISPATCH_INPUTS = {
+    "recover_finalization": {
+        "description": "Finalize a successful original review with zero additional provider calls",
+        "type": "boolean", "required": "false", "default": "false",
+    },
+    **{
+        key: {"description": description, "type": "string", "required": "false"}
+        for key, description in (
+            ("recovery_original_run_id", "Original failed Actions run ID"),
+            ("recovery_original_run_attempt", "Exact original Actions attempt"),
+            ("recovery_expected_head_sha", "Exact reviewed PR HEAD (40 lowercase hex)"),
+            ("recovery_expected_base_sha", "Exact original PR base (40 lowercase hex)"),
+        )
+    },
+}
+RECOVERY_NORMAL_GUARD = " && ".join("!inputs." + key for key in RECOVERY_DISPATCH_INPUTS)
+RECOVERY_REQUEST_GUARD = "(" + " || ".join("inputs." + key for key in RECOVERY_DISPATCH_INPUTS) + ")"
 EXPECTED_CLAUDE_CALLER_VALIDATION_SHA256 = (
     "c723636ffdf202b3888c7903704353edb6367630a46b50e77412389b43d566db"
 )
@@ -2546,6 +2589,7 @@ def verify_opencode_runtime(
         EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256["opencode"],
         EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256["opencode"],
         EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256["opencode"],
+        EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["opencode"],
     }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
@@ -2585,6 +2629,7 @@ def verify_opencode_runtime(
             EXPECTED_OPENCODE_DISMISSAL_WORKFLOW_SHA256["opencode"],
             EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256["opencode"],
             EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256["opencode"],
+            EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["opencode"],
         }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
@@ -3520,7 +3565,10 @@ def _verify_tag_catalog(
                 r"([^\s'\"]+)",
                 text,
             )
-            if uses != [(entry.central_workflow, "__AUTOMATION_COMMIT__")]:
+            expected_uses = [(entry.central_workflow, "__AUTOMATION_COMMIT__")]
+            if release_supports_opencode_recovery(ref) and name == RECOVERY_CALLER:
+                expected_uses.insert(0, (RECOVERY_WORKFLOW, "__AUTOMATION_COMMIT__"))
+            if uses != expected_uses:
                 raise ReleaseVerificationError(
                     f"{name} central target or release placeholder violates the catalog"
                 )
@@ -6154,7 +6202,9 @@ def _verify_review_invocation_budget(
         ),
         REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix(): (
             helper_payload,
-            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V174
+            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176
+            if release_supports_opencode_recovery(ref)
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V174
             if release_supports_expanded_review_budget(ref)
             else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V171
             if release_supports_opencode_dismissals(ref)
@@ -6168,7 +6218,9 @@ def _verify_review_invocation_budget(
         ),
     }
     workflow_digests = (
-        EXPECTED_CLAUDE_VALIDATION_WORKFLOW_SHA256
+        EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256
+        if release_supports_opencode_recovery(ref)
+        else EXPECTED_CLAUDE_VALIDATION_WORKFLOW_SHA256
         if release_supports_claude_workflow_validation(ref)
         else EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256
         if release_supports_opencode_active_section_order(ref)
@@ -6424,10 +6476,15 @@ def _verify_review_policy_callers(tree: VerifiedCommitTree, ref: str) -> None:
                 tree.read_file(path),
                 reject_duplicate_keys=True,
             )
-            if not isinstance(document, dict) or document.get("on") != trigger:
+            expected_trigger = deepcopy(trigger)
+            expected_if = caller_if
+            if release_supports_opencode_recovery(ref) and workflow == "opencode-auto-review.yml":
+                expected_trigger["workflow_dispatch"]["inputs"].update(RECOVERY_DISPATCH_INPUTS)
+                expected_if = caller_if[:-1] + " && " + RECOVERY_NORMAL_GUARD + ")"
+            if not isinstance(document, dict) or document.get("on") != expected_trigger:
                 raise ValueError("caller trigger differs")
             job = document["jobs"][job_name]
-            if _normalize_expression(job.get("if")) != caller_if:
+            if _normalize_expression(job.get("if")) != expected_if:
                 raise ValueError("caller draft/manual guard differs")
             values = job["with"]
             if (
@@ -7332,6 +7389,96 @@ def _verify_gemini_workflow(name: str, document: dict, ref: str) -> None:
         raise ReleaseVerificationError(f"{name} has no setup-gemini-auth resolver")
 
 
+def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
+    """Authenticate the separate recovery execution surface and admission gates."""
+    path = ".github/workflows/" + RECOVERY_WORKFLOW
+    if not release_supports_opencode_recovery(ref):
+        if any(blob.path.as_posix() == path for blob in tree.files(".github/workflows")):
+            raise ReleaseVerificationError("OpenCode recovery requires v1.76")
+        return
+    helper_paths = {
+        blob.path.as_posix() for blob in tree.files(".github/actions/recover-opencode-review")
+    }
+    if helper_paths != {
+        ".github/actions/recover-opencode-review/" + name
+        for name in ("evidence.py", "replay.js", "receipt.js", "transport.py")
+    }:
+        raise ReleaseVerificationError("OpenCode recovery inventory is not closed")
+    try:
+        document = _load_release_yaml(tree.read_file(path), reject_duplicate_keys=True)
+        job = document["jobs"]["opencode-recover-finalization"]
+        steps = job["steps"]
+        driver, trusted, target, recover, checkpoint = steps
+        caller = _load_release_yaml(tree.read_file(RECOVERY_CALLER), reject_duplicate_keys=True)
+        recovery_job = caller["jobs"]["opencode-recovery"]
+        reject = caller["jobs"]["reject-conflicting-dispatch"]
+        if (
+            document.get("on") != {"workflow_call": {"inputs": {
+                name: {"type": "string", "required": "true"} for name in RECOVERY_INPUTS
+            }}}
+            or document.get("permissions") != {}
+            or document.get("concurrency") != {
+                "group": "automation-opencode-auto-review-${{ github.repository }}-${{ inputs.pr_number }}",
+                "cancel-in-progress": "false",
+            }
+            or set(document["jobs"]) != {"opencode-recover-finalization"}
+            or job.get("permissions") != RECOVERY_PERMISSIONS
+            or job.get("runs-on") != "ubuntu-latest" or job.get("timeout-minutes") != "20"
+            or set(job) != {"runs-on", "timeout-minutes", "permissions", "steps"}
+            or trusted.get("uses") != CHECKOUT_ACTION
+            or trusted.get("with") != {
+                "repository": "jhw7500/automation", "ref": "${{ steps.driver.outputs.central_sha }}",
+                "path": "automation-recovery", "persist-credentials": "false",
+            }
+            or target.get("uses") != CHECKOUT_ACTION
+            or target.get("with") != {
+                "repository": "${{ github.repository }}", "ref": "${{ inputs.expected_head_sha }}",
+                "path": "review-target", "fetch-depth": "0", "persist-credentials": "false",
+            }
+            or driver.get("id") != "driver"
+            or driver.get("uses") != "actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea"
+            or any(key in driver for key in ("if", "continue-on-error"))
+            or recover.get("working-directory") != "automation-recovery"
+            or recover.get("shell") != "bash"
+            or checkpoint.get("uses") != UPLOAD_ARTIFACT_ACTION
+            or checkpoint.get("with", {}).get("retention-days") != "7"
+            or recovery_job.get("permissions") != RECOVERY_PERMISSIONS
+            or set(recovery_job) != {"if", "permissions", "uses", "with"}
+            or recovery_job.get("uses") != "jhw7500/automation/.github/workflows/" + RECOVERY_WORKFLOW + "@__AUTOMATION_COMMIT__"
+            or recovery_job.get("with") != {
+                "pr_number": "${{ format('{0}', inputs.pr_number) }}",
+                **{name: "${{ inputs.recovery_" + name + " }}" for name in RECOVERY_INPUTS[1:]},
+            }
+            or _normalize_expression(recovery_job.get("if")) != (
+                "github.event_name == 'workflow_dispatch' && !inputs.force_review && " + RECOVERY_REQUEST_GUARD
+            )
+            or _normalize_expression(reject.get("if")) != (
+                "github.event_name == 'workflow_dispatch' && inputs.force_review && " + RECOVERY_REQUEST_GUARD
+            )
+            or reject.get("permissions") != {}
+            or reject.get("steps") != [{"name": "Reject conflicting recovery and force-review inputs", "run": "exit 1"}]
+            or set(caller["jobs"]) != {"reject-conflicting-dispatch", "opencode-recovery", "opencode-review"}
+        ):
+            raise ValueError("recovery execution or caller gate differs")
+        script = driver["with"]["script"]
+        for guard in (
+            "context.eventName !== 'workflow_dispatch'", "Number.isSafeInteger(Number(value))",
+            "/^[1-9][0-9]*$/", "/^[0-9a-f]{40}$/", "getWorkflowRunAttempt",
+            "run.run_attempt !== Number(process.env.GITHUB_RUN_ATTEMPT)",
+            "run.repository?.full_name !== process.env.GITHUB_REPOSITORY",
+            "refs.length !== 1", "refs[0].path !== prefix + refs[0].sha",
+        ):
+            if guard not in script:
+                raise ValueError("recovery input/provenance guard differs")
+        if any(secret in tree.read_text(path) for secret in ("ZHIPU_API_KEY", "secrets:", "opencode run", "pip install", "npm install")):
+            raise ValueError("provider execution is forbidden in recovery")
+        for relative, expected in EXPECTED_OPENCODE_RECOVERY_SHA256.items():
+            if hashlib.sha256(tree.read_file(relative)).hexdigest() != expected:
+                raise ReleaseVerificationError("OpenCode recovery authenticated source digest differs: " + relative)
+    except (AttributeError, KeyError, TypeError, ValueError, yaml.YAMLError):
+        raise ReleaseVerificationError("OpenCode recovery execution/caller contract is invalid") from None
+
+
 def _verify_commit_content(
     repo: Path, ref: str, revision: str
 ) -> VerifiedCommitTree:
@@ -7339,6 +7486,7 @@ def _verify_commit_content(
     if _release_version(ref) >= (1, 40):
         _release_inventory(tree, ref)
         _verify_setup_gemini_auth(tree, ref)
+    _verify_opencode_recovery(tree, ref)
     if release_supports_prepare_review_diff(ref):
         _verify_prepare_review_diff_action(tree, ref)
     if release_supports_canonicalize_review(ref):
@@ -7439,6 +7587,9 @@ def _verify_commit_content(
                 or not set(job.secrets) <= set(declared_secrets)
                 or not required_secrets <= set(job.secrets)
                 for job in entry.caller_jobs
+                if not (release_supports_opencode_recovery(ref)
+                        and entry.path.as_posix() == ".github/workflows/opencode-auto-review.yml"
+                        and job.name == "opencode-recovery")
             ):
                 raise ReleaseVerificationError(
                     f"{entry.path} is incompatible with {entry.central_workflow}"
@@ -7858,8 +8009,8 @@ def _verify_commit_content(
         self_job = self_document.get("jobs", {}).get("opencode-review", {})
         if (
             opencode_entry is None
-            or len(opencode_entry.caller_jobs) != 1
-            or dict(opencode_entry.caller_jobs[0].permissions) != expected_caller_permissions
+            or len(opencode_entry.caller_jobs) != (2 if release_supports_opencode_recovery(ref) else 1)
+            or dict(opencode_entry.caller_jobs[-1].permissions) != expected_caller_permissions
             or self_job.get("permissions") != expected_caller_permissions
             or self_job.get("uses") != "./.github/workflows/opencode-auto-review.yml"
         ):
