@@ -74,6 +74,7 @@ class VerifiedModules:
     release_bundle: ModuleType
     inventory: ModuleType
     rollout: ModuleType
+    canonicalizer: ModuleType
 
 
 class EvidenceProvider(Protocol):
@@ -246,6 +247,34 @@ def load_trusted_yaml() -> None:
     raise VerificationError("verifier_dependency_invalid")
 
 
+def _load_verified_canonicalizer(root: Path) -> ModuleType:
+    canonicalizer_root = root / ".github/actions/canonicalize-review"
+
+    def load_exact(name: str, filename: str) -> ModuleType:
+        path = canonicalizer_root / filename
+        existing = sys.modules.get(name)
+        if existing is not None:
+            if Path(existing.__file__) != path:
+                raise ImportError
+            return existing
+        specification = importlib.util.spec_from_file_location(name, path)
+        if specification is None or specification.loader is None:
+            raise ImportError
+        module = importlib.util.module_from_spec(specification)
+        sys.modules[name] = module
+        try:
+            specification.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        if Path(module.__file__) != path:
+            raise ImportError
+        return module
+
+    load_exact("review_scope", "review_scope.py")
+    return load_exact("canonicalize_review", "canonicalize_review.py")
+
+
 def load_verified_modules(root: Path) -> VerifiedModules:
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(root))
@@ -256,7 +285,7 @@ def load_verified_modules(root: Path) -> VerifiedModules:
         for module in modules:
             if not Path(module.__file__).is_relative_to(root):
                 raise ImportError
-        return VerifiedModules(*modules)
+        return VerifiedModules(*modules, _load_verified_canonicalizer(root))
     except (ImportError, OSError, ValueError):
         raise VerificationError("verifier_root_invalid") from None
 
@@ -675,8 +704,44 @@ def verify_automatic_failure(request: VerificationRequest, evidence: EvidencePro
         raise VerificationError("automatic_evidence_invalid") from None
 
 
+def _require_canonical_success_document(
+        canonicalizer: ModuleType, contract: ModuleType, request: VerificationRequest,
+        canonical: dict[str, object], state: dict[str, object], raw: bytes) -> None:
+    body = canonical.get("body")
+    if not isinstance(body, str):
+        raise ValueError
+    metadata = "\n".join((
+        "- Status: success",
+        "- Execution: performed",
+        f"- Run: https://github.com/{request.repository}/actions/runs/{state['run_id']}",
+        f"- Reviewed: {state['successful_head']}",
+        f"- Validation: accepted={state['accepted_count']}; filtered={state['filtered_count']}; "
+        f"normalized={state['normalized_count']}; filtered_max={state['filtered_max_severity']}",
+    ))
+    prefix = (
+        f"{contract.AUTOMATIC_HEADER}\n{contract.AUTOMATIC_MARKER}\n"
+        f"<!-- automation-state:{raw.decode('utf-8', 'strict')} -->\n\n{metadata}\n\n"
+    )
+    if not body.startswith(prefix):
+        raise ValueError
+    document = body[len(prefix):]
+    sections = canonicalizer._parse_document(document)
+    new = [canonicalizer._parse_prior_active(block, "claude")
+           for block in sections["New findings"]]
+    still_open = [canonicalizer._parse_prior_active(block, "claude")
+                  for block in sections["Still open"]]
+    resolved = [canonicalizer._validate_prior_closed(block)
+                for block in sections["Resolved"]]
+    retracted = [canonicalizer._validate_prior_closed(block)
+                 for block in sections["Retracted"]]
+    rendered = canonicalizer._render_document(new, still_open, resolved, retracted)
+    if rendered != document or len(new) + len(still_open) != state["accepted_count"]:
+        raise ValueError
+
+
 def verify_fallback_success(request: VerificationRequest, evidence: EvidenceProvider,
-                            automatic: dict[str, object], driver_commit: str) -> dict[str, object]:
+                            automatic: dict[str, object], driver_commit: str,
+                            canonicalizer: ModuleType) -> dict[str, object]:
     try:
         contract, comments, comment, parsed = _request_evidence(request, evidence)
         entry = _fallback_invocation(_ledger(request, comments), parsed, comment)
@@ -748,6 +813,9 @@ def verify_fallback_success(request: VerificationRequest, evidence: EvidenceProv
                 or state.get("route") != route or state.get("filtered_max_severity") != "none"
                 or any(type(state.get(key)) is not int or state[key] != 0 for key in ("accepted_count", "filtered_count", "normalized_count"))):
             raise ValueError
+        _require_canonical_success_document(
+            canonicalizer, contract, request, canonical, state, raw,
+        )
         return {"budget_status": "finalized", "canonical_comment_id": canonical["id"],
                 "canonical_state_sha256": hashlib.sha256(raw).hexdigest(), "driver_commit": driver_commit,
                 "filtered_max_severity": "none", "request_comment_id": comment["id"], "request_nonce": parsed.nonce,
@@ -788,7 +856,9 @@ def verify(request: VerificationRequest, evidence_provider: EvidenceProvider) ->
     except Exception:
         raise VerificationError("request_evidence_invalid") from None
     automatic = verify_automatic_failure(request, evidence)
-    fallback = verify_fallback_success(request, evidence, automatic, driver)
+    fallback = verify_fallback_success(
+        request, evidence, automatic, driver, modules.canonicalizer,
+    )
     require_required_checks_clean(evidence.required_checks(request.expected_head))
     try:
         contract, _, _, parsed = _request_evidence(request, evidence)

@@ -7601,9 +7601,9 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
 EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/claude-rollout-fallback/action.yml": "ee4b8e6b88ebfc1d0691e032da93b03ba8268fac1bd9377a26554d8200621c0a",
     ".github/actions/claude-rollout-fallback/contract.py": "ae39e0f9c0a1faa6831559c93150fca7f768fbaa0257aade70f045abd0eafff6",
-    "scripts/verify_claude_rollout_fallback.py": "281d443f4ebcc1dcd1f7db91abb0df3f31bc786527b6e0e0d4619c53d11f553e",
+    "scripts/verify_claude_rollout_fallback.py": "22567889d6d0ae0a4158e0d886d36eaceba52ceb688346ef284736eed5075eb4",
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
-    ".github/actions/review-invocation-budget/review_invocation_budget.py": "64731d5c61c4d2a5109a738839589d3f419f1215030eff41b8ba608f8654b876",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "bb111fd319a6449f8f56cbe22a20572b662525f9f4a7765bc46a415bba5f5881",
     ".github/workflows/claude-code-review.yml": "e9ab0aafc14b21e5eb6780ad80b1ca3c3766e5f8f0cc5b60700cfe88eb18ab81",
     ".github/workflows/opencode-auto-review.yml": "ca6cbf2b1f1c9c57f524c45d4de0c863ac2bb249d0e261bbcf1da7e2017c5ea1",
@@ -7614,9 +7614,9 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
 EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/claude-rollout-fallback/action.yml": "fa6b723778608c90683a9cd49bd64229b4f1bc5ad10845978be51e605f6ef894",
     ".github/actions/claude-rollout-fallback/contract.py": "b2b1c32742bab2642b24ff6e20fd9525432610721ce4e55b501c8255aa09a121",
-    "scripts/verify_claude_rollout_fallback.py": "65425e217b6574ff6af2cbc06c0f1fa422a51ad63b6102b2e6cd14915b2f62dd",
+    "scripts/verify_claude_rollout_fallback.py": "6daa78d4135a474e1c85254841a0cce38e1998f00aa2cc6ce2fc1f8a88ddf5d7",
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
-    ".github/actions/review-invocation-budget/review_invocation_budget.py": "a98dd0b04614ae1094e5fd8534ae8b2d27e117596fbaeac397d0e604158a588c",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "5781ef1db5e22f83ed07fc83fabe0beb615544a1412e01b2b8dabfd5f06593ab",
     ".github/workflows/claude-code-review.yml": "130a3ee4164a2561ce6554e1fd6ddac25de11c734e7ec9504c8980841339407f",
     ".github/workflows/opencode-auto-review.yml": "da90fcad95d03f2b51120447edcf187eeb5fbdaa050ded885bb9c9907f3d7f9e",

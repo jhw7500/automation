@@ -1456,7 +1456,15 @@ def finalize(
     index, entry = exact[0]
     if entry.status != "claimed":
         return _finalization_refusal(state, request, "invocation_not_claimed")
-    if request.route.to_dict() != entry.route.to_dict():
+    # The composite action's historical force-review callers pass the force flag only
+    # while claiming. Their finalization uses the default automatic route. The exact
+    # same-run ledger entry has already authenticated and consumed the override event,
+    # so retain that stored route for this one legacy default instead of stranding the
+    # provider call. Explicit non-default routes must still match byte-for-byte.
+    final_route = entry.route if (
+        entry.route.kind == "authorized_override" and request.route.kind == "automatic"
+    ) else request.route
+    if final_route.to_dict() != entry.route.to_dict():
         return _finalization_refusal(state, request, "invocation_route_mismatch")
     if request.model_route[0] != entry.model_route[0]:
         return _finalization_refusal(state, request, "model_route_unknown")

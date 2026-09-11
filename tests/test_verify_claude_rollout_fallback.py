@@ -239,7 +239,10 @@ def exact_rollout_fixture(verifier, tmp_path, monkeypatch):
                       release_ref=bundle.ref, expected_head=head, expected_base=snapshot.base_sha)
     monkeypatch.setattr(release, "materialize_release_bundle", lambda *a, **kw: nullcontext(bundle))
     return SimpleNamespace(request=request, provider=provider, bundle=bundle, snapshot=snapshot,
-                           modules=verifier.VerifiedModules(release, inventory, rollout), pr=pr,
+                           modules=verifier.VerifiedModules(
+                               release, inventory, rollout,
+                               verifier._load_verified_canonicalizer(ROOT),
+                           ), pr=pr,
                            plan=plan)
 
 
@@ -339,8 +342,23 @@ def exact_evidence(verifier, exact_rollout_fixture, monkeypatch):
                        "reviewed_base_sha": request.expected_base, "route": "default_branch_rollout_fallback"}}
     state.pop("failure_reason")
     canonical = admission._automatic_comment()
-    def state_body():
-        return "## Claude Code Review (latest)\n<!-- automation:claude-code-review:v3 -->\n<!-- automation-state:" + json.dumps(state, separators=(",", ":")) + " -->\n"
+    def state_body(content=None):
+        if content is None:
+            content = "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+        metadata = (
+            "- Status: success\n"
+            f"- Execution: {state['review_execution']}\n"
+            f"- Run: https://github.com/{request.repository}/actions/runs/{state['run_id']}\n"
+            f"- Reviewed: {state['successful_head']}\n"
+            f"- Validation: accepted={state['accepted_count']}; filtered={state['filtered_count']}; "
+            f"normalized={state['normalized_count']}; filtered_max={state['filtered_max_severity']}"
+        )
+        return (
+            "## Claude Code Review (latest)\n"
+            "<!-- automation:claude-code-review:v3 -->\n"
+            "<!-- automation-state:" + json.dumps(state, separators=(",", ":")) + " -->\n\n"
+            + metadata + "\n\n" + content
+        )
     canonical["body"] = state_body()
     route = ledger.budget.InvocationRoute(kind="default_branch_rollout_fallback", request_comment_id=901,
         request_nonce=contract_request.nonce, original_run_id=auto["id"], original_run_attempt=1,
@@ -400,6 +418,40 @@ def test_exact_chain_emits_effective_clean_receipt(verifier, exact_evidence):
     assert receipt["fallback"]["driver_commit"] == receipt["verifier_commit"] == f.driver
     assert receipt["verifier_commit"] != receipt["release_commit"] == f.bundle.commit
     assert receipt["effective_status"] == "CLEAN"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_document", "wrong_execution", "wrong_reviewed", "active_high_zero_count"],
+)
+def test_fallback_canonical_envelope_matches_authenticated_state(
+    verifier, exact_evidence, mutation,
+):
+    f = exact_evidence
+    body = f.state_body()
+    if mutation == "missing_document":
+        body = body.split("\n\n", 2)[0] + "\n"
+    elif mutation == "wrong_execution":
+        body = body.replace("- Execution: performed", "- Execution: not_performed")
+    elif mutation == "wrong_reviewed":
+        body = body.replace(f"- Reviewed: {f.request.expected_head}", "- Reviewed: " + "f" * 40)
+    else:
+        title = "Unsafe disclosure"
+        identity = "\0".join(("claude", "workflow.yml", "1", "HIGH", title.casefold()))
+        finding_id = "RVW-" + hashlib.sha256(identity.encode()).hexdigest()[:12]
+        content = (
+            "### New findings\n\n"
+            f"#### {finding_id} [HIGH] {title}\n"
+            '- Changed anchor: {"path":"workflow.yml","line":1}\n'
+            '- Trigger evidence: {"path":"workflow.yml","line":1,"quote":"secret"}\n'
+            "- Impact class: security\n"
+            "- Material impact: A credential is exposed.\n"
+        )
+        body = f.state_body(content)
+    f.canonical["body"] = body
+    with pytest.raises(verifier.VerificationError, match="^fallback_evidence_invalid$"):
+        verifier.verify(f.request, f.provider)
+    assert not f.request.output.exists()
 
 
 @pytest.mark.parametrize("change", ["missing_request", "duplicate_request", "unauthorized_request",

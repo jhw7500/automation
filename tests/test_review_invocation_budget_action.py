@@ -684,11 +684,10 @@ def test_force_review_default_route_claims_as_authorized_override(fake_github):
     assert invocation["override_event_id"] == 9001
 
 
-def test_force_review_default_route_finalizes_as_authorized_override(fake_github):
+def test_force_review_default_route_finalizes_with_action_defaults(fake_github):
     result = fake_github.run_action(
         mode="finalize",
         scenario="force-review-default-finalize",
-        env_overrides={"FORCE_REVIEW": "true"},
     )
     invocation = result.checkpoint["ledger"]["invocations"][0]
     assert result.outputs["decision"] == "finalized"
