@@ -18,6 +18,8 @@ HEAD_A = "a" * 40
 HEAD_B = "b" * 40
 HASH_1 = "1" * 64
 HASH_2 = "2" * 64
+BASE_SHA = "b" * 40
+TARGET_RELEASE_COMMIT = "e" * 40
 CENTRAL_REF = "refs/tags/v1.47"
 CENTRAL_SHA = "d" * 40
 CENTRAL_PATH = (
@@ -29,6 +31,21 @@ assert SPEC and SPEC.loader
 budget = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = budget
 SPEC.loader.exec_module(budget)
+
+
+def _fallback_route() -> dict[str, object]:
+    return {
+        "kind": "default_branch_rollout_fallback",
+        "request_comment_id": 8101,
+        "request_nonce": "9" * 32,
+        "original_run_id": 6101,
+        "original_run_attempt": 1,
+        "expected_base_sha": BASE_SHA,
+        "release_commit": TARGET_RELEASE_COMMIT,
+        "managed_diff_sha256": "3" * 64,
+        "automatic_comment_id": 8102,
+        "automatic_state_sha256": "4" * 64,
+    }
 
 
 def _prior_comment(round_count: int = 1) -> str:
@@ -55,6 +72,9 @@ def _prior_comment(round_count: int = 1) -> str:
             outcome="provider_failure",
             stop_reason="provider_failure",
             remaining_finding_ids=(),
+            route=budget.InvocationRoute.from_legacy_event(
+                "workflow_dispatch" if index >= 5 else "pull_request",
+            ),
         )
         for index in range(round_count)
     )
@@ -94,6 +114,53 @@ def _claimed_comment() -> str:
         outcome=None,
         stop_reason="claimed",
         remaining_finding_ids=(),
+        route=budget.InvocationRoute.automatic(),
+    )
+    state = budget.LedgerState.initial("example/repo", 52, "claude", invocations=(invocation,))
+    return (
+        f"{budget.MARKERS['claude']}\n"
+        f"{budget.STATE_PREFIX}{budget.serialize_ledger(state)}{budget.STATE_SUFFIX}\n\nprior"
+    )
+
+
+def _schema_one_prior_comment() -> str:
+    state = json.loads(
+        _prior_comment().split(budget.STATE_PREFIX, 1)[1].split(budget.STATE_SUFFIX, 1)[0]
+    )
+    state["schema"] = 1
+    for invocation in state["invocations"]:
+        invocation.pop("route")
+    payload = json.dumps(state, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return (
+        f"{budget.MARKERS['claude']}\n"
+        f"{budget.STATE_PREFIX}{payload}{budget.STATE_SUFFIX}\n\nprior"
+    )
+
+
+def _fallback_claimed_comment() -> str:
+    invocation = budget.Invocation(
+        run_id=700,
+        run_attempt=1,
+        head_sha=HEAD_A,
+        full_diff_sha256=HASH_1,
+        caller_workflow_path=".github/workflows/claude.yml",
+        caller_event="issue_comment",
+        referenced_workflow_path=CENTRAL_PATH,
+        referenced_workflow_ref=CENTRAL_REF,
+        referenced_workflow_sha=CENTRAL_SHA,
+        round_number=1,
+        override_event_id=None,
+        model_route=("route-v2",),
+        effort="medium",
+        call_unit="claude-code-action review session",
+        call_count=0,
+        estimated_input_tokens=20_002,
+        elapsed_seconds=0,
+        status="claimed",
+        outcome=None,
+        stop_reason="claimed",
+        remaining_finding_ids=(),
+        route=budget.InvocationRoute.from_dict(_fallback_route()),
     )
     state = budget.LedgerState.initial("example/repo", 52, "claude", invocations=(invocation,))
     return (
@@ -130,7 +197,12 @@ if endpoint.endswith("/pulls/52"):
     head = config["head"]
     if config["scenario"] == "pr-head-changed-before-patch" and state["pr"] > 1:
         head = "c" * 40
-    response = {"number": 52, "head": {"sha": head}}
+    base_sha = "b" * 40
+    if config["scenario"] == "fallback-wrong-base" or (
+        config["scenario"] == "fallback-base-changed-before-patch" and state["pr"] > 1
+    ):
+        base_sha = "c" * 40
+    response = {"number": 52, "head": {"sha": head}, "base": {"sha": base_sha}}
 elif endpoint.endswith("/issues/52/comments?per_page=100"):
     state["comments"] += 1
     response = config["comments"]
@@ -163,16 +235,17 @@ elif "/actions/runs/501/attempts/1" in endpoint:
     if config["scenario"] == "historical-run-head-mismatch":
         response["head_sha"] = "b" * 40
 elif "/actions/runs/700/attempts/1" in endpoint:
+    fallback = config["scenario"].startswith("fallback-")
     response = {
         "id": 700,
         "run_attempt": 1,
-        "head_sha": config["head"],
-        "event": "pull_request",
-        "path": ".github/workflows/claude-review-caller.yml",
+        "head_sha": "6" * 40 if fallback else config["head"],
+        "event": "issue_comment" if fallback else "pull_request",
+        "path": ".github/workflows/claude.yml" if fallback else ".github/workflows/claude-review-caller.yml",
         "status": "in_progress",
         "conclusion": None,
         "repository": {"full_name": "example/repo"},
-        "pull_requests": [{"number": 52}],
+        "pull_requests": [] if fallback else [{"number": 52}],
         "referenced_workflows": [{
             "path": "jhw7500/automation/.github/workflows/claude-code-review.yml@" + "d" * 40,
             "ref": "refs/tags/v1.47",
@@ -231,6 +304,7 @@ class FakeGitHub:
         self, *, mode: str, scenario: str, hostile: bool = False,
         diff_mode: str = "full", env_overrides: dict[str, str] | None = None,
         timeline: list[dict] | None = None, permissions: dict[str, str] | None = None,
+        invocation_route: object | None = None,
     ) -> ActionResult:
         document = yaml.load(ACTION.read_text(), Loader=yaml.BaseLoader)
         run = document["runs"]["steps"][0]["run"]
@@ -262,12 +336,23 @@ class FakeGitHub:
         if scenario in {
             "first-comment-create", "empty-cas-pages",
             "current-run-reference-omits-ref",
+            "fallback-first-claim", "fallback-wrong-base",
+            "fallback-base-changed-before-patch",
         }:
             comments = []
             head, full_hash = HEAD_A, HASH_1
         elif scenario == "finalize-trusted-comment":
             comments = [_bot_comment(_claimed_comment())]
             head, full_hash = HEAD_A, HASH_1
+        elif scenario in {"fallback-finalize", "fallback-finalize-route-drift"}:
+            comments = [_bot_comment(_fallback_claimed_comment())]
+            head, full_hash = HEAD_A, HASH_1
+        elif scenario == "schema-one-migration":
+            comments = [_bot_comment(_schema_one_prior_comment())]
+            head, full_hash = HEAD_B, HASH_2
+        elif scenario == "fallback-duplicate-head":
+            comments = [_bot_comment(_prior_comment())]
+            head, full_hash = HEAD_A, HASH_2
         else:
             comments = [_bot_comment(prior)]
             head, full_hash = HEAD_B, HASH_2
@@ -303,6 +388,9 @@ class FakeGitHub:
                 "full_diff_sha256": None,
                 "remaining_finding_ids": [],
             }),
+            "INVOCATION_ROUTE_JSON": json.dumps(
+                {"kind": "automatic"} if invocation_route is None else invocation_route
+            ),
             "MODEL_ROUTE_JSON": json.dumps([route]),
             "EFFORT": effort,
             "ACTUAL_CALL_COUNT": "1" if mode == "finalize" else "0",
@@ -337,7 +425,9 @@ class FakeGitHub:
         assert not marker.exists()
         if hostile:
             argv = [json.loads(entry) for entry in argv_log.read_text().splitlines()]
-            for name in ("INPUT_FILES_JSON", "MODEL_ROUTE_JSON", "EFFORT"):
+            for name in (
+                "INPUT_FILES_JSON", "INVOCATION_ROUTE_JSON", "MODEL_ROUTE_JSON", "EFFORT",
+            ):
                 value = request_values[name]
                 assert sum(part == value for entry in argv for part in entry) == 1, name
         return ActionResult(outputs, json.loads(checkpoint.read_text()), calls)
@@ -353,7 +443,7 @@ def test_action_metadata_has_one_inert_environment_bridge():
     assert set(document["inputs"]) == {
         "github-token", "mode", "reviewer", "pr-number", "expected-head-sha",
         "full-diff-sha256", "diff-mode", "input-files-json", "authenticated-review-json",
-        "force-review",
+        "force-review", "invocation-route-json",
         "model-route-json", "effort", "checkpoint-file", "actual-call-count",
         "elapsed-seconds", "outcome", "stop-reason", "remaining-finding-ids-json",
         "max-rounds",
@@ -366,6 +456,7 @@ def test_action_metadata_has_one_inert_environment_bridge():
     assert {name: value["default"] for name, value in document["inputs"].items() if "default" in value} == {
         "actual-call-count": "0",
         "force-review": "false",
+        "invocation-route-json": '{"kind":"automatic"}',
         "elapsed-seconds": "0",
         "outcome": "checkpoint_failure",
         "stop-reason": "",
@@ -383,6 +474,7 @@ def test_action_metadata_has_one_inert_environment_bridge():
     assert step["shell"] == "bash"
     assert step["env"]["GH_TOKEN"] == "${{ inputs.github-token }}"
     assert step["env"]["REVIEW_MAX_ROUNDS"] == "${{ inputs.max-rounds }}"
+    assert step["env"]["INVOCATION_ROUTE_JSON"] == "${{ inputs.invocation-route-json }}"
     assert "${{ inputs." not in step["run"]
     assert step["run"].index('cat -- "$budget_dir/summary.md" >> "$GITHUB_STEP_SUMMARY"') < step[
         "run"
@@ -520,6 +612,91 @@ def test_first_claim_authenticates_and_stores_reusable_workflow_provenance(fake_
     assert invocation["referenced_workflow_path"] == CENTRAL_PATH
     assert invocation["referenced_workflow_ref"] == CENTRAL_REF
     assert invocation["referenced_workflow_sha"] == CENTRAL_SHA
+    assert invocation["route"] == {"kind": "automatic"}
+
+
+def test_schema_one_comment_migrates_on_the_next_claim(fake_github):
+    result = fake_github.run_action(mode="claim", scenario="schema-one-migration")
+    assert result.outputs["decision"] == "claimed"
+    assert result.checkpoint["ledger"]["schema"] == 2
+    assert [
+        invocation["route"]["kind"]
+        for invocation in result.checkpoint["ledger"]["invocations"]
+    ] == ["automatic", "automatic"]
+
+
+def test_fallback_claim_uses_fresh_pr_head_and_exact_base(fake_github):
+    result = fake_github.run_action(
+        mode="claim", scenario="fallback-first-claim", invocation_route=_fallback_route(),
+    )
+    invocation = result.checkpoint["ledger"]["invocations"][0]
+    assert result.outputs["decision"] == "claimed"
+    assert invocation["head_sha"] == HEAD_A
+    assert invocation["caller_event"] == "issue_comment"
+    assert invocation["caller_workflow_path"] == ".github/workflows/claude.yml"
+    assert invocation["referenced_workflow_sha"] == CENTRAL_SHA
+    assert invocation["route"] == _fallback_route()
+    assert invocation["round_number"] == 1
+    assert invocation["override_event_id"] is None
+
+
+def test_fallback_claim_rejects_fresh_pr_base_mismatch(fake_github):
+    result = fake_github.run_action(
+        mode="claim", scenario="fallback-wrong-base", invocation_route=_fallback_route(),
+    )
+    assert result.outputs["decision"] == "state_invalid"
+    assert result.outputs["allow-invocation"] == "false"
+    assert result.checkpoint["handoff"]["stop_reason"] == "pr_base_mismatch"
+
+
+def test_fallback_claim_rechecks_base_before_comment_mutation(fake_github):
+    result = fake_github.run_action(
+        mode="claim", scenario="fallback-base-changed-before-patch",
+        invocation_route=_fallback_route(),
+    )
+    mutations = [call for call in result.calls if "--method" in call]
+    assert result.outputs["decision"] == "state_invalid"
+    assert result.outputs["allow-invocation"] == "false"
+    assert mutations == []
+    assert result.checkpoint["handoff"]["stop_reason"] == "compare_and_swap_failed"
+
+
+def test_fallback_duplicate_head_reuses_existing_budget_without_a_round(fake_github):
+    result = fake_github.run_action(
+        mode="claim", scenario="fallback-duplicate-head", invocation_route=_fallback_route(),
+    )
+    assert result.outputs["decision"] == "duplicate_head"
+    assert result.outputs["allow-invocation"] == "false"
+    assert len(result.checkpoint["ledger"]["invocations"]) == 1
+
+
+def test_fallback_finalize_records_one_call_with_the_exact_route(fake_github):
+    result = fake_github.run_action(
+        mode="finalize", scenario="fallback-finalize", invocation_route=_fallback_route(),
+    )
+    invocation = result.checkpoint["ledger"]["invocations"][0]
+    assert result.outputs["decision"] == "finalized"
+    assert invocation["call_count"] == 1
+    assert invocation["route"] == _fallback_route()
+
+
+def test_malformed_invocation_route_json_refuses_before_github(fake_github):
+    result = fake_github.run_action(
+        mode="claim", scenario="first-comment-create",
+        env_overrides={"INVOCATION_ROUTE_JSON": "{"},
+    )
+    assert result.calls == []
+    assert result.outputs["decision"] == "state_invalid"
+    assert result.checkpoint["handoff"]["stop_reason"] == "invocation_route_json_invalid"
+
+
+def test_fallback_finalize_rejects_claim_route_drift(fake_github):
+    result = fake_github.run_action(
+        mode="finalize", scenario="fallback-finalize-route-drift",
+        invocation_route={"kind": "automatic"},
+    )
+    assert result.outputs["decision"] == "state_invalid"
+    assert result.checkpoint["handoff"]["stop_reason"] == "invocation_route_mismatch"
 
 
 def test_first_claim_uses_resolved_sha_when_github_omits_reusable_workflow_ref(fake_github):

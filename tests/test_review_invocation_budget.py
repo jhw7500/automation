@@ -24,6 +24,11 @@ HASH_2 = "2" * 64
 HASH_3 = "3" * 64
 CENTRAL_SHA = "d" * 40
 CENTRAL_REF = "refs/tags/v1.47"
+REQUEST_NONCE = "e" * 32
+DRIVER_COMMIT = "f" * 40
+TARGET_RELEASE_COMMIT = "9" * 40
+MANAGED_DIFF_SHA256 = "4" * 64
+AUTOMATIC_STATE_SHA256 = "5" * 64
 FINDING_1 = "RVW-111111111111"
 FINDING_2 = "RVW-222222222222"
 
@@ -58,6 +63,8 @@ def request(*, reviewer="claude", head=HEAD_A, full_hash=HASH_1, run_id=700, run
         "call_unit": CALL_UNITS[reviewer],
     }
     values.update(changes)
+    if values.get("force_review") and "route" not in changes:
+        values["route"] = budget.InvocationRoute(kind="authorized_override")
     return budget.ClaimRequest(**values)
 
 
@@ -96,7 +103,9 @@ def invocation(*, reviewer="claude", head=HEAD_A, full_hash=HASH_1, run_id=501, 
         run_id=run_id, run_attempt=run_attempt, head_sha=head,
         full_diff_sha256=full_hash,
         caller_workflow_path=f".github/workflows/{reviewer}-caller.yml",
-        caller_event="pull_request",
+        caller_event=(
+            "pull_request" if override_event_id is None else "workflow_dispatch"
+        ),
         referenced_workflow_path=(
             f"jhw7500/automation/{budget.WORKFLOWS[reviewer]}@{CENTRAL_SHA}"
         ),
@@ -109,6 +118,9 @@ def invocation(*, reviewer="claude", head=HEAD_A, full_hash=HASH_1, run_id=501, 
         elapsed_seconds=elapsed_seconds, status=status,
         outcome=outcome if status == "finalized" else None,
         stop_reason=outcome if status == "finalized" else "claimed", remaining_finding_ids=(),
+        route=budget.InvocationRoute(
+            kind="automatic" if override_event_id is None else "authorized_override",
+        ),
     )
 
 
@@ -209,6 +221,234 @@ def assert_stored_state_rejected(state, reason):
         budget.parse_ledger(
             ledger_body(state), repository=state.repository, pr=state.pr, reviewer=state.reviewer,
         )
+
+
+def fallback_route_dict():
+    return {
+        "kind": "default_branch_rollout_fallback",
+        "request_comment_id": 8101,
+        "request_nonce": REQUEST_NONCE,
+        "original_run_id": 7201,
+        "original_run_attempt": 2,
+        "expected_base_sha": HEAD_B,
+        "release_commit": TARGET_RELEASE_COMMIT,
+        "managed_diff_sha256": MANAGED_DIFF_SHA256,
+        "automatic_comment_id": 8102,
+        "automatic_state_sha256": AUTOMATIC_STATE_SHA256,
+    }
+
+
+def fallback_route():
+    return budget.InvocationRoute.from_dict(fallback_route_dict())
+
+
+def fallback_claim(**changes):
+    values = {
+        "route": fallback_route(),
+        "head": HEAD_A,
+        "run_id": 7301,
+        "run_attempt": 1,
+    }
+    values.update(changes)
+    return request(**values)
+
+
+def fallback_provenances(claim_request=None):
+    claim_request = fallback_claim() if claim_request is None else claim_request
+    return {
+        (claim_request.run_id, claim_request.run_attempt): budget.RunProvenance(
+            repository=REPOSITORY,
+            pr=PR,
+            head_sha=claim_request.head_sha,
+            caller_workflow_path=".github/workflows/claude.yml",
+            caller_event="issue_comment",
+            referenced_workflow_path=(
+                f"jhw7500/automation/{budget.WORKFLOWS['claude']}@{DRIVER_COMMIT}"
+            ),
+            referenced_workflow_ref="refs/tags/v1.76",
+            referenced_workflow_sha=DRIVER_COMMIT,
+            run_id=claim_request.run_id,
+            run_attempt=claim_request.run_attempt,
+            status="in_progress",
+            conclusion=None,
+        )
+    }
+
+
+def schema_one_ledger(*, caller_event="pull_request"):
+    override_event_id = 9001 if caller_event == "workflow_dispatch" else None
+    state = budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        "claude",
+        invocations=(replace(
+            invocation(override_event_id=override_event_id),
+            caller_event=caller_event,
+        ),),
+        consumed_override_event_ids=(() if override_event_id is None else (override_event_id,)),
+    )
+    raw = state.to_dict()
+    raw["schema"] = 1
+    for item in raw["invocations"]:
+        item.pop("route", None)
+    return raw
+
+
+@pytest.mark.parametrize(("event", "kind"), [
+    ("pull_request", "automatic"),
+    ("workflow_dispatch", "authorized_override"),
+])
+def test_schema_one_invocations_gain_typed_route(event, kind):
+    raw = schema_one_ledger(caller_event=event)
+    state = budget.LedgerState.from_dict(raw)
+    assert state.invocations[0].route.kind == kind
+    assert state.to_dict()["schema"] == 2
+
+
+def test_schema_one_invocation_with_unknown_event_fails_closed():
+    raw = schema_one_ledger()
+    raw["invocations"][0]["caller_event"] = "issue_comment"
+    with pytest.raises(budget.BudgetStateError, match="^invocation_route_invalid$"):
+        budget.LedgerState.from_dict(raw)
+
+
+@pytest.mark.parametrize("kind", ["automatic", "authorized_override"])
+def test_simple_routes_serialize_only_kind(kind):
+    route = budget.InvocationRoute.from_dict({"kind": kind})
+    assert route.to_dict() == {"kind": kind}
+    with pytest.raises(budget.BudgetStateError, match="^invocation_route_invalid$"):
+        budget.InvocationRoute.from_dict({"kind": kind, "request_comment_id": None})
+
+
+def test_fallback_route_serializes_exact_evidence_fields():
+    raw = fallback_route_dict()
+    assert budget.InvocationRoute.from_dict(raw).to_dict() == raw
+
+
+def test_fallback_route_requires_every_evidence_field():
+    raw = fallback_route_dict()
+    raw.pop("automatic_state_sha256")
+    with pytest.raises(budget.BudgetStateError, match="^invocation_route_invalid$"):
+        budget.InvocationRoute.from_dict(raw)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("request_comment_id", 0),
+    ("request_nonce", "not-a-nonce"),
+    ("original_run_id", True),
+    ("original_run_attempt", 0),
+    ("expected_base_sha", "not-a-sha"),
+    ("release_commit", "not-a-sha"),
+    ("managed_diff_sha256", "not-a-digest"),
+    ("automatic_comment_id", -1),
+    ("automatic_state_sha256", "not-a-digest"),
+])
+def test_fallback_route_rejects_invalid_evidence(field, value):
+    raw = fallback_route_dict()
+    raw[field] = value
+    with pytest.raises(budget.BudgetStateError, match="^invocation_route_invalid$"):
+        budget.InvocationRoute.from_dict(raw)
+
+
+def test_fallback_claim_uses_pr_head_and_one_automatic_round():
+    claim_request = fallback_claim()
+    result = budget.claim(None, claim_request, fallback_provenances(claim_request))
+    invocation = result.state.invocations[-1]
+    assert result.allow_invocation is True
+    assert invocation.head_sha == HEAD_A
+    assert invocation.caller_event == "issue_comment"
+    assert invocation.caller_workflow_path == ".github/workflows/claude.yml"
+    assert invocation.referenced_workflow_sha == DRIVER_COMMIT
+    assert invocation.route.release_commit == TARGET_RELEASE_COMMIT
+    assert invocation.round_number == 1
+    assert invocation.override_event_id is None
+
+
+@pytest.mark.parametrize("change", [
+    "force_review", "wrong_caller", "wrong_pr_head", "wrong_base",
+    "wrong_request", "wrong_target_release", "wrong_driver", "wrong_state_digest",
+    "non_claude_reviewer",
+])
+def test_fallback_provenance_rejects_mismatches(change):
+    claim_request = fallback_claim()
+    provenances = fallback_provenances(claim_request)
+    key = (claim_request.run_id, claim_request.run_attempt)
+    if change == "force_review":
+        claim_request = replace(claim_request, force_review=True)
+    elif change == "wrong_caller":
+        provenances[key] = replace(
+            provenances[key], caller_workflow_path=".github/workflows/other.yml",
+        )
+    elif change == "wrong_pr_head":
+        claim_request = replace(claim_request, head_sha="not-a-sha")
+    elif change == "wrong_base":
+        claim_request = replace(
+            claim_request,
+            route=replace(claim_request.route, expected_base_sha="not-a-sha"),
+        )
+    elif change == "wrong_request":
+        claim_request = replace(
+            claim_request,
+            route=replace(claim_request.route, request_comment_id=0),
+        )
+    elif change == "wrong_target_release":
+        claim_request = replace(
+            claim_request,
+            route=replace(claim_request.route, release_commit="not-a-sha"),
+        )
+    elif change == "wrong_driver":
+        provenances[key] = replace(
+            provenances[key], referenced_workflow_sha="8" * 40,
+        )
+    elif change == "wrong_state_digest":
+        claim_request = replace(
+            claim_request,
+            route=replace(claim_request.route, automatic_state_sha256="not-a-digest"),
+        )
+    elif change == "non_claude_reviewer":
+        claim_request = replace(claim_request, reviewer="gemini")
+    transition = budget.claim(None, claim_request, provenances)
+    assert (transition.allow_invocation, transition.decision) == (False, "state_invalid")
+
+
+def test_finalize_requires_the_exact_claimed_fallback_route():
+    claim_request = fallback_claim()
+    claimed = budget.claim(None, claim_request, fallback_provenances(claim_request)).state
+    current = fallback_provenances(claim_request)
+    finalize = finalize_request(
+        head=claim_request.head_sha,
+        run_id=claim_request.run_id,
+        run_attempt=claim_request.run_attempt,
+        route=replace(claim_request.route, automatic_comment_id=9999),
+    )
+    result = budget.finalize(claimed, finalize, current)
+    assert result.decision == "state_invalid"
+    assert result.stop_reason == "invocation_route_mismatch"
+
+
+def test_idempotent_recovery_rejects_finalize_route_drift():
+    claim_request = request(reviewer="opencode")
+    claimed = budget.claim(
+        None, claim_request, claim_provenances(None, claim_request),
+    ).state
+    original_claim = claimed.invocations[-1]
+    authenticated = budget.AuthenticatedReview(True, HEAD_A, HASH_1)
+    finalize = finalize_request(
+        reviewer="opencode", authenticated_review=authenticated,
+        route=budget.InvocationRoute.automatic(),
+    )
+    completed = budget.recover_finalize(
+        claimed, original_claim, finalize, current_provenances(claimed),
+    )
+    assert completed.decision == "finalized"
+    drifted = budget.recover_finalize(
+        completed.state,
+        original_claim,
+        replace(finalize, route=budget.InvocationRoute(kind="authorized_override")),
+        valid_provenances(completed.state),
+    )
+    assert drifted.decision == "state_invalid"
+    assert drifted.stop_reason == "invocation_route_mismatch"
 
 
 @pytest.fixture
@@ -443,6 +683,7 @@ def test_force_review_claims_same_head_once_with_dispatch_and_authorized_overrid
     force_request = replace(
         request(run_id=700),
         force_review=True,
+        route=budget.InvocationRoute(kind="authorized_override"),
         override_events=(
             budget.OverrideEvent(9001, "labeled", "review-budget-override", "write"),
         ),
@@ -499,7 +740,10 @@ def test_force_review_fails_closed_without_dispatch_or_authorized_override():
         "claude",
         invocations=(invocation(),),
     )
-    force_request = replace(request(run_id=700), force_review=True)
+    force_request = replace(
+        request(run_id=700), force_review=True,
+        route=budget.InvocationRoute(kind="authorized_override"),
+    )
     pull_request_provenances = claim_provenances(existing, force_request)
 
     wrong_event = budget.claim(existing, force_request, pull_request_provenances)
@@ -798,7 +1042,7 @@ def test_parser_requires_exact_schema_and_serializes_deterministically():
     assert budget.parse_ledger(body, repository=REPOSITORY, pr=PR, reviewer="gemini") == state
     assert payload == json.dumps(state.to_dict(), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     with pytest.raises(budget.BudgetStateError):
-        budget.parse_ledger(body.replace('"schema":1', '"schema":true'), repository=REPOSITORY, pr=PR, reviewer="gemini")
+        budget.parse_ledger(body.replace('"schema":2', '"schema":true'), repository=REPOSITORY, pr=PR, reviewer="gemini")
 
 
 def test_parser_rejects_noncanonical_json_encoding():
