@@ -26,7 +26,7 @@ def evidence_module():
 
 def test_current_workflow_replays_the_same_original_success(tmp_path):
     module = evidence_module()
-    bundle = original_bundle(tmp_path)
+    bundle = original_bundle(tmp_path, ledger_schema=2)
     bundle["workflow_source"] = (ROOT / ".github/workflows/opencode-auto-review.yml").read_text()
     result = module.validate_evidence(module.RecoveryTarget(**bundle["target"]), bundle, bundle["workspace"])
     assert result.request.call_count == 1
@@ -192,6 +192,10 @@ def test_claim_provenance_must_match_original_publication_even_with_sealed_hashe
     bundle = original_bundle(tmp_path)
     original = bundle['claim_state']
     changed = replace(original, invocations=(replace(original.invocations[0], **changes),))
+    if changes.get('caller_event') == 'workflow_dispatch':
+        with pytest.raises(budget.BudgetStateError, match='provenance_mismatch'):
+            budget.render_checkpoint(changed)
+        return
     checkpoint = budget.render_checkpoint(changed)
     with zipfile.ZipFile(io.BytesIO(bundle['artifacts']['handoff']['payload'])) as stream:
         files = {name: stream.read(name) for name in stream.namelist()}

@@ -84,15 +84,17 @@ def read_artifact(metadata: dict, payload: bytes, expected_name: str, run_id: in
     except (zipfile.BadZipFile, NotImplementedError, RuntimeError, OSError) as exc:
         raise RecoveryError("artifact_zip_invalid") from exc
 
-# Only the reviewed v1.74/v1.75 and v1.76 canonicalizers are executable in recovery.
+# Only the reviewed v1.74 through v1.77 canonicalizers are executable in recovery.
 # Future formats must add a reviewed replay contract; unknown source fails closed.
 APPROVED_REPLAY_SHA256 = frozenset({
     "b8804d0c387e4f7e554443a1d0edd5862d9c4b1c1435de4140c621c241a25df5",
     "3915f9bc32985745996d2246017cff9122460d25a071ca72568ac73c75339371",
+    "deb5353681c02b8932b9da47c49c28549654f6b8dc5852c58e7497de84e6623a",
 })
 APPROVED_WORKFLOW_SHA256 = frozenset({
     "f81db9665847aea815c8691caea7c6458011595cbed28c13809f051c381b5e91",
     "9cc171e9c11de4c6719d73922fed0373c5db0281feae7488c55c7447025bf0ab",
+    "ff4b2acfb3a87f66a77e5e9821d0d60237b6335cbe2a7afd6e7af484a80d66bb",
 })
 
 def _budget_module():

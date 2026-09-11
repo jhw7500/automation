@@ -312,6 +312,17 @@ def test_schema_one_invocation_with_unknown_event_fails_closed():
         budget.LedgerState.from_dict(raw)
 
 
+def test_schema_one_checkpoint_is_canonical_before_migration_on_read():
+    ledger = schema_one_ledger()
+    payload = (json.dumps(
+        {"schema": 1, "ledger": ledger, "handoff": ledger["handoff"]},
+        ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+    ) + "\n").encode("ascii")
+    restored = budget.load_checkpoint(payload)
+    assert restored.to_dict()["schema"] == 2
+    assert restored.invocations[0].route == budget.InvocationRoute(kind="automatic")
+
+
 @pytest.mark.parametrize("kind", ["automatic", "authorized_override"])
 def test_simple_routes_serialize_only_kind(kind):
     route = budget.InvocationRoute.from_dict({"kind": kind})

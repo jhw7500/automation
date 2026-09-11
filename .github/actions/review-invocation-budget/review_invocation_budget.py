@@ -1696,11 +1696,15 @@ def load_checkpoint(payload: bytes) -> LedgerState:
     raw = _exact_keys(raw, {"schema", "ledger", "handoff"}, "checkpoint")
     if _integer(raw["schema"], "schema", positive=True) != CHECKPOINT_SCHEMA:
         raise BudgetStateError("checkpoint_schema_invalid")
+    source_schema = raw["ledger"].get("schema") if isinstance(raw["ledger"], dict) else None
     state = LedgerState.from_dict(raw["ledger"])
     handoff = Handoff.from_dict(raw["handoff"])
     if handoff != state.handoff:
         raise BudgetStateError("checkpoint_handoff_mismatch")
-    if payload != render_checkpoint(state):
+    expected = render_checkpoint(state) if source_schema == SCHEMA else (
+        json.dumps(raw, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii") + b"\n"
+    )
+    if payload != expected:
         raise BudgetStateError("checkpoint_json_noncanonical")
     return state
 

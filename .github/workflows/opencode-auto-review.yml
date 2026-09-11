@@ -835,7 +835,7 @@ jobs:
           ledger = checkpoint["ledger"]
           invocations = ledger.get("invocations")
           if (
-              ledger.get("schema") != 1
+              ledger.get("schema") != 2
               or ledger.get("repository") != os.environ["GITHUB_REPOSITORY"]
               or ledger.get("reviewer") != "opencode"
               or not isinstance(invocations, list)
@@ -3650,7 +3650,7 @@ jobs:
                 || Array.isArray(claimCheckpoint.ledger)
                 || JSON.stringify(claimCheckpoint.handoff)
                     !== JSON.stringify(claimCheckpoint.ledger.handoff)
-                || claimCheckpoint.ledger.schema !== 1
+                || claimCheckpoint.ledger.schema !== 2
                 || claimCheckpoint.ledger.repository !== repository
                 || claimCheckpoint.ledger.pr !== issueNumber
                 || claimCheckpoint.ledger.reviewer !== reviewer

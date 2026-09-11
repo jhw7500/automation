@@ -47,7 +47,7 @@ def git(root, *args):
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
 
 
-def original_bundle(tmp_path):
+def original_bundle(tmp_path, *, ledger_schema=1):
     repo = tmp_path / "target"
     repo.mkdir()
     git(repo, "init", "-q")
@@ -74,6 +74,15 @@ def original_bundle(tmp_path):
         "final-review/default", "opencode run session")
     claim_state = budget.claim(None, request, {(RUN, ATTEMPT): provenance}).state
     checkpoint = budget.render_checkpoint(claim_state)
+    if ledger_schema == 1:
+        checkpoint_value = json.loads(checkpoint)
+        checkpoint_value["ledger"]["schema"] = 1
+        for invocation in checkpoint_value["ledger"]["invocations"]:
+            invocation.pop("route")
+        checkpoint = (json.dumps(checkpoint_value, ensure_ascii=True, separators=(",", ":"),
+                                 sort_keys=True) + "\n").encode("ascii")
+    elif ledger_schema != 2:
+        raise ValueError("unsupported fixture ledger schema")
     scope = {"schema": 1, "repository": REPOSITORY, "pr_number": PR,
              "merge_base_sha": base, "head_sha": head,
              "files": [{"filename": "app.py", "status": "modified"}]}

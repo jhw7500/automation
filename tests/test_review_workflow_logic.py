@@ -13806,6 +13806,7 @@ def _run_opencode_canonicalize(
                 "status": "claimed",
                 "outcome": None,
                 "stop_reason": "claimed",
+                "route": {"kind": "automatic"},
             }
         )
     budget_checkpoint = handoff_dir / "review-budget-claim.json"
@@ -13814,7 +13815,7 @@ def _run_opencode_canonicalize(
             {
                 "schema": 1,
                 "ledger": {
-                    "schema": 1,
+                    "schema": 2,
                     "repository": "example/repo",
                     "pr": 7,
                     "reviewer": "opencode",
