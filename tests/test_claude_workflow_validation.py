@@ -11,6 +11,261 @@ from test_review_workflow_logic import (
 )
 
 
+FALLBACK_INPUTS = {
+    "fallback_request_comment_id": "901",
+    "fallback_request_nonce": "dd" * 16,
+    "fallback_expected_head_sha": "aa" * 20,
+    "fallback_expected_base_sha": "bb" * 20,
+    "fallback_original_run_id": "34549275027",
+    "fallback_original_run_attempt": "1",
+    "fallback_release_commit": "444a7347aee169ed178aae80e8bd8d10eca52e02",
+    "fallback_managed_diff_sha256": "cc" * 32,
+}
+
+
+def _run_fallback_shell_step(tmp_path, name, env):
+    output = tmp_path / f"{name}.output"
+    step = _new_step(name)
+    result = subprocess.run(
+        ["bash", "-c", step.get("run", "")],
+        env={**os.environ, **env, "GITHUB_OUTPUT": str(output)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, _github_outputs(output) if output.exists() else {}
+
+
+def _fallback_inputs_json(values):
+    return json.dumps({name: values.get(name, "") for name in FALLBACK_INPUTS})
+
+
+def _fallback_admission(tmp_path, **changes):
+    fixture = {
+        "route": "managed",
+        "request-comment-id": "901",
+        "request-nonce": "dd" * 16,
+        "expected-head-sha": "aa" * 20,
+        "expected-base-sha": "bb" * 20,
+        "original-run-id": "34549275027",
+        "original-run-attempt": "1",
+        "release-commit": "444a7347aee169ed178aae80e8bd8d10eca52e02",
+        "managed-diff-sha256": "cc" * 32,
+        "liveHead": "aa" * 20,
+        "liveBase": "bb" * 20,
+        **changes,
+    }
+    step = _new_step("Validate Claude fallback admission")
+    script = step.get("with", {}).get("script", "")
+    harness = r"""
+const fx = JSON.parse(process.argv[1]);
+const script = JSON.parse(process.argv[2]);
+const outputs = {}, failures = [], calls = [];
+const context = {repo: {owner: 'o', repo: 'r'}};
+for (const [key, value] of Object.entries(fx)) {
+  if (!['liveHead', 'liveBase'].includes(key)) process.env[key.toUpperCase().replaceAll('-', '_')] = value;
+}
+const inputMap = {
+  'request-comment-id': 'INPUT_REQUEST_COMMENT_ID',
+  'request-nonce': 'INPUT_REQUEST_NONCE',
+  'expected-head-sha': 'INPUT_EXPECTED_HEAD_SHA',
+  'expected-base-sha': 'INPUT_EXPECTED_BASE_SHA',
+  'original-run-id': 'INPUT_ORIGINAL_RUN_ID',
+  'original-run-attempt': 'INPUT_ORIGINAL_RUN_ATTEMPT',
+  'release-commit': 'INPUT_RELEASE_COMMIT',
+  'managed-diff-sha256': 'INPUT_MANAGED_DIFF_SHA256',
+};
+for (const [key, envName] of Object.entries(inputMap)) process.env[envName] = {
+  'request-comment-id': '901',
+  'request-nonce': 'dddddddddddddddddddddddddddddddd',
+  'expected-head-sha': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  'expected-base-sha': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+  'original-run-id': '34549275027',
+  'original-run-attempt': '1',
+  'release-commit': '444a7347aee169ed178aae80e8bd8d10eca52e02',
+  'managed-diff-sha256': 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+}[key];
+process.env.PR_NUMBER = '109';
+const github = {rest: {pulls: {get: async args => {
+  calls.push(args);
+  return {data: {head: {sha: fx.liveHead}, base: {sha: fx.liveBase}}};
+}}}};
+const core = {
+  setOutput: (key, value) => {outputs[key] = value;},
+  setFailed: message => failures.push(message),
+};
+(async () => {
+  await new Function('github', 'context', 'core',
+    'return (async () => {' + script + '})();')(github, context, core);
+  console.log(JSON.stringify({outputs, failures, calls}));
+})().catch(error => {console.error(error); process.exit(1);});
+"""
+    result = subprocess.run(
+        ["node", "-e", harness, json.dumps(fixture), json.dumps(script)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_fallback_workflow_call_inputs_are_exact_optional_strings():
+    inputs = _load("claude-code-review.yml")["on"]["workflow_call"]["inputs"]
+    for name in FALLBACK_INPUTS:
+        assert inputs[name] == {"type": "string", "required": "false", "default": ""}
+
+
+@pytest.mark.parametrize("present", range(1, 8))
+def test_partial_fallback_inputs_fail_before_diff(tmp_path, present):
+    values = dict(list(FALLBACK_INPUTS.items())[:present])
+    result, outputs = _run_fallback_shell_step(
+        tmp_path, "Resolve Claude fallback mode",
+        {"FALLBACK_INPUTS_JSON": _fallback_inputs_json(values)},
+    )
+    assert result.returncode != 0
+    assert outputs == {}
+
+
+@pytest.mark.parametrize(("values", "mode"), (({}, "normal"), (FALLBACK_INPUTS, "fallback")))
+def test_fallback_mode_is_all_or_none(tmp_path, values, mode):
+    result, outputs = _run_fallback_shell_step(
+        tmp_path, "Resolve Claude fallback mode",
+        {"FALLBACK_INPUTS_JSON": _fallback_inputs_json(values)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs == {"mode": mode}
+
+
+@node_required
+@pytest.mark.parametrize("coordinate", tuple(FALLBACK_INPUTS))
+def test_fallback_admission_rejects_every_immutable_coordinate_mutation(tmp_path, coordinate):
+    output_name = {
+        "fallback_request_comment_id": "request-comment-id",
+        "fallback_request_nonce": "request-nonce",
+        "fallback_expected_head_sha": "expected-head-sha",
+        "fallback_expected_base_sha": "expected-base-sha",
+        "fallback_original_run_id": "original-run-id",
+        "fallback_original_run_attempt": "original-run-attempt",
+        "fallback_release_commit": "release-commit",
+        "fallback_managed_diff_sha256": "managed-diff-sha256",
+    }[coordinate]
+    result = _fallback_admission(tmp_path, **{output_name: "mismatch"})
+    assert result["failures"] == ["fallback_admission_mismatch"]
+    assert result["outputs"] == {"allowed": "false", "reason": "fallback_admission_mismatch"}
+
+
+@node_required
+@pytest.mark.parametrize("change", ({"route": "interactive"}, {"liveHead": "ee" * 20}, {"liveBase": "ff" * 20}))
+def test_fallback_admission_requires_managed_route_and_live_pr_coordinates(tmp_path, change):
+    result = _fallback_admission(tmp_path, **change)
+    assert result["failures"] == ["fallback_admission_mismatch"]
+    assert result["outputs"] == {"allowed": "false", "reason": "fallback_admission_mismatch"}
+
+
+@node_required
+def test_fallback_admission_accepts_exact_replayed_coordinates(tmp_path):
+    result = _fallback_admission(tmp_path)
+    assert result["failures"] == []
+    assert result["outputs"] == {"allowed": "true", "reason": ""}
+    assert result["calls"] == [{
+        "owner": "o", "repo": "r", "pull_number": 109, "request": {"timeout": 15000},
+    }]
+
+
+def test_fallback_requires_exact_recomputed_full_diff(tmp_path):
+    result, outputs = _run_fallback_shell_step(
+        tmp_path,
+        "Resolve Claude invocation route",
+        {
+            "FALLBACK_MODE": "fallback",
+            "DIFF_MODE": "full",
+            "COMPUTED_FULL_DIFF_SHA256": "12" * 32,
+            "FALLBACK_MANAGED_DIFF_SHA256": "34" * 32,
+            "FORCE_REVIEW": "false",
+            **{name.upper(): value for name, value in FALLBACK_INPUTS.items()},
+            "AUTOMATIC_COMMENT_ID": "887",
+            "AUTOMATIC_STATE_SHA256": "56" * 32,
+        },
+    )
+    assert result.returncode != 0
+    assert outputs == {}
+
+
+@pytest.mark.parametrize(
+    ("force_review", "expected"),
+    (("false", {"kind": "automatic"}), ("true", {"kind": "authorized_override"})),
+)
+def test_normal_claude_invocation_route_is_explicit(tmp_path, force_review, expected):
+    result, outputs = _run_fallback_shell_step(
+        tmp_path,
+        "Resolve Claude invocation route",
+        {
+            "FALLBACK_MODE": "normal",
+            "DIFF_MODE": "full",
+            "COMPUTED_FULL_DIFF_SHA256": "12" * 32,
+            "FALLBACK_MANAGED_DIFF_SHA256": "",
+            "FORCE_REVIEW": force_review,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(outputs["invocation_route_json"]) == expected
+    assert outputs["state_route_json"] == ""
+
+
+def test_fallback_route_json_binds_fresh_admission_outputs(tmp_path):
+    result, outputs = _run_fallback_shell_step(
+        tmp_path,
+        "Resolve Claude invocation route",
+        {
+            "FALLBACK_MODE": "fallback",
+            "DIFF_MODE": "full",
+            "COMPUTED_FULL_DIFF_SHA256": "cc" * 32,
+            "FORCE_REVIEW": "false",
+            **{name.upper(): value for name, value in FALLBACK_INPUTS.items()},
+            "AUTOMATIC_COMMENT_ID": "887",
+            "AUTOMATIC_STATE_SHA256": "56" * 32,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(outputs["invocation_route_json"]) == {
+        "kind": "default_branch_rollout_fallback",
+        "request_comment_id": 901,
+        "request_nonce": "dd" * 16,
+        "original_run_id": 34549275027,
+        "original_run_attempt": 1,
+        "expected_base_sha": "bb" * 20,
+        "release_commit": "444a7347aee169ed178aae80e8bd8d10eca52e02",
+        "managed_diff_sha256": "cc" * 32,
+        "automatic_comment_id": 887,
+        "automatic_state_sha256": "56" * 32,
+    }
+    assert json.loads(outputs["state_route_json"]) == {
+        "managed_diff_sha256": "cc" * 32,
+        "original_failed_run_id": 34549275027,
+        "release_commit": "444a7347aee169ed178aae80e8bd8d10eca52e02",
+        "request_comment_id": 901,
+        "reviewed_base_sha": "bb" * 20,
+        "route": "default_branch_rollout_fallback",
+    }
+
+
+@node_required
+def test_fallback_does_not_bypass_caller_validation(tmp_path):
+    result = _preflight(tmp_path, currentBlob="11" * 20, defaultBlob="22" * 20)
+    assert result["outputs"] == {
+        "allowed": "false", "reason": "workflow_validation_mismatch",
+    }
+
+
+def test_fallback_still_requires_live_request_policy():
+    workflow = _load("claude-code-review.yml")
+    assert workflow["jobs"]["claude-review"]["if"] == (
+        "needs.check-enabled.outputs.enabled == 'true' && "
+        "needs.check-enabled.outputs.policy_run == 'true'"
+    )
+
+
 def _new_step(name):
     steps = _load("claude-code-review.yml")["jobs"]["claude-review"]["steps"]
     return next((step for step in steps if step.get("name") == name), {})

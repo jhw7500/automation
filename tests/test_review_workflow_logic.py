@@ -59,6 +59,15 @@ GEMINI_V2_MARKER = "<!-- automation:gemini-auto-review:v2 -->"
 GEMINI_V3_MARKER = "<!-- automation:gemini-auto-review:v3 -->"
 GITHUB_ACTIONS_APP_ID = 15368
 
+FALLBACK_STATE_ROUTE = {
+    "managed_diff_sha256": "cc" * 32,
+    "original_failed_run_id": 34549275027,
+    "release_commit": "444a7347aee169ed178aae80e8bd8d10eca52e02",
+    "request_comment_id": 901,
+    "reviewed_base_sha": "bb" * 20,
+    "route": "default_branch_rollout_fallback",
+}
+
 
 def _state_line(
     reviewer: str, pr: int, run_id: int, head: str, run_attempt: int = 1, **changes: object
@@ -1439,6 +1448,7 @@ def test_claude_budget_claim_is_durable_before_provider_and_every_model_path_is_
     claim = _step(workflow, "claude-review", "Claim Claude review budget")
     assert claim["if"] == (
         "${{ always() && steps.prepare-review-input.outcome == 'success' "
+        "&& steps.claude-invocation-route.outcome == 'success' "
         "&& steps.stage-claude-budget-input.outcome == 'success' "
         "&& (steps.prepare-diff.outputs.diff-ready != 'true' "
         "|| steps.prepare-diff.outputs.diff-mode == 'unchanged' "
@@ -1457,6 +1467,9 @@ def test_claude_budget_claim_is_durable_before_provider_and_every_model_path_is_
         ),
             "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}",
             "force-review": "${{ inputs.force_review && 'true' || 'false' }}",
+        "invocation-route-json": (
+            "${{ steps.claude-invocation-route.outputs.invocation_route_json }}"
+        ),
         "input-files-json": (
             "${{ steps.stage-claude-budget-input.outputs.input_files_json }}"
         ),
@@ -1720,6 +1733,9 @@ def test_claude_budget_finalizes_after_review_state_upsert_and_uploads_both_chec
         "expected-head-sha": "${{ steps.prepare-diff.outputs.head-sha }}",
         "full-diff-sha256": "${{ steps.prepare-diff.outputs.full-diff-sha256 }}",
         "diff-mode": "${{ steps.prepare-diff.outputs.diff-mode }}",
+        "invocation-route-json": (
+            "${{ steps.claude-invocation-route.outputs.invocation_route_json }}"
+        ),
         "input-files-json": "[]",
         "authenticated-review-json": (
             "${{ steps.prepare-review-input.outputs.authenticated_review_json }}"
@@ -2890,7 +2906,12 @@ def test_shared_diff_wiring_is_exact_and_scope_safe():
             "pr-number": pr_number,
             "previous-sha": f"${{{{ steps.{_step_id(job, collector_name)}.outputs.previous_sha }}}}",
             "previous-full-hash": f"${{{{ steps.{_step_id(job, collector_name)}.outputs.previous_full_hash }}}}",
-            "force-full": "${{ inputs.force_review && 'true' || 'false' }}",
+            "force-full": (
+                "${{ (inputs.force_review || steps.fallback-mode.outputs.mode == "
+                "'fallback') && 'true' || 'false' }}"
+                if filename == "claude-code-review.yml"
+                else "${{ inputs.force_review && 'true' || 'false' }}"
+            ),
             "context-lines": context_lines,
             "output-directory": "${{ runner.temp }}",
         }
@@ -3143,9 +3164,13 @@ def test_force_review_is_opt_in_and_forces_a_full_diff_for_every_provider():
         force_input = workflow["on"]["workflow_call"]["inputs"]["force_review"]
         assert force_input["type"] == "boolean"
         assert force_input["default"] == "false"
-        assert _step(workflow, job_name, prepare_name)["with"]["force-full"] == (
-            "${{ inputs.force_review && 'true' || 'false' }}"
+        expected_force_full = (
+            "${{ (inputs.force_review || steps.fallback-mode.outputs.mode == "
+            "'fallback') && 'true' || 'false' }}"
+            if workflow_name == "claude-code-review.yml"
+            else "${{ inputs.force_review && 'true' || 'false' }}"
         )
+        assert _step(workflow, job_name, prepare_name)["with"]["force-full"] == expected_force_full
         assert _step(workflow, job_name, claim_name)["with"]["force-review"] == (
             "${{ inputs.force_review && 'true' || 'false' }}"
         )
@@ -4198,6 +4223,7 @@ let comments = JSON.parse(JSON.stringify(fx.comments));
 let checkRuns = JSON.parse(JSON.stringify(fx.checkRuns || []));
 const workflowRunAttemptOffsets = new Map();
 let listCommentCalls = 0;
+let pullRequestCalls = 0;
 let listWorkflowRunCalls = 0;
 let listCheckRunCalls = 0;
 let nextCommentId = Math.max(100, ...comments.map((item) => Number(item.id) || 0)) + 1;
@@ -4247,7 +4273,13 @@ const github = {
         },
     },
     pulls: {
-      get: async () => ({ data: fx.pullRequest || { head: { sha: fx.currentHead } } }),
+      get: async () => {
+        const sequence = fx.pullRequestSequence;
+        const data = Array.isArray(sequence) && sequence.length
+          ? sequence[Math.min(pullRequestCalls++, sequence.length - 1)]
+          : (fx.pullRequest || { head: { sha: fx.currentHead } });
+        return { data };
+      },
       listCommits: 'LIST_COMMITS',
     },
     checks: {
@@ -4397,6 +4429,7 @@ def _run_upsert(
     inject_comments_at_list_call: dict[int, list[dict]] | None = None,
     node_preload: Path | None = None,
     pull_request: dict | None = None,
+    pull_request_sequence: list[dict] | None = None,
     pull_commits: list[dict] | None = None,
 ) -> list:
     workflow = _load(workflow_file)
@@ -4444,6 +4477,7 @@ def _run_upsert(
         "checkRunListResponses": check_run_list_responses,
         "currentWorkflowRun": current_workflow_run,
         "pullRequest": pull_request,
+        "pullRequestSequence": pull_request_sequence,
         "pullCommits": pull_commits or [],
         "runJobs": [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "success"}],
         "runJobsByAttempt": run_jobs_by_attempt or {},
@@ -4496,6 +4530,10 @@ def _claude_upsert(
     workflow_run_attempt_sequences: dict[str, list[dict]] | None = None,
     candidate_artifact: str = "success",
     provider_failure_reason: str = "",
+    fallback_mode: str = "normal",
+    fallback_state_route_json: str = "",
+    current_base: str | None = None,
+    pull_request_sequence: list[dict] | None = None,
 ) -> list:
     workdir = tmp_path / ("with-review" if with_review else "without-review")
     workdir.mkdir()
@@ -4526,6 +4564,8 @@ def _claude_upsert(
         "CANONICAL_FAILURE_REASON": canonical_failure_reason,
         "CANDIDATE_ARTIFACT": candidate_artifact,
         "BUDGET_ALLOW_INVOCATION": budget_allow_invocation,
+        "FALLBACK_MODE": fallback_mode,
+        "FALLBACK_STATE_ROUTE_JSON": fallback_state_route_json,
         "BOT_LOGIN": "github-actions[bot]",
     }
     if not literal_schema:
@@ -4539,6 +4579,11 @@ def _claude_upsert(
         comments,
         cwd=workdir,
         current_head=current_head or attempt_head,
+        pull_request={
+            "head": {"sha": current_head or attempt_head},
+            "base": {"sha": current_base or "ef" * 20},
+        },
+        pull_request_sequence=pull_request_sequence,
         workflow_runs=workflow_runs,
         workflow_run_attempt_sequences=workflow_run_attempt_sequences,
     )
@@ -4548,6 +4593,93 @@ def _posted_state(body: str) -> dict[str, object]:
     match = re.search(r"^<!-- automation-state:(\{.*\}) -->$", body, re.M)
     assert match
     return json.loads(match.group(1))
+
+
+def test_fallback_claim_and_finalize_use_identical_route_json():
+    workflow = _load("claude-code-review.yml")
+    claim = _step(workflow, "claude-review", "Claim Claude review budget")
+    finalize = _step(workflow, "claude-review", "Finalize Claude review budget")
+    expected = "${{ steps.claude-invocation-route.outputs.invocation_route_json }}"
+    assert claim["with"]["invocation-route-json"] == expected
+    assert finalize["with"]["invocation-route-json"] == expected
+
+
+@node_required
+def test_fallback_success_publishes_authenticated_route(tmp_path):
+    calls = _claude_upsert(
+        tmp_path,
+        "success",
+        [],
+        with_review=True,
+        fallback_mode="fallback",
+        fallback_state_route_json=json.dumps(FALLBACK_STATE_ROUTE, separators=(",", ":")),
+        current_base="bb" * 20,
+        full_diff_sha256="cc" * 32,
+    )
+    state = _posted_state(_single_mutation_body(calls))
+    assert state["attempt_status"] == "success"
+    assert state["review_execution"] == "performed"
+    assert set(state["route"]) == {
+        "managed_diff_sha256", "original_failed_run_id", "release_commit",
+        "request_comment_id", "reviewed_base_sha", "route",
+    }
+    assert state["route"]["route"] == "default_branch_rollout_fallback"
+    assert state["route"]["original_failed_run_id"] == 34549275027
+    assert state["route"]["reviewed_base_sha"] == "bb" * 20
+
+
+@node_required
+def test_mismatch_failure_publishes_authenticated_reason(tmp_path):
+    calls = _claude_upsert(
+        tmp_path,
+        "skipped",
+        [],
+        with_review=False,
+        canonical_outcome="skipped",
+        document_valid="false",
+        provider_failure_reason="workflow_validation_mismatch",
+    )
+    state = _posted_state(_single_mutation_body(calls))
+    assert (state["failure_reason"], state["review_execution"]) == (
+        "workflow_validation_mismatch", "not_performed",
+    )
+
+
+@node_required
+def test_fallback_rechecks_live_head_and_base_immediately_before_publication(tmp_path):
+    head = "cd" * 20
+    calls = _claude_upsert(
+        tmp_path,
+        "success",
+        [],
+        with_review=True,
+        fallback_mode="fallback",
+        fallback_state_route_json=json.dumps(FALLBACK_STATE_ROUTE, separators=(",", ":")),
+        current_base="bb" * 20,
+        full_diff_sha256="cc" * 32,
+        pull_request_sequence=[
+            {"head": {"sha": head}, "base": {"sha": "bb" * 20}},
+            {"head": {"sha": head}, "base": {"sha": "ee" * 20}},
+        ],
+    )
+    assert not [call for call in calls if call[0] in {"create", "update"}]
+    assert [call for call in calls if call[0] == "notice"] == [[
+        "notice", "Claude review publication coordinates changed; left sticky state unchanged.",
+    ]]
+
+
+def test_fallback_success_state_is_readable_as_authenticated_review_context(tmp_path):
+    head = "ab" * 20
+    state = _v3_state(
+        head=head,
+        full_diff_sha256="cc" * 32,
+        route=FALLBACK_STATE_ROUTE,
+    )
+    _run_collect(tmp_path, [_bot("github-actions[bot]", _v3_body(state), 31)])
+    outputs = _github_outputs(tmp_path / "github-output")
+    assert outputs["previous_sha"] == head
+    assert outputs["previous_full_hash"] == "cc" * 32
+    assert json.loads(outputs["authenticated_review_json"])["success"] is True
 
 
 @node_required

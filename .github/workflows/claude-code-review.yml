@@ -22,6 +22,38 @@ on:
         type: boolean
         required: false
         default: false
+      fallback_request_comment_id:
+        type: string
+        required: false
+        default: ''
+      fallback_request_nonce:
+        type: string
+        required: false
+        default: ''
+      fallback_expected_head_sha:
+        type: string
+        required: false
+        default: ''
+      fallback_expected_base_sha:
+        type: string
+        required: false
+        default: ''
+      fallback_original_run_id:
+        type: string
+        required: false
+        default: ''
+      fallback_original_run_attempt:
+        type: string
+        required: false
+        default: ''
+      fallback_release_commit:
+        type: string
+        required: false
+        default: ''
+      fallback_managed_diff_sha256:
+        type: string
+        required: false
+        default: ''
     # Optional: Only run on specific file changes
     # paths:
     #   - "src/**/*.ts"
@@ -118,6 +150,97 @@ jobs:
           # Shared diff preparation validates merge-base ancestry on every round.
           fetch-depth: 0
 
+      - name: Resolve Claude fallback mode
+        id: fallback-mode
+        shell: bash
+        env:
+          FALLBACK_INPUTS_JSON: >-
+            {"fallback_request_comment_id":${{ toJSON(inputs.fallback_request_comment_id) }},"fallback_request_nonce":${{ toJSON(inputs.fallback_request_nonce) }},"fallback_expected_head_sha":${{ toJSON(inputs.fallback_expected_head_sha) }},"fallback_expected_base_sha":${{ toJSON(inputs.fallback_expected_base_sha) }},"fallback_original_run_id":${{ toJSON(inputs.fallback_original_run_id) }},"fallback_original_run_attempt":${{ toJSON(inputs.fallback_original_run_attempt) }},"fallback_release_commit":${{ toJSON(inputs.fallback_release_commit) }},"fallback_managed_diff_sha256":${{ toJSON(inputs.fallback_managed_diff_sha256) }}}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          values = json.loads(os.environ["FALLBACK_INPUTS_JSON"])
+          count = sum(isinstance(value, str) and value != "" for value in values.values())
+          if count not in {0, 8}:
+              raise SystemExit("fallback_inputs_partial")
+          mode = "fallback" if count == 8 else "normal"
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+              stream.write(f"mode={mode}\n")
+          PY
+
+      - name: Authenticate Claude fallback request
+        id: fallback-admission
+        if: ${{ steps.fallback-mode.outputs.mode == 'fallback' }}
+        uses: $/.github/actions/claude-rollout-fallback
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Validate Claude fallback admission
+        id: fallback-admission-validation
+        if: ${{ steps.fallback-mode.outputs.mode == 'fallback' }}
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          ROUTE: ${{ steps.fallback-admission.outputs.route }}
+          REQUEST_COMMENT_ID: ${{ steps.fallback-admission.outputs.request-comment-id }}
+          REQUEST_NONCE: ${{ steps.fallback-admission.outputs.request-nonce }}
+          EXPECTED_HEAD_SHA: ${{ steps.fallback-admission.outputs.expected-head-sha }}
+          EXPECTED_BASE_SHA: ${{ steps.fallback-admission.outputs.expected-base-sha }}
+          ORIGINAL_RUN_ID: ${{ steps.fallback-admission.outputs.original-run-id }}
+          ORIGINAL_RUN_ATTEMPT: ${{ steps.fallback-admission.outputs.original-run-attempt }}
+          RELEASE_COMMIT: ${{ steps.fallback-admission.outputs.release-commit }}
+          MANAGED_DIFF_SHA256: ${{ steps.fallback-admission.outputs.managed-diff-sha256 }}
+          INPUT_REQUEST_COMMENT_ID: ${{ inputs.fallback_request_comment_id }}
+          INPUT_REQUEST_NONCE: ${{ inputs.fallback_request_nonce }}
+          INPUT_EXPECTED_HEAD_SHA: ${{ inputs.fallback_expected_head_sha }}
+          INPUT_EXPECTED_BASE_SHA: ${{ inputs.fallback_expected_base_sha }}
+          INPUT_ORIGINAL_RUN_ID: ${{ inputs.fallback_original_run_id }}
+          INPUT_ORIGINAL_RUN_ATTEMPT: ${{ inputs.fallback_original_run_attempt }}
+          INPUT_RELEASE_COMMIT: ${{ inputs.fallback_release_commit }}
+          INPUT_MANAGED_DIFF_SHA256: ${{ inputs.fallback_managed_diff_sha256 }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            core.setOutput('allowed', 'false');
+            core.setOutput('reason', 'fallback_admission_mismatch');
+            const stop = () => core.setFailed('fallback_admission_mismatch');
+            const pairs = [
+              ['REQUEST_COMMENT_ID', 'INPUT_REQUEST_COMMENT_ID'],
+              ['REQUEST_NONCE', 'INPUT_REQUEST_NONCE'],
+              ['EXPECTED_HEAD_SHA', 'INPUT_EXPECTED_HEAD_SHA'],
+              ['EXPECTED_BASE_SHA', 'INPUT_EXPECTED_BASE_SHA'],
+              ['ORIGINAL_RUN_ID', 'INPUT_ORIGINAL_RUN_ID'],
+              ['ORIGINAL_RUN_ATTEMPT', 'INPUT_ORIGINAL_RUN_ATTEMPT'],
+              ['RELEASE_COMMIT', 'INPUT_RELEASE_COMMIT'],
+              ['MANAGED_DIFF_SHA256', 'INPUT_MANAGED_DIFF_SHA256'],
+            ];
+            if (process.env.ROUTE !== 'managed'
+              || pairs.some(([actual, expected]) =>
+                !process.env[actual] || process.env[actual] !== process.env[expected])) {
+              stop();
+              return;
+            }
+            try {
+              const { owner, repo } = context.repo;
+              const { data: pr } = await github.rest.pulls.get({
+                owner, repo, pull_number: Number(process.env.PR_NUMBER),
+                request: { timeout: 15000 },
+              });
+              if (pr?.head?.sha !== process.env.EXPECTED_HEAD_SHA
+                || pr?.base?.sha !== process.env.EXPECTED_BASE_SHA) {
+                stop();
+                return;
+              }
+              core.setOutput('reason', '');
+              core.setOutput('allowed', 'true');
+            } catch {
+              stop();
+            }
+
       # 재리뷰 라운드 인식: 직전 라운드의 자기 리뷰(sticky 코멘트)와 사람 코멘트(반박 포함)를
       # 트리밍해 파일로 준비한다. 라운드 1(컨텍스트 없음)은 파일을 만들지 않아 오버헤드 0.
       # 섹션별 문자 상한으로 토큰 사용을 상수로 묶는다(라운드가 늘어도 크기 일정).
@@ -176,6 +299,17 @@ jobs:
                 type == "string" and (. == "full" or . == "delta" or . == "unchanged" or . == "unavailable");
               def review_execution:
                 . == null or . == "performed" or . == "reused" or . == "not_performed";
+              def failure_reason:
+                type == "string" and test("^[a-z_]+$");
+              def fallback_route:
+                type == "object"
+                and (keys | sort) == ["managed_diff_sha256", "original_failed_run_id", "release_commit", "request_comment_id", "reviewed_base_sha", "route"]
+                and .route == "default_branch_rollout_fallback"
+                and (.request_comment_id | positive_integer)
+                and (.original_failed_run_id | positive_integer)
+                and (.reviewed_base_sha | sha1)
+                and (.release_commit | sha1)
+                and (.managed_diff_sha256 | sha256);
               def successful_pair:
                 if .successful_head == null then .full_diff_sha256 == null
                 else (.successful_head | sha1) and (.full_diff_sha256 | sha256)
@@ -214,8 +348,18 @@ jobs:
                 | select($lines[0] == $header and $lines[1] == $marker)
                 | (($lines[2]? // "") | (capture("^<!-- automation-state:(?<json>\\{.*\\}) -->$")? | .json? | fromjson?)) as $s
                 | select(($s | type) == "object")
-                | select((($s | keys | sort) == ["accepted_count", "attempt_head", "attempt_status", "diff_mode", "filtered_count", "filtered_max_severity", "full_diff_sha256", "normalized_count", "pr", "quality_schema", "reviewer", "run_attempt", "run_id", "schema", "successful_head"])
-                  or (($s | keys | sort) == ["accepted_count", "attempt_head", "attempt_status", "diff_mode", "filtered_count", "filtered_max_severity", "full_diff_sha256", "normalized_count", "pr", "quality_schema", "review_execution", "reviewer", "run_attempt", "run_id", "schema", "successful_head"]))
+                | (($s | keys | sort) as $keys
+                  | ["accepted_count", "attempt_head", "attempt_status", "diff_mode", "filtered_count", "filtered_max_severity", "full_diff_sha256", "normalized_count", "pr", "quality_schema", "reviewer", "run_attempt", "run_id", "schema", "successful_head"] as $legacy
+                  | ($legacy + ["review_execution"] | sort) as $normal
+                  | ($normal + ["failure_reason"] | sort) as $failure
+                  | ($normal + ["route"] | sort) as $fallback
+                  | select($keys == $legacy or $keys == $normal or $keys == $failure or $keys == $fallback)
+                  | select(if $keys == $failure then
+                      $s.attempt_status == "failure" and ($s.failure_reason | failure_reason)
+                    elif $keys == $fallback then
+                      $s.attempt_status == "success" and ($s.route | fallback_route)
+                      and $s.route.managed_diff_sha256 == $s.full_diff_sha256
+                    else true end))
                 | select(($s.schema | type) == "number" and $s.schema == 3)
                 | select(($s.quality_schema | type) == "number" and $s.quality_schema == 1)
                 | select(($s.reviewer | type) == "string" and $s.reviewer == $reviewer)
@@ -399,16 +543,98 @@ jobs:
           pr-number: ${{ inputs.pr_number || github.event.pull_request.number }}
           previous-sha: ${{ steps.prepare-review-input.outputs.previous_sha }}
           previous-full-hash: ${{ steps.prepare-review-input.outputs.previous_full_hash }}
-          force-full: ${{ inputs.force_review && 'true' || 'false' }}
+          force-full: ${{ (inputs.force_review || steps.fallback-mode.outputs.mode == 'fallback') && 'true' || 'false' }}
           context-lines: '3'
           output-directory: ${{ runner.temp }}
+
+      - name: Resolve Claude invocation route
+        id: claude-invocation-route
+        shell: bash
+        env:
+          FALLBACK_MODE: ${{ steps.fallback-mode.outputs.mode }}
+          DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode }}
+          COMPUTED_FULL_DIFF_SHA256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
+          FORCE_REVIEW: ${{ inputs.force_review && 'true' || 'false' }}
+          FALLBACK_REQUEST_COMMENT_ID: ${{ inputs.fallback_request_comment_id }}
+          FALLBACK_REQUEST_NONCE: ${{ inputs.fallback_request_nonce }}
+          FALLBACK_EXPECTED_BASE_SHA: ${{ inputs.fallback_expected_base_sha }}
+          FALLBACK_ORIGINAL_RUN_ID: ${{ inputs.fallback_original_run_id }}
+          FALLBACK_ORIGINAL_RUN_ATTEMPT: ${{ inputs.fallback_original_run_attempt }}
+          FALLBACK_RELEASE_COMMIT: ${{ inputs.fallback_release_commit }}
+          FALLBACK_MANAGED_DIFF_SHA256: ${{ inputs.fallback_managed_diff_sha256 }}
+          AUTOMATIC_COMMENT_ID: ${{ steps.fallback-admission.outputs.automatic-comment-id }}
+          AUTOMATIC_STATE_SHA256: ${{ steps.fallback-admission.outputs.automatic-state-sha256 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          mode = os.environ["FALLBACK_MODE"]
+          force_review = os.environ["FORCE_REVIEW"]
+          if mode not in {"normal", "fallback"} or force_review not in {"true", "false"}:
+              raise SystemExit("invocation_route_invalid")
+
+          if mode == "normal":
+              kind = "authorized_override" if force_review == "true" else "automatic"
+              invocation_route = {"kind": kind}
+              state_route = None
+          else:
+              if force_review != "false":
+                  raise SystemExit("fallback_force_review_invalid")
+              if (os.environ["DIFF_MODE"] != "full"
+                  or os.environ["COMPUTED_FULL_DIFF_SHA256"]
+                  != os.environ["FALLBACK_MANAGED_DIFF_SHA256"]):
+                  raise SystemExit("fallback_diff_mismatch")
+              integers = {
+                  "request_comment_id": os.environ["FALLBACK_REQUEST_COMMENT_ID"],
+                  "original_run_id": os.environ["FALLBACK_ORIGINAL_RUN_ID"],
+                  "original_run_attempt": os.environ["FALLBACK_ORIGINAL_RUN_ATTEMPT"],
+                  "automatic_comment_id": os.environ["AUTOMATIC_COMMENT_ID"],
+              }
+              if any(re.fullmatch(r"[1-9][0-9]*", value) is None for value in integers.values()):
+                  raise SystemExit("invocation_route_invalid")
+              hashes = {
+                  "request_nonce": (os.environ["FALLBACK_REQUEST_NONCE"], 32),
+                  "expected_base_sha": (os.environ["FALLBACK_EXPECTED_BASE_SHA"], 40),
+                  "release_commit": (os.environ["FALLBACK_RELEASE_COMMIT"], 40),
+                  "managed_diff_sha256": (os.environ["FALLBACK_MANAGED_DIFF_SHA256"], 64),
+                  "automatic_state_sha256": (os.environ["AUTOMATIC_STATE_SHA256"], 64),
+              }
+              if any(re.fullmatch(rf"[0-9a-f]{{{size}}}", value) is None
+                     for value, size in hashes.values()):
+                  raise SystemExit("invocation_route_invalid")
+              invocation_route = {
+                  "kind": "default_branch_rollout_fallback",
+                  **{name: int(value) for name, value in integers.items()},
+                  **{name: value for name, (value, _) in hashes.items()},
+              }
+              state_route = {
+                  "route": "default_branch_rollout_fallback",
+                  "request_comment_id": int(integers["request_comment_id"]),
+                  "original_failed_run_id": int(integers["original_run_id"]),
+                  "reviewed_base_sha": hashes["expected_base_sha"][0],
+                  "release_commit": hashes["release_commit"][0],
+                  "managed_diff_sha256": hashes["managed_diff_sha256"][0],
+              }
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+              stream.write("invocation_route_json=" + json.dumps(
+                  invocation_route, ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+              ) + "\n")
+              stream.write("state_route_json=" + ("" if state_route is None else json.dumps(
+                  state_route, ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+              )) + "\n")
+          PY
 
       # The App validates the caller against the current default branch. Check
       # before reserving a round, using workflow identity rather than PR checkout.
       # This is a prediction only; the upstream App remains the authority.
       - name: Validate Claude caller workflow
         id: claude-workflow-validation
-        if: ${{ always() && steps.prepare-review-input.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
+        if: ${{ always() && steps.prepare-review-input.outcome == 'success' && steps.claude-invocation-route.outcome == 'success' && steps.prepare-diff.outputs.diff-ready == 'true' && steps.prepare-diff.outputs.diff-mode != 'unchanged' }}
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
         env:
           WORKFLOW_REF: ${{ github.workflow_ref }}
@@ -530,7 +756,7 @@ jobs:
 
       - name: Claim Claude review budget
         id: review-budget-claim
-        if: ${{ always() && steps.prepare-review-input.outcome == 'success' && steps.stage-claude-budget-input.outcome == 'success' && (steps.prepare-diff.outputs.diff-ready != 'true' || steps.prepare-diff.outputs.diff-mode == 'unchanged' || steps.claude-workflow-validation.outputs.allowed == 'true') }}
+        if: ${{ always() && steps.prepare-review-input.outcome == 'success' && steps.claude-invocation-route.outcome == 'success' && steps.stage-claude-budget-input.outcome == 'success' && (steps.prepare-diff.outputs.diff-ready != 'true' || steps.prepare-diff.outputs.diff-mode == 'unchanged' || steps.claude-workflow-validation.outputs.allowed == 'true') }}
         uses: $/.github/actions/review-invocation-budget
         with:
           github-token: ${{ github.token }}
@@ -541,6 +767,7 @@ jobs:
           full-diff-sha256: ${{ steps.stage-claude-budget-input.outputs.full_diff_sha256 }}
           diff-mode: ${{ steps.prepare-diff.outputs.diff-mode || 'unavailable' }}
           force-review: ${{ inputs.force_review && 'true' || 'false' }}
+          invocation-route-json: ${{ steps.claude-invocation-route.outputs.invocation_route_json }}
           input-files-json: ${{ steps.stage-claude-budget-input.outputs.input_files_json }}
           authenticated-review-json: ${{ steps.prepare-review-input.outputs.authenticated_review_json }}
           model-route-json: ${{ steps.claude-budget-config.outputs.model_route_json }}
@@ -876,6 +1103,8 @@ jobs:
           CANONICAL_FAILURE_REASON: ${{ steps.canonicalize-review.outputs.failure-reason }}
           CANDIDATE_ARTIFACT: ${{ steps.upload-candidate.outcome }}
           BUDGET_ALLOW_INVOCATION: ${{ steps.review-budget-claim.outputs.allow-invocation }}
+          FALLBACK_MODE: ${{ steps.fallback-mode.outputs.mode }}
+          FALLBACK_STATE_ROUTE_JSON: ${{ steps.claude-invocation-route.outputs.state_route_json }}
           BOT_LOGIN: 'github-actions[bot]'
         with:
           github-token: ${{ github.token }}
@@ -897,6 +1126,7 @@ jobs:
             const canonicalOutcome = (process.env.CANONICAL_OUTCOME || '').toLowerCase();
             const documentValid = process.env.DOCUMENT_VALID === 'true';
             const invocationAllowed = process.env.BUDGET_ALLOW_INVOCATION === 'true';
+            const fallbackMode = process.env.FALLBACK_MODE === 'fallback';
             const runIdRaw = process.env.RUN_ID || '';
             const runIdIsValid = /^[1-9][0-9]*$/.test(runIdRaw)
               && Number.isSafeInteger(Number(runIdRaw));
@@ -952,6 +1182,25 @@ jobs:
             });
             const sha1 = (value) => /^[0-9a-f]{40}$/.test(value || '');
             const sha256 = (value) => /^[0-9a-f]{64}$/.test(value || '');
+            const positiveInteger = (value) => Number.isSafeInteger(value) && value > 0;
+            let fallbackRoute = null;
+            try {
+              fallbackRoute = JSON.parse(process.env.FALLBACK_STATE_ROUTE_JSON || 'null');
+            } catch (e) {
+              fallbackRoute = null;
+            }
+            const fallbackRouteKeys = [
+              'managed_diff_sha256', 'original_failed_run_id', 'release_commit',
+              'request_comment_id', 'reviewed_base_sha', 'route',
+            ];
+            const validFallbackRoute = (route) => route && typeof route === 'object'
+              && !Array.isArray(route)
+              && JSON.stringify(Object.keys(route).sort()) === JSON.stringify(fallbackRouteKeys)
+              && route.route === 'default_branch_rollout_fallback'
+              && positiveInteger(route.request_comment_id)
+              && positiveInteger(route.original_failed_run_id)
+              && sha1(route.reviewed_base_sha) && sha1(route.release_commit)
+              && sha256(route.managed_diff_sha256);
             const validQuality = (state) => Number.isSafeInteger(state.accepted_count)
               && state.accepted_count >= 0
               && Number.isSafeInteger(state.filtered_count) && state.filtered_count >= 0
@@ -959,9 +1208,17 @@ jobs:
               && maxSeverity(state.filtered_max_severity);
             const legacyStateKeys = ['accepted_count', 'attempt_head', 'attempt_status', 'diff_mode', 'filtered_count', 'filtered_max_severity', 'full_diff_sha256', 'normalized_count', 'pr', 'quality_schema', 'reviewer', 'run_attempt', 'run_id', 'schema', 'successful_head'];
             const expectedStateKeys = [...legacyStateKeys, 'review_execution'].sort();
+            const failureStateKeys = [...expectedStateKeys, 'failure_reason'].sort();
+            const fallbackStateKeys = [...expectedStateKeys, 'route'].sort();
             const validState = (state) => state && typeof state === 'object' && !Array.isArray(state)
-              && [legacyStateKeys, expectedStateKeys].some((keys) =>
+              && [legacyStateKeys, expectedStateKeys, failureStateKeys, fallbackStateKeys].some((keys) =>
                 JSON.stringify(Object.keys(state).sort()) === JSON.stringify(keys))
+              && (state.failure_reason === undefined
+                || (state.attempt_status === 'failure'
+                  && /^[a-z_]+$/.test(state.failure_reason)))
+              && (state.route === undefined
+                || (state.attempt_status === 'success' && validFallbackRoute(state.route)
+                  && state.route.managed_diff_sha256 === state.full_diff_sha256))
               && state.schema === 3 && state.quality_schema === 1
               && state.reviewer === 'claude' && state.pr === issueNumber
               && Number.isSafeInteger(state.run_id) && state.run_id > 0
@@ -1076,7 +1333,9 @@ jobs:
               return;
             }
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: issueNumber });
-            if (pr.head?.sha !== attemptHead) {
+            if (pr.head?.sha !== attemptHead
+              || (fallbackMode && (!validFallbackRoute(fallbackRoute)
+                || pr.base?.sha !== fallbackRoute.reviewed_base_sha))) {
               core.notice(`Discarding stale review for ${attemptHead}; current head is ${pr.head?.sha || 'unknown'}`);
               return;
             }
@@ -1098,11 +1357,13 @@ jobs:
               && existing.state.full_diff_sha256 === fullDiffSha256
               && preservedProse.length > 0;
             const currentSuccess = invocationAllowed && ok && canonicalOutcome === 'success' && documentValid
-              && qualityValid && review.length > 0 && reviewedInputIsValid;
+              && qualityValid && review.length > 0 && reviewedInputIsValid
+              && (!fallbackMode || validFallbackRoute(fallbackRoute));
             let checkpointFailed = !(currentSuccess || unchangedInputIsValid);
             let failureReason = !diffReady ? 'diff_unavailable'
               : !modelStepEntered && nonexecutionReasons.has(providerFailureReason) ? providerFailureReason
                 : !ok ? 'provider_failure'
+                : fallbackMode && !validFallbackRoute(fallbackRoute) ? 'fallback_route_invalid'
                 : hardReasons.has(canonicalFailureReason) ? canonicalFailureReason
                   : 'canonicalizer_error';
             const stateDiffMode = ['full', 'delta', 'unchanged', 'unavailable'].includes(diffMode)
@@ -1115,36 +1376,41 @@ jobs:
               filtered_max_severity: existing.state.filtered_max_severity,
             } : quality;
             const successBody = unchangedInputIsValid ? preservedProse : review;
-            const buildState = (failed, preserveSuccess) => ({
-              schema: 3,
-              reviewer: 'claude',
-              pr: issueNumber,
-              run_id: runId,
-              run_attempt: runAttempt,
-              attempt_head: attemptHead,
-              successful_head: failed ? (preserveSuccess ? existing.state.successful_head : null) : attemptHead,
-              attempt_status: failed ? 'failure' : 'success',
-              diff_mode: stateDiffMode,
-              review_execution: unchangedInputIsValid
-                ? 'reused'
-                : (modelStepEntered ? 'performed' : 'not_performed'),
-              full_diff_sha256: failed
-                ? (preserveSuccess ? existing.state.full_diff_sha256 : null)
-                : fullDiffSha256,
-              quality_schema: 1,
-              accepted_count: failed
-                ? (preserveSuccess ? existing.state.accepted_count : null)
-                : successQuality.accepted_count,
-              filtered_count: failed
-                ? (preserveSuccess ? existing.state.filtered_count : null)
-                : successQuality.filtered_count,
-              normalized_count: failed
-                ? (preserveSuccess ? existing.state.normalized_count : null)
-                : successQuality.normalized_count,
-              filtered_max_severity: failed
-                ? (preserveSuccess ? existing.state.filtered_max_severity : null)
-                : successQuality.filtered_max_severity,
-            });
+            const buildState = (failed, preserveSuccess) => {
+              const state = {
+                schema: 3,
+                reviewer: 'claude',
+                pr: issueNumber,
+                run_id: runId,
+                run_attempt: runAttempt,
+                attempt_head: attemptHead,
+                successful_head: failed ? (preserveSuccess ? existing.state.successful_head : null) : attemptHead,
+                attempt_status: failed ? 'failure' : 'success',
+                diff_mode: stateDiffMode,
+                review_execution: unchangedInputIsValid
+                  ? 'reused'
+                  : (modelStepEntered ? 'performed' : 'not_performed'),
+                full_diff_sha256: failed
+                  ? (preserveSuccess ? existing.state.full_diff_sha256 : null)
+                  : fullDiffSha256,
+                quality_schema: 1,
+                accepted_count: failed
+                  ? (preserveSuccess ? existing.state.accepted_count : null)
+                  : successQuality.accepted_count,
+                filtered_count: failed
+                  ? (preserveSuccess ? existing.state.filtered_count : null)
+                  : successQuality.filtered_count,
+                normalized_count: failed
+                  ? (preserveSuccess ? existing.state.normalized_count : null)
+                  : successQuality.normalized_count,
+                filtered_max_severity: failed
+                  ? (preserveSuccess ? existing.state.filtered_max_severity : null)
+                  : successQuality.filtered_max_severity,
+              };
+              if (failed) state.failure_reason = failureReason;
+              if (!failed && fallbackMode) state.route = fallbackRoute;
+              return state;
+            };
             const envelope = (state, content) => `${header}\n${marker}\n<!-- automation-state:${JSON.stringify(state)} -->\n\n${metadata(state)}\n\n${content}`;
             if (!checkpointFailed) {
               const candidate = envelope(buildState(false, false), successBody);
@@ -1176,6 +1442,14 @@ jobs:
             }
             if (checkpointFailed) core.notice(`Claude review attempt failed: ${failureReason}`);
 
+            const { data: publicationPr } = await github.rest.pulls.get({
+              owner, repo, pull_number: issueNumber,
+            });
+            if (publicationPr.head?.sha !== attemptHead
+              || (fallbackMode && publicationPr.base?.sha !== fallbackRoute.reviewed_base_sha)) {
+              core.notice('Claude review publication coordinates changed; left sticky state unchanged.');
+              return;
+            }
             const target = existing?.comment || v2Target;
             if (target) {
               await github.rest.issues.updateComment({ owner, repo, comment_id: target.id, body });
@@ -1265,6 +1539,7 @@ jobs:
           expected-head-sha: ${{ steps.prepare-diff.outputs.head-sha }}
           full-diff-sha256: ${{ steps.prepare-diff.outputs.full-diff-sha256 }}
           diff-mode: ${{ steps.prepare-diff.outputs.diff-mode }}
+          invocation-route-json: ${{ steps.claude-invocation-route.outputs.invocation_route_json }}
           input-files-json: '[]'
           authenticated-review-json: ${{ steps.prepare-review-input.outputs.authenticated_review_json }}
           model-route-json: ${{ steps.claude-budget-metrics.outputs.model_route_json }}
