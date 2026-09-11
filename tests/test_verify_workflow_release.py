@@ -41,6 +41,10 @@ from release_fixture_helpers import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+V176_REVIEW_BUDGET_COMMIT = "444a7347aee169ed178aae80e8bd8d10eca52e02"
+REVIEW_INVOCATION_BUDGET_HELPER = (
+    ".github/actions/review-invocation-budget/review_invocation_budget.py"
+)
 
 RECOVERY_RELEASE_FILES = (
     ".github/actions/recover-opencode-review/evidence.py",
@@ -48,6 +52,17 @@ RECOVERY_RELEASE_FILES = (
     ".github/actions/recover-opencode-review/receipt.js",
     ".github/actions/recover-opencode-review/transport.py",
 )
+
+
+def restore_pre_v177_token_estimate_policy(repo: Path) -> None:
+    """Restore the authenticated v1.76 invocation-budget helper bytes."""
+
+    tree = release_verifier.VerifiedCommitTree.open(ROOT, V176_REVIEW_BUDGET_COMMIT)
+    payload = tree.read_file(REVIEW_INVOCATION_BUDGET_HELPER)
+    assert hashlib.sha256(payload).hexdigest() == (
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176
+    )
+    (repo / REVIEW_INVOCATION_BUDGET_HELPER).write_bytes(payload)
 
 
 @pytest.fixture
@@ -63,10 +78,16 @@ def recovery_release_repo(tmp_path):
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v177_token_estimate_policy(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
     return repo, commit(repo, "v1.76 recovery candidate")
+
+
+def prepare_v177(repo: Path) -> str:
+    shutil.copy2(ROOT / REVIEW_INVOCATION_BUDGET_HELPER, repo / REVIEW_INVOCATION_BUDGET_HELPER)
+    return commit(repo, "v1.77 observational token estimate candidate")
 
 
 def test_v176_accepts_recovery_and_rejects_old_release_identity(recovery_release_repo):
@@ -75,6 +96,209 @@ def test_v176_accepts_recovery_and_rejects_old_release_identity(recovery_release
     for ref in ("v1.74", "v1.75"):
         with pytest.raises(ReleaseVerificationError):
             release_verifier.verify_commit_content(repo, ref, candidate)
+
+
+def test_token_estimate_observability_release_boundary() -> None:
+    assert release_inventory.release_supports_observational_token_estimates("v1.76") is False
+    assert release_inventory.release_supports_observational_token_estimates("v1.77") is True
+
+
+def test_v177_accepts_observational_token_estimate_contract(recovery_release_repo):
+    repo, _ = recovery_release_repo
+    candidate = prepare_v177(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.77", candidate) == candidate
+
+
+def test_v177_structural_contract_ignores_nonsemantic_comments() -> None:
+    source = (ROOT / REVIEW_INVOCATION_BUDGET_HELPER).read_text(encoding="utf-8")
+
+    release_verifier.require_budget_helper_contract(
+        "# nonsemantic release-verifier probe\n" + source,
+        rounds_variable=True,
+        filter_reasons=True,
+        dismissals=True,
+        expanded_budget=True,
+        observational_token_estimates=True,
+    )
+
+
+def test_v177_helper_is_rejected_on_v176_release_line(recovery_release_repo):
+    repo, _ = recovery_release_repo
+    candidate = prepare_v177(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.76", candidate)
+
+
+def test_v176_helper_is_rejected_on_v177_release_line(recovery_release_repo):
+    repo, candidate = recovery_release_repo
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.77", candidate)
+
+
+def test_v177_rejects_reintroduced_estimated_token_gate() -> None:
+    source = (ROOT / REVIEW_INVOCATION_BUDGET_HELPER).read_text(encoding="utf-8")
+    insertion = (
+        "    if request.estimated_input_tokens > "
+        "validated.budgets.max_estimated_tokens_per_round:\n"
+        "        return refuse(validated, request, 'input_budget_exhausted')\n"
+        "    override_count = sum(\n"
+    )
+    source = source.replace("    override_count = sum(\n", insertion, 1)
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="invocation-budget helper contract",
+    ):
+        release_verifier.require_budget_helper_contract(
+            source,
+            rounds_variable=True,
+            filter_reasons=True,
+            dismissals=True,
+            expanded_budget=True,
+            observational_token_estimates=True,
+        )
+
+
+def test_v177_rejects_estimated_token_gate_relocated_to_append_claim() -> None:
+    source = (ROOT / REVIEW_INVOCATION_BUDGET_HELPER).read_text(encoding="utf-8")
+    insertion = (
+        "        provenance: RunProvenance) -> Transition:\n"
+        "    round_estimate = request.estimated_input_tokens\n"
+        "    round_limit = state.budgets.max_estimated_tokens_per_round\n"
+        "    if round_estimate > round_limit:\n"
+        "        return refuse(state, request, 'round_budget_exhausted')\n"
+        "    round_number = len(state.invocations) + 1\n"
+    )
+    source = source.replace(
+        "        provenance: RunProvenance) -> Transition:\n"
+        "    round_number = len(state.invocations) + 1\n",
+        insertion,
+        1,
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="invocation-budget helper contract",
+    ):
+        release_verifier.require_budget_helper_contract(
+            source,
+            rounds_variable=True,
+            filter_reasons=True,
+            dismissals=True,
+            expanded_budget=True,
+            observational_token_estimates=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("setup", "condition"),
+    (
+        (
+            "round_estimate_box = (request.estimated_input_tokens,)",
+            "round_estimate_box[0] > 200_000",
+        ),
+        (
+            "round_estimate_box = [request.estimated_input_tokens]",
+            "round_estimate_box[0] > 200_000",
+        ),
+        (
+            "round_estimate_box = {'value': request.estimated_input_tokens}",
+            "round_estimate_box['value'] > 200_000",
+        ),
+        (
+            "round_estimate_box.value = request.estimated_input_tokens",
+            "round_estimate_box.value > 200_000",
+        ),
+    ),
+)
+def test_v177_rejects_container_indirected_token_gate_in_append_claim(
+    setup: str, condition: str,
+) -> None:
+    source = (ROOT / REVIEW_INVOCATION_BUDGET_HELPER).read_text(encoding="utf-8")
+    insertion = (
+        "        provenance: RunProvenance) -> Transition:\n"
+        f"    {setup}\n"
+        f"    if {condition}:\n"
+        "        return refuse(state, request, 'round_budget_exhausted')\n"
+        "    round_number = len(state.invocations) + 1\n"
+    )
+    source = source.replace(
+        "        provenance: RunProvenance) -> Transition:\n"
+        "    round_number = len(state.invocations) + 1\n",
+        insertion,
+        1,
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="invocation-budget helper contract",
+    ):
+        release_verifier.require_budget_helper_contract(
+            source,
+            rounds_variable=True,
+            filter_reasons=True,
+            dismissals=True,
+            expanded_budget=True,
+            observational_token_estimates=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("anchor", "replacement"),
+    (
+        (
+            "def _integer(value: object, name: str, *, positive: bool = False, "
+            "minimum: int | None = None) -> int:\n"
+            "    if isinstance(value, bool) or not isinstance(value, int):\n",
+            "def _integer(value: object, name: str, *, positive: bool = False, "
+            "minimum: int | None = None) -> int:\n"
+            "    if name == 'estimated_input_tokens' and value > 200_000:\n"
+            "        raise BudgetStateError('input_budget_exhausted')\n"
+            "    if isinstance(value, bool) or not isinstance(value, int):\n",
+        ),
+        (
+            "        provenance: RunProvenance) -> Transition:\n"
+            "    round_number = len(state.invocations) + 1\n",
+            "        provenance: RunProvenance) -> Transition:\n"
+            "    round_estimate = request.estimated_input_tokens\n"
+            "    def over_legacy_limit():\n"
+            "        return round_estimate > 200_000\n"
+            "    if over_legacy_limit():\n"
+            "        return refuse(state, request, 'round_budget_exhausted')\n"
+            "    round_number = len(state.invocations) + 1\n",
+        ),
+        (
+            "        provenance: RunProvenance) -> Transition:\n"
+            "    round_number = len(state.invocations) + 1\n",
+            "        provenance: RunProvenance) -> Transition:\n"
+            "    request.estimated_input_tokens > 200_000 and "
+            "(_ for _ in ()).throw(BudgetStateError('input_budget_exhausted'))\n"
+            "    round_number = len(state.invocations) + 1\n",
+        ),
+    ),
+)
+def test_v177_rejects_indirect_token_gate_control_forms(
+    anchor: str, replacement: str,
+) -> None:
+    source = (ROOT / REVIEW_INVOCATION_BUDGET_HELPER).read_text(encoding="utf-8")
+    mutated = source.replace(anchor, replacement, 1)
+    assert mutated != source
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="invocation-budget helper contract",
+    ):
+        release_verifier.require_budget_helper_contract(
+            mutated,
+            rounds_variable=True,
+            filter_reasons=True,
+            dismissals=True,
+            expanded_budget=True,
+            observational_token_estimates=True,
+        )
 
 
 def test_v176_inventory_owns_all_recovery_executables_only_from_v176(recovery_release_repo):
@@ -3356,6 +3580,7 @@ def test_v147_budget_helper_semantics_reject_authenticated_mutations(
             filter_reasons=True,
             dismissals=True,
             expanded_budget=True,
+            observational_token_estimates=True,
         )
 
 
@@ -3489,6 +3714,7 @@ def test_v147_budget_helper_semantics_bind_live_ast_relationships(
             filter_reasons=True,
             dismissals=True,
             expanded_budget=True,
+            observational_token_estimates=True,
         )
 
 
