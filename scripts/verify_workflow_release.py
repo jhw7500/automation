@@ -7601,7 +7601,7 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
 EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/claude-rollout-fallback/action.yml": "ee4b8e6b88ebfc1d0691e032da93b03ba8268fac1bd9377a26554d8200621c0a",
     ".github/actions/claude-rollout-fallback/contract.py": "ae39e0f9c0a1faa6831559c93150fca7f768fbaa0257aade70f045abd0eafff6",
-    "scripts/verify_claude_rollout_fallback.py": "22567889d6d0ae0a4158e0d886d36eaceba52ceb688346ef284736eed5075eb4",
+    "scripts/verify_claude_rollout_fallback.py": "91b986a63ec0ab97d072b9b7a906b2191d6a4de4adae8025fc5d4855fab883f5",
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "bb111fd319a6449f8f56cbe22a20572b662525f9f4a7765bc46a415bba5f5881",
@@ -7614,7 +7614,7 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
 EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/claude-rollout-fallback/action.yml": "fa6b723778608c90683a9cd49bd64229b4f1bc5ad10845978be51e605f6ef894",
     ".github/actions/claude-rollout-fallback/contract.py": "b2b1c32742bab2642b24ff6e20fd9525432610721ce4e55b501c8255aa09a121",
-    "scripts/verify_claude_rollout_fallback.py": "6daa78d4135a474e1c85254841a0cce38e1998f00aa2cc6ce2fc1f8a88ddf5d7",
+    "scripts/verify_claude_rollout_fallback.py": "76d20b6674e4323c4971b0c27cbbac35c0641e363856d022fdbcb43ac71ce2f2",
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "5781ef1db5e22f83ed07fc83fabe0beb615544a1412e01b2b8dabfd5f06593ab",

@@ -200,14 +200,68 @@ def verify_source_root(root: Path, driver_commit: str) -> None:
         raise VerificationError("verifier_root_invalid") from None
 
 
-def require_trusted_dependency_directory(path: Path) -> None:
+def require_trusted_dependency_directory(
+    path: Path, *, allowed_owners: frozenset[int] = frozenset({0})
+) -> None:
     try:
+        if (
+            not isinstance(allowed_owners, frozenset)
+            or 0 not in allowed_owners
+            or any(
+                isinstance(owner, bool) or not isinstance(owner, int) or owner < 0
+                for owner in allowed_owners
+            )
+        ):
+            raise ValueError
         _no_symlinks(path)
         for node in (path, *path.parents):
             observed = node.lstat()
-            if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != 0 or observed.st_mode & 0o022:
+            mode = stat.S_IMODE(observed.st_mode)
+            trusted_sticky = observed.st_uid == 0 and bool(mode & stat.S_ISVTX)
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or observed.st_uid not in allowed_owners
+                or (mode & 0o022 and not trusted_sticky)
+            ):
                 raise ValueError
     except (OSError, ValueError):
+        raise VerificationError("verifier_dependency_invalid") from None
+
+
+def trusted_runtime_dependency_owners(path: Path) -> frozenset[int]:
+    """Trust the owner of the interpreter prefix that is already executing us."""
+
+    try:
+        _no_symlinks(path)
+        executable = Path(os.path.realpath(sys.executable))
+        _no_symlinks(executable)
+        observed = executable.lstat()
+        mode = stat.S_IMODE(observed.st_mode)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid not in {0, os.getuid()}
+            or mode & 0o022
+        ):
+            raise ValueError
+        # setup-python may keep a root-owned executable inside a prefix whose
+        # packages are installed by the isolated runner account. The executing
+        # interpreter and its configured prefix are already part of the TCB.
+        owners = frozenset({0, os.getuid(), observed.st_uid})
+        roots: list[Path] = []
+        for value in (sys.prefix, sys.base_prefix):
+            root = Path(value).resolve(strict=True)
+            if root not in roots:
+                roots.append(root)
+        for root in roots:
+            if not executable.is_relative_to(root) or not path.is_relative_to(root):
+                continue
+            require_trusted_dependency_directory(root, allowed_owners=owners)
+            require_trusted_dependency_directory(
+                executable.parent, allowed_owners=owners
+            )
+            return owners
+        raise ValueError
+    except (OSError, RuntimeError, ValueError, VerificationError):
         raise VerificationError("verifier_dependency_invalid") from None
 
 
@@ -219,7 +273,8 @@ def load_trusted_yaml() -> None:
         parent = Path(candidate)
         if not parent.exists():
             continue
-        require_trusted_dependency_directory(parent)
+        allowed_owners = trusted_runtime_dependency_owners(parent)
+        require_trusted_dependency_directory(parent, allowed_owners=allowed_owners)
         specification = importlib.machinery.PathFinder.find_spec("yaml", [str(parent)])
         if specification is None:
             continue
@@ -228,10 +283,12 @@ def load_trusted_yaml() -> None:
             if not origin.is_relative_to(parent) or specification.submodule_search_locations is None:
                 raise ValueError
             package = origin.parent
-            require_trusted_dependency_directory(package)
+            require_trusted_dependency_directory(
+                package, allowed_owners=allowed_owners
+            )
             for node in package.rglob("*"):
                 observed = node.lstat()
-                if (stat.S_ISLNK(observed.st_mode) or observed.st_uid != 0
+                if (stat.S_ISLNK(observed.st_mode) or observed.st_uid not in allowed_owners
                         or observed.st_mode & 0o022
                         or not (stat.S_ISREG(observed.st_mode) or stat.S_ISDIR(observed.st_mode))):
                     raise ValueError

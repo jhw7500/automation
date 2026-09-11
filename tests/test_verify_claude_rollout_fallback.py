@@ -197,6 +197,71 @@ def test_local_dependency_directory_rejects_untrusted_paths(verifier, tmp_path, 
         verifier.require_trusted_dependency_directory(candidate)
 
 
+def test_local_dependency_directory_accepts_verified_runtime_owner(
+    verifier, tmp_path, monkeypatch
+):
+    runtime = tmp_path / "runtime"
+    executable = runtime / "bin/python3"
+    dependency = runtime / "lib/python3.12/site-packages/yaml"
+    executable.parent.mkdir(parents=True)
+    dependency.mkdir(parents=True)
+    for directory in (
+        runtime,
+        executable.parent,
+        runtime / "lib",
+        runtime / "lib/python3.12",
+        runtime / "lib/python3.12/site-packages",
+        dependency,
+    ):
+        directory.chmod(0o755)
+    executable.write_bytes(b"trusted runtime fixture\n")
+    executable.chmod(0o755)
+
+    monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.setattr(sys, "prefix", str(runtime))
+    monkeypatch.setattr(sys, "base_prefix", str(runtime))
+
+    owners = verifier.trusted_runtime_dependency_owners(dependency)
+    assert owners == frozenset({0, os.getuid()})
+    verifier.require_trusted_dependency_directory(
+        dependency, allowed_owners=owners
+    )
+
+
+@pytest.mark.parametrize("kind", ["outside_prefix", "writable_prefix"])
+def test_local_dependency_directory_rejects_untrusted_runtime_boundary(
+    verifier, tmp_path, monkeypatch, kind
+):
+    runtime = tmp_path / "runtime"
+    executable = runtime / "bin/python3"
+    dependency = runtime / "lib/python3.12/site-packages/yaml"
+    executable.parent.mkdir(parents=True)
+    dependency.mkdir(parents=True)
+    for directory in (
+        runtime,
+        executable.parent,
+        runtime / "lib",
+        runtime / "lib/python3.12",
+        runtime / "lib/python3.12/site-packages",
+        dependency,
+    ):
+        directory.chmod(0o755)
+    executable.write_bytes(b"trusted runtime fixture\n")
+    executable.chmod(0o755)
+    if kind == "outside_prefix":
+        dependency = tmp_path / "outside/yaml"
+        dependency.mkdir(parents=True)
+    else:
+        runtime.chmod(0o775)
+
+    monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.setattr(sys, "prefix", str(runtime))
+    monkeypatch.setattr(sys, "base_prefix", str(runtime))
+
+    with pytest.raises(verifier.VerificationError, match="^verifier_dependency_invalid$"):
+        verifier.trusted_runtime_dependency_owners(dependency)
+
+
 @pytest.fixture
 def exact_rollout_fixture(verifier, tmp_path, monkeypatch):
     import test_rollout_workflow_fleet as existing
