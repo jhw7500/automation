@@ -649,6 +649,13 @@ is created as a current-user-owned non-symlink regular file and independently se
 to 0600. It computes the intended tag OID before the first POST and verifies both
 response OIDs, then verifies the local and public direct/peeled identities.
 
+For v1.77.1, before either POST it also authenticates the existing annotated
+v1.77 tag and peeled commit, requires a distinct reviewed candidate, and compares
+every v1.77 inventory-owned path, mode and blob. The inventory is loaded from
+the authenticated v1.77 checkout, so the candidate cannot reduce the comparison.
+Any release-owned difference invalidates this boundary canary and requires a
+normal reviewed patch design. First publication of v1.77 has no prior-v1.77 check.
+
 ```bash
 rtk proxy /usr/bin/python3 -I -S -B -c '
 import os
@@ -689,6 +696,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 
@@ -747,6 +755,40 @@ def verify_release(*extra):
                     "--expected-commit", commit, *extra], cwd=checkout, env=runtime, check=True)
 
 verify_release("--commit-only")
+if tag == "v1.77.1":
+    pairs = [line.split("\t") for line in public_tags("v1.77").splitlines()]
+    require(len(pairs) == 2 and all(len(pair) == 2 for pair in pairs),
+            "missing or ambiguous v1.77 direct/peeled identity")
+    refs = {ref: oid for oid, ref in pairs}
+    require(set(refs) == {"refs/tags/v1.77", "refs/tags/v1.77^{}"}
+            and all(re.fullmatch("[0-9a-f]{40}", oid) for oid in refs.values()),
+            "invalid v1.77 direct/peeled identity")
+    v177_tag = refs["refs/tags/v1.77"]
+    v177_commit = refs["refs/tags/v1.77^{}"]
+    require(commit != v177_commit, "boundary canary requires a distinct reviewed commit")
+    git("fetch", "--no-tags", url, "refs/tags/v1.77:refs/tags/v1.77", cwd=checkout)
+    require(git("rev-parse", "refs/tags/v1.77", cwd=checkout) == v177_tag
+            and git("rev-parse", "refs/tags/v1.77^{}", cwd=checkout) == v177_commit
+            and git("cat-file", "-t", v177_tag, cwd=checkout) == "tag",
+            "fetched v1.77 annotation or peeled commit differs")
+    baseline = root / "v177-baseline"
+    git("worktree", "add", "--detach", str(baseline), v177_commit, cwd=checkout)
+    subprocess.run(["/usr/bin/python3", "-B", "-m", "scripts.verify_workflow_release",
+                    "--automation", str(baseline), "--ref", "v1.77",
+                    "--expected-commit", v177_commit, "--remote", "origin"],
+                   cwd=baseline, env=runtime, check=True)
+    inventory = subprocess.run(["/usr/bin/python3", "-B", "-c",
+        'import json; from scripts.workflow_release_inventory import release_paths_for; '
+        'print(json.dumps(release_paths_for("v1.77")))'],
+        cwd=baseline, env=runtime, check=True, capture_output=True, text=True)
+    owned = json.loads(inventory.stdout)
+    require(isinstance(owned, list) and owned and all(isinstance(path, str) for path in owned),
+            "invalid authenticated v1.77 inventory")
+    require(git("diff", "--raw", "--no-ext-diff", "--no-textconv", "--exit-code",
+                v177_commit, commit, "--", *owned, cwd=checkout) == "",
+            "release-owned difference invalidates boundary canary; normal reviewed patch design required")
+    require(set(public_tags("v1.77").splitlines()) == tag_pairs("v1.77", v177_tag, v177_commit),
+            "v1.77 identity moved before write")
 require(git("ls-remote", "--heads", url, "refs/heads/main") == main, "main moved before write")
 require(public_tags(tag) == "", "release ref appeared before write")
 now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -833,7 +875,12 @@ and receipt schemas are defined in [the consumer contract](workflows/contracts.m
 
 ## v1.77.1 real-boundary canary
 
-Publish a separately reviewed v1.77.1 commit after v1.77 caller adoption. Create one
+Publish a separately reviewed v1.77.1 commit after v1.77 caller adoption. It must
+be distinct from the authenticated v1.77 peeled commit while preserving every
+v1.77 release-owned byte, path and mode. Before publication, the procedure above
+must prove an empty raw Git diff across the authenticated v1.77 inventory. Any
+difference invalidates this boundary canary and requires a normal reviewed patch
+design. Create one
 approved managed rollout PR from the v1.77 default to v1.77.1; record exact HEAD,
 base and managed diff hash. Require the original automatic attempt to fail at
 caller validation, with budget claim and provider skipped and the matching

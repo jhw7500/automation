@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ast
 import hashlib
 import json
 import os
@@ -63,6 +64,56 @@ def test_v177_adds_only_claude_rollout_fallback_roots():
     assert not release_inventory.release_supports_claude_rollout_fallback("v1.76")
     assert release_inventory.release_supports_claude_rollout_fallback("v1.77")
     assert release_inventory.release_supports_claude_rollout_fallback("v1.77.1")
+
+
+def test_v1771_publication_proves_owned_boundary_before_post():
+    document = (ROOT / "docs/workflow-fleet-rollout.md").read_text()
+    section = document.split("## Create-only v1.77 and v1.77.1 tag publication\n", 1)[1]
+    body = section.split("' <<'CLAUDE_RELEASE_PY'\n", 1)[1].split("\nCLAUDE_RELEASE_PY", 1)[0]
+    tree = ast.parse(body)
+    first_post = min(node.lineno for node in ast.walk(tree)
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                     and node.func.id == "post")
+    branches = [node for node in tree.body if isinstance(node, ast.If)
+                and ast.unparse(node.test) == "tag == 'v1.77.1'"]
+    assert len(branches) == 1, "v1.77.1 needs a pre-publication boundary proof"
+    branch = branches[0]
+    assert branch.end_lineno < first_post
+    assert not branch.orelse, "v1.77 first publication must not need an existing v1.77 tag"
+    source = ast.unparse(branch)
+    # Ordered checks bind the remote annotation and trusted inventory before any write.
+    checks = [
+        "pairs = [line.split('\\t') for line in public_tags('v1.77').splitlines()]",
+        "len(pairs) == 2 and all((len(pair) == 2 for pair in pairs))",
+        "set(refs) == {'refs/tags/v1.77', 'refs/tags/v1.77^{}'}",
+        "all((re.fullmatch('[0-9a-f]{40}', oid) for oid in refs.values()))",
+        "v177_tag = refs['refs/tags/v1.77']",
+        "v177_commit = refs['refs/tags/v1.77^{}']",
+        "require(commit != v177_commit,",
+        "git('fetch', '--no-tags', url, 'refs/tags/v1.77:refs/tags/v1.77', cwd=checkout)",
+        "git('rev-parse', 'refs/tags/v1.77', cwd=checkout) == v177_tag",
+        "git('rev-parse', 'refs/tags/v1.77^{}', cwd=checkout) == v177_commit",
+        "git('cat-file', '-t', v177_tag, cwd=checkout) == 'tag'",
+        "git('worktree', 'add', '--detach', str(baseline), v177_commit, cwd=checkout)",
+        "'scripts.verify_workflow_release', '--automation', str(baseline), '--ref', 'v1.77', '--expected-commit', v177_commit, '--remote', 'origin'",
+        "from scripts.workflow_release_inventory import release_paths_for",
+        'release_paths_for("v1.77")',
+        "owned = json.loads(inventory.stdout)",
+        "git('diff', '--raw', '--no-ext-diff', '--no-textconv', '--exit-code', v177_commit, commit, '--', *owned, cwd=checkout) == ''",
+        "set(public_tags('v1.77').splitlines()) == tag_pairs('v1.77', v177_tag, v177_commit)",
+    ]
+    offset = 0
+    for check in checks:
+        position = source.find(check, offset)
+        assert position >= 0, f"missing or out-of-order boundary check: {check}"
+        offset = position + len(check)
+    runs = [node for node in ast.walk(branch) if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "subprocess.run"]
+    assert len(runs) == 2
+    for run in runs:
+        keywords = {item.arg: ast.unparse(item.value) for item in run.keywords}
+        assert keywords["cwd"] == "baseline", "never import the candidate's reduced inventory"
+        assert keywords["check"] == "True"
 
 
 def test_v176_candidate_remains_accepted():
