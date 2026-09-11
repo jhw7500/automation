@@ -116,6 +116,12 @@ function invocationShape(entry, schema) {
   return schema === 2 && exact(entry, INVOCATION_KEYS_V2)
     && exact(entry.route, ['kind']) && entry.route.kind === 'automatic';
 }
+function invocationDigestMatches(entry, schema, expected) {
+  if (sha(canonicalJson(entry)) === expected) return true;
+  if (schema !== 2 || entry.route.kind !== 'automatic') return false;
+  const historical = Object.fromEntries(INVOCATION_KEYS_V1.map((key) => [key, entry[key]]));
+  return sha(canonicalJson(historical)) === expected;
+}
 function runMatches(run, binding, repository, event) {
   return run?.id === binding.run_id && run.run_attempt === binding.run_attempt
     && run.repository?.full_name === repository && run.head_sha === binding.workflow_head
@@ -215,7 +221,7 @@ function validateReceipt(facts) {
       && originalRun.referenced_workflows.some((ref) => ref.path === o.referenced_workflow_path
         && ref.sha === o.referenced_workflow_sha
         && entry.referenced_workflow_ref === ('ref' in ref ? ref.ref : ref.sha))
-      && sha(canonicalJson(entry)) === o.finalized_invocation_sha256;
+      && invocationDigestMatches(entry, ledger.schema, o.finalized_invocation_sha256);
   } catch { return false; }
 }
 

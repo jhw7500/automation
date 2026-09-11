@@ -1880,7 +1880,10 @@ def _model_route(request: Mapping[str, object]) -> tuple[str, ...]:
 
 
 def _invocation_route(request: Mapping[str, object]) -> InvocationRoute:
-    return InvocationRoute.from_dict(_embedded_json(request, "invocation_route_json"))
+    route = InvocationRoute.from_dict(_embedded_json(request, "invocation_route_json"))
+    if request["force_review"] is True and route.kind == "automatic":
+        return InvocationRoute(kind="authorized_override")
+    return route
 
 
 def _remaining_findings(request: Mapping[str, object]) -> tuple[str, ...]:

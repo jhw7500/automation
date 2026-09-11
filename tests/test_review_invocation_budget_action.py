@@ -123,6 +123,41 @@ def _claimed_comment() -> str:
     )
 
 
+def _override_claimed_comment() -> str:
+    invocation = budget.Invocation(
+        run_id=700,
+        run_attempt=1,
+        head_sha=HEAD_A,
+        full_diff_sha256=HASH_1,
+        caller_workflow_path=".github/workflows/claude-review-caller.yml",
+        caller_event="workflow_dispatch",
+        referenced_workflow_path=CENTRAL_PATH,
+        referenced_workflow_ref=CENTRAL_REF,
+        referenced_workflow_sha=CENTRAL_SHA,
+        round_number=1,
+        override_event_id=9001,
+        model_route=("route-v2",),
+        effort="medium",
+        call_unit="claude-code-action review session",
+        call_count=0,
+        estimated_input_tokens=20_002,
+        elapsed_seconds=0,
+        status="claimed",
+        outcome=None,
+        stop_reason="claimed",
+        remaining_finding_ids=(),
+        route=budget.InvocationRoute(kind="authorized_override"),
+    )
+    state = budget.LedgerState.initial(
+        "example/repo", 52, "claude", invocations=(invocation,),
+        consumed_override_event_ids=(9001,),
+    )
+    return (
+        f"{budget.MARKERS['claude']}\n"
+        f"{budget.STATE_PREFIX}{budget.serialize_ledger(state)}{budget.STATE_SUFFIX}\n\nprior"
+    )
+
+
 def _schema_one_prior_comment() -> str:
     state = json.loads(
         _prior_comment().split(budget.STATE_PREFIX, 1)[1].split(budget.STATE_SUFFIX, 1)[0]
@@ -236,16 +271,17 @@ elif "/actions/runs/501/attempts/1" in endpoint:
         response["head_sha"] = "b" * 40
 elif "/actions/runs/700/attempts/1" in endpoint:
     fallback = config["scenario"].startswith("fallback-")
+    override = config["scenario"].startswith("force-review-default-")
     response = {
         "id": 700,
         "run_attempt": 1,
         "head_sha": "6" * 40 if fallback else config["head"],
-        "event": "issue_comment" if fallback else "pull_request",
+        "event": "issue_comment" if fallback else "workflow_dispatch" if override else "pull_request",
         "path": ".github/workflows/claude.yml" if fallback else ".github/workflows/claude-review-caller.yml",
         "status": "in_progress",
         "conclusion": None,
         "repository": {"full_name": "example/repo"},
-        "pull_requests": [] if fallback else [{"number": 52}],
+        "pull_requests": [] if fallback or override else [{"number": 52}],
         "referenced_workflows": [{
             "path": "jhw7500/automation/.github/workflows/claude-code-review.yml@" + "d" * 40,
             "ref": "refs/tags/v1.47",
@@ -338,11 +374,15 @@ class FakeGitHub:
             "current-run-reference-omits-ref",
             "fallback-first-claim", "fallback-wrong-base",
             "fallback-base-changed-before-patch",
+            "force-review-default-claim",
         }:
             comments = []
             head, full_hash = HEAD_A, HASH_1
         elif scenario == "finalize-trusted-comment":
             comments = [_bot_comment(_claimed_comment())]
+            head, full_hash = HEAD_A, HASH_1
+        elif scenario == "force-review-default-finalize":
+            comments = [_bot_comment(_override_claimed_comment())]
             head, full_hash = HEAD_A, HASH_1
         elif scenario in {"fallback-finalize", "fallback-finalize-route-drift"}:
             comments = [_bot_comment(_fallback_claimed_comment())]
@@ -623,6 +663,36 @@ def test_schema_one_comment_migrates_on_the_next_claim(fake_github):
         invocation["route"]["kind"]
         for invocation in result.checkpoint["ledger"]["invocations"]
     ] == ["automatic", "automatic"]
+
+
+def test_force_review_default_route_claims_as_authorized_override(fake_github):
+    result = fake_github.run_action(
+        mode="claim",
+        scenario="force-review-default-claim",
+        env_overrides={"FORCE_REVIEW": "true"},
+        timeline=[{
+            "id": 9001,
+            "event": "labeled",
+            "label": {"name": "review-budget-override"},
+            "actor": {"login": "maintainer"},
+        }],
+        permissions={"maintainer": "write"},
+    )
+    invocation = result.checkpoint["ledger"]["invocations"][0]
+    assert result.outputs["decision"] == "claimed"
+    assert invocation["route"] == {"kind": "authorized_override"}
+    assert invocation["override_event_id"] == 9001
+
+
+def test_force_review_default_route_finalizes_as_authorized_override(fake_github):
+    result = fake_github.run_action(
+        mode="finalize",
+        scenario="force-review-default-finalize",
+        env_overrides={"FORCE_REVIEW": "true"},
+    )
+    invocation = result.checkpoint["ledger"]["invocations"][0]
+    assert result.outputs["decision"] == "finalized"
+    assert invocation["route"] == {"kind": "authorized_override"}
 
 
 def test_fallback_claim_uses_fresh_pr_head_and_exact_base(fake_github):

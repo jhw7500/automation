@@ -100,7 +100,7 @@ def node_validate(facts):
 AUTOMATIC_ROUTE = object()
 
 
-def schema_two_facts(route=AUTOMATIC_ROUTE):
+def schema_two_facts(route=AUTOMATIC_ROUTE, *, preserve_receipt_digest=False):
     facts = facts_fixture()
     if route is AUTOMATIC_ROUTE:
         route = {"kind": "automatic"}
@@ -113,12 +113,13 @@ def schema_two_facts(route=AUTOMATIC_ROUTE):
         "<!-- automation:review-invocation-budget:opencode:v1 -->\n"
         + prefix + compact(ledger) + " -->"
     )
-    facts["receipt"]["original"]["finalized_invocation_sha256"] = digest(
-        compact(ledger["invocations"][0])
-    )
-    facts["check"]["output"]["text"] = (
-        "<!-- automation-opencode-recovery:" + compact(facts["receipt"]) + " -->"
-    )
+    if not preserve_receipt_digest:
+        facts["receipt"]["original"]["finalized_invocation_sha256"] = digest(
+            compact(ledger["invocations"][0])
+        )
+        facts["check"]["output"]["text"] = (
+            "<!-- automation-opencode-recovery:" + compact(facts["receipt"]) + " -->"
+        )
     return facts
 
 
@@ -128,6 +129,10 @@ def test_receipt_accepts_historical_schema_one_invocation():
 
 def test_receipt_accepts_schema_two_automatic_invocation():
     assert node_validate(schema_two_facts())
+
+
+def test_receipt_accepts_unchanged_schema_one_digest_after_automatic_migration():
+    assert node_validate(schema_two_facts(preserve_receipt_digest=True))
 
 
 @pytest.mark.parametrize("route", [
