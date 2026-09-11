@@ -7,9 +7,13 @@ from dataclasses import fields, replace
 import json
 from pathlib import Path, PurePosixPath
 import subprocess
+import sys
 from unittest import mock
 
 import pytest
+
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts import rollout_workflow_fleet as rollout
 from scripts.prepare_workflow_rollout import (
@@ -2555,7 +2559,7 @@ def test_new_pull_request_is_attested_against_branch_and_exact_pr_metadata(
             rollout.fleet_git, "list_rollout_prs", return_value=(request,)
         ),
     ):
-        rollout.attest_pull_request(snap, "v1.40", COMMIT, HEAD, changed, request)
+        rollout._attest_published_pull_request(snap, "v1.40", COMMIT, HEAD, changed, request)
 
     with (
         mock.patch.object(
@@ -2566,7 +2570,23 @@ def test_new_pull_request_is_attested_against_branch_and_exact_pr_metadata(
         ),
     ):
         with pytest.raises(rollout.CommandError, match="branch"):
-            rollout.attest_pull_request(snap, "v1.40", COMMIT, HEAD, changed, request)
+            rollout._attest_published_pull_request(snap, "v1.40", COMMIT, HEAD, changed, request)
+
+
+def test_fleet_public_attestation_is_pure_and_returns_observed_request(tmp_path):
+    import inspect
+    assert tuple(inspect.signature(rollout.validate_commit_tree).parameters) == (
+        "snapshot", "expected_head", "expected_base", "plan")
+    snap = snapshot(tmp_path)
+    changed = (".github/workflows/claude.yml",)
+    request = exact_pr(rollout.pr_body("v1.40", COMMIT, changed))
+    with mock.patch.object(rollout.fleet_git, "remote_branch_sha", side_effect=AssertionError("remote read")), mock.patch.object(rollout.fleet_git, "list_rollout_prs", side_effect=AssertionError("remote read")):
+        assert rollout.attest_pull_request(snap, "v1.40", COMMIT, HEAD, changed, request) is request
+
+
+def test_fleet_public_renderer_matches_existing_wrapper(tmp_path, bundle):
+    snap = initialized_canonical_fleet_repository(tmp_path, bundle)
+    assert rollout.render_rollout_plan(snap, bundle, "gstApp", bootstrap=False) == rollout._render(snap, bundle, "gstApp", bootstrap=False)
 
 
 @pytest.mark.parametrize(

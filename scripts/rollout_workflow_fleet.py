@@ -665,14 +665,14 @@ def _validate_tree_contents(
 
 def validate_commit_tree(
     snapshot: RepositorySnapshot,
-    head_sha: str,
-    base_sha: str,
+    expected_head: str,
+    expected_base: str,
     plan: RenderPlan,
 ) -> None:
     """Attest one proposed commit's parent, paths, blobs, and deletions."""
 
-    head_sha = _object_id(head_sha, "rollout commit")
-    base_sha = _object_id(base_sha, "default branch object")
+    head_sha = _object_id(expected_head, "rollout commit")
+    base_sha = _object_id(expected_base, "default branch object")
     if plan.observed_revision is not None and plan.observed_revision != base_sha:
         raise CommandError("render plan does not match the observed base")
     parents = git(
@@ -1032,7 +1032,7 @@ def require_no_current_rollout_branch(snapshot: RepositorySnapshot, ref: str) ->
         )
 
 
-def attest_pull_request(
+def _attest_published_pull_request(
     snapshot: RepositorySnapshot,
     ref: str,
     commit: str,
@@ -1051,22 +1051,33 @@ def attest_pull_request(
         len(requests) != 1
         or requests[0].number != request.number
         or requests[0].url != request.url
-        or not _exact_pr(
-            requests[0],
-            base=selected_base,
-            branch=branch,
-            head_repo=f"{fleet_git.OWNER}/{snapshot.path.name}",
-            head_sha=head_sha,
-            title=pr_title(ref, selected_base, snapshot.default_branch),
-            body=pr_body(
-                ref, commit, changed_paths, selected_base, snapshot.default_branch
-            ),
-        )
     ):
         raise CommandError("pull request attestation failed")
+    attest_pull_request(snapshot, ref, commit, head_sha, tuple(changed_paths), requests[0])
 
 
-def _render(
+def attest_pull_request(
+    snapshot: RepositorySnapshot,
+    release_ref: str,
+    release_commit: str,
+    expected_head: str,
+    changed_paths: tuple[str, ...],
+    request: PullRequest,
+) -> PullRequest:
+    """Validate supplied observed PR metadata without performing remote reads."""
+    selected_base = _selected_base_branch(snapshot)
+    if not _exact_pr(
+        request, base=selected_base,
+        branch=rollout_branch(release_ref, selected_base, snapshot.default_branch),
+        head_repo=f"{fleet_git.OWNER}/{snapshot.path.name}", head_sha=expected_head,
+        title=pr_title(release_ref, selected_base, snapshot.default_branch),
+        body=pr_body(release_ref, release_commit, changed_paths, selected_base, snapshot.default_branch),
+    ):
+        raise CommandError("pull request attestation failed")
+    return request
+
+
+def render_rollout_plan(
     snapshot: RepositorySnapshot,
     bundle: ReleaseBundle,
     repo: str,
@@ -1086,6 +1097,16 @@ def _render(
         bootstrap=bootstrap,
         observed_revision=snapshot.base_sha,
     )
+
+
+def _render(
+    snapshot: RepositorySnapshot,
+    bundle: ReleaseBundle,
+    repo: str,
+    *,
+    bootstrap: bool,
+) -> RenderPlan:
+    return render_rollout_plan(snapshot, bundle, repo, bootstrap=bootstrap)
 
 
 def _prepared_outcome(
@@ -1453,7 +1474,7 @@ def _publish_repository_fresh(
                     "branch published but pull request state is unavailable",
                 )
         try:
-            attest_pull_request(
+            _attest_published_pull_request(
                 snapshot, bundle.ref, bundle.commit, head_sha, changed, request
             )
         except (CommandError, FleetGitError) as exc:
