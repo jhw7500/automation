@@ -178,7 +178,8 @@ OPENCODE_ACTIVE_SECTION_ORDER_RELEASE = (1, 73)
 EXPANDED_REVIEW_BUDGET_RELEASE = (1, 74)
 CLAUDE_WORKFLOW_VALIDATION_RELEASE = (1, 75)
 OPENCODE_RECOVERY_RELEASE = (1, 76)
-CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 77)
+CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 78)
+OBSERVATIONAL_TOKEN_ESTIMATES_RELEASE = (1, 77)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -304,6 +305,12 @@ def release_supports_claude_workflow_validation(ref: str) -> bool:
 def release_supports_opencode_recovery(ref: str) -> bool:
     """Return whether the release owns original-attempt finalization recovery."""
     return _release_version(ref) >= OPENCODE_RECOVERY_RELEASE
+
+
+def release_supports_observational_token_estimates(ref: str) -> bool:
+    """Return whether estimated input tokens are telemetry rather than invocation gates."""
+
+    return _release_version(ref) >= OBSERVATIONAL_TOKEN_ESTIMATES_RELEASE
 
 
 def release_retires_manual_pr_review(ref: str) -> bool:

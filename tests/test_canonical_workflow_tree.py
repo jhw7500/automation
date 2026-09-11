@@ -714,7 +714,7 @@ def test_comment_callers_carry_the_request_scoped_run_name() -> None:
         assert load_yaml(path)["run-name"] == ISSUE_RUN_NAME_VALUE, filename
 
 
-def test_v177_catalog_ceiling_and_nested_claude_permissions_agree() -> None:
+def test_v178_catalog_ceiling_and_nested_claude_permissions_agree() -> None:
     from scripts.verify_workflow_release import (
         FALLBACK_PERMISSIONS,
         require_claude_fallback_permissions,

@@ -293,9 +293,9 @@ def valid_bundle() -> EvidenceBundle:
         "referenced_workflows": [
             {
                 "path": "jhw7500/automation/.github/workflows/claude-code-review.yml@"
-                "refs/tags/v1.77",
+                "refs/tags/v1.78",
                 "sha": "444a7347aee169ed178aae80e8bd8d10eca52e02",
-                "ref": "refs/tags/v1.77",
+                "ref": "refs/tags/v1.78",
             }
         ],
     }

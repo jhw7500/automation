@@ -613,10 +613,10 @@ def _fallback_run_fixture(state: dict[str, object]) -> dict:
         "referenced_workflows": [{
             "path": (
                 "jhw7500/automation/.github/workflows/"
-                "claude-code-review.yml@refs/tags/v1.77"
+                "claude-code-review.yml@refs/tags/v1.78"
             ),
             "sha": "46" * 20,
-            "ref": "refs/tags/v1.77",
+            "ref": "refs/tags/v1.78",
         }],
     }
 

@@ -34,7 +34,7 @@ from release_fixture_helpers import (
     restore_pre_v172_opencode_context_budget,
     restore_pre_v173_opencode_active_section_order,
     restore_pre_v176_opencode_recovery,
-    restore_pre_v177_claude_rollout_fallback,
+    restore_pre_v178_claude_rollout_fallback,
     restore_pre_v170_opencode_finding_ids,
     restore_retired_manual_pr_review,
     restore_pre_v166_label_mismatch_decline,
@@ -43,8 +43,13 @@ from release_fixture_helpers import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+V176_REVIEW_BUDGET_COMMIT = "444a7347aee169ed178aae80e8bd8d10eca52e02"
+REVIEW_INVOCATION_BUDGET_HELPER = (
+    ".github/actions/review-invocation-budget/review_invocation_budget.py"
+)
 
 V176_COMMIT = "444a7347aee169ed178aae80e8bd8d10eca52e02"
+V177_COMMIT = "dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19"
 FALLBACK_RELEASE_FILES = (
     ".github/actions/claude-rollout-fallback/action.yml",
     ".github/actions/claude-rollout-fallback/contract.py",
@@ -52,55 +57,85 @@ FALLBACK_RELEASE_FILES = (
 )
 
 
-def test_v177_adds_only_claude_rollout_fallback_roots():
-    old = set(release_inventory.release_paths_for("v1.76"))
-    new = set(release_inventory.release_paths_for("v1.77"))
+def test_v178_adds_only_claude_rollout_fallback_roots():
+    old = set(release_inventory.release_paths_for("v1.77"))
+    new = set(release_inventory.release_paths_for("v1.78"))
     assert new - old == set(FALLBACK_RELEASE_FILES)
     assert old - new == set()
-    roots = release_inventory.release_roots_for("v1.77")
+    roots = release_inventory.release_roots_for("v1.78")
     assert {(str(root.path), root.kind, root.mode) for root in roots if str(root.path) in new - old} == {
         (relative, "file", "100644") for relative in FALLBACK_RELEASE_FILES
     }
     assert not release_inventory.release_supports_claude_rollout_fallback("v1.76")
-    assert release_inventory.release_supports_claude_rollout_fallback("v1.77")
-    assert release_inventory.release_supports_claude_rollout_fallback("v1.77.1")
+    assert not release_inventory.release_supports_claude_rollout_fallback("v1.77")
+    assert release_inventory.release_supports_claude_rollout_fallback("v1.78")
+    assert release_inventory.release_supports_claude_rollout_fallback("v1.78.1")
 
 
-def test_v1771_publication_proves_owned_boundary_before_post():
+def test_v1781_publication_proves_owned_boundary_before_post():
     document = (ROOT / "docs/workflow-fleet-rollout.md").read_text()
-    section = document.split("## Create-only v1.77 and v1.77.1 tag publication\n", 1)[1]
+    section = document.split("## Create-only v1.78 and v1.78.1 tag publication\n", 1)[1]
     body = section.split("' <<'CLAUDE_RELEASE_PY'\n", 1)[1].split("\nCLAUDE_RELEASE_PY", 1)[0]
     tree = ast.parse(body)
     first_post = min(node.lineno for node in ast.walk(tree)
                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                      and node.func.id == "post")
     branches = [node for node in tree.body if isinstance(node, ast.If)
-                and ast.unparse(node.test) == "tag == 'v1.77.1'"]
-    assert len(branches) == 1, "v1.77.1 needs a pre-publication boundary proof"
+                and ast.unparse(node.test) == "tag == 'v1.78.1'"]
+    assert len(branches) == 1, "v1.78.1 needs a pre-publication boundary proof"
     branch = branches[0]
     assert branch.end_lineno < first_post
-    assert not branch.orelse, "v1.77 first publication must not need an existing v1.77 tag"
+    assert not branch.orelse, "v1.78 first publication must not need an existing v1.78 tag"
+    launcher = section.split("rtk proxy /usr/bin/python3 -I -S -B -c '\n", 1)[1].split("\n' <<", 1)[0]
+    launcher_tree = ast.parse(launcher)
+    allowed = [node for node in ast.walk(launcher_tree) if isinstance(node, ast.Compare)
+               and isinstance(node.left, ast.Name) and node.left.id == "tag"]
+    assert len(allowed) == 1
+    assert ast.literal_eval(allowed[0].comparators[0]) == {"v1.78", "v1.78.1"}
+    pre_post = ast.unparse(ast.Module(
+        body=[node for node in tree.body if node.end_lineno < first_post], type_ignores=[],
+    ))
+    for binding in (
+        "v177_tag = '81f44fb6786bdfcc40f93161db74b1d9a9e3b7c5'",
+        "v177_commit = 'dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19'",
+        "v176_tag = '09af80682619129fcf343091b78413d2686a4579'",
+        "v176_commit = '444a7347aee169ed178aae80e8bd8d10eca52e02'",
+    ):
+        assert binding in pre_post
+    for version, variable in (("v1.76", "v176"), ("v1.77", "v177")):
+        check = f"set(public_tags('{version}').splitlines()) == tag_pairs('{version}', {variable}_tag, {variable}_commit)"
+        checks_before_post = [node for node in tree.body
+                             if isinstance(node, ast.Expr) and check in ast.unparse(node)
+                             and node.end_lineno < first_post]
+        assert len(checks_before_post) == 2
+        assert checks_before_post[-1].lineno > branch.end_lineno
+    annotation = [node for node in tree.body if isinstance(node, ast.For)
+                  and "historical_tag" in ast.unparse(node.target)]
+    assert len(annotation) == 1 and annotation[0].end_lineno < branch.lineno
+    assert ast.literal_eval(annotation[0].iter.elts[0].elts[0]) == "v1.76"
+    assert ast.literal_eval(annotation[0].iter.elts[1].elts[0]) == "v1.77"
+    assert "git('cat-file', '-t', direct, cwd=checkout) == 'tag'" in ast.unparse(annotation[0])
     source = ast.unparse(branch)
     # Ordered checks bind the remote annotation and trusted inventory before any write.
     checks = [
-        "pairs = [line.split('\\t') for line in public_tags('v1.77').splitlines()]",
+        "pairs = [line.split('\\t') for line in public_tags('v1.78').splitlines()]",
         "len(pairs) == 2 and all((len(pair) == 2 for pair in pairs))",
-        "set(refs) == {'refs/tags/v1.77', 'refs/tags/v1.77^{}'}",
+        "set(refs) == {'refs/tags/v1.78', 'refs/tags/v1.78^{}'}",
         "all((re.fullmatch('[0-9a-f]{40}', oid) for oid in refs.values()))",
-        "v177_tag = refs['refs/tags/v1.77']",
-        "v177_commit = refs['refs/tags/v1.77^{}']",
-        "require(commit != v177_commit,",
-        "git('fetch', '--no-tags', url, 'refs/tags/v1.77:refs/tags/v1.77', cwd=checkout)",
-        "git('rev-parse', 'refs/tags/v1.77', cwd=checkout) == v177_tag",
-        "git('rev-parse', 'refs/tags/v1.77^{}', cwd=checkout) == v177_commit",
-        "git('cat-file', '-t', v177_tag, cwd=checkout) == 'tag'",
-        "git('worktree', 'add', '--detach', str(baseline), v177_commit, cwd=checkout)",
-        "'scripts.verify_workflow_release', '--automation', str(baseline), '--ref', 'v1.77', '--expected-commit', v177_commit, '--remote', 'origin'",
+        "v178_tag = refs['refs/tags/v1.78']",
+        "v178_commit = refs['refs/tags/v1.78^{}']",
+        "require(commit != v178_commit,",
+        "git('fetch', '--no-tags', url, 'refs/tags/v1.78:refs/tags/v1.78', cwd=checkout)",
+        "git('rev-parse', 'refs/tags/v1.78', cwd=checkout) == v178_tag",
+        "git('rev-parse', 'refs/tags/v1.78^{}', cwd=checkout) == v178_commit",
+        "git('cat-file', '-t', v178_tag, cwd=checkout) == 'tag'",
+        "git('worktree', 'add', '--detach', str(baseline), v178_commit, cwd=checkout)",
+        "'scripts.verify_workflow_release', '--automation', str(baseline), '--ref', 'v1.78', '--expected-commit', v178_commit, '--remote', 'origin'",
         "from scripts.workflow_release_inventory import release_paths_for",
-        'release_paths_for("v1.77")',
+        'release_paths_for("v1.78")',
         "owned = json.loads(inventory.stdout)",
-        "git('diff', '--raw', '--no-ext-diff', '--no-textconv', '--exit-code', v177_commit, commit, '--', *owned, cwd=checkout) == ''",
-        "set(public_tags('v1.77').splitlines()) == tag_pairs('v1.77', v177_tag, v177_commit)",
+        "git('diff', '--raw', '--no-ext-diff', '--no-textconv', '--exit-code', v178_commit, commit, '--', *owned, cwd=checkout) == ''",
+        "set(public_tags('v1.78').splitlines()) == tag_pairs('v1.78', v178_tag, v178_commit)",
     ]
     offset = 0
     for check in checks:
@@ -149,13 +184,13 @@ def fallback_release_repo(tmp_path):
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
-    return repo, commit(repo, "v1.77 fallback candidate")
+    return repo, commit(repo, "v1.78 fallback candidate")
 
 
-def test_v177_candidate_is_accepted(fallback_release_repo):
+def test_v178_candidate_is_accepted(fallback_release_repo):
     repo, candidate = fallback_release_repo
     release_verifier.verify_claude_rollout_fallback_contract(repo)
-    assert release_verifier.verify_commit_content(repo, "v1.77", candidate) == candidate
+    assert release_verifier.verify_commit_content(repo, "v1.78", candidate) == candidate
 
 
 FALLBACK_MUTATIONS = {
@@ -170,6 +205,17 @@ FALLBACK_MUTATIONS = {
     "route_json": ('.github/workflows/claude-code-review.yml', 'invocation-route-json: ${{ steps.claude-invocation-route.outputs.invocation_route_json }}', 'invocation-route-json: \'{"kind":"automatic"}\''),
     "ledger_migration": ('.github/actions/review-invocation-budget/review_invocation_budget.py', 'if schema == 1:', 'if schema == 0:'),
     "canonical_route": ('.github/actions/review-invocation-budget/review_invocation_budget.py', 'if kind != "default_branch_rollout_fallback":', 'if kind != "untrusted":'),
+    "estimated_token_admission": (
+        REVIEW_INVOCATION_BUDGET_HELPER, '    override_count = sum(\n',
+        '    if request.estimated_input_tokens > validated.budgets.max_estimated_tokens_per_round:\n'
+        '        return refuse(validated, request, "input_budget_exhausted")\n'
+        '    override_count = sum(\n',
+    ),
+    "estimated_token_telemetry": (
+        REVIEW_INVOCATION_BUDGET_HELPER,
+        'f"- Estimated input tokens: {estimated_total(state)} total\\n"',
+        'f"- Estimated input tokens: unavailable\\n"',
+    ),
     "receipt_keys": (FALLBACK_RELEASE_FILES[2], '"schema", "verifier_commit"}', '"schema", "untrusted"}'),
     "receipt_mode": (FALLBACK_RELEASE_FILES[2], 'os.fchmod(stream.fileno(), 0o600)', 'os.fchmod(stream.fileno(), 0o644)'),
     "required_check": (FALLBACK_RELEASE_FILES[2], 'require_required_checks_clean(evidence.required_checks(request.expected_head))', 'require_required_checks_clean(())'),
@@ -177,9 +223,9 @@ FALLBACK_MUTATIONS = {
 
 
 @pytest.mark.parametrize("mutation", list(FALLBACK_MUTATIONS))
-def test_v177_rejects_fallback_contract_mutation(fallback_release_repo, mutation):
+def test_v178_rejects_fallback_contract_mutation(fallback_release_repo, mutation):
     repo, _ = fallback_release_repo
-    # Establish acceptance first: a legacy seal must not mask a missing v1.77 seal.
+    # Establish acceptance first: a legacy seal must not mask a missing v1.78 seal.
     release_verifier.verify_claude_rollout_fallback_contract(repo)
     relative, old, new = FALLBACK_MUTATIONS[mutation]
     replace(repo / relative, old, new, count=1)
@@ -187,7 +233,7 @@ def test_v177_rejects_fallback_contract_mutation(fallback_release_repo, mutation
     with pytest.raises(ReleaseVerificationError):
         release_verifier.verify_claude_rollout_fallback_contract(repo)
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_commit_content(repo, "v1.77", bad)
+        release_verifier.verify_commit_content(repo, "v1.78", bad)
 
 RECOVERY_RELEASE_FILES = (
     ".github/actions/recover-opencode-review/evidence.py",
@@ -195,6 +241,17 @@ RECOVERY_RELEASE_FILES = (
     ".github/actions/recover-opencode-review/receipt.js",
     ".github/actions/recover-opencode-review/transport.py",
 )
+
+
+def restore_pre_v177_token_estimate_policy(repo: Path) -> None:
+    """Restore the authenticated v1.76 invocation-budget helper bytes."""
+
+    tree = release_verifier.VerifiedCommitTree.open(ROOT, V176_REVIEW_BUDGET_COMMIT)
+    payload = tree.read_file(REVIEW_INVOCATION_BUDGET_HELPER)
+    assert hashlib.sha256(payload).hexdigest() == (
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176
+    )
+    (repo / REVIEW_INVOCATION_BUDGET_HELPER).write_bytes(payload)
 
 
 @pytest.fixture
@@ -210,11 +267,54 @@ def recovery_release_repo(tmp_path):
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v177_token_estimate_policy(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
-    restore_pre_v177_claude_rollout_fallback(repo)
+    restore_pre_v178_claude_rollout_fallback(repo)
     return repo, commit(repo, "v1.76 recovery candidate")
+
+
+def prepare_v177(repo: Path) -> str:
+    (repo / REVIEW_INVOCATION_BUDGET_HELPER).write_bytes(v177_budget_helper())
+    return commit(repo, "v1.77 observational token estimate candidate")
+
+
+def v177_budget_helper() -> bytes:
+    tree = release_verifier.VerifiedCommitTree.open(ROOT, V177_COMMIT)
+    payload = tree.read_file(REVIEW_INVOCATION_BUDGET_HELPER)
+    assert hashlib.sha256(payload).hexdigest() == (
+        release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V177
+    )
+    return payload
+
+
+def test_v177_immutable_candidate_remains_accepted():
+    assert release_verifier.verify_commit_content(ROOT, "v1.77", V177_COMMIT) == V177_COMMIT
+
+
+def test_pre_v178_fixture_restores_authenticated_files_and_preserves_mutations(fallback_release_repo):
+    from release_fixture_helpers import PRE_V178_FILES
+
+    repo, _ = fallback_release_repo
+    tree = release_verifier.VerifiedCommitTree.open(ROOT, V177_COMMIT)
+    restore_pre_v178_claude_rollout_fallback(repo)
+    for relative in PRE_V178_FILES:
+        assert (repo / relative).read_bytes() == tree.read_file(relative)
+    assert all(not (repo / relative).exists() for relative in FALLBACK_RELEASE_FILES)
+    mutation = repo / REVIEW_INVOCATION_BUDGET_HELPER
+    mutation.write_bytes(mutation.read_bytes() + b"\n# deliberate fixture mutation\n")
+    before = {relative: (repo / relative).read_bytes() for relative in PRE_V178_FILES}
+    restore_pre_v178_claude_rollout_fallback(repo)
+    assert {relative: (repo / relative).read_bytes() for relative in PRE_V178_FILES} == before
+
+
+def test_v178_schema_two_helper_is_rejected_on_v177_release_line(recovery_release_repo):
+    repo, _ = recovery_release_repo
+    shutil.copy2(ROOT / REVIEW_INVOCATION_BUDGET_HELPER, repo / REVIEW_INVOCATION_BUDGET_HELPER)
+    candidate = commit(repo, "schema two on observational schema one release")
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.77", candidate)
 
 
 def test_v176_accepts_recovery_and_rejects_old_release_identity(recovery_release_repo):
@@ -223,6 +323,209 @@ def test_v176_accepts_recovery_and_rejects_old_release_identity(recovery_release
     for ref in ("v1.74", "v1.75"):
         with pytest.raises(ReleaseVerificationError):
             release_verifier.verify_commit_content(repo, ref, candidate)
+
+
+def test_token_estimate_observability_release_boundary() -> None:
+    assert release_inventory.release_supports_observational_token_estimates("v1.76") is False
+    assert release_inventory.release_supports_observational_token_estimates("v1.77") is True
+
+
+def test_v177_accepts_observational_token_estimate_contract(recovery_release_repo):
+    repo, _ = recovery_release_repo
+    candidate = prepare_v177(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.77", candidate) == candidate
+
+
+def test_v177_structural_contract_ignores_nonsemantic_comments() -> None:
+    source = v177_budget_helper().decode("utf-8")
+
+    release_verifier.require_budget_helper_contract(
+        "# nonsemantic release-verifier probe\n" + source,
+        rounds_variable=True,
+        filter_reasons=True,
+        dismissals=True,
+        expanded_budget=True,
+        observational_token_estimates=True,
+    )
+
+
+def test_v177_helper_is_rejected_on_v176_release_line(recovery_release_repo):
+    repo, _ = recovery_release_repo
+    candidate = prepare_v177(repo)
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.76", candidate)
+
+
+def test_v176_helper_is_rejected_on_v177_release_line(recovery_release_repo):
+    repo, candidate = recovery_release_repo
+
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.77", candidate)
+
+
+def test_v177_rejects_reintroduced_estimated_token_gate() -> None:
+    source = v177_budget_helper().decode("utf-8")
+    insertion = (
+        "    if request.estimated_input_tokens > "
+        "validated.budgets.max_estimated_tokens_per_round:\n"
+        "        return refuse(validated, request, 'input_budget_exhausted')\n"
+        "    override_count = sum(\n"
+    )
+    source = source.replace("    override_count = sum(\n", insertion, 1)
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="invocation-budget helper contract",
+    ):
+        release_verifier.require_budget_helper_contract(
+            source,
+            rounds_variable=True,
+            filter_reasons=True,
+            dismissals=True,
+            expanded_budget=True,
+            observational_token_estimates=True,
+        )
+
+
+def test_v177_rejects_estimated_token_gate_relocated_to_append_claim() -> None:
+    source = v177_budget_helper().decode("utf-8")
+    insertion = (
+        "        provenance: RunProvenance) -> Transition:\n"
+        "    round_estimate = request.estimated_input_tokens\n"
+        "    round_limit = state.budgets.max_estimated_tokens_per_round\n"
+        "    if round_estimate > round_limit:\n"
+        "        return refuse(state, request, 'round_budget_exhausted')\n"
+        "    round_number = len(state.invocations) + 1\n"
+    )
+    source = source.replace(
+        "        provenance: RunProvenance) -> Transition:\n"
+        "    round_number = len(state.invocations) + 1\n",
+        insertion,
+        1,
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="invocation-budget helper contract",
+    ):
+        release_verifier.require_budget_helper_contract(
+            source,
+            rounds_variable=True,
+            filter_reasons=True,
+            dismissals=True,
+            expanded_budget=True,
+            observational_token_estimates=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("setup", "condition"),
+    (
+        (
+            "round_estimate_box = (request.estimated_input_tokens,)",
+            "round_estimate_box[0] > 200_000",
+        ),
+        (
+            "round_estimate_box = [request.estimated_input_tokens]",
+            "round_estimate_box[0] > 200_000",
+        ),
+        (
+            "round_estimate_box = {'value': request.estimated_input_tokens}",
+            "round_estimate_box['value'] > 200_000",
+        ),
+        (
+            "round_estimate_box.value = request.estimated_input_tokens",
+            "round_estimate_box.value > 200_000",
+        ),
+    ),
+)
+def test_v177_rejects_container_indirected_token_gate_in_append_claim(
+    setup: str, condition: str,
+) -> None:
+    source = v177_budget_helper().decode("utf-8")
+    insertion = (
+        "        provenance: RunProvenance) -> Transition:\n"
+        f"    {setup}\n"
+        f"    if {condition}:\n"
+        "        return refuse(state, request, 'round_budget_exhausted')\n"
+        "    round_number = len(state.invocations) + 1\n"
+    )
+    source = source.replace(
+        "        provenance: RunProvenance) -> Transition:\n"
+        "    round_number = len(state.invocations) + 1\n",
+        insertion,
+        1,
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="invocation-budget helper contract",
+    ):
+        release_verifier.require_budget_helper_contract(
+            source,
+            rounds_variable=True,
+            filter_reasons=True,
+            dismissals=True,
+            expanded_budget=True,
+            observational_token_estimates=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("anchor", "replacement"),
+    (
+        (
+            "def _integer(value: object, name: str, *, positive: bool = False, "
+            "minimum: int | None = None) -> int:\n"
+            "    if isinstance(value, bool) or not isinstance(value, int):\n",
+            "def _integer(value: object, name: str, *, positive: bool = False, "
+            "minimum: int | None = None) -> int:\n"
+            "    if name == 'estimated_input_tokens' and value > 200_000:\n"
+            "        raise BudgetStateError('input_budget_exhausted')\n"
+            "    if isinstance(value, bool) or not isinstance(value, int):\n",
+        ),
+        (
+            "        provenance: RunProvenance) -> Transition:\n"
+            "    round_number = len(state.invocations) + 1\n",
+            "        provenance: RunProvenance) -> Transition:\n"
+            "    round_estimate = request.estimated_input_tokens\n"
+            "    def over_legacy_limit():\n"
+            "        return round_estimate > 200_000\n"
+            "    if over_legacy_limit():\n"
+            "        return refuse(state, request, 'round_budget_exhausted')\n"
+            "    round_number = len(state.invocations) + 1\n",
+        ),
+        (
+            "        provenance: RunProvenance) -> Transition:\n"
+            "    round_number = len(state.invocations) + 1\n",
+            "        provenance: RunProvenance) -> Transition:\n"
+            "    request.estimated_input_tokens > 200_000 and "
+            "(_ for _ in ()).throw(BudgetStateError('input_budget_exhausted'))\n"
+            "    round_number = len(state.invocations) + 1\n",
+        ),
+    ),
+)
+def test_v177_rejects_indirect_token_gate_control_forms(
+    anchor: str, replacement: str,
+) -> None:
+    source = v177_budget_helper().decode("utf-8")
+    mutated = source.replace(anchor, replacement, 1)
+    assert mutated != source
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="invocation-budget helper contract",
+    ):
+        release_verifier.require_budget_helper_contract(
+            mutated,
+            rounds_variable=True,
+            filter_reasons=True,
+            dismissals=True,
+            expanded_budget=True,
+            observational_token_estimates=True,
+        )
 
 
 def test_v176_inventory_owns_all_recovery_executables_only_from_v176(recovery_release_repo):
@@ -2560,7 +2863,7 @@ def prepare_v175(repo: Path) -> str:
     prepare_v174(repo)
     relative = ".github/workflows/claude-code-review.yml"
     shutil.copy2(ROOT / relative, repo / relative)
-    restore_pre_v177_claude_rollout_fallback(repo)
+    restore_pre_v178_claude_rollout_fallback(repo)
     return commit(repo, "v1.75 candidate")
 
 
@@ -3508,6 +3811,7 @@ def test_v147_budget_helper_semantics_reject_authenticated_mutations(
             filter_reasons=True,
             dismissals=True,
             expanded_budget=True,
+            observational_token_estimates=True,
         )
 
 
@@ -3647,6 +3951,7 @@ def test_v147_budget_helper_semantics_bind_live_ast_relationships(
             filter_reasons=True,
             dismissals=True,
             expanded_budget=True,
+            observational_token_estimates=True,
         )
 
 

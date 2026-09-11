@@ -62,6 +62,7 @@ from scripts.workflow_release_inventory import (
     release_supports_claude_workflow_validation,
     release_supports_opencode_recovery,
     release_supports_claude_rollout_fallback,
+    release_supports_observational_token_estimates,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
@@ -848,6 +849,8 @@ EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256 = {
     "opencode": "9cc171e9c11de4c6719d73922fed0373c5db0281feae7488c55c7447025bf0ab",
 }
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176 = "3e8decf2bf21d007d40c0dc011b173ed0af6b2e15ae8827ae51f6986e90b813f"
+EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V177 = "5b53efd67b4728e01ddbd029c13dd039d93cc0c94b86bccb4e1fc1a4486c6cda"
+EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_AST_SHA256_V177 = "e6596be9b7670a75cad740496a34b5f3f1714e0b37b5c0dab06a7f4762ce323e"
 EXPECTED_OPENCODE_RECOVERY_SHA256 = {
     ".github/actions/recover-opencode-review/evidence.py": "3b43f256e77c89fbd123cc155dc8931cf02701d2a642bf280cbc795253ea81b8",
     ".github/actions/recover-opencode-review/replay.js": "1756d715e529dbe66dbea0674b2ca157a80fee5069309ec902eec7de19556a3b",
@@ -3822,6 +3825,37 @@ def _ast_statement_matches(node: ast.AST, statement: str) -> bool:
     ) == ast.dump(expected[0], include_attributes=False)
 
 
+_AST_STRUCTURAL_IGNORED_FIELDS = frozenset({
+    "type_comment", "type_ignores", "type_params",
+})
+
+
+def _stable_ast_structure(value: object) -> object:
+    if isinstance(value, ast.AST):
+        return [
+            type(value).__name__,
+            [
+                [name, _stable_ast_structure(item)]
+                for name, item in ast.iter_fields(value)
+                if name not in _AST_STRUCTURAL_IGNORED_FIELDS
+            ],
+        ]
+    if isinstance(value, (list, tuple)):
+        return [_stable_ast_structure(item) for item in value]
+    if value is None or isinstance(value, (bool, float, int, str)):
+        return value
+    return [type(value).__name__, repr(value)]
+
+
+def _ast_structural_sha256(module: ast.Module) -> str:
+    payload = json.dumps(
+        _stable_ast_structure(module),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _record_shape(
     node: ast.ClassDef,
 ) -> tuple[tuple[str, str, str | None], ...]:
@@ -4401,8 +4435,9 @@ def require_budget_helper_contract(
     filter_reasons: bool = False,
     dismissals: bool = False,
     expanded_budget: bool = False,
+    observational_token_estimates: bool = False,
 ) -> None:
-    """Require the authenticated schema-1 helper and every fixed policy gate."""
+    """Require the authenticated schema-1 helper and release-specific policy gates."""
 
     # v1.60 resolves the round budget through effective_budgets(), which renames the
     # owner of the round caps and adds three statements ahead of the ledger checks.
@@ -4887,36 +4922,60 @@ def require_budget_helper_contract(
             if dismissals
             else ""
         )
-        claim_budget_policy = (
-            "    override_count = sum(item.override_event_id is not None "
-            "for item in validated.invocations)\n"
-            "    override = None\n"
-            "    needs_override = (override_count > 0 or request.force_review or "
-            f"automatic_rounds(validated) >= {claim_rounds})\n"
-            "    if needs_override:\n"
-            "        if not request.force_review:\n"
-            "            return refuse(validated, request, 'round_budget_exhausted')\n"
-            "        override = choose_override(validated, request.override_events)\n"
-            "        if override is None:\n"
-            "            return refuse(validated, request, 'round_budget_exhausted')\n"
-            "    total_limit = (validated.budgets.max_estimated_tokens_total "
-            "+ (override_count + int(override is not None)) * "
-            "validated.budgets.max_estimated_tokens_per_round)\n"
-            if expanded_budget
+        if observational_token_estimates and not expanded_budget:
+            raise ValueError("observational token estimates require expanded budget")
+        if expanded_budget:
+            claim_budget_policy = (
+                "    override_count = sum(item.override_event_id is not None "
+                "for item in validated.invocations)\n"
+                "    override = None\n"
+                "    needs_override = (override_count > 0 or request.force_review or "
+                f"automatic_rounds(validated) >= {claim_rounds})\n"
+                "    if needs_override:\n"
+                "        if not request.force_review:\n"
+                "            return refuse(validated, request, 'round_budget_exhausted')\n"
+                "        override = choose_override(validated, request.override_events)\n"
+                "        if override is None:\n"
+                "            return refuse(validated, request, 'round_budget_exhausted')\n"
+            )
+            if not observational_token_estimates:
+                claim_budget_policy += (
+                    "    total_limit = (validated.budgets.max_estimated_tokens_total "
+                    "+ (override_count + int(override is not None)) * "
+                    "validated.budgets.max_estimated_tokens_per_round)\n"
+                )
+        else:
+            claim_budget_policy = (
+                "    override = None\n"
+                "    if any(item.override_event_id is not None "
+                "for item in validated.invocations):\n"
+                "        return refuse(validated, request, 'round_budget_exhausted')\n"
+                "    if request.force_review:\n"
+                "        override = choose_override(validated, request.override_events)\n"
+                "        if override is None:\n"
+                "            return refuse(validated, request, 'round_budget_exhausted')\n"
+                f"    elif automatic_rounds(validated) >= {claim_rounds}:\n"
+                "        override = choose_override(validated, request.override_events)\n"
+                "        if override is None:\n"
+                "            return refuse(validated, request, 'round_budget_exhausted')\n"
+                "    total_limit = 600_000 if override is not None else 400_000\n"
+            )
+        claim_input_token_gate = (
+            ""
+            if observational_token_estimates
             else
-            "    override = None\n"
-            "    if any(item.override_event_id is not None "
-            "for item in validated.invocations):\n"
-            "        return refuse(validated, request, 'round_budget_exhausted')\n"
-            "    if request.force_review:\n"
-            "        override = choose_override(validated, request.override_events)\n"
-            "        if override is None:\n"
-            "            return refuse(validated, request, 'round_budget_exhausted')\n"
-            f"    elif automatic_rounds(validated) >= {claim_rounds}:\n"
-            "        override = choose_override(validated, request.override_events)\n"
-            "        if override is None:\n"
-            "            return refuse(validated, request, 'round_budget_exhausted')\n"
-            "    total_limit = 600_000 if override is not None else 400_000\n"
+            "    if request.estimated_input_tokens > "
+            "validated.budgets.max_estimated_tokens_per_round:\n"
+            "        return refuse(validated, request, 'input_budget_exhausted')\n"
+        )
+        claim_total_token_gate = (
+            ""
+            if observational_token_estimates
+            else
+            "    if estimated_total(validated) + request.estimated_input_tokens "
+            "> total_limit:\n"
+            "        return refuse(validated, request, "
+            "'total_usage_budget_exhausted')\n"
         )
         expected_claim = ast.parse(
             "def expected(state, request, provenances):\n"
@@ -4950,14 +5009,9 @@ def require_budget_helper_contract(
             "item.full_diff_sha256 == request.full_diff_sha256 "
             "for item in validated.invocations):\n"
             "        return refuse(validated, request, 'duplicate_effective_diff')\n"
-            "    if request.estimated_input_tokens > "
-            "validated.budgets.max_estimated_tokens_per_round:\n"
-            "        return refuse(validated, request, 'input_budget_exhausted')\n"
+            f"{claim_input_token_gate}"
             f"{claim_budget_policy}"
-            "    if estimated_total(validated) + request.estimated_input_tokens "
-            "> total_limit:\n"
-            "        return refuse(validated, request, "
-            "'total_usage_budget_exhausted')\n"
+            f"{claim_total_token_gate}"
             "    return append_claim(validated, request, override, "
             "provenances[(request.run_id, request.run_attempt)])\n"
         ).body[0]
@@ -4994,6 +5048,14 @@ def require_budget_helper_contract(
             if isinstance(statement, ast.For)
             and _ast_expression_matches(statement.iter, "state.invocations")
         ]
+        stored_input_token_gate = (
+            ""
+            if observational_token_estimates
+            else
+            "    if item.estimated_input_tokens > "
+            "state.budgets.max_estimated_tokens_per_round:\n"
+            "        raise BudgetStateError('input_budget_exhausted')\n"
+        )
         expected_invocation_loop = ast.parse(
             "for item in state.invocations:\n"
             "    Invocation.from_dict(item.to_dict())\n"
@@ -5007,9 +5069,7 @@ def require_budget_helper_contract(
             "    if item.call_count > state.budgets.max_calls_per_round "
             "and not call_failure:\n"
             "        raise BudgetStateError('call_budget_exhausted')\n"
-            "    if item.estimated_input_tokens > "
-            "state.budgets.max_estimated_tokens_per_round:\n"
-            "        raise BudgetStateError('input_budget_exhausted')\n"
+            f"{stored_input_token_gate}"
             "    call_first_dual_failure = call_failure and "
             "item.call_count > state.budgets.max_calls_per_round\n"
             "    if item.elapsed_seconds > "
@@ -5125,22 +5185,36 @@ def require_budget_helper_contract(
             include_attributes=False,
         ):
             raise ValueError("forced duplicate policy differs")
-        for expression, reason in (
-            (
-                f"len(automatic) > {rounds_owner}.max_rounds or "
-                f"len(overrides) > {rounds_owner}.max_override_rounds",
-                "rounds_invalid",
-            ),
-            (
-                "automatic_total > total_limit",
-                "total_usage_budget_exhausted",
-            ),
-            (
-                "sum(item.estimated_input_tokens "
-                "for item in state.invocations) > total_limit",
-                "total_usage_budget_exhausted",
-            ),
-        ):
+        state_guards = [(
+            f"len(automatic) > {rounds_owner}.max_rounds or "
+            f"len(overrides) > {rounds_owner}.max_override_rounds",
+            "rounds_invalid",
+        )]
+        if observational_token_estimates:
+            forbidden_token_decisions = {
+                node.value
+                for node in ast.walk(state_shape)
+                if isinstance(node, ast.Constant)
+                and node.value in {
+                    "input_budget_exhausted",
+                    "total_usage_budget_exhausted",
+                }
+            }
+            if forbidden_token_decisions:
+                raise ValueError("stored token estimate gate remains")
+        else:
+            state_guards.extend((
+                (
+                    "automatic_total > total_limit",
+                    "total_usage_budget_exhausted",
+                ),
+                (
+                    "sum(item.estimated_input_tokens "
+                    "for item in state.invocations) > total_limit",
+                    "total_usage_budget_exhausted",
+                ),
+            ))
+        for expression, reason in state_guards:
             _direct_guard(
                 state_shape.body, expression, "BudgetStateError", reason
             )
@@ -5445,6 +5519,12 @@ def require_budget_helper_contract(
             )
         ):
             raise ValueError("compare-and-swap refusal differs")
+        if (
+            observational_token_estimates
+            and _ast_structural_sha256(module)
+            != EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_AST_SHA256_V177
+        ):
+            raise ValueError("observational token helper structure differs")
     except (StopIteration, SyntaxError, TypeError, ValueError):
         raise ReleaseVerificationError(
             "invocation-budget helper contract is invalid"
@@ -6203,6 +6283,7 @@ def _verify_review_invocation_budget(
         release_supports_filter_reason_surface(ref),
         release_supports_finding_dismissal(ref),
         release_supports_expanded_review_budget(ref),
+        release_supports_observational_token_estimates(ref),
     )
     for reviewer, workflow in REVIEWER_WORKFLOWS.items():
         require_budget_workflow_contract(
@@ -6225,7 +6306,9 @@ def _verify_review_invocation_budget(
         ),
         REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix(): (
             helper_payload,
-            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176
+            EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V177
+            if release_supports_observational_token_estimates(ref)
+            else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176
             if release_supports_opencode_recovery(ref)
             else EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V174
             if release_supports_expanded_review_budget(ref)
@@ -6781,7 +6864,7 @@ def _verify_review_publication_contracts(
     try:
         for name, raw_contract in REVIEW_PUBLICATION_CONTRACTS.items():
             if release_supports_claude_rollout_fallback(ref) and name == "claude-code-review.yml":
-                # The schema-3 failure/fallback variants have an exact v1.77
+                # The schema-3 failure/fallback variants have an exact v1.78
                 # parsed seal, including the complete collector and publisher.
                 require_claude_fallback_inputs(documents[name])
                 continue
@@ -7512,7 +7595,7 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
 
 
 
-# Reviewed v1.77 inputs, never calculated from the candidate at verification time.
+# Reviewed v1.78 inputs, never calculated from the candidate at verification time.
 # Parsed seals retain all existing policy statements while schema-2 replaces the
 # legacy positional schema-1 AST checks. Raw seals additionally authenticate bytes.
 EXPECTED_CLAUDE_FALLBACK_SHA256 = {
@@ -7520,11 +7603,11 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/claude-rollout-fallback/contract.py": "ae39e0f9c0a1faa6831559c93150fca7f768fbaa0257aade70f045abd0eafff6",
     "scripts/verify_claude_rollout_fallback.py": "281d443f4ebcc1dcd1f7db91abb0df3f31bc786527b6e0e0d4619c53d11f553e",
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
-    ".github/actions/review-invocation-budget/review_invocation_budget.py": "61bb3e0efa79daaa4b38c1a2a3d52cd7b6abf0432f81208e4fcdfdad61477103",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py": "64731d5c61c4d2a5109a738839589d3f419f1215030eff41b8ba608f8654b876",
     ".github/workflows/claude.yml": "bb111fd319a6449f8f56cbe22a20572b662525f9f4a7765bc46a415bba5f5881",
     ".github/workflows/claude-code-review.yml": "e9ab0aafc14b21e5eb6780ad80b1ca3c3766e5f8f0cc5b60700cfe88eb18ab81",
-    ".github/workflows/opencode-auto-review.yml": "ff4b2acfb3a87f66a77e5e9821d0d60237b6335cbe2a7afd6e7af484a80d66bb",
-    ".github/actions/recover-opencode-review/evidence.py": "9be2af2a2f121f36d8587d11efcdd197bc98e7306e901a0b727097d991dd1a01",
+    ".github/workflows/opencode-auto-review.yml": "ca6cbf2b1f1c9c57f524c45d4de0c863ac2bb249d0e261bbcf1da7e2017c5ea1",
+    ".github/actions/recover-opencode-review/evidence.py": "1eacc5e56ad5554324eeb0ce7a9d6872d1c8e22ca95828ce34758ccc2be0fee1",
     ".github/actions/recover-opencode-review/replay.js": "1587bc1c858708d30edf1da3559cc37486d6eaa6e8fbe7d57ab6debf24e6f503",
     ".github/actions/recover-opencode-review/receipt.js": "49a10b88745fce3ef3e43d6f4b5a0448b70d5e37b40e358d530a0f99dcd51d82",
 }
@@ -7533,11 +7616,11 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/claude-rollout-fallback/contract.py": "b2b1c32742bab2642b24ff6e20fd9525432610721ce4e55b501c8255aa09a121",
     "scripts/verify_claude_rollout_fallback.py": "65425e217b6574ff6af2cbc06c0f1fa422a51ad63b6102b2e6cd14915b2f62dd",
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
-    ".github/actions/review-invocation-budget/review_invocation_budget.py": "c7338146a36ad36077d10b22f6db8947822c5da725fd779b914d252a2b9671ec",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py": "a98dd0b04614ae1094e5fd8534ae8b2d27e117596fbaeac397d0e604158a588c",
     ".github/workflows/claude.yml": "5781ef1db5e22f83ed07fc83fabe0beb615544a1412e01b2b8dabfd5f06593ab",
     ".github/workflows/claude-code-review.yml": "130a3ee4164a2561ce6554e1fd6ddac25de11c734e7ec9504c8980841339407f",
-    ".github/workflows/opencode-auto-review.yml": "f27759c57939c8739bc0ee8c9c373869dd828d12dc2d10415c834937176ecd51",
-    ".github/actions/recover-opencode-review/evidence.py": "ffbc745e3912974a46d4496a507c03c759ee6d3ef83f6f9eeba874b808fd5ae4",
+    ".github/workflows/opencode-auto-review.yml": "da90fcad95d03f2b51120447edcf187eeb5fbdaa050ded885bb9c9907f3d7f9e",
+    ".github/actions/recover-opencode-review/evidence.py": "4e27f7f7f11b3726c67f9e459554de1fc9d00586b37f18d67b7aaf67c5ff0d5b",
 }
 FALLBACK_ACTION = "$/.github/actions/claude-rollout-fallback"
 FALLBACK_INPUT_OUTPUTS = {

@@ -683,7 +683,7 @@ jobs:
             --arg central_path "$central_path" --arg central_sha "$central_sha" \
             --argjson pr "$PR_NUMBER" --argjson run_id "$GITHUB_RUN_ID" \
             --argjson run_attempt "$GITHUB_RUN_ATTEMPT" --arg attempt_head "$ATTEMPT_HEAD" \
-            --argjson merge_base "$([[ "$merge_base" == null ]] && printf null || jq -Rn --arg value "$merge_base" '$value')" \
+            --argjson merge_base "$(if [[ "$merge_base" == null ]]; then printf null; else jq -Rn --arg value "$merge_base" '$value'; fi)" \
             --arg diff_ready "$DIFF_READY" \
             --arg diff_mode "$DIFF_MODE" --arg unchanged "$UNCHANGED_SINCE_PREVIOUS" \
             --arg full_hash "$FULL_DIFF_SHA256" \

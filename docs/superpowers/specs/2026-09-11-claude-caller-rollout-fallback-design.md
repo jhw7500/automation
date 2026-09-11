@@ -4,6 +4,18 @@ Status: design approved by the user's `go` on 2026-09-11.
 Date: 2026-09-11. Source tree: 444a7347aee169ed178aae80e8bd8d10eca52e02.
 Issue: https://github.com/jhw7500/automation/issues/182
 
+Integration note (2026-09-11): #183 published observational token estimates as
+immutable v1.77, tag object `81f44fb6786bdfcc40f93161db74b1d9a9e3b7c5` at exact
+commit `dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19`. The #182 fallback release is
+therefore v1.78, with its distinct byte-identical boundary canary at v1.78.1.
+The normal main merge preserves reviewed Task 1-6 history. Both future publication
+paths authenticate v1.77 and unchanged v1.76 before any write; v1.78.1 additionally
+authenticates v1.78 and compares all release-owned paths using that baseline's
+inventory. Schema 2 keeps token estimates observational and preserves the v1.77
+summary field, round, override, call-count, wall-time, checkpoint and provenance
+gates. v1.77 continues to validate its authentic schema-1 helper. The v1.76 source
+and bootstrap evidence below are historical and remain unchanged.
+
 This is an advisory design record. Task and Claim ownership continue to come only
 from the supported Project Control lifecycle. The active #182 Claim remains the
 authority for the current canary and rollout work.
@@ -251,7 +263,7 @@ GitHub-generated merge commit. Native required checks are not filtered or waived
 
 ## Bootstrap and rollout order
 
-Repositories whose default branch still points to v1.76 or earlier do not yet have
+Repositories whose default branch still points to v1.77 or earlier do not yet have
 the structured route. Their first adoption cannot use code that exists only in the PR
 copy. The already completed gstApp #109 and max9296 #74 free-form reviews are therefore
 a one-time bootstrap exception, covered by the user's approval of this design and the

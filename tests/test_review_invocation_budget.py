@@ -422,6 +422,28 @@ def test_fallback_provenance_rejects_mismatches(change):
     assert (transition.allow_invocation, transition.decision) == (False, "state_invalid")
 
 
+def test_fallback_schema_two_records_over_limit_estimates_through_checkpoint_and_finalize():
+    claim_request = fallback_claim(estimated_input_tokens=10_000_000)
+    provenances = fallback_provenances(claim_request)
+    claimed = budget.claim(None, claim_request, provenances)
+    assert claimed.allow_invocation
+    assert claimed.state.to_dict()["schema"] == 2
+    assert claimed.state.invocations[-1].estimated_input_tokens == 10_000_000
+    checkpoint = budget.render_checkpoint(claimed.state)
+    restored = budget.load_checkpoint(checkpoint)
+    assert restored == claimed.state
+    finalized = budget.finalize(
+        restored,
+        finalize_request(run_id=claim_request.run_id, route=claim_request.route),
+        provenances,
+    )
+    assert finalized.decision == "finalized"
+    assert finalized.state.invocations[-1].route == claim_request.route
+    assert finalized.state.invocations[-1].estimated_input_tokens == 10_000_000
+    assert finalized.state.invocations[-1].call_count == 1
+    assert finalized.state.invocations[-1].round_number == 1
+
+
 def test_finalize_requires_the_exact_claimed_fallback_route():
     claim_request = fallback_claim()
     claimed = budget.claim(None, claim_request, fallback_provenances(claim_request)).state
@@ -943,6 +965,7 @@ def test_comment_summary_and_handoff_are_exact_and_workflow_owned():
         "- Decision: duplicate_head\n"
         "- Automatic rounds: 1/5\n"
         "- Override rounds: 0/2\n"
+        "- Estimated input tokens: 50000 total\n"
         "- Current run: https://github.com/example/repo/actions/runs/700\n"
         "- Stop reason: duplicate_head\n"
         "- Dismissed findings: none\n\n"
@@ -1276,60 +1299,82 @@ def test_stored_elapsed_seconds_enforces_each_reviewer_round_boundary(
     )
 
 
-def test_stored_estimated_input_enforces_round_boundary():
-    at_limit = budget.LedgerState.initial(
-        REPOSITORY, PR, "claude", invocations=(invocation(estimated_input_tokens=200_000),),
+@pytest.mark.parametrize("reviewer", ("claude", "gemini", "opencode"))
+def test_first_claim_above_legacy_token_limit_is_allowed_and_recorded(reviewer):
+    estimated_tokens = 250_001
+    claim_request = request(
+        reviewer=reviewer,
+        estimated_input_tokens=estimated_tokens,
     )
-    assert budget.parse_ledger(
-        ledger_body(at_limit), repository=REPOSITORY, pr=PR, reviewer="claude",
-    ) == at_limit
-    above_limit = replace(
-        at_limit,
-        invocations=(replace(at_limit.invocations[0], estimated_input_tokens=200_001),),
+
+    claimed = budget.claim(
+        None,
+        claim_request,
+        claim_provenances(None, claim_request),
     )
-    assert_stored_state_rejected(above_limit, "input_budget_exhausted")
+
+    assert claimed.allow_invocation
+    assert claimed.decision == "claimed"
+    assert claimed.state.invocations[-1].estimated_input_tokens == estimated_tokens
+    assert claimed.state.handoff.round_usage == ((1, 0, estimated_tokens, 0),)
+    assert "- Estimated input tokens: 250001 total\n" in budget.render_summary(
+        claimed.state
+    )
+    assert budget.load_checkpoint(budget.render_checkpoint(claimed.state)) == claimed.state
 
 
-def test_stored_automatic_and_override_aggregate_boundaries():
-    first = invocation(estimated_input_tokens=200_000)
+@pytest.mark.parametrize("reviewer", ("claude", "gemini", "opencode"))
+def test_later_claim_above_legacy_accumulated_token_limit_is_allowed(reviewer):
+    first = invocation(reviewer=reviewer, estimated_input_tokens=210_001)
     second = invocation(
-        head=HEAD_B, full_hash=HASH_2, run_id=502, round_number=2,
-        estimated_input_tokens=200_000,
+        reviewer=reviewer,
+        head=HEAD_B,
+        full_hash=HASH_2,
+        run_id=502,
+        round_number=2,
+        estimated_input_tokens=210_001,
     )
-    automatic_limit = budget.LedgerState.initial(
-        REPOSITORY, PR, "claude", invocations=(first, second),
+    state = budget.LedgerState.initial(
+        REPOSITORY,
+        PR,
+        reviewer,
+        invocations=(first, second),
     )
-    assert budget.parse_ledger(
-        ledger_body(automatic_limit), repository=REPOSITORY, pr=PR, reviewer="claude",
-    ) == automatic_limit
+    claim_request = request(
+        reviewer=reviewer,
+        head=HEAD_C,
+        full_hash=HASH_3,
+        run_id=503,
+        estimated_input_tokens=210_001,
+    )
 
-    third = invocation(
-        head=HEAD_C, full_hash=HASH_3, run_id=503, round_number=3,
-        override_event_id=9001, estimated_input_tokens=200_000,
+    claimed = budget.claim(
+        state,
+        claim_request,
+        claim_provenances(state, claim_request),
     )
-    override_limit = budget.LedgerState.initial(
-        REPOSITORY, PR, "claude", invocations=(first, second, third),
-        consumed_override_event_ids=(9001,),
-    )
-    override_limit = replace(
-        override_limit,
-        budgets=replace(
-            override_limit.budgets,
-            max_rounds=2,
-            max_override_rounds=1,
-        ),
-    )
-    assert budget.parse_ledger(
-        ledger_body(override_limit), repository=REPOSITORY, pr=PR, reviewer="claude",
-    ) == override_limit
 
-    above_override_limit = replace(
-        override_limit,
-        invocations=override_limit.invocations[:2] + (
-            replace(override_limit.invocations[2], estimated_input_tokens=200_001),
-        ),
+    assert claimed.allow_invocation
+    assert claimed.round_number == 3
+    assert [
+        item.estimated_input_tokens for item in claimed.state.invocations
+    ] == [210_001, 210_001, 210_001]
+    assert budget.load_checkpoint(budget.render_checkpoint(claimed.state)) == claimed.state
+
+
+@pytest.mark.parametrize(
+    "decision",
+    ("input_budget_exhausted", "total_usage_budget_exhausted"),
+)
+def test_legacy_token_budget_decisions_remain_readable(decision):
+    state = replace(
+        budget.LedgerState.initial(REPOSITORY, PR, "claude"),
+        last_decision=budget.DecisionRecord(decision, decision, 700, 1),
     )
-    assert_stored_state_rejected(above_override_limit, "input_budget_exhausted")
+
+    assert budget.parse_ledger(
+        ledger_body(state), repository=REPOSITORY, pr=PR, reviewer="claude",
+    ) == state
 
 
 # --- configurable automatic round budget (issue #114) ---
@@ -2052,6 +2097,7 @@ def test_comment_summary_lists_dismissals_and_documents_the_command():
         "- Decision: claimed\n"
         "- Automatic rounds: 1/5\n"
         "- Override rounds: 0/2\n"
+        "- Estimated input tokens: 50000 total\n"
         "- Current run: https://github.com/example/repo/actions/runs/700\n"
         "- Stop reason: claimed\n"
         "- Dismissed findings: "

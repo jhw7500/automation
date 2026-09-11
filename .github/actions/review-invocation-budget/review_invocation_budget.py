@@ -777,8 +777,6 @@ def _validate_state_shape(state: LedgerState) -> None:
         )
         if item.call_count > state.budgets.max_calls_per_round and not call_failure:
             raise BudgetStateError("call_budget_exhausted")
-        if item.estimated_input_tokens > state.budgets.max_estimated_tokens_per_round:
-            raise BudgetStateError("input_budget_exhausted")
         call_first_dual_failure = call_failure and item.call_count > state.budgets.max_calls_per_round
         if (item.elapsed_seconds > state.budgets.max_wall_seconds_per_round and
                 not (wall_failure or call_first_dual_failure)):
@@ -838,13 +836,6 @@ def _validate_state_shape(state: LedgerState) -> None:
         )
     ):
         raise BudgetStateError("override_invalid")
-    automatic_total = sum(item.estimated_input_tokens for item in automatic)
-    total_limit = state.budgets.max_estimated_tokens_total
-    if automatic_total > total_limit:
-        raise BudgetStateError("total_usage_budget_exhausted")
-    total_limit += len(overrides) * state.budgets.max_estimated_tokens_per_round
-    if sum(item.estimated_input_tokens for item in state.invocations) > total_limit:
-        raise BudgetStateError("total_usage_budget_exhausted")
     _validate_dismissed_findings(state.dismissed_findings)
     DecisionRecord.from_dict(state.last_decision.to_dict())
     handoff = Handoff.from_dict(state.handoff.to_dict())
@@ -1348,8 +1339,6 @@ def claim(state: LedgerState | None, request: ClaimRequest,
         for item in validated.invocations
     ):
         return refuse(validated, request, "duplicate_effective_diff")
-    if request.estimated_input_tokens > validated.budgets.max_estimated_tokens_per_round:
-        return refuse(validated, request, "input_budget_exhausted")
     override_count = sum(
         item.override_event_id is not None for item in validated.invocations
     )
@@ -1365,13 +1354,6 @@ def claim(state: LedgerState | None, request: ClaimRequest,
         override = choose_override(validated, request.override_events)
         if override is None:
             return refuse(validated, request, "round_budget_exhausted")
-    total_limit = (
-        validated.budgets.max_estimated_tokens_total
-        + (override_count + int(override is not None))
-        * validated.budgets.max_estimated_tokens_per_round
-    )
-    if estimated_total(validated) + request.estimated_input_tokens > total_limit:
-        return refuse(validated, request, "total_usage_budget_exhausted")
     return append_claim(
         validated, request, override,
         provenances[(request.run_id, request.run_attempt)],
@@ -1653,6 +1635,7 @@ def _summary(state: LedgerState, *, server_url: str) -> str:
         f"- Decision: {handoff.decision}\n"
         f"- Automatic rounds: {handoff.automatic_rounds}/{budgets.max_rounds}\n"
         f"- Override rounds: {handoff.override_rounds}/{override_limit}\n"
+        f"- Estimated input tokens: {estimated_total(state)} total\n"
         f"- Current run: {run_url}\n"
         f"- Stop reason: {handoff.stop_reason}\n"
         f"{dismissed_line}\n"

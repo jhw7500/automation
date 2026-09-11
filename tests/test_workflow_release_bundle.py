@@ -427,7 +427,7 @@ def test_review_policy_release_boundary() -> None:
     assert {root.kind for root in policy_roots} == {"file"}
 
 
-def test_v177_review_invocation_budget_action_has_exact_safe_contract() -> None:
+def test_v178_review_invocation_budget_action_has_exact_safe_contract() -> None:
     payload = REVIEW_INVOCATION_BUDGET_ACTION.read_bytes()
     document = yaml.load(payload, Loader=yaml.BaseLoader)
 

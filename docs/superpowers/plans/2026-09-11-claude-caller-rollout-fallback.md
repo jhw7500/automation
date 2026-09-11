@@ -10,19 +10,31 @@
 
 **Spec:** ../specs/2026-09-11-claude-caller-rollout-fallback-design.md
 
+## Main integration note (2026-09-11)
+
+#183 published observational token estimates as immutable v1.77: annotated tag
+`81f44fb6786bdfcc40f93161db74b1d9a9e3b7c5` peels to
+`dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19`. Integrate that exact main with a normal
+merge, preserving the reviewed #182 Task 1-6 history. The fallback boundary and
+all future publication/adoption approvals now use v1.78; its distinct, byte-identical
+release-owned boundary canary uses v1.78.1. Never republish or move v1.77.
+Schema 2 preserves v1.77's observational token estimates and summary field while
+retaining round, override, call-count, wall-time, checkpoint and provenance gates.
+The v1.76 bootstrap evidence and immutable v1.76 identity below remain historical.
+
 ## Global Constraints
 
 - Work only in `/home/jhw/ai/opencode/worktrees/jhw-control/wt-7e615b91b0e8-jhw7500-automation-182` on `task/7e615b91b0e8-jhw7500-automation-182`, starting from design commit `b10503c` over immutable v1.76 source `444a7347aee169ed178aae80e8bd8d10eca52e02`.
 - Keep Task `tsk-01a08b34-cc9e-777f-a99d-7e615b91b0e8` and Claim `clm-01a08b35-4a07-75ba-8a22-a8ca96029ade`. Do not add, take over, delete, repair, or directly edit a Claim, lock, Registry record, budget ledger, secret, or Notion record.
 - Every shell command starts with `rtk`; commands that need an unwrapped executable use `rtk proxy`. Apply source edits with `apply_patch`.
 - Write a failing behavioral test before each implementation change. Add no dependency and execute no code, action, hook, filter, binary, or artifact supplied by a consumer pull request.
-- Preserve v1.76 bytes, tag, release acceptance, and historical fixtures. Own the new workflow, action, verifier, and ledger schema behavior behind the v1.77 feature boundary.
+- Preserve v1.76 and v1.77 bytes, tags, release acceptance, and historical fixtures. Own the new workflow, action, verifier, and ledger schema behavior behind the v1.78 feature boundary.
 - Authenticate only `workflow_validation_mismatch` with `review_execution=not_performed`, the Claude provider step skipped, and no budget claim. `workflow_validation_unavailable`, provider entry, any other failure, stale coordinates, ambiguity, pagination overflow, and transport uncertainty remain blocking.
 - The fallback uses the existing Claude credential once and consumes one ordinary automatic review round for the exact pull-request HEAD/full diff. A retry reuses a valid request or finalized result and cannot add a second provider call.
 - Do not make the original failed automatic check successful, hide it, waive a required status, weaken branch protection, or replace target tests, mergeability, exact HEAD/base, origin, or GitHub-generated merge verification.
 - The consumer permission ceiling for `claude.yml` becomes `pull-requests: write`; the central interactive Claude job explicitly reduces itself to `pull-requests: read`; only the admitted nested managed job retains write permission for the canonical sticky comment.
 - This plan changes only the automation repository. It ends with a versioned receipt schema and verifier CLI. Before editing `/home/jhw/ai/opencode/projects/jhw-notion-runtime`, run that repository's stateless Task nudge, obtain any required separate approval, and write a second implementation plan.
-- Do not publish v1.77 or mutate a consumer until the implementation branch passes local verification, native pre-PR tribunal, hosted review, and reviewed merge. Stop a canary if a required failed Claude check remains native-blocking.
+- Do not publish v1.78 or mutate a consumer until the implementation branch passes local verification, native pre-PR tribunal, hosted review, and reviewed merge. Stop a canary if a required failed Claude check remains native-blocking.
 
 ---
 
@@ -35,7 +47,7 @@
 | Budget ledger | `review-invocation-budget` | later review runs and verifier | schema 2, reads schema 1 |
 | Claude sticky state | `claude-code-review.yml` | review context and fleet verifier | schema 3 with exact optional extensions |
 | Fleet fallback receipt | `verify_claude_rollout_fallback.py` | later JHW command | schema 1 |
-| Workflow release | reviewed automation merge | release verifier and consumers | v1.77 |
+| Workflow release | reviewed automation merge | release verifier and consumers | v1.78 |
 
 The only accepted request body is the following two-line form, with one optional final LF and no other bytes:
 
@@ -409,8 +421,8 @@ rtk git commit -m 'feat(claude): authenticate rollout fallback requests'
 - Add `InvocationRoute(kind, request_comment_id, request_nonce, original_run_id, original_run_attempt, expected_base_sha, release_commit, managed_diff_sha256, automatic_comment_id, automatic_state_sha256)`.
 - Exact `kind` values are `automatic`, `authorized_override`, and `default_branch_rollout_fallback`. Only the fallback kind carries the nine evidence fields; the other kinds serialize only their `kind` key.
 - Schema-1 migration derives `automatic` from `pull_request` and `authorized_override` from `workflow_dispatch`; every other legacy event fails closed.
-- Add optional action input `invocation-route-json` with default `{"kind":"automatic"}` for source compatibility during staged edits; every v1.77 workflow call passes an explicit route value.
-- Add required persisted `route: InvocationRoute` to `Invocation`. Add `route` to `ClaimRequest` and `FinalizeRequest` with `field(default_factory=InvocationRoute.automatic)` so existing pure-Python callers remain automatic; every v1.77 action/workflow call still supplies explicit JSON. Claim and finalize require the same serialized route.
+- Add optional action input `invocation-route-json` with default `{"kind":"automatic"}` for source compatibility during staged edits; every v1.78 workflow call passes an explicit route value.
+- Add required persisted `route: InvocationRoute` to `Invocation`. Add `route` to `ClaimRequest` and `FinalizeRequest` with `field(default_factory=InvocationRoute.automatic)` so existing pure-Python callers remain automatic; every v1.78 action/workflow call still supplies explicit JSON. Claim and finalize require the same serialized route.
 - For fallback claims only, the selected run event is `issue_comment`, caller path is `.github/workflows/claude.yml`, and the invocation HEAD is the freshly fetched pull-request HEAD rather than the default-branch run HEAD. Existing `referenced_workflow_sha` records the installed driver commit from the consumer default branch; route `release_commit` separately records the target commit being rolled out.
 - The route still consumes an automatic round. `force_review` must be false, no override event may be consumed, and the existing duplicate-head/round/usage/finalization behavior is unchanged.
 
@@ -1320,7 +1332,7 @@ rtk git add scripts/verify_claude_rollout_fallback.py scripts/rollout_workflow_f
 rtk git commit -m 'feat(rollout): attest Claude fallback evidence'
 ```
 
-### Task 6: v1.77 release boundary and operator documentation
+### Task 6: v1.78 release boundary and operator documentation
 
 **Files:**
 
@@ -1335,30 +1347,30 @@ rtk git commit -m 'feat(rollout): attest Claude fallback evidence'
 
 **Interfaces:**
 
-- Add `CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 77)` and `release_supports_claude_rollout_fallback(ref)`.
-- Add both new action files and the verifier script as exact 100644 release roots for v1.77 only. The verifier's imported rollout modules remain ordinary repository source, but delayed imports require a clean checkout at receipt `verifier_commit`; the later JHW plan must execute from that exact commit.
-- v1.77 validation seals request keys, bounded evidence reads, mutual exclusion, permission reduction, nested `$/` path, eight all-or-none inputs, ledger schema migration, exact canonical route, receipt keys, and no required-check waiver.
-- v1.76 continues to validate at `444a7347aee169ed178aae80e8bd8d10eca52e02`; v1.74/v1.75 historical fixtures retain their current accepted trees.
+- Add `CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 78)` and `release_supports_claude_rollout_fallback(ref)`.
+- Add both new action files and the verifier script as exact 100644 release roots for v1.78 only. The verifier's imported rollout modules remain ordinary repository source, but delayed imports require a clean checkout at receipt `verifier_commit`; the later JHW plan must execute from that exact commit.
+- v1.78 validation seals request keys, bounded evidence reads, mutual exclusion, permission reduction, nested `$/` path, eight all-or-none inputs, ledger schema migration, exact canonical route, receipt keys, and no required-check waiver.
+- v1.76 continues to validate at `444a7347aee169ed178aae80e8bd8d10eca52e02`; v1.77 continues to validate its authentic observational schema-1 helper at `dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19`. v1.74/v1.75 historical fixtures retain their current accepted trees.
 - Release-contract helpers have fixed signatures: `require_claude_fallback_permissions(caller: object, router: object, review: object) -> None`, `require_claude_fallback_routes(router: object) -> None`, `require_claude_fallback_inputs(review: object) -> None`, `require_budget_schema_two(root: Path) -> None`, and `require_request_and_receipt_contracts(root: Path) -> None`. They raise `ReleaseVerificationError` and emit no partial acceptance.
-- The v1.77 operator section adapts the existing v1.76 create-only GitHub Git Data procedure. It requires an absent direct/peeled ref, exact reviewed public-main commit, one intended token passed by private file descriptor into an isolated environment, one annotated-tag-object POST followed by one tag-ref POST, exact response OIDs, raw response records at mode 0600, and final local/public remote verification. It never publishes through an ordinary Git push or moves/deletes a tag.
+- The v1.78 operator section adapts the existing v1.76 create-only GitHub Git Data procedure. It requires an absent direct/peeled ref, exact reviewed public-main commit, one intended token passed by private file descriptor into an isolated environment, one annotated-tag-object POST followed by one tag-ref POST, exact response OIDs, raw response records at mode 0600, and final local/public remote verification. It never publishes through an ordinary Git push or moves/deletes a tag.
 
 Target release gate:
 
 ```python
-CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 77)
+CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 78)
 
 def release_supports_claude_rollout_fallback(ref: str) -> bool:
     """Return whether the release owns the managed Claude rollout fallback."""
     return _release_version(ref) >= CLAUDE_ROLLOUT_FALLBACK_RELEASE
 ```
 
-- [ ] **Step 1: Write failing v1.77 inventory and historical-acceptance tests.** Assert exact path ownership and unchanged older boundaries.
+- [ ] **Step 1: Write failing v1.78 inventory and historical-acceptance tests.** Assert exact path ownership and unchanged older boundaries.
 
 ```python
-def test_v177_adds_only_claude_rollout_fallback_roots():
-    v176 = set(release_inventory.release_paths_for("v1.76"))
+def test_v178_adds_only_claude_rollout_fallback_roots():
     v177 = set(release_inventory.release_paths_for("v1.77"))
-    assert v177 - v176 == {
+    v178 = set(release_inventory.release_paths_for("v1.78"))
+    assert v178 - v177 == {
         ".github/actions/claude-rollout-fallback/action.yml",
         ".github/actions/claude-rollout-fallback/contract.py",
         "scripts/verify_claude_rollout_fallback.py",
@@ -1371,15 +1383,15 @@ def test_v176_candidate_remains_accepted():
 - [ ] **Step 2: Run inventory cases and verify red.**
 
 ```bash
-rtk pytest -q tests/test_verify_workflow_release.py -k 'v177 or v176_candidate'
+rtk pytest -q tests/test_verify_workflow_release.py -k 'v178 or v176_candidate'
 ```
 
-Expected: v1.77 feature boundary and fixture do not exist.
+Expected: v1.78 feature boundary and fixture do not exist.
 
 - [ ] **Step 3: Implement the versioned roots and fixture downgrade.** Append only the three exact regular files when the ref supports the feature.
 
 ```python
-CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 77)
+CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 78)
 CLAUDE_ROLLOUT_FALLBACK_ROOTS = (
     ReleaseRoot(PurePosixPath(".github/actions/claude-rollout-fallback/action.yml"), "file", "100644"),
     ReleaseRoot(PurePosixPath(".github/actions/claude-rollout-fallback/contract.py"), "file", "100644"),
@@ -1397,9 +1409,9 @@ def _with_claude_rollout_fallback_roots(
     return roots
 ```
 
-Return `_with_claude_rollout_fallback_roots(ref, roots)` at the end of the existing `release_roots_for` branch sequence. In the test fixture helper, downgrade versions below v1.77 by deleting these three paths and restoring the v1.76 Claude caller, central workflow, budget schema, sticky-state key sets, catalog permission, and release-verifier seals from the committed v1.76 fixture bytes.
+Return `_with_claude_rollout_fallback_roots(ref, roots)` at the end of the existing `release_roots_for` branch sequence. In the test fixture helper, downgrade versions below v1.78 by deleting these three paths and restoring every #182-modified release-owned file from authenticated v1.77 commit `dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19` before older downgrade chains. Preserve deliberate mutations and repeated-call idempotency. Keep the authentic v1.77 schema-1 verifier and seals; seal the combined schema-2 observational helper only at v1.78.
 
-- [ ] **Step 4: Write failing v1.77 mutation tests.** Use one named mutation for every security seal.
+- [ ] **Step 4: Write failing v1.78 mutation tests.** Use one named mutation for every security seal.
 
 ```python
 @pytest.mark.parametrize("mutation", [
@@ -1408,11 +1420,11 @@ Return `_with_claude_rollout_fallback_roots(ref, roots)` at the end of the exist
     "interactive_permission", "route_json", "ledger_migration",
     "canonical_route", "receipt_keys", "receipt_mode", "required_check",
 ])
-def test_v177_rejects_fallback_contract_mutation(repo, mutation):
-    mutate_v177_contract(repo, mutation)
+def test_v178_rejects_fallback_contract_mutation(repo, mutation):
+    mutate_v178_contract(repo, mutation)
     bad = commit(repo, f"mutate {mutation}")
     with pytest.raises(ReleaseVerificationError):
-        verify_commit_content(repo, "v1.77", bad)
+        verify_commit_content(repo, "v1.78", bad)
 ```
 
 - [ ] **Step 5: Implement parsed and literal release seals.** Add one feature-gated verifier function and call it from the existing commit-content pipeline.
@@ -1445,10 +1457,10 @@ docs/workflows/contracts.md
   Fleet fallback receipt schema 1
 
 docs/workflow-fleet-rollout.md
-  Create-only v1.77 and v1.77.1 tag publication
+  Create-only v1.78 and v1.78.1 tag publication
   v1.76 bootstrap evidence
-  v1.77 route adoption
-  v1.77.1 real-boundary canary
+  v1.78 route adoption
+  v1.78.1 real-boundary canary
   Required-check stop conditions
 ```
 
@@ -1459,13 +1471,13 @@ rtk pytest -q tests/test_verify_workflow_release.py tests/test_canonical_workflo
 rtk git diff --check
 ```
 
-Expected: v1.77 positive/mutation cases and v1.74-v1.76 historical cases pass.
+Expected: v1.78 positive/mutation cases and v1.74-v1.77 historical cases pass.
 
 - [ ] **Step 8: Commit the independently testable release unit.**
 
 ```bash
 rtk git add scripts/workflow_release_inventory.py scripts/verify_workflow_release.py tests/test_verify_workflow_release.py tests/release_fixture_helpers.py scripts/workflow-catalog.json tests/test_canonical_workflow_tree.py docs/workflows/contracts.md docs/workflow-fleet-rollout.md
-rtk git commit -m 'feat(release): define v1.77 Claude fallback contract'
+rtk git commit -m 'feat(release): define v1.78 Claude fallback contract'
 ```
 
 - [ ] **Step 9: Verify the exact committed object.** Resolve HEAD inside Python and pass the resulting 40-hex object to the existing commit-only CLI.
@@ -1488,14 +1500,14 @@ subprocess.run([
     sys.executable,
     "scripts/verify_workflow_release.py",
     "--automation", str(root),
-    "--ref", "v1.77",
+    "--ref", "v1.78",
     "--expected-commit", head,
     "--commit-only",
 ], cwd=root, check=True)
 PY
 ```
 
-Expected: `PASS: v1.77 commit content is secure` names the exact HEAD object.
+Expected: `PASS: v1.78 commit content is secure` names the exact HEAD object.
 
 ### Task 7: Whole-change verification and adversarial review
 
@@ -1524,7 +1536,7 @@ Expected: ownership succeeds, status is empty, and `hooks` plus `multi_agent` ar
 - [ ] **Step 2: Run the focused acceptance suite.**
 
 ```bash
-rtk pytest -q tests/test_claude_rollout_fallback.py tests/test_claude_workflow_validation.py tests/test_review_invocation_budget.py tests/test_review_invocation_budget_action.py tests/test_review_workflow_logic.py tests/test_canonical_workflow_tree.py tests/test_rollout_workflow_fleet.py tests/test_verify_claude_rollout_fallback.py tests/test_verify_workflow_release.py tests/test_action_pins.py
+rtk pytest -q tests/test_claude_rollout_fallback.py tests/test_claude_workflow_validation.py tests/test_review_invocation_budget.py tests/test_review_invocation_budget_action.py tests/test_review_workflow_logic.py tests/test_canonical_workflow_tree.py tests/test_rollout_workflow_fleet.py tests/test_verify_claude_rollout_fallback.py tests/test_verify_workflow_release.py tests/test_workflow_release_bundle.py tests/test_action_pins.py
 ```
 
 Expected: all focused tests pass.
@@ -1615,125 +1627,151 @@ Close the telemetry run on every exit. A PASS records bound HEAD/diff. CRITICAL/
 
 **Files:**
 
-- Create after the v1.77 bootstrap merge: `docs/workflows/v1.77.1-boundary-canary.md`
-- Write evidence only beneath a new `/home/jhw/ai/opencode/projects/automation/.review/releases/v1.77-*` directory; do not commit generated evidence.
+- Create after the v1.78 bootstrap merge: `docs/workflows/v1.78.1-boundary-canary.md`
+- Write evidence only beneath a new `/home/jhw/ai/opencode/projects/automation/.review/releases/v1.78-*` directory; do not commit generated evidence.
 - Reuse the current v1.76 batch evidence at `/home/jhw/ai/opencode/projects/automation/.review/releases/v1.76-canary-next-mxyr4iya/full-profile-batch-nOaszzvB` without rewriting its source records.
 
 **Interfaces:**
 
-- Publish v1.77 only from the exact reviewed merge commit with an annotated immutable tag and the repository's existing release verification flow.
-- The first consumer adoption is a bootstrap because its default branch lacks the route. After that merge, publish a separately reviewed v1.77.1 validation release from a distinct automation commit with identical release-owned v1.77 bytes. The exact v1.77-to-v1.77.1 pin change on the same canary must exercise automatic mismatch, structured request, nested fallback, one provider call, finalized budget, canonical result, and verifier receipt.
-- On that canary, `driver_commit` is the installed v1.77 commit and target `release_commit` is the distinct v1.77.1 commit. Equality is an attestation failure because it would not test the caller-changing boundary.
+- Publish v1.78 only from the exact reviewed merge commit with an annotated immutable tag and the repository's existing release verification flow. Both v1.78 and v1.78.1 publication paths authenticate immutable v1.77 tag `81f44fb6786bdfcc40f93161db74b1d9a9e3b7c5` / commit `dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19` and unchanged v1.76 identity before either create-only POST. Allowed new tags are exactly v1.78 and v1.78.1; first publication has no prior-v1.78 requirement.
+- The first consumer adoption is a bootstrap because its default branch lacks the route. After that merge, publish a separately reviewed v1.78.1 validation release from a distinct automation commit with identical release-owned v1.78 bytes. The exact v1.78-to-v1.78.1 pin change on the same canary must exercise automatic mismatch, structured request, nested fallback, one provider call, finalized budget, canonical result, and verifier receipt.
+- On that canary, `driver_commit` is the installed v1.78 commit and target `release_commit` is the distinct v1.78.1 commit. Equality is an attestation failure because it would not test the caller-changing boundary.
 - Current gstApp #109 and max9296 #74 stay separate from the durable route. Their existing default-branch Claude reviews are accepted only through the already hashed bootstrap proposal after live exact-head/base revalidation and a concrete authorization record.
 
-- [ ] **Step 1: Seal the reviewed v1.77 merge candidate.** From a clean checkout whose `origin/main` is the hosted-review merge returned by Task 7, create a mode-0700 evidence directory whose suffix is the first 12 hexadecimal characters of that merge, under `/home/jhw/ai/opencode/projects/automation/.review/releases/`. Record the exact merge SHA, commit tree, `release_paths_for("v1.77")`, focused/full test logs, actionlint log, and SHA-256 for every recorded file. Run the commit-only verifier against the resolved 40-hex object:
+- [ ] **Step 1: Seal the reviewed v1.78 merge candidate.** From a clean checkout whose `origin/main` is the hosted-review merge returned by Task 7, create a mode-0700 evidence directory whose suffix is the first 12 hexadecimal characters of that merge, under `/home/jhw/ai/opencode/projects/automation/.review/releases/`. Record the exact merge SHA, commit tree, `release_paths_for("v1.78")`, focused/full test logs, actionlint log, and SHA-256 for every recorded file. Run the commit-only verifier against the resolved 40-hex object:
 
 ```bash
 release_commit="$(rtk git rev-parse origin/main)"
-rtk python3 scripts/verify_workflow_release.py --automation . --ref v1.77 --expected-commit "$release_commit" --commit-only
+rtk python3 scripts/verify_workflow_release.py --automation . --ref v1.78 --expected-commit "$release_commit" --commit-only
 ```
 
-Expected: `PASS: v1.77 commit content is secure` names `release_commit`; the evidence writer independently chmods every regular record to 0600 and rejects an existing path or symlink.
+Expected: `PASS: v1.78 commit content is secure` names `release_commit`; the evidence writer independently chmods every regular record to 0600 and rejects an existing path or symlink.
 
-- [ ] **Step 2: Present the concrete v1.77 publication boundary.** Show the user the reviewed merge SHA, tree SHA, release verifier result, release-root digest manifest, and proof that local and remote `refs/tags/v1.77` are absent. Obtain explicit approval for creation of that one immutable tag. Stop without creating a local tag when approval is absent or does not bind the displayed commit.
+- [ ] **Step 2: Present the concrete v1.78 publication boundary.** Show the user the reviewed merge SHA, tree SHA, release verifier result, release-root digest manifest, and proof that local and remote `refs/tags/v1.78` are absent. Obtain explicit approval for creation of that one immutable tag. Stop without creating a local tag when approval is absent or does not bind the displayed commit.
 
-- [ ] **Step 3: Publish and remotely verify v1.77.** Use the exact release procedure written in Task 6: create one annotated `v1.77` tag on the approved commit, create the remote tag ref once, then run the tag and remote verifier. The final verification command resolves the commit before invocation:
+- [ ] **Step 3: Publish and remotely verify v1.78.** Use the exact release procedure written in Task 6: create one annotated `v1.78` tag on the approved commit, create the remote tag ref once, then run the tag and remote verifier. The final verification command resolves the commit before invocation:
 
 ```bash
 release_commit="$(rtk git rev-parse origin/main)"
-rtk python3 scripts/verify_workflow_release.py --automation . --ref v1.77 --expected-commit "$release_commit" --remote origin
+rtk python3 scripts/verify_workflow_release.py --automation . --ref v1.78 --expected-commit "$release_commit" --remote origin
 ```
 
 Expected: the local tag object and the public remote tag object are annotated, agree, and peel to the approved commit. A partially created or conflicting tag stops rollout; never move, delete, or recreate it.
 
-- [ ] **Step 4: Render the read-only v1.77 bootstrap canary for wlan-package.** Reuse `wlan-package`, whose v1.76 automatic runtime canary already completed, and initialize a new private rollout workspace. Pass the released ref and an explicit manifest path:
+- [ ] **Step 4: Render the read-only v1.78 bootstrap canary for wlan-package.** Reuse `wlan-package`, whose v1.76 automatic runtime canary already completed, and initialize a new private rollout workspace. Pass the released ref and an explicit manifest path:
 
 ```bash
-canary_workspace="$(rtk mktemp -d /tmp/automation-v177-wlan-package.XXXXXX)"
-rtk python3 scripts/rollout_workflow_fleet.py --automation . --workspace "$canary_workspace" --initialize-workspace --mode plan --ref v1.77 --repo wlan-package --manifest "$canary_workspace/rollout-plan.json" --actionlint /home/jhw/ai/opencode/projects/automation/.review/releases/v1.74/tools/actionlint-1.7.12
+canary_workspace="$(rtk mktemp -d /tmp/automation-v178-wlan-package.XXXXXX)"
+rtk python3 scripts/rollout_workflow_fleet.py --automation . --workspace "$canary_workspace" --initialize-workspace --mode plan --ref v1.78 --repo wlan-package --manifest "$canary_workspace/rollout-plan.json" --actionlint /home/jhw/ai/opencode/projects/automation/.review/releases/v1.74/tools/actionlint-1.7.12
 ```
 
-Expected: one `planned` or exact `reusable` default-branch target, no remote mutation, and rendered callers pinned to the peeled v1.77 commit. Copy the manifest and its digest into the v1.77 evidence directory.
+Expected: one `planned` or exact `reusable` default-branch target, no remote mutation, and rendered callers pinned to the peeled v1.78 commit. Copy the manifest and its digest into the v1.78 evidence directory.
 
-- [ ] **Step 5: Obtain approval for the exact bootstrap PR publication.** Present repository `jhw7500/wlan-package`, observed base SHA, deterministic branch, expected commit/tree, changed paths, full diff digest, and the existing `review:request` label that will trigger review after publication. Obtain explicit user approval for that one branch/PR creation and label application. This approval does not authorize a merge or a later v1.77.1 publication.
+- [ ] **Step 5: Obtain approval for the exact bootstrap PR publication.** Present repository `jhw7500/wlan-package`, observed base SHA, deterministic branch, expected commit/tree, changed paths, full diff digest, and the existing `review:request` label that will trigger review after publication. Obtain explicit user approval for that one branch/PR creation and label application. This approval does not authorize a merge or a later v1.78.1 publication.
 
-- [ ] **Step 6: Publish or reuse the exact v1.77 bootstrap PR.** In the same marked workspace, let the released fleet publisher refetch and recompute before its single remote write:
+- [ ] **Step 6: Publish or reuse the exact v1.78 bootstrap PR.** In the same marked workspace, let the released fleet publisher refetch and recompute before its single remote write:
 
 ```bash
-rtk python3 scripts/rollout_workflow_fleet.py --automation . --workspace "$canary_workspace" --mode publish --ref v1.77 --repo wlan-package --confirm --manifest "$canary_workspace/rollout-publish.json" --actionlint /home/jhw/ai/opencode/projects/automation/.review/releases/v1.74/tools/actionlint-1.7.12
+rtk python3 scripts/rollout_workflow_fleet.py --automation . --workspace "$canary_workspace" --mode publish --ref v1.78 --repo wlan-package --confirm --manifest "$canary_workspace/rollout-publish.json" --actionlint /home/jhw/ai/opencode/projects/automation/.review/releases/v1.74/tools/actionlint-1.7.12
 ```
 
 Expected: exactly one `published` or `reused` PR whose live head, base, title, body, branch and managed tree match the manifest. Stop on `current`, `blocked`, an unexpected prior branch/PR, or any second candidate.
 
 - [ ] **Step 7: Trigger review and capture the expected bootstrap failure without retrying it.** Apply the already-existing `review:request` label once, then fetch the resulting automatic Claude run, its exact attempt, jobs, check-run annotations, budget comment, and canonical sticky comment. Require `workflow_validation_mismatch`, `review_execution=not_performed`, a skipped provider step, and no new Claude budget invocation. Preserve the raw responses as private evidence; another reason, provider entry, or ambiguous run stops the bootstrap.
 
-- [ ] **Step 8: Complete the v1.77 bootstrap reviews.** Run the consumer repository's exact three-role tribunal, required tests, Gemini/OpenCode/Codex gates, and a separately requested default-branch manual Claude read-only review bound to the same HEAD/base/full diff. Record all exact-byte responses and current checks. A reviewer rerun must bind the same current HEAD; a new commit starts a new review round.
+- [ ] **Step 8: Complete the v1.78 bootstrap reviews.** Run the consumer repository's exact three-role tribunal, required tests, Gemini/OpenCode/Codex gates, and a separately requested default-branch manual Claude read-only review bound to the same HEAD/base/full diff. Record all exact-byte responses and current checks. A reviewer rerun must bind the same current HEAD; a new commit starts a new review round.
 
-- [ ] **Step 9: Present the v1.77 bootstrap merge tuple.** Re-read the pull request, head repository, head SHA, base SHA, mergeability, required checks and every reviewer state. Present those concrete values plus the manual-Claude substitution evidence to the user and obtain explicit authorization for this one merge.
+- [ ] **Step 9: Present the v1.78 bootstrap merge tuple.** Re-read the pull request, head repository, head SHA, base SHA, mergeability, required checks and every reviewer state. Present those concrete values plus the manual-Claude substitution evidence to the user and obtain explicit authorization for this one merge.
 
-- [ ] **Step 10: Merge and confirm the v1.77 bootstrap once.** Invoke the consumer repository's supported reviewed-merge helper with the approved HEAD/base and reviewer map. Re-read the pull request and default branch until GitHub reports the returned merge commit. If the response is uncertain, reconcile read-only and do not invoke merge again.
+- [ ] **Step 10: Merge and confirm the v1.78 bootstrap once.** Invoke the consumer repository's supported reviewed-merge helper with the approved HEAD/base and reviewer map. Re-read the pull request and default branch until GitHub reports the returned merge commit. If the response is uncertain, reconcile read-only and do not invoke merge again.
 
-- [ ] **Step 11: Create the distinct v1.77.1 validation commit.** From the new public automation `main`, create only `docs/workflows/v1.77.1-boundary-canary.md` with this complete content, then commit it on a dedicated branch:
+- [ ] **Step 11: Create the distinct v1.78.1 validation commit.** From the new public automation `main`, create only `docs/workflows/v1.78.1-boundary-canary.md` with this complete content, then commit it on a dedicated branch:
 
 ```text
-# v1.77.1 Boundary Canary
+# v1.78.1 Boundary Canary
 
-This validation release intentionally preserves every v1.77 release-owned byte.
+This validation release intentionally preserves every v1.78 release-owned byte.
 Its distinct commit exists only to exercise a real immutable caller-pin change from
-v1.77 to v1.77.1 after the default branch has installed the fallback router.
+v1.78 to v1.78.1 after the default branch has installed the fallback router.
 ```
 
-Use `apply_patch`, run `rtk git diff --check`, and commit with `docs(release): define v1.77.1 boundary canary`. Run focused/full tests, the exact A/B/C tribunal procedure from Task 7, hosted review, and reviewed merge before treating the resulting main commit as a release candidate.
+Use `apply_patch`, run `rtk git diff --check`, and commit with `docs(release): define v1.78.1 boundary canary`. Run focused/full tests, the exact A/B/C tribunal procedure from Task 7, hosted review, and reviewed merge before treating the resulting main commit as a release candidate.
 
-- [ ] **Step 12: Prove v1.77.1 changes no release-owned byte.** Resolve the v1.77 peeled commit and the reviewed v1.77.1 candidate, derive the owned paths from the inventory, and require an empty raw Git diff before commit-only verification:
+- [ ] **Step 12: Prove v1.78.1 changes no release-owned byte.** Authenticate the existing annotated v1.78 tag locally and publicly, require a distinct reviewed v1.78.1 candidate, load inventory from a clean checkout of that authenticated baseline, and require an empty raw Git diff before commit-only verification:
 
 ```bash
 rtk python3 - <<'PY'
+import json
 from pathlib import Path
 import subprocess
 import sys
 
-from scripts.workflow_release_inventory import release_paths_for
-
 root = Path.cwd()
-old = subprocess.run(
-    ["/usr/bin/git", "rev-parse", "refs/tags/v1.77^{}"],
-    cwd=root, check=True, capture_output=True, text=True,
-).stdout.strip()
-new = subprocess.run(
-    ["/usr/bin/git", "rev-parse", "origin/main"],
-    cwd=root, check=True, capture_output=True, text=True,
-).stdout.strip()
-subprocess.run(
-    ["/usr/bin/git", "diff", "--exit-code", old, new, "--", *release_paths_for("v1.77")],
-    cwd=root, check=True,
-)
+def git(*args):
+    return subprocess.run(["/usr/bin/git", *args], cwd=root, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+direct = git("rev-parse", "refs/tags/v1.78")
+old = git("rev-parse", "refs/tags/v1.78^{}")
+new = git("rev-parse", "origin/main")
+if git("cat-file", "-t", direct) != "tag" or old == new:
+    raise SystemExit("annotated baseline and distinct candidate required")
+subprocess.run([
+    sys.executable, "-B", "-m", "scripts.verify_workflow_release",
+    "--automation", str(root), "--ref", "v1.78",
+    "--expected-commit", old, "--remote", "origin",
+], cwd=root, check=True)
+baseline = root / ".review" / ("v178-boundary-baseline-" + old)
+if baseline.exists() or baseline.is_symlink():
+    raise SystemExit("new baseline checkout required")
+git("worktree", "add", "--detach", str(baseline), old)
+if subprocess.run(["/usr/bin/git", "status", "--porcelain"], cwd=baseline,
+                  check=True, capture_output=True, text=True).stdout:
+    raise SystemExit("dirty baseline checkout")
+subprocess.run([
+    sys.executable, "-B", "-m", "scripts.verify_workflow_release",
+    "--automation", str(baseline), "--ref", "v1.78",
+    "--expected-commit", old, "--remote", "origin",
+], cwd=baseline, check=True)
+inventory = subprocess.run([
+    sys.executable, "-B", "-c",
+    'import json; from scripts.workflow_release_inventory import release_paths_for; '
+    'print(json.dumps(release_paths_for("v1.78")))',
+], cwd=baseline, check=True, capture_output=True, text=True)
+owned = json.loads(inventory.stdout)
+if not isinstance(owned, list) or not owned or not all(isinstance(path, str) for path in owned):
+    raise SystemExit("invalid authenticated baseline inventory")
+if git("diff", "--raw", "--no-ext-diff", "--no-textconv", "--exit-code",
+       old, new, "--", *owned):
+    raise SystemExit("release-owned boundary difference")
+if git("rev-parse", "refs/tags/v1.78") != direct or git("rev-parse", "refs/tags/v1.78^{}") != old:
+    raise SystemExit("baseline identity moved")
 subprocess.run([
     sys.executable, "scripts/verify_workflow_release.py",
-    "--automation", str(root), "--ref", "v1.77.1",
+    "--automation", str(root), "--ref", "v1.78.1",
     "--expected-commit", new, "--commit-only",
 ], cwd=root, check=True)
 PY
 ```
 
-Expected: the owned-path diff is empty and v1.77.1 commit content passes. Any release-owned change requires a normal patch release design and invalidates this boundary canary.
+Expected: the owned-path diff is empty and v1.78.1 commit content passes. Any release-owned change requires a normal patch release design and invalidates this boundary canary. The create-only operator procedure repeats baseline authentication and the raw diff immediately before either POST, and authenticates unchanged v1.76 and v1.77 for both new release paths.
 
-- [ ] **Step 13: Present the concrete v1.77.1 publication boundary.** Show the distinct reviewed commit, tree, empty release-owned diff, commit-only verifier output, digest manifest, and proof that local and remote `refs/tags/v1.77.1` are absent. Obtain explicit approval for creation of that immutable tag.
+- [ ] **Step 13: Present the concrete v1.78.1 publication boundary.** Show the distinct reviewed commit, tree, empty release-owned diff, commit-only verifier output, digest manifest, and proof that local and remote `refs/tags/v1.78.1` are absent. Obtain explicit approval for creation of that immutable tag.
 
-- [ ] **Step 14: Publish and verify v1.77.1.** Create the annotated tag once and verify it remotely:
+- [ ] **Step 14: Publish and verify v1.78.1.** Create the annotated tag once and verify it remotely:
 
 ```bash
 validation_commit="$(rtk git rev-parse origin/main)"
-rtk python3 scripts/verify_workflow_release.py --automation . --ref v1.77.1 --expected-commit "$validation_commit" --remote origin
+rtk python3 scripts/verify_workflow_release.py --automation . --ref v1.78.1 --expected-commit "$validation_commit" --remote origin
 ```
 
-Expected: v1.77 and v1.77.1 remain two immutable annotated tags that peel to two different commits while their v1.77 release-owned paths are byte-identical.
+Expected: v1.78 and v1.78.1 remain two immutable annotated tags that peel to two different commits while their v1.78 release-owned paths are byte-identical.
 
-- [ ] **Step 15: Render the real pin-change canary without mutation.** Use a second new workspace and the same `wlan-package` repository. Require the default branch to pin the v1.77 driver commit and the rendered rollout head to pin the distinct v1.77.1 target commit.
+- [ ] **Step 15: Render the real pin-change canary without mutation.** Use a second new workspace and the same `wlan-package` repository. Require the default branch to pin the v1.78 driver commit and the rendered rollout head to pin the distinct v1.78.1 target commit.
 
 ```bash
-boundary_workspace="$(rtk mktemp -d /tmp/automation-v1771-wlan-package.XXXXXX)"
-rtk python3 scripts/rollout_workflow_fleet.py --automation . --workspace "$boundary_workspace" --initialize-workspace --mode plan --ref v1.77.1 --repo wlan-package --manifest "$boundary_workspace/rollout-plan.json" --actionlint /home/jhw/ai/opencode/projects/automation/.review/releases/v1.74/tools/actionlint-1.7.12
+boundary_workspace="$(rtk mktemp -d /tmp/automation-v1781-wlan-package.XXXXXX)"
+rtk python3 scripts/rollout_workflow_fleet.py --automation . --workspace "$boundary_workspace" --initialize-workspace --mode plan --ref v1.78.1 --repo wlan-package --manifest "$boundary_workspace/rollout-plan.json" --actionlint /home/jhw/ai/opencode/projects/automation/.review/releases/v1.74/tools/actionlint-1.7.12
 ```
 
 - [ ] **Step 16: Present the real pin-change publication boundary.** Show the fresh plan's repository, observed base, deterministic branch, expected head/tree, changed paths, target release, full diff digest, and the existing `review:request` label that will trigger review. Obtain explicit approval for this one branch/PR creation and label application.
@@ -1741,41 +1779,41 @@ rtk python3 scripts/rollout_workflow_fleet.py --automation . --workspace "$bound
 - [ ] **Step 17: Publish the real pin-change canary.** Reuse the Step 15 workspace and let the released publisher refetch and recompute before mutation:
 
 ```bash
-rtk python3 scripts/rollout_workflow_fleet.py --automation . --workspace "$boundary_workspace" --mode publish --ref v1.77.1 --repo wlan-package --confirm --manifest "$boundary_workspace/rollout-publish.json" --actionlint /home/jhw/ai/opencode/projects/automation/.review/releases/v1.74/tools/actionlint-1.7.12
+rtk python3 scripts/rollout_workflow_fleet.py --automation . --workspace "$boundary_workspace" --mode publish --ref v1.78.1 --repo wlan-package --confirm --manifest "$boundary_workspace/rollout-publish.json" --actionlint /home/jhw/ai/opencode/projects/automation/.review/releases/v1.74/tools/actionlint-1.7.12
 ```
 
 Expected: one exact `published` or `reused` PR and no other remote change.
 
 - [ ] **Step 18: Trigger review and capture the real-boundary automatic failure.** Apply the already-existing `review:request` label once, then preserve the automatic run, attempt, jobs, annotations, budget comment and canonical comment. Require `workflow_validation_mismatch`, `review_execution=not_performed`, skipped provider, and no budget invocation at the exact published HEAD/base. Stop on ambiguity or any other result.
 
-- [ ] **Step 19: Build one canonical request record.** Generate a fresh 16-byte nonce with `secrets.token_hex(16)`, construct `FallbackRequest` from the Step 18 run/attempt plus the published repository/PR/HEAD/base/v1.77.1 release/full-diff coordinates, and render it with v1.77's `canonical_request_body`. Write the exact body and coordinates with O_EXCL/no-follow creation, chmod 0600, and immediately lstat current owner/type/mode. If one exact live request already exists, record its comment ID and reuse it instead of generating a second request.
+- [ ] **Step 19: Build one canonical request record.** Generate a fresh 16-byte nonce with `secrets.token_hex(16)`, construct `FallbackRequest` from the Step 18 run/attempt plus the published repository/PR/HEAD/base/v1.78.1 release/full-diff coordinates, and render it with v1.78's `canonical_request_body`. Write the exact body and coordinates with O_EXCL/no-follow creation, chmod 0600, and immediately lstat current owner/type/mode. If one exact live request already exists, record its comment ID and reuse it instead of generating a second request.
 
 - [ ] **Step 20: Authorize the exact request comment.** Present the complete two-line body and all bound coordinates to the user. Obtain explicit authorization to post that exact GitHub issue comment; an approval for the PR or release tag does not authorize this message.
 
 - [ ] **Step 21: Post or reuse the request exactly once.** Immediately re-read HEAD/base and the failed run before the write. Post the authorized body once through the fixed GitHub REST endpoint, or reuse the single exact existing request. Save the returned comment object byte-for-byte and never retry an uncertain write until a read proves that no matching comment exists.
 
-- [ ] **Step 22: Prove the managed fallback ran exactly once.** Wait for one default-branch `claude.yml` issue-comment run. Require classifier route `managed`, nested `claude-code-review.yml` identity at the installed v1.77 driver commit, one provider entry, one finalized automatic budget round, and one schema-3 fallback state whose route binds the request comment, failed run, base, v1.77.1 target commit and full-diff hash. A second request/run/provider call, partial route, changed coordinate, or required failed automatic check stops before merge.
+- [ ] **Step 22: Prove the managed fallback ran exactly once.** Wait for one default-branch `claude.yml` issue-comment run. Require classifier route `managed`, nested `claude-code-review.yml` identity at the installed v1.78 driver commit, one provider entry, one finalized automatic budget round, and one schema-3 fallback state whose route binds the request comment, failed run, base, v1.78.1 target commit and full-diff hash. A second request/run/provider call, partial route, changed coordinate, or required failed automatic check stops before merge.
 
-- [ ] **Step 23: Generate and validate the immutable fallback receipt.** Create a clean detached checkout at the v1.77 driver commit, keep the output outside that checkout, derive PR/head/base from the single authoritative publish manifest, and invoke the verifier:
+- [ ] **Step 23: Generate and validate the immutable fallback receipt.** Create a clean detached checkout at the v1.78 driver commit, keep the output outside that checkout, derive PR/head/base from the single authoritative publish manifest, and invoke the verifier:
 
 ```bash
-driver_commit="$(rtk git rev-parse 'refs/tags/v1.77^{}')"
-driver_checkout="/tmp/automation-v177-driver-$driver_commit"
-boundary_evidence="$(rtk mktemp -d /home/jhw/ai/opencode/projects/automation/.review/releases/v1.77.1-wlan-package.XXXXXX)"
+driver_commit="$(rtk git rev-parse 'refs/tags/v1.78^{}')"
+driver_checkout="/tmp/automation-v178-driver-$driver_commit"
+boundary_evidence="$(rtk mktemp -d /home/jhw/ai/opencode/projects/automation/.review/releases/v1.78.1-wlan-package.XXXXXX)"
 rtk git worktree add --detach "$driver_checkout" "$driver_commit"
 boundary_pr="$(rtk python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert len(value)==1; print(value[0]["pr_url"].rsplit("/",1)[1])' "$boundary_workspace/rollout-publish.json")"
 boundary_head="$(rtk python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert len(value)==1; print(value[0]["head_sha"])' "$boundary_workspace/rollout-publish.json")"
 boundary_base="$(rtk python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert len(value)==1; print(value[0]["base_sha"])' "$boundary_workspace/rollout-publish.json")"
-rtk python3 -I -S -B "$driver_checkout/scripts/verify_claude_rollout_fallback.py" --automation-root "$driver_checkout" --release-ref v1.77.1 --remote origin --repository jhw7500/wlan-package --pr "$boundary_pr" --expected-head "$boundary_head" --expected-base "$boundary_base" --output "$boundary_evidence/fallback-receipt.json"
+rtk python3 -I -S -B "$driver_checkout/scripts/verify_claude_rollout_fallback.py" --automation-root "$driver_checkout" --release-ref v1.78.1 --remote origin --repository jhw7500/wlan-package --pr "$boundary_pr" --expected-head "$boundary_head" --expected-base "$boundary_base" --output "$boundary_evidence/fallback-receipt.json"
 ```
 
-Immediately lstat the receipt and require current UID, regular/non-symlink type, mode 0600, schema 1, `effective_status=CLEAN`, `fallback.driver_commit` equal to the v1.77 peeled commit, and `release_commit` equal to the distinct v1.77.1 peeled commit. Independently re-read the live pull request, checks, budget, comment, and runs after receipt creation; any drift invalidates the receipt.
+Immediately lstat the receipt and require current UID, regular/non-symlink type, mode 0600, schema 1, `effective_status=CLEAN`, `fallback.driver_commit` equal to the v1.78 peeled commit, and `release_commit` equal to the distinct v1.78.1 peeled commit. Independently re-read the live pull request, checks, budget, comment, and runs after receipt creation; any drift invalidates the receipt.
 
 - [ ] **Step 24: Complete the real-boundary reviews.** Run the remaining independent reviewers and target checks on the receipt-bound HEAD. Require native policy to show that the failed automatic Claude check is not a required blocker and require the fallback canonical state to contain no blocking finding.
 
 - [ ] **Step 25: Present the real-boundary merge tuple.** Re-read the receipt, exact head/base/origin, mergeability, required checks and all review states. Present the concrete merge tuple and obtain explicit authorization for this one merge.
 
-- [ ] **Step 26: Merge and audit the real-boundary canary.** Use the supported reviewed-merge helper once, verify the GitHub-generated merge commit, and run the released fleet audit at `v1.77.1` for `wlan-package`. Remove the detached verifier worktree with a non-force removal only after its clean status is proven.
+- [ ] **Step 26: Merge and audit the real-boundary canary.** Use the supported reviewed-merge helper once, verify the GitHub-generated merge commit, and run the released fleet audit at `v1.78.1` for `wlan-package`. Remove the detached verifier worktree with a non-force removal only after its clean status is proven.
 
 - [ ] **Step 27: Revalidate the existing two-PR v1.76 proposal without altering evidence.** Require SHA-256 `916c58c9a9062d74a0740d8fb51a184fe979dd37c2872c328f21bb6e12c5170d` for `/home/jhw/ai/opencode/projects/automation/.review/releases/v1.76-canary-next-mxyr4iya/full-profile-batch-nOaszzvB/merge-substitution-proposal.json`. Freshly require gstApp #109 head `52dbdedbc090dcdb50bdc93172985a67bc5df683` / base `6d8200e4562da0b7aff01db7b86cb565390eb56d` and max9296 #74 head `00db418bd1520ab36d866961b70179d53a01453e` / base `621f6605e1ec16251a1d086e8f3fc4e4ce36f212`. Re-run the existing read-only policy/evidence preflights; stop if either tuple, reviewer state, required check, mergeability, origin, release tag or proposal digest differs.
 
@@ -1783,7 +1821,7 @@ Immediately lstat the receipt and require current UID, regular/non-symlink type,
 
 - [ ] **Step 29: Merge gstApp and max9296 sequentially.** Run the existing `merge-one-approved.sh` for gstApp, require its private merge receipt and API-confirmed GitHub merge commit, then do the same for max9296. An uncertain or partial result is read-only reconciliation, never a repeated merge.
 
-- [ ] **Step 30: Close the operational handoff.** Record v1.77/v1.77.1 tag objects and peeled commits, the bootstrap and boundary PR/run/comment/receipt coordinates, provider call count, fleet audits, the two v1.76 merge receipts, remaining blockers, and untouched evidence digests in the existing Task handoff. Release Claim `clm-01a08b35-4a07-75ba-8a22-a8ca96029ade` only through the supported Task completion path after every requested rollout result is verified; do not edit the Registry directly.
+- [ ] **Step 30: Close the operational handoff.** Record v1.78/v1.78.1 tag objects and peeled commits, the bootstrap and boundary PR/run/comment/receipt coordinates, provider call count, fleet audits, the two v1.76 merge receipts, remaining blockers, and untouched evidence digests in the existing Task handoff. Release Claim `clm-01a08b35-4a07-75ba-8a22-a8ca96029ade` only through the supported Task completion path after every requested rollout result is verified; do not edit the Registry directly.
 
 ## Final Verification Matrix
 
@@ -1800,4 +1838,4 @@ Immediately lstat the receipt and require current UID, regular/non-symlink type,
 | Automatic Claude check required and failed | Native required-check failure remains blocking |
 | Valid receipt and all independent gates clean | Later JHW gate may map effective Claude status to CLEAN |
 
-The automation implementation is complete only when Tasks 1-7 are merged after review. Operational rollout is complete only when Task 8 proves the v1.77-to-v1.77.1 pin-change boundary with one provider call and no required-check bypass. JHW command consumption is outside this plan and starts only after its separate Task decision.
+The automation implementation is complete only when Tasks 1-7 are merged after review. Operational rollout is complete only when Task 8 proves the v1.78-to-v1.78.1 pin-change boundary with one provider call and no required-check bypass. JHW command consumption is outside this plan and starts only after its separate Task decision.
