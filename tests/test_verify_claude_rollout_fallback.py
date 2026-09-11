@@ -678,3 +678,165 @@ def test_required_workflow_rule_cannot_be_silently_ignored(verifier, monkeypatch
     monkeypatch.setattr(provider, "_pages", lambda endpoint, **kw: ({"type": "workflows", "parameters": {}},) if "/rules/" in endpoint else ())
     with pytest.raises(verifier.VerificationError, match="^required_check_failed$"):
         provider.required_checks("a" * 40)
+
+
+def caller_document(content):
+    import base64
+    return {"type": "file", "path": ".github/workflows/claude.yml", "encoding": "base64",
+            "content": base64.b64encode(content.encode()).decode()}
+
+
+@pytest.mark.parametrize("change", ["literal", "folded", "quoted_scalar", "plain_continuation",
+    "duplicate_jobs", "quoted_duplicate_jobs", "duplicate_uses", "alias", "tag", "second_job", "documents"])
+def test_fix_round1_caller_pin_rejects_inert_or_ambiguous_yaml(verifier, change):
+    inert, active = "1" * 40, "2" * 40
+    prefix = "jhw7500/automation/.github/workflows/claude.yml@"
+    job = f"jobs:\n  claude:\n    uses: {prefix}{inert}\n"
+    actual = f"jobs:\n  claude:\n    uses: '{prefix}{active}'\n"
+    values = {
+        "literal": f"env:\n  TEXT: |\n    uses: {prefix}{inert}\n" + actual,
+        "folded": f"env:\n  TEXT: >-\n    uses: {prefix}{inert}\n" + actual,
+        "quoted_scalar": f"name: 'inert\n    uses: {prefix}{inert}\n'\n" + actual,
+        "plain_continuation": f"name: inert\n    uses: {prefix}{inert}\n" + actual,
+        "duplicate_jobs": job + actual,
+        "quoted_duplicate_jobs": job + actual.replace("jobs:", "'jobs':"),
+        "duplicate_uses": job + f"    'uses': '{prefix}{active}'\n",
+        "alias": f"job: &definition\n    uses: {prefix}{inert}\njobs:\n  claude: *definition\n",
+        "tag": job.replace("jobs:", "jobs: !!map"),
+        "second_job": job + f"  other:\n    uses: '{prefix}{active}'\n",
+        "documents": job + "---\n" + actual,
+    }
+    with pytest.raises(verifier.VerificationError, match="^driver_pin_invalid$"):
+        verifier.parse_default_caller_pin(caller_document(values[change]))
+
+
+@pytest.mark.parametrize("style", ["plain", "single", "double", "canonical"])
+def test_fix_round1_caller_pin_accepts_active_canonical_job(verifier, style):
+    driver = "9" * 40
+    value = "jhw7500/automation/.github/workflows/claude.yml@" + driver
+    if style == "canonical":
+        content = (ROOT / "examples/baseline-workflows/.github/workflows/claude.yml").read_text().replace("__AUTOMATION_COMMIT__", driver)
+    else:
+        value = {"plain": value, "single": "'" + value + "'", "double": '"' + value + '"'}[style]
+        content = f"jobs:\n  claude:\n    uses: {value} # installed\n"
+    assert verifier.parse_default_caller_pin(caller_document(content)) == driver
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_fix_round1_caller_rejects_yaml_line_breaks_inside_comment(verifier, separator):
+    prefix = "jhw7500/automation/.github/workflows/claude.yml@"
+    first = f"jobs:\n  claude:\n    uses: {prefix}{'1' * 40}\n"
+    hidden = separator.join(["# comment", "jobs:", "  claude:", f"    uses: {prefix}{'2' * 40}"])
+    with pytest.raises(verifier.VerificationError, match="^driver_pin_invalid$"):
+        verifier.parse_default_caller_pin(caller_document(first + hidden))
+
+
+@pytest.mark.parametrize("override", ["GIT_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY",
+                                    "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"])
+def test_fix_round1_promoted_git_ignores_ambient_overrides(verifier, exact_rollout_fixture, monkeypatch, override):
+    fixture = exact_rollout_fixture
+    original = subprocess.run
+    seen = []
+    def run(args, **kwargs):
+        if Path(args[0]).name == "git":
+            seen.append((args, dict(kwargs.get("env") or os.environ)))
+        return original(args, **kwargs)
+    monkeypatch.setenv(override, "invalid-ambient-value")
+    monkeypatch.setenv("GIT_NO_REPLACE_OBJECTS", "0")
+    monkeypatch.setattr(subprocess, "run", run)
+    verifier.verify_fleet_request(fixture.request, fixture.provider, fixture.modules)
+    assert seen
+    assert all(environment.get("GIT_NO_REPLACE_OBJECTS") == "1" or "--no-replace-objects" in args
+               for args, environment in seen)
+    assert all(environment.get(override) != "invalid-ambient-value" for _, environment in seen)
+    assert os.environ[override] == "invalid-ambient-value"
+
+
+def test_fix_round1_replacement_objects_cannot_hide_wrong_commit(verifier, exact_rollout_fixture):
+    fixture = exact_rollout_fixture
+    repo = fixture.snapshot.path
+    valid_head = fixture.request.expected_head
+    git(repo, "checkout", "--detach", valid_head)
+    (repo / "extra").write_text("not renderer owned")
+    git(repo, "add", "extra")
+    git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--amend", "--no-edit", "-q")
+    invalid_head = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "--detach", fixture.request.expected_base)
+    git(repo, "replace", invalid_head, valid_head)
+    fixture.pr["head"]["sha"] = invalid_head
+    request = replace(fixture.request, expected_head=invalid_head)
+    with pytest.raises(verifier.VerificationError, match="^fleet_attestation_failed$"):
+        verifier.verify_fleet_request(request, fixture.provider, fixture.modules)
+
+
+@pytest.mark.parametrize("moment", ["before_create", "after_create", "before_link", "after_link"])
+def test_fix_round1_receipt_parent_replacement_never_redirects_or_leaks(verifier, tmp_path, monkeypatch, moment):
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    automation = tmp_path / "automation"
+    automation.mkdir(mode=0o700)
+    target = automation / "target"
+    target.mkdir(mode=0o700)
+    moved = automation / "moved"
+    output = parent / "receipt.json"
+    temporary = f".receipt.json.{os.getpid()}.tmp"
+    guard = target / (temporary if moment == "before_link" else "guard")
+    guard.write_bytes(b"untouched")
+    guard.chmod(0o600)
+    swapped = False
+    original_open, original_link = os.open, os.link
+    def swap():
+        nonlocal swapped
+        if not swapped:
+            parent.rename(moved)
+            parent.symlink_to(target, target_is_directory=True)
+            swapped = True
+    def opened(path, flags, *args, **kwargs):
+        temporary_open = bool(flags & os.O_CREAT) and str(path).endswith(".tmp")
+        if temporary_open and moment == "before_create": swap()
+        result = original_open(path, flags, *args, **kwargs)
+        if temporary_open and moment == "after_create": swap()
+        return result
+    def linked(src, dst, **kwargs):
+        if moment == "before_link": swap()
+        result = original_link(src, dst, **kwargs)
+        if moment == "after_link": swap()
+        return result
+    monkeypatch.setattr(os, "open", opened)
+    monkeypatch.setattr(os, "link", linked)
+    with pytest.raises(verifier.VerificationError):
+        verifier.write_receipt(output, {"schema": 1})
+    assert swapped
+    assert guard.read_bytes() == b"untouched"
+    assert not list(moved.iterdir())
+    assert list(target.iterdir()) == [guard]
+
+
+def test_fix_round1_receipt_rejects_writable_nonsticky_ancestor(verifier, tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o777)
+    shared.chmod(0o777)
+    parent = shared / "private"
+    parent.mkdir(mode=0o700)
+    with pytest.raises(verifier.VerificationError, match="^receipt_parent_invalid$"):
+        verifier.write_receipt(parent / "receipt.json", {"schema": 1})
+    assert not list(parent.iterdir())
+
+
+@pytest.mark.parametrize("app", [{"id": True}, {"id": False}, {"id": "1"}, {"id": 1.0},
+                                {"id": None}, {"id": 0}, {"id": -1}, {}, None, 1, {"id": 1}])
+def test_fix_round1_required_check_app_identity_is_a_positive_integer(verifier, monkeypatch, app):
+    provider = verifier.GitHubEvidenceProvider("jhw7500/gstApp")
+    provider.base_branch = "main"
+    monkeypatch.setattr(provider, "_json", lambda *a, **kw: {"checks": [{"context": "CI", "app_id": 1}], "contexts": ["CI"]})
+    def pages(endpoint, **kwargs):
+        if "/check-runs" in endpoint:
+            return ({"name": "CI", "head_sha": "a" * 40, "app": app,
+                     "status": "completed", "conclusion": "success"},)
+        return ()
+    monkeypatch.setattr(provider, "_pages", pages)
+    if type(app) is dict and type(app.get("id")) is int and app["id"] == 1:
+        verifier.require_required_checks_clean(provider.required_checks("a" * 40))
+    else:
+        with pytest.raises(verifier.VerificationError, match="^required_check_failed$"):
+            verifier.require_required_checks_clean(provider.required_checks("a" * 40))

@@ -90,7 +90,7 @@ class EvidenceProvider(Protocol):
     def consumer_snapshot(self, request: VerificationRequest, modules: VerifiedModules): ...
 
 
-def _git_bytes(root: Path, *args: str) -> bytes:
+def _git_environment() -> dict[str, str]:
     environment = {
         "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
         "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
@@ -98,14 +98,30 @@ def _git_bytes(root: Path, *args: str) -> bytes:
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_NO_REPLACE_OBJECTS": "1",
     }
+    for name in ("HOME", "GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "XDG_CONFIG_HOME"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    settings = (("core.hooksPath", "/dev/null"), ("core.fsmonitor", "false"),
+                ("submodule.recurse", "false"), ("core.untrackedCache", "false"))
+    environment["GIT_CONFIG_COUNT"] = str(len(settings))
+    for index, (key, value) in enumerate(settings):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    return environment
+
+
+def _git_bytes(root: Path, *args: str) -> bytes:
+    environment = _git_environment()
     if args and args[0] == "fetch":
         # Only the fresh disposable repository uses this path. Supply credentials
         # in the child environment, never command arguments or diagnostics.
         token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
         if token:
             encoded = base64.b64encode(("x-access-token:" + token).encode()).decode()
-            environment.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
-                               GIT_CONFIG_VALUE_0="AUTHORIZATION: basic " + encoded)
+            index = int(environment["GIT_CONFIG_COUNT"])
+            environment["GIT_CONFIG_COUNT"] = str(index + 1)
+            environment[f"GIT_CONFIG_KEY_{index}"] = "http.https://github.com/.extraheader"
+            environment[f"GIT_CONFIG_VALUE_{index}"] = "AUTHORIZATION: basic " + encoded
     try:
         result = subprocess.run(
             ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
@@ -250,57 +266,131 @@ def canonical_json_bytes(payload: dict[str, object]) -> bytes:
                        allow_nan=False) + "\n").encode("ascii")
 
 
-def require_private_output_parent(path: Path) -> None:
-    try:
-        _no_symlinks(path)
-        observed = path.lstat()
-        if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.getuid()
-                or stat.S_IMODE(observed.st_mode) != 0o700):
+@contextmanager
+def _private_output_directory(path: Path):
+    descriptors = []
+    links = []
+
+    def validate_directory(descriptor, *, final=False):
+        observed = os.fstat(descriptor)
+        mode = stat.S_IMODE(observed.st_mode)
+        trusted_sticky = observed.st_uid == 0 and bool(mode & stat.S_ISVTX)
+        if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid not in {0, os.getuid()}
+                or (mode & 0o022 and not trusted_sticky)
+                or (final and (observed.st_uid != os.getuid() or mode != 0o700))):
             raise ValueError
-    except (OSError, ValueError):
+        return observed
+
+    def check_identity():
+        try:
+            for descriptor in descriptors:
+                validate_directory(descriptor, final=descriptor == descriptors[-1])
+            for parent, name, descriptor in links:
+                observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                opened = os.fstat(descriptor)
+                if (not stat.S_ISDIR(observed.st_mode)
+                        or (observed.st_dev, observed.st_ino) != (opened.st_dev, opened.st_ino)):
+                    raise ValueError
+        except (OSError, ValueError):
+            raise VerificationError("receipt_parent_invalid") from None
+
+    try:
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        descriptors.append(os.open("/", flags))
+        validate_directory(descriptors[-1])
+        for name in path.parts[1:]:
+            parent = descriptors[-1]
+            descriptor = os.open(name, flags, dir_fd=parent)
+            descriptors.append(descriptor)
+            links.append((parent, name, descriptor))
+            validate_directory(descriptor)
+        check_identity()
+        yield descriptors[-1], check_identity
+    except (OSError, ValueError) as error:
+        if isinstance(error, VerificationError):
+            raise
         raise VerificationError("receipt_parent_invalid") from None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def require_private_output_parent(path: Path) -> None:
+    with _private_output_directory(path):
+        pass
+
+
+def _require_private_file_stat(observed) -> None:
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.getuid()
+            or stat.S_IMODE(observed.st_mode) != 0o600):
+        raise VerificationError("receipt_file_invalid")
 
 
 def require_private_regular_owned(path: Path) -> None:
     try:
-        observed = path.lstat()
-        if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.getuid()
-                or stat.S_IMODE(observed.st_mode) != 0o600):
-            raise ValueError
+        with _private_output_directory(path.parent) as (directory, check_identity):
+            _require_private_file_stat(os.stat(path.name, dir_fd=directory, follow_symlinks=False))
+            check_identity()
     except (OSError, ValueError):
         raise VerificationError("receipt_file_invalid") from None
 
 
 def write_receipt(path: Path, payload: dict[str, object]) -> None:
-    require_private_output_parent(path.parent)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    created = False
-    try:
+    with _private_output_directory(path.parent) as (directory, check_identity):
+        temporary = f".{path.name}.{os.getpid()}.tmp"
+        identity = None
+        published = False
+
+        def remove_owned(name):
+            try:
+                observed = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if (observed.st_dev, observed.st_ino) == identity:
+                    os.unlink(name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+
         try:
-            path.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            raise VerificationError("receipt_path_exists")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        created = True
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(canonical_json_bytes(payload))
-            os.fchmod(stream.fileno(), 0o600)
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.link(temporary, path, follow_symlinks=False)
-        except FileExistsError:
-            raise VerificationError("receipt_path_exists") from None
-    except (OSError, ValueError) as error:
-        if isinstance(error, VerificationError):
-            raise
-        raise VerificationError("receipt_write_failed") from None
-    finally:
-        if created:
-            temporary.unlink(missing_ok=True)
-    require_private_regular_owned(path)
+            try:
+                os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise VerificationError("receipt_path_exists")
+            check_identity()
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=directory)
+            with os.fdopen(descriptor, "wb") as stream:
+                observed = os.fstat(stream.fileno())
+                identity = (observed.st_dev, observed.st_ino)
+                stream.write(canonical_json_bytes(payload))
+                os.fchmod(stream.fileno(), 0o600)
+                stream.flush()
+                os.fsync(stream.fileno())
+            check_identity()
+            try:
+                os.link(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory,
+                        follow_symlinks=False)
+            except FileExistsError:
+                raise VerificationError("receipt_path_exists") from None
+            published = True
+            check_identity()
+            remove_owned(temporary)
+            observed = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            _require_private_file_stat(observed)
+            if (observed.st_dev, observed.st_ino) != identity:
+                raise VerificationError("receipt_file_invalid")
+            check_identity()
+        except (OSError, ValueError) as error:
+            if published:
+                remove_owned(path.name)
+            if isinstance(error, VerificationError):
+                raise
+            raise VerificationError("receipt_write_failed") from None
+        finally:
+            if identity is not None:
+                remove_owned(temporary)
 
 
 def validate_request(request: VerificationRequest) -> None:
@@ -316,21 +406,21 @@ def validate_request(request: VerificationRequest) -> None:
 
 
 @contextmanager
-def _fixed_tool_path():
-    previous = os.environ.get("PATH")
-    os.environ["PATH"] = "/usr/bin:/bin"
+def _isolated_git_environment():
+    previous = dict(os.environ)
+    environment = _git_environment()
+    os.environ.clear()
+    os.environ.update(environment)
     try:
         yield
     finally:
-        if previous is None:
-            os.environ.pop("PATH", None)
-        else:
-            os.environ["PATH"] = previous
+        os.environ.clear()
+        os.environ.update(previous)
 
 
 def verify_fleet_request(request: VerificationRequest, evidence: EvidenceProvider,
                          modules: VerifiedModules) -> dict[str, object]:
-    with _fixed_tool_path():
+    with _isolated_git_environment():
         return _verify_fleet_request(request, evidence, modules)
 
 
@@ -386,6 +476,74 @@ def _verify_fleet_request(request, evidence, modules):
         raise VerificationError("fleet_attestation_failed") from None
 
 
+def _caller_scalar(value: str) -> str:
+    """Recognize the single-line scalar subset used by generated callers.
+
+    This is deliberately not a general YAML loader. Block/multiline scalars,
+    tags, aliases, anchors, flow mappings and complex keys are refused before
+    any installed dependency or checkout can become executable authority.
+    """
+    if value.startswith('"'):
+        scalar, end = json.JSONDecoder().raw_decode(value)
+        if type(scalar) is not str or value[end:].strip() and not value[end:].lstrip().startswith("#"):
+            raise ValueError
+        return scalar
+    if value.startswith("'"):
+        match = re.fullmatch(r"'((?:[^']|'')*)'(?:[ ]*#[^\n]*)?[ ]*", value)
+        if match is None:
+            raise ValueError
+        return match[1].replace("''", "'")
+    scalar = re.split(r" +#", value, maxsplit=1)[0].rstrip()
+    if scalar.startswith("["):
+        if re.fullmatch(r"\[[A-Za-z_]+(?:, *[A-Za-z_]+)*\]", scalar) is None:
+            raise ValueError
+    elif not scalar or scalar[0] in "!&*|>{}%@`" or ": " in scalar:
+        raise ValueError
+    return scalar
+
+
+def _caller_mapping(content: str) -> dict[str, object]:
+    document: dict[str, object] = {}
+    levels = [(-2, document)]
+    previous_indent = -2
+    previous_value: object = document
+    if any((ord(character) < 32 and character != "\n") or character in "\u0085\u2028\u2029"
+           for character in content):
+        raise ValueError
+    for line in content.split("\n"):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"( *)([A-Za-z_][A-Za-z0-9_-]*|'[A-Za-z_][A-Za-z0-9_-]*'|\"[A-Za-z_][A-Za-z0-9_-]*\"):(?: +(.*))?", line)
+        if match is None:
+            raise ValueError
+        indent = len(match[1])
+        if indent % 2 or indent > previous_indent + 2:
+            raise ValueError
+        if indent > previous_indent:
+            if type(previous_value) is not dict:
+                raise ValueError
+            levels.append((previous_indent, previous_value))
+        while levels[-1][0] >= indent:
+            levels.pop()
+        mapping = levels[-1][1]
+        key = match[2].strip("\"'")
+        if key in mapping:
+            raise ValueError
+        raw = (match[3] or "").strip()
+        value = {} if not raw or raw.startswith("#") else _caller_scalar(raw)
+        mapping[key] = value
+        previous_indent, previous_value = indent, value
+    if not set(document) <= {"name", "run-name", "on", "jobs", "permissions", "concurrency"}:
+        raise ValueError
+    jobs = document.get("jobs")
+    if type(jobs) is not dict or set(jobs) != {"claude"}:
+        raise ValueError
+    job = jobs["claude"]
+    if type(job) is not dict or not set(job) <= {"name", "if", "uses", "with", "secrets", "permissions"}:
+        raise ValueError
+    return document
+
+
 def parse_default_caller_pin(document: object) -> str:
     try:
         if (type(document) is not dict or document.get("type") != "file"
@@ -395,11 +553,14 @@ def parse_default_caller_pin(document: object) -> str:
                 or type(document.get("content")) is not str or len(document["content"]) > 100000):
             raise ValueError
         content = base64.b64decode("".join(document["content"].split()), validate=True).decode("utf-8")
-        pins = re.findall(r"^    uses: jhw7500/automation/\.github/workflows/claude\.yml@([0-9a-f]{40})(?: +#[^\r\n]*)?$",
-                          content, re.MULTILINE)
-        if len(pins) != 1:
+        caller = _caller_mapping(content)
+        uses = caller["jobs"]["claude"].get("uses")
+        if type(uses) is not str:
             raise ValueError
-        return pins[0]
+        pin = re.fullmatch(r"jhw7500/automation/\.github/workflows/claude\.yml@([0-9a-f]{40})", uses)
+        if pin is None:
+            raise ValueError
+        return pin[1]
     except (ValueError, TypeError, UnicodeError):
         raise VerificationError("driver_pin_invalid") from None
 
@@ -809,8 +970,16 @@ class GitHubEvidenceProvider:
             statuses = self._pages(self.prefix + f"/commits/{head_sha}/statuses")
             result = []
             for name, app in sorted(required, key=lambda item: (item[0], str(item[1]))):
-                matches = [check for check in checks if check.get("name") == name
-                           and (app in {None, -1} or check.get("app", {}).get("id") == app)]
+                matches = []
+                for check in checks:
+                    if check.get("name") != name:
+                        continue
+                    identity = check.get("app")
+                    if (type(identity) is not dict or type(identity.get("id")) is not int
+                            or identity["id"] <= 0):
+                        raise ValueError
+                    if app in {None, -1} or identity["id"] == app:
+                        matches.append(check)
                 if len(matches) == 1:
                     if matches[0].get("head_sha") != head_sha:
                         raise ValueError
