@@ -51,7 +51,18 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install test dependencies
-        run: python -m pip install pytest PyYAML
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install pytest PyYAML
+          cache="$(realpath --canonicalize-existing "${RUNNER_TOOL_CACHE:?}")"
+          runtime="$(python -I -S -c 'import os,sys; print(os.path.realpath(sys.prefix))')"
+          case "$runtime" in
+            "$cache"/Python/*/x64) ;;
+            *) echo "unexpected setup-python runtime" >&2; exit 1 ;;
+          esac
+          sudo chmod -R go-w "$runtime"
+          sudo chmod go-w /opt "$cache" "$cache/Python" "$(dirname "$runtime")"
       - name: Run complete Python suite
         run: pytest -q
       - name: Parse central and canonical workflow YAML
