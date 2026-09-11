@@ -12,8 +12,49 @@ from pathlib import Path
 import hashlib
 
 
+V177_FALLBACK_BOUNDARY_COMMIT = "dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19"
+PRE_V178_FILES = (
+    ".github/workflows/claude.yml",
+    ".github/workflows/claude-code-review.yml",
+    "examples/baseline-workflows/.github/workflows/claude.yml",
+    ".github/actions/review-invocation-budget/action.yml",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py",
+    ".github/workflows/opencode-auto-review.yml",
+    ".github/actions/recover-opencode-review/evidence.py",
+    ".github/actions/recover-opencode-review/receipt.js",
+    ".github/actions/recover-opencode-review/replay.js",
+    "scripts/workflow-catalog.json",
+)
+
+
+def restore_pre_v178_claude_rollout_fallback(repo: Path) -> None:
+    """Downgrade copied current bytes before applying any older fixture patches.
+
+    Restore only a current file, so repeated older restore chains cannot undo
+    earlier historical changes or deliberately mutated test bytes. The immutable
+    tree supplies the old ledger, publisher key sets, caller and catalog ceiling.
+    """
+    from scripts.verify_workflow_release import VerifiedCommitTree
+
+    root = Path(__file__).resolve().parents[1]
+    tree = None
+    for relative in PRE_V178_FILES:
+        path = repo / relative
+        if path.is_file() and path.read_bytes() == (root / relative).read_bytes():
+            if tree is None:
+                tree = VerifiedCommitTree.open(root, V177_FALLBACK_BOUNDARY_COMMIT)
+            path.write_bytes(tree.read_file(relative))
+    for relative in (
+        ".github/actions/claude-rollout-fallback/action.yml",
+        ".github/actions/claude-rollout-fallback/contract.py",
+        "scripts/verify_claude_rollout_fallback.py",
+    ):
+        (repo / relative).unlink(missing_ok=True)
+
+
 def restore_pre_v176_opencode_recovery(repo: Path) -> None:
     """Restore authenticated pre-recovery bytes only when new recovery markers exist."""
+    restore_pre_v178_claude_rollout_fallback(repo)
     from scripts.verify_workflow_release import VerifiedCommitTree
 
     root = Path(__file__).resolve().parents[1]

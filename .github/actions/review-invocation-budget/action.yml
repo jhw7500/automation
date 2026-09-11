@@ -18,6 +18,9 @@ inputs:
   force-review:
     required: false
     default: 'false'
+  invocation-route-json:
+    required: false
+    default: '{"kind":"automatic"}'
   input-files-json:
     required: true
   authenticated-review-json:
@@ -75,6 +78,7 @@ runs:
         FULL_DIFF_SHA256: ${{ inputs.full-diff-sha256 }}
         DIFF_MODE: ${{ inputs.diff-mode }}
         FORCE_REVIEW: ${{ inputs.force-review }}
+        INVOCATION_ROUTE_JSON: ${{ inputs.invocation-route-json }}
         INPUT_FILES_JSON: ${{ inputs.input-files-json }}
         AUTHENTICATED_REVIEW_JSON: ${{ inputs.authenticated-review-json }}
         MODEL_ROUTE_JSON: ${{ inputs.model-route-json }}
@@ -140,7 +144,7 @@ runs:
           "$BUDGET_MODE" "$GITHUB_REPOSITORY" "$PR_NUMBER" "$REVIEWER" \
           "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$EXPECTED_HEAD_SHA" \
           "$FULL_DIFF_SHA256" "$DIFF_MODE" "$INPUT_FILES_JSON" \
-          "$FORCE_REVIEW" \
+          "$FORCE_REVIEW" "$INVOCATION_ROUTE_JSON" \
           "$AUTHENTICATED_REVIEW_JSON" "$MODEL_ROUTE_JSON" "$EFFORT" \
           "$ACTUAL_CALL_COUNT" "$ELAPSED_SECONDS" "$REVIEW_OUTCOME" \
           "$STOP_REASON" "$REMAINING_FINDING_IDS_JSON" "$CHECKPOINT_FILE" \
@@ -152,7 +156,7 @@ runs:
         names = (
             "operation", "repository", "pr", "reviewer", "run_id", "run_attempt",
             "head_sha", "full_diff_sha256", "diff_mode", "input_files_json",
-            "force_review",
+            "force_review", "invocation_route_json",
             "authenticated_review_json", "model_route_json", "effort", "actual_call_count",
             "elapsed_seconds", "outcome", "stop_reason", "remaining_finding_ids_json",
             "checkpoint_file", "github_workspace", "server_url",
@@ -282,6 +286,11 @@ runs:
         expected = json.loads(Path(sys.argv[1]).read_text())
         pull = json.loads(Path(sys.argv[2]).read_text())
         if pull.get("head", {}).get("sha") != expected["expected-head-sha"]:
+            raise SystemExit(1)
+        if (
+            expected["expected-base-sha"]
+            and pull.get("base", {}).get("sha") != expected["expected-base-sha"]
+        ):
             raise SystemExit(1)
         if expected["mutation"] == "patch":
             current = json.loads(Path(sys.argv[3]).read_text())

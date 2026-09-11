@@ -625,3 +625,316 @@ Claude token rotation remains owned by `personal-ops/claude-token-sync`, includi
 inventory, locking, health checks, and deployment lifecycle. Other provider-key changes
 must use their separately reviewed owner process. There is intentionally no command that
 combines workflow PR publication with token synchronization.
+
+## Create-only v1.78 and v1.78.1 tag publication
+
+This is an operator procedure for a separately approved publication, not an action
+performed by implementing the fallback. The Git Data sequence used for the
+immutable v1.76 boundary remains create-only. Never publish with ordinary Git push,
+move a tag or delete a tag. The older v1.40.1 example above is historical.
+
+For each release separately, obtain the exact reviewed merge commit from the
+approved public-main change. Set `RELEASE_TAG` to `v1.78` or `v1.78.1`,
+`EXPECTED_RELEASE_COMMIT` to that 40-character commit and `RELEASE_DIRECTORY` to
+an absolute, absent disposable directory under a trusted parent. Exactly one of
+`GH_TOKEN` and `GITHUB_TOKEN` must contain the intended publication token. Never
+put its value in an argument, trace or response report. The launcher passes it
+through a private descriptor to an isolated process; only the GitHub API child
+receives it in an exact environment. The public Git process receives no token.
+
+The following complete procedure verifies absent direct and peeled refs twice,
+verifies public main against the review anchor, validates the exact candidate,
+then makes one annotated-tag-object POST and one tag-ref POST. Every raw response
+is created as a current-user-owned non-symlink regular file and independently set
+to 0600. It computes the intended tag OID before the first POST and verifies both
+response OIDs, then verifies the local and public direct/peeled identities.
+
+For v1.78.1, before either POST it also authenticates the existing annotated
+v1.78 tag and peeled commit, requires a distinct reviewed candidate, and compares
+every v1.78 inventory-owned path, mode and blob. The inventory is loaded from
+the authenticated v1.78 checkout, so the candidate cannot reduce the comparison.
+Any release-owned difference invalidates this boundary canary and requires a
+normal reviewed patch design. First publication of v1.78 has no prior-v1.78 check.
+Both paths authenticate immutable v1.77 tag object
+`81f44fb6786bdfcc40f93161db74b1d9a9e3b7c5`, peeled commit
+`dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19`, and the unchanged v1.76 identity
+before any publication write. v1.77 is #183's observational-token release;
+#182's fallback begins in v1.78 and its distinct boundary canary is v1.78.1.
+
+```bash
+rtk proxy /usr/bin/python3 -I -S -B -c '
+import os
+import re
+keys = [key for key in ("GH_TOKEN", "GITHUB_TOKEN") if os.environ.get(key)]
+if len(keys) != 1:
+    raise SystemExit("exactly one intended token is required")
+key = keys[0]
+token = os.environ[key].encode("ascii")
+if not 0 < len(token) <= 4096 or b"\n" in token or b"\r" in token:
+    raise SystemExit("invalid token channel")
+tag = os.environ.get("RELEASE_TAG", "")
+commit = os.environ.get("EXPECTED_RELEASE_COMMIT", "")
+directory = os.environ.get("RELEASE_DIRECTORY", "")
+if tag not in {"v1.78", "v1.78.1"} or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+    raise SystemExit("invalid reviewed release identity")
+if not directory.startswith("/"):
+    raise SystemExit("absolute disposable directory required")
+read_fd, write_fd = os.pipe()
+os.write(write_fd, token + b"\n")
+os.close(write_fd)
+if read_fd != 3:
+    os.dup2(read_fd, 3, inheritable=True)
+    os.close(read_fd)
+os.set_inheritable(3, True)
+os.closerange(4, os.sysconf("SC_OPEN_MAX"))
+environment = {
+    "PATH": "/usr/bin:/bin", "HOME": "/nonexistent/automation-release/home",
+    "XDG_CONFIG_HOME": "/nonexistent/automation-release/xdg",
+    "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TOKEN_KEY": key,
+    "RELEASE_TAG": tag, "EXPECTED_RELEASE_COMMIT": commit,
+    "RELEASE_DIRECTORY": directory,
+}
+os.execve("/usr/bin/python3", ["/usr/bin/python3", "-I", "-S", "-B", "-"], environment)
+' <<'CLAUDE_RELEASE_PY'
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+
+def require(condition, reason):
+    if not condition:
+        raise SystemExit(reason)
+
+with os.fdopen(3, "rb") as channel:
+    secret = channel.read(4098)
+require(1 < len(secret) <= 4097 and secret.endswith(b"\n")
+        and b"\n" not in secret[:-1] and b"\r" not in secret, "invalid token channel")
+token = secret[:-1].decode("ascii")
+tag = os.environ["RELEASE_TAG"]
+commit = os.environ["EXPECTED_RELEASE_COMMIT"]
+root = Path(os.environ["RELEASE_DIRECTORY"])
+require(not root.exists() and not root.is_symlink(), "release directory already exists")
+root.mkdir(mode=0o700)
+os.chmod(root, 0o700)
+checkout = root / "automation"
+runtime = {key: os.environ[key] for key in
+           ("PATH", "HOME", "XDG_CONFIG_HOME", "LANG", "LC_ALL")}
+git_env = {**runtime, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_SYSTEM": "/dev/null",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+           "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false",
+           "GCM_INTERACTIVE": "Never", "GIT_ALLOW_PROTOCOL": "https",
+           "GIT_PROTOCOL_FROM_USER": "0", "GIT_NO_REPLACE_OBJECTS": "1",
+           "GIT_CEILING_DIRECTORIES": "/"}
+url = "https://github.com/jhw7500/automation.git"
+
+def git(*args, cwd=Path("/")):
+    return subprocess.run(["/usr/bin/git", *args], cwd=cwd, env=git_env,
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+def public_tags(name):
+    return git("ls-remote", "--tags", url, "refs/tags/" + name, "refs/tags/" + name + "^{}")
+
+def tag_pairs(name, direct, peeled):
+    return {direct + "\trefs/tags/" + name, peeled + "\trefs/tags/" + name + "^{}"}
+
+v176_commit = "444a7347aee169ed178aae80e8bd8d10eca52e02"
+v176_tag = "09af80682619129fcf343091b78413d2686a4579"
+v177_commit = "dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19"
+v177_tag = "81f44fb6786bdfcc40f93161db74b1d9a9e3b7c5"
+require(set(public_tags("v1.77").splitlines()) == tag_pairs("v1.77", v177_tag, v177_commit),
+        "v1.77 identity changed")
+require(set(public_tags("v1.76").splitlines()) == tag_pairs("v1.76", v176_tag, v176_commit),
+        "v1.76 identity changed")
+require(public_tags(tag) == "", "release direct or peeled ref already exists")
+main = git("ls-remote", "--heads", url, "refs/heads/main")
+require(main == commit + "\trefs/heads/main", "public main differs from reviewed commit")
+git("clone", "--no-recurse-submodules", url, str(checkout))
+require(git("rev-parse", "--is-shallow-repository", cwd=checkout) == "false", "incomplete clone")
+require(git("rev-parse", "refs/remotes/origin/main", cwd=checkout) == commit, "main moved")
+git("checkout", "--detach", commit, cwd=checkout)
+require(git("status", "--porcelain", cwd=checkout) == "", "dirty release checkout")
+for historical_tag, direct, peeled in (
+    ("v1.76", v176_tag, v176_commit), ("v1.77", v177_tag, v177_commit),
+):
+    require(git("rev-parse", "refs/tags/" + historical_tag, cwd=checkout) == direct
+            and git("rev-parse", "refs/tags/" + historical_tag + "^{}", cwd=checkout) == peeled
+            and git("cat-file", "-t", direct, cwd=checkout) == "tag",
+            historical_tag + " annotation or peeled commit differs")
+
+def verify_release(*extra):
+    subprocess.run(["/usr/bin/python3", "-B", "-m", "scripts.verify_workflow_release",
+                    "--automation", str(checkout), "--ref", tag,
+                    "--expected-commit", commit, *extra], cwd=checkout, env=runtime, check=True)
+
+verify_release("--commit-only")
+if tag == "v1.78.1":
+    pairs = [line.split("\t") for line in public_tags("v1.78").splitlines()]
+    require(len(pairs) == 2 and all(len(pair) == 2 for pair in pairs),
+            "missing or ambiguous v1.78 direct/peeled identity")
+    refs = {ref: oid for oid, ref in pairs}
+    require(set(refs) == {"refs/tags/v1.78", "refs/tags/v1.78^{}"}
+            and all(re.fullmatch("[0-9a-f]{40}", oid) for oid in refs.values()),
+            "invalid v1.78 direct/peeled identity")
+    v178_tag = refs["refs/tags/v1.78"]
+    v178_commit = refs["refs/tags/v1.78^{}"]
+    require(commit != v178_commit, "boundary canary requires a distinct reviewed commit")
+    git("fetch", "--no-tags", url, "refs/tags/v1.78:refs/tags/v1.78", cwd=checkout)
+    require(git("rev-parse", "refs/tags/v1.78", cwd=checkout) == v178_tag
+            and git("rev-parse", "refs/tags/v1.78^{}", cwd=checkout) == v178_commit
+            and git("cat-file", "-t", v178_tag, cwd=checkout) == "tag",
+            "fetched v1.78 annotation or peeled commit differs")
+    baseline = root / "v178-baseline"
+    git("worktree", "add", "--detach", str(baseline), v178_commit, cwd=checkout)
+    subprocess.run(["/usr/bin/python3", "-B", "-m", "scripts.verify_workflow_release",
+                    "--automation", str(baseline), "--ref", "v1.78",
+                    "--expected-commit", v178_commit, "--remote", "origin"],
+                   cwd=baseline, env=runtime, check=True)
+    inventory = subprocess.run(["/usr/bin/python3", "-B", "-c",
+        'import json; from scripts.workflow_release_inventory import release_paths_for; '
+        'print(json.dumps(release_paths_for("v1.78")))'],
+        cwd=baseline, env=runtime, check=True, capture_output=True, text=True)
+    owned = json.loads(inventory.stdout)
+    require(isinstance(owned, list) and owned and all(isinstance(path, str) for path in owned),
+            "invalid authenticated v1.78 inventory")
+    require(git("diff", "--raw", "--no-ext-diff", "--no-textconv", "--exit-code",
+                v178_commit, commit, "--", *owned, cwd=checkout) == "",
+            "release-owned difference invalidates boundary canary; normal reviewed patch design required")
+    require(set(public_tags("v1.78").splitlines()) == tag_pairs("v1.78", v178_tag, v178_commit),
+            "v1.78 identity moved before write")
+require(set(public_tags("v1.76").splitlines()) == tag_pairs("v1.76", v176_tag, v176_commit),
+        "v1.76 identity moved before write")
+require(set(public_tags("v1.77").splitlines()) == tag_pairs("v1.77", v177_tag, v177_commit),
+        "v1.77 identity moved before write")
+require(git("ls-remote", "--heads", url, "refs/heads/main") == main, "main moved before write")
+require(public_tags(tag) == "", "release ref appeared before write")
+now = datetime.now(timezone.utc).replace(microsecond=0)
+tagger = {"name": "Automation workflow release", "email": "noreply@github.com",
+          "date": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+message = "automation workflow release " + tag + "\n"
+tag_bytes = ("object " + commit + "\ntype commit\ntag " + tag + "\ntagger "
+             + tagger["name"] + " <" + tagger["email"] + "> "
+             + str(int(now.timestamp())) + " +0000\n\n" + message).encode("utf-8")
+tag_oid = hashlib.sha1(b"tag " + str(len(tag_bytes)).encode("ascii") + b"\0" + tag_bytes).hexdigest()
+
+def post(endpoint, payload, filename):
+    path = root / filename
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "wb") as output:
+        os.fchmod(output.fileno(), 0o600)
+        result = subprocess.run(["/usr/bin/gh", "api", "--hostname", "github.com",
+            "--method", "POST", "-H", "Accept: application/vnd.github+json",
+            "-H", "X-GitHub-Api-Version: 2022-11-28", endpoint, "--input", "-"],
+            env={**runtime, os.environ["TOKEN_KEY"]: token}, input=json.dumps(payload).encode(),
+            stdout=output, stderr=subprocess.PIPE)
+        output.flush()
+        os.fsync(output.fileno())
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o600, "unsafe raw response file")
+    require(result.returncode == 0, "POST failed: stop and reconcile read-only; never retry blindly")
+    return json.loads(path.read_bytes())
+
+created = post("repos/jhw7500/automation/git/tags",
+    {"tag": tag, "message": message, "object": commit, "type": "commit", "tagger": tagger},
+    "tag-object-response.json")
+require(created.get("sha") == tag_oid and created.get("tag") == tag
+        and created.get("message") == message and created.get("tagger") == tagger
+        and created.get("object", {}).get("sha") == commit
+        and created.get("object", {}).get("type") == "commit", "tag object response differs")
+created_ref = post("repos/jhw7500/automation/git/refs",
+    {"ref": "refs/tags/" + tag, "sha": tag_oid}, "tag-ref-response.json")
+require(created_ref.get("ref") == "refs/tags/" + tag
+        and created_ref.get("object", {}).get("sha") == tag_oid
+        and created_ref.get("object", {}).get("type") == "tag", "tag ref response differs")
+require(set(public_tags(tag).splitlines()) == tag_pairs(tag, tag_oid, commit), "public tag differs")
+require(set(public_tags("v1.77").splitlines()) == tag_pairs("v1.77", v177_tag, v177_commit),
+        "v1.77 identity changed")
+require(set(public_tags("v1.76").splitlines()) == tag_pairs("v1.76", v176_tag, v176_commit),
+        "v1.76 identity changed")
+git("fetch", "--no-tags", url, "refs/tags/" + tag + ":refs/tags/" + tag, cwd=checkout)
+require(git("rev-parse", "refs/tags/" + tag, cwd=checkout) == tag_oid, "local direct ref differs")
+require(git("rev-parse", "refs/tags/" + tag + "^{}", cwd=checkout) == commit, "local peeled ref differs")
+verify_release("--remote", "origin")
+print(tag + " verified: tag=" + tag_oid + " commit=" + commit)
+CLAUDE_RELEASE_PY
+```
+
+A failed or uncertain POST stops the procedure. Preserve both raw response files
+that exist and reconcile with read-only API/public Git reads. An orphan annotated
+object is harmless; a concurrent ref creation must never be repaired by moving
+or deleting the tag. Repeat this procedure for v1.78.1 only after its separate
+reviewed main change and publication authorization.
+
+## v1.76 bootstrap evidence
+
+The immutable bootstrap boundary is commit
+`444a7347aee169ed178aae80e8bd8d10eca52e02`, annotated tag object
+`09af80682619129fcf343091b78413d2686a4579`. Preserve original fleet manifests,
+PR HEAD/base tuples, automatic run IDs/attempts, canonical failure states and
+evidence digests. A default branch still pinned to v1.76 cannot authenticate the
+new managed route. Its original automatic caller-validation failure is bootstrap
+evidence; neither a new comment nor a receipt can retroactively enable v1.78 code.
+Use a separately reviewed adoption/merge decision to establish the new default
+caller. Never rewrite the original failure as a successful run.
+
+## v1.78 route adoption
+
+After create-only publication and release verification, render consumer caller
+changes with the existing fleet plan/publish/audit workflow, explicitly selecting
+the immutable release ref and approved consumer/base branch. Review the generated
+managed diff and adoption PR before a separately authorized merge. Verify the
+default-branch `claude.yml` pins the peeled v1.78 commit and has the catalogued
+write ceiling. Keep the ordinary automatic reviewer on the reviewed release pin.
+
+Record the new default caller SHA and its central commit as the future fallback
+driver. A v1.78 adoption PR alone is not the real boundary canary: until merged,
+the default branch still runs the older caller. Request/admission/ledger/comment
+and receipt schemas are defined in [the consumer contract](workflows/contracts.md).
+
+## v1.78.1 real-boundary canary
+
+Publish a separately reviewed v1.78.1 commit after v1.78 caller adoption. It must
+be distinct from the authenticated v1.78 peeled commit while preserving every
+v1.78 release-owned byte, path and mode. Before publication, the procedure above
+must prove an empty raw Git diff across the authenticated v1.78 inventory. Any
+difference invalidates this boundary canary and requires a normal reviewed patch
+design. Create one
+approved managed rollout PR from the v1.78 default to v1.78.1; record exact HEAD,
+base and managed diff hash. Require the original automatic attempt to fail at
+caller validation, with budget claim and provider skipped and the matching
+canonical automatic failure. Post one separately authorized canonical managed
+request after that failure. Its target release is v1.78.1; its default caller and
+verification checkout remain the exact v1.78 driver commit. Wait for the managed
+run and charged invocation to finalize. Do not retry an uncertain request.
+
+From a clean automation checkout at that driver commit, in an independently
+mode-0700 evidence directory, run the read-only verifier using recorded values:
+
+```bash
+rtk proxy /usr/bin/python3 -I -S -B "$AUTOMATION_ROOT/scripts/verify_claude_rollout_fallback.py" \
+  --automation-root "$AUTOMATION_ROOT" --release-ref v1.78.1 --remote origin \
+  --repository "$CONSUMER_REPOSITORY" --pr "$PR_NUMBER" \
+  --expected-head "$EXPECTED_HEAD_SHA" --expected-base "$EXPECTED_BASE_SHA" \
+  --output "$PRIVATE_EVIDENCE_DIRECTORY/claude-fallback-receipt.json"
+```
+
+The output must be absent before invocation. Require an owned regular mode-0600
+receipt, `effective_status: CLEAN`, the distinct driver/target commits and the
+recorded request/run/comment/budget coordinates. A receipt permits evaluation of
+the named rollout tuple; it does not itself authorize merging.
+
+## Required-check stop conditions
+
+Stop on changed HEAD/base, caller or release identity, noncanonical managed diff,
+missing/expired/ambiguous evidence, provider entry in the original failed attempt,
+partial fallback inputs, an unfinalized budget, non-clean fallback quality, or
+uncertain required-check discovery. Required checks must be completed with an
+accepted conclusion (`success`, `neutral`, or `skipped`); any failure, cancellation
+or pending check prevents the receipt. In particular, if the original failed
+automatic job is a required check, fallback evidence cannot waive it. Stop and
+resolve the repository's required-check policy through its own approved process.
+Never remove a required check or fabricate a successful Check to make rollout pass.

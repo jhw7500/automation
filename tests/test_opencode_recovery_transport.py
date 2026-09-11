@@ -230,7 +230,7 @@ def test_finalized_without_receipt_retries_only_receipt_publication(tmp_path, tr
 
 
 def test_current_workflow_uses_tokenless_recovery_discovery_during_replay(tmp_path, transport):
-    b = original_bundle(tmp_path)
+    b = original_bundle(tmp_path, ledger_schema=2)
     b["workflow_source"] = (ROOT / ".github/workflows/opencode-auto-review.yml").read_text()
     api = FakeAPI(b)
     assert execute(transport, b, api)["decision"] == "finalized"
@@ -238,7 +238,7 @@ def test_current_workflow_uses_tokenless_recovery_discovery_during_replay(tmp_pa
 
 
 def test_current_history_authenticates_completed_receipt_from_server_facts(tmp_path, transport):
-    b = original_bundle(tmp_path)
+    b = original_bundle(tmp_path, ledger_schema=2)
     b["workflow_source"] = (ROOT / ".github/workflows/opencode-auto-review.yml").read_text()
     api = FakeAPI(b)
     execute(transport, b, api)

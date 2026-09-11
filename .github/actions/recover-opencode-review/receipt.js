@@ -27,10 +27,11 @@ const STATE_KEYS = ['schema', 'reviewer', 'pr', 'run_id', 'run_attempt', 'attemp
 const ATTESTATION_KEYS = ['schema', 'repository', 'workflow', 'caller_workflow_path', 'caller_event',
   'referenced_workflow_path', 'referenced_workflow_sha', 'pr', 'attempt_head', 'workflow_head',
   'successful_head', 'run_id', 'run_attempt', 'prepared_run_attempt', 'comment_id', 'body_sha256', 'state_sha256'];
-const INVOCATION_KEYS = ['run_id', 'run_attempt', 'head_sha', 'full_diff_sha256', 'caller_workflow_path',
+const INVOCATION_KEYS_V1 = ['run_id', 'run_attempt', 'head_sha', 'full_diff_sha256', 'caller_workflow_path',
   'caller_event', 'referenced_workflow_path', 'referenced_workflow_ref', 'referenced_workflow_sha',
   'round_number', 'override_event_id', 'model_route', 'effort', 'call_unit', 'call_count',
   'estimated_input_tokens', 'elapsed_seconds', 'status', 'outcome', 'stop_reason', 'remaining_finding_ids'];
+const INVOCATION_KEYS_V2 = [...INVOCATION_KEYS_V1, 'route'];
 
 // Python's ensure_ascii=True and recursive code-point key ordering, including
 // numeric-looking keys (which JSON.stringify on a reconstructed object reorders).
@@ -109,6 +110,17 @@ function receiptShape(r) {
     && exact(o.artifacts, ['handoff', 'claim', 'candidate'])
     && Object.values(o.artifacts).every((a) => exact(a, ['id', 'sha256']) && positive(a.id) && hash(a.sha256))
     && new Set(Object.values(o.artifacts).map((a) => a.id)).size === 3;
+}
+function invocationShape(entry, schema) {
+  if (schema === 1) return exact(entry, INVOCATION_KEYS_V1);
+  return schema === 2 && exact(entry, INVOCATION_KEYS_V2)
+    && exact(entry.route, ['kind']) && entry.route.kind === 'automatic';
+}
+function invocationDigestMatches(entry, schema, expected) {
+  if (sha(canonicalJson(entry)) === expected) return true;
+  if (schema !== 2 || entry.route.kind !== 'automatic') return false;
+  const historical = Object.fromEntries(INVOCATION_KEYS_V1.map((key) => [key, entry[key]]));
+  return sha(canonicalJson(historical)) === expected;
 }
 function runMatches(run, binding, repository, event) {
   return run?.id === binding.run_id && run.run_attempt === binding.run_attempt
@@ -196,20 +208,20 @@ function validateReceipt(facts) {
     const ledgerLines = (ledgerComment.body || '').split('\n');
     if (ledgerLines[0] !== LEDGER) return false;
     const ledger = envelope(ledgerLines[1], 'automation-budget-state');
-    if (ledger.schema !== 1 || ledger.repository !== r.repository || ledger.pr !== r.pr || ledger.reviewer !== 'opencode'
+    if (![1, 2].includes(ledger.schema) || ledger.repository !== r.repository || ledger.pr !== r.pr || ledger.reviewer !== 'opencode'
       || !Array.isArray(ledger.invocations) || ledger.invocations.length > 100
       || ledgerLines[1] !== `<!-- automation-budget-state:${canonicalJson(ledger)} -->`) return false;
     const entries = ledger.invocations.filter((e) => e.run_id === o.run_id && e.run_attempt === o.run_attempt);
     if (entries.length !== 1) return false;
     const entry = entries[0];
-    return exact(entry, INVOCATION_KEYS) && entry.status === 'finalized' && ['success', 'quality_filtered'].includes(entry.outcome)
+    return invocationShape(entry, ledger.schema) && entry.status === 'finalized' && ['success', 'quality_filtered'].includes(entry.outcome)
       && entry.caller_event === 'pull_request'
       && ['head_sha', 'full_diff_sha256', 'caller_workflow_path', 'referenced_workflow_path', 'referenced_workflow_sha']
         .every((key) => entry[key] === o[key])
       && originalRun.referenced_workflows.some((ref) => ref.path === o.referenced_workflow_path
         && ref.sha === o.referenced_workflow_sha
         && entry.referenced_workflow_ref === ('ref' in ref ? ref.ref : ref.sha))
-      && sha(canonicalJson(entry)) === o.finalized_invocation_sha256;
+      && invocationDigestMatches(entry, ledger.schema, o.finalized_invocation_sha256);
   } catch { return false; }
 }
 

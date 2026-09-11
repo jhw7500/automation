@@ -76,6 +76,31 @@ class ActionPinsTest(unittest.TestCase):
 
         self.assertEqual([f"actions/setup-python@{SETUP_PYTHON_SHA}"], references)
 
+    def test_fleet_tool_ci_locks_the_setup_python_runtime_after_install(self) -> None:
+        workflow = yaml.load(
+            (ROOT / ".github/workflows/test-fleet-tools.yml").read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        steps = {
+            step.get("name"): step
+            for step in workflow["jobs"]["pytest"]["steps"]
+        }
+        script = steps["Install test dependencies"]["run"]
+
+        install = "python -m pip install pytest PyYAML"
+        recursive_lock = 'sudo chmod -R go-w "$runtime"'
+        self.assertIn(install, script)
+        self.assertIn('"${RUNNER_TOOL_CACHE:?}"', script)
+        self.assertIn('"$cache"/Python/*/x64', script)
+        self.assertIn(recursive_lock, script)
+        self.assertIn(
+            'sudo chmod go-w /opt "$cache" "$cache/Python" "$(dirname "$runtime")"',
+            script,
+        )
+        self.assertLess(script.index(install), script.index(recursive_lock))
+
     def test_managed_workflows_do_not_contain_empty_github_expressions(self) -> None:
         offenders: list[str] = []
         pattern = re.compile(r"\$\{\{\s*\}\}")
@@ -113,6 +138,21 @@ class ActionPinsTest(unittest.TestCase):
                 ),
             ],
             references,
+        )
+
+    def test_claude_router_uses_only_repository_local_fallback_targets(self) -> None:
+        workflow = yaml.load(
+            (ROOT / ".github/workflows/claude.yml").read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+
+        self.assertEqual(
+            "$/.github/actions/claude-rollout-fallback",
+            workflow["jobs"]["classify-request"]["steps"][0]["uses"],
+        )
+        self.assertEqual(
+            "$/.github/workflows/claude-code-review.yml",
+            workflow["jobs"]["managed-rollout-review"]["uses"],
         )
 
     def test_manual_claude_path_exposes_full_output_behind_a_repository_variable(

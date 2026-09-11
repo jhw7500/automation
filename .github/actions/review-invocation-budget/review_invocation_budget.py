@@ -20,7 +20,8 @@ Reviewer = Literal["claude", "gemini", "opencode"]
 Outcome = Literal["success", "provider_failure", "quality_filtered", "checkpoint_failure", "wall_time_exhausted"]
 Decision = Literal["claimed", "finalized", "state_invalid", "diff_unavailable", "authenticated_reuse", "duplicate_head", "duplicate_effective_diff", "input_budget_exhausted", "round_budget_exhausted", "total_usage_budget_exhausted"]
 
-SCHEMA = 1
+SCHEMA = 2
+CHECKPOINT_SCHEMA = 1
 STATE_PREFIX = "<!-- automation-budget-state:"
 STATE_SUFFIX = " -->"
 MARKERS = {
@@ -37,6 +38,7 @@ CENTRAL_REPOSITORY = "jhw7500/automation"
 
 _HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
+_NONCE = re.compile(r"[0-9a-f]{32}\Z")
 _FINDING = re.compile(r"RVW-[0-9a-f]{12}\Z")
 _CALLER_WORKFLOW = re.compile(r"\.github/workflows/[A-Za-z0-9_./-]+\.ya?ml\Z")
 _WORKFLOW_REF = re.compile(r"[^\x00-\x20\x7f]{1,256}\Z")
@@ -222,6 +224,121 @@ class RunProvenance:
 
 
 @dataclass(frozen=True)
+class InvocationRoute:
+    kind: Literal[
+        "automatic", "authorized_override", "default_branch_rollout_fallback"
+    ]
+    request_comment_id: int | None = None
+    request_nonce: str | None = None
+    original_run_id: int | None = None
+    original_run_attempt: int | None = None
+    expected_base_sha: str | None = None
+    release_commit: str | None = None
+    managed_diff_sha256: str | None = None
+    automatic_comment_id: int | None = None
+    automatic_state_sha256: str | None = None
+
+    @classmethod
+    def automatic(cls) -> "InvocationRoute":
+        return cls(kind="automatic")
+
+    @classmethod
+    def from_legacy_event(cls, event: str) -> "InvocationRoute":
+        kinds = {
+            "pull_request": "automatic",
+            "workflow_dispatch": "authorized_override",
+        }
+        if event not in kinds:
+            raise BudgetStateError("invocation_route_invalid")
+        return cls(kind=kinds[event])
+
+    def to_dict(self) -> dict[str, object]:
+        if self.kind in {"automatic", "authorized_override"}:
+            if any(
+                value is not None
+                for value in (
+                    self.request_comment_id, self.request_nonce,
+                    self.original_run_id, self.original_run_attempt,
+                    self.expected_base_sha, self.release_commit,
+                    self.managed_diff_sha256, self.automatic_comment_id,
+                    self.automatic_state_sha256,
+                )
+            ):
+                raise BudgetStateError("invocation_route_invalid")
+            return {"kind": self.kind}
+        payload = {
+            "kind": self.kind,
+            "request_comment_id": self.request_comment_id,
+            "request_nonce": self.request_nonce,
+            "original_run_id": self.original_run_id,
+            "original_run_attempt": self.original_run_attempt,
+            "expected_base_sha": self.expected_base_sha,
+            "release_commit": self.release_commit,
+            "managed_diff_sha256": self.managed_diff_sha256,
+            "automatic_comment_id": self.automatic_comment_id,
+            "automatic_state_sha256": self.automatic_state_sha256,
+        }
+        InvocationRoute.from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, value: object) -> "InvocationRoute":
+        try:
+            if not isinstance(value, dict):
+                raise BudgetStateError("invocation_route_invalid")
+            kind = value.get("kind")
+            if kind in {"automatic", "authorized_override"}:
+                _exact_keys(value, {"kind"}, "invocation_route")
+                return cls(kind=kind)
+            if kind != "default_branch_rollout_fallback":
+                raise BudgetStateError("invocation_route_invalid")
+            keys = {
+                "kind", "request_comment_id", "request_nonce", "original_run_id",
+                "original_run_attempt", "expected_base_sha", "release_commit",
+                "managed_diff_sha256", "automatic_comment_id", "automatic_state_sha256",
+            }
+            value = _exact_keys(value, keys, "invocation_route")
+            return cls(
+                kind=kind,
+                request_comment_id=_integer(
+                    value["request_comment_id"], "request_comment_id", positive=True,
+                ),
+                request_nonce=_hash(value["request_nonce"], _NONCE, "request_nonce"),
+                original_run_id=_integer(
+                    value["original_run_id"], "original_run_id", positive=True,
+                ),
+                original_run_attempt=_integer(
+                    value["original_run_attempt"], "original_run_attempt", positive=True,
+                ),
+                expected_base_sha=_hash(
+                    value["expected_base_sha"], _HEAD, "expected_base_sha",
+                ),
+                release_commit=_hash(value["release_commit"], _HEAD, "release_commit"),
+                managed_diff_sha256=_hash(
+                    value["managed_diff_sha256"], _HASH, "managed_diff_sha256",
+                ),
+                automatic_comment_id=_integer(
+                    value["automatic_comment_id"], "automatic_comment_id", positive=True,
+                ),
+                automatic_state_sha256=_hash(
+                    value["automatic_state_sha256"], _HASH, "automatic_state_sha256",
+                ),
+            )
+        except (BudgetStateError, KeyError, TypeError) as exc:
+            raise BudgetStateError("invocation_route_invalid") from exc
+
+
+def decode_invocation_route(
+    value: object, *, schema: int, caller_event: str,
+) -> InvocationRoute:
+    if schema == 1:
+        return InvocationRoute.from_legacy_event(caller_event)
+    if schema == 2:
+        return InvocationRoute.from_dict(value)
+    raise BudgetStateError("schema_invalid")
+
+
+@dataclass(frozen=True)
 class Invocation:
     run_id: int
     run_attempt: int
@@ -244,6 +361,7 @@ class Invocation:
     outcome: Outcome | None
     stop_reason: str
     remaining_finding_ids: tuple[str, ...]
+    route: InvocationRoute
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -262,6 +380,7 @@ class Invocation:
             "outcome": self.outcome,
             "override_event_id": self.override_event_id,
             "remaining_finding_ids": list(self.remaining_finding_ids),
+            "route": self.route.to_dict(),
             "round_number": self.round_number,
             "run_attempt": self.run_attempt,
             "run_id": self.run_id,
@@ -271,7 +390,7 @@ class Invocation:
         }
 
     @classmethod
-    def from_dict(cls, value: object) -> "Invocation":
+    def from_dict(cls, value: object, *, schema: int) -> "Invocation":
         keys = {
             "run_id", "run_attempt", "head_sha", "full_diff_sha256",
             "caller_workflow_path", "caller_event", "referenced_workflow_path",
@@ -280,6 +399,8 @@ class Invocation:
             "estimated_input_tokens", "elapsed_seconds", "status", "outcome", "stop_reason",
             "remaining_finding_ids",
         }
+        if schema == 2:
+            keys.add("route")
         value = _exact_keys(value, keys, "invocation")
         route = value["model_route"]
         findings = value["remaining_finding_ids"]
@@ -326,6 +447,10 @@ class Invocation:
             elapsed_seconds=_integer(value["elapsed_seconds"], "elapsed_seconds", minimum=0),
             status=status, outcome=outcome, stop_reason=_string(value["stop_reason"], "stop_reason"),
             remaining_finding_ids=tuple(findings),
+            route=decode_invocation_route(
+                value.get("route"), schema=schema,
+                caller_event=_string(value["caller_event"], "caller_event"),
+            ),
         )
 
 
@@ -520,7 +645,8 @@ class LedgerState:
             dismissed = value["dismissed_findings"]
             if not isinstance(dismissed, list) or not dismissed:
                 raise BudgetStateError("dismissed_findings_invalid")
-        if _integer(value["schema"], "schema", positive=True) != SCHEMA:
+        schema = _integer(value["schema"], "schema", positive=True)
+        if schema not in {1, SCHEMA}:
             raise BudgetStateError("schema_invalid")
         reviewer = _string(value["reviewer"], "reviewer")
         if reviewer not in MARKERS:
@@ -532,7 +658,7 @@ class LedgerState:
         state = cls(
             repository=_string(value["repository"], "repository"), pr=_integer(value["pr"], "pr", positive=True),
             reviewer=reviewer, budgets=BudgetPolicy.from_dict(value["budgets"]),
-            invocations=tuple(Invocation.from_dict(item) for item in invocations),
+            invocations=tuple(Invocation.from_dict(item, schema=schema) for item in invocations),
             consumed_override_event_ids=tuple(_integer(item, "consumed_override_event_id", positive=True) for item in consumed),
             last_decision=DecisionRecord.from_dict(value["last_decision"]), handoff=Handoff.from_dict(value["handoff"]),
             dismissed_findings=tuple(DismissedFinding.from_dict(item) for item in dismissed),
@@ -559,6 +685,7 @@ class ClaimRequest:
     call_unit: str
     force_review: bool = False
     dismiss_events: tuple[DismissEvent, ...] = ()
+    route: InvocationRoute = field(default_factory=InvocationRoute.automatic)
 
 
 @dataclass(frozen=True)
@@ -579,6 +706,7 @@ class FinalizeRequest:
     authenticated_review: AuthenticatedReview
     remaining_finding_ids: tuple[str, ...]
     dismiss_events: tuple[DismissEvent, ...] = ()
+    route: InvocationRoute = field(default_factory=InvocationRoute.automatic)
 
 
 @dataclass(frozen=True)
@@ -637,7 +765,7 @@ def _validate_state_shape(state: LedgerState) -> None:
     if any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in state.consumed_override_event_ids):
         raise BudgetStateError("consumed_override_event_ids_invalid")
     for item in state.invocations:
-        Invocation.from_dict(item.to_dict())
+        Invocation.from_dict(item.to_dict(), schema=SCHEMA)
         _validate_stored_provenance_identity(item, state.reviewer)
         call_failure = (
             item.status == "finalized" and item.outcome == "checkpoint_failure" and
@@ -822,10 +950,13 @@ def parse_ledger(body: str | None, *, repository: str, pr: int, reviewer: Review
         raise BudgetStateError("ledger_marker_invalid")
     payload = body[start:end]
     try:
-        state = LedgerState.from_dict(json.loads(payload))
+        raw = json.loads(payload)
+        state = LedgerState.from_dict(raw)
     except (json.JSONDecodeError, TypeError) as exc:
         raise BudgetStateError("ledger_json_invalid") from exc
-    if payload != serialize_ledger(state):
+    if payload != json.dumps(
+        raw, ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+    ):
         raise BudgetStateError("ledger_json_noncanonical")
     if state.repository != repository or state.pr != pr or state.reviewer != reviewer:
         raise BudgetStateError("ledger_identity_mismatch")
@@ -857,6 +988,18 @@ def _validate_request(request: ClaimRequest) -> None:
         raise BudgetStateError("force_review_invalid")
     if request.force_review and request.diff_mode != "changed":
         raise BudgetStateError("force_review_diff_invalid")
+    if not isinstance(request.route, InvocationRoute):
+        raise BudgetStateError("invocation_route_invalid")
+    InvocationRoute.from_dict(request.route.to_dict())
+    if (
+        request.route.kind == "default_branch_rollout_fallback"
+        and (request.reviewer != "claude" or request.force_review)
+    ):
+        raise BudgetStateError("invocation_route_invalid")
+    if request.route.kind == "authorized_override" and not request.force_review:
+        raise BudgetStateError("invocation_route_invalid")
+    if request.route.kind == "automatic" and request.force_review:
+        raise BudgetStateError("invocation_route_invalid")
     if not isinstance(request.authenticated_review, AuthenticatedReview):
         raise BudgetStateError("authenticated_review_invalid")
     review = request.authenticated_review
@@ -893,7 +1036,7 @@ def _expected_referenced_workflow_path(reviewer: Reviewer, sha: str) -> str:
 def _validate_provenance_identity(
         provenance: RunProvenance, reviewer: Reviewer) -> None:
     if (
-        provenance.caller_event not in {"pull_request", "workflow_dispatch"} or
+        provenance.caller_event not in {"pull_request", "workflow_dispatch", "issue_comment"} or
         not isinstance(provenance.caller_workflow_path, str) or
         _CALLER_WORKFLOW.fullmatch(provenance.caller_workflow_path) is None or
         ".." in Path(provenance.caller_workflow_path).parts or
@@ -908,10 +1051,43 @@ def _validate_provenance_identity(
         raise BudgetStateError("provenance_mismatch")
 
 
+def expected_caller_event(request: ClaimRequest | FinalizeRequest) -> str:
+    return {
+        "automatic": "pull_request",
+        "authorized_override": "workflow_dispatch",
+        "default_branch_rollout_fallback": "issue_comment",
+    }[request.route.kind]
+
+
+def provenance_head(
+        provenance: RunProvenance, request: ClaimRequest | FinalizeRequest) -> str:
+    if request.route.kind == "default_branch_rollout_fallback":
+        if request.reviewer != "claude" or (
+                isinstance(request, ClaimRequest) and request.force_review):
+            raise BudgetStateError("invocation_route_invalid")
+        return request.head_sha
+    return provenance.head_sha
+
+
+def _validate_route_provenance(
+        route: InvocationRoute, provenance: RunProvenance, reviewer: Reviewer) -> None:
+    if route.kind == "default_branch_rollout_fallback":
+        if (
+            reviewer != "claude"
+            or provenance.caller_event != "issue_comment"
+            or provenance.caller_workflow_path != ".github/workflows/claude.yml"
+        ):
+            raise BudgetStateError("provenance_mismatch")
+    elif provenance.caller_event != {
+        "automatic": "pull_request",
+        "authorized_override": "workflow_dispatch",
+    }[route.kind]:
+        raise BudgetStateError("provenance_mismatch")
+
+
 def _validate_stored_provenance_identity(
         invocation: Invocation, reviewer: Reviewer) -> None:
-    _validate_provenance_identity(
-        RunProvenance(
+    provenance = RunProvenance(
             repository="stored/stored",
             pr=1,
             head_sha=invocation.head_sha,
@@ -924,9 +1100,9 @@ def _validate_stored_provenance_identity(
             run_attempt=invocation.run_attempt,
             status=invocation.status,
             conclusion=invocation.outcome,
-        ),
-        reviewer,
-    )
+        )
+    _validate_provenance_identity(provenance, reviewer)
+    _validate_route_provenance(invocation.route, provenance, reviewer)
 
 
 def _validate_one_provenance(
@@ -939,19 +1115,14 @@ def _validate_one_provenance(
     expected_run_attempt = (
         request.run_attempt if invocation is None else invocation.run_attempt
     )
-    expected_event = (
-        invocation.caller_event
-        if invocation is not None
-        else (
-            "workflow_dispatch"
-            if isinstance(request, ClaimRequest) and request.force_review
-            else "pull_request"
-        )
-    )
+    expected_event = invocation.caller_event if invocation is not None else expected_caller_event(request)
+    route = invocation.route if invocation is not None else request.route
+    _validate_route_provenance(route, provenance, state.reviewer)
+    observed_head = provenance.head_sha if invocation is not None else provenance_head(provenance, request)
     if (
         provenance.repository != state.repository or
         provenance.pr != state.pr or
-        provenance.head_sha != expected_head or
+        observed_head != expected_head or
         provenance.caller_event != expected_event or
         provenance.run_id != expected_run_id or
         provenance.run_attempt != expected_run_attempt or
@@ -1108,7 +1279,7 @@ def append_claim(
         override_event_id=None if override is None else override.event_id, model_route=request.model_route,
         effort=request.effort, call_unit=request.call_unit, call_count=0,
         estimated_input_tokens=request.estimated_input_tokens, elapsed_seconds=0, status="claimed",
-        outcome=None, stop_reason="claimed", remaining_finding_ids=(),
+        outcome=None, stop_reason="claimed", remaining_finding_ids=(), route=request.route,
     )
     consumed = state.consumed_override_event_ids if override is None else state.consumed_override_event_ids + (override.event_id,)
     updated = replace(state, invocations=state.invocations + (item,), consumed_override_event_ids=consumed)
@@ -1197,6 +1368,11 @@ def _validate_finalize_request(request: FinalizeRequest) -> None:
     _integer(request.run_attempt, "run_attempt", positive=True)
     _hash(request.head_sha, _HEAD, "head_sha")
     _hash(request.full_diff_sha256, _HASH, "full_diff_sha256")
+    if not isinstance(request.route, InvocationRoute):
+        raise BudgetStateError("invocation_route_invalid")
+    InvocationRoute.from_dict(request.route.to_dict())
+    if request.route.kind == "default_branch_rollout_fallback" and request.reviewer != "claude":
+        raise BudgetStateError("invocation_route_invalid")
     _integer(request.call_count, "call_count", minimum=0)
     _integer(request.elapsed_seconds, "elapsed_seconds", minimum=0)
     if (not isinstance(request.model_route, tuple) or not request.model_route or
@@ -1280,6 +1456,16 @@ def finalize(
     index, entry = exact[0]
     if entry.status != "claimed":
         return _finalization_refusal(state, request, "invocation_not_claimed")
+    # The composite action's historical force-review callers pass the force flag only
+    # while claiming. Their finalization uses the default automatic route. The exact
+    # same-run ledger entry has already authenticated and consumed the override event,
+    # so retain that stored route for this one legacy default instead of stranding the
+    # provider call. Explicit non-default routes must still match byte-for-byte.
+    final_route = entry.route if (
+        entry.route.kind == "authorized_override" and request.route.kind == "automatic"
+    ) else request.route
+    if final_route.to_dict() != entry.route.to_dict():
+        return _finalization_refusal(state, request, "invocation_route_mismatch")
     if request.model_route[0] != entry.model_route[0]:
         return _finalization_refusal(state, request, "model_route_unknown")
     outcome = request.outcome
@@ -1353,7 +1539,7 @@ def recover_finalize(
         _validate_state_shape(state)
         if not isinstance(original_claim, Invocation):
             raise BudgetStateError("original_claim_invalid")
-        Invocation.from_dict(original_claim.to_dict())
+        Invocation.from_dict(original_claim.to_dict(), schema=SCHEMA)
         if original_claim.status != "claimed" or original_claim.remaining_finding_ids:
             raise BudgetStateError("original_claim_invalid")
     except (AttributeError, BudgetStateError) as exc:
@@ -1368,6 +1554,8 @@ def recover_finalize(
             original_claim.run_id, original_claim.run_attempt,
             original_claim.head_sha, original_claim.full_diff_sha256):
         return _invalid_transition(state, request, "recovery_request_mismatch")
+    if request.route.to_dict() != original_claim.route.to_dict():
+        return _invalid_transition(state, request, "invocation_route_mismatch")
     if (request.outcome not in {"success", "quality_filtered"}
             or not request.authenticated_review.success
             or request.authenticated_review.head_sha != request.head_sha
@@ -1478,7 +1666,11 @@ def render_comment(state: LedgerState, *, server_url: str) -> str:
 
 def render_checkpoint(state: LedgerState) -> bytes:
     _validate_state_shape(state)
-    payload = {"schema": SCHEMA, "ledger": state.to_dict(), "handoff": state.handoff.to_dict()}
+    payload = {
+        "schema": CHECKPOINT_SCHEMA,
+        "ledger": state.to_dict(),
+        "handoff": state.handoff.to_dict(),
+    }
     return (
         json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii") + b"\n"
     )
@@ -1493,13 +1685,17 @@ def load_checkpoint(payload: bytes) -> LedgerState:
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
         raise BudgetStateError("checkpoint_json_invalid") from exc
     raw = _exact_keys(raw, {"schema", "ledger", "handoff"}, "checkpoint")
-    if _integer(raw["schema"], "schema", positive=True) != SCHEMA:
+    if _integer(raw["schema"], "schema", positive=True) != CHECKPOINT_SCHEMA:
         raise BudgetStateError("checkpoint_schema_invalid")
+    source_schema = raw["ledger"].get("schema") if isinstance(raw["ledger"], dict) else None
     state = LedgerState.from_dict(raw["ledger"])
     handoff = Handoff.from_dict(raw["handoff"])
     if handoff != state.handoff:
         raise BudgetStateError("checkpoint_handoff_mismatch")
-    if payload != render_checkpoint(state):
+    expected = render_checkpoint(state) if source_schema == SCHEMA else (
+        json.dumps(raw, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii") + b"\n"
+    )
+    if payload != expected:
         raise BudgetStateError("checkpoint_json_noncanonical")
     return state
 
@@ -1595,6 +1791,7 @@ def _transport_request(path: Path) -> dict[str, object]:
         "elapsed_seconds", "outcome", "stop_reason", "remaining_finding_ids_json",
         "checkpoint_file", "github_workspace", "server_url",
         "force_review",
+        "invocation_route_json",
     }
     value = dict(_exact_keys(value, keys, "request"))
     repository = _string(value["repository"], "repository")
@@ -1633,7 +1830,8 @@ def _transport_request(path: Path) -> dict[str, object]:
         raise TransportError("force_review_invalid")
     value["force_review"] = force_review == "true"
     for name in (
-        "input_files_json", "authenticated_review_json", "model_route_json", "effort",
+        "input_files_json", "authenticated_review_json", "invocation_route_json",
+        "model_route_json", "effort",
         "outcome", "stop_reason", "remaining_finding_ids_json", "checkpoint_file",
         "github_workspace", "server_url",
     ):
@@ -1672,6 +1870,13 @@ def _model_route(request: Mapping[str, object]) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _invocation_route(request: Mapping[str, object]) -> InvocationRoute:
+    route = InvocationRoute.from_dict(_embedded_json(request, "invocation_route_json"))
+    if request["force_review"] is True and route.kind == "automatic":
+        return InvocationRoute(kind="authorized_override")
+    return route
+
+
 def _remaining_findings(request: Mapping[str, object]) -> tuple[str, ...]:
     value = _embedded_json(request, "remaining_finding_ids_json")
     if not isinstance(value, list):
@@ -1690,6 +1895,7 @@ def _base_claim_request(
         estimated_input_tokens=estimated_input_tokens,
         diff_mode="changed" if request["diff_mode"] in {"full", "delta"} else request["diff_mode"],
         authenticated_review=_authenticated_review(request), override_events=override_events,
+        route=_invocation_route(request),
         model_route=_model_route(request), effort=request["effort"],
         call_unit=_CALL_UNITS[request["reviewer"]],
         force_review=request["force_review"],
@@ -1713,6 +1919,7 @@ def _finalize_request(
         authenticated_review=_authenticated_review(request),
         remaining_finding_ids=_remaining_findings(request),
         dismiss_events=dismiss_events,
+        route=_invocation_route(request),
     )
 
 
@@ -1775,7 +1982,9 @@ def _write_diagnostic(
     if re.fullmatch(r"[a-z0-9_]{1,128}", stop_reason) is None:
         stop_reason = "state_invalid"
     handoff = _diagnostic_handoff(raw_request, decision, stop_reason)
-    checkpoint = _json_bytes({"schema": SCHEMA, "ledger": None, "handoff": handoff})
+    checkpoint = _json_bytes({
+        "schema": CHECKPOINT_SCHEMA, "ledger": None, "handoff": handoff,
+    })
     summary = (
         "## Review invocation budget\n"
         f"- Decision: {decision}\n"
@@ -1825,11 +2034,16 @@ def _verify_pr(request: Mapping[str, object], output_directory: Path) -> None:
     if not isinstance(value, dict):
         raise TransportError("pr_invalid")
     head = value.get("head")
+    route = _invocation_route(request)
     if (
         value.get("number") != request["pr"] or not isinstance(head, dict) or
         head.get("sha") != request["head_sha"]
     ):
         raise TransportError("pr_head_mismatch")
+    if route.kind == "default_branch_rollout_fallback":
+        base = value.get("base")
+        if not isinstance(base, dict) or base.get("sha") != route.expected_base_sha:
+            raise TransportError("pr_base_mismatch")
 
 
 def _ledger_comment(
@@ -1977,6 +2191,7 @@ def _run_provenances(
     stored_by_identity = {} if state is None else {
         (item.run_id, item.run_attempt): item for item in state.invocations
     }
+    current_route = _invocation_route(request)
     identities = {(request["run_id"], request["run_attempt"])}
     if state is not None:
         identities.update(
@@ -2011,21 +2226,22 @@ def _run_provenances(
         central = central[0]
         central_ref = central.get("ref") if "ref" in central else central.get("sha")
         stored = stored_by_identity.get((run_id, run_attempt))
-        is_force_dispatch = (
-            stored is not None and stored.caller_event == "workflow_dispatch"
+        route = stored.route if stored is not None else current_route
+        is_detached_event = (
+            stored is not None and stored.caller_event in {"workflow_dispatch", "issue_comment"}
         ) or (
             stored is None
             and request["operation"] == "claim"
-            and request["force_review"]
+            and (request["force_review"] or route.kind == "default_branch_rollout_fallback")
             and (run_id, run_attempt) == (request["run_id"], request["run_attempt"])
         )
         reviewed_head = stored.head_sha if stored is not None else request["head_sha"]
         provenance = RunProvenance(
             repository=repository.get("full_name"), pr=request["pr"],
-            # workflow_dispatch runs are rooted at the caller's default branch, not
+            # Detached caller events are rooted at the caller's default branch, not
             # the reviewed PR. The independently fetched PR payload binds the target
             # head; the Actions payload still binds run/attempt/caller/reusable ref.
-            head_sha=reviewed_head if is_force_dispatch else value.get("head_sha"),
+            head_sha=reviewed_head if is_detached_event else value.get("head_sha"),
             caller_workflow_path=value.get("path"),
             caller_event=value.get("event"),
             referenced_workflow_path=central.get("path"),
@@ -2034,8 +2250,11 @@ def _run_provenances(
             run_id=value.get("id"), run_attempt=value.get("run_attempt"),
             status=value.get("status"), conclusion=value.get("conclusion"),
         )
-        if is_force_dispatch:
-            if value.get("event") != "workflow_dispatch":
+        if is_detached_event:
+            if value.get("event") != {
+                "authorized_override": "workflow_dispatch",
+                "default_branch_rollout_fallback": "issue_comment",
+            }.get(route.kind):
                 raise TransportError("provenance_mismatch")
         elif request["pr"] not in pull_numbers:
             raise TransportError("provenance_mismatch")
@@ -2104,6 +2323,7 @@ def _write_transition(
     mutation = "none"
     if transition.mutate_comment:
         mutation = "create" if prior_comment is None else "patch"
+    route = _invocation_route(request)
     output = {
         "allow-invocation": "true" if transition.allow_invocation else "false",
         "decision": transition.decision,
@@ -2114,6 +2334,11 @@ def _write_transition(
         "mutate-comment": transition.mutate_comment,
         "mutation": mutation,
         "expected-head-sha": request["head_sha"],
+        "expected-base-sha": (
+            route.expected_base_sha
+            if route.kind == "default_branch_rollout_fallback"
+            else ""
+        ),
         "prior-comment-id": comment_id,
         "prior-comment-body": None if prior_comment is None else prior_comment["body"],
         "marker": MARKERS[request["reviewer"]],
@@ -2150,6 +2375,7 @@ def _fallback_request(request: Mapping[str, object]) -> ClaimRequest | FinalizeR
             estimated_input_tokens=0, diff_mode="changed", authenticated_review=review,
             override_events=(), model_route=("invalid",), effort=request["effort"],
             call_unit=_CALL_UNITS[request["reviewer"]],
+            route=InvocationRoute.automatic(),
         )
     return FinalizeRequest(
         repository=request["repository"], pr=request["pr"], reviewer=request["reviewer"],
@@ -2158,6 +2384,7 @@ def _fallback_request(request: Mapping[str, object]) -> ClaimRequest | FinalizeR
         model_route=("invalid",), effort=request["effort"], call_count=0, elapsed_seconds=0,
         outcome="checkpoint_failure", stop_reason="checkpoint_failure",
         authenticated_review=review, remaining_finding_ids=(),
+        route=InvocationRoute.automatic(),
     )
 
 

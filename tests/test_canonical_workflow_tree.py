@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import sys
 
+import pytest
 import yaml
 
 
@@ -259,6 +260,16 @@ CLAUDE_COMMAND_PERMISSIONS = {
     "contents": "read",
     "id-token": "write",
     "issues": "read",
+    "pull-requests": "write",
+}
+CLAUDE_INTERACTIVE_PERMISSIONS = {
+    **CLAUDE_COMMAND_PERMISSIONS,
+    "pull-requests": "read",
+}
+CLAUDE_CLASSIFIER_PERMISSIONS = {
+    "actions": "read",
+    "contents": "read",
+    "issues": "read",
     "pull-requests": "read",
 }
 CLAUDE_REVIEW_PERMISSIONS = {
@@ -321,6 +332,13 @@ def caller_job_contracts(
     workflow: dict[str, object],
 ) -> tuple[CallerJobContract, ...]:
     return extract_caller_jobs(workflow)
+
+
+def route_jobs(classification: str) -> dict[str, bool]:
+    return {
+        "claude": classification == "interactive",
+        "managed-rollout-review": classification == "managed",
+    }
 
 
 def central_accepts(entry: CatalogEntry, central_root: Path) -> bool:
@@ -488,6 +506,135 @@ def test_canonical_callers_use_only_the_selected_auth_contract() -> None:
                 assert "secrets" not in job
 
 
+def test_claude_router_has_closed_jobs_outputs_and_permissions() -> None:
+    central = load_yaml(ROOT / ".github/workflows/claude.yml")
+    baseline = load_yaml(CANONICAL / "workflows/claude.yml")
+
+    assert set(central["jobs"]) == {
+        "check-enabled",
+        "classify-request",
+        "claude",
+        "managed-rollout-review",
+        "skipped",
+    }
+    classifier = central["jobs"]["classify-request"]
+    assert classifier["needs"] == "check-enabled"
+    assert classifier["if"] == "needs.check-enabled.outputs.enabled == 'true'"
+    assert classifier["permissions"] == CLAUDE_CLASSIFIER_PERMISSIONS
+    assert classifier["outputs"] == {
+        name: f"${{{{ steps.classify.outputs.{name} }}}}"
+        for name in (
+            "route",
+            "reason",
+            "request-comment-id",
+            "request-nonce",
+            "expected-head-sha",
+            "expected-base-sha",
+            "original-run-id",
+            "original-run-attempt",
+            "release-commit",
+            "managed-diff-sha256",
+            "automatic-comment-id",
+            "automatic-state-sha256",
+        )
+    }
+    classify_step = classifier["steps"][0]
+    assert classify_step == {
+        "id": "classify",
+        "uses": "$/.github/actions/claude-rollout-fallback",
+        "with": {"github-token": "${{ github.token }}"},
+    }
+
+    interactive = central["jobs"]["claude"]
+    managed = central["jobs"]["managed-rollout-review"]
+    assert set(interactive["needs"]) == {"check-enabled", "classify-request"}
+    assert interactive["permissions"] == CLAUDE_INTERACTIVE_PERMISSIONS
+    assert managed["needs"] == ["check-enabled", "classify-request"]
+    assert managed["if"] == "needs.classify-request.outputs.route == 'managed'"
+    assert managed["permissions"] == CLAUDE_REVIEW_PERMISSIONS
+    assert managed["uses"] == "$/.github/workflows/claude-code-review.yml"
+    assert managed["with"] == {
+        "pr_number": "${{ github.event.issue.number }}",
+        "review_mode": "request",
+        "fallback_request_comment_id": (
+            "${{ needs.classify-request.outputs.request-comment-id }}"
+        ),
+        "fallback_request_nonce": (
+            "${{ needs.classify-request.outputs.request-nonce }}"
+        ),
+        "fallback_expected_head_sha": (
+            "${{ needs.classify-request.outputs.expected-head-sha }}"
+        ),
+        "fallback_expected_base_sha": (
+            "${{ needs.classify-request.outputs.expected-base-sha }}"
+        ),
+        "fallback_original_run_id": (
+            "${{ needs.classify-request.outputs.original-run-id }}"
+        ),
+        "fallback_original_run_attempt": (
+            "${{ needs.classify-request.outputs.original-run-attempt }}"
+        ),
+        "fallback_release_commit": (
+            "${{ needs.classify-request.outputs.release-commit }}"
+        ),
+        "fallback_managed_diff_sha256": (
+            "${{ needs.classify-request.outputs.managed-diff-sha256 }}"
+        ),
+    }
+    assert managed["secrets"] == {
+        "CLAUDE_CODE_OAUTH_TOKEN": "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}"
+    }
+    assert baseline["jobs"]["claude"]["permissions"] == CLAUDE_COMMAND_PERMISSIONS
+
+
+@pytest.mark.parametrize(
+    ("classification", "interactive", "managed"),
+    [
+        ("interactive", True, False),
+        ("managed", False, True),
+        ("invalid", False, False),
+    ],
+)
+def test_claude_routes_are_mutually_exclusive(
+    classification: str, interactive: bool, managed: bool
+) -> None:
+    assert route_jobs(classification) == {
+        "claude": interactive,
+        "managed-rollout-review": managed,
+    }
+
+
+def test_claude_router_preserves_interactive_guards_and_bounds_invalid_reason() -> None:
+    central = load_yaml(ROOT / ".github/workflows/claude.yml")
+    condition = " ".join(central["jobs"]["claude"]["if"].split())
+
+    assert condition.startswith(
+        "needs.classify-request.outputs.route == 'interactive' && ("
+    )
+    assert (
+        "!startsWith(github.event.comment.body, "
+        "'@claude managed rollout review for PR ')" in condition
+    )
+    for fragment in (
+        "github.event_name == 'issue_comment'",
+        "github.event.comment.author_association",
+        "github.event_name == 'pull_request_review_comment'",
+        "github.event_name == 'pull_request_review'",
+        "github.event.review.author_association",
+        "github.event_name == 'issues'",
+        "github.event.issue.author_association",
+        "contains(github.event.issue.body, '@claude')",
+        "contains(github.event.issue.title, '@claude')",
+    ):
+        assert fragment in condition
+
+    invalid = central["jobs"]["classify-request"]["steps"][1]
+    assert invalid["if"] == "steps.classify.outputs.route == 'invalid'"
+    assert invalid["env"] == {"REASON": "${{ steps.classify.outputs.reason }}"}
+    assert '[[ "$REASON" =~ ^[a-z_]+$ ]]' in invalid["run"]
+    assert "$GITHUB_STEP_SUMMARY" in invalid["run"]
+
+
 def test_auto_review_callers_forward_the_resolved_review_mode() -> None:
     callers = {
         "claude-code-review.yml": "claude-review",
@@ -565,3 +712,19 @@ def test_comment_callers_carry_the_request_scoped_run_name() -> None:
 
         assert len(matches) == 1, filename
         assert load_yaml(path)["run-name"] == ISSUE_RUN_NAME_VALUE, filename
+
+
+def test_v178_catalog_ceiling_and_nested_claude_permissions_agree() -> None:
+    from scripts.verify_workflow_release import (
+        FALLBACK_PERMISSIONS,
+        require_claude_fallback_permissions,
+    )
+
+    caller = load_yaml(CANONICAL / "workflows/claude.yml")
+    router = load_yaml(ROOT / ".github/workflows/claude.yml")
+    review = load_yaml(ROOT / ".github/workflows/claude-code-review.yml")
+    require_claude_fallback_permissions(caller, router, review)
+    entry = next(entry for entry in load_catalog(ROOT).callers
+                 if entry.path.as_posix() == ".github/workflows/claude.yml")
+    assert len(entry.caller_jobs) == 1
+    assert dict(entry.caller_jobs[0].permissions) == FALLBACK_PERMISSIONS

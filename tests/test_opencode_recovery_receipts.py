@@ -97,8 +97,51 @@ def node_validate(facts):
     return json.loads(result.stdout)["valid"]
 
 
-def test_receipt_accepts_complete_exact_provenance():
+AUTOMATIC_ROUTE = object()
+
+
+def schema_two_facts(route=AUTOMATIC_ROUTE, *, preserve_receipt_digest=False):
+    facts = facts_fixture()
+    if route is AUTOMATIC_ROUTE:
+        route = {"kind": "automatic"}
+    prefix = "<!-- automation-budget-state:"
+    ledger = json.loads(facts["ledgerComment"]["body"].splitlines()[1][len(prefix):-4])
+    ledger["schema"] = 2
+    if route is not None:
+        ledger["invocations"][0]["route"] = route
+    facts["ledgerComment"]["body"] = (
+        "<!-- automation:review-invocation-budget:opencode:v1 -->\n"
+        + prefix + compact(ledger) + " -->"
+    )
+    if not preserve_receipt_digest:
+        facts["receipt"]["original"]["finalized_invocation_sha256"] = digest(
+            compact(ledger["invocations"][0])
+        )
+        facts["check"]["output"]["text"] = (
+            "<!-- automation-opencode-recovery:" + compact(facts["receipt"]) + " -->"
+        )
+    return facts
+
+
+def test_receipt_accepts_historical_schema_one_invocation():
     assert node_validate(facts_fixture())
+
+
+def test_receipt_accepts_schema_two_automatic_invocation():
+    assert node_validate(schema_two_facts())
+
+
+def test_receipt_accepts_unchanged_schema_one_digest_after_automatic_migration():
+    assert node_validate(schema_two_facts(preserve_receipt_digest=True))
+
+
+@pytest.mark.parametrize("route", [
+    None,
+    {"kind": "authorized_override"},
+    {"kind": "automatic", "unexpected": True},
+])
+def test_receipt_rejects_schema_two_noncanonical_automatic_route(route):
+    assert not node_validate(schema_two_facts(route))
 
 
 @pytest.mark.parametrize("field,value", [

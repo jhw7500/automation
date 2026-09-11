@@ -6,7 +6,8 @@ const crypto = require('node:crypto');
 const childProcess = require('node:child_process');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const approved = new Set(['b8804d0c387e4f7e554443a1d0edd5862d9c4b1c1435de4140c621c241a25df5',
-  '3915f9bc32985745996d2246017cff9122460d25a071ca72568ac73c75339371']);
+  '3915f9bc32985745996d2246017cff9122460d25a071ca72568ac73c75339371',
+  'deb5353681c02b8932b9da47c49c28549654f6b8dc5852c58e7497de84e6623a']);
 if (!approved.has(crypto.createHash('sha256').update(input.source).digest('hex'))) {
   throw new Error('original_replay_unsupported');
 }
