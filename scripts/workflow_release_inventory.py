@@ -133,6 +133,14 @@ OPENCODE_RECOVERY_ROOTS = tuple(
     ReleaseRoot(PurePosixPath(f".github/actions/recover-opencode-review/{name}"), "file", "100644")
     for name in ("evidence.py", "replay.js", "receipt.js", "transport.py")
 )
+CLAUDE_ROLLOUT_FALLBACK_ROOTS = tuple(
+    ReleaseRoot(PurePosixPath(path), "file", "100644")
+    for path in (
+        ".github/actions/claude-rollout-fallback/action.yml",
+        ".github/actions/claude-rollout-fallback/contract.py",
+        "scripts/verify_claude_rollout_fallback.py",
+    )
+)
 RELEASE_ROOTS = (
     HISTORICAL_RELEASE_ROOTS
     + PREPARE_REVIEW_DIFF_ROOTS
@@ -140,6 +148,7 @@ RELEASE_ROOTS = (
     + REVIEW_INVOCATION_BUDGET_ROOTS
     + REVIEW_POLICY_ROOTS
     + OPENCODE_RECOVERY_ROOTS
+    + CLAUDE_ROLLOUT_FALLBACK_ROOTS
 )
 RELEASE_PATHS = tuple(root.path.as_posix() for root in RELEASE_ROOTS)
 EXACT_RELEASE_ROOTS = tuple(root for root in RELEASE_ROOTS if root.kind == "file")
@@ -169,6 +178,7 @@ OPENCODE_ACTIVE_SECTION_ORDER_RELEASE = (1, 73)
 EXPANDED_REVIEW_BUDGET_RELEASE = (1, 74)
 CLAUDE_WORKFLOW_VALIDATION_RELEASE = (1, 75)
 OPENCODE_RECOVERY_RELEASE = (1, 76)
+CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 77)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -302,6 +312,19 @@ def release_retires_manual_pr_review(ref: str) -> bool:
     return _release_version(ref) >= MANUAL_PR_REVIEW_RETIRED_RELEASE
 
 
+def release_supports_claude_rollout_fallback(ref: str) -> bool:
+    """Return whether the release owns the managed Claude rollout fallback."""
+    return _release_version(ref) >= CLAUDE_ROLLOUT_FALLBACK_RELEASE
+
+
+def _with_claude_rollout_fallback_roots(
+    ref: str, roots: tuple[ReleaseRoot, ...],
+) -> tuple[ReleaseRoot, ...]:
+    if release_supports_claude_rollout_fallback(ref):
+        return roots + CLAUDE_ROLLOUT_FALLBACK_ROOTS
+    return roots
+
+
 def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:
     """Select the authenticated inventory that existed at ``ref``'s release line."""
     roots = HISTORICAL_RELEASE_ROOTS
@@ -315,7 +338,7 @@ def release_roots_for(ref: str) -> tuple[ReleaseRoot, ...]:
         roots += REVIEW_POLICY_ROOTS
     if release_supports_opencode_recovery(ref):
         roots += OPENCODE_RECOVERY_ROOTS
-    return roots
+    return _with_claude_rollout_fallback_roots(ref, roots)
 
 
 def release_paths_for(ref: str) -> tuple[str, ...]:

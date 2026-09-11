@@ -712,3 +712,19 @@ def test_comment_callers_carry_the_request_scoped_run_name() -> None:
 
         assert len(matches) == 1, filename
         assert load_yaml(path)["run-name"] == ISSUE_RUN_NAME_VALUE, filename
+
+
+def test_v177_catalog_ceiling_and_nested_claude_permissions_agree() -> None:
+    from scripts.verify_workflow_release import (
+        FALLBACK_PERMISSIONS,
+        require_claude_fallback_permissions,
+    )
+
+    caller = load_yaml(CANONICAL / "workflows/claude.yml")
+    router = load_yaml(ROOT / ".github/workflows/claude.yml")
+    review = load_yaml(ROOT / ".github/workflows/claude-code-review.yml")
+    require_claude_fallback_permissions(caller, router, review)
+    entry = next(entry for entry in load_catalog(ROOT).callers
+                 if entry.path.as_posix() == ".github/workflows/claude.yml")
+    assert len(entry.caller_jobs) == 1
+    assert dict(entry.caller_jobs[0].permissions) == FALLBACK_PERMISSIONS

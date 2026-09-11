@@ -33,6 +33,7 @@ from release_fixture_helpers import (
     restore_pre_v172_opencode_context_budget,
     restore_pre_v173_opencode_active_section_order,
     restore_pre_v176_opencode_recovery,
+    restore_pre_v177_claude_rollout_fallback,
     restore_pre_v170_opencode_finding_ids,
     restore_retired_manual_pr_review,
     restore_pre_v166_label_mismatch_decline,
@@ -41,6 +42,101 @@ from release_fixture_helpers import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+V176_COMMIT = "444a7347aee169ed178aae80e8bd8d10eca52e02"
+FALLBACK_RELEASE_FILES = (
+    ".github/actions/claude-rollout-fallback/action.yml",
+    ".github/actions/claude-rollout-fallback/contract.py",
+    "scripts/verify_claude_rollout_fallback.py",
+)
+
+
+def test_v177_adds_only_claude_rollout_fallback_roots():
+    old = set(release_inventory.release_paths_for("v1.76"))
+    new = set(release_inventory.release_paths_for("v1.77"))
+    assert new - old == set(FALLBACK_RELEASE_FILES)
+    assert old - new == set()
+    roots = release_inventory.release_roots_for("v1.77")
+    assert {(str(root.path), root.kind, root.mode) for root in roots if str(root.path) in new - old} == {
+        (relative, "file", "100644") for relative in FALLBACK_RELEASE_FILES
+    }
+    assert not release_inventory.release_supports_claude_rollout_fallback("v1.76")
+    assert release_inventory.release_supports_claude_rollout_fallback("v1.77")
+    assert release_inventory.release_supports_claude_rollout_fallback("v1.77.1")
+
+
+def test_v176_candidate_remains_accepted():
+    assert release_verifier.verify_commit_content(ROOT, "v1.76", V176_COMMIT) == V176_COMMIT
+
+
+def test_v176_candidate_fixture_remains_accepted(recovery_release_repo):
+    repo, candidate = recovery_release_repo
+    assert release_verifier.verify_commit_content(repo, "v1.76", candidate) == candidate
+    tree = release_verifier.VerifiedCommitTree.open(ROOT, V176_COMMIT)
+    for relative in (
+        ".github/workflows/claude.yml",
+        ".github/workflows/claude-code-review.yml",
+        "examples/baseline-workflows/.github/workflows/claude.yml",
+        ".github/actions/review-invocation-budget/review_invocation_budget.py",
+        ".github/actions/canonicalize-review/canonicalize_review.py",
+    ):
+        assert (repo / relative).read_bytes() == tree.read_file(relative)
+    assert all(not (repo / relative).exists() for relative in FALLBACK_RELEASE_FILES)
+
+
+@pytest.fixture
+def fallback_release_repo(tmp_path):
+    repo = tmp_path / "fallback-release"
+    repo.mkdir()
+    for relative in RELEASE_PATHS:
+        source, target = ROOT / relative, repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            shutil.copy2(source, target)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    return repo, commit(repo, "v1.77 fallback candidate")
+
+
+def test_v177_candidate_is_accepted(fallback_release_repo):
+    repo, candidate = fallback_release_repo
+    release_verifier.verify_claude_rollout_fallback_contract(repo)
+    assert release_verifier.verify_commit_content(repo, "v1.77", candidate) == candidate
+
+
+FALLBACK_MUTATIONS = {
+    "request_keys": (FALLBACK_RELEASE_FILES[1], '"nonce",', '"untrusted",'),
+    "actor_set": (FALLBACK_RELEASE_FILES[1], '{"OWNER", "MEMBER", "COLLABORATOR"}', '{"OWNER", "MEMBER", "COLLABORATOR", "NONE"}'),
+    "comment_page_bound": (FALLBACK_RELEASE_FILES[1], 'range(1, 11)', 'range(1, 12)'),
+    "provider_skipped": (FALLBACK_RELEASE_FILES[1], 'if provider.get("conclusion") != "skipped":', 'if False:'),
+    "nested_reference": ('.github/workflows/claude.yml', '$/.github/workflows/claude-code-review.yml', './.github/workflows/claude-code-review.yml'),
+    "interactive_exclusion": ('.github/workflows/claude.yml', "!startsWith(github.event.comment.body, '@claude managed rollout review for PR ')", 'true'),
+    "consumer_permission": ('examples/baseline-workflows/.github/workflows/claude.yml', 'pull-requests: write', 'pull-requests: read'),
+    "interactive_permission": ('.github/workflows/claude.yml', '      pull-requests: read\n      issues: read', '      pull-requests: write\n      issues: read'),
+    "route_json": ('.github/workflows/claude-code-review.yml', 'invocation-route-json: ${{ steps.claude-invocation-route.outputs.invocation_route_json }}', 'invocation-route-json: \'{"kind":"automatic"}\''),
+    "ledger_migration": ('.github/actions/review-invocation-budget/review_invocation_budget.py', 'if schema == 1:', 'if schema == 0:'),
+    "canonical_route": ('.github/actions/review-invocation-budget/review_invocation_budget.py', 'if kind != "default_branch_rollout_fallback":', 'if kind != "untrusted":'),
+    "receipt_keys": (FALLBACK_RELEASE_FILES[2], '"schema", "verifier_commit"}', '"schema", "untrusted"}'),
+    "receipt_mode": (FALLBACK_RELEASE_FILES[2], 'os.fchmod(stream.fileno(), 0o600)', 'os.fchmod(stream.fileno(), 0o644)'),
+    "required_check": (FALLBACK_RELEASE_FILES[2], 'require_required_checks_clean(evidence.required_checks(request.expected_head))', 'require_required_checks_clean(())'),
+}
+
+
+@pytest.mark.parametrize("mutation", list(FALLBACK_MUTATIONS))
+def test_v177_rejects_fallback_contract_mutation(fallback_release_repo, mutation):
+    repo, _ = fallback_release_repo
+    # Establish acceptance first: a legacy seal must not mask a missing v1.77 seal.
+    release_verifier.verify_claude_rollout_fallback_contract(repo)
+    relative, old, new = FALLBACK_MUTATIONS[mutation]
+    replace(repo / relative, old, new, count=1)
+    bad = commit(repo, f"mutate {mutation}")
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_claude_rollout_fallback_contract(repo)
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.77", bad)
 
 RECOVERY_RELEASE_FILES = (
     ".github/actions/recover-opencode-review/evidence.py",
@@ -66,6 +162,7 @@ def recovery_release_repo(tmp_path):
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
+    restore_pre_v177_claude_rollout_fallback(repo)
     return repo, commit(repo, "v1.76 recovery candidate")
 
 
@@ -2412,6 +2509,7 @@ def prepare_v175(repo: Path) -> str:
     prepare_v174(repo)
     relative = ".github/workflows/claude-code-review.yml"
     shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v177_claude_rollout_fallback(repo)
     return commit(repo, "v1.75 candidate")
 
 
@@ -3288,10 +3386,13 @@ def test_v147_rejects_budget_helper_gate_removal(
 def test_v147_budget_helper_semantics_reject_authenticated_mutations(
     monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
-    source = (
-        ROOT
-        / ".github/actions/review-invocation-budget/review_invocation_budget.py"
-    ).read_text(encoding="utf-8")
+    source = release_verifier.VerifiedCommitTree.open(ROOT, V176_COMMIT).read_text(
+        ".github/actions/review-invocation-budget/review_invocation_budget.py"
+    )
+    release_verifier.require_budget_helper_contract(
+        source, rounds_variable=True, filter_reasons=True,
+        dismissals=True, expanded_budget=True,
+    )
     if mutation == "ledger-schema":
         source = source.replace(
             'keys = {"schema", "repository", "pr", "reviewer", "budgets", '
@@ -3376,10 +3477,16 @@ def test_v147_budget_helper_semantics_reject_authenticated_mutations(
 def test_v147_budget_helper_semantics_bind_live_ast_relationships(
     mutation: str,
 ) -> None:
-    source = (
-        ROOT
-        / ".github/actions/review-invocation-budget/review_invocation_budget.py"
-    ).read_text(encoding="utf-8")
+    # These schema-1 mutations must exercise schema-1 statements, even after the
+    # live source migrates to schema 2. Authenticate the immutable v1.76 bytes.
+    source = release_verifier.VerifiedCommitTree.open(ROOT, V176_COMMIT).read_text(
+        ".github/actions/review-invocation-budget/review_invocation_budget.py"
+    )
+
+    release_verifier.require_budget_helper_contract(
+        source, rounds_variable=True, filter_reasons=True,
+        dismissals=True, expanded_budget=True,
+    )
 
     def substitute(old: str, new: str, *, count: int = 1) -> None:
         nonlocal source

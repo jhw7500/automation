@@ -104,6 +104,138 @@ the updated normal receipt collectors and budget helper. Immutable v1.74/v1.75
 acceptance remains unchanged. This implementation pass performs no release publication,
 consumer adoption, live recovery or provider execution; those remain separate actions.
 
+## Claude rollout request v1
+
+Release v1.77 adds one managed route to the default-branch Claude comment caller.
+The request is exactly two lines, with at most one terminal newline:
+
+```text
+@claude managed rollout review for PR <positive PR number>
+<!-- automation:claude-rollout-review-request:v1 <canonical JSON object> -->
+```
+
+The helper's `canonical_request_body()` produces ASCII JSON with sorted keys and
+compact separators. Use it instead of composing the hidden marker by hand. The
+parser rejects duplicate/extra keys, noncanonical bytes, bodies over 4096 UTF-8
+bytes, mismatched visible PR numbers, booleans in integer fields, and invalid
+hashes. The exact request fields are:
+
+| Keys | Contract |
+| --- | --- |
+| `repository`, `pr` | Exact owner/repository and positive safe integer PR |
+| `expected_head_sha`, `expected_base_sha`, `release_commit` | 40 lowercase hexadecimal characters |
+| `original_run_id`, `original_run_attempt` | Positive safe integers identifying one original attempt |
+| `managed_diff_sha256` | 64 lowercase hexadecimal characters, the complete managed diff |
+| `nonce` | 32 lowercase hexadecimal characters |
+
+Only a created `issue_comment` by an OWNER, MEMBER or COLLABORATOR is admissible.
+The helper rereads the exact comment, open same-repository PR, original run/attempt
+and jobs. It reads at most ten pages of 100 comments; a full tenth page refuses.
+The original caller-validation step must fail before the budget claim and provider
+steps, which must both be skipped. The canonical automatic state must independently
+identify that exact failure. Ambiguous requests, changed HEAD/base, uncertain
+evidence and an already successful fallback refuse without entering the provider.
+
+```text
+created comment -> classify -> interactive -> existing Claude interaction
+                          +-> managed     -> authenticated nested review
+                          +-> invalid     -> bounded refusal, no review
+```
+
+The managed visible prefix is excluded from the interactive route, including
+malformed managed requests. The consumer caller grants exactly `actions: read`,
+`contents: read`, `id-token: write`, `issues: read`, `pull-requests: write`.
+The interactive central job keeps `pull-requests: read`. Classification grants
+only actions/contents/issues/pull-requests read. The nested managed job uses exactly
+`$/.github/workflows/claude-code-review.yml`, the consumer write ceiling above,
+and the same-name `CLAUDE_CODE_OAUTH_TOKEN` secret.
+
+## Admission schema 1
+
+Admission is a private regular JSON file owned by the runner, mode 0600, created
+without replacing an existing path. Its complete key set is:
+
+| Key | Meaning |
+| --- | --- |
+| `schema` | Integer 1 |
+| `request` | Exact request object described above |
+| `request_comment_id` | Authenticated created comment ID |
+| `automatic_comment_id` | Authenticated automatic failure comment ID |
+| `automatic_state_sha256` | SHA-256 of the exact embedded automatic state JSON bytes |
+
+The nested review accepts eight string inputs, either all empty or all nonempty:
+`fallback_request_comment_id`, `fallback_request_nonce`,
+`fallback_expected_head_sha`, `fallback_expected_base_sha`,
+`fallback_original_run_id`, `fallback_original_run_attempt`,
+`fallback_release_commit`, `fallback_managed_diff_sha256`.
+It reauthenticates admission and compares every input before claiming budget.
+A partial tuple refuses with `fallback_inputs_partial`; `force_review` cannot be
+combined with fallback. Admission is local execution evidence, not a review result.
+
+## Invocation route schema 2 migration
+
+The budget ledger writes schema 2. Reading authenticated schema 1 derives the route
+from its original caller event, preserving its history and usage. Checkpoint
+envelopes remain schema 1. Older checkpoint canonical bytes are validated before
+migration; migration does not forgive a malformed record or refund a round.
+
+| Route kind | Exact route keys |
+| --- | --- |
+| `automatic` | `kind` |
+| `authorized_override` | `kind` |
+| `default_branch_rollout_fallback` | `kind`, `request_comment_id`, `request_nonce`, `original_run_id`, `original_run_attempt`, `expected_base_sha`, `release_commit`, `managed_diff_sha256`, `automatic_comment_id`, `automatic_state_sha256` |
+
+Legacy `pull_request` maps to automatic; `workflow_dispatch` maps to authorized
+override. Other legacy events fail closed. Claim and finalize receive the same
+canonical `invocation-route-json`; the fallback remains a normal charged review
+invocation, with no extra round, call, token or elapsed-time allowance. OpenCode
+recovery and its receipt consumers validate the schema-2 ledger as well.
+
+## Claude schema-3 failure and fallback variants
+
+The canonical comment keeps `## Claude Code Review (latest)` and
+`<!-- automation:claude-code-review:v3 -->`. Its state is schema 3, quality schema 1.
+The existing state keys are `schema`, `reviewer`, `pr`, `run_id`, `run_attempt`,
+`attempt_head`, `successful_head`, `attempt_status`, `diff_mode`,
+`review_execution`, `full_diff_sha256`, `quality_schema`, `accepted_count`,
+`filtered_count`, `normalized_count`, `filtered_max_severity`.
+
+| Variant | Exact additional field and acceptance |
+| --- | --- |
+| Automatic validation failure | `failure_reason: workflow_validation_mismatch`; failure, `review_execution: not_performed`, preserving previous successful quality evidence |
+| Successful managed fallback | `route` object below; success, `review_execution: performed`, authenticated current quality and finalized charged invocation |
+
+The canonical `route` has exactly `route`, `request_comment_id`,
+`original_failed_run_id`, `reviewed_base_sha`, `release_commit`,
+`managed_diff_sha256`; its `route` value is `default_branch_rollout_fallback`.
+It differs deliberately from the budget route: the canonical comment exposes
+only the public review coordinates. Publication checks fresh PR HEAD and base
+and refuses stale evidence. A failure must never be labeled as a successful
+fallback or overwrite the meaning of the original failed Actions run.
+
+## Fleet fallback receipt schema 1
+
+`scripts/verify_claude_rollout_fallback.py` independently verifies the current
+default caller, exact automation checkout, fleet diff, original failure, managed
+request, successful canonical fallback, finalized budget and all required checks.
+Run it with `python3 -I -S -B`; imported rollout modules are loaded only after their
+clean automation checkout is verified at the default caller's `verifier_commit`.
+These ordinary repository modules do not become additional release inventory roots.
+The output parent must be private and the new receipt must not already exist.
+
+| Object | Exact keys |
+| --- | --- |
+| Receipt | `schema`, `repository`, `pr`, `head_sha`, `base_sha`, `release_commit`, `managed_diff_sha256`, `verifier_commit`, `automatic`, `fallback`, `fleet`, `effective_status` |
+| `automatic` | `admitted_state_sha256`, `canonical_comment_id`, `reason`, `review_execution`, `run_attempt`, `run_id`, `status` |
+| `fallback` | `budget_status`, `canonical_comment_id`, `canonical_state_sha256`, `driver_commit`, `filtered_max_severity`, `request_comment_id`, `request_nonce`, `review_execution`, `route`, `run_attempt`, `run_id`, `status` |
+| `fleet` | `base_branch`, `changed_paths`, `head_repository`, `pull_request_url`, `rollout_branch` |
+
+A successful receipt records `schema: 1`, `effective_status: CLEAN`, and distinct
+driver and target release commits. It is published only after all checks and final
+PR/branch readback succeed, via exclusive private-file creation with independent
+0600 enforcement and atomic publication. It is evidence for the named tuple; it
+neither changes the original Actions conclusion nor waives required checks.
+
 ## Same-name credential mappings
 
 Model credential names are fixed by authentication family, and every mapping uses the

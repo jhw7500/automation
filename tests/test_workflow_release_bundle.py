@@ -427,14 +427,19 @@ def test_review_policy_release_boundary() -> None:
     assert {root.kind for root in policy_roots} == {"file"}
 
 
-def test_review_invocation_budget_action_has_exact_safe_contract() -> None:
+def test_v177_review_invocation_budget_action_has_exact_safe_contract() -> None:
     payload = REVIEW_INVOCATION_BUDGET_ACTION.read_bytes()
     document = yaml.load(payload, Loader=yaml.BaseLoader)
 
     assert hashlib.sha256(payload).hexdigest() == (
-        "b9ebc50e0959d9a2db82b1b11715be81309581ac45bb29b6dab02dccacedb91c"
+        "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90"
     )
-    assert document == release_verifier.EXPECTED_REVIEW_INVOCATION_BUDGET_ACTION_V163
+    release_verifier._fallback_parsed_seal(
+        ".github/actions/review-invocation-budget/action.yml", document
+    )
+    assert document["inputs"]["invocation-route-json"] == {
+        "required": "false", "default": '{"kind":"automatic"}',
+    }
 
 
 def git(repo: Path, *args: str) -> str:

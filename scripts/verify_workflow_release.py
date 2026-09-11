@@ -61,6 +61,7 @@ from scripts.workflow_release_inventory import (
     release_supports_expanded_review_budget,
     release_supports_claude_workflow_validation,
     release_supports_opencode_recovery,
+    release_supports_claude_rollout_fallback,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
@@ -2590,6 +2591,7 @@ def verify_opencode_runtime(
         EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256["opencode"],
         EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256["opencode"],
         EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["opencode"],
+        EXPECTED_CLAUDE_FALLBACK_SHA256[".github/workflows/opencode-auto-review.yml"],
     }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
@@ -2630,6 +2632,7 @@ def verify_opencode_runtime(
             EXPECTED_OPENCODE_CONTEXT_BUDGET_WORKFLOW_SHA256["opencode"],
             EXPECTED_OPENCODE_ACTIVE_SECTION_ORDER_WORKFLOW_SHA256["opencode"],
             EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["opencode"],
+            EXPECTED_CLAUDE_FALLBACK_SHA256[".github/workflows/opencode-auto-review.yml"],
         }
         and run_step.get("shell") == "bash"
         and run_env.get("CANDIDATE_NONCE")
@@ -6147,6 +6150,26 @@ def _verify_review_invocation_budget(
         raise ReleaseVerificationError(
             "invocation-budget inventory is not closed"
         )
+    if release_supports_claude_rollout_fallback(ref):
+        # Schema 2 changes the legacy positional AST and Claude route wiring.
+        # Seal their complete parsed structures, including every budget gate;
+        # retain the unchanged Gemini contract below as well.
+        for relative in (
+            REVIEW_INVOCATION_BUDGET_ACTION_ROOT.path.as_posix(),
+            REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix(),
+            ".github/workflows/claude-code-review.yml",
+            ".github/workflows/opencode-auto-review.yml",
+        ):
+            payload = tree.read_file(relative)
+            parsed = (ast.parse(payload) if relative.endswith(".py") else
+                      _load_release_yaml(payload, reject_duplicate_keys=True))
+            _fallback_parsed_seal(relative, parsed)
+            if hashlib.sha256(payload).hexdigest() != EXPECTED_CLAUDE_FALLBACK_SHA256[relative]:
+                raise ReleaseVerificationError("invocation-budget authenticated source digest differs")
+        require_budget_workflow_contract(tree, "gemini-auto-review.yml", "gemini", review_policy=True)
+        if hashlib.sha256(tree.read_file(".github/workflows/gemini-auto-review.yml")).hexdigest() != EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["gemini"]:
+            raise ReleaseVerificationError("invocation-budget authenticated source digest differs")
+        return
     action_path = REVIEW_INVOCATION_BUDGET_ACTION_ROOT.path.as_posix()
     try:
         action_payload = tree.read_file(action_path)
@@ -6269,6 +6292,8 @@ def expected_review_actions(ref: str, workflow: str) -> list[str]:
         actions.append(REVIEW_POLICY_ACTION)
     if _release_version(ref) >= (1, 46) and workflow == "gemini-auto-review.yml":
         actions.append(SETUP_GEMINI_AUTH_REVIEW)
+    if release_supports_claude_rollout_fallback(ref) and workflow == "claude-code-review.yml":
+        actions.append(FALLBACK_ACTION)
     if release_supports_prepare_review_diff(ref):
         actions.append(PREPARE_REVIEW_DIFF_ACTION)
     if release_supports_review_invocation_budget(ref):
@@ -6755,6 +6780,11 @@ def _verify_review_publication_contracts(
     )
     try:
         for name, raw_contract in REVIEW_PUBLICATION_CONTRACTS.items():
+            if release_supports_claude_rollout_fallback(ref) and name == "claude-code-review.yml":
+                # The schema-3 failure/fallback variants have an exact v1.77
+                # parsed seal, including the complete collector and publisher.
+                require_claude_fallback_inputs(documents[name])
+                continue
             contract = {
                 key: value
                 for key, value in raw_contract.items()
@@ -7473,10 +7503,267 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
         if any(secret in tree.read_text(path) for secret in ("ZHIPU_API_KEY", "secrets:", "opencode run", "pip install", "npm install")):
             raise ValueError("provider execution is forbidden in recovery")
         for relative, expected in EXPECTED_OPENCODE_RECOVERY_SHA256.items():
+            if release_supports_claude_rollout_fallback(ref):
+                expected = EXPECTED_CLAUDE_FALLBACK_SHA256.get(relative, expected)
             if hashlib.sha256(tree.read_file(relative)).hexdigest() != expected:
                 raise ReleaseVerificationError("OpenCode recovery authenticated source digest differs: " + relative)
     except (AttributeError, KeyError, TypeError, ValueError, yaml.YAMLError):
         raise ReleaseVerificationError("OpenCode recovery execution/caller contract is invalid") from None
+
+
+
+# Reviewed v1.77 inputs, never calculated from the candidate at verification time.
+# Parsed seals retain all existing policy statements while schema-2 replaces the
+# legacy positional schema-1 AST checks. Raw seals additionally authenticate bytes.
+EXPECTED_CLAUDE_FALLBACK_SHA256 = {
+    ".github/actions/claude-rollout-fallback/action.yml": "ee4b8e6b88ebfc1d0691e032da93b03ba8268fac1bd9377a26554d8200621c0a",
+    ".github/actions/claude-rollout-fallback/contract.py": "ae39e0f9c0a1faa6831559c93150fca7f768fbaa0257aade70f045abd0eafff6",
+    "scripts/verify_claude_rollout_fallback.py": "281d443f4ebcc1dcd1f7db91abb0df3f31bc786527b6e0e0d4619c53d11f553e",
+    ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py": "61bb3e0efa79daaa4b38c1a2a3d52cd7b6abf0432f81208e4fcdfdad61477103",
+    ".github/workflows/claude.yml": "bb111fd319a6449f8f56cbe22a20572b662525f9f4a7765bc46a415bba5f5881",
+    ".github/workflows/claude-code-review.yml": "e9ab0aafc14b21e5eb6780ad80b1ca3c3766e5f8f0cc5b60700cfe88eb18ab81",
+    ".github/workflows/opencode-auto-review.yml": "ff4b2acfb3a87f66a77e5e9821d0d60237b6335cbe2a7afd6e7af484a80d66bb",
+    ".github/actions/recover-opencode-review/evidence.py": "9be2af2a2f121f36d8587d11efcdd197bc98e7306e901a0b727097d991dd1a01",
+    ".github/actions/recover-opencode-review/replay.js": "1587bc1c858708d30edf1da3559cc37486d6eaa6e8fbe7d57ab6debf24e6f503",
+    ".github/actions/recover-opencode-review/receipt.js": "49a10b88745fce3ef3e43d6f4b5a0448b70d5e37b40e358d530a0f99dcd51d82",
+}
+EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
+    ".github/actions/claude-rollout-fallback/action.yml": "fa6b723778608c90683a9cd49bd64229b4f1bc5ad10845978be51e605f6ef894",
+    ".github/actions/claude-rollout-fallback/contract.py": "b2b1c32742bab2642b24ff6e20fd9525432610721ce4e55b501c8255aa09a121",
+    "scripts/verify_claude_rollout_fallback.py": "65425e217b6574ff6af2cbc06c0f1fa422a51ad63b6102b2e6cd14915b2f62dd",
+    ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py": "c7338146a36ad36077d10b22f6db8947822c5da725fd779b914d252a2b9671ec",
+    ".github/workflows/claude.yml": "5781ef1db5e22f83ed07fc83fabe0beb615544a1412e01b2b8dabfd5f06593ab",
+    ".github/workflows/claude-code-review.yml": "130a3ee4164a2561ce6554e1fd6ddac25de11c734e7ec9504c8980841339407f",
+    ".github/workflows/opencode-auto-review.yml": "f27759c57939c8739bc0ee8c9c373869dd828d12dc2d10415c834937176ecd51",
+    ".github/actions/recover-opencode-review/evidence.py": "ffbc745e3912974a46d4496a507c03c759ee6d3ef83f6f9eeba874b808fd5ae4",
+}
+FALLBACK_ACTION = "$/.github/actions/claude-rollout-fallback"
+FALLBACK_INPUT_OUTPUTS = {
+    "fallback_request_comment_id": "request-comment-id",
+    "fallback_request_nonce": "request-nonce",
+    "fallback_expected_head_sha": "expected-head-sha",
+    "fallback_expected_base_sha": "expected-base-sha",
+    "fallback_original_run_id": "original-run-id",
+    "fallback_original_run_attempt": "original-run-attempt",
+    "fallback_release_commit": "release-commit",
+    "fallback_managed_diff_sha256": "managed-diff-sha256",
+}
+FALLBACK_PERMISSIONS = {
+    "actions": "read", "contents": "read", "id-token": "write",
+    "issues": "read", "pull-requests": "write",
+}
+
+
+def _fallback_literals(source: str, *literals: str) -> None:
+    if any(literal not in source for literal in literals):
+        raise ReleaseVerificationError("Claude fallback literal contract differs")
+
+
+def _fallback_parsed_seal(relative: str, value: object) -> None:
+    if isinstance(value, ast.AST):
+        # Python 3.12 adds empty type_params fields; they carry no policy.
+        for node in ast.walk(value):
+            if hasattr(node, "type_params"):
+                if node.type_params:
+                    raise ReleaseVerificationError("unexpected generic fallback contract")
+                del node.type_params
+        payload = ast.dump(value, include_attributes=False)
+    else:
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if hashlib.sha256(payload.encode()).hexdigest() != EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256[relative]:
+        raise ReleaseVerificationError("Claude fallback parsed contract differs: " + relative)
+
+
+def require_claude_fallback_permissions(caller: object, router: object, review: object) -> None:
+    try:
+        if (
+            caller.get("permissions") is not None
+            or set(caller["jobs"]) != {"claude"}
+            or caller["jobs"]["claude"].get("permissions") != FALLBACK_PERMISSIONS
+            or router.get("permissions") is not None
+            or router["jobs"]["claude"].get("permissions")
+                != {**FALLBACK_PERMISSIONS, "pull-requests": "read"}
+            or router["jobs"]["managed-rollout-review"].get("permissions") != FALLBACK_PERMISSIONS
+            or router["jobs"]["classify-request"].get("permissions") != {
+                "actions": "read", "contents": "read", "issues": "read", "pull-requests": "read",
+            }
+            or review.get("permissions") is not None
+            or review["jobs"]["claude-review"].get("permissions") != FALLBACK_PERMISSIONS
+        ):
+            raise ValueError("permissions differ")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise ReleaseVerificationError("Claude fallback permission contract differs") from None
+
+
+def require_claude_fallback_routes(router: object) -> None:
+    try:
+        jobs = router["jobs"]
+        interactive, managed = jobs["claude"], jobs["managed-rollout-review"]
+        if (
+            set(jobs) != {"check-enabled", "classify-request", "claude", "managed-rollout-review", "skipped"}
+            or interactive["needs"] != ["check-enabled", "classify-request"]
+            or managed["needs"] != interactive["needs"]
+            or managed["if"] != "needs.classify-request.outputs.route == 'managed'"
+            or managed["uses"] != "$/.github/workflows/claude-code-review.yml"
+            or managed["with"] != {
+                "pr_number": "${{ github.event.issue.number }}", "review_mode": "request",
+                **{name: "${{ needs.classify-request.outputs." + output + " }}"
+                   for name, output in FALLBACK_INPUT_OUTPUTS.items()},
+            }
+            or managed["secrets"] != {"CLAUDE_CODE_OAUTH_TOKEN": "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}"}
+        ):
+            raise ValueError("route differs")
+        condition = _normalize_expression(interactive["if"])
+        if not condition.startswith("needs.classify-request.outputs.route == 'interactive' && ("):
+            raise ValueError("interactive route differs")
+        _fallback_literals(condition,
+            "!startsWith(github.event.comment.body, '@claude managed rollout review for PR ')",
+            """contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)""")
+        _fallback_parsed_seal(".github/workflows/claude.yml", router)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise ReleaseVerificationError("Claude fallback route contract differs") from None
+
+
+def require_claude_fallback_inputs(review: object) -> None:
+    try:
+        inputs = review["on"]["workflow_call"]["inputs"]
+        if {key: value for key, value in inputs.items() if key.startswith("fallback_")} != {
+            name: {"type": "string", "required": "false", "default": ""}
+            for name in FALLBACK_INPUT_OUTPUTS
+        }:
+            raise ValueError("fallback inputs differ")
+        steps = review["jobs"]["claude-review"]["steps"]
+        by_id = {step["id"]: step for step in steps if "id" in step}
+        for identifier in ("review-budget-claim", "review-budget-finalize"):
+            if by_id[identifier]["with"].get("invocation-route-json") != (
+                "${{ steps.claude-invocation-route.outputs.invocation_route_json }}"
+            ):
+                raise ValueError("invocation route wiring differs")
+        if by_id["fallback-admission"]["uses"] != FALLBACK_ACTION:
+            raise ValueError("fallback admission differs")
+        _fallback_literals(by_id["upsert-review-comment"]["with"]["script"],
+            "const failureStateKeys = [...expectedStateKeys, 'failure_reason'].sort();",
+            "const fallbackStateKeys = [...expectedStateKeys, 'route'].sort();",
+            "JSON.stringify(Object.keys(route).sort()) === JSON.stringify(fallbackRouteKeys)",
+            "route.route === 'default_branch_rollout_fallback'",
+            "if (!failed && fallbackMode) state.route = fallbackRoute;",
+            "publicationPr.base?.sha !== fallbackRoute.reviewed_base_sha")
+        _fallback_parsed_seal(".github/workflows/claude-code-review.yml", review)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise ReleaseVerificationError("Claude fallback input/publication contract differs") from None
+
+
+def require_budget_schema_two(root: Path) -> None:
+    relative = ".github/actions/review-invocation-budget/review_invocation_budget.py"
+    try:
+        source = (root / relative).read_text(encoding="utf-8")
+        module = ast.parse(source)
+        _require_unique_module_bindings(module, frozenset({
+            "SCHEMA", "CHECKPOINT_SCHEMA", "InvocationRoute", "decode_invocation_route",
+            "Invocation", "LedgerState", "claim", "finalize", "load_checkpoint",
+        }))
+        if _static_literal(module, "SCHEMA") != 2 or _static_literal(module, "CHECKPOINT_SCHEMA") != 1:
+            raise ValueError("budget schema differs")
+        _fallback_literals(source,
+            'if schema == 1:\n        return InvocationRoute.from_legacy_event(caller_event)',
+            'if schema == 2:\n        return InvocationRoute.from_dict(value)',
+            'if kind != "default_branch_rollout_fallback":',
+            'if schema not in {1, SCHEMA}:',
+            'InvocationRoute.from_dict(_embedded_json(request, "invocation_route_json"))')
+        _fallback_parsed_seal(relative, module)
+        action = ".github/actions/review-invocation-budget/action.yml"
+        _fallback_parsed_seal(action, _load_release_yaml((root / action).read_bytes(), reject_duplicate_keys=True))
+    except (OSError, SyntaxError, TypeError, ValueError):
+        raise ReleaseVerificationError("Claude fallback budget schema-2 contract differs") from None
+
+
+def require_request_and_receipt_contracts(root: Path) -> None:
+    contract_path = ".github/actions/claude-rollout-fallback/contract.py"
+    receipt_path = "scripts/verify_claude_rollout_fallback.py"
+    try:
+        source = (root / contract_path).read_text(encoding="utf-8")
+        module = ast.parse(source)
+        constants = {
+            "REQUEST_KEYS": frozenset({
+                "repository", "pr", "expected_head_sha", "expected_base_sha",
+                "original_run_id", "original_run_attempt", "release_commit",
+                "managed_diff_sha256", "nonce",
+            }),
+            "ALLOWED_ASSOCIATIONS": frozenset({"OWNER", "MEMBER", "COLLABORATOR"}),
+            "FALLBACK_ROUTE_KEYS": frozenset({
+                "managed_diff_sha256", "original_failed_run_id", "release_commit",
+                "request_comment_id", "reviewed_base_sha", "route",
+            }),
+        }
+        _require_unique_module_bindings(module, frozenset(constants))
+        if any(_static_literal(module, name) != expected for name, expected in constants.items()):
+            raise ValueError("request keys differ")
+        _fallback_literals(source,
+            'set(value) != REQUEST_KEYS',
+            'range(1, 11)', 'if len(comments) >= 1000:',
+            'if provider.get("conclusion") != "skipped":',
+            'raise ContractError("provider_entered")',
+            'raise ContractError("comment_horizon_exceeded")',
+            'stat.S_IMODE(info.st_mode) != 0o600')
+        _fallback_parsed_seal(contract_path, module)
+        receipt = (root / receipt_path).read_text(encoding="utf-8")
+        receipt_module = ast.parse(receipt)
+        receipt_constants = {
+            "RECEIPT_KEYS": frozenset({
+                "automatic", "base_sha", "effective_status", "fallback", "fleet", "head_sha",
+                "managed_diff_sha256", "pr", "release_commit", "repository", "schema", "verifier_commit",
+            }),
+            "AUTOMATIC_KEYS": frozenset({
+                "admitted_state_sha256", "canonical_comment_id", "reason", "review_execution",
+                "run_attempt", "run_id", "status",
+            }),
+            "FALLBACK_KEYS": frozenset({
+                "budget_status", "canonical_comment_id", "canonical_state_sha256", "driver_commit",
+                "filtered_max_severity", "request_comment_id", "request_nonce", "review_execution",
+                "route", "run_attempt", "run_id", "status",
+            }),
+            "FLEET_KEYS": frozenset({
+                "base_branch", "changed_paths", "head_repository", "pull_request_url", "rollout_branch",
+            }),
+        }
+        _require_unique_module_bindings(receipt_module, frozenset(receipt_constants))
+        if any(_static_literal(receipt_module, name) != expected for name, expected in receipt_constants.items()):
+            raise ValueError("receipt keys differ")
+        _fallback_literals(receipt,
+            'os.fchmod(stream.fileno(), 0o600)',
+            'stat.S_IMODE(observed.st_mode) != 0o600',
+            'verify_source_root(request.automation_root, driver)',
+            'modules = load_verified_modules(request.automation_root)',
+            'require_required_checks_clean(evidence.required_checks(request.expected_head))',
+            'raise VerificationError("required_check_failed")',
+            'return build_receipt(request, fleet, automatic, fallback, driver)')
+        _fallback_parsed_seal(receipt_path, receipt_module)
+    except (OSError, SyntaxError, TypeError, ValueError):
+        raise ReleaseVerificationError("Claude fallback request/receipt contract differs") from None
+
+
+def verify_claude_rollout_fallback_contract(root: Path) -> None:
+    try:
+        def load(relative):
+            return _load_release_yaml((root / relative).read_bytes(), reject_duplicate_keys=True)
+        caller = load("examples/baseline-workflows/.github/workflows/claude.yml")
+        router = load(".github/workflows/claude.yml")
+        review = load(".github/workflows/claude-code-review.yml")
+        require_claude_fallback_permissions(caller, router, review)
+        require_claude_fallback_routes(router)
+        require_claude_fallback_inputs(review)
+        require_budget_schema_two(root)
+        require_request_and_receipt_contracts(root)
+        for relative in (".github/actions/claude-rollout-fallback/action.yml",
+                         ".github/workflows/opencode-auto-review.yml"):
+            _fallback_parsed_seal(relative, load(relative))
+        for relative, expected in EXPECTED_CLAUDE_FALLBACK_SHA256.items():
+            if hashlib.sha256((root / relative).read_bytes()).hexdigest() != expected:
+                raise ReleaseVerificationError("Claude fallback authenticated source digest differs: " + relative)
+    except (OSError, TypeError, ValueError, yaml.YAMLError):
+        raise ReleaseVerificationError("Claude fallback contract is invalid") from None
 
 
 def _verify_commit_content(
@@ -7486,6 +7773,16 @@ def _verify_commit_content(
     if _release_version(ref) >= (1, 40):
         _release_inventory(tree, ref)
         _verify_setup_gemini_auth(tree, ref)
+    if release_supports_claude_rollout_fallback(ref):
+        with tempfile.TemporaryDirectory(prefix="verify-claude-fallback-") as temporary:
+            candidate_root = Path(temporary)
+            for blob in validate_release_listing(
+                tree.listing(release_paths_for(ref)), release_roots_for(ref)
+            ):
+                target = candidate_root / blob.path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(tree.read_file(blob.path))
+            verify_claude_rollout_fallback_contract(candidate_root)
     _verify_opencode_recovery(tree, ref)
     if release_supports_prepare_review_diff(ref):
         _verify_prepare_review_diff_action(tree, ref)
