@@ -104,6 +104,20 @@ the updated normal receipt collectors and budget helper. Immutable v1.74/v1.75
 acceptance remains unchanged. This implementation pass performs no release publication,
 consumer adoption, live recovery or provider execution; those remain separate actions.
 
+## Observational review-input estimates (v1.77)
+
+Starting with v1.77, estimated input tokens are telemetry, not invocation admission gates.
+The budget helper still computes and records each estimate in the invocation ledger,
+checkpoint, handoff round usage, and metrics consumed by workflow summaries. The schema-1
+`max_estimated_tokens_per_round` and `max_estimated_tokens_total` fields, along with historical
+`input_budget_exhausted` and `total_usage_budget_exhausted` decisions, remain readable for
+backward compatibility but do not reject a new claim. The model provider's actual context
+limit is authoritative; a real context rejection is reported through the provider-failure
+path instead of being predicted by the budget helper.
+
+Round, override, call-count, wall-time, authenticated-checkpoint, and provenance gates are
+unchanged. Immutable v1.76 and earlier release identities retain their historical token gates.
+
 ## Same-name credential mappings
 
 Model credential names are fixed by authentication family, and every mapping uses the
@@ -1275,11 +1289,10 @@ up to two additional rounds; each requires a different `review-budget-override` 
 timeline-event ID and each ID is consumed exactly once. Once the first override is consumed,
 automatic rounds do not resume: another round requires another explicit approval event.
 OpenCode remains automatic-only because its canonicalizer cannot publish a dispatch override.
-Estimated
-input is `ceil(sum(input_file_bytes) / 4) + 20_000`, capped at 200,000 tokens per
-round, 400,000 across automatic rounds, 600,000 after the first override, and 800,000
-after the second. Every
-round has a 600-second provider wall-time cap. Call units and caps are one Claude
+Estimated input is `ceil(sum(input_file_bytes) / 4) + 20_000`. From v1.77 the estimate
+is recorded per round and in aggregate without imposing either the historical 200,000-token
+per-round limit or the 400,000-token accumulated limit. Every round has a 600-second
+provider wall-time cap. Call units and caps are one Claude
 action session, three Gemini `generate_content` requests across primary, retries, and
 configured same-reviewer fallback, and two OpenCode `opencode run` sessions including
 format repair.
@@ -1340,9 +1353,9 @@ Neither a failed force run nor budget exhaustion is merge approval, and orchestr
 as satisfied.
 
 Claim decisions are applied in this order: invalid state/provenance/head/diff;
-authenticated unchanged reuse; normal duplicate head; normal duplicate effective diff; per-round
-input exhaustion; force authorization or automatic-round exhaustion and eligible override consumption;
-aggregate usage exhaustion; then `claimed` with `allow-invocation=true`. The claim is
+authenticated unchanged reuse; normal duplicate head; normal duplicate effective diff;
+force authorization or automatic-round exhaustion and eligible override consumption; then
+`claimed` with `allow-invocation=true`. The claim is
 persisted before provider execution. Cancelled, timed-out, provider-failed,
 quality-filtered, and unfinalized claims remain consumed. Immediately before ledger
 mutation, the action refetches both PR head and prior comment; any mismatch returns
