@@ -115,6 +115,21 @@ class ActionPinsTest(unittest.TestCase):
             references,
         )
 
+    def test_claude_router_uses_only_repository_local_fallback_targets(self) -> None:
+        workflow = yaml.load(
+            (ROOT / ".github/workflows/claude.yml").read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+
+        self.assertEqual(
+            "$/.github/actions/claude-rollout-fallback",
+            workflow["jobs"]["classify-request"]["steps"][0]["uses"],
+        )
+        self.assertEqual(
+            "$/.github/workflows/claude-code-review.yml",
+            workflow["jobs"]["managed-rollout-review"]["uses"],
+        )
+
     def test_manual_claude_path_exposes_full_output_behind_a_repository_variable(
         self,
     ) -> None:

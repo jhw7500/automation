@@ -812,9 +812,9 @@ jobs:
           [[ "$BUDGET_CHECKPOINT_SHA256" =~ ^[0-9a-f]{64}$ ]]
           {
             printf '### Claude review budget claim\n\n'
-            printf -- '- Decision: `%s`\n' "$BUDGET_DECISION"
-            printf -- '- Round: `%s`\n' "${BUDGET_ROUND:-none}"
-            printf -- '- Checkpoint SHA-256: `%s`\n' "$BUDGET_CHECKPOINT_SHA256"
+            printf -- "- Decision: \`%s\`\n" "$BUDGET_DECISION"
+            printf -- "- Round: \`%s\`\n" "${BUDGET_ROUND:-none}"
+            printf -- "- Checkpoint SHA-256: \`%s\`\n" "$BUDGET_CHECKPOINT_SHA256"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Claude review budget claim checkpoint
@@ -1053,8 +1053,8 @@ jobs:
           [[ "$FILTERED_REASONS" =~ ^[a-z_]+(,[a-z_]+)*$ ]]
           {
             printf '### Claude filtered findings\n\n'
-            printf -- '- Filtered: `%s` (max severity `%s`)\n' "$FILTERED_COUNT" "$FILTERED_MAX_SEVERITY"
-            printf -- '- Reasons: `%s`\n' "$FILTERED_REASONS"
+            printf -- "- Filtered: \`%s\` (max severity \`%s\`)\n" "$FILTERED_COUNT" "$FILTERED_MAX_SEVERITY"
+            printf -- "- Reasons: \`%s\`\n" "$FILTERED_REASONS"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # 거부된 후보의 원문이 없으면 프롬프트/포맷 회귀와 검증기 과잉을 구분할 수 없다.
@@ -1539,10 +1539,12 @@ jobs:
             )"
           fi
 
-          printf 'outcome=%s\n' "$outcome" >> "$GITHUB_OUTPUT"
-          printf 'stop_reason=%s\n' "$stop_reason" >> "$GITHUB_OUTPUT"
-          printf 'remaining_finding_ids_json=%s\n' \
-            "$remaining_finding_ids_json" >> "$GITHUB_OUTPUT"
+          {
+            printf 'outcome=%s\n' "$outcome"
+            printf 'stop_reason=%s\n' "$stop_reason"
+            printf 'remaining_finding_ids_json=%s\n' \
+              "$remaining_finding_ids_json"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Finalize Claude review budget
         id: review-budget-finalize

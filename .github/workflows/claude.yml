@@ -33,11 +33,50 @@ jobs:
           workflow-name: claude
           force-run: ${{ inputs.force_run && 'true' || 'false' }}
 
-  claude:
+  classify-request:
     needs: check-enabled
+    if: needs.check-enabled.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      route: ${{ steps.classify.outputs.route }}
+      reason: ${{ steps.classify.outputs.reason }}
+      request-comment-id: ${{ steps.classify.outputs.request-comment-id }}
+      request-nonce: ${{ steps.classify.outputs.request-nonce }}
+      expected-head-sha: ${{ steps.classify.outputs.expected-head-sha }}
+      expected-base-sha: ${{ steps.classify.outputs.expected-base-sha }}
+      original-run-id: ${{ steps.classify.outputs.original-run-id }}
+      original-run-attempt: ${{ steps.classify.outputs.original-run-attempt }}
+      release-commit: ${{ steps.classify.outputs.release-commit }}
+      managed-diff-sha256: ${{ steps.classify.outputs.managed-diff-sha256 }}
+      automatic-comment-id: ${{ steps.classify.outputs.automatic-comment-id }}
+      automatic-state-sha256: ${{ steps.classify.outputs.automatic-state-sha256 }}
+    steps:
+      - id: classify
+        uses: $/.github/actions/claude-rollout-fallback
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Report invalid managed request
+        if: steps.classify.outputs.route == 'invalid'
+        shell: bash
+        env:
+          REASON: ${{ steps.classify.outputs.reason }}
+        run: |
+          set -euo pipefail
+          [[ "$REASON" =~ ^[a-z_]+$ ]]
+          printf "## Claude request declined\n\nReason: \`%s\`\n" "$REASON" >> "$GITHUB_STEP_SUMMARY"
+
+  claude:
+    needs: [check-enabled, classify-request]
     if: |
-      needs.check-enabled.outputs.enabled == 'true' && (
+      needs.classify-request.outputs.route == 'interactive' && (
         (github.event_name == 'issue_comment' &&
+          !startsWith(github.event.comment.body, '@claude managed rollout review for PR ') &&
           contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
           contains(github.event.comment.body, '@claude')) ||
         (github.event_name == 'pull_request_review_comment' &&
@@ -87,6 +126,29 @@ jobs:
           # or https://code.claude.com/docs/en/cli-reference for available options
           # claude_args: '--allowed-tools Bash(gh pr:*)'
 
+  managed-rollout-review:
+    needs: [check-enabled, classify-request]
+    if: needs.classify-request.outputs.route == 'managed'
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      issues: read
+      pull-requests: write
+    uses: $/.github/workflows/claude-code-review.yml
+    with:
+      pr_number: ${{ github.event.issue.number }}
+      review_mode: request
+      fallback_request_comment_id: ${{ needs.classify-request.outputs.request-comment-id }}
+      fallback_request_nonce: ${{ needs.classify-request.outputs.request-nonce }}
+      fallback_expected_head_sha: ${{ needs.classify-request.outputs.expected-head-sha }}
+      fallback_expected_base_sha: ${{ needs.classify-request.outputs.expected-base-sha }}
+      fallback_original_run_id: ${{ needs.classify-request.outputs.original-run-id }}
+      fallback_original_run_attempt: ${{ needs.classify-request.outputs.original-run-attempt }}
+      fallback_release_commit: ${{ needs.classify-request.outputs.release-commit }}
+      fallback_managed_diff_sha256: ${{ needs.classify-request.outputs.managed-diff-sha256 }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
   skipped:
     name: Workflow Skipped
@@ -97,5 +159,5 @@ jobs:
       - name: Notice
         run: |
           echo "::notice::Claude Code workflow is disabled in .github/workflow-config.yml"
-          echo "## Workflow Skipped" >> $GITHUB_STEP_SUMMARY
-          echo "Claude Code is disabled in workflow-config.yml" >> $GITHUB_STEP_SUMMARY
+          echo "## Workflow Skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "Claude Code is disabled in workflow-config.yml" >> "$GITHUB_STEP_SUMMARY"

@@ -33,7 +33,7 @@
             "contents": "read",
             "id-token": "write",
             "issues": "read",
-            "pull-requests": "read"
+            "pull-requests": "write"
           },
           "with": [],
           "secrets": [
