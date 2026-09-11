@@ -28,6 +28,7 @@ def _run_fallback_shell_step(tmp_path, name, env):
     step = _new_step(name)
     result = subprocess.run(
         ["bash", "-c", step.get("run", "")],
+        cwd=tmp_path,
         env={**os.environ, **env, "GITHUB_OUTPUT": str(output)},
         text=True,
         capture_output=True,
@@ -38,6 +39,16 @@ def _run_fallback_shell_step(tmp_path, name, env):
 
 def _fallback_inputs_json(values):
     return json.dumps({name: values.get(name, "") for name in FALLBACK_INPUTS})
+
+
+def _route_step_env():
+    return {
+        "FALLBACK_MODE": "normal",
+        "DIFF_MODE": "full",
+        "COMPUTED_FULL_DIFF_SHA256": "12" * 32,
+        "FALLBACK_MANAGED_DIFF_SHA256": "",
+        "FORCE_REVIEW": "false",
+    }
 
 
 def _fallback_admission(tmp_path, **changes):
@@ -135,6 +146,28 @@ def test_fallback_mode_is_all_or_none(tmp_path, values, mode):
     )
     assert result.returncode == 0, result.stderr
     assert outputs == {"mode": mode}
+
+
+@pytest.mark.parametrize("step_name", (
+    "Resolve Claude fallback mode", "Resolve Claude invocation route",
+))
+@pytest.mark.parametrize("module_name", ("json", "pathlib"))
+def test_fallback_python_steps_ignore_checkout_module_shadowing(
+    tmp_path, step_name, module_name,
+):
+    (tmp_path / f"{module_name}.py").write_text(
+        "open('consumer-code-ran', 'w').write('executed')\n",
+        encoding="utf-8",
+    )
+    env = (
+        {"FALLBACK_INPUTS_JSON": _fallback_inputs_json({})}
+        if step_name == "Resolve Claude fallback mode"
+        else _route_step_env()
+    )
+    result, outputs = _run_fallback_shell_step(tmp_path, step_name, env)
+    assert result.returncode == 0, result.stderr
+    assert not (tmp_path / "consumer-code-ran").exists()
+    assert outputs
 
 
 @node_required

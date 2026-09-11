@@ -158,7 +158,7 @@ jobs:
             {"fallback_request_comment_id":${{ toJSON(inputs.fallback_request_comment_id) }},"fallback_request_nonce":${{ toJSON(inputs.fallback_request_nonce) }},"fallback_expected_head_sha":${{ toJSON(inputs.fallback_expected_head_sha) }},"fallback_expected_base_sha":${{ toJSON(inputs.fallback_expected_base_sha) }},"fallback_original_run_id":${{ toJSON(inputs.fallback_original_run_id) }},"fallback_original_run_attempt":${{ toJSON(inputs.fallback_original_run_attempt) }},"fallback_release_commit":${{ toJSON(inputs.fallback_release_commit) }},"fallback_managed_diff_sha256":${{ toJSON(inputs.fallback_managed_diff_sha256) }}}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I -S -B - <<'PY'
           import json
           import os
           from pathlib import Path
@@ -402,6 +402,7 @@ jobs:
             candidate_run_id="$(jq -r '.state.run_id' <<< "$candidate")"
             candidate_attempt="$(jq -r '.state.run_attempt' <<< "$candidate")"
             candidate_head="$(jq -r '.state.attempt_head' <<< "$candidate")"
+            candidate_state="$(jq -c '.state' <<< "$candidate")"
             if gh api --include \
               "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate_run_id}/attempts/${candidate_attempt}" \
               > "$RUN_RESPONSE" 2> "$RUN_ERROR"; then
@@ -434,14 +435,20 @@ jobs:
               --argjson run_attempt "$candidate_attempt" \
               --argjson pr "$PR_NUM" \
               --arg head "$candidate_head" \
+              --argjson state "$candidate_state" \
               --arg repo "$REPOSITORY" \
               --arg workflow_prefix 'jhw7500/automation/.github/workflows/claude-code-review.yml@' '
                 .id == $run_id and .run_attempt == $run_attempt
                 and .status == "completed"
                 and (.conclusion == "success" or .conclusion == "failure")
-                and ((.event == "pull_request" and .head_sha == $head
-                  and ([.pull_requests[]? | select(.number == $pr)] | length == 1))
-                  or .event == "workflow_dispatch")
+                and (if $state.route != null then
+                  .event == "issue_comment"
+                  and .path == ".github/workflows/claude.yml"
+                else
+                  (.event == "pull_request" and .head_sha == $head
+                    and ([.pull_requests[]? | select(.number == $pr)] | length == 1))
+                  or .event == "workflow_dispatch"
+                end)
                 and .repository.full_name == $repo
                 and ([.referenced_workflows[]? | select(
                   (.path | startswith($workflow_prefix))
@@ -566,7 +573,7 @@ jobs:
           AUTOMATIC_STATE_SHA256: ${{ steps.fallback-admission.outputs.automatic-state-sha256 }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I -S -B - <<'PY'
           import json
           import os
           from pathlib import Path
@@ -1180,8 +1187,10 @@ jobs:
               issue_number: issueNumber,
               per_page: 100,
             });
-            const sha1 = (value) => /^[0-9a-f]{40}$/.test(value || '');
-            const sha256 = (value) => /^[0-9a-f]{64}$/.test(value || '');
+            const sha1 = (value) => typeof value === 'string'
+              && /^[0-9a-f]{40}$/.test(value);
+            const sha256 = (value) => typeof value === 'string'
+              && /^[0-9a-f]{64}$/.test(value);
             const positiveInteger = (value) => Number.isSafeInteger(value) && value > 0;
             let fallbackRoute = null;
             try {
@@ -1215,6 +1224,7 @@ jobs:
                 JSON.stringify(Object.keys(state).sort()) === JSON.stringify(keys))
               && (state.failure_reason === undefined
                 || (state.attempt_status === 'failure'
+                  && typeof state.failure_reason === 'string'
                   && /^[a-z_]+$/.test(state.failure_reason)))
               && (state.route === undefined
                 || (state.attempt_status === 'success' && validFallbackRoute(state.route)
@@ -1281,19 +1291,26 @@ jobs:
                 || Number(b.comment.id) - Number(a.comment.id)
             ).slice(0, 20);
             const workflowPrefix = 'jhw7500/automation/.github/workflows/claude-code-review.yml@';
-            const runMatches = (record, run) => run?.id === record.state.run_id
-              && run?.run_attempt === record.state.run_attempt
-              && run?.status === 'completed'
-              && ['success', 'failure'].includes(run?.conclusion)
-              && ((run?.event === 'pull_request' && run?.head_sha === record.state.attempt_head
-                && (run?.pull_requests || []).filter((pr) =>
-                  pr?.number === issueNumber
-                ).length === 1)
-                || run?.event === 'workflow_dispatch')
-              && run?.repository?.full_name === repository
-              && (run?.referenced_workflows || []).filter((item) =>
-                (item?.path || '').startsWith(workflowPrefix) && sha1(item?.sha)
-              ).length === 1;
+            const runMatches = (record, run) => {
+              const route = record.state.route;
+              const eventMatches = route === undefined
+                ? ((run?.event === 'pull_request' && run?.head_sha === record.state.attempt_head
+                    && (run?.pull_requests || []).filter((pr) =>
+                      pr?.number === issueNumber
+                    ).length === 1)
+                  || run?.event === 'workflow_dispatch')
+                : run?.event === 'issue_comment'
+                  && run?.path === '.github/workflows/claude.yml';
+              return run?.id === record.state.run_id
+                && run?.run_attempt === record.state.run_attempt
+                && run?.status === 'completed'
+                && ['success', 'failure'].includes(run?.conclusion)
+                && eventMatches
+                && run?.repository?.full_name === repository
+                && (run?.referenced_workflows || []).filter((item) =>
+                  (item?.path || '').startsWith(workflowPrefix) && sha1(item?.sha)
+                ).length === 1;
+            };
             let existing;
             let provenanceLookupUncertain = false;
             for (const record of syntacticRecords) {

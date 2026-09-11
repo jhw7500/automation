@@ -599,6 +599,28 @@ def _review_run_fixtures(comments: list[dict], reviewer: str) -> list[dict]:
     return runs
 
 
+def _fallback_run_fixture(state: dict[str, object]) -> dict:
+    return {
+        "id": state["run_id"],
+        "run_attempt": state["run_attempt"],
+        "status": "completed",
+        "conclusion": "success" if state["attempt_status"] == "success" else "failure",
+        "head_sha": "44" * 20,
+        "event": "issue_comment",
+        "path": ".github/workflows/claude.yml",
+        "repository": {"full_name": "example/repo"},
+        "pull_requests": [],
+        "referenced_workflows": [{
+            "path": (
+                "jhw7500/automation/.github/workflows/"
+                "claude-code-review.yml@refs/tags/v1.77"
+            ),
+            "sha": "46" * 20,
+            "ref": "refs/tags/v1.77",
+        }],
+    }
+
+
 def _human(login: str, body: str, comment_id: int = 2, created: str = "t") -> dict:
     return {
         "id": comment_id,
@@ -4675,11 +4697,90 @@ def test_fallback_success_state_is_readable_as_authenticated_review_context(tmp_
         full_diff_sha256="cc" * 32,
         route=FALLBACK_STATE_ROUTE,
     )
-    _run_collect(tmp_path, [_bot("github-actions[bot]", _v3_body(state), 31)])
+    comment = _bot("github-actions[bot]", _v3_body(state), 31)
+    _run_collect(tmp_path, [comment], workflow_runs=[_fallback_run_fixture(state)])
     outputs = _github_outputs(tmp_path / "github-output")
     assert outputs["previous_sha"] == head
     assert outputs["previous_full_hash"] == "cc" * 32
     assert json.loads(outputs["authenticated_review_json"])["success"] is True
+
+
+@node_required
+def test_fallback_success_state_is_updated_on_subsequent_publication(tmp_path):
+    prior_state = _v3_state(
+        run_id=1,
+        head="ab" * 20,
+        full_diff_sha256="cc" * 32,
+        route=FALLBACK_STATE_ROUTE,
+    )
+    prior = _bot(
+        "github-actions[bot]", _v3_body(prior_state, "PRIOR FALLBACK REVIEW"), 31,
+    )
+    calls = _claude_upsert(
+        tmp_path,
+        "success",
+        [prior],
+        with_review=True,
+        review="SUBSEQUENT REVIEW",
+        workflow_runs=[_fallback_run_fixture(prior_state)],
+    )
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [31]
+    assert not [call for call in calls if call[0] == "create"]
+
+
+def _malformed_extension_state(field: str, value: object) -> dict[str, object]:
+    if field == "failure_reason":
+        return _v3_state(
+            run_id=99,
+            attempt_status="failure",
+            successful_head=None,
+            diff_mode="unavailable",
+            review_execution="not_performed",
+            full_diff_sha256=None,
+            accepted_count=None,
+            filtered_count=None,
+            normalized_count=None,
+            filtered_max_severity=None,
+            failure_reason=value,
+        )
+    route = dict(FALLBACK_STATE_ROUTE)
+    route[field] = value
+    return _v3_state(run_id=99, full_diff_sha256="cc" * 32, route=route)
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("failure_reason", None),
+        ("failure_reason", True),
+        ("failure_reason", ["workflow_validation_mismatch"]),
+        ("reviewed_base_sha", ["bb" * 20]),
+        ("release_commit", ["444a7347aee169ed178aae80e8bd8d10eca52e02"]),
+    ),
+)
+def test_claude_readers_reject_non_string_extension_fields(tmp_path, field, value):
+    valid_state = _v3_state(run_id=1, head="ab" * 20)
+    valid = _bot(
+        "github-actions[bot]", _v3_body(valid_state, "VALID PRIOR REVIEW"), 11,
+    )
+    malformed_state = _malformed_extension_state(field, value)
+    malformed = _bot(
+        "github-actions[bot]", _v3_body(malformed_state, "MALFORMED EXTENSION"), 99,
+    )
+    _run_collect(tmp_path, [valid, malformed])
+    context = (tmp_path / "claude-review-context.md").read_text(encoding="utf-8")
+    assert "VALID PRIOR REVIEW" in context
+    assert "MALFORMED EXTENSION" not in context
+
+    calls = _claude_upsert(
+        tmp_path,
+        "failure",
+        [valid, malformed],
+        with_review=False,
+    )
+    assert [call[1]["comment_id"] for call in calls if call[0] == "update"] == [11]
+    assert not [call for call in calls if call[0] == "create"]
 
 
 @node_required
