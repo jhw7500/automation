@@ -377,6 +377,28 @@ def mutated_bundle(change: str) -> EvidenceBundle:
         values["original_jobs"]["jobs"][0]["steps"][3]["conclusion"] = "success"
     elif change == "budget_claimed":
         values["original_jobs"]["jobs"][0]["steps"][2]["conclusion"] = "success"
+    elif change == "extra_failed_job":
+        values["original_jobs"]["jobs"].append(
+            {
+                "id": 501,
+                "name": "Claude Code Review / post-review",
+                "run_id": 34549275027,
+                "run_attempt": 1,
+                "status": "completed",
+                "conclusion": "failure",
+                "steps": [],
+            }
+        )
+        values["original_jobs"]["total_count"] = 2
+    elif change == "extra_failed_step":
+        values["original_jobs"]["jobs"][0]["steps"].append(
+            {
+                "number": 5,
+                "name": "Publish unexpected failure",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        )
     elif change == "duplicate_request":
         duplicate = FallbackRequest.from_dict({**REQUEST, "nonce": "e" * 32})
         values["issue_comments"].append(_request_comment(902, canonical_request_body(duplicate)))
@@ -422,6 +444,8 @@ def test_admission_binds_failure_before_provider_or_budget() -> None:
         "wrong_release",
         "provider_entered",
         "budget_claimed",
+        "extra_failed_job",
+        "extra_failed_step",
         "duplicate_request",
         "duplicate_state",
         "existing_fallback",

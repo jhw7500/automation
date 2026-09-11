@@ -461,6 +461,15 @@ def require_failed_before_provider(jobs: object) -> None:
     if len(matches) != 1:
         raise ContractError("original_jobs_invalid")
     job = matches[0]
+    if any(
+        item is not job
+        and (
+            item.get("status") != "completed"
+            or item.get("conclusion") not in {"success", "skipped"}
+        )
+        for item in items
+    ):
+        raise ContractError("original_jobs_invalid")
     steps_value = job.get("steps")
     if (
         job.get("status") != "completed"
@@ -487,6 +496,15 @@ def require_failed_before_provider(jobs: object) -> None:
         raise ContractError("budget_claimed")
     if provider.get("conclusion") != "skipped":
         raise ContractError("provider_entered")
+    if any(
+        step is not validation
+        and (
+            step.get("status") != "completed"
+            or step.get("conclusion") not in {"success", "skipped"}
+        )
+        for step in steps
+    ):
+        raise ContractError("original_jobs_invalid")
     if not validation["number"] < claim["number"] < provider["number"]:
         raise ContractError("original_jobs_invalid")
 
