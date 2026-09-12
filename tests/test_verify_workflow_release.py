@@ -51,6 +51,9 @@ REVIEW_INVOCATION_BUDGET_HELPER = (
 V176_COMMIT = "444a7347aee169ed178aae80e8bd8d10eca52e02"
 V177_COMMIT = "dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19"
 V178_COMMIT = "a08141d644ab1036cadd8167d48158e827dcd978"
+CHECK_WORKFLOW_ENABLED_ACTION_PATH = (
+    ".github/actions/check-workflow-enabled/action.yml"
+)
 FALLBACK_RELEASE_FILES = (
     ".github/actions/claude-rollout-fallback/action.yml",
     ".github/actions/claude-rollout-fallback/contract.py",
@@ -198,6 +201,59 @@ def test_v178_immutable_candidate_remains_accepted():
     assert release_verifier.verify_commit_content(ROOT, "v1.78", V178_COMMIT) == V178_COMMIT
 
 
+def test_hardened_claude_fallback_pinned_check_honors_reordered_disabled(tmp_path):
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/claude.yml").read_bytes(), Loader=yaml.BaseLoader,
+    )
+    check_step = next(
+        step for step in workflow["jobs"]["check-enabled"]["steps"]
+        if step.get("id") == "check"
+    )
+    prefix = "jhw7500/automation/.github/actions/check-workflow-enabled@"
+    assert check_step["uses"].startswith(prefix)
+    pin = check_step["uses"][len(prefix):]
+    action = yaml.load(
+        release_verifier.VerifiedCommitTree.open(ROOT, pin).read_file(
+            CHECK_WORKFLOW_ENABLED_ACTION_PATH,
+        ),
+        Loader=yaml.BaseLoader,
+    )
+    script = action["runs"]["steps"][0]["run"]
+    script = script.replace("${{ inputs.workflow-name }}", "claude")
+    script = script.replace("${{ inputs.force-run }}", "false")
+
+    consumer = tmp_path / "consumer"
+    (consumer / ".github").mkdir(parents=True)
+    (consumer / ".github/workflow-config.yml").write_text(
+        "workflows:\n"
+        "  claude:\n"
+        "    description: consumer kill switch\n"
+        "    enabled: false\n",
+    )
+    command_path = tmp_path / "bin"
+    command_path.mkdir()
+    for name in ("grep", "sed", "tr"):
+        os.symlink(shutil.which(name), command_path / name)
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+        cwd=consumer,
+        env={
+            "PATH": str(command_path),
+            "GITHUB_OUTPUT": str(output),
+            "LANG": "C",
+            "LC_ALL": "C",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    enabled = [
+        line for line in output.read_text().splitlines() if line.startswith("enabled=")
+    ]
+    assert enabled == ["enabled=false"]
+
+
 def test_v1781_rejects_immutable_v178_security_boundary():
     with pytest.raises(
         ReleaseVerificationError,
@@ -261,7 +317,7 @@ def restore_mutable_claude_check_action(path: Path) -> None:
     text = path.read_text()
     text = text.replace(
         "jhw7500/automation/.github/actions/check-workflow-enabled@"
-        "fec2c90743cca062f113a87bb5deaf73b61501ce",
+        "a08141d644ab1036cadd8167d48158e827dcd978",
         "jhw7500/automation/.github/actions/check-workflow-enabled@v1.1",
         1,
     )

@@ -73,7 +73,7 @@ from scripts.workflow_release_inventory import (
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 CHECK_WORKFLOW_ENABLED_ACTION = (
     "jhw7500/automation/.github/actions/check-workflow-enabled@"
-    "fec2c90743cca062f113a87bb5deaf73b61501ce"
+    "a08141d644ab1036cadd8167d48158e827dcd978"
 )
 CLAUDE_CODE_ACTION = (
     "anthropics/claude-code-action@"
@@ -7609,7 +7609,7 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     "scripts/verify_claude_rollout_fallback.py": "91b986a63ec0ab97d072b9b7a906b2191d6a4de4adae8025fc5d4855fab883f5",
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
-    ".github/workflows/claude.yml": "a309b233ed754d688c2af0c4486d76bb5f25bde78b4fc86a0c31c2de213c1bc8",
+    ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
     ".github/workflows/claude-code-review.yml": "e9ab0aafc14b21e5eb6780ad80b1ca3c3766e5f8f0cc5b60700cfe88eb18ab81",
     ".github/workflows/opencode-auto-review.yml": "ca6cbf2b1f1c9c57f524c45d4de0c863ac2bb249d0e261bbcf1da7e2017c5ea1",
     ".github/actions/recover-opencode-review/evidence.py": "1eacc5e56ad5554324eeb0ce7a9d6872d1c8e22ca95828ce34758ccc2be0fee1",
@@ -7622,7 +7622,7 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     "scripts/verify_claude_rollout_fallback.py": "76d20b6674e4323c4971b0c27cbbac35c0641e363856d022fdbcb43ac71ce2f2",
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
-    ".github/workflows/claude.yml": "78725b166e53b6d6919d15a924e84a81ee21c702406ffb2ad911aecd8f8d1342",
+    ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
     ".github/workflows/claude-code-review.yml": "130a3ee4164a2561ce6554e1fd6ddac25de11c734e7ec9504c8980841339407f",
     ".github/workflows/opencode-auto-review.yml": "da90fcad95d03f2b51120447edcf187eeb5fbdaa050ded885bb9c9907f3d7f9e",
     ".github/actions/recover-opencode-review/evidence.py": "4e27f7f7f11b3726c67f9e459554de1fc9d00586b37f18d67b7aaf67c5ff0d5b",

@@ -1651,7 +1651,7 @@ further mutations.
 | --- | --- | --- |
 | v1.78 | Annotated tag `7efe562b49c7b5f9fdad6855ff8c2a73b090a122`, peeled commit `a08141d644ab1036cadd8167d48158e827dcd978` | Preserve unchanged |
 | Bootstrap PR | `jhw7500/wlan-package#331`, reviewed HEAD `8ed6b45e8c5df68391941fbd181cfb79f0380178`, base `a35064638d4881c06d7589cd6bfa08a2bffbaff0` | Blocked by tribunal finding A-R1-001; update to v1.78.1 and review the new HEAD |
-| v1.78.1 | Security patch candidate | Narrow pre-admission permissions and pin `check-workflow-enabled` to `fec2c90743cca062f113a87bb5deaf73b61501ce` |
+| v1.78.1 | Security patch candidate | Narrow pre-admission permissions and pin `check-workflow-enabled` to the immutable v1.78 commit `a08141d644ab1036cadd8167d48158e827dcd978`, preserving description-before-enabled fallback parsing |
 | v1.78.2 | Not yet created | Distinct docs-only release after v1.78.1 adoption, with every v1.78.1 release-owned path byte-identical |
 
 - [ ] **Step A: Complete the v1.78.1 hardening patch test-first.** Require

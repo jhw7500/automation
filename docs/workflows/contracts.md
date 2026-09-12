@@ -152,7 +152,8 @@ and the same-name `CLAUDE_CODE_OAUTH_TOKEN` secret.
 
 Release v1.78.1 hardens the jobs that run before managed admission. `check-enabled`
 has only `contents: read`, calls
-`check-workflow-enabled@fec2c90743cca062f113a87bb5deaf73b61501ce`, and cannot
+`check-workflow-enabled@a08141d644ab1036cadd8167d48158e827dcd978`, whose no-`yq`
+fallback accepts `enabled` after descriptive fields, and cannot
 inherit the caller's pull-request write or OIDC grants. `skipped` has an empty
 permission map. The release verifier preserves exact v1.78 acceptance and requires
 these constraints for v1.78.1 and later.

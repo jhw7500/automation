@@ -30,7 +30,7 @@ jobs:
 
       - name: Check workflow config
         id: check
-        uses: jhw7500/automation/.github/actions/check-workflow-enabled@fec2c90743cca062f113a87bb5deaf73b61501ce
+        uses: jhw7500/automation/.github/actions/check-workflow-enabled@a08141d644ab1036cadd8167d48158e827dcd978
         with:
           workflow-name: claude
           force-run: ${{ inputs.force_run && 'true' || 'false' }}
