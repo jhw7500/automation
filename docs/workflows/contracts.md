@@ -150,13 +150,20 @@ only actions/contents/issues/pull-requests read. The nested managed job uses exa
 `$/.github/workflows/claude-code-review.yml`, the consumer write ceiling above,
 and the same-name `CLAUDE_CODE_OAUTH_TOKEN` secret.
 
-Release v1.78.1 hardens the jobs that run before managed admission. `check-enabled`
-has only `contents: read`, calls
+Release v1.78.1 hardens the jobs that run before managed admission in the command
+router. `check-enabled` has only `contents: read`, calls
 `check-workflow-enabled@a08141d644ab1036cadd8167d48158e827dcd978`, whose no-`yq`
 fallback accepts `enabled` after descriptive fields, and cannot
 inherit the caller's pull-request write or OIDC grants. `skipped` has an empty
 permission map. The release verifier preserves exact v1.78 acceptance and requires
 these constraints for v1.78.1 and later.
+
+Release v1.78.2 applies the same boundary to the automatic Claude review workflow.
+Its `check-enabled` job has only `contents`, `issues`, and `pull-requests` read,
+uses the same immutable check-workflow-enabled commit, and therefore cannot inherit
+the caller's pull-request write or OIDC grants. Its `skipped` job has an empty
+permission map. The release verifier preserves the exact v1.78.1 workflow seal
+and requires the automatic-review constraints for v1.78.2 and later.
 
 ## Admission schema 1
 

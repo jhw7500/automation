@@ -68,6 +68,10 @@ on:
 
 jobs:
   check-enabled:
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
     name: Check if enabled
     runs-on: ubuntu-latest
     outputs:
@@ -84,7 +88,7 @@ jobs:
 
       - name: Check workflow config
         id: check
-        uses: jhw7500/automation/.github/actions/check-workflow-enabled@v1.1
+        uses: jhw7500/automation/.github/actions/check-workflow-enabled@a08141d644ab1036cadd8167d48158e827dcd978
         with:
           workflow-name: claude-code-review
           force-run: ${{ inputs.force_run && 'true' || 'false' }}
@@ -1583,6 +1587,7 @@ jobs:
 
 
   skipped:
+    permissions: {}
     name: Workflow Skipped
     needs: check-enabled
     if: needs.check-enabled.outputs.enabled != 'true' || needs.check-enabled.outputs.policy_run != 'true'

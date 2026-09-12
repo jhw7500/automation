@@ -6247,8 +6247,15 @@ def _verify_review_invocation_budget(
             payload = tree.read_file(relative)
             parsed = (ast.parse(payload) if relative.endswith(".py") else
                       _load_release_yaml(payload, reject_duplicate_keys=True))
-            _fallback_parsed_seal(relative, parsed)
-            if hashlib.sha256(payload).hexdigest() != EXPECTED_CLAUDE_FALLBACK_SHA256[relative]:
+            _fallback_parsed_seal(relative, parsed, ref)
+            expected = EXPECTED_CLAUDE_FALLBACK_SHA256[relative]
+            if (
+                relative == ".github/workflows/claude-code-review.yml"
+                and _release_version(ref)
+                    < CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE
+            ):
+                expected = V1781_CLAUDE_REVIEW_SHA256
+            if hashlib.sha256(payload).hexdigest() != expected:
                 raise ReleaseVerificationError("invocation-budget authenticated source digest differs")
         require_budget_workflow_contract(tree, "gemini-auto-review.yml", "gemini", review_policy=True)
         if hashlib.sha256(tree.read_file(".github/workflows/gemini-auto-review.yml")).hexdigest() != EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["gemini"]:
@@ -6870,7 +6877,7 @@ def _verify_review_publication_contracts(
             if release_supports_claude_rollout_fallback(ref) and name == "claude-code-review.yml":
                 # The schema-3 failure/fallback variants have an exact v1.78
                 # parsed seal, including the complete collector and publisher.
-                require_claude_fallback_inputs(documents[name])
+                require_claude_fallback_inputs(documents[name], ref)
                 continue
             contract = {
                 key: value
@@ -7600,9 +7607,10 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
 
 
 # Reviewed fallback inputs, never calculated from the candidate at verification time.
-# The current seals require the v1.78.1 pre-admission hardening; separate historical
-# router seals preserve exact immutable v1.78 acceptance. Parsed seals retain all
-# existing policy statements, and raw seals additionally authenticate exact bytes.
+# The current seals require the v1.78.2 review pre-admission hardening. Separate
+# historical router and review seals preserve exact immutable releases. Parsed
+# seals retain all existing policy statements, and raw seals additionally
+# authenticate exact bytes.
 EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/claude-rollout-fallback/action.yml": "ee4b8e6b88ebfc1d0691e032da93b03ba8268fac1bd9377a26554d8200621c0a",
     ".github/actions/claude-rollout-fallback/contract.py": "ae39e0f9c0a1faa6831559c93150fca7f768fbaa0257aade70f045abd0eafff6",
@@ -7610,7 +7618,7 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
-    ".github/workflows/claude-code-review.yml": "e9ab0aafc14b21e5eb6780ad80b1ca3c3766e5f8f0cc5b60700cfe88eb18ab81",
+    ".github/workflows/claude-code-review.yml": "ce36edc1072a0ce9a77899641b1b6df1c3f4cdcbd50d044995101a4e7494ae29",
     ".github/workflows/opencode-auto-review.yml": "ca6cbf2b1f1c9c57f524c45d4de0c863ac2bb249d0e261bbcf1da7e2017c5ea1",
     ".github/actions/recover-opencode-review/evidence.py": "1eacc5e56ad5554324eeb0ce7a9d6872d1c8e22ca95828ce34758ccc2be0fee1",
     ".github/actions/recover-opencode-review/replay.js": "1587bc1c858708d30edf1da3559cc37486d6eaa6e8fbe7d57ab6debf24e6f503",
@@ -7623,16 +7631,23 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
-    ".github/workflows/claude-code-review.yml": "130a3ee4164a2561ce6554e1fd6ddac25de11c734e7ec9504c8980841339407f",
+    ".github/workflows/claude-code-review.yml": "fdb9f09ef8c283034afbc3b8ecf3bcb60b7d73e00558ba45116531ca547f5bb3",
     ".github/workflows/opencode-auto-review.yml": "da90fcad95d03f2b51120447edcf187eeb5fbdaa050ded885bb9c9907f3d7f9e",
     ".github/actions/recover-opencode-review/evidence.py": "4e27f7f7f11b3726c67f9e459554de1fc9d00586b37f18d67b7aaf67c5ff0d5b",
 }
 CLAUDE_FALLBACK_HARDENING_RELEASE = (1, 78, 1)
+CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE = (1, 78, 2)
 V178_CLAUDE_ROUTER_SHA256 = (
     "bb111fd319a6449f8f56cbe22a20572b662525f9f4a7765bc46a415bba5f5881"
 )
 V178_CLAUDE_ROUTER_PARSED_SHA256 = (
     "5781ef1db5e22f83ed07fc83fabe0beb615544a1412e01b2b8dabfd5f06593ab"
+)
+V1781_CLAUDE_REVIEW_SHA256 = (
+    "e9ab0aafc14b21e5eb6780ad80b1ca3c3766e5f8f0cc5b60700cfe88eb18ab81"
+)
+V1781_CLAUDE_REVIEW_PARSED_SHA256 = (
+    "130a3ee4164a2561ce6554e1fd6ddac25de11c734e7ec9504c8980841339407f"
 )
 FALLBACK_ACTION = "$/.github/actions/claude-rollout-fallback"
 FALLBACK_INPUT_OUTPUTS = {
@@ -7673,6 +7688,11 @@ def _fallback_parsed_seal(relative: str, value: object, ref: str = "v1.78.1") ->
         and _release_version(ref) < CLAUDE_FALLBACK_HARDENING_RELEASE
     ):
         expected = V178_CLAUDE_ROUTER_PARSED_SHA256
+    elif (
+        relative == ".github/workflows/claude-code-review.yml"
+        and _release_version(ref) < CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE
+    ):
+        expected = V1781_CLAUDE_REVIEW_PARSED_SHA256
     if hashlib.sha256(payload.encode()).hexdigest() != expected:
         raise ReleaseVerificationError("Claude fallback parsed contract differs: " + relative)
 
@@ -7711,6 +7731,32 @@ def require_claude_fallback_permissions(
         raise ReleaseVerificationError(
             "Claude fallback pre-admission permission contract differs"
         ) from None
+    if _release_version(ref) < CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE:
+        return
+    try:
+        jobs = review["jobs"]
+        if (
+            jobs["check-enabled"].get("permissions") != {
+                "contents": "read",
+                "issues": "read",
+                "pull-requests": "read",
+            }
+            or jobs["skipped"].get("permissions") != {}
+        ):
+            raise ValueError("pre-admission permissions differ")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise ReleaseVerificationError(
+            "Claude review pre-admission permission contract differs"
+        ) from None
+    check_actions = [
+        step.get("uses")
+        for step in jobs["check-enabled"]["steps"]
+        if step.get("id") == "check"
+    ]
+    if check_actions != [CHECK_WORKFLOW_ENABLED_ACTION]:
+        raise ReleaseVerificationError(
+            "Claude review check-workflow-enabled action is not immutable"
+        )
 
 
 def require_claude_fallback_routes(router: object, ref: str) -> None:
@@ -7752,7 +7798,7 @@ def require_claude_fallback_routes(router: object, ref: str) -> None:
         raise ReleaseVerificationError("Claude fallback route contract differs") from None
 
 
-def require_claude_fallback_inputs(review: object) -> None:
+def require_claude_fallback_inputs(review: object, ref: str = "v1.78.1") -> None:
     try:
         inputs = review["on"]["workflow_call"]["inputs"]
         if {key: value for key, value in inputs.items() if key.startswith("fallback_")} != {
@@ -7776,7 +7822,7 @@ def require_claude_fallback_inputs(review: object) -> None:
             "route.route === 'default_branch_rollout_fallback'",
             "if (!failed && fallbackMode) state.route = fallbackRoute;",
             "publicationPr.base?.sha !== fallbackRoute.reviewed_base_sha")
-        _fallback_parsed_seal(".github/workflows/claude-code-review.yml", review)
+        _fallback_parsed_seal(".github/workflows/claude-code-review.yml", review, ref)
     except (AttributeError, KeyError, TypeError, ValueError):
         raise ReleaseVerificationError("Claude fallback input/publication contract differs") from None
 
@@ -7881,7 +7927,7 @@ def verify_claude_rollout_fallback_contract(
         review = load(".github/workflows/claude-code-review.yml")
         require_claude_fallback_permissions(caller, router, review, ref)
         require_claude_fallback_routes(router, ref)
-        require_claude_fallback_inputs(review)
+        require_claude_fallback_inputs(review, ref)
         require_budget_schema_two(root)
         require_request_and_receipt_contracts(root)
         for relative in (".github/actions/claude-rollout-fallback/action.yml",
@@ -7893,6 +7939,12 @@ def verify_claude_rollout_fallback_contract(
                 and _release_version(ref) < CLAUDE_FALLBACK_HARDENING_RELEASE
             ):
                 expected = V178_CLAUDE_ROUTER_SHA256
+            elif (
+                relative == ".github/workflows/claude-code-review.yml"
+                and _release_version(ref)
+                    < CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE
+            ):
+                expected = V1781_CLAUDE_REVIEW_SHA256
             if hashlib.sha256((root / relative).read_bytes()).hexdigest() != expected:
                 raise ReleaseVerificationError("Claude fallback authenticated source digest differs: " + relative)
     except (OSError, TypeError, ValueError, yaml.YAMLError):

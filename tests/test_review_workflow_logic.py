@@ -451,6 +451,35 @@ def test_review_policy_jobs_do_not_drop_pull_request_read_permission():
         assert pull_request_permission in {"inherited", "read"}
 
 
+def test_claude_review_gate_has_only_required_read_permissions():
+    check_job = REVIEW_WORKFLOWS["claude-code-review"]["jobs"]["check-enabled"]
+
+    assert check_job["permissions"] == {
+        "contents": "read",
+        "issues": "read",
+        "pull-requests": "read",
+    }
+
+
+def test_claude_review_skip_job_has_no_permissions():
+    skipped_job = REVIEW_WORKFLOWS["claude-code-review"]["jobs"]["skipped"]
+
+    assert skipped_job["permissions"] == {}
+
+
+def test_claude_review_gate_uses_immutable_check_action():
+    check_step = _step(
+        REVIEW_WORKFLOWS["claude-code-review"],
+        "check-enabled",
+        "Check workflow config",
+    )
+
+    assert check_step["uses"] == (
+        "jhw7500/automation/.github/actions/check-workflow-enabled@"
+        "a08141d644ab1036cadd8167d48158e827dcd978"
+    )
+
+
 def _job_needs(job: dict) -> set[str]:
     needs = job.get("needs", [])
     return {needs} if isinstance(needs, str) else set(needs)

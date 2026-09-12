@@ -51,6 +51,7 @@ REVIEW_INVOCATION_BUDGET_HELPER = (
 V176_COMMIT = "444a7347aee169ed178aae80e8bd8d10eca52e02"
 V177_COMMIT = "dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19"
 V178_COMMIT = "a08141d644ab1036cadd8167d48158e827dcd978"
+V1781_COMMIT = "72e0cfad8020a1fe40352b70ddb6438791c58f00"
 CHECK_WORKFLOW_ENABLED_ACTION_PATH = (
     ".github/actions/check-workflow-enabled/action.yml"
 )
@@ -87,7 +88,7 @@ def test_v178_patch_publication_proves_owned_boundary_before_post():
     branches = [node for node in tree.body if isinstance(node, ast.If)
                 and ast.unparse(node.test) == "tag == 'v1.78.2'"
                 and node.end_lineno < first_post]
-    assert len(branches) == 1, "v1.78.2 needs a pre-publication boundary proof"
+    assert len(branches) == 1, "v1.78.2 needs a pre-publication patch proof"
     branch = branches[0]
     assert branch.end_lineno < first_post
     assert not branch.orelse, "v1.78.1 security patch must not need an existing v1.78.1 tag"
@@ -144,7 +145,9 @@ def test_v178_patch_publication_proves_owned_boundary_before_post():
         "from scripts.workflow_release_inventory import release_paths_for",
         'release_paths_for("v1.78.1")',
         "owned = json.loads(inventory.stdout)",
-        "git('diff', '--raw', '--no-ext-diff', '--no-textconv', '--exit-code', v1781_commit, commit, '--', *owned, cwd=checkout) == ''",
+        "expected_owned_changes = {'.github/workflows/claude-code-review.yml', 'scripts/verify_workflow_release.py'}",
+        "changed = git('diff', '--name-only', '--no-ext-diff', '--no-textconv', v1781_commit, commit, '--', *owned, cwd=checkout).splitlines()",
+        "len(changed) == len(expected_owned_changes) and set(changed) == expected_owned_changes",
         "set(public_tags('v1.78.1').splitlines()) == tag_pairs('v1.78.1', v1781_tag, v1781_commit)",
     ]
     offset = 0
@@ -262,11 +265,17 @@ def test_v1781_rejects_immutable_v178_security_boundary():
         release_verifier.verify_commit_content(ROOT, "v1.78.1", V178_COMMIT)
 
 
-@pytest.mark.parametrize("ref", ("v1.78.1", "v1.78.2"))
-def test_hardened_claude_fallback_candidate_is_accepted(fallback_release_repo, ref):
+def test_v1781_immutable_candidate_remains_accepted():
+    assert (
+        release_verifier.verify_commit_content(ROOT, "v1.78.1", V1781_COMMIT)
+        == V1781_COMMIT
+    )
+
+
+def test_hardened_claude_fallback_candidate_is_accepted(fallback_release_repo):
     repo, candidate = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, ref)
-    assert release_verifier.verify_commit_content(repo, ref, candidate) == candidate
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.2")
+    assert release_verifier.verify_commit_content(repo, "v1.78.2", candidate) == candidate
 
 
 FALLBACK_MUTATIONS = {
@@ -324,6 +333,22 @@ def restore_mutable_claude_check_action(path: Path) -> None:
     path.write_text(text)
 
 
+def inherit_claude_review_pre_admission_permissions(path: Path) -> None:
+    text = path.read_text()
+    hardened_gate = (
+        "  check-enabled:\n"
+        "    permissions:\n"
+        "      contents: read\n"
+        "      issues: read\n"
+        "      pull-requests: read\n"
+    )
+    hardened_skip = "  skipped:\n    permissions: {}\n"
+    assert hardened_gate in text and hardened_skip in text
+    text = text.replace(hardened_gate, "  check-enabled:\n", 1)
+    text = text.replace(hardened_skip, "  skipped:\n", 1)
+    path.write_text(text)
+
+
 @pytest.mark.parametrize(
     ("mutate", "error"),
     [
@@ -338,28 +363,62 @@ def restore_mutable_claude_check_action(path: Path) -> None:
     ],
     ids=("ambient-permissions", "mutable-check-action"),
 )
-def test_v1781_rejects_claude_router_pre_admission_regressions(
+def test_v1782_rejects_claude_router_pre_admission_regressions(
     fallback_release_repo, mutate, error,
 ):
     repo, _ = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.1")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.2")
     mutate(repo / ".github/workflows/claude.yml")
     with pytest.raises(ReleaseVerificationError, match=error):
-        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.1")
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.2")
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error"),
+    [
+        (
+            inherit_claude_review_pre_admission_permissions,
+            "Claude review pre-admission permission contract differs",
+        ),
+        (
+            restore_mutable_claude_check_action,
+            "Claude review check-workflow-enabled action is not immutable",
+        ),
+    ],
+    ids=("ambient-permissions", "mutable-check-action"),
+)
+def test_v1782_rejects_claude_review_pre_admission_regressions(
+    fallback_release_repo, mutate, error,
+):
+    repo, _ = fallback_release_repo
+
+    def load(relative):
+        return yaml.load((repo / relative).read_bytes(), Loader=yaml.BaseLoader)
+
+    caller = load("examples/baseline-workflows/.github/workflows/claude.yml")
+    router = load(".github/workflows/claude.yml")
+    release_verifier.require_claude_fallback_permissions(
+        caller, router, load(".github/workflows/claude-code-review.yml"), "v1.78.2"
+    )
+    mutate(repo / ".github/workflows/claude-code-review.yml")
+    with pytest.raises(ReleaseVerificationError, match=error):
+        release_verifier.require_claude_fallback_permissions(
+            caller, router, load(".github/workflows/claude-code-review.yml"), "v1.78.2"
+        )
 
 
 @pytest.mark.parametrize("mutation", list(FALLBACK_MUTATIONS))
-def test_v1781_rejects_fallback_contract_mutation(fallback_release_repo, mutation):
+def test_v1782_rejects_fallback_contract_mutation(fallback_release_repo, mutation):
     repo, _ = fallback_release_repo
     # Establish acceptance first: an older seal must not mask a missing current seal.
-    release_verifier.verify_claude_rollout_fallback_contract(repo)
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.2")
     relative, old, new = FALLBACK_MUTATIONS[mutation]
     replace(repo / relative, old, new, count=1)
     bad = commit(repo, f"mutate {mutation}")
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_claude_rollout_fallback_contract(repo)
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.2")
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_commit_content(repo, "v1.78.1", bad)
+        release_verifier.verify_commit_content(repo, "v1.78.2", bad)
 
 RECOVERY_RELEASE_FILES = (
     ".github/actions/recover-opencode-review/evidence.py",
