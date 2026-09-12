@@ -279,6 +279,16 @@ def test_post_create_pr_metadata_drift_stops_before_success():
     assert state["writes"] == ["blobs", "refs", "pr"]
 
 
+def test_duplicate_rollout_pr_readback_stops_before_success():
+    publish = canary_publisher()
+    approved, state, fleet, snapshot, candidate, observe, action = canary_fixture()
+    original_list = fleet.list_rollout_prs
+    fleet.list_rollout_prs = lambda *args: (*original_list(*args), SimpleNamespace(number=1000))
+    with pytest.raises(ValueError, match="reconcile read-only"):
+        publish(approved, fleet, observe, action)
+    assert state["writes"] == ["blobs", "refs", "pr"]
+
+
 @pytest.mark.parametrize("base_moves", [False, True])
 def test_documented_candidate_survives_review_then_uses_released_adapters(tmp_path, monkeypatch, base_moves):
     """Execute both snippets using real render/Git/adapters; fake only external I/O."""
