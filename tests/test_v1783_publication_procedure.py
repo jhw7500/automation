@@ -7,8 +7,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -119,6 +121,25 @@ def canary_publisher():
     namespace = {}
     exec(compile(source, str(DOCUMENT), "exec"), namespace)
     return namespace["publish_approved_canary"]
+
+
+def test_documented_preparation_interpreter_loads_dependencies_without_consumer_imports(tmp_path):
+    launch = DOCUMENT.read_text().split("controller process launched with\n`", 1)[1].split("`", 1)[0]
+    command = shlex.split(launch)
+    assert command[:2] == ["rtk", "python3"]
+    (tmp_path / "yaml.py").write_text("raise RuntimeError('consumer dependency imported')\n")
+    source = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from scripts import rollout_workflow_fleet; "
+        "assert callable(rollout_workflow_fleet.construct_rollout_commit); "
+        "print('fleet dependency import: PASS')"
+    )
+    result = subprocess.run(
+        [sys.executable, *command[2:], "-c", source, str(DOCUMENT.parents[2])],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "fleet dependency import: PASS\n"
 
 
 def canary_fixture():
