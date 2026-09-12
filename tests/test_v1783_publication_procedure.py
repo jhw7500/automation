@@ -146,8 +146,12 @@ def canary_fixture():
     approved = {"repository": "jhw7500/wlan-package", "base_ref": "master", "base_sha": "b" * 40,
                 "head_sha": "c" * 40, "tree_sha": "d" * 40,
                 "branch": "automation/common-workflows-v1.78.3", "title": "canonical title", "body": "canonical body"}
-    state = {"base": approved["base_sha"], "head": None, "writes": [], "move_after_blob": False}
+    state = {"base": approved["base_sha"], "head": None, "writes": [],
+             "move_after_blob": False, "ref_post_uncertain": False}
     fleet = SimpleNamespace()
+
+    class FleetGitError(RuntimeError):
+        pass
 
     def post(repo, section, payload):
         state["writes"].append(section)
@@ -155,11 +159,17 @@ def canary_fixture():
             state["base"] = "e" * 40
         if section == "refs":
             state["head"] = payload["sha"]
+            if state["ref_post_uncertain"]:
+                raise FleetGitError("GitHub ref response unavailable")
         return {}
 
     def branch(snapshot, name, *, commit):
         fleet._github_post("wlan-package", "blobs", {})
-        fleet._github_post("wlan-package", "refs", {"ref": "refs/heads/" + name, "sha": commit.head_sha})
+        try:
+            fleet._github_post("wlan-package", "refs", {"ref": "refs/heads/" + name, "sha": commit.head_sha})
+        except FleetGitError:
+            if state["head"] != commit.head_sha:
+                raise
         return commit.head_sha
 
     def pr(*args):
@@ -167,6 +177,7 @@ def canary_fixture():
         return args
 
     fleet._github_post, fleet.create_rollout_branch, fleet.create_pull_request = post, branch, pr
+    fleet.FleetGitError = FleetGitError
     snapshot = SimpleNamespace(path=Path("/tmp/wlan-package"), default_branch="master", base_branch="master", base_sha="b" * 40)
     candidate = SimpleNamespace(head_sha="c" * 40, tree_sha="d" * 40, base_sha="b" * 40)
     observe = lambda: {"repository": "jhw7500/wlan-package", "base_ref": "master", "base_sha": state["base"], "head_sha": state["head"]}
@@ -204,6 +215,16 @@ def test_mid_publication_base_drift_stops_before_ref_and_pr():
     with pytest.raises(ValueError):
         publish(approved, fleet, observe, action)
     assert state["writes"] == ["blobs"] and state["head"] is None
+
+
+def test_uncertain_ref_creation_stops_before_pr():
+    publish = canary_publisher()
+    approved, state, fleet, snapshot, candidate, observe, action = canary_fixture()
+    state["ref_post_uncertain"] = True
+    with pytest.raises(ValueError, match="reconcile read-only"):
+        publish(approved, fleet, observe, action)
+    assert state["writes"] == ["blobs", "refs"]
+    assert state["head"] == approved["head_sha"]
 
 
 @pytest.mark.parametrize("wrong", ["head", "body"])
