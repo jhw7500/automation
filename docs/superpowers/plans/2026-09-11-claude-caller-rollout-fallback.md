@@ -1658,7 +1658,7 @@ verifier, which protected the command router but not the automatic review gate.
 | Consumer updates | wlan-package #331 and the local tossApp candidate target v1.78.1 | Hold merge; repin both to the reviewed v1.78.2 release and rerun their exact-HEAD reviews |
 
 - [ ] **Step I: Complete the v1.78.2 automatic-review hardening test-first.** Give
-  `check-enabled` only contents/issues/pull-requests read, give `skipped` an empty
+  `check-enabled` only contents/pull-requests read, give `skipped` an empty
   permission map, and pin the config check to the immutable v1.78 commit. Add
   mutation tests proving the release verifier rejects inherited authority and a
   movable action reference while retaining exact v1.78.1 acceptance.

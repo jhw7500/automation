@@ -77,7 +77,7 @@ def test_v178_adds_only_claude_rollout_fallback_roots():
     assert release_inventory.release_supports_claude_rollout_fallback("v1.78.1")
 
 
-def test_v178_patch_publication_proves_owned_boundary_before_post():
+def test_v178_patch_publication_proves_owned_boundary_before_post(tmp_path):
     document = (ROOT / "docs/workflow-fleet-rollout.md").read_text()
     section = document.split("## Create-only v1.78.1 and v1.78.2 tag publication\n", 1)[1]
     body = section.split("' <<'CLAUDE_RELEASE_PY'\n", 1)[1].split("\nCLAUDE_RELEASE_PY", 1)[0]
@@ -146,7 +146,8 @@ def test_v178_patch_publication_proves_owned_boundary_before_post():
         'release_paths_for("v1.78.1")',
         "owned = json.loads(inventory.stdout)",
         "expected_owned_changes = {'.github/workflows/claude-code-review.yml', 'scripts/verify_workflow_release.py'}",
-        "changed = git('diff', '--name-only', '--no-ext-diff', '--no-textconv', v1781_commit, commit, '--', *owned, cwd=checkout).splitlines()",
+        "diff_scope = sorted(set(owned) | expected_owned_changes)",
+        "changed = git('diff', '--name-only', '--no-ext-diff', '--no-textconv', v1781_commit, commit, '--', *diff_scope, cwd=checkout).splitlines()",
         "len(changed) == len(expected_owned_changes) and set(changed) == expected_owned_changes",
         "set(public_tags('v1.78.1').splitlines()) == tag_pairs('v1.78.1', v1781_tag, v1781_commit)",
     ]
@@ -162,6 +163,49 @@ def test_v178_patch_publication_proves_owned_boundary_before_post():
         keywords = {item.arg: ast.unparse(item.value) for item in run.keywords}
         assert keywords["cwd"] == "baseline", "never import the candidate's reduced inventory"
         assert keywords["check"] == "True"
+
+    expected_owned_changes = {
+        ".github/workflows/claude-code-review.yml",
+        "scripts/verify_workflow_release.py",
+    }
+    owned = release_inventory.release_paths_for("v1.78.1")
+    diff_scope = sorted(set(owned) | expected_owned_changes)
+    unexpected = ".github/actions/setup-gemini-auth/action.yml"
+    assert unexpected in owned and unexpected not in expected_owned_changes
+
+    candidate = tmp_path / "v1782-patch"
+    candidate.mkdir()
+    git(candidate, "init", "-q")
+    git(candidate, "config", "user.email", "test@example.com")
+    git(candidate, "config", "user.name", "Test")
+    for relative in (*sorted(expected_owned_changes), unexpected):
+        target = candidate / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(subprocess.check_output(
+            ["git", "show", f"{V1781_COMMIT}:{relative}"], cwd=ROOT,
+        ))
+    base = commit(candidate, "v1.78.1")
+    for relative in expected_owned_changes:
+        (candidate / relative).write_bytes((ROOT / relative).read_bytes())
+    changed = git(
+        candidate, "diff", "--name-only", "--no-ext-diff", "--no-textconv",
+        base, "--", *diff_scope,
+    ).splitlines()
+
+    def accepts(paths):
+        return (
+            len(paths) == len(expected_owned_changes)
+            and set(paths) == expected_owned_changes
+        )
+
+    assert accepts(changed)
+    with (candidate / unexpected).open("ab") as stream:
+        stream.write(b"# unexpected release-owned change\n")
+    changed = git(
+        candidate, "diff", "--name-only", "--no-ext-diff", "--no-textconv",
+        base, "--", *diff_scope,
+    ).splitlines()
+    assert not accepts(changed)
 
 
 def test_v176_candidate_remains_accepted():
@@ -339,7 +383,6 @@ def inherit_claude_review_pre_admission_permissions(path: Path) -> None:
         "  check-enabled:\n"
         "    permissions:\n"
         "      contents: read\n"
-        "      issues: read\n"
         "      pull-requests: read\n"
     )
     hardened_skip = "  skipped:\n    permissions: {}\n"
@@ -347,6 +390,18 @@ def inherit_claude_review_pre_admission_permissions(path: Path) -> None:
     text = text.replace(hardened_gate, "  check-enabled:\n", 1)
     text = text.replace(hardened_skip, "  skipped:\n", 1)
     path.write_text(text)
+
+
+def remove_claude_review_check_steps(path: Path) -> None:
+    document = yaml.load(path.read_bytes(), Loader=yaml.BaseLoader)
+    del document["jobs"]["check-enabled"]["steps"]
+    path.write_text(yaml.safe_dump(document, sort_keys=False))
+
+
+def make_claude_review_step_non_mapping(path: Path) -> None:
+    document = yaml.load(path.read_bytes(), Loader=yaml.BaseLoader)
+    document["jobs"]["check-enabled"]["steps"][0] = "invalid-step"
+    path.write_text(yaml.safe_dump(document, sort_keys=False))
 
 
 @pytest.mark.parametrize(
@@ -384,27 +439,30 @@ def test_v1782_rejects_claude_router_pre_admission_regressions(
             restore_mutable_claude_check_action,
             "Claude review check-workflow-enabled action is not immutable",
         ),
+        (
+            remove_claude_review_check_steps,
+            "Claude review check-workflow-enabled action is not immutable",
+        ),
+        (
+            make_claude_review_step_non_mapping,
+            "Claude review check-workflow-enabled action is not immutable",
+        ),
     ],
-    ids=("ambient-permissions", "mutable-check-action"),
+    ids=(
+        "ambient-permissions",
+        "mutable-check-action",
+        "missing-steps",
+        "non-mapping-step",
+    ),
 )
 def test_v1782_rejects_claude_review_pre_admission_regressions(
     fallback_release_repo, mutate, error,
 ):
     repo, _ = fallback_release_repo
-
-    def load(relative):
-        return yaml.load((repo / relative).read_bytes(), Loader=yaml.BaseLoader)
-
-    caller = load("examples/baseline-workflows/.github/workflows/claude.yml")
-    router = load(".github/workflows/claude.yml")
-    release_verifier.require_claude_fallback_permissions(
-        caller, router, load(".github/workflows/claude-code-review.yml"), "v1.78.2"
-    )
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.2")
     mutate(repo / ".github/workflows/claude-code-review.yml")
     with pytest.raises(ReleaseVerificationError, match=error):
-        release_verifier.require_claude_fallback_permissions(
-            caller, router, load(".github/workflows/claude-code-review.yml"), "v1.78.2"
-        )
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.2")
 
 
 @pytest.mark.parametrize("mutation", list(FALLBACK_MUTATIONS))

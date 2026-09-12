@@ -817,8 +817,9 @@ if tag == "v1.78.2":
         ".github/workflows/claude-code-review.yml",
         "scripts/verify_workflow_release.py",
     }
+    diff_scope = sorted(set(owned) | expected_owned_changes)
     changed = git("diff", "--name-only", "--no-ext-diff", "--no-textconv",
-                  v1781_commit, commit, "--", *owned, cwd=checkout).splitlines()
+                  v1781_commit, commit, "--", *diff_scope, cwd=checkout).splitlines()
     require(len(changed) == len(expected_owned_changes)
             and set(changed) == expected_owned_changes,
             "v1.78.2 release-owned patch scope differs")

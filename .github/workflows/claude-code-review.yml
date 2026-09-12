@@ -70,7 +70,6 @@ jobs:
   check-enabled:
     permissions:
       contents: read
-      issues: read
       pull-requests: read
     name: Check if enabled
     runs-on: ubuntu-latest

@@ -159,7 +159,7 @@ permission map. The release verifier preserves exact v1.78 acceptance and requir
 these constraints for v1.78.1 and later.
 
 Release v1.78.2 applies the same boundary to the automatic Claude review workflow.
-Its `check-enabled` job has only `contents`, `issues`, and `pull-requests` read,
+Its `check-enabled` job has only `contents` and `pull-requests` read,
 uses the same immutable check-workflow-enabled commit, and therefore cannot inherit
 the caller's pull-request write or OIDC grants. Its `skipped` job has an empty
 permission map. The release verifier preserves the exact v1.78.1 workflow seal

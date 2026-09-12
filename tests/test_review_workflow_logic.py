@@ -456,7 +456,6 @@ def test_claude_review_gate_has_only_required_read_permissions():
 
     assert check_job["permissions"] == {
         "contents": "read",
-        "issues": "read",
         "pull-requests": "read",
     }
 

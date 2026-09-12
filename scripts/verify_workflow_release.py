@@ -7618,7 +7618,7 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
-    ".github/workflows/claude-code-review.yml": "ce36edc1072a0ce9a77899641b1b6df1c3f4cdcbd50d044995101a4e7494ae29",
+    ".github/workflows/claude-code-review.yml": "4042a50e7d4e5155c82677a27692482f64766eb660be07aaf88829b925f8be15",
     ".github/workflows/opencode-auto-review.yml": "ca6cbf2b1f1c9c57f524c45d4de0c863ac2bb249d0e261bbcf1da7e2017c5ea1",
     ".github/actions/recover-opencode-review/evidence.py": "1eacc5e56ad5554324eeb0ce7a9d6872d1c8e22ca95828ce34758ccc2be0fee1",
     ".github/actions/recover-opencode-review/replay.js": "1587bc1c858708d30edf1da3559cc37486d6eaa6e8fbe7d57ab6debf24e6f503",
@@ -7631,7 +7631,7 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
-    ".github/workflows/claude-code-review.yml": "fdb9f09ef8c283034afbc3b8ecf3bcb60b7d73e00558ba45116531ca547f5bb3",
+    ".github/workflows/claude-code-review.yml": "8239044289476276719047121bff873731ea2c425457976379513de75182184b",
     ".github/workflows/opencode-auto-review.yml": "da90fcad95d03f2b51120447edcf187eeb5fbdaa050ded885bb9c9907f3d7f9e",
     ".github/actions/recover-opencode-review/evidence.py": "4e27f7f7f11b3726c67f9e459554de1fc9d00586b37f18d67b7aaf67c5ff0d5b",
 }
@@ -7738,7 +7738,6 @@ def require_claude_fallback_permissions(
         if (
             jobs["check-enabled"].get("permissions") != {
                 "contents": "read",
-                "issues": "read",
                 "pull-requests": "read",
             }
             or jobs["skipped"].get("permissions") != {}
@@ -7748,11 +7747,16 @@ def require_claude_fallback_permissions(
         raise ReleaseVerificationError(
             "Claude review pre-admission permission contract differs"
         ) from None
-    check_actions = [
-        step.get("uses")
-        for step in jobs["check-enabled"]["steps"]
-        if step.get("id") == "check"
-    ]
+    try:
+        check_actions = [
+            step.get("uses")
+            for step in jobs["check-enabled"]["steps"]
+            if step.get("id") == "check"
+        ]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise ReleaseVerificationError(
+            "Claude review check-workflow-enabled action is not immutable"
+        ) from None
     if check_actions != [CHECK_WORKFLOW_ENABLED_ACTION]:
         raise ReleaseVerificationError(
             "Claude review check-workflow-enabled action is not immutable"
