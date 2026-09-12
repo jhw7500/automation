@@ -652,20 +652,21 @@ response OIDs, then verifies the local and public direct/peeled identities.
 Both paths authenticate the existing annotated v1.78 tag object
 `7efe562b49c7b5f9fdad6855ff8c2a73b090a122` and peeled commit
 `a08141d644ab1036cadd8167d48158e827dcd978`. v1.78.1 is the reviewed security
-patch that narrows pre-admission Claude permissions and pins the nested
-check-workflow-enabled action to an immutable commit. For v1.78.2, before either
-POST the procedure also authenticates the existing annotated v1.78.1 tag and
-peeled commit, requires a distinct reviewed candidate, and compares every
-v1.78.1 inventory-owned path, mode and blob. The inventory is loaded from the
-authenticated v1.78.1 checkout, so the candidate cannot reduce the comparison.
-Any release-owned difference invalidates the v1.78.2 boundary canary and requires
-a normal reviewed patch design. First publication of v1.78.1 has no
-prior-v1.78.1 check. Both paths also authenticate immutable v1.77 tag object
+patch that narrows the managed command router's pre-admission permissions and
+pins its nested check-workflow-enabled action to an immutable commit. v1.78.2
+extends that boundary to the automatic Claude review workflow. Before either
+POST, its procedure authenticates the existing annotated v1.78.1 tag and peeled
+commit, requires a distinct reviewed candidate, and loads the complete release
+inventory from the authenticated v1.78.1 checkout. Exactly the central Claude
+review workflow and its release verifier may differ; every other inventory-owned
+path must remain unchanged, and the candidate verifier still authenticates all
+release paths and modes. First publication of v1.78.1 has no prior-v1.78.1 check.
+Both paths also authenticate immutable v1.77 tag object
 `81f44fb6786bdfcc40f93161db74b1d9a9e3b7c5`, peeled commit
 `dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19`, and the unchanged v1.76 identity
 before any publication write. v1.77 is #183's observational-token release;
-#182's fallback begins in v1.78, is hardened in v1.78.1, and uses v1.78.2 for
-the distinct real-boundary canary.
+#182's fallback begins in v1.78, its router is hardened in v1.78.1, and its
+automatic review pre-admission path is hardened in v1.78.2.
 
 ```bash
 rtk proxy /usr/bin/python3 -I -S -B -c '
@@ -812,9 +813,16 @@ if tag == "v1.78.2":
     owned = json.loads(inventory.stdout)
     require(isinstance(owned, list) and owned and all(isinstance(path, str) for path in owned),
             "invalid authenticated v1.78.1 inventory")
-    require(git("diff", "--raw", "--no-ext-diff", "--no-textconv", "--exit-code",
-                v1781_commit, commit, "--", *owned, cwd=checkout) == "",
-            "release-owned difference invalidates boundary canary; normal reviewed patch design required")
+    expected_owned_changes = {
+        ".github/workflows/claude-code-review.yml",
+        "scripts/verify_workflow_release.py",
+    }
+    diff_scope = sorted(set(owned) | expected_owned_changes)
+    changed = git("diff", "--name-only", "--no-ext-diff", "--no-textconv",
+                  v1781_commit, commit, "--", *diff_scope, cwd=checkout).splitlines()
+    require(len(changed) == len(expected_owned_changes)
+            and set(changed) == expected_owned_changes,
+            "v1.78.2 release-owned patch scope differs")
     require(set(public_tags("v1.78.1").splitlines()) == tag_pairs("v1.78.1", v1781_tag, v1781_commit),
             "v1.78.1 identity moved before write")
 require(set(public_tags("v1.76").splitlines()) == tag_pairs("v1.76", v176_tag, v176_commit),
@@ -887,7 +895,7 @@ A failed or uncertain POST stops the procedure. Preserve both raw response files
 that exist and reconcile with read-only API/public Git reads. An orphan annotated
 object is harmless; a concurrent ref creation must never be repaired by moving
 or deleting the tag. Repeat this procedure for v1.78.2 only after its separate
-reviewed main change and publication authorization.
+reviewed security change and publication authorization.
 
 ## v1.76 bootstrap evidence
 
@@ -917,37 +925,20 @@ driver. A v1.78.1 adoption PR alone is not the real boundary canary: until merge
 the default branch still runs the older caller. Request/admission/ledger/comment
 and receipt schemas are defined in [the consumer contract](workflows/contracts.md).
 
-## v1.78.2 real-boundary canary
+## v1.78.2 automatic-review hardening adoption
 
-Publish a separately reviewed v1.78.2 commit after v1.78.1 caller adoption. It must
-be distinct from the authenticated v1.78.1 peeled commit while preserving every
-v1.78.1 release-owned byte, path and mode. Before publication, the procedure above
-must prove an empty raw Git diff across the authenticated v1.78.1 inventory. Any
-difference invalidates this boundary canary and requires a normal reviewed patch
-design. Create one
-approved managed rollout PR from the v1.78.1 default to v1.78.2; record exact HEAD,
-base and managed diff hash. Require the original automatic attempt to fail at
-caller validation, with budget claim and provider skipped and the matching
-canonical automatic failure. Post one separately authorized canonical managed
-request after that failure. Its target release is v1.78.2; its default caller and
-verification checkout remain the exact v1.78.1 driver commit. Wait for the managed
-run and charged invocation to finalize. Do not retry an uncertain request.
+Publish v1.78.2 only from the separately reviewed security patch described above.
+Update bootstrap consumers directly to its immutable peeled commit, preserving
+the expanded v1.78.1 review budgets. A caller-changing PR can still produce the
+expected workflow-validation mismatch while its default branch runs an older
+caller; preserve that result as bootstrap evidence and require the repository's
+other review gates before a separately authorized merge.
 
-From a clean automation checkout at that driver commit, in an independently
-mode-0700 evidence directory, run the read-only verifier using recorded values:
-
-```bash
-rtk proxy /usr/bin/python3 -I -S -B "$AUTOMATION_ROOT/scripts/verify_claude_rollout_fallback.py" \
-  --automation-root "$AUTOMATION_ROOT" --release-ref v1.78.2 --remote origin \
-  --repository "$CONSUMER_REPOSITORY" --pr "$PR_NUMBER" \
-  --expected-head "$EXPECTED_HEAD_SHA" --expected-base "$EXPECTED_BASE_SHA" \
-  --output "$PRIVATE_EVIDENCE_DIRECTORY/claude-fallback-receipt.json"
-```
-
-The output must be absent before invocation. Require an owned regular mode-0600
-receipt, `effective_status: CLEAN`, the distinct driver/target commits and the
-recorded request/run/comment/budget coordinates. A receipt permits evaluation of
-the named rollout tuple; it does not itself authorize merging.
+After a consumer default branch installs v1.78.2, use a later distinct reviewed
+release for the real managed-boundary canary. That release must have its own
+create-only publication procedure, exact driver and target commits, and the same
+request, invocation, finalized-budget, canonical-result and mode-0600 receipt
+proofs. Do not reuse the former docs-only v1.78.2 assumption.
 
 ## Required-check stop conditions
 

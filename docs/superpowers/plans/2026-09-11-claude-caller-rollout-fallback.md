@@ -1641,7 +1641,44 @@ Close the telemetry run on every exit. A PASS records bound HEAD/diff. CRITICAL/
 
 ### Task 8: Immutable release, real-boundary canary, and bootstrap batch
 
-#### Current execution amendment (2026-09-12)
+#### Automatic-review security amendment (2026-09-12)
+
+This amendment supersedes the v1.78.2 docs-only and real-boundary-canary steps in
+the earlier amendment below. Its v1.78.1 evidence and completed validation remain
+historical inputs. A consumer tribunal found that the automatic
+`claude-code-review.yml` still let `check-enabled` and `skipped` inherit the
+caller's pull-request write and OIDC ceiling, and its config check still used the
+mutable `check-workflow-enabled@v1.1` tag. The same omission existed in the release
+verifier, which protected the command router but not the automatic review gate.
+
+| Boundary | Current evidence | Required next state |
+| --- | --- | --- |
+| v1.78.1 | Published immutable router-hardening release | Preserve exact tag and historical verifier acceptance |
+| v1.78.2 | Unpublished | Automatic-review security patch with exact release-owned changes limited to the central Claude review workflow and verifier |
+| Consumer updates | wlan-package #331 and the local tossApp candidate target v1.78.1 | Hold merge; repin both to the reviewed v1.78.2 release and rerun their exact-HEAD reviews |
+
+- [ ] **Step I: Complete the v1.78.2 automatic-review hardening test-first.** Give
+  `check-enabled` only contents/pull-requests read, give `skipped` an empty
+  permission map, and pin the config check to the immutable v1.78 commit. Add
+  mutation tests proving the release verifier rejects inherited authority and a
+  movable action reference while retaining exact v1.78.1 acceptance.
+- [ ] **Step J: Review and merge the central security patch.** Run focused and
+  full verification, actionlint, Python compilation and `git diff --check`, then
+  complete the three-role tribunal and hosted reviews on one exact HEAD. Obtain
+  the separate exact-tuple merge approval required by this plan.
+- [ ] **Step K: Publish v1.78.2 only after separate tag approval.** Use the
+  create-only procedure, authenticate the v1.78.1 direct and peeled identities,
+  and require the release-owned diff to contain exactly the central Claude review
+  workflow and its verifier. Never move, delete, or blindly retry a tag write.
+- [ ] **Step L: Repin and rereview both consumer candidates.** Update only the
+  managed config and active caller paths to v1.78.2, preserve prior evidence, and
+  rerun local and hosted exact-HEAD checks. Merge each repository only after its
+  separate reviewed tuple is approved.
+- [ ] **Step M: Defer the real managed-boundary canary.** After a default branch
+  installs v1.78.2, select a later distinct release and add a separately reviewed
+  create-only publication procedure and receipt-bound canary plan.
+
+#### Prior execution amendment (2026-09-12; superseded where conflicting)
 
 This amendment supersedes the original numbered Task 8 procedure below. The old
 sequence is retained only as historical design provenance and must not be used for
