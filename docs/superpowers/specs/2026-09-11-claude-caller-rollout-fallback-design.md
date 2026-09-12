@@ -7,11 +7,13 @@ Issue: https://github.com/jhw7500/automation/issues/182
 Integration note (2026-09-11): #183 published observational token estimates as
 immutable v1.77, tag object `81f44fb6786bdfcc40f93161db74b1d9a9e3b7c5` at exact
 commit `dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19`. The #182 fallback release is
-therefore v1.78, with its distinct byte-identical boundary canary at v1.78.1.
-The normal main merge preserves reviewed Task 1-6 history. Both future publication
-paths authenticate v1.77 and unchanged v1.76 before any write; v1.78.1 additionally
-authenticates v1.78 and compares all release-owned paths using that baseline's
-inventory. Schema 2 keeps token estimates observational and preserves the v1.77
+therefore immutable v1.78. A consumer tribunal finding after publication requires
+the pre-admission permission and action-pin correction in v1.78.1; the distinct
+byte-identical boundary canary moves to v1.78.2. The normal main merge preserves
+reviewed Task 1-6 history. Both new publication paths authenticate v1.78, v1.77,
+and unchanged v1.76 before any write; v1.78.2 additionally authenticates v1.78.1
+and compares all release-owned paths using that baseline's inventory. Schema 2
+keeps token estimates observational and preserves the v1.77
 summary field, round, override, call-count, wall-time, checkpoint and provenance
 gates. v1.77 continues to validate its authentic schema-1 helper. The v1.76 source
 and bootstrap evidence below are historical and remain unchanged.
@@ -168,10 +170,12 @@ workflow's exact commit; it does not select code from the consumer checkout.
 
 The consumer caller grants `pull-requests: write` as the permission ceiling required
 for the canonical sticky comment. The central interactive job continues to reduce
-its own permissions to read-only. Only the admitted managed rollout job retains the
-write permission used by the existing canonical publication path. Both jobs keep
-`contents: read`, `actions: read`, `issues: read` and `id-token: write` at the minimum
-already required by their provider paths.
+its own permissions to read-only. The unconditional `check-enabled` job receives
+only `contents: read`, the `skipped` job receives no permissions, and the nested
+check action is pinned to an exact commit. Only the admitted managed rollout job
+retains the write permission used by the existing canonical publication path.
+Provider paths keep `contents: read`, `actions: read`, `issues: read` and
+`id-token: write` at the minimum already required by those paths.
 
 The nested review receives new optional, all-or-none fallback inputs:
 

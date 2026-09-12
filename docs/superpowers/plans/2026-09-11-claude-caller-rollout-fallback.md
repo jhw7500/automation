@@ -15,26 +15,42 @@
 #183 published observational token estimates as immutable v1.77: annotated tag
 `81f44fb6786bdfcc40f93161db74b1d9a9e3b7c5` peels to
 `dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19`. Integrate that exact main with a normal
-merge, preserving the reviewed #182 Task 1-6 history. The fallback boundary and
-all future publication/adoption approvals now use v1.78; its distinct, byte-identical
-release-owned boundary canary uses v1.78.1. Never republish or move v1.77.
+merge, preserving the reviewed #182 Task 1-6 history. The fallback boundary was
+published as immutable v1.78. Never republish or move v1.77 or v1.78.
 Schema 2 preserves v1.77's observational token estimates and summary field while
 retaining round, override, call-count, wall-time, checkpoint and provenance gates.
 The v1.76 bootstrap evidence and immutable v1.76 identity below remain historical.
 
+## Tribunal correction (2026-09-12)
+
+The first `wlan-package` bootstrap candidate at v1.78 reached exact-head tribunal
+review as PR #331. Reviewer A found that its caller-level `pull-requests: write`
+and `id-token: write` ceiling also reached the unconditional `check-enabled` job,
+where a mutable `check-workflow-enabled@v1.1` action ran before managed admission.
+The public exact-head Codex review therefore supersedes the earlier zero-finding
+comment and blocks that HEAD.
+
+The bounded correction is a normal security patch. v1.78.1 gives
+`check-enabled` only `contents: read`, gives `skipped` no permissions, and pins
+the nested check action to its exact reviewed commit. The release verifier keeps
+the immutable v1.78 contract accepted but requires this hardening at v1.78.1 and
+later. PR #331 must be updated to v1.78.1 and pass a complete new review round
+before any merge decision. The distinct release-owned-byte boundary canary moves
+to v1.78.2 after v1.78.1 is installed on the consumer default branch.
+
 ## Global Constraints
 
 - Work only in `/home/jhw/ai/opencode/worktrees/jhw-control/wt-7e615b91b0e8-jhw7500-automation-182` on `task/7e615b91b0e8-jhw7500-automation-182`, starting from design commit `b10503c` over immutable v1.76 source `444a7347aee169ed178aae80e8bd8d10eca52e02`.
-- Keep Task `tsk-01a08b34-cc9e-777f-a99d-7e615b91b0e8` and Claim `clm-01a08b35-4a07-75ba-8a22-a8ca96029ade`. Do not add, take over, delete, repair, or directly edit a Claim, lock, Registry record, budget ledger, secret, or Notion record.
+- Keep Task `tsk-01a08b34-cc9e-777f-a99d-7e615b91b0e8` and its current supported Claim. Do not add, take over, delete, repair, or directly edit a Claim, lock, Registry record, budget ledger, secret, or Notion record.
 - Every shell command starts with `rtk`; commands that need an unwrapped executable use `rtk proxy`. Apply source edits with `apply_patch`.
 - Write a failing behavioral test before each implementation change. Add no dependency and execute no code, action, hook, filter, binary, or artifact supplied by a consumer pull request.
-- Preserve v1.76 and v1.77 bytes, tags, release acceptance, and historical fixtures. Own the new workflow, action, verifier, and ledger schema behavior behind the v1.78 feature boundary.
+- Preserve v1.76, v1.77, and v1.78 bytes, tags, release acceptance, and historical fixtures. Own the fallback behind the v1.78 feature boundary and the pre-admission hardening behind v1.78.1.
 - Authenticate only `workflow_validation_mismatch` with `review_execution=not_performed`, the Claude provider step skipped, and no budget claim. `workflow_validation_unavailable`, provider entry, any other failure, stale coordinates, ambiguity, pagination overflow, and transport uncertainty remain blocking.
 - The fallback uses the existing Claude credential once and consumes one ordinary automatic review round for the exact pull-request HEAD/full diff. A retry reuses a valid request or finalized result and cannot add a second provider call.
 - Do not make the original failed automatic check successful, hide it, waive a required status, weaken branch protection, or replace target tests, mergeability, exact HEAD/base, origin, or GitHub-generated merge verification.
-- The consumer permission ceiling for `claude.yml` becomes `pull-requests: write`; the central interactive Claude job explicitly reduces itself to `pull-requests: read`; only the admitted nested managed job retains write permission for the canonical sticky comment.
+- The consumer permission ceiling for `claude.yml` becomes `pull-requests: write`; the central interactive Claude job explicitly reduces itself to `pull-requests: read`; `check-enabled` is limited to `contents: read`, `skipped` has no permissions, and only the admitted nested managed job retains write permission for the canonical sticky comment. The pre-admission check action is pinned to an immutable commit.
 - This plan changes only the automation repository. It ends with a versioned receipt schema and verifier CLI. Before editing `/home/jhw/ai/opencode/projects/jhw-notion-runtime`, run that repository's stateless Task nudge, obtain any required separate approval, and write a second implementation plan.
-- Do not publish v1.78 or mutate a consumer until the implementation branch passes local verification, native pre-PR tribunal, hosted review, and reviewed merge. Stop a canary if a required failed Claude check remains native-blocking.
+- Do not publish v1.78.1 or update the consumer candidate until the hardening branch passes local verification, native pre-PR tribunal, hosted review, and reviewed merge. Stop a canary if a required failed Claude check remains native-blocking.
 
 ---
 
@@ -47,7 +63,7 @@ The v1.76 bootstrap evidence and immutable v1.76 identity below remain historica
 | Budget ledger | `review-invocation-budget` | later review runs and verifier | schema 2, reads schema 1 |
 | Claude sticky state | `claude-code-review.yml` | review context and fleet verifier | schema 3 with exact optional extensions |
 | Fleet fallback receipt | `verify_claude_rollout_fallback.py` | later JHW command | schema 1 |
-| Workflow release | reviewed automation merge | release verifier and consumers | v1.78 |
+| Workflow release | reviewed automation merge | release verifier and consumers | v1.78 feature; v1.78.1 hardening |
 
 The only accepted request body is the following two-line form, with one optional final LF and no other bytes:
 
@@ -1624,6 +1640,61 @@ Close the telemetry run on every exit. A PASS records bound HEAD/diff. CRITICAL/
 - [ ] **Step 11: Merge and verify the remote result.** Merge only the reviewed HEAD through the supported method, then compare the API-returned merge commit and the new remote `main` object with the expected GitHub-generated commit. Any drift stops before release publication.
 
 ### Task 8: Immutable release, real-boundary canary, and bootstrap batch
+
+#### Current execution amendment (2026-09-12)
+
+This amendment supersedes the original numbered Task 8 procedure below. The old
+sequence is retained only as historical design provenance and must not be used for
+further mutations.
+
+| Boundary | Current evidence | Required next state |
+| --- | --- | --- |
+| v1.78 | Annotated tag `7efe562b49c7b5f9fdad6855ff8c2a73b090a122`, peeled commit `a08141d644ab1036cadd8167d48158e827dcd978` | Preserve unchanged |
+| Bootstrap PR | `jhw7500/wlan-package#331`, reviewed HEAD `8ed6b45e8c5df68391941fbd181cfb79f0380178`, base `a35064638d4881c06d7589cd6bfa08a2bffbaff0` | Blocked by tribunal finding A-R1-001; update to v1.78.1 and review the new HEAD |
+| v1.78.1 | Security patch candidate | Narrow pre-admission permissions and pin `check-workflow-enabled` to the immutable v1.78 commit `a08141d644ab1036cadd8167d48158e827dcd978`, preserving description-before-enabled fallback parsing |
+| v1.78.2 | Not yet created | Distinct docs-only release after v1.78.1 adoption, with every v1.78.1 release-owned path byte-identical |
+
+- [ ] **Step A: Complete the v1.78.1 hardening patch test-first.** Require
+  `check-enabled.permissions == {contents: read}`,
+  `skipped.permissions == {}`, and the exact immutable nested action pin. Keep
+  v1.78 accepted only at its existing authenticated bytes; require hardening for
+  v1.78.1 and later. Update release documentation and tests for the new sequence.
+- [ ] **Step B: Review and merge the automation patch.** Run focused and full
+  verification, actionlint, Python compilation and `git diff --check`; then run a
+  complete three-role native tribunal and hosted review on one exact automation
+  HEAD. Resolve every HIGH/CRITICAL finding with a decision and a new complete
+  round. Merge only after a clean verdict and an explicit reviewed-merge decision.
+- [ ] **Step C: Publish v1.78.1 only after concrete approval.** Present the exact
+  reviewed main commit, tree, verifier result, release-root digest, and proof that
+  both direct and peeled v1.78.1 refs are absent. Create the annotated tag once
+  through the create-only procedure in `docs/workflow-fleet-rollout.md`; never move,
+  delete, or retry an uncertain ref creation.
+- [ ] **Step D: Update the existing bootstrap PR.** Re-render only the managed
+  workflow paths in PR #331 from v1.78 to v1.78.1. Bind the new commit, tree, base,
+  full-diff digest and released central commit before the single remote update.
+  Preserve the original automatic mismatch and Round 1 tribunal evidence.
+- [ ] **Step E: Rereview and merge the bootstrap only if clean.** Record a formal
+  decision for A-R1-001, run all three tribunal roles as Round 2 against the new
+  exact HEAD, and rerun target, Gemini, OpenCode, shell, source and Codex gates.
+  A new finding or coordinate drift blocks merge. Present the live exact-head/base
+  merge tuple and obtain separate merge approval.
+- [ ] **Step F: Create and publish the v1.78.2 boundary candidate.** After v1.78.1
+  is installed on the consumer default branch, add only
+  `docs/workflows/v1.78.2-boundary-canary.md` on a distinct automation commit.
+  Prove an empty raw Git diff over the authenticated v1.78.1 release inventory,
+  run complete automation review, merge, and obtain separate tag approval.
+- [ ] **Step G: Exercise the real pin boundary.** Create one managed rollout PR
+  from the installed v1.78.1 caller to v1.78.2. Require the expected automatic
+  `workflow_validation_mismatch`, one separately authorized canonical fallback
+  request, exactly one provider entry, a finalized budget, canonical clean state,
+  and a receipt verified from the exact v1.78.1 driver commit. Merge only after
+  independent review and separate approval.
+- [ ] **Step H: Close the operational handoff.** Record both new tag objects and
+  peeled commits, PR/run/comment/receipt tuples, review decisions, provider count,
+  fleet audits, remaining blockers and untouched evidence digests. Complete the
+  supported Task lifecycle only after every requested rollout result is verified.
+
+#### Archived original Task 8 sequence (superseded)
 
 **Files:**
 

@@ -50,6 +50,10 @@ REVIEW_INVOCATION_BUDGET_HELPER = (
 
 V176_COMMIT = "444a7347aee169ed178aae80e8bd8d10eca52e02"
 V177_COMMIT = "dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19"
+V178_COMMIT = "a08141d644ab1036cadd8167d48158e827dcd978"
+CHECK_WORKFLOW_ENABLED_ACTION_PATH = (
+    ".github/actions/check-workflow-enabled/action.yml"
+)
 FALLBACK_RELEASE_FILES = (
     ".github/actions/claude-rollout-fallback/action.yml",
     ".github/actions/claude-rollout-fallback/contract.py",
@@ -72,26 +76,27 @@ def test_v178_adds_only_claude_rollout_fallback_roots():
     assert release_inventory.release_supports_claude_rollout_fallback("v1.78.1")
 
 
-def test_v1781_publication_proves_owned_boundary_before_post():
+def test_v178_patch_publication_proves_owned_boundary_before_post():
     document = (ROOT / "docs/workflow-fleet-rollout.md").read_text()
-    section = document.split("## Create-only v1.78 and v1.78.1 tag publication\n", 1)[1]
+    section = document.split("## Create-only v1.78.1 and v1.78.2 tag publication\n", 1)[1]
     body = section.split("' <<'CLAUDE_RELEASE_PY'\n", 1)[1].split("\nCLAUDE_RELEASE_PY", 1)[0]
     tree = ast.parse(body)
     first_post = min(node.lineno for node in ast.walk(tree)
                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                      and node.func.id == "post")
     branches = [node for node in tree.body if isinstance(node, ast.If)
-                and ast.unparse(node.test) == "tag == 'v1.78.1'"]
-    assert len(branches) == 1, "v1.78.1 needs a pre-publication boundary proof"
+                and ast.unparse(node.test) == "tag == 'v1.78.2'"
+                and node.end_lineno < first_post]
+    assert len(branches) == 1, "v1.78.2 needs a pre-publication boundary proof"
     branch = branches[0]
     assert branch.end_lineno < first_post
-    assert not branch.orelse, "v1.78 first publication must not need an existing v1.78 tag"
+    assert not branch.orelse, "v1.78.1 security patch must not need an existing v1.78.1 tag"
     launcher = section.split("rtk proxy /usr/bin/python3 -I -S -B -c '\n", 1)[1].split("\n' <<", 1)[0]
     launcher_tree = ast.parse(launcher)
     allowed = [node for node in ast.walk(launcher_tree) if isinstance(node, ast.Compare)
                and isinstance(node.left, ast.Name) and node.left.id == "tag"]
     assert len(allowed) == 1
-    assert ast.literal_eval(allowed[0].comparators[0]) == {"v1.78", "v1.78.1"}
+    assert ast.literal_eval(allowed[0].comparators[0]) == {"v1.78.1", "v1.78.2"}
     pre_post = ast.unparse(ast.Module(
         body=[node for node in tree.body if node.end_lineno < first_post], type_ignores=[],
     ))
@@ -100,9 +105,13 @@ def test_v1781_publication_proves_owned_boundary_before_post():
         "v177_commit = 'dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19'",
         "v176_tag = '09af80682619129fcf343091b78413d2686a4579'",
         "v176_commit = '444a7347aee169ed178aae80e8bd8d10eca52e02'",
+        "v178_tag = '7efe562b49c7b5f9fdad6855ff8c2a73b090a122'",
+        "v178_commit = 'a08141d644ab1036cadd8167d48158e827dcd978'",
     ):
         assert binding in pre_post
-    for version, variable in (("v1.76", "v176"), ("v1.77", "v177")):
+    for version, variable in (
+        ("v1.76", "v176"), ("v1.77", "v177"), ("v1.78", "v178"),
+    ):
         check = f"set(public_tags('{version}').splitlines()) == tag_pairs('{version}', {variable}_tag, {variable}_commit)"
         checks_before_post = [node for node in tree.body
                              if isinstance(node, ast.Expr) and check in ast.unparse(node)
@@ -114,28 +123,29 @@ def test_v1781_publication_proves_owned_boundary_before_post():
     assert len(annotation) == 1 and annotation[0].end_lineno < branch.lineno
     assert ast.literal_eval(annotation[0].iter.elts[0].elts[0]) == "v1.76"
     assert ast.literal_eval(annotation[0].iter.elts[1].elts[0]) == "v1.77"
+    assert ast.literal_eval(annotation[0].iter.elts[2].elts[0]) == "v1.78"
     assert "git('cat-file', '-t', direct, cwd=checkout) == 'tag'" in ast.unparse(annotation[0])
     source = ast.unparse(branch)
     # Ordered checks bind the remote annotation and trusted inventory before any write.
     checks = [
-        "pairs = [line.split('\\t') for line in public_tags('v1.78').splitlines()]",
+        "pairs = [line.split('\\t') for line in public_tags('v1.78.1').splitlines()]",
         "len(pairs) == 2 and all((len(pair) == 2 for pair in pairs))",
-        "set(refs) == {'refs/tags/v1.78', 'refs/tags/v1.78^{}'}",
+        "set(refs) == {'refs/tags/v1.78.1', 'refs/tags/v1.78.1^{}'}",
         "all((re.fullmatch('[0-9a-f]{40}', oid) for oid in refs.values()))",
-        "v178_tag = refs['refs/tags/v1.78']",
-        "v178_commit = refs['refs/tags/v1.78^{}']",
-        "require(commit != v178_commit,",
-        "git('fetch', '--no-tags', url, 'refs/tags/v1.78:refs/tags/v1.78', cwd=checkout)",
-        "git('rev-parse', 'refs/tags/v1.78', cwd=checkout) == v178_tag",
-        "git('rev-parse', 'refs/tags/v1.78^{}', cwd=checkout) == v178_commit",
-        "git('cat-file', '-t', v178_tag, cwd=checkout) == 'tag'",
-        "git('worktree', 'add', '--detach', str(baseline), v178_commit, cwd=checkout)",
-        "'scripts.verify_workflow_release', '--automation', str(baseline), '--ref', 'v1.78', '--expected-commit', v178_commit, '--remote', 'origin'",
+        "v1781_tag = refs['refs/tags/v1.78.1']",
+        "v1781_commit = refs['refs/tags/v1.78.1^{}']",
+        "require(commit != v1781_commit,",
+        "git('fetch', '--no-tags', url, 'refs/tags/v1.78.1:refs/tags/v1.78.1', cwd=checkout)",
+        "git('rev-parse', 'refs/tags/v1.78.1', cwd=checkout) == v1781_tag",
+        "git('rev-parse', 'refs/tags/v1.78.1^{}', cwd=checkout) == v1781_commit",
+        "git('cat-file', '-t', v1781_tag, cwd=checkout) == 'tag'",
+        "git('worktree', 'add', '--detach', str(baseline), v1781_commit, cwd=checkout)",
+        "'scripts.verify_workflow_release', '--automation', str(baseline), '--ref', 'v1.78.1', '--expected-commit', v1781_commit, '--remote', 'origin'",
         "from scripts.workflow_release_inventory import release_paths_for",
-        'release_paths_for("v1.78")',
+        'release_paths_for("v1.78.1")',
         "owned = json.loads(inventory.stdout)",
-        "git('diff', '--raw', '--no-ext-diff', '--no-textconv', '--exit-code', v178_commit, commit, '--', *owned, cwd=checkout) == ''",
-        "set(public_tags('v1.78').splitlines()) == tag_pairs('v1.78', v178_tag, v178_commit)",
+        "git('diff', '--raw', '--no-ext-diff', '--no-textconv', '--exit-code', v1781_commit, commit, '--', *owned, cwd=checkout) == ''",
+        "set(public_tags('v1.78.1').splitlines()) == tag_pairs('v1.78.1', v1781_tag, v1781_commit)",
     ]
     offset = 0
     for check in checks:
@@ -187,10 +197,76 @@ def fallback_release_repo(tmp_path):
     return repo, commit(repo, "v1.78 fallback candidate")
 
 
-def test_v178_candidate_is_accepted(fallback_release_repo):
+def test_v178_immutable_candidate_remains_accepted():
+    assert release_verifier.verify_commit_content(ROOT, "v1.78", V178_COMMIT) == V178_COMMIT
+
+
+def test_hardened_claude_fallback_pinned_check_honors_reordered_disabled(tmp_path):
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/claude.yml").read_bytes(), Loader=yaml.BaseLoader,
+    )
+    check_step = next(
+        step for step in workflow["jobs"]["check-enabled"]["steps"]
+        if step.get("id") == "check"
+    )
+    prefix = "jhw7500/automation/.github/actions/check-workflow-enabled@"
+    assert check_step["uses"].startswith(prefix)
+    pin = check_step["uses"][len(prefix):]
+    action = yaml.load(
+        release_verifier.VerifiedCommitTree.open(ROOT, pin).read_file(
+            CHECK_WORKFLOW_ENABLED_ACTION_PATH,
+        ),
+        Loader=yaml.BaseLoader,
+    )
+    script = action["runs"]["steps"][0]["run"]
+    script = script.replace("${{ inputs.workflow-name }}", "claude")
+    script = script.replace("${{ inputs.force-run }}", "false")
+
+    consumer = tmp_path / "consumer"
+    (consumer / ".github").mkdir(parents=True)
+    (consumer / ".github/workflow-config.yml").write_text(
+        "workflows:\n"
+        "  claude:\n"
+        "    description: consumer kill switch\n"
+        "    enabled: false\n",
+    )
+    command_path = tmp_path / "bin"
+    command_path.mkdir()
+    for name in ("grep", "sed", "tr"):
+        os.symlink(shutil.which(name), command_path / name)
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+        cwd=consumer,
+        env={
+            "PATH": str(command_path),
+            "GITHUB_OUTPUT": str(output),
+            "LANG": "C",
+            "LC_ALL": "C",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    enabled = [
+        line for line in output.read_text().splitlines() if line.startswith("enabled=")
+    ]
+    assert enabled == ["enabled=false"]
+
+
+def test_v1781_rejects_immutable_v178_security_boundary():
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="Claude fallback pre-admission permission contract differs",
+    ):
+        release_verifier.verify_commit_content(ROOT, "v1.78.1", V178_COMMIT)
+
+
+@pytest.mark.parametrize("ref", ("v1.78.1", "v1.78.2"))
+def test_hardened_claude_fallback_candidate_is_accepted(fallback_release_repo, ref):
     repo, candidate = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo)
-    assert release_verifier.verify_commit_content(repo, "v1.78", candidate) == candidate
+    release_verifier.verify_claude_rollout_fallback_contract(repo, ref)
+    assert release_verifier.verify_commit_content(repo, ref, candidate) == candidate
 
 
 FALLBACK_MUTATIONS = {
@@ -222,10 +298,60 @@ FALLBACK_MUTATIONS = {
 }
 
 
-@pytest.mark.parametrize("mutation", list(FALLBACK_MUTATIONS))
-def test_v178_rejects_fallback_contract_mutation(fallback_release_repo, mutation):
+def inherit_claude_pre_admission_permissions(path: Path) -> None:
+    text = path.read_text()
+    text = text.replace(
+        "  check-enabled:\n    permissions:\n      contents: read\n",
+        "  check-enabled:\n",
+        1,
+    )
+    text = text.replace(
+        "  skipped:\n    permissions: {}\n",
+        "  skipped:\n",
+        1,
+    )
+    path.write_text(text)
+
+
+def restore_mutable_claude_check_action(path: Path) -> None:
+    text = path.read_text()
+    text = text.replace(
+        "jhw7500/automation/.github/actions/check-workflow-enabled@"
+        "a08141d644ab1036cadd8167d48158e827dcd978",
+        "jhw7500/automation/.github/actions/check-workflow-enabled@v1.1",
+        1,
+    )
+    path.write_text(text)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error"),
+    [
+        (
+            inherit_claude_pre_admission_permissions,
+            "Claude fallback pre-admission permission contract differs",
+        ),
+        (
+            restore_mutable_claude_check_action,
+            "Claude fallback check-workflow-enabled action is not immutable",
+        ),
+    ],
+    ids=("ambient-permissions", "mutable-check-action"),
+)
+def test_v1781_rejects_claude_router_pre_admission_regressions(
+    fallback_release_repo, mutate, error,
+):
     repo, _ = fallback_release_repo
-    # Establish acceptance first: a legacy seal must not mask a missing v1.78 seal.
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.1")
+    mutate(repo / ".github/workflows/claude.yml")
+    with pytest.raises(ReleaseVerificationError, match=error):
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.1")
+
+
+@pytest.mark.parametrize("mutation", list(FALLBACK_MUTATIONS))
+def test_v1781_rejects_fallback_contract_mutation(fallback_release_repo, mutation):
+    repo, _ = fallback_release_repo
+    # Establish acceptance first: an older seal must not mask a missing current seal.
     release_verifier.verify_claude_rollout_fallback_contract(repo)
     relative, old, new = FALLBACK_MUTATIONS[mutation]
     replace(repo / relative, old, new, count=1)
@@ -233,7 +359,7 @@ def test_v178_rejects_fallback_contract_mutation(fallback_release_repo, mutation
     with pytest.raises(ReleaseVerificationError):
         release_verifier.verify_claude_rollout_fallback_contract(repo)
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_commit_content(repo, "v1.78", bad)
+        release_verifier.verify_commit_content(repo, "v1.78.1", bad)
 
 RECOVERY_RELEASE_FILES = (
     ".github/actions/recover-opencode-review/evidence.py",
