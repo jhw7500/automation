@@ -172,11 +172,16 @@ def canary_fixture():
                 raise
         return commit.head_sha
 
-    def pr(*args):
+    def pr(owner, repo, base, head, head_sha, title, body):
         state["writes"].append("pr")
-        return args
+        result = SimpleNamespace(number=999, url="https://github.com/jhw7500/wlan-package/pull/999",
+                                 state="OPEN", base=base, head=head, head_repo=owner + "/" + repo,
+                                 head_sha=head_sha, title=title, body=body)
+        state["pr"] = result
+        return result
 
     fleet._github_post, fleet.create_rollout_branch, fleet.create_pull_request = post, branch, pr
+    fleet.list_rollout_prs = lambda *args: (state["pr"],) if state.get("pr") else ()
     fleet.FleetGitError = FleetGitError
     snapshot = SimpleNamespace(path=Path("/tmp/wlan-package"), default_branch="master", base_branch="master", base_sha="b" * 40)
     candidate = SimpleNamespace(head_sha="c" * 40, tree_sha="d" * 40, base_sha="b" * 40)
@@ -245,8 +250,33 @@ def test_approved_candidate_publishes_exact_metadata_and_restores_adapters():
     original = fleet._github_post, fleet.create_rollout_branch, fleet.create_pull_request
     result = publish(approved, fleet, observe, action)
     assert state["writes"] == ["blobs", "refs", "pr"]
-    assert result == ("jhw7500", "wlan-package", "master", approved["branch"], approved["head_sha"], approved["title"], approved["body"])
+    assert (result.number, result.state, result.base, result.head, result.head_repo, result.head_sha,
+            result.title, result.body) == (999, "OPEN", "master", approved["branch"],
+                                            "jhw7500/wlan-package", approved["head_sha"],
+                                            approved["title"], approved["body"])
     assert (fleet._github_post, fleet.create_rollout_branch, fleet.create_pull_request) == original
+
+
+def test_post_create_pr_metadata_drift_stops_before_success():
+    publish = canary_publisher()
+    approved, state, fleet, snapshot, candidate, observe, action = canary_fixture()
+
+    def create_pr(owner, repo, base, head, head_sha, title, body):
+        state["writes"].append("pr")
+        return SimpleNamespace(number=999, url="https://github.com/jhw7500/wlan-package/pull/999",
+                               state="OPEN", base=base, head=head, head_repo=owner + "/" + repo,
+                               head_sha=head_sha, title=title, body=body)
+
+    fleet.create_pull_request = create_pr
+    fleet.list_rollout_prs = lambda *args: (
+        SimpleNamespace(number=999, url="https://github.com/jhw7500/wlan-package/pull/999",
+                        state="OPEN", base="master", head=approved["branch"],
+                        head_repo="jhw7500/wlan-package", head_sha=approved["head_sha"],
+                        title=approved["title"], body="changed after create"),
+    )
+    with pytest.raises(ValueError, match="reconcile read-only"):
+        publish(approved, fleet, observe, action)
+    assert state["writes"] == ["blobs", "refs", "pr"]
 
 
 @pytest.mark.parametrize("base_moves", [False, True])
@@ -284,7 +314,14 @@ def test_documented_candidate_survives_review_then_uses_released_adapters(tmp_pa
     monkeypatch.setattr(fleet, "clone_default_branch", lambda *args: snapshot)
     monkeypatch.setattr(fleet, "refetch_default", lambda *args: base)
     monkeypatch.setattr(fleet, "remote_branch_sha", lambda *args: state["head"])
-    monkeypatch.setattr(fleet, "list_rollout_prs", lambda *args: ())
+    monkeypatch.setattr(
+        fleet, "list_rollout_prs",
+        lambda *args: (fleet.PullRequest(999, "https://github.com/jhw7500/wlan-package/pull/999",
+                                         "OPEN", "master", approved["branch"],
+                                         "jhw7500/wlan-package", approved["head_sha"],
+                                         approved["title"], approved["body"]),)
+        if "pr" in state["writes"] else (),
+    )
     monkeypatch.setattr(bundles, "materialize_release_bundle", lambda *args, **kwargs: nullcontext(bundle))
     monkeypatch.setattr(rollout, "_run_actionlint", lambda *args: None)
     blocks = re.findall(r"```python\n(.*?)\n```", DOCUMENT.read_text(), re.S)
