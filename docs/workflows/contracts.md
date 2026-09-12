@@ -150,6 +150,13 @@ only actions/contents/issues/pull-requests read. The nested managed job uses exa
 `$/.github/workflows/claude-code-review.yml`, the consumer write ceiling above,
 and the same-name `CLAUDE_CODE_OAUTH_TOKEN` secret.
 
+Release v1.78.1 hardens the jobs that run before managed admission. `check-enabled`
+has only `contents: read`, calls
+`check-workflow-enabled@fec2c90743cca062f113a87bb5deaf73b61501ce`, and cannot
+inherit the caller's pull-request write or OIDC grants. `skipped` has an empty
+permission map. The release verifier preserves exact v1.78 acceptance and requires
+these constraints for v1.78.1 and later.
+
 ## Admission schema 1
 
 Admission is a private regular JSON file owned by the runner, mode 0600, created
