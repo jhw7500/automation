@@ -942,7 +942,7 @@ proofs. Do not reuse the former docs-only v1.78.2 assumption.
 
 The next concrete validation release is described in
 [the v1.78.3 boundary canary procedure](workflows/v1.78.3-boundary-canary.md).
-It preserves all v1.78.2 release-owned bytes and tests one tossApp rollout with
+It preserves all v1.78.2 release-owned bytes and tests one wlan-package rollout with
 the installed v1.78.2 driver, a distinct target commit, one managed provider
 invocation and the immutable fallback receipt. Tag publication, the consumer
 PR, its exact managed request and both merges retain their separate approvals.

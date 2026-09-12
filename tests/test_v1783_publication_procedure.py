@@ -1,10 +1,14 @@
 """Exercise the documented publisher without network access or real tag writes."""
 
 import ast
+from contextlib import nullcontext
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -107,3 +111,203 @@ def test_response_symlink_is_never_followed(tmp_path):
     with pytest.raises(FileExistsError):
         post("repos/jhw7500/automation/git/tags", {}, "object.json")
     assert state["posts"] == [] and target.read_text() == "keep"
+
+
+def canary_publisher():
+    document = DOCUMENT.read_text()
+    source = document.split("<!-- approved-canary-python -->\n```python\n", 1)[1].split("\n```", 1)[0]
+    namespace = {}
+    exec(compile(source, str(DOCUMENT), "exec"), namespace)
+    return namespace["publish_approved_canary"]
+
+
+def canary_fixture():
+    approved = {"repository": "jhw7500/wlan-package", "base_ref": "master", "base_sha": "b" * 40,
+                "head_sha": "c" * 40, "tree_sha": "d" * 40,
+                "branch": "automation/common-workflows-v1.78.3", "title": "canonical title", "body": "canonical body"}
+    state = {"base": approved["base_sha"], "head": None, "writes": [], "move_after_blob": False}
+    fleet = SimpleNamespace()
+
+    def post(repo, section, payload):
+        state["writes"].append(section)
+        if section == "blobs" and state["move_after_blob"]:
+            state["base"] = "e" * 40
+        if section == "refs":
+            state["head"] = payload["sha"]
+        return {}
+
+    def branch(snapshot, name, *, commit):
+        fleet._github_post("wlan-package", "blobs", {})
+        fleet._github_post("wlan-package", "refs", {"ref": "refs/heads/" + name, "sha": commit.head_sha})
+        return commit.head_sha
+
+    def pr(*args):
+        state["writes"].append("pr")
+        return args
+
+    fleet._github_post, fleet.create_rollout_branch, fleet.create_pull_request = post, branch, pr
+    snapshot = SimpleNamespace(path=Path("/tmp/wlan-package"), default_branch="master", base_branch="master", base_sha="b" * 40)
+    candidate = SimpleNamespace(head_sha="c" * 40, tree_sha="d" * 40, base_sha="b" * 40)
+    observe = lambda: {"repository": "jhw7500/wlan-package", "base_ref": "master", "base_sha": state["base"], "head_sha": state["head"]}
+
+    def action():
+        fleet.create_rollout_branch(snapshot, approved["branch"], commit=candidate)
+        return fleet.create_pull_request("jhw7500", "wlan-package", "master", approved["branch"], candidate.head_sha, approved["title"], approved["body"])
+
+    return approved, state, fleet, snapshot, candidate, observe, action
+
+
+@pytest.mark.parametrize("field", ["base_sha", "head_sha", "tree_sha"])
+def test_unreviewed_recomputed_candidate_never_reaches_a_remote_writer(field):
+    publish = canary_publisher()
+    approved, state, fleet, snapshot, candidate, observe, action = canary_fixture()
+    setattr(candidate, field, "f" * 40)
+    with pytest.raises(ValueError):
+        publish(approved, fleet, observe, action)
+    assert state["writes"] == []
+
+
+def test_advanced_live_base_causes_zero_remote_writes():
+    publish = canary_publisher()
+    approved, state, fleet, snapshot, candidate, observe, action = canary_fixture()
+    state["base"] = "e" * 40
+    with pytest.raises(ValueError):
+        publish(approved, fleet, observe, action)
+    assert state["writes"] == []
+
+
+def test_mid_publication_base_drift_stops_before_ref_and_pr():
+    publish = canary_publisher()
+    approved, state, fleet, snapshot, candidate, observe, action = canary_fixture()
+    state["move_after_blob"] = True
+    with pytest.raises(ValueError):
+        publish(approved, fleet, observe, action)
+    assert state["writes"] == ["blobs"] and state["head"] is None
+
+
+@pytest.mark.parametrize("wrong", ["head", "body"])
+def test_unapproved_existing_branch_or_pr_body_causes_zero_writes(wrong):
+    publish = canary_publisher()
+    approved, state, fleet, snapshot, candidate, observe, action = canary_fixture()
+    state["head"] = approved["head_sha"] if wrong == "body" else "e" * 40
+    def create():
+        return fleet.create_pull_request("jhw7500", "wlan-package", "master", approved["branch"], approved["head_sha"], approved["title"], "changed" if wrong == "body" else approved["body"])
+    with pytest.raises(ValueError):
+        publish(approved, fleet, observe, create)
+    assert state["writes"] == []
+
+
+def test_approved_candidate_publishes_exact_metadata_and_restores_adapters():
+    publish = canary_publisher()
+    approved, state, fleet, snapshot, candidate, observe, action = canary_fixture()
+    original = fleet._github_post, fleet.create_rollout_branch, fleet.create_pull_request
+    result = publish(approved, fleet, observe, action)
+    assert state["writes"] == ["blobs", "refs", "pr"]
+    assert result == ("jhw7500", "wlan-package", "master", approved["branch"], approved["head_sha"], approved["title"], approved["body"])
+    assert (fleet._github_post, fleet.create_rollout_branch, fleet.create_pull_request) == original
+
+
+@pytest.mark.parametrize("base_moves", [False, True])
+def test_documented_candidate_survives_review_then_uses_released_adapters(tmp_path, monkeypatch, base_moves):
+    """Execute both snippets using real render/Git/adapters; fake only external I/O."""
+    root = DOCUMENT.parents[2]
+    monkeypatch.syspath_prepend(str(root))
+    from scripts import rollout_workflow_fleet as rollout
+    from scripts import workflow_fleet_git as fleet
+    from scripts import workflow_release_bundle as bundles
+    from scripts.prepare_workflow_rollout import apply_render_plan
+    from scripts.workflow_catalog import load_catalog, load_fleet_config
+
+    catalog = load_catalog(root)
+    config = load_fleet_config(root, catalog)
+    repo = tmp_path / "wlan-package"
+    (repo / ".github/workflows").mkdir(parents=True)
+    (repo / ".github/workflow-config.yml").write_text("automation_ref: v1.78.1\nreview:\n  auto: false\n")
+    secrets = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "GEMINI_API_KEY", "ZHIPU_API_KEY", "APP_PRIVATE_KEY"})
+    variables = frozenset({"APP_ID"})
+    labels = frozenset({"review:request", "review:skip", "review-budget-override"})
+    canonical = root / config.canonical_dir
+    initial = rollout.render_repository(repo, canonical, catalog, config.profiles[repo.name],
+                                        "v1.78.2", "a" * 40, set(secrets), set(variables), label_names=labels)
+    assert initial.status == "drift"
+    apply_render_plan(repo, initial)
+    for args in (["init", "-q", "-b", "master"], ["config", "user.name", "fixture"],
+                 ["config", "user.email", "fixture@invalid"], ["add", "--all"],
+                 ["commit", "-q", "-m", "base"], ["remote", "add", "origin", "https://github.com/jhw7500/wlan-package.git"]):
+        subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=repo, check=True)
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo).decode().strip()
+    snapshot = fleet.RepositorySnapshot(repo, "master", base, secrets, variables, "master", labels)
+    bundle = bundles.ReleaseBundle(root, "v1.78.3", "f" * 40, catalog, config, canonical)
+    state = {"head": None, "base": base, "writes": []}
+    monkeypatch.setattr(fleet, "clone_default_branch", lambda *args: snapshot)
+    monkeypatch.setattr(fleet, "refetch_default", lambda *args: base)
+    monkeypatch.setattr(fleet, "remote_branch_sha", lambda *args: state["head"])
+    monkeypatch.setattr(fleet, "list_rollout_prs", lambda *args: ())
+    monkeypatch.setattr(bundles, "materialize_release_bundle", lambda *args, **kwargs: nullcontext(bundle))
+    monkeypatch.setattr(rollout, "_run_actionlint", lambda *args: None)
+    blocks = re.findall(r"```python\n(.*?)\n```", DOCUMENT.read_text(), re.S)
+    assert len(blocks) == 3
+    namespace = {"target": root, "workspace": tmp_path, "publish_approved_canary": canary_publisher()}
+    exec(compile(blocks[1], str(DOCUMENT), "exec"), namespace)
+    raw = (tmp_path / "approved-candidate.json").read_bytes()
+    namespace["approved_digest"] = hashlib.sha256(raw).hexdigest()
+    approved = json.loads(raw)["approved"]
+    assert approved["base_sha"] == base and approved["repository"] == "jhw7500/wlan-package"
+    if base_moves:
+        state["base"] = "e" * 40
+
+    original_output, original_run = subprocess.check_output, fleet.run
+    def output(args, **kwargs):
+        if args[0] != "gh":
+            return original_output(args, **kwargs)
+        endpoint = args[-1]
+        if endpoint.endswith("/wlan-package"):
+            result = {"full_name": "jhw7500/wlan-package", "default_branch": "master"}
+        elif endpoint.endswith("/git/ref/heads/master"):
+            result = {"ref": "refs/heads/master", "object": {"sha": state["base"], "type": "commit"}}
+        else:
+            assert endpoint.endswith("/git/matching-refs/heads/" + approved["branch"])
+            result = [] if state["head"] is None else [{"ref": "refs/heads/" + approved["branch"], "object": {"sha": state["head"], "type": "commit"}}]
+        return json.dumps(result).encode()
+
+    def post(repo, section, payload):
+        import base64
+        state["writes"].append(section)
+        api = "https://api.github.com/repos/jhw7500/wlan-package/git/"
+        if section == "blobs":
+            content = base64.b64decode(payload["content"])
+            sha = hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest()
+            return {"sha": sha, "url": api + "blobs/" + sha}
+        if section == "trees":
+            return {"sha": approved["tree_sha"], "url": api + "trees/" + approved["tree_sha"], "tree": [], "truncated": False}
+        if section == "commits":
+            return {"sha": approved["head_sha"], "url": api + "commits/" + approved["head_sha"],
+                    "message": payload["message"].rstrip("\n"), "author": payload["author"], "committer": payload["committer"],
+                    "tree": {"sha": payload["tree"], "url": api + "trees/" + payload["tree"]},
+                    "parents": [{"sha": base, "url": api + "commits/" + base}]}
+        assert section == "refs"
+        state["head"] = payload["sha"]
+        return {"ref": payload["ref"], "url": api + "refs/heads/" + approved["branch"],
+                "object": {"sha": state["head"], "type": "commit", "url": api + "commits/" + state["head"]}}
+
+    def run(args, **kwargs):
+        if args[:3] == ["gh", "pr", "create"]:
+            state["writes"].append("pr")
+            body = Path(args[args.index("--body-file") + 1])
+            assert body.read_text() == approved["body"] and stat.S_IMODE(body.stat().st_mode) == 0o600
+            return "https://github.com/jhw7500/wlan-package/pull/999"
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "check_output", output)
+    monkeypatch.setattr(fleet, "_github_post", post)
+    monkeypatch.setattr(fleet, "run", run)
+    if base_moves:
+        with pytest.raises(ValueError):
+            exec(compile(blocks[2], str(DOCUMENT), "exec"), namespace)
+        assert state["writes"] == [] and not (tmp_path / "rollout-publish.json").exists()
+    else:
+        exec(compile(blocks[2], str(DOCUMENT), "exec"), namespace)
+        assert state["writes"] == ["blobs"] * 11 + ["trees", "commits", "refs", "pr"]
+        result = json.loads((tmp_path / "rollout-publish.json").read_bytes())[0]
+        assert {key: result[key] for key in approved} == approved
+    assert (tmp_path / "approved-candidate.json").read_bytes() == raw
