@@ -807,11 +807,36 @@ That constraint binds this job's own normalization, not the model. Nothing requi
 active finding to reappear in the candidate, so a model that emits `### New findings` / `None`
 retires every open finding with `attempt_status: success`, and one that carries some findings over
 retires exactly the ones it left out — observed once, on the `v1.71` change, where the same body is
-produced byte-for-byte at that change's base and head. The soft carryover path above closed the
-route that retires a finding through a *bad* block; it does not close the cheaper route of omitting
-the block entirely. Closing that route is not a free tightening, because omission is the same
-mechanism a dismissal retires through (below), and every republished block re-enters the next
-round's model context in full. See #157.
+produced byte-for-byte at that change's base and head. Omission is not the only such route.
+In the shared `canonicalize-review` normalizer a carryover block the candidate *did* write also
+retires the finding it names whenever that block fails validation: a `Resolved` without a `Fix
+anchor` (`missing_fix_anchor`), a `Retracted` whose `Trigger evidence` is out of tree
+(`invalid_trigger_evidence`), and two identical `Still open` blocks (`duplicate_prior_binding`)
+each drop the finding from the published body. The `v1.71` soft carryover paragraph above
+describes `opencode-auto-review.yml`, whose own canonicalizer republishes a rejected block in
+place with reason `invalid_anchor`; the shared helper has no such republication, so for Claude and
+Gemini a rejected block and an omitted block retire a finding alike. A malformed disposition is
+arguably easier to reach unintentionally than a deliberate omission, because it is what a genuine
+attempt to close a finding produces when one required field is wrong.
+
+Closing either route is not a free tightening, and that cost is now measured rather than
+estimated. An unconditional republish of every unmentioned prior was implemented and put through
+three adversarial review rounds; each round's fix exposed the next defect, every one of them in
+the republish itself:
+
+| Attempted guard | What the measurement showed |
+| --- | --- |
+| Republish every unmentioned prior | A prior body rendered from the 200-block fixture that fills `MAX_CANDIDATE_BYTES` — 63,400 bytes, under both the 64,000-byte canonical ceiling and the 65,536-byte previous-body ceiling — plus one valid new finding failed `candidate_oversize` and removed the canonical file, where the same inputs canonicalized without the republish. |
+| Skip when `scope.validate_changed_anchor` fails | In `delta` rounds that predicate asks whether the anchor line changed *again this round*, not whether it still exists, so a prior about code untouched since the previous round is dropped. Which rounds run in `delta` is decided by `prepare_review_diff.py`'s `unchanged`/`delta`/`full` branches, which this contract points at rather than restates. |
+| Also require `scope.validate_trigger` | Necessary — without it a republished block quotes a line the head no longer contains — but it does not restore the priors the anchor predicate already dropped. |
+| Shed under the ceiling with `pop()` | In the measured fixtures, which held one entry per section, `pop()` removed the `Still open` entry, because `_load_prior_active` inserts the prior body's `New findings` before its `Still open` blocks. That is not an age order in general: within `Still open` the order is the model's, and a prior body carrying no `Still open` entry sheds a finding that was never carried at all. Shedding by age needs age tracked explicitly. |
+
+An honest republish therefore needs a liveness predicate this scope helper does not expose — the
+anchor path still a regular blob at the reviewed head and the anchor line still present — kept
+distinct from the changed-in-this-delta predicate it does expose. Until that exists this contract
+states the behaviour rather than claiming a closure the pipeline does not have. Every republished
+block would also re-enter the next round's model context in full, and omission remains the same
+mechanism a dismissal retires through (below). See #157.
 
 From `v1.72` the previous review reaches the model under its own budget rather than sharing the
 one that bounds human comments, and it is cut at a finding boundary: a partial block would have
