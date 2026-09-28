@@ -829,7 +829,7 @@ the republish itself:
 | Republish every unmentioned prior | The maximum authenticated prior body (200 findings, 63,400 bytes) plus one valid new finding failed `candidate_oversize` and removed the canonical file, where the same inputs canonicalized without the republish. |
 | Skip when `scope.validate_changed_anchor` fails | In `delta` rounds that predicate asks whether the anchor line changed *again this round*, not whether it still exists, so a prior about code untouched since the previous round is dropped — and `prepare-review-diff` selects `delta` for ordinary follow-up rounds. |
 | Also require `scope.validate_trigger` | Necessary — without it a republished block quotes a line the head no longer contains — but it does not restore the priors the anchor predicate already dropped. |
-| Shed under the ceiling with `pop()` | Sheds the longest-carried finding first, because `_load_prior_active` fills the active set newest-first. |
+| Shed under the ceiling with `pop()` | Sheds from the `Still open` end, because `_load_prior_active` inserts the prior body's `New findings` before its `Still open` blocks. The dropped block has therefore been carried at least once, but within `Still open` the order is the model's rather than an age order, so it is not necessarily the longest-carried one. Shedding by age needs age tracked explicitly. |
 
 An honest republish therefore needs a liveness predicate this scope helper does not expose — the
 anchor path still a regular blob at the reviewed head and the anchor line still present — kept
