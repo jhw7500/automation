@@ -1186,6 +1186,20 @@ None
 '''
 
 
+def test_prior_active_finding_unmentioned_by_model_is_carried_forward(review_quality_repo):
+    """A prior active finding the model never mentions must not silently disappear.
+
+    The published body is the active set the next round reads back, so omitting a
+    finding nothing proved fixed would retire it.
+    """
+    result, canonical = review_quality_repo.run_delta(
+        accepted_rejected_plan_review(), "### New findings\n\nNone\n",
+    )
+    assert result.accepted_count == 1
+    assert "### Still open" in canonical
+    assert "RVW-3253866a28c6" in canonical
+
+
 @pytest.mark.parametrize(
     ("replacement", "replaced", "reason"),
     (
@@ -1491,8 +1505,13 @@ def test_max_candidate_renderer_output_is_valid_authenticated_previous_input(rev
     assert request.previous_review_file is not None
     assert request.previous_review_file.read_bytes() == previous_bytes
     followup, canonical = review_quality_repo._run(request)
-    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
-    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+    # The candidate omitted every prior active finding, so all 200 are republished under
+    # `Still open` rather than retired. Full carryover at the maximum renderer output
+    # must still fit the canonical ceiling, or closing the omission route would turn a
+    # silent retirement into a failed round.
+    assert followup == canonicalize_review.CanonicalizationResult(True, 200, 0, 0, "none", "", (), ())
+    assert canonical.startswith("### New findings\n\nNone\n\n### Still open\n\n")
+    assert len(canonical.encode("utf-8")) <= canonicalize_review.MAX_CANONICAL_BYTES
 
 
 def test_candidate_reason_indexes_follow_physical_source_block_order(review_quality_repo):
@@ -1804,8 +1823,11 @@ None
     loaded_followup = canonicalize_review._load_prior_active(followup_request)
     assert loaded_followup[expected_id].finding.anchor == SourceAnchor("review_cases.py", 20)
     followup, followup_canonical = review_quality_repo._run(followup_request)
-    assert followup == canonicalize_review.CanonicalizationResult(True, 0, 0, 0, "none", "", (), ())
-    assert followup_canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+    # The candidate mentioned no carryover, so the prior finding is republished with its
+    # canonical title bytes intact rather than retired.
+    assert followup == canonicalize_review.CanonicalizationResult(True, 1, 0, 0, "none", "", (), ())
+    assert followup_canonical.startswith("### New findings\n\nNone\n\n### Still open\n\n")
+    assert f"#### {expected_id} [HIGH] {canonical_title}" in followup_canonical
 
 
 def test_bulleted_supplemental_prose_round_trips_as_authenticated_prior(

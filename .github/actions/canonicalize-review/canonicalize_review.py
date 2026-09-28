@@ -940,6 +940,23 @@ def canonicalize(request: CanonicalizationRequest) -> CanonicalizationResult:
                                     reasons.append(_claim_reason(block, "normalized", "invalid_trigger_evidence"))
                                 else:
                                     retracted.append((prior, evidence, reason))
+                    # A prior active finding the model never wrote a block for reaches
+                    # none of the lists above, so rendering would drop it. The published
+                    # body is the active set the next round reads back: omitting a
+                    # finding nothing proved fixed retires it silently and strands the
+                    # budget ledger's remaining IDs. Republish the prior canonical
+                    # finding under `Still open` instead — it was already validated and
+                    # attested. `bound` is exactly the prior set the model did claim, so
+                    # a block it wrote that filtered or normalized out keeps its existing
+                    # disposition and is not carried forward here.
+                    for finding_id, prior in prior_active.items():
+                        if finding_id in bound:
+                            continue
+                        still_open.append(prior)
+                        print(
+                            f"review-canonicalization-carryover: {finding_id}",
+                            file=sys.stderr,
+                        )
                     canonical_new: list[_PriorFinding] = []
                     active_ids = set(prior_active)
                     for block, finding in accepted:

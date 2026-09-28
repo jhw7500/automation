@@ -44,6 +44,7 @@ from scripts.workflow_release_inventory import (
     release_paths_for,
     release_roots_for,
     release_supports_canonicalize_review,
+    release_supports_carryover_completion,
     release_supports_prepare_review_diff,
     release_supports_review_invocation_budget,
     release_supports_review_optin,
@@ -564,6 +565,10 @@ EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V162 = (
 )
 EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163 = (
     "36a2a9301e60f806c4ee32441a0bb98fccad091d96dfb63b6ca25773d3a28b3e"
+)
+# v1.79 republishes a prior active finding the candidate wrote no block for.
+EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V179 = (
+    "02828ed91056ba137fa3f7e3faf050fd53c63ef25c152641266b11b8cb52be3d"
 )
 EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
     "68779c9038c31aa09a846b643bc0178b147798527e1a34ee5821ab539f10b19a"
@@ -3291,7 +3296,9 @@ def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree, ref: str) -> N
         if (
             hashlib.sha256(canonical_source).hexdigest()
             != (
-                EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163
+                EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V179
+                if release_supports_carryover_completion(ref)
+                else EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163
                 if release_supports_finding_dismissal(ref)
                 else EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V162
                 if release_supports_filter_reason_surface(ref)

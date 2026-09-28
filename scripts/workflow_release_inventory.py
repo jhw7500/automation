@@ -180,6 +180,7 @@ CLAUDE_WORKFLOW_VALIDATION_RELEASE = (1, 75)
 OPENCODE_RECOVERY_RELEASE = (1, 76)
 CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 78)
 OBSERVATIONAL_TOKEN_ESTIMATES_RELEASE = (1, 77)
+CARRYOVER_COMPLETION_RELEASE = (1, 79)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -240,6 +241,12 @@ def release_supports_finding_dismissal(ref: str) -> bool:
     """Return whether ``ref`` lets a write collaborator dismiss a finding by comment."""
 
     return _release_version(ref) >= FINDING_DISMISSAL_RELEASE
+
+
+def release_supports_carryover_completion(ref: str) -> bool:
+    """Return whether ``ref`` republishes a prior active finding the candidate omitted."""
+
+    return _release_version(ref) >= CARRYOVER_COMPLETION_RELEASE
 
 
 def release_supports_label_review_trigger(ref: str) -> bool:

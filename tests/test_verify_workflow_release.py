@@ -238,6 +238,7 @@ def fallback_release_repo(tmp_path):
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v179_carryover_completion(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -510,6 +511,7 @@ def recovery_release_repo(tmp_path):
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v179_carryover_completion(repo)
     restore_pre_v177_token_estimate_policy(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
@@ -921,6 +923,7 @@ V159_ROUND_BUDGET_COMMIT = "96d66e1d17952f01b19bb957057830a2b2a6318b"
 V161_FILTER_SURFACE_COMMIT = "08f96e3244bfe8bdd569fb926b26d3086bab125d"
 V162_FINDING_DISMISSAL_COMMIT = "1cbb6df4590fb6be8a5012de31d98dc1f1cd3fa8"
 V173_REVIEW_BUDGET_COMMIT = "ac406e263f9bdc6d83e3d135d1c31b257ed57fa9"
+V178_CARRYOVER_COMPLETION_COMMIT = "74afc0057c4732993ecd76601590b8856e2a3bb3"
 V1462_WORKFLOW_FIXTURE_SHA256 = {
     "claude-code-review.yml": (
         "008bbdcdeacdaf7796c1e3b59d22194d3f1ce380735d36dada5efab8ff52d112"
@@ -1160,6 +1163,29 @@ def restore_pre_v159_review_policy_helper(repo: Path) -> None:
         == release_verifier.EXPECTED_REVIEW_POLICY_HELPER_SHA256
     )
     (repo / relative).write_bytes(payload)
+
+
+def restore_pre_v179_carryover_completion(repo: Path) -> None:
+    """Restore the authenticated pre-v1.79 canonicalizer helper bytes.
+
+    v1.79 makes the canonicalizer re-publish an unmentioned prior finding as
+    ``Still open`` instead of dropping it, which changes the shared helper's pinned
+    digest. Only the helper moved, so ``action.yml`` is deliberately left alone;
+    restoring it too would undo the older action bytes some prepares rely on. Call
+    this after any ``shutil.copy2`` that brings the current helper back in, and
+    otherwise newest release first so no later whole-file restore is undone.
+    """
+
+    tree = release_verifier.VerifiedCommitTree.open(
+        ROOT, V178_CARRYOVER_COMPLETION_COMMIT
+    )
+    relative = ".github/actions/canonicalize-review/canonicalize_review.py"
+    helper = tree.read_file(relative)
+    assert (
+        hashlib.sha256(helper).hexdigest()
+        == release_verifier.EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163
+    )
+    (repo / relative).write_bytes(helper)
 
 
 def restore_pre_v163_finding_dismissal(repo: Path, *, budget: bool = False) -> None:
@@ -2879,6 +2905,7 @@ def prepare_v163(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v179_carryover_completion(repo)
     restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
@@ -2898,6 +2925,7 @@ def prepare_v164(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v179_carryover_completion(repo)
     restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
@@ -2916,6 +2944,7 @@ def prepare_v165(repo: Path) -> str:
         ".github/actions/canonicalize-review/canonicalize_review.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v179_carryover_completion(repo)
     restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
@@ -2934,6 +2963,7 @@ def prepare_v166(repo: Path) -> str:
         ".github/actions/resolve-review-policy/resolve_review_policy.py",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v179_carryover_completion(repo)
     restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
@@ -2953,6 +2983,7 @@ def prepare_v167(repo: Path) -> str:
         ".github/workflows/gemini-dispatch.yml",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v179_carryover_completion(repo)
     restore_pre_v174_expanded_review_budget(repo)
     restore_pre_v172_opencode_context_budget(repo)
     restore_pre_v171_opencode_dismissals(repo)
@@ -2971,6 +3002,7 @@ def prepare_v168(repo: Path) -> str:
         ".github/workflows/gemini-dispatch.yml",
     ):
         shutil.copy2(ROOT / relative, repo / relative)
+    restore_pre_v179_carryover_completion(repo)
     restore_pre_v174_expanded_review_budget(repo)
     for name in ("gemini-pr-review.yml", "gemini-review.yml"):
         (repo / "examples/baseline-workflows/.github/workflows" / name).unlink(

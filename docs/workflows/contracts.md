@@ -808,10 +808,21 @@ active finding to reappear in the candidate, so a model that emits `### New find
 retires every open finding with `attempt_status: success`, and one that carries some findings over
 retires exactly the ones it left out — observed once, on the `v1.71` change, where the same body is
 produced byte-for-byte at that change's base and head. The soft carryover path above closed the
-route that retires a finding through a *bad* block; it does not close the cheaper route of omitting
-the block entirely. Closing that route is not a free tightening, because omission is the same
-mechanism a dismissal retires through (below), and every republished block re-enters the next
-round's model context in full. See #157.
+route that retires a finding through a *bad* block; through `v1.78` it did not close the cheaper
+route of omitting the block entirely.
+
+From `v1.79` the shared `canonicalize-review` normalizer closes that route for Claude and Gemini. A
+prior active finding the candidate wrote no block for is republished under `Still open` from the
+authenticated prior canonical body, and one `review-canonicalization-carryover: <id>` line per
+finding is written to stderr. A block the model did write keeps its existing disposition: the bound
+set is exactly the prior set the candidate claimed, so a carryover that filtered or normalized out
+is not additionally republished here and keeps its `invalid_anchor` or closed-reason path above.
+Dismissal is unaffected: a dismissed ID leaves the active set before this step and is never
+republished, so omission remains the mechanism a dismissal retires through. The cost this decision
+weighed is the canonical ceiling — republishing every prior block at the maximum renderer output,
+200 findings over a 63,400-byte prior body, stays within `MAX_CANONICAL_BYTES`, and every
+republished block re-enters the next round's model context in full. OpenCode is unchanged and still
+retires a finding through omission. See #157.
 
 From `v1.72` the previous review reaches the model under its own budget rather than sharing the
 one that bounds human comments, and it is cut at a finding boundary: a partial block would have
