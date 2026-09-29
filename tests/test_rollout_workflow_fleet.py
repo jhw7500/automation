@@ -2855,6 +2855,45 @@ def test_publish_stops_before_any_command_when_the_workflow_scope_is_absent(
     assert "'workflow' scope" in capsys.readouterr().err
 
 
+def test_workflow_scope_makes_no_claim_when_the_probe_cannot_be_answered() -> None:
+    with mock.patch.object(
+        rollout.fleet_git,
+        "run",
+        side_effect=rollout.FleetGitError("command failed (gh, rc=4)"),
+    ):
+        rollout.fleet_git.require_workflow_scope()
+
+
+def test_publish_continues_when_the_scope_probe_cannot_be_answered(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with mock.patch.object(
+        rollout.fleet_git,
+        "run",
+        side_effect=rollout.FleetGitError("command failed (gh, rc=4)"),
+    ):
+        with pytest.raises(SystemExit):
+            rollout.main(
+                [
+                    "--mode",
+                    "publish",
+                    "--confirm",
+                    "--repo",
+                    "pim-check",
+                    "--workspace",
+                    str(tmp_path / "absent"),
+                ]
+            )
+    # An unanswerable probe must not be reported as a missing scope, and must
+    # not stop the run at all: assert the later workspace check is what failed.
+    # A bare "workspace" substring would also match argparse's usage banner, so
+    # this names the message only that check emits.
+    stderr = capsys.readouterr().err
+    assert "'workflow' scope" not in stderr
+    assert "command failed" not in stderr
+    assert "workspace is not initialized" in stderr
+
+
 def test_plan_does_not_require_the_workflow_scope(tmp_path: Path) -> None:
     occupied = tmp_path / "occupied"
     occupied.write_text("", encoding="utf-8")

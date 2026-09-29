@@ -195,12 +195,19 @@ def require_workflow_scope() -> None:
     GitHub answers a Git Data write touching `.github/workflows/` with 404
     rather than 403, and `run` keeps child output out of failures, so an absent
     scope is indistinguishable from an absent repository at the first mutation.
-    Tokens that carry no OAuth scopes, such as GitHub App installation tokens
-    and fine-grained personal access tokens, expose no header; this check makes
-    no claim about them and leaves them to the ordinary failure path.
+
+    Only proven absence refuses. A probe that cannot be answered at all, and a
+    token that carries no OAuth scopes such as a GitHub App installation token
+    or a fine-grained personal access token, leave the run on its ordinary
+    failure path: `run` raises on every non-zero child exit and discards the
+    child's output, so converting that into a refusal would block publication
+    for a reason this function cannot name.
     """
 
-    output = run(["gh", "api", "--include", "--hostname", "github.com", "user"])
+    try:
+        output = run(["gh", "api", "--include", "--hostname", "github.com", "user"])
+    except FleetGitError:
+        return
     for line in output.splitlines():
         if not line.strip():
             break
@@ -211,8 +218,10 @@ def require_workflow_scope() -> None:
         if not scopes or "workflow" in scopes:
             return
         raise FleetGitError(
-            "the GitHub token does not carry the 'workflow' scope, so managed "
-            ".github/workflows writes would be refused; run "
+            "the GitHub token does not carry the 'workflow' scope; --mode "
+            "publish requires it for every rollout, including one whose only "
+            "managed change is .github/workflow-config.yml, because this check "
+            "runs before the render plan exists; run "
             "'gh auth refresh -h github.com -s workflow' or use a token that "
             "may write workflow files"
         )
