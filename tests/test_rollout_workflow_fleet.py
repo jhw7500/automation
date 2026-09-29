@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import nullcontext
 from dataclasses import fields, replace
 import json
@@ -29,6 +30,20 @@ from scripts.workflow_fleet_git import (
 )
 from scripts.workflow_catalog import load_catalog, load_fleet_config
 from scripts.workflow_release_bundle import ReleaseBundle
+
+
+# main()'s publish preflight reads the operator's ambient gh credentials, so
+# leaving it live makes this module's verdict a function of the machine running
+# it and emits one authenticated api.github.com request per publish-mode test.
+# Every test gets a stub; the few that exercise the preflight itself re-bind
+# this captured original explicitly, so the exception is visible at each site.
+_REAL_REQUIRE_WORKFLOW_SCOPE = rollout.fleet_git.require_workflow_scope
+
+
+@pytest.fixture(autouse=True)
+def _stub_workflow_scope_probe() -> Iterator[None]:
+    with mock.patch.object(rollout.fleet_git, "require_workflow_scope"):
+        yield
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2815,26 +2830,28 @@ def _scope_response(scopes: str | None) -> str:
 )
 def test_workflow_scope_accepts_a_token_that_carries_it(scopes: str) -> None:
     with mock.patch.object(rollout.fleet_git, "run", return_value=_scope_response(scopes)):
-        rollout.fleet_git.require_workflow_scope()
+        _REAL_REQUIRE_WORKFLOW_SCOPE()
 
 
 @pytest.mark.parametrize("scopes", ["repo", "admin:public_key, gist, read:org, repo"])
 def test_workflow_scope_refuses_a_token_that_proves_absence(scopes: str) -> None:
     with mock.patch.object(rollout.fleet_git, "run", return_value=_scope_response(scopes)):
         with pytest.raises(FleetGitError, match="'workflow' scope"):
-            rollout.fleet_git.require_workflow_scope()
+            _REAL_REQUIRE_WORKFLOW_SCOPE()
 
 
 @pytest.mark.parametrize("scopes", [None, "", "   "])
 def test_workflow_scope_makes_no_claim_without_oauth_scopes(scopes: str | None) -> None:
     with mock.patch.object(rollout.fleet_git, "run", return_value=_scope_response(scopes)):
-        rollout.fleet_git.require_workflow_scope()
+        _REAL_REQUIRE_WORKFLOW_SCOPE()
 
 
 def test_publish_stops_before_any_command_when_the_workflow_scope_is_absent(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     with mock.patch.object(
+        rollout.fleet_git, "require_workflow_scope", _REAL_REQUIRE_WORKFLOW_SCOPE
+    ), mock.patch.object(
         rollout.fleet_git, "run", return_value=_scope_response("repo")
     ), mock.patch("scripts.workflow_fleet_git.subprocess.run") as child:
         with pytest.raises(SystemExit):
@@ -2861,13 +2878,15 @@ def test_workflow_scope_makes_no_claim_when_the_probe_cannot_be_answered() -> No
         "run",
         side_effect=rollout.FleetGitError("command failed (gh, rc=4)"),
     ):
-        rollout.fleet_git.require_workflow_scope()
+        _REAL_REQUIRE_WORKFLOW_SCOPE()
 
 
 def test_publish_continues_when_the_scope_probe_cannot_be_answered(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     with mock.patch.object(
+        rollout.fleet_git, "require_workflow_scope", _REAL_REQUIRE_WORKFLOW_SCOPE
+    ), mock.patch.object(
         rollout.fleet_git,
         "run",
         side_effect=rollout.FleetGitError("command failed (gh, rc=4)"),
