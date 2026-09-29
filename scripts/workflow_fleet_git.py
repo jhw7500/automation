@@ -189,6 +189,35 @@ def _json(args: Sequence[str]) -> object:
     return data
 
 
+def require_workflow_scope() -> None:
+    """Refuse publication when the token provably lacks the `workflow` scope.
+
+    GitHub answers a Git Data write touching `.github/workflows/` with 404
+    rather than 403, and `run` keeps child output out of failures, so an absent
+    scope is indistinguishable from an absent repository at the first mutation.
+    Tokens that carry no OAuth scopes, such as GitHub App installation tokens
+    and fine-grained personal access tokens, expose no header; this check makes
+    no claim about them and leaves them to the ordinary failure path.
+    """
+
+    output = run(["gh", "api", "--include", "--hostname", "github.com", "user"])
+    for line in output.splitlines():
+        if not line.strip():
+            break
+        name, separator, value = line.partition(":")
+        if not separator or name.strip().casefold() != "x-oauth-scopes":
+            continue
+        scopes = {item.strip() for item in value.split(",") if item.strip()}
+        if not scopes or "workflow" in scopes:
+            return
+        raise FleetGitError(
+            "the GitHub token does not carry the 'workflow' scope, so managed "
+            ".github/workflows writes would be refused; run "
+            "'gh auth refresh -h github.com -s workflow' or use a token that "
+            "may write workflow files"
+        )
+
+
 def _github_post(repo: str, collection: str, body: object) -> object:
     """POST one closed Git Data schema through JSON stdin, never argv fields."""
 

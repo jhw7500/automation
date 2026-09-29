@@ -24,6 +24,14 @@ by `scripts/workflow-config.json`. Consumer-repository Git and `gh` operations u
 operator's normal GitHub authentication, but provider credentials are removed from child
 environments. Supply the locally installed, reviewed `actionlint` executable explicitly.
 
+Publication also needs a token that may write `.github/workflows/`. An OAuth token
+requires the `workflow` scope; `gh auth refresh -h github.com -s workflow` adds it
+without dropping the existing scopes. GitHub answers a Git Data write to a workflow
+path with 404 rather than 403, so `--mode publish` reads `X-Oauth-Scopes` before any
+mutation and stops when that header proves the scope is absent. The check makes no
+claim about tokens that expose no OAuth scopes, and a token whose scope is present
+may still be denied per repository; both remain the ordinary failure path.
+
 The historical `v1.40.1` release bundle uses schema v1 and is default-branch-only across
 its 19 configured repositories. Its commands below must not be used to claim schema-v2
 or multi-branch coverage.

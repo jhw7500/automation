@@ -22,7 +22,11 @@ from scripts.prepare_workflow_rollout import (
     RenderPlan,
     apply_render_plan,
 )
-from scripts.workflow_fleet_git import PullRequest, RepositorySnapshot
+from scripts.workflow_fleet_git import (
+    FleetGitError,
+    PullRequest,
+    RepositorySnapshot,
+)
 from scripts.workflow_catalog import load_catalog, load_fleet_config
 from scripts.workflow_release_bundle import ReleaseBundle
 
@@ -2788,3 +2792,73 @@ def test_render_blocks_when_a_required_label_is_missing(tmp_path: Path, bundle) 
     assert plan.status == "blocked"
     assert plan.changes == ()
     assert plan.reason == "missing labels: review-budget-override"
+
+
+def _scope_response(scopes: str | None) -> str:
+    """Build one `gh api --include` response whose body repeats the header name.
+
+    The body line is a decoy: parsing that does not stop at the header/body
+    separator reads it as a second scope declaration, so every assertion below
+    also covers that boundary.
+    """
+
+    lines = ["HTTP/2.0 200 OK", "Content-Type: application/json"]
+    if scopes is not None:
+        lines.append(f"X-Oauth-Scopes: {scopes}")
+    lines += ["", "x-oauth-scopes: repo"]
+    return "\n".join(lines)
+
+
+@pytest.mark.parametrize(
+    "scopes",
+    ["workflow", "repo, workflow", "admin:public_key, gist, read:org, repo, workflow"],
+)
+def test_workflow_scope_accepts_a_token_that_carries_it(scopes: str) -> None:
+    with mock.patch.object(rollout.fleet_git, "run", return_value=_scope_response(scopes)):
+        rollout.fleet_git.require_workflow_scope()
+
+
+@pytest.mark.parametrize("scopes", ["repo", "admin:public_key, gist, read:org, repo"])
+def test_workflow_scope_refuses_a_token_that_proves_absence(scopes: str) -> None:
+    with mock.patch.object(rollout.fleet_git, "run", return_value=_scope_response(scopes)):
+        with pytest.raises(FleetGitError, match="'workflow' scope"):
+            rollout.fleet_git.require_workflow_scope()
+
+
+@pytest.mark.parametrize("scopes", [None, "", "   "])
+def test_workflow_scope_makes_no_claim_without_oauth_scopes(scopes: str | None) -> None:
+    with mock.patch.object(rollout.fleet_git, "run", return_value=_scope_response(scopes)):
+        rollout.fleet_git.require_workflow_scope()
+
+
+def test_publish_stops_before_any_command_when_the_workflow_scope_is_absent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with mock.patch.object(
+        rollout.fleet_git, "run", return_value=_scope_response("repo")
+    ), mock.patch("scripts.workflow_fleet_git.subprocess.run") as child:
+        with pytest.raises(SystemExit):
+            rollout.main(
+                [
+                    "--mode",
+                    "publish",
+                    "--confirm",
+                    "--repo",
+                    "pim-check",
+                    "--workspace",
+                    str(tmp_path),
+                ]
+            )
+        child.assert_not_called()
+    # The exit must name the scope, not merely happen: a workspace or argument
+    # rejection would also raise SystemExit without the preflight wired in.
+    assert "'workflow' scope" in capsys.readouterr().err
+
+
+def test_plan_does_not_require_the_workflow_scope(tmp_path: Path) -> None:
+    occupied = tmp_path / "occupied"
+    occupied.write_text("", encoding="utf-8")
+    with mock.patch.object(rollout.fleet_git, "require_workflow_scope") as guard:
+        with pytest.raises(SystemExit):
+            rollout.main(["--mode", "plan", "--workspace", str(occupied)])
+        guard.assert_not_called()

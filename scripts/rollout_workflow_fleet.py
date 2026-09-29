@@ -1639,6 +1639,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--bootstrap-repo requires exactly one matching bootstrap-allowed --repo"
         )
+    if args.mode == "publish":
+        try:
+            fleet_git.require_workflow_scope()
+        except FleetGitError as exc:
+            parser.error(str(exc))
     workspace = _workspace(args.workspace, args.initialize_workspace, parser)
     actionlint = _resolve_actionlint(args.actionlint)
     manifest = _preflight_manifest(args.manifest or workspace / "rollout-manifest.json")
