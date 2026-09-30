@@ -19,6 +19,9 @@ from typing import Sequence
 
 CONTRACT_VERSION = "v1"
 MAX_BYTES = 64 * 1024
+MAX_FINDINGS = 128
+MAX_REPORT_JSON_UTF16_BYTES = 512 * 1024
+REPORT_ENVELOPE_UTF16_RESERVE = 4 * 1024
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
 FENCE_RE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<rest>[^\r\n]*)$")
 LINK_DEFINITION_RE = re.compile(
@@ -35,6 +38,10 @@ ANGLE_PLACEHOLDER_RE = re.compile(
 ISSUE_URL_RE = re.compile(
     r"(?i)https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*\b"
 )
+CHANGE_URL_PATTERN = (
+    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/[1-9][0-9]*\b"
+)
+CHANGE_URL_RE = re.compile(CHANGE_URL_PATTERN, re.IGNORECASE)
 BARE_REFERENCE_RE = re.compile(
     r"(?<![A-Za-z0-9_./?=&%+-])#[1-9][0-9]*\b"
 )
@@ -44,8 +51,8 @@ INLINE_LINK_RE = re.compile(
     r"(?P<destination><[^>\r\n]*>|[^\s)\r\n]+)"
 )
 CHANGE_REFERENCE_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_./?=&%+-])#[1-9][0-9]*\b|"
-    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/[1-9][0-9]*\b"
+    r"(?<![A-Za-z0-9_./?=&%+-])#[1-9][0-9]*\b|" + CHANGE_URL_PATTERN,
+    re.IGNORECASE,
 )
 LIST_MARKER = r"(?:[-*+]|[0-9]{1,9}[.)])"
 STRUCTURAL_LIST_ITEM_RE = re.compile(
@@ -144,6 +151,49 @@ class Finding:
     message: str
     line: int | None = None
     field: str | None = None
+
+
+class FindingAccumulator(list[Finding]):
+    """Keep diagnostics deterministic and safe for GitHub output framing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.omitted = 0
+        self.payload_utf16_bytes = 0
+
+    @property
+    def has_findings(self) -> bool:
+        return bool(self) or self.omitted > 0
+
+    def append(self, item: Finding) -> None:
+        encoded = json.dumps(
+            asdict(item), ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-16-le")
+        item_size = len(encoded) + 2
+        if (
+            len(self) >= MAX_FINDINGS - 1
+            or self.payload_utf16_bytes + item_size
+            > MAX_REPORT_JSON_UTF16_BYTES - REPORT_ENVELOPE_UTF16_RESERVE
+        ):
+            self.omitted += 1
+            return
+        super().append(item)
+        self.payload_utf16_bytes += item_size
+
+    def extend(self, items: Sequence[Finding]) -> None:
+        for item in items:
+            self.append(item)
+
+    def freeze(self) -> tuple[Finding, ...]:
+        items = list(self)
+        if self.omitted:
+            items.append(
+                Finding(
+                    "findings-truncated",
+                    f"{self.omitted} additional findings were omitted to keep output bounded.",
+                )
+            )
+        return tuple(items)
 
 
 @dataclass(frozen=True)
@@ -252,12 +302,15 @@ def _structural_lines(
             previous_line_blank = False
             continue
 
-        if blockquote_paragraph:
+        heading_interrupt = HEADING_RE.fullmatch(line) is not None
+        if blockquote_paragraph and not heading_interrupt:
             classified.append((line, False, None))
             previous_line_blank = False
             continue
+        if heading_interrupt:
+            blockquote_paragraph = False
 
-        if previous_line_blank:
+        if previous_line_blank or heading_interrupt:
             while list_content_indents and indent < list_content_indents[-1]:
                 list_content_indents.pop()
         classified.append((line, not list_content_indents, None))
@@ -745,10 +798,30 @@ def _has_issue_reference(value: str) -> bool:
 
 
 def _has_change_reference(value: str) -> bool:
-    return any(
-        CHANGE_REFERENCE_RE.search(_inline_visible_text(candidate))
-        for candidate in _top_level_reference_blocks(value)
-    )
+    for candidate in _top_level_reference_blocks(value):
+        if CHANGE_REFERENCE_RE.search(_inline_visible_text(candidate)):
+            return True
+        for link in INLINE_LINK_RE.finditer(candidate):
+            if (
+                link.start() > 0
+                and candidate[link.start() - 1] == "!"
+                and not _backslash_escaped(candidate, link.start() - 1)
+            ):
+                continue
+            destination = link.group("destination").strip("<>")
+            if CHANGE_URL_RE.fullmatch(destination):
+                return True
+    return False
+
+
+def _absence_uses_markdown_container(value: str) -> bool:
+    for line, top_level, list_match in _structural_lines(value):
+        if not line.strip():
+            continue
+        candidate = _top_level_candidate(line, list_match)
+        if ABSENCE_RE.fullmatch(_visible_evidence_text(candidate)):
+            return list_match is not None or not top_level
+    return False
 
 
 def _has_top_level_checklist_item(value: str) -> bool:
@@ -828,12 +901,12 @@ def validate_text(
     if expected_version != CONTRACT_VERSION:
         raise ValueError(f"unsupported contract version: {expected_version}")
 
-    findings: list[Finding] = []
+    findings = FindingAccumulator()
     if "\x00" in text:
         findings.append(Finding("nul-byte", "NUL bytes are not valid Markdown evidence."))
     if not text.strip():
         findings.append(Finding("empty-document", "Evidence document is empty."))
-        return ValidationResult(False, kind, None, tuple(findings))
+        return ValidationResult(False, kind, None, findings.freeze())
     unsupported_separator = UNSUPPORTED_LINE_SEPARATOR_RE.search(text)
     if unsupported_separator:
         findings.append(
@@ -984,7 +1057,9 @@ def validate_text(
                 )
             continue
 
-        if LIST_SENTINEL_RE.search(visible_body):
+        if LIST_SENTINEL_RE.search(visible_body) or _absence_uses_markdown_container(
+            visible_body
+        ):
             findings.append(
                 Finding(
                     "invalid-absence-syntax",
@@ -1075,7 +1150,9 @@ def validate_text(
                 )
             )
 
-    return ValidationResult(not findings, kind, version, tuple(findings))
+    return ValidationResult(
+        not findings.has_findings, kind, version, findings.freeze()
+    )
 
 
 def _read_regular_descriptor(descriptor: int) -> str:
@@ -1154,6 +1231,8 @@ def _open_regular_file(path: Path, workspace: Path | None) -> str:
 
 def _write_github_output(path: Path, result: ValidationResult) -> None:
     payload = json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":"))
+    if len(payload.encode("utf-16-le")) > MAX_REPORT_JSON_UTF16_BYTES:
+        raise ValueError("report JSON exceeds the GitHub output budget")
     safe_version = result.version if result.version == CONTRACT_VERSION else ""
     with path.open("a", encoding="utf-8") as stream:
         stream.write(f"valid={'true' if result.valid else 'false'}\n")
@@ -1194,8 +1273,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
 
-    if args.github_output:
-        _write_github_output(args.github_output, result)
+    try:
+        if args.github_output:
+            _write_github_output(args.github_output, result)
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
     if args.format == "json":
         print(json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True))
     else:

@@ -136,6 +136,28 @@ def test_list_wrapped_absence_sentinels_are_rejected(field: str, value: str) -> 
     assert "invalid-absence-syntax" in {item.code for item in result.findings}
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "- **Not run:** no tests were executed.",
+        "- [ ] *Not run:* no tests were executed.",
+        "> **Not run:** no tests were executed.",
+    ],
+)
+def test_formatted_container_wrapped_absence_sentinels_are_rejected(
+    value: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Validation\n") + len("### Validation\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + value + "\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "invalid-absence-syntax" in {item.code for item in result.findings}
+
+
 def test_concrete_prose_may_discuss_placeholder_tokens() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Adds deterministic validation for structured change evidence.",
@@ -749,6 +771,42 @@ def test_rendered_or_navigable_issue_url_satisfies_related_issue(
     assert result.valid, result.findings
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "[Issue](https://github.com/example/repo/issues/194)",
+        "[Pull request](https://github.com/example/repo/pull/194)",
+    ],
+)
+def test_navigable_change_url_satisfies_commit_reference(reference: str) -> None:
+    text = (FIXTURES / "valid-commit.md").read_text().replace(
+        "Issue: #194", reference
+    )
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "Context ![](https://github.com/example/repo/issues/194)",
+        '[documentation](https://example.invalid "https://github.com/example/repo/issues/194")',
+    ],
+)
+def test_hidden_change_url_does_not_satisfy_commit_reference(
+    reference: str,
+) -> None:
+    text = (FIXTURES / "valid-commit.md").read_text().replace(
+        "Issue: #194", reference
+    )
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert "reference-required" in {item.code for item in result.findings}
+
+
 def test_nested_issue_reference_does_not_satisfy_related_issue() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Closes #194", "- Parent item\n  - Closes #194"
@@ -918,6 +976,28 @@ Delivered result.
 
 
 @pytest.mark.parametrize(
+    ("kind", "fixture"),
+    [
+        ("issue", "valid-issue.md"),
+        ("pull-request", "valid-pull-request.md"),
+        ("commit", "valid-commit.md"),
+    ],
+)
+def test_top_level_heading_may_immediately_follow_list_field(
+    kind: str, fixture: str
+) -> None:
+    text = (FIXTURES / fixture).read_text()
+    contract_start = text.index("### Contract version")
+    text = text[:contract_start] + text[contract_start:].replace(
+        "\n\n### ", "\n### "
+    )
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
     "separator",
     ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
 )
@@ -1026,6 +1106,72 @@ def test_cli_enforces_or_audits_the_same_invalid_document(tmp_path: Path) -> Non
     assert audit.returncode == 0
     assert json.loads(audit.stdout)["findings"] == json.loads(enforce.stdout)["findings"]
     assert "valid=false\n" in audit_output.read_text()
+
+
+def test_maximum_input_findings_and_github_outputs_are_bounded(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "evidence.md"
+    source.write_text("<a>" * (validator.MAX_BYTES // 3))
+    reports: list[dict[str, object]] = []
+
+    for mode, expected_code in (("enforce", 1), ("audit", 0)):
+        github_output = tmp_path / f"github-output-{mode}"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--kind",
+                "issue",
+                "--path",
+                str(source),
+                "--mode",
+                mode,
+                "--format",
+                "json",
+                "--github-output",
+                str(github_output),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert completed.returncode == expected_code, completed.stderr
+        report = json.loads(completed.stdout)
+        reports.append(report)
+        assert len(report["findings"]) <= validator.MAX_FINDINGS
+        assert report["findings"][-1]["code"] == "findings-truncated"
+        assert (
+            len(github_output.read_text().encode("utf-16-le"))
+            < 1024 * 1024
+        )
+
+    assert reports[0] == reports[1]
+
+
+def test_github_output_io_failure_returns_operational_error(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--kind",
+            "issue",
+            "--path",
+            str(FIXTURES / "valid-issue.md"),
+            "--github-output",
+            str(tmp_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "Is a directory" in completed.stderr
+    assert "Traceback" not in completed.stderr
 
 
 def test_github_outputs_cannot_be_injected_by_multiline_version(tmp_path: Path) -> None:

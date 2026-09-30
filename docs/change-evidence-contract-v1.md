@@ -124,6 +124,9 @@ Kinds are exactly `issue`, `pull-request`, and `commit`. Valid evidence exits `0
 Invalid evidence exits `1`; an I/O, encoding, path, or unsupported-version error exits
 `2`. `--format json` emits a stable object with `valid`, `kind`, `version`, and ordered
 `findings`. Finding entries expose `code`, `message`, `line`, and `field`.
+The validator emits at most 128 findings. When additional diagnostics exist, the final
+`findings-truncated` entry reports how many were omitted, keeping the single-line
+`report-json` output within a conservative GitHub Actions output budget.
 
 `--mode audit` preserves the same findings and outputs but exits `0` for structurally
 invalid evidence. It does not turn invalid evidence into v1 evidence. In GitHub Actions,
