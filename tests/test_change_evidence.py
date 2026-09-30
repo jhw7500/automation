@@ -80,6 +80,20 @@ def test_canonical_commit_template_title_is_rejected() -> None:
 
 
 @pytest.mark.parametrize(
+    "title",
+    ["**Update**", "[Fix](https://example.invalid)", "`WIP`"],
+)
+def test_formatted_generic_commit_title_is_rejected(title: str) -> None:
+    text = (FIXTURES / "valid-commit.md").read_text()
+    text = title + text[text.index("\n") :]
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert not result.valid
+    assert "commit-title-generic" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("Validation", "Unknown: the test owner has not replied."),
@@ -129,6 +143,41 @@ def test_concrete_prose_may_discuss_placeholder_tokens() -> None:
     ).replace(
         "Repositories must adopt the template before enabling enforcement.",
         "Not applicable: this change removes TODO comments from documentation.",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize("value", ["**TBD**", "`TODO`", "[N/A](https://example.invalid)"])
+def test_formatted_placeholder_only_field_is_rejected(value: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Repositories must adopt the template before enabling enforcement.", value
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "placeholder" in {item.code for item in result.findings}
+
+
+def test_empty_html_markup_does_not_satisfy_required_field() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        "<span></span>",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "empty-field" in {item.code for item in result.findings}
+
+
+def test_fenced_code_content_satisfies_prose_field() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        "```text\nobserved validator output\n```",
     )
 
     result = validator.validate_text(text, kind="pull-request")
@@ -321,6 +370,20 @@ def test_multiline_link_reference_definition_does_not_satisfy_related_issue() ->
     }
 
 
+def test_multiline_label_link_definition_does_not_satisfy_related_issue() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194",
+        "[hidden\nlabel]: https://github.com/example/repo/issues/194",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "non-rendered-link-definition" in {
+        item.code for item in result.findings
+    }
+
+
 def test_escaped_label_link_definition_does_not_satisfy_related_issue() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Closes #194",
@@ -413,6 +476,16 @@ def test_explicit_pr_label_does_not_satisfy_related_issue(reference: str) -> Non
 def test_formatted_pr_label_does_not_satisfy_related_issue(reference: str) -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Closes #194", reference
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+def test_softbreak_pr_label_does_not_satisfy_related_issue() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", "PR:\n#194"
     )
 
     result = validator.validate_text(text, kind="pull-request")

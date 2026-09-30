@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import errno
+import html
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,8 @@ MAX_BYTES = 64 * 1024
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
 FENCE_RE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<rest>[^\r\n]*)$")
 LINK_DEFINITION_RE = re.compile(
-    r"^ {0,3}\[(?:\\.|[^\]\\\r\n])+\]:[ \t]*(?:\S.*)?$"
+    r"^ {0,3}\[(?:\\.|[^\[\]\\])+\]:[ \t]*(?:\S.*)?$",
+    re.DOTALL,
 )
 SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 PLACEHOLDER_VALUE_RE = re.compile(
@@ -179,6 +181,7 @@ def _structural_lines(
     previous_line_blank = True
     for line in value.splitlines():
         if not line.strip():
+            classified.append((line, False, None))
             previous_line_blank = True
             continue
 
@@ -318,6 +321,37 @@ def _scan_visible_markdown(
     )
 
 
+def _link_definition_start_lines(value: str) -> list[int]:
+    starts: list[int] = []
+    start: int | None = None
+    candidate = ""
+    for index, line in enumerate(value.splitlines()):
+        opener = bool(re.match(r"^ {0,3}\[", line))
+        if start is None:
+            if not opener:
+                continue
+            start = index
+            candidate = line
+        elif not line.strip():
+            start = None
+            candidate = ""
+            continue
+        elif opener:
+            start = index
+            candidate = line
+        else:
+            candidate += "\n" + line
+
+        if LINK_DEFINITION_RE.fullmatch(candidate):
+            starts.append(start + 1)
+            start = None
+            candidate = ""
+        elif len(candidate) > 4096:
+            start = None
+            candidate = ""
+    return starts
+
+
 def _content_without_comments(value: str) -> str:
     return _scan_markdown(value, mask_code=False).strip()
 
@@ -330,6 +364,9 @@ def _contains_placeholder_value(value: str) -> bool:
         list_match = LIST_ITEM_RE.fullmatch(line)
         if list_match:
             candidate = list_match.group("value").strip()
+        if ANGLE_PLACEHOLDER_RE.fullmatch(candidate):
+            return True
+        candidate = _inline_visible_text(candidate).strip()
         if PLACEHOLDER_VALUE_RE.fullmatch(candidate) or ANGLE_PLACEHOLDER_RE.fullmatch(
             candidate
         ):
@@ -340,9 +377,18 @@ def _contains_placeholder_value(value: str) -> bool:
 def _inline_visible_text(value: str) -> str:
     value = re.sub(r"!?\[([^\]\r\n]*)\]\([^\)\r\n]*\)", r"\1", value)
     value = re.sub(r"!?\[([^\]\r\n]*)\]\[[^\]\r\n]*\]", r"\1", value)
-    value = re.sub(r"</?[A-Za-z][^>\r\n]*>", "", value)
+    value = re.sub(
+        r"</?[A-Za-z][A-Za-z0-9-]*(?:[ \t][^>\r\n]*)?/?>",
+        "",
+        value,
+    )
     value = re.sub(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~\\])", r"\1", value)
-    return value.translate(str.maketrans("", "", "`*_~[]()"))
+    value = value.translate(str.maketrans("", "", "`*_~[]()"))
+    return html.unescape(value)
+
+
+def _visible_evidence_text(value: str) -> str:
+    return "\n".join(_inline_visible_text(line) for line in value.splitlines()).strip()
 
 
 def _top_level_candidate(
@@ -351,11 +397,31 @@ def _top_level_candidate(
     return list_match.group("value") if list_match else line.strip()
 
 
-def _has_issue_reference(value: str) -> bool:
+def _top_level_reference_blocks(value: str) -> list[str]:
+    blocks: list[str] = []
+    paragraph: list[str] = []
+
+    def flush_paragraph() -> None:
+        if paragraph:
+            blocks.append(" ".join(paragraph))
+            paragraph.clear()
+
     for line, top_level, list_match in _structural_lines(value):
-        if not top_level:
+        if not line.strip() or not top_level:
+            flush_paragraph()
             continue
         candidate = _top_level_candidate(line, list_match)
+        if list_match:
+            flush_paragraph()
+            blocks.append(candidate)
+        else:
+            paragraph.append(candidate)
+    flush_paragraph()
+    return blocks
+
+
+def _has_issue_reference(value: str) -> bool:
+    for candidate in _top_level_reference_blocks(value):
         if ISSUE_URL_RE.search(candidate):
             return True
         visible_candidate = _inline_visible_text(candidate)
@@ -368,11 +434,8 @@ def _has_issue_reference(value: str) -> bool:
 
 def _has_change_reference(value: str) -> bool:
     return any(
-        top_level
-        and CHANGE_REFERENCE_RE.search(
-            _inline_visible_text(_top_level_candidate(line, list_match))
-        )
-        for line, top_level, list_match in _structural_lines(value)
+        CHANGE_REFERENCE_RE.search(_inline_visible_text(candidate))
+        for candidate in _top_level_reference_blocks(value)
     )
 
 
@@ -457,15 +520,15 @@ def validate_text(
             )
         )
     visible_lines = visible_document.splitlines()
-    for index, line in enumerate(visible_lines):
-        if LINK_DEFINITION_RE.fullmatch(line):
-            findings.append(
-                Finding(
-                    "non-rendered-link-definition",
-                    "Link reference definitions do not count as rendered field evidence; use an inline link.",
-                    index + 1,
-                )
+    for line_number in _link_definition_start_lines(visible_document):
+        findings.append(
+            Finding(
+                "non-rendered-link-definition",
+                "Link reference definitions do not count as rendered field evidence; use an inline link.",
+                line_number,
             )
+        )
+    for index, line in enumerate(visible_lines):
         if (
             index > 0
             and visible_lines[index - 1].strip()
@@ -481,10 +544,9 @@ def validate_text(
 
     definition = CONTRACTS[kind]
     if kind == "commit":
-        title = _content_without_comments(text.splitlines()[0])
-        if not title:
-            findings.append(Finding("commit-title-empty", "Commit title is required.", 1))
-        elif _contains_placeholder_value(title):
+        title_source = _content_without_comments(text.splitlines()[0])
+        title = _inline_visible_text(title_source).strip()
+        if _contains_placeholder_value(title_source):
             findings.append(
                 Finding(
                     "commit-title-placeholder",
@@ -492,6 +554,8 @@ def validate_text(
                     1,
                 )
             )
+        elif not title:
+            findings.append(Finding("commit-title-empty", "Commit title is required.", 1))
         elif len(title) > 72:
             findings.append(
                 Finding("commit-title-too-long", "Commit title must be 72 characters or fewer.", 1)
@@ -556,7 +620,9 @@ def validate_text(
         raw_body = text[body_start:body_end]
         body = _content_without_comments(raw_body)
         visible_body = _scan_visible_markdown(raw_body).strip()
-        if not body:
+        visible_evidence = _visible_evidence_text(body)
+        visible_structure = _visible_evidence_text(visible_body)
+        if not visible_evidence:
             findings.append(
                 Finding("empty-field", "Contract field must contain evidence.", line_number, field)
             )
@@ -585,7 +651,7 @@ def validate_text(
             )
             continue
 
-        absence_match = ABSENCE_RE.fullmatch(visible_body)
+        absence_match = ABSENCE_RE.fullmatch(visible_structure)
         absence_kind = absence_match.group("kind").casefold() if absence_match else None
         absence_reason = absence_match.group("reason").strip() if absence_match else ""
         allowed_absence_kinds = (
