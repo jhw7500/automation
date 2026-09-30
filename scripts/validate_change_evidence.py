@@ -48,13 +48,19 @@ STRUCTURAL_LIST_ITEM_RE = re.compile(
     rf"^(?P<indent>[ \t]*)(?P<marker>{LIST_MARKER})(?P<spacing>[ \t]+)(?P<value>.*)$"
 )
 BLOCKQUOTE_RE = re.compile(r"^ {0,3}>")
+BLOCKQUOTE_CONTENT_RE = re.compile(r"^ {0,3}>[ \t]?(?P<value>.*)$")
 CHECKBOX_VALUE_RE = re.compile(r"^\[[ xX]\][ \t]+(?P<value>.*)$")
 RAW_HTML_START_RE = re.compile(
-    r"(?i)(?<!\\)(?:</?[A-Za-z][A-Za-z0-9-]*(?=[\s/>])|<![A-Z]|<\?)"
+    r"(?i)(?:</?[A-Za-z][A-Za-z0-9-]*(?=[\s/>])|<![A-Z]|<\?)"
+)
+ATX_HEADING_RE = re.compile(r"^#{1,6}(?:[ \t]+(?P<value>.*))?$")
+THEMATIC_BREAK_RE = re.compile(
+    r"^(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$"
 )
 LIST_ITEM_RE = re.compile(
     rf"^ {{0,3}}{LIST_MARKER}\s+(?:\[[ xX]\]\s+)?(?P<value>.*)$"
 )
+EMPTY_LIST_MARKER_RE = re.compile(rf"^ {{0,3}}{LIST_MARKER}[ \t]*$")
 LIST_SENTINEL_RE = re.compile(
     rf"(?im)^ {{0,3}}{LIST_MARKER}\s+(?:\[[ xX]\]\s+)?"
     r"(?:unknown|not applicable|not run):"
@@ -175,6 +181,17 @@ def _column_width(value: str) -> int:
     return columns
 
 
+def _blockquote_allows_lazy_continuation(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if ATX_HEADING_RE.fullmatch(candidate) or THEMATIC_BREAK_RE.fullmatch(
+        candidate
+    ):
+        return False
+    return True
+
+
 def _structural_lines(
     value: str,
 ) -> list[tuple[str, bool, re.Match[str] | None]]:
@@ -194,7 +211,13 @@ def _structural_lines(
         if BLOCKQUOTE_RE.match(line):
             classified.append((line, False, None))
             previous_line_blank = False
-            blockquote_paragraph = True
+            blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(line)
+            blockquote_paragraph = bool(
+                blockquote
+                and _blockquote_allows_lazy_continuation(
+                    blockquote.group("value")
+                )
+            )
             continue
 
         indent = _indent_columns(line)
@@ -258,10 +281,13 @@ def _scan_markdown(
     value: str,
     *,
     mask_code: bool,
+    mask_indented_code: bool | None = None,
     ambiguous_comment_offsets: list[int] | None = None,
 ) -> str:
     """Mask comments and optionally code using one ordered Markdown state machine."""
 
+    if mask_indented_code is None:
+        mask_indented_code = mask_code
     output: list[str] = []
     fence_character = ""
     fence_length = 0
@@ -303,7 +329,7 @@ def _scan_markdown(
                 offset += len(line)
                 continue
         if _indent_columns(line) >= 4:
-            if ambiguous_comment_offsets is not None:
+            if mask_indented_code and ambiguous_comment_offsets is not None:
                 cursor = 0
                 while True:
                     comment_start = line.find("<!--", cursor)
@@ -311,7 +337,16 @@ def _scan_markdown(
                         break
                     ambiguous_comment_offsets.append(offset + comment_start)
                     cursor = comment_start + 4
-            output.append(_masked_line(line) if mask_code else line)
+            if mask_indented_code:
+                output.append(_masked_line(line) if mask_code else line)
+            else:
+                masked, in_comment = _mask_comment_spans(
+                    line,
+                    False,
+                    line_offset=offset,
+                    ambiguous_comment_offsets=ambiguous_comment_offsets,
+                )
+                output.append(masked)
         else:
             masked, in_comment = _mask_comment_spans(
                 line,
@@ -375,7 +410,7 @@ def _mask_inline_code_spans(value: str) -> str:
     characters = list(value)
     cursor = 0
     while cursor < len(value):
-        if value[cursor] != "`" or (cursor > 0 and value[cursor - 1] == "\\"):
+        if value[cursor] != "`" or _backslash_escaped(value, cursor):
             cursor += 1
             continue
         opener_end = cursor
@@ -405,10 +440,132 @@ def _mask_inline_code_spans(value: str) -> str:
     return "".join(characters)
 
 
+def _backslash_escaped(value: str, offset: int) -> bool:
+    backslashes = 0
+    cursor = offset - 1
+    while cursor >= 0 and value[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    return backslashes % 2 == 1
+
+
+def _drop_indent_columns(value: str, columns: int) -> str:
+    cursor = 0
+    width = 0
+    while cursor < len(value) and width < columns:
+        character = value[cursor]
+        if character == " ":
+            width += 1
+        elif character == "\t":
+            width += 4 - (width % 4)
+        else:
+            break
+        cursor += 1
+    return value[cursor:]
+
+
+def _mask_top_level_indented_code(value: str) -> str:
+    """Mask indented code while retaining list-relative Markdown content."""
+
+    output: list[str] = []
+    list_content_indents: list[int] = []
+    previous_line_blank = True
+    in_indented_code = False
+    fence_character = ""
+    fence_length = 0
+    for line in value.splitlines(keepends=True):
+        line_without_ending = line.rstrip("\r\n")
+        if not line_without_ending.strip():
+            output.append(line)
+            previous_line_blank = True
+            continue
+
+        indent = _indent_columns(line_without_ending)
+        relative_line = _drop_indent_columns(
+            line_without_ending,
+            list_content_indents[-1] if list_content_indents else 0,
+        )
+        if fence_character:
+            output.append(_masked_line(line))
+            fence_match = FENCE_RE.match(relative_line)
+            if fence_match:
+                run = fence_match.group("run")
+                if (
+                    run[0] == fence_character
+                    and len(run) >= fence_length
+                    and not fence_match.group("rest").strip()
+                ):
+                    fence_character = ""
+                    fence_length = 0
+            previous_line_blank = False
+            continue
+
+        list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(line_without_ending)
+        if list_match:
+            in_indented_code = False
+            while list_content_indents and indent < list_content_indents[-1]:
+                list_content_indents.pop()
+            list_content_indents.append(
+                _column_width(line_without_ending[: list_match.start("value")])
+            )
+            fence_match = FENCE_RE.match(list_match.group("value"))
+            if fence_match:
+                run = fence_match.group("run")
+                rest = fence_match.group("rest")
+                if run[0] != "`" or "`" not in rest:
+                    fence_character = run[0]
+                    fence_length = len(run)
+                    output.append(_masked_line(line))
+                else:
+                    output.append(line)
+            else:
+                output.append(line)
+            previous_line_blank = False
+            continue
+
+        if previous_line_blank:
+            while list_content_indents and indent < list_content_indents[-1]:
+                list_content_indents.pop()
+        relative_line = _drop_indent_columns(
+            line_without_ending,
+            list_content_indents[-1] if list_content_indents else 0,
+        )
+        fence_match = FENCE_RE.match(relative_line)
+        if fence_match:
+            run = fence_match.group("run")
+            rest = fence_match.group("rest")
+            if run[0] != "`" or "`" not in rest:
+                fence_character = run[0]
+                fence_length = len(run)
+                output.append(_masked_line(line))
+                previous_line_blank = False
+                in_indented_code = False
+                continue
+        code_indent = (
+            list_content_indents[-1] + 4 if list_content_indents else 4
+        )
+        if in_indented_code and indent < code_indent:
+            in_indented_code = False
+        if not in_indented_code and previous_line_blank and indent >= code_indent:
+            in_indented_code = True
+        output.append(_masked_line(line) if in_indented_code else line)
+        previous_line_blank = False
+    return "".join(output)
+
+
 def _raw_html_offsets(value: str) -> list[int]:
+    candidates = _scan_markdown(
+        value,
+        mask_code=True,
+        mask_indented_code=False,
+    )
+    candidates = _mask_inline_code_spans(
+        _mask_top_level_indented_code(candidates)
+    )
     return [
         match.start()
-        for match in RAW_HTML_START_RE.finditer(_mask_inline_code_spans(value))
+        for match in RAW_HTML_START_RE.finditer(candidates)
+        if not _backslash_escaped(candidates, match.start())
     ]
 
 
@@ -442,12 +599,77 @@ def _inline_visible_text(value: str) -> str:
     value = value.translate(str.maketrans("", "", "`*_~[]()"))
     value = html.unescape(value)
     return "".join(
-        character for character in value if unicodedata.category(character) != "Cf"
+        character
+        for character in value
+        if unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+        and not unicodedata.category(character).startswith("M")
     )
 
 
 def _visible_evidence_text(value: str) -> str:
-    return "\n".join(_inline_visible_text(line) for line in value.splitlines()).strip()
+    visible: list[str] = []
+    fence_character = ""
+    fence_length = 0
+    for line in value.splitlines():
+        fence_match = FENCE_RE.match(line)
+        if fence_character:
+            if fence_match:
+                run = fence_match.group("run")
+                if (
+                    run[0] == fence_character
+                    and len(run) >= fence_length
+                    and not fence_match.group("rest").strip()
+                ):
+                    fence_character = ""
+                    fence_length = 0
+                    continue
+            visible.append(
+                "".join(
+                    character
+                    for character in line
+                    if unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+                    and not unicodedata.category(character).startswith("M")
+                )
+            )
+            continue
+        if fence_match:
+            run = fence_match.group("run")
+            rest = fence_match.group("rest")
+            if run[0] != "`" or "`" not in rest:
+                fence_character = run[0]
+                fence_length = len(run)
+                continue
+
+        candidate = line.strip()
+        while candidate:
+            if THEMATIC_BREAK_RE.fullmatch(candidate):
+                candidate = ""
+                break
+            list_match = LIST_ITEM_RE.fullmatch(candidate)
+            if list_match:
+                candidate = list_match.group("value").strip()
+                continue
+            checkbox = CHECKBOX_VALUE_RE.fullmatch(candidate)
+            if checkbox:
+                candidate = checkbox.group("value").strip()
+                continue
+            blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+            if blockquote:
+                candidate = blockquote.group("value").strip()
+                continue
+            if EMPTY_LIST_MARKER_RE.fullmatch(candidate):
+                candidate = ""
+            break
+        heading = ATX_HEADING_RE.fullmatch(candidate)
+        if heading:
+            candidate = (heading.group("value") or "").strip()
+            candidate = re.sub(r"[ \t]+#+[ \t]*$", "", candidate)
+            if re.fullmatch(r"#+", candidate):
+                candidate = ""
+        if THEMATIC_BREAK_RE.fullmatch(candidate):
+            candidate = ""
+        visible.append(_inline_visible_text(candidate))
+    return "\n".join(visible).strip()
 
 
 def _top_level_candidate(
@@ -581,7 +803,7 @@ def validate_text(
                 _line_number(text, offset),
             )
         )
-    for offset in _raw_html_offsets(visible_document):
+    for offset in _raw_html_offsets(text):
         findings.append(
             Finding(
                 "raw-html",
@@ -615,7 +837,7 @@ def validate_text(
     definition = CONTRACTS[kind]
     if kind == "commit":
         title_source = _content_without_comments(text.splitlines()[0])
-        title = _inline_visible_text(title_source).strip()
+        title = _visible_evidence_text(title_source)
         if _contains_placeholder_value(title_source):
             findings.append(
                 Finding(

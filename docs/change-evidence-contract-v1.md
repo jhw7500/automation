@@ -28,6 +28,8 @@ The words MUST, MUST NOT, SHOULD, and MAY in this document are normative.
 - `Contract version` MUST be exactly `v1`.
 - Placeholder-only values such as `TBD`, `TODO`, `N/A`, `unknown`, `미정`, `추후`,
   or angle-bracket fill instructions are invalid.
+- Default-ignorable, variation, combining, and block-marker characters do not count as
+  visible evidence when no rendered text remains.
 - Prose, list items, fenced code blocks, and links MAY appear inside a field. Additional
   Markdown headings MUST NOT be used because they create an ambiguous field boundary.
 - Link reference definitions are invalid because they render no field evidence. Use

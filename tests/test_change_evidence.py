@@ -189,6 +189,64 @@ def test_default_ignorable_unicode_does_not_satisfy_required_field(
     assert "empty-field" in {item.code for item in result.findings}
 
 
+@pytest.mark.parametrize("value", ["\u034f", "\ufe00"])
+def test_combining_or_variation_character_does_not_satisfy_field(
+    value: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.", value
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "empty-field" in {item.code for item in result.findings}
+
+
+def test_combining_characters_do_not_satisfy_structural_evidence() -> None:
+    pull_request = (FIXTURES / "valid-pull-request.md").read_text()
+    pull_request = pull_request.replace(
+        "- Define the v1 headings and field rules.\n"
+        "- Add a dependency-free validator and reusable action.",
+        "- \u034f",
+    ).replace(
+        "- `pytest -q tests/test_change_evidence.py` passed.",
+        "- \ufe00",
+    )
+    issue = (FIXTURES / "valid-issue.md").read_text()
+    start = issue.index("### Acceptance criteria\n") + len(
+        "### Acceptance criteria\n"
+    )
+    end = issue.find("\n### ", start)
+    issue = issue[:start] + "- [ ] \u034f\n" + issue[end:]
+
+    pull_request_result = validator.validate_text(
+        pull_request, kind="pull-request"
+    )
+    issue_result = validator.validate_text(issue, kind="issue")
+
+    assert not pull_request_result.valid
+    assert not issue_result.valid
+    assert {item.code for item in pull_request_result.findings} & {
+        "empty-field",
+        "bullet-required",
+    }
+    assert {item.code for item in issue_result.findings} & {
+        "empty-field",
+        "checklist-required",
+    }
+
+
+def test_variation_character_does_not_satisfy_commit_title() -> None:
+    text = (FIXTURES / "valid-commit.md").read_text()
+    text = "\ufe00" + text[text.index("\n") :]
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert not result.valid
+    assert "commit-title-empty" in {item.code for item in result.findings}
+
+
 @pytest.mark.parametrize("field", ["Changes", "Validation"])
 def test_syntax_only_list_item_does_not_satisfy_bullet_field(field: str) -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text()
@@ -199,7 +257,10 @@ def test_syntax_only_list_item_does_not_satisfy_bullet_field(field: str) -> None
     result = validator.validate_text(text, kind="pull-request")
 
     assert not result.valid
-    assert "bullet-required" in {item.code for item in result.findings}
+    assert {item.code for item in result.findings} & {
+        "empty-field",
+        "bullet-required",
+    }
 
 
 def test_syntax_only_task_item_does_not_satisfy_acceptance_criteria() -> None:
@@ -213,7 +274,10 @@ def test_syntax_only_task_item_does_not_satisfy_acceptance_criteria() -> None:
     result = validator.validate_text(text, kind="issue")
 
     assert not result.valid
-    assert "checklist-required" in {item.code for item in result.findings}
+    assert {item.code for item in result.findings} & {
+        "empty-field",
+        "checklist-required",
+    }
 
 
 @pytest.mark.parametrize(
@@ -259,6 +323,35 @@ def test_raw_html_cannot_supply_contract_evidence(
 
     assert not result.valid
     assert "raw-html" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    ("replacement", "raw_html"),
+    [
+        (r"\<span>escaped literal\</span>", False),
+        (r"\\<img src=x onerror=alert(1)>", True),
+        ("Delivered result.\n\n- parent\n    <span>raw</span>", True),
+        ("Delivered result.\n    <span>raw</span>", True),
+        (
+            "Delivered result.\n\n- parent\n    ```html\n"
+            "    <span>literal</span>\n    ```",
+            False,
+        ),
+    ],
+)
+def test_raw_html_respects_escapes_and_list_relative_indentation(
+    replacement: str, raw_html: bool
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        replacement,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+    codes = {item.code for item in result.findings}
+
+    assert ("raw-html" in codes) is raw_html
+    assert result.valid is not raw_html
 
 
 def test_markdown_autolink_issue_reference_remains_valid() -> None:
@@ -636,6 +729,64 @@ def test_lazy_blockquote_issue_reference_does_not_satisfy_related_issue() -> Non
     result = validator.validate_text(text, kind="pull-request")
 
     assert "reference-required" in {item.code for item in result.findings}
+
+
+def test_empty_blockquote_does_not_hide_following_issue_reference() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", ">\nCloses #194"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+def test_empty_link_paragraph_keeps_lazy_blockquote_continuation() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", "> []()\nCloses #194"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+def test_block_only_markdown_does_not_satisfy_required_evidence() -> None:
+    commit = (FIXTURES / "valid-commit.md").read_text()
+    commit = "#" + commit[commit.index("\n") :]
+    pull_request = (FIXTURES / "valid-pull-request.md").read_text()
+    pull_request = pull_request.replace(
+        "- Define the v1 headings and field rules.\n"
+        "- Add a dependency-free validator and reusable action.",
+        "- #",
+    ).replace(
+        "- `pytest -q tests/test_change_evidence.py` passed.",
+        "- ---",
+    )
+
+    commit_result = validator.validate_text(commit, kind="commit")
+    pull_request_result = validator.validate_text(
+        pull_request, kind="pull-request"
+    )
+
+    assert not commit_result.valid
+    assert "commit-title-empty" in {item.code for item in commit_result.findings}
+    assert not pull_request_result.valid
+    assert "empty-field" in {
+        item.code for item in pull_request_result.findings
+    }
+
+
+@pytest.mark.parametrize("value", ["-", "- -", "- - -", "- 1.", "1."])
+def test_empty_list_markers_do_not_satisfy_required_evidence(value: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.", value
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "empty-field" in {item.code for item in result.findings}
 
 
 def test_inline_link_issue_label_satisfies_related_issue() -> None:
