@@ -560,6 +560,91 @@ def test_comment_opener_inside_fence_is_allowed_as_literal_code() -> None:
     assert result.valid, result.findings
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        (
+            "> ```markdown\n"
+            "> <!-- literal code -->\n"
+            "> ### literal heading\n"
+            "> <span>literal HTML</span>\n"
+            "> ```"
+        ),
+        (
+            "- ```markdown\n"
+            "  <!-- literal code -->\n"
+            "  ### literal heading\n"
+            "  <span>literal HTML</span>\n"
+            "  ```"
+        ),
+    ],
+)
+def test_comment_opener_inside_container_fence_is_literal_code(
+    replacement: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        replacement,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "> ```markdown\n> ```",
+        "- ```markdown\n  ```",
+    ],
+)
+def test_empty_container_fence_does_not_supply_evidence(
+    replacement: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        replacement,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "empty-field" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        """Paragraph remains open.
+2. ```markdown
+   <!-- cannot hide the heading -->
+   ### Unexpected heading
+   ```""",
+        """> Paragraph remains open.
+> 2. ```markdown
+>    <!-- cannot hide the heading -->
+>    ### Unexpected heading
+>    ```""",
+    ],
+)
+def test_noninterrupting_ordered_marker_does_not_open_container_fence(
+    replacement: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        replacement,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert {item.code for item in result.findings} & {
+        "heading-contract",
+        "nested-heading",
+        "unknown-heading",
+    }
+
+
 def test_comment_opener_inside_indented_code_is_rejected() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text()
     text = text.replace(
@@ -613,6 +698,27 @@ def test_indented_extra_heading_is_rejected() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "Delivered result.\n> ### Unexpected heading\n> Nested detail.",
+        "Delivered result.\n- ### Unexpected heading\n  Nested detail.",
+        "Delivered result.\n> Unexpected heading\n> ---",
+        "Delivered result.\n- Unexpected heading\n  ---",
+    ],
+)
+def test_container_heading_is_rejected(replacement: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        replacement,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "nested-heading" in {item.code for item in result.findings}
+
+
 @pytest.mark.parametrize("underline", ["-------------", "============="])
 def test_setext_heading_is_rejected(underline: str) -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
@@ -626,6 +732,28 @@ def test_setext_heading_is_rejected(underline: str) -> None:
     assert "setext-heading" in {item.code for item in result.findings}
 
 
+def test_thematic_break_after_list_is_not_a_setext_heading() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + "- material change\n---\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+def test_thematic_break_after_blockquoted_list_is_not_a_setext_heading() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        "> - material detail\n> ---",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
 def test_link_reference_definition_does_not_satisfy_related_issue() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Closes #194", "[hidden]: https://example.invalid/#194"
@@ -637,6 +765,46 @@ def test_link_reference_definition_does_not_satisfy_related_issue() -> None:
     assert "non-rendered-link-definition" in {
         item.code for item in result.findings
     }
+
+
+def test_list_link_definition_does_not_satisfy_changes() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = (
+        text[:start]
+        + "Change overview.\n"
+        + "- [hidden]: https://github.com/example/repo/issues/194\n"
+        + text[end:]
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+    codes = {item.code for item in result.findings}
+
+    assert "non-rendered-link-definition" in codes
+    assert "bullet-required" in codes
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        "- [hidden]: https://github.com/example/repo/issues/194",
+        "- [hidden]:\n    https://github.com/example/repo/issues/194",
+    ],
+)
+def test_list_link_definition_does_not_satisfy_related_issue(
+    definition: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194",
+        f"Tracker reference follows.\n{definition}",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+    codes = {item.code for item in result.findings}
+
+    assert "non-rendered-link-definition" in codes
+    assert "reference-required" in codes
 
 
 def test_multiline_link_reference_definition_does_not_satisfy_related_issue() -> None:

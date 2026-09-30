@@ -25,7 +25,8 @@ REPORT_ENVELOPE_UTF16_RESERVE = 4 * 1024
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
 FENCE_RE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<rest>[^\r\n]*)$")
 LINK_DEFINITION_RE = re.compile(
-    r"^ {0,3}\[(?:\\.|[^\[\]\\])+\]:[ \t]*(?:\S.*)?$",
+    r"^ {0,3}\[(?:\\.|[^\[\]\\])+\]:[ \t]*"
+    r"(?:\n[ \t]*)?(?:\S.*)?$",
     re.DOTALL,
 )
 SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
@@ -404,6 +405,106 @@ def _mask_comment_spans(
     return "".join(characters), in_comment
 
 
+def _strip_blockquote_prefixes(line: str) -> tuple[str, int]:
+    candidate = line
+    depth = 0
+    while True:
+        blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+        if not blockquote:
+            return candidate, depth
+        candidate = blockquote.group("value")
+        depth += 1
+
+
+def _container_line_info(line: str) -> tuple[str, bool, int, int]:
+    candidate, blockquote_depth = _strip_blockquote_prefixes(line)
+    list_indent = 0
+    while True:
+        list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(candidate)
+        if not list_match:
+            break
+        list_indent += _column_width(candidate[: list_match.start("value")])
+        candidate = list_match.group("value")
+    return (
+        candidate,
+        bool(blockquote_depth or list_indent),
+        blockquote_depth,
+        list_indent,
+    )
+
+
+def _effective_container_line_info(
+    line: str,
+    structural_list_match: re.Match[str] | None,
+    *,
+    blockquote_list_rendered: bool = True,
+) -> tuple[str, bool, int, int]:
+    relative_line, nested, blockquote_depth, list_indent = _container_line_info(line)
+    if list_indent and not blockquote_depth and structural_list_match is None:
+        return line, False, 0, 0
+    if list_indent and blockquote_depth and not blockquote_list_rendered:
+        quoted_line, _depth = _strip_blockquote_prefixes(line)
+        return quoted_line, True, blockquote_depth, 0
+    return relative_line, nested, blockquote_depth, list_indent
+
+
+def _blockquote_list_rendering(value: str) -> list[bool]:
+    rendered_flags: list[bool] = []
+    active_depth = 0
+    paragraph_open = False
+    for line in _markdown_lines(value):
+        candidate, blockquote_depth = _strip_blockquote_prefixes(line)
+        if not blockquote_depth:
+            rendered_flags.append(True)
+            active_depth = 0
+            paragraph_open = False
+            continue
+        if blockquote_depth != active_depth:
+            active_depth = blockquote_depth
+            paragraph_open = False
+        list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(candidate)
+        if list_match:
+            rendered = not paragraph_open or _list_can_interrupt_paragraph(
+                list_match
+            )
+            rendered_flags.append(rendered)
+            if rendered:
+                paragraph_open = False
+            continue
+        rendered_flags.append(True)
+        stripped = candidate.strip()
+        if not stripped:
+            paragraph_open = False
+        elif (
+            HEADING_RE.fullmatch(candidate)
+            or THEMATIC_BREAK_RE.fullmatch(stripped)
+            or LINK_DEFINITION_RE.fullmatch(candidate)
+            or FENCE_RE.fullmatch(candidate)
+        ):
+            paragraph_open = False
+        else:
+            paragraph_open = True
+    return rendered_flags
+
+
+def _line_in_container(
+    line: str, *, blockquote_depth: int, list_indent: int
+) -> str | None:
+    candidate = line
+    for _ in range(blockquote_depth):
+        blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+        if not blockquote:
+            return None
+        candidate = blockquote.group("value")
+    if list_indent:
+        if not candidate.strip():
+            return ""
+        if _indent_columns(candidate) < list_indent:
+            return None
+        candidate = _drop_indent_columns(candidate, list_indent)
+    return candidate
+
+
 def _scan_markdown(
     value: str,
     *,
@@ -418,24 +519,51 @@ def _scan_markdown(
     output: list[str] = []
     fence_character = ""
     fence_length = 0
+    fence_blockquote_depth = 0
+    fence_list_indent = 0
     in_comment = False
     offset = 0
-    for line in _markdown_lines(value, keepends=True):
+    structural_lines = iter(_structural_lines(value))
+    blockquote_list_rendering = _blockquote_list_rendering(value)
+    for line_index, line in enumerate(_markdown_lines(value, keepends=True)):
         line_without_ending = line.rstrip("\r\n")
-        fence_match = FENCE_RE.match(line_without_ending)
+        _classified_line, _top_level, structural_list_match = next(
+            structural_lines
+        )
         if fence_character:
-            output.append(_masked_line(line) if mask_code else line)
-            if fence_match:
-                run = fence_match.group("run")
-                if (
-                    run[0] == fence_character
-                    and len(run) >= fence_length
-                    and not fence_match.group("rest").strip()
-                ):
-                    fence_character = ""
-                    fence_length = 0
-            offset += len(line)
-            continue
+            relative_line = _line_in_container(
+                line_without_ending,
+                blockquote_depth=fence_blockquote_depth,
+                list_indent=fence_list_indent,
+            )
+            if relative_line is not None:
+                output.append(_masked_line(line) if mask_code else line)
+                fence_match = FENCE_RE.match(relative_line)
+                if fence_match:
+                    run = fence_match.group("run")
+                    if (
+                        run[0] == fence_character
+                        and len(run) >= fence_length
+                        and not fence_match.group("rest").strip()
+                    ):
+                        fence_character = ""
+                        fence_length = 0
+                        fence_blockquote_depth = 0
+                        fence_list_indent = 0
+                offset += len(line)
+                continue
+            fence_character = ""
+            fence_length = 0
+            fence_blockquote_depth = 0
+            fence_list_indent = 0
+        relative_line, _nested, blockquote_depth, list_indent = (
+            _effective_container_line_info(
+                line_without_ending,
+                structural_list_match,
+                blockquote_list_rendered=blockquote_list_rendering[line_index],
+            )
+        )
+        fence_match = FENCE_RE.match(relative_line)
         if in_comment:
             masked, in_comment = _mask_comment_spans(
                 line,
@@ -452,11 +580,13 @@ def _scan_markdown(
             if run[0] != "`" or "`" not in rest:
                 fence_character = run[0]
                 fence_length = len(run)
+                fence_blockquote_depth = blockquote_depth
+                fence_list_indent = list_indent
                 output.append(_masked_line(line) if mask_code else line)
                 offset += len(line)
                 continue
         if _indent_columns(line) >= 4:
-            if mask_indented_code and ambiguous_comment_offsets is not None:
+            if ambiguous_comment_offsets is not None:
                 cursor = 0
                 while True:
                     comment_start = line.find("<!--", cursor)
@@ -489,42 +619,114 @@ def _scan_markdown(
 def _scan_visible_markdown(
     value: str, ambiguous_comment_offsets: list[int] | None = None
 ) -> str:
-    return _scan_markdown(
-        value,
-        mask_code=True,
-        ambiguous_comment_offsets=ambiguous_comment_offsets,
+    return _mask_top_level_indented_code(
+        _scan_markdown(
+            value,
+            mask_code=True,
+            mask_indented_code=False,
+            ambiguous_comment_offsets=ambiguous_comment_offsets,
+        )
     )
 
 
-def _link_definition_start_lines(value: str) -> list[int]:
-    starts: list[int] = []
+def _link_definition_line_ranges(value: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
     start: int | None = None
     candidate = ""
-    for index, line in enumerate(_markdown_lines(value)):
-        opener = bool(re.match(r"^ {0,3}\[", line))
+    blockquote_depth = 0
+    list_indent = 0
+    lines = _markdown_lines(value)
+    classified = _structural_lines(value)
+    blockquote_list_rendering = _blockquote_list_rendering(value)
+    for index, line in enumerate(lines):
+        structural_list_match = classified[index][2]
+        relative_line, _nested, fresh_blockquote_depth, fresh_list_indent = (
+            _effective_container_line_info(
+                line,
+                structural_list_match,
+                blockquote_list_rendered=blockquote_list_rendering[index],
+            )
+        )
+        opener = bool(re.match(r"^ {0,3}\[", relative_line))
         if start is None:
             if not opener:
                 continue
             start = index
-            candidate = line
-        elif not line.strip():
-            start = None
-            candidate = ""
-            continue
-        elif opener:
-            start = index
-            candidate = line
+            candidate = relative_line
+            blockquote_depth = fresh_blockquote_depth
+            list_indent = fresh_list_indent
         else:
-            candidate += "\n" + line
+            continuation = _line_in_container(
+                line,
+                blockquote_depth=blockquote_depth,
+                list_indent=list_indent,
+            )
+            if not line.strip() or continuation is None:
+                start = None
+                candidate = ""
+                blockquote_depth = 0
+                list_indent = 0
+                if not opener:
+                    continue
+                start = index
+                candidate = relative_line
+                blockquote_depth = fresh_blockquote_depth
+                list_indent = fresh_list_indent
+            elif opener:
+                start = index
+                candidate = relative_line
+                blockquote_depth = fresh_blockquote_depth
+                list_indent = fresh_list_indent
+            else:
+                candidate += "\n" + continuation
 
-        if LINK_DEFINITION_RE.fullmatch(candidate):
-            starts.append(start + 1)
+        match = LINK_DEFINITION_RE.fullmatch(candidate)
+        expects_destination = bool(
+            match
+            and candidate.rstrip().endswith(":")
+            and index + 1 < len(lines)
+        )
+        if expects_destination:
+            next_line = _line_in_container(
+                lines[index + 1],
+                blockquote_depth=blockquote_depth,
+                list_indent=list_indent,
+            )
+            expects_destination = bool(
+                next_line
+                and HEADING_RE.fullmatch(next_line) is None
+                and STRUCTURAL_LIST_ITEM_RE.fullmatch(next_line) is None
+                and not BLOCKQUOTE_RE.match(next_line)
+                and _line_opens_paragraph(next_line)
+            )
+        if match and not expects_destination:
+            ranges.append((start + 1, index + 1))
             start = None
             candidate = ""
+            blockquote_depth = 0
+            list_indent = 0
         elif len(candidate) > 4096:
             start = None
             candidate = ""
-    return starts
+            blockquote_depth = 0
+            list_indent = 0
+    return ranges
+
+
+def _link_definition_start_lines(value: str) -> list[int]:
+    return [start for start, _end in _link_definition_line_ranges(value)]
+
+
+def _mask_line_ranges(value: str, ranges: Sequence[tuple[int, int]]) -> str:
+    if not ranges:
+        return value
+    masked_lines: list[str] = []
+    for line_number, line in enumerate(_markdown_lines(value, keepends=True), start=1):
+        if any(start <= line_number <= end for start, end in ranges):
+            masked_lines.append(_masked_line(line))
+        else:
+            masked_lines.append(line)
+    return "".join(masked_lines)
 
 
 def _content_without_comments(value: str) -> str:
@@ -628,6 +830,8 @@ def _mask_top_level_indented_code(value: str) -> str:
             continue
 
         list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(line_without_ending)
+        if list_match and not list_content_indents and indent >= 4:
+            list_match = None
         if list_match:
             in_indented_code = False
             while list_content_indents and indent < list_content_indents[-1]:
@@ -745,33 +949,62 @@ def _visible_evidence_text(value: str) -> str:
     visible: list[str] = []
     fence_character = ""
     fence_length = 0
-    for line in _markdown_lines(value):
-        fence_match = FENCE_RE.match(line)
+    fence_blockquote_depth = 0
+    fence_list_indent = 0
+    structural_lines = iter(_structural_lines(value))
+    blockquote_list_rendering = _blockquote_list_rendering(value)
+    for line_index, line in enumerate(_markdown_lines(value)):
+        _classified_line, _top_level, structural_list_match = next(
+            structural_lines
+        )
         if fence_character:
-            if fence_match:
-                run = fence_match.group("run")
-                if (
-                    run[0] == fence_character
-                    and len(run) >= fence_length
-                    and not fence_match.group("rest").strip()
-                ):
-                    fence_character = ""
-                    fence_length = 0
-                    continue
-            visible.append(
-                "".join(
-                    character
-                    for character in line
-                    if _is_visible_character(character)
-                )
+            relative_line = _line_in_container(
+                line,
+                blockquote_depth=fence_blockquote_depth,
+                list_indent=fence_list_indent,
             )
-            continue
+            if relative_line is not None:
+                fence_match = FENCE_RE.match(relative_line)
+                if fence_match:
+                    run = fence_match.group("run")
+                    if (
+                        run[0] == fence_character
+                        and len(run) >= fence_length
+                        and not fence_match.group("rest").strip()
+                    ):
+                        fence_character = ""
+                        fence_length = 0
+                        fence_blockquote_depth = 0
+                        fence_list_indent = 0
+                        continue
+                visible.append(
+                    "".join(
+                        character
+                        for character in relative_line
+                        if _is_visible_character(character)
+                    )
+                )
+                continue
+            fence_character = ""
+            fence_length = 0
+            fence_blockquote_depth = 0
+            fence_list_indent = 0
+        relative_line, _nested, blockquote_depth, list_indent = (
+            _effective_container_line_info(
+                line,
+                structural_list_match,
+                blockquote_list_rendered=blockquote_list_rendering[line_index],
+            )
+        )
+        fence_match = FENCE_RE.match(relative_line)
         if fence_match:
             run = fence_match.group("run")
             rest = fence_match.group("rest")
             if run[0] != "`" or "`" not in rest:
                 fence_character = run[0]
                 fence_length = len(run)
+                fence_blockquote_depth = blockquote_depth
+                fence_list_indent = list_indent
                 continue
 
         candidate = line.strip()
@@ -907,6 +1140,93 @@ def _line_number(text: str, offset: int) -> int:
     return len(MARKDOWN_LINE_ENDING_RE.findall(text, 0, offset)) + 1
 
 
+def _setext_heading_findings(value: str) -> list[Finding]:
+    lines = _markdown_lines(value)
+    classified = _structural_lines(value)
+    blockquote_list_rendering = _blockquote_list_rendering(value)
+    findings: list[Finding] = []
+    for index in range(1, len(lines)):
+        previous = lines[index - 1]
+        current = lines[index]
+        (
+            previous_relative,
+            _previous_nested,
+            previous_blockquote_depth,
+            previous_list_indent,
+        ) = _effective_container_line_info(
+            previous,
+            classified[index - 1][2],
+            blockquote_list_rendered=blockquote_list_rendering[index - 1],
+        )
+        (
+            current_relative,
+            _current_nested,
+            current_blockquote_depth,
+            _current_list_indent,
+        ) = _effective_container_line_info(
+            current,
+            classified[index][2],
+            blockquote_list_rendered=blockquote_list_rendering[index],
+        )
+        nested_setext = False
+        if (
+            previous_blockquote_depth
+            and not previous_list_indent
+            and previous_blockquote_depth == current_blockquote_depth
+            and previous_relative.strip()
+            and HEADING_RE.fullmatch(previous_relative) is None
+            and _line_opens_paragraph(previous_relative)
+            and SETEXT_UNDERLINE_RE.fullmatch(current_relative)
+        ):
+            nested_setext = True
+        elif previous_list_indent:
+            continuation = _line_in_container(
+                current,
+                blockquote_depth=previous_blockquote_depth,
+                list_indent=previous_list_indent,
+            )
+            nested_setext = bool(
+                continuation is not None
+                and previous_relative.strip()
+                and HEADING_RE.fullmatch(previous_relative) is None
+                and _line_opens_paragraph(previous_relative)
+                and SETEXT_UNDERLINE_RE.fullmatch(continuation)
+            )
+        if nested_setext:
+            findings.append(
+                Finding(
+                    "nested-heading",
+                    "Contract headings must be top-level Markdown structures.",
+                    index + 1,
+                    _visible_evidence_text(previous_relative) or None,
+                )
+            )
+            continue
+
+        previous_line, previous_top_level, previous_list_match = classified[
+            index - 1
+        ]
+        current_line, current_top_level, current_list_match = classified[index]
+        if (
+            current_top_level
+            and current_list_match is None
+            and SETEXT_UNDERLINE_RE.fullmatch(current_line)
+            and previous_top_level
+            and previous_list_match is None
+            and previous_line.strip()
+            and HEADING_RE.fullmatch(previous_line) is None
+            and _line_opens_paragraph(previous_line)
+        ):
+            findings.append(
+                Finding(
+                    "setext-heading",
+                    "Contract documents must not contain Setext-style Markdown headings.",
+                    index + 1,
+                )
+            )
+    return findings
+
+
 def _parse_sections(
     text: str,
 ) -> tuple[list[tuple[str, int, int, int]], list[Finding]]:
@@ -917,14 +1237,25 @@ def _parse_sections(
     findings: list[Finding] = []
     offset = 0
     structural_lines = iter(_structural_lines(scan_text))
-    for line in _markdown_lines(scan_text, keepends=True):
-        _classified_line, top_level, _list_match = next(structural_lines)
-        match = HEADING_RE.match(line.rstrip("\r\n"))
+    blockquote_list_rendering = _blockquote_list_rendering(scan_text)
+    for line_index, line in enumerate(_markdown_lines(scan_text, keepends=True)):
+        _classified_line, top_level, list_match = next(structural_lines)
+        line_without_ending = line.rstrip("\r\n")
+        relative_line, nested, _blockquote_depth, _list_indent = (
+            _effective_container_line_info(
+                line_without_ending,
+                list_match,
+                blockquote_list_rendered=blockquote_list_rendering[line_index],
+            )
+        )
+        match = HEADING_RE.match(line_without_ending)
+        if match is None and nested:
+            match = HEADING_RE.match(relative_line)
         if match:
             level = len(match.group(1))
             name = match.group(2)
             line_number = _line_number(text, offset)
-            if not top_level:
+            if nested or not top_level:
                 findings.append(
                     Finding(
                         "nested-heading",
@@ -995,7 +1326,6 @@ def validate_text(
                 _line_number(text, offset),
             )
         )
-    visible_lines = _markdown_lines(visible_document)
     for line_number in _link_definition_start_lines(visible_document):
         findings.append(
             Finding(
@@ -1004,19 +1334,7 @@ def validate_text(
                 line_number,
             )
         )
-    for index, line in enumerate(visible_lines):
-        if (
-            index > 0
-            and visible_lines[index - 1].strip()
-            and SETEXT_UNDERLINE_RE.fullmatch(line)
-        ):
-            findings.append(
-                Finding(
-                    "setext-heading",
-                    "Contract documents must not contain Setext-style Markdown headings.",
-                    index + 1,
-                )
-            )
+    findings.extend(_setext_heading_findings(visible_document))
 
     definition = CONTRACTS[kind]
     if kind == "commit":
@@ -1095,8 +1413,16 @@ def validate_text(
             continue
 
         raw_body = text[body_start:body_end]
-        body = _content_without_comments(raw_body)
-        visible_body = _scan_visible_markdown(raw_body).strip()
+        scanned_body = _scan_visible_markdown(raw_body)
+        link_definition_ranges = _link_definition_line_ranges(scanned_body)
+        body = _mask_line_ranges(
+            _scan_markdown(raw_body, mask_code=False),
+            link_definition_ranges,
+        ).strip()
+        visible_body = _mask_line_ranges(
+            scanned_body,
+            link_definition_ranges,
+        ).strip()
         visible_evidence = _visible_evidence_text(body)
         visible_structure = _visible_evidence_text(visible_body)
         if not visible_evidence:
