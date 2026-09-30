@@ -71,6 +71,7 @@ THEMATIC_BREAK_RE = re.compile(
 UNSUPPORTED_LINE_SEPARATOR_RE = re.compile(
     "[\x0b\x0c\x1c-\x1e\x85\u2028\u2029]"
 )
+MARKDOWN_LINE_ENDING_RE = re.compile(r"\r\n|\r|\n")
 LIST_ITEM_RE = re.compile(
     rf"^ {{0,3}}{LIST_MARKER}\s+(?:\[[ xX]\]\s+)?(?P<value>.*)$"
 )
@@ -260,7 +261,7 @@ def _column_width(value: str) -> int:
 def _markdown_lines(value: str, *, keepends: bool = False) -> list[str]:
     lines: list[str] = []
     cursor = 0
-    for match in re.finditer(r"\r\n|\r|\n", value):
+    for match in MARKDOWN_LINE_ENDING_RE.finditer(value):
         end = match.end() if keepends else match.start()
         lines.append(value[cursor:end])
         cursor = match.end()
@@ -280,6 +281,23 @@ def _blockquote_allows_lazy_continuation(value: str) -> bool:
     return True
 
 
+def _list_can_interrupt_paragraph(list_match: re.Match[str]) -> bool:
+    if not list_match.group("value").strip():
+        return False
+    marker = list_match.group("marker")
+    if marker[0].isdigit():
+        return int(marker[:-1]) == 1
+    return True
+
+
+def _line_opens_paragraph(line: str) -> bool:
+    candidate = line.strip()
+    return not (
+        THEMATIC_BREAK_RE.fullmatch(candidate)
+        or LINK_DEFINITION_RE.fullmatch(line)
+    )
+
+
 def _structural_lines(
     value: str,
 ) -> list[tuple[str, bool, re.Match[str] | None]]:
@@ -289,11 +307,13 @@ def _structural_lines(
     list_content_indents: list[int] = []
     previous_line_blank = True
     blockquote_paragraph = False
+    paragraph_open = False
     for line in _markdown_lines(value):
         if not line.strip():
             classified.append((line, False, None))
             previous_line_blank = True
             blockquote_paragraph = False
+            paragraph_open = False
             continue
 
         if BLOCKQUOTE_RE.match(line):
@@ -306,11 +326,20 @@ def _structural_lines(
                     blockquote.group("value")
                 )
             )
+            paragraph_open = False
             continue
 
         indent = _indent_columns(line)
         list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(line)
         if list_match:
+            if (
+                paragraph_open
+                and not list_content_indents
+                and not _list_can_interrupt_paragraph(list_match)
+            ):
+                classified.append((line, True, None))
+                previous_line_blank = False
+                continue
             blockquote_paragraph = False
             while list_content_indents and indent < list_content_indents[-1]:
                 list_content_indents.pop()
@@ -319,12 +348,14 @@ def _structural_lines(
             content_indent = _column_width(line[: list_match.start("value")])
             list_content_indents.append(content_indent)
             previous_line_blank = False
+            paragraph_open = False
             continue
 
         heading_interrupt = HEADING_RE.fullmatch(line) is not None
         if blockquote_paragraph and not heading_interrupt:
             classified.append((line, False, None))
             previous_line_blank = False
+            paragraph_open = False
             continue
         if heading_interrupt:
             blockquote_paragraph = False
@@ -334,6 +365,11 @@ def _structural_lines(
                 list_content_indents.pop()
         classified.append((line, not list_content_indents, None))
         previous_line_blank = False
+        paragraph_open = (
+            not list_content_indents
+            and not heading_interrupt
+            and _line_opens_paragraph(line)
+        )
     return classified
 
 
@@ -868,7 +904,7 @@ def _has_top_level_list_item(value: str) -> bool:
 
 
 def _line_number(text: str, offset: int) -> int:
-    return text.count("\n", 0, offset) + 1
+    return len(MARKDOWN_LINE_ENDING_RE.findall(text, 0, offset)) + 1
 
 
 def _parse_sections(

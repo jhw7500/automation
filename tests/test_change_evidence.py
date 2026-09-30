@@ -979,6 +979,47 @@ def test_ordered_list_satisfies_changes_field() -> None:
     assert result.valid, result.findings
 
 
+@pytest.mark.parametrize("marker", ["0.", "2.", "10."])
+def test_ordered_continuation_does_not_satisfy_changes_field(
+    marker: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + f"Change summary\n{marker} hidden change\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "bullet-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize("marker", ["1.", "1)", "-", "*", "+"])
+def test_list_marker_may_interrupt_changes_paragraph(marker: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + f"Change summary\n{marker} visible change\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "block",
+    ["---", "***", "___", "[reference]: https://example.invalid"],
+)
+def test_ordered_list_is_recognized_after_nonparagraph_block(block: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + f"{block}\n2. visible change\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "bullet-required" not in {item.code for item in result.findings}
+
+
 @pytest.mark.parametrize("marker", ["1.", "1)"])
 def test_ordered_task_list_satisfies_acceptance_criteria(marker: str) -> None:
     text = (FIXTURES / "valid-issue.md").read_text().replace(
@@ -989,6 +1030,26 @@ def test_ordered_task_list_satisfies_acceptance_criteria(marker: str) -> None:
     result = validator.validate_text(text, kind="issue")
 
     assert result.valid, result.findings
+
+
+@pytest.mark.parametrize("marker", ["0.", "2.", "10."])
+def test_ordered_continuation_does_not_satisfy_acceptance_criteria(
+    marker: str,
+) -> None:
+    text = (FIXTURES / "valid-issue.md").read_text()
+    start = text.index("### Acceptance criteria\n") + len(
+        "### Acceptance criteria\n"
+    )
+    end = text.find("\n### ", start)
+    text = (
+        text[:start]
+        + f"Acceptance summary\n{marker} [ ] hidden criterion\n"
+        + text[end:]
+    )
+
+    result = validator.validate_text(text, kind="issue")
+
+    assert "checklist-required" in {item.code for item in result.findings}
 
 
 def test_nested_task_list_does_not_satisfy_acceptance_criteria() -> None:
@@ -1068,6 +1129,24 @@ def test_non_markdown_line_separator_cannot_create_list_item(
     assert "unsupported-line-separator" in {
         item.code for item in result.findings
     }
+
+
+@pytest.mark.parametrize("separator", ["\r", "\r\n"])
+def test_finding_line_numbers_follow_supported_line_endings(
+    separator: str,
+) -> None:
+    source = (FIXTURES / "valid-pull-request.md").read_text()
+    expected_line = source[: source.index("### Related issue")].count("\n") + 1
+    text = source.replace("Closes #194", "No tracker reference.").replace(
+        "\n", separator
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+    finding = next(
+        item for item in result.findings if item.code == "reference-required"
+    )
+
+    assert finding.line == expected_line
 
 
 @pytest.mark.parametrize(
