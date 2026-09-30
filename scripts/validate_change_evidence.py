@@ -93,6 +93,25 @@ GENERIC_COMMIT_TITLES = {
     "수정",
     "작업",
 }
+DEFAULT_IGNORABLE_CODE_POINT_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
 
 
 @dataclass(frozen=True)
@@ -672,11 +691,17 @@ def _inline_visible_text(value: str) -> str:
     value = re.sub(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~\\])", r"\1", value)
     value = value.translate(str.maketrans("", "", "`*_~[]()"))
     value = html.unescape(value)
-    return "".join(
-        character
-        for character in value
-        if unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
-        and not unicodedata.category(character).startswith("M")
+    return "".join(character for character in value if _is_visible_character(character))
+
+
+def _is_visible_character(character: str) -> bool:
+    category = unicodedata.category(character)
+    if category in {"Cc", "Cf", "Cs"} or category.startswith("M"):
+        return False
+    code_point = ord(character)
+    return not any(
+        start <= code_point <= end
+        for start, end in DEFAULT_IGNORABLE_CODE_POINT_RANGES
     )
 
 
@@ -701,8 +726,7 @@ def _visible_evidence_text(value: str) -> str:
                 "".join(
                     character
                     for character in line
-                    if unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
-                    and not unicodedata.category(character).startswith("M")
+                    if _is_visible_character(character)
                 )
             )
             continue

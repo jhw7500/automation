@@ -269,6 +269,59 @@ def test_variation_character_does_not_satisfy_commit_title() -> None:
     assert "commit-title-empty" in {item.code for item in result.findings}
 
 
+@pytest.mark.parametrize("value", ["\u115f", "\u1160", "\u3164", "\uffa0"])
+def test_other_default_ignorable_characters_never_supply_evidence(
+    value: str,
+) -> None:
+    pull_request = (FIXTURES / "valid-pull-request.md").read_text()
+    prose = pull_request.replace(
+        "Adds deterministic validation for structured change evidence.", value
+    )
+    fenced = pull_request.replace(
+        "Adds deterministic validation for structured change evidence.",
+        f"```text\n{value}\n```",
+    )
+    bullet = pull_request.replace(
+        "- Define the v1 headings and field rules.\n"
+        "- Add a dependency-free validator and reusable action.",
+        f"- {value}",
+    )
+    visible = pull_request.replace(
+        "Adds deterministic validation for structured change evidence.",
+        f"Delivered {value} result.",
+    )
+    issue = (FIXTURES / "valid-issue.md").read_text()
+    start = issue.index("### Acceptance criteria\n") + len(
+        "### Acceptance criteria\n"
+    )
+    end = issue.find("\n### ", start)
+    checklist = issue[:start] + f"- [ ] {value}\n" + issue[end:]
+    commit = (FIXTURES / "valid-commit.md").read_text()
+    commit = value + commit[commit.index("\n") :]
+
+    prose_result = validator.validate_text(prose, kind="pull-request")
+    fenced_result = validator.validate_text(fenced, kind="pull-request")
+    bullet_result = validator.validate_text(bullet, kind="pull-request")
+    checklist_result = validator.validate_text(checklist, kind="issue")
+    commit_result = validator.validate_text(commit, kind="commit")
+    visible_result = validator.validate_text(visible, kind="pull-request")
+
+    assert "empty-field" in {item.code for item in prose_result.findings}
+    assert "empty-field" in {item.code for item in fenced_result.findings}
+    assert {item.code for item in bullet_result.findings} & {
+        "empty-field",
+        "bullet-required",
+    }
+    assert {item.code for item in checklist_result.findings} & {
+        "empty-field",
+        "checklist-required",
+    }
+    assert "commit-title-empty" in {
+        item.code for item in commit_result.findings
+    }
+    assert visible_result.valid, visible_result.findings
+
+
 @pytest.mark.parametrize("field", ["Changes", "Validation"])
 def test_syntax_only_list_item_does_not_satisfy_bullet_field(field: str) -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text()
