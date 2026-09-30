@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import unicodedata
 from typing import Sequence
 
 
@@ -47,7 +48,10 @@ STRUCTURAL_LIST_ITEM_RE = re.compile(
     rf"^(?P<indent>[ \t]*)(?P<marker>{LIST_MARKER})(?P<spacing>[ \t]+)(?P<value>.*)$"
 )
 BLOCKQUOTE_RE = re.compile(r"^ {0,3}>")
-CHECKBOX_RE = re.compile(rf"(?m)^ {{0,3}}{LIST_MARKER}\s+\[[ xX]\]\s+\S")
+CHECKBOX_VALUE_RE = re.compile(r"^\[[ xX]\][ \t]+(?P<value>.*)$")
+RAW_HTML_START_RE = re.compile(
+    r"(?i)(?<!\\)(?:</?[A-Za-z][A-Za-z0-9-]*(?=[\s/>])|<![A-Z]|<\?)"
+)
 LIST_ITEM_RE = re.compile(
     rf"^ {{0,3}}{LIST_MARKER}\s+(?:\[[ xX]\]\s+)?(?P<value>.*)$"
 )
@@ -179,26 +183,35 @@ def _structural_lines(
     classified: list[tuple[str, bool, re.Match[str] | None]] = []
     list_content_indents: list[int] = []
     previous_line_blank = True
+    blockquote_paragraph = False
     for line in value.splitlines():
         if not line.strip():
             classified.append((line, False, None))
             previous_line_blank = True
+            blockquote_paragraph = False
             continue
 
         if BLOCKQUOTE_RE.match(line):
             classified.append((line, False, None))
             previous_line_blank = False
+            blockquote_paragraph = True
             continue
 
         indent = _indent_columns(line)
         list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(line)
         if list_match:
+            blockquote_paragraph = False
             while list_content_indents and indent < list_content_indents[-1]:
                 list_content_indents.pop()
             top_level = not list_content_indents
             classified.append((line, top_level, list_match))
             content_indent = _column_width(line[: list_match.start("value")])
             list_content_indents.append(content_indent)
+            previous_line_blank = False
+            continue
+
+        if blockquote_paragraph:
+            classified.append((line, False, None))
             previous_line_blank = False
             continue
 
@@ -356,6 +369,49 @@ def _content_without_comments(value: str) -> str:
     return _scan_markdown(value, mask_code=False).strip()
 
 
+def _mask_inline_code_spans(value: str) -> str:
+    """Mask complete inline code spans while preserving line positions."""
+
+    characters = list(value)
+    cursor = 0
+    while cursor < len(value):
+        if value[cursor] != "`" or (cursor > 0 and value[cursor - 1] == "\\"):
+            cursor += 1
+            continue
+        opener_end = cursor
+        while opener_end < len(value) and value[opener_end] == "`":
+            opener_end += 1
+        run_length = opener_end - cursor
+        search = opener_end
+        closer_end: int | None = None
+        while search < len(value):
+            next_tick = value.find("`", search)
+            if next_tick == -1:
+                break
+            candidate_end = next_tick
+            while candidate_end < len(value) and value[candidate_end] == "`":
+                candidate_end += 1
+            if candidate_end - next_tick == run_length:
+                closer_end = candidate_end
+                break
+            search = candidate_end
+        if closer_end is None:
+            cursor = opener_end
+            continue
+        for index in range(cursor, closer_end):
+            if characters[index] not in {"\r", "\n"}:
+                characters[index] = " "
+        cursor = closer_end
+    return "".join(characters)
+
+
+def _raw_html_offsets(value: str) -> list[int]:
+    return [
+        match.start()
+        for match in RAW_HTML_START_RE.finditer(_mask_inline_code_spans(value))
+    ]
+
+
 def _contains_placeholder_value(value: str) -> bool:
     for line in value.splitlines():
         candidate = line.strip()
@@ -384,7 +440,10 @@ def _inline_visible_text(value: str) -> str:
     )
     value = re.sub(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~\\])", r"\1", value)
     value = value.translate(str.maketrans("", "", "`*_~[]()"))
-    return html.unescape(value)
+    value = html.unescape(value)
+    return "".join(
+        character for character in value if unicodedata.category(character) != "Cf"
+    )
 
 
 def _visible_evidence_text(value: str) -> str:
@@ -440,17 +499,20 @@ def _has_change_reference(value: str) -> bool:
 
 
 def _has_top_level_checklist_item(value: str) -> bool:
-    return any(
-        top_level and CHECKBOX_RE.search(line)
-        for line, top_level, _list_match in _structural_lines(value)
-    )
+    for _line, top_level, list_match in _structural_lines(value):
+        if not top_level or list_match is None:
+            continue
+        checkbox = CHECKBOX_VALUE_RE.fullmatch(list_match.group("value"))
+        if checkbox and _visible_evidence_text(checkbox.group("value")):
+            return True
+    return False
 
 
 def _has_top_level_list_item(value: str) -> bool:
     return any(
         top_level
         and list_match is not None
-        and bool(list_match.group("value").strip())
+        and bool(_visible_evidence_text(list_match.group("value")))
         for _line, top_level, list_match in _structural_lines(value)
     )
 
@@ -516,6 +578,14 @@ def validate_text(
             Finding(
                 "ambiguous-comment-opener",
                 "HTML comment openers must begin a line; use fenced code for literal '<!--'.",
+                _line_number(text, offset),
+            )
+        )
+    for offset in _raw_html_offsets(visible_document):
+        findings.append(
+            Finding(
+                "raw-html",
+                "Raw HTML is not valid contract evidence; use Markdown or fenced code.",
                 _line_number(text, offset),
             )
         )
@@ -767,12 +837,17 @@ def _open_regular_file(path: Path, workspace: Path | None) -> str:
     if no_follow is None or directory_flag is None or os.open not in os.supports_dir_fd:
         raise ValueError("platform does not support secure workspace-relative file reads")
 
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nonblock is None:
+        raise ValueError("platform does not support nonblocking evidence-file reads")
+
     base_flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+    final_flags = base_flags | nonblock
     if workspace is None:
         item_stat = path.lstat()
         if stat.S_ISLNK(item_stat.st_mode):
             raise ValueError("path must not contain symlinks")
-        descriptor = _open_no_follow(path, base_flags)
+        descriptor = _open_no_follow(path, final_flags)
         try:
             return _read_regular_descriptor(descriptor)
         finally:
@@ -787,8 +862,9 @@ def _open_regular_file(path: Path, workspace: Path | None) -> str:
             component_stat = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
             if stat.S_ISLNK(component_stat.st_mode):
                 raise ValueError("path must not contain symlinks")
-            component_flags = base_flags
+            component_flags = final_flags
             if index < len(path.parts) - 1:
+                component_flags = base_flags
                 component_flags |= directory_flag
             next_descriptor = _open_no_follow(
                 part,

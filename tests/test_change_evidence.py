@@ -171,7 +171,122 @@ def test_empty_html_markup_does_not_satisfy_required_field() -> None:
     result = validator.validate_text(text, kind="pull-request")
 
     assert not result.valid
+    assert "raw-html" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize("field", ["Summary", "Impact and risks"])
+def test_default_ignorable_unicode_does_not_satisfy_required_field(
+    field: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index(f"### {field}\n") + len(f"### {field}\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + "\u200b\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
     assert "empty-field" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize("field", ["Changes", "Validation"])
+def test_syntax_only_list_item_does_not_satisfy_bullet_field(field: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index(f"### {field}\n") + len(f"### {field}\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + "- []()\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "bullet-required" in {item.code for item in result.findings}
+
+
+def test_syntax_only_task_item_does_not_satisfy_acceptance_criteria() -> None:
+    text = (FIXTURES / "valid-issue.md").read_text()
+    start = text.index("### Acceptance criteria\n") + len(
+        "### Acceptance criteria\n"
+    )
+    end = text.find("\n### ", start)
+    text = text[:start] + "- [ ] []()\n" + text[end:]
+
+    result = validator.validate_text(text, kind="issue")
+
+    assert not result.valid
+    assert "checklist-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    ("kind", "fixture", "field", "replacement"),
+    [
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Summary",
+            '<span\nclass="empty"></span>',
+        ),
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Changes",
+            "<div>\n- hidden change\n</div>",
+        ),
+        (
+            "issue",
+            "valid-issue.md",
+            "Acceptance criteria",
+            "<div>\n- [ ] hidden criterion\n</div>",
+        ),
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Related issue",
+            "<div>\nCloses #194\n</div>",
+        ),
+    ],
+)
+def test_raw_html_cannot_supply_contract_evidence(
+    kind: str, fixture: str, field: str, replacement: str
+) -> None:
+    text = (FIXTURES / fixture).read_text()
+    start = text.index(f"### {field}\n") + len(f"### {field}\n")
+    end = text.find("\n### ", start)
+    if end == -1:
+        end = len(text)
+    text = text[:start] + replacement + "\n" + text[end:]
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert not result.valid
+    assert "raw-html" in {item.code for item in result.findings}
+
+
+def test_markdown_autolink_issue_reference_remains_valid() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", "<https://github.com/jhw7500/automation/issues/194>"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "Documents literal `<span>` syntax.",
+        "```html\n<span>literal example</span>\n```",
+    ],
+)
+def test_html_literal_in_code_is_not_raw_html(replacement: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        replacement,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
 
 
 def test_fenced_code_content_satisfies_prose_field() -> None:
@@ -513,6 +628,16 @@ def test_blockquoted_issue_reference_does_not_satisfy_related_issue() -> None:
     assert "reference-required" in {item.code for item in result.findings}
 
 
+def test_lazy_blockquote_issue_reference_does_not_satisfy_related_issue() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", "> context\nCloses #194"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "reference-required" in {item.code for item in result.findings}
+
+
 def test_inline_link_issue_label_satisfies_related_issue() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Closes #194", "Issue: [#194](https://example.invalid/reference)"
@@ -704,6 +829,36 @@ def test_workspace_mode_rejects_symlink_evidence(tmp_path: Path) -> None:
 
     assert completed.returncode == 2
     assert "must not contain symlinks" in completed.stderr
+
+
+@pytest.mark.parametrize("workspace_mode", [False, True])
+def test_fifo_evidence_returns_promptly(
+    tmp_path: Path, workspace_mode: bool
+) -> None:
+    fifo = tmp_path / "evidence.md"
+    os.mkfifo(fifo)
+    path = "evidence.md" if workspace_mode else str(fifo)
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--kind",
+        "issue",
+        "--path",
+        path,
+    ]
+    if workspace_mode:
+        command.extend(["--workspace", str(tmp_path)])
+
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert completed.returncode == 2
+    assert "non-symlink regular file" in completed.stderr
 
 
 def test_workspace_read_rejects_symlink_swap(

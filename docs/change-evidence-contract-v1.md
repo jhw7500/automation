@@ -22,6 +22,9 @@ The words MUST, MUST NOT, SHOULD, and MAY in this document are normative.
 - Field bodies MUST contain evidence after HTML comments are removed.
 - An HTML comment opener (`<!--`) MUST begin a line with at most three leading spaces.
   Literal or inline uses of that token MUST be placed inside a fenced code block.
+- Raw HTML tags and blocks are invalid contract evidence. Use Markdown or a fenced code
+  block for literal HTML; Markdown autolinks such as `<https://example.invalid>` remain
+  valid.
 - `Contract version` MUST be exactly `v1`.
 - Placeholder-only values such as `TBD`, `TODO`, `N/A`, `unknown`, `미정`, `추후`,
   or angle-bracket fill instructions are invalid.
@@ -32,6 +35,7 @@ The words MUST, MUST NOT, SHOULD, and MAY in this document are normative.
 - A checklist, ordered/unordered list item, or reference counts only when rendered as a
   top-level Markdown structure with zero to three leading spaces. Nested structures and
   text inside fenced or indented code do not satisfy a structural field requirement.
+  List and checklist markers without rendered item text do not count as evidence.
 - Commit messages MUST begin with a result-oriented title of at most 72 characters,
   followed by a blank line. Generic titles such as `Update`, `Fix`, `WIP`, `수정`, or
   `작업` are invalid. The validator catches these obvious placeholders; authors and
