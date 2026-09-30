@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -257,6 +258,32 @@ def test_indented_extra_heading_is_rejected() -> None:
     }
 
 
+@pytest.mark.parametrize("underline", ["-------------", "============="])
+def test_setext_heading_is_rejected(underline: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        f"Adds deterministic validation for structured change evidence.\n\nUnexpected heading\n{underline}",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "setext-heading" in {item.code for item in result.findings}
+
+
+def test_link_reference_definition_does_not_satisfy_related_issue() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", "[hidden]: https://example.invalid/#194"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "non-rendered-link-definition" in {
+        item.code for item in result.findings
+    }
+
+
 def test_four_backtick_fence_keeps_nested_triple_fence_and_heading_as_code() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text()
     text = text.replace(
@@ -341,6 +368,18 @@ def test_ordered_list_satisfies_changes_field() -> None:
     text = text[:start] + "1. Define the v1 headings and field rules.\n" + text[end:]
 
     result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize("marker", ["1.", "1)"])
+def test_ordered_task_list_satisfies_acceptance_criteria(marker: str) -> None:
+    text = (FIXTURES / "valid-issue.md").read_text().replace(
+        "- [ ] Validator accepts every valid v1 fixture.",
+        f"{marker} [ ] Validator accepts every valid v1 fixture.",
+    )
+
+    result = validator.validate_text(text, kind="issue")
 
     assert result.valid, result.findings
 
@@ -480,6 +519,41 @@ def test_workspace_mode_rejects_symlink_evidence(tmp_path: Path) -> None:
 
     assert completed.returncode == 2
     assert "must not contain symlinks" in completed.stderr
+
+
+def test_workspace_read_rejects_symlink_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    evidence = workspace / "evidence.md"
+    evidence.write_text((FIXTURES / "valid-issue.md").read_text())
+    outside = tmp_path / "outside.md"
+    outside.write_text("OUTSIDE")
+    replacement = workspace / "replacement"
+    replacement.symlink_to(outside)
+
+    original_open = validator._open_no_follow
+    swapped = False
+
+    def swap_before_open(
+        path: str | os.PathLike[str],
+        flags: int,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if path == "evidence.md" and dir_fd is not None and not swapped:
+            os.replace(replacement, evidence)
+            swapped = True
+        return original_open(path, flags, dir_fd=dir_fd)
+
+    monkeypatch.setattr(validator, "_open_no_follow", swap_before_open)
+
+    with pytest.raises(ValueError, match="must not contain symlinks"):
+        validator._open_regular_file(Path("evidence.md"), workspace)
+
+    assert swapped
 
 
 def test_composite_action_exposes_closed_inputs_and_outputs() -> None:

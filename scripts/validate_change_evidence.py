@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import errno
 import json
+import os
 from pathlib import Path
 import re
 import stat
@@ -17,6 +19,8 @@ CONTRACT_VERSION = "v1"
 MAX_BYTES = 64 * 1024
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
 FENCE_RE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<rest>[^\r\n]*)$")
+LINK_DEFINITION_RE = re.compile(r"^ {0,3}\[[^\]\r\n]+\]:[ \t]*\S.*$")
+SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 PLACEHOLDER_VALUE_RE = re.compile(
     r"(?i)^(?:tbd|todo|fixme|n/?a|none|unknown|미정|추후|없음|\?{2,})[.。]?$"
 )
@@ -33,7 +37,7 @@ CHANGE_REFERENCE_RE = re.compile(
     r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/[1-9][0-9]*\b"
 )
 LIST_MARKER = r"(?:[-*+]|[0-9]{1,9}[.)])"
-CHECKBOX_RE = re.compile(r"(?m)^ {0,3}[-*+]\s+\[[ xX]\]\s+\S")
+CHECKBOX_RE = re.compile(rf"(?m)^ {{0,3}}{LIST_MARKER}\s+\[[ xX]\]\s+\S")
 BULLET_RE = re.compile(rf"(?m)^ {{0,3}}{LIST_MARKER}\s+\S")
 LIST_ITEM_RE = re.compile(
     rf"^ {{0,3}}{LIST_MARKER}\s+(?:\[[ xX]\]\s+)?(?P<value>.*)$"
@@ -343,7 +347,7 @@ def validate_text(
         return ValidationResult(False, kind, None, tuple(findings))
 
     ambiguous_comment_offsets: list[int] = []
-    _scan_visible_markdown(text, ambiguous_comment_offsets)
+    visible_document = _scan_visible_markdown(text, ambiguous_comment_offsets)
     for offset in ambiguous_comment_offsets:
         findings.append(
             Finding(
@@ -352,6 +356,28 @@ def validate_text(
                 _line_number(text, offset),
             )
         )
+    visible_lines = visible_document.splitlines()
+    for index, line in enumerate(visible_lines):
+        if LINK_DEFINITION_RE.fullmatch(line):
+            findings.append(
+                Finding(
+                    "non-rendered-link-definition",
+                    "Link reference definitions do not count as rendered field evidence; use an inline link.",
+                    index + 1,
+                )
+            )
+        if (
+            index > 0
+            and visible_lines[index - 1].strip()
+            and SETEXT_UNDERLINE_RE.fullmatch(line)
+        ):
+            findings.append(
+                Finding(
+                    "setext-heading",
+                    "Contract documents must not contain Setext-style Markdown headings.",
+                    index + 1,
+                )
+            )
 
     definition = CONTRACTS[kind]
     if kind == "commit":
@@ -531,24 +557,72 @@ def validate_text(
     return ValidationResult(not findings, kind, version, tuple(findings))
 
 
-def _open_regular_file(path: Path, workspace: Path | None) -> str:
-    if workspace is not None:
-        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-            raise ValueError("path must be a normalized workspace-relative path")
-        workspace = workspace.resolve(strict=True)
-        candidate = workspace
-        for part in path.parts:
-            candidate = candidate / part
-            item_stat = candidate.lstat()
-            if stat.S_ISLNK(item_stat.st_mode):
-                raise ValueError("path must not contain symlinks")
-        path = candidate
-    item_stat = path.lstat()
-    if not stat.S_ISREG(item_stat.st_mode) or stat.S_ISLNK(item_stat.st_mode):
+def _read_regular_descriptor(descriptor: int) -> str:
+    item_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(item_stat.st_mode):
         raise ValueError("evidence path must be a non-symlink regular file")
     if item_stat.st_size > MAX_BYTES:
         raise ValueError(f"evidence file exceeds {MAX_BYTES} bytes")
-    return path.read_text(encoding="utf-8")
+
+    content = bytearray()
+    while len(content) <= MAX_BYTES:
+        chunk = os.read(descriptor, min(64 * 1024, MAX_BYTES + 1 - len(content)))
+        if not chunk:
+            break
+        content.extend(chunk)
+    if len(content) > MAX_BYTES:
+        raise ValueError(f"evidence file exceeds {MAX_BYTES} bytes")
+    return bytes(content).decode("utf-8")
+
+
+def _open_no_follow(path: str | Path, flags: int, *, dir_fd: int | None = None) -> int:
+    try:
+        return os.open(path, flags, dir_fd=dir_fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError("path must not contain symlinks") from error
+        raise
+
+
+def _open_regular_file(path: Path, workspace: Path | None) -> str:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory_flag is None or os.open not in os.supports_dir_fd:
+        raise ValueError("platform does not support secure workspace-relative file reads")
+
+    base_flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+    if workspace is None:
+        item_stat = path.lstat()
+        if stat.S_ISLNK(item_stat.st_mode):
+            raise ValueError("path must not contain symlinks")
+        descriptor = _open_no_follow(path, base_flags)
+        try:
+            return _read_regular_descriptor(descriptor)
+        finally:
+            os.close(descriptor)
+
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError("path must be a normalized workspace-relative path")
+    workspace = workspace.resolve(strict=True)
+    descriptor = _open_no_follow(workspace, base_flags | directory_flag)
+    try:
+        for index, part in enumerate(path.parts):
+            component_stat = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(component_stat.st_mode):
+                raise ValueError("path must not contain symlinks")
+            component_flags = base_flags
+            if index < len(path.parts) - 1:
+                component_flags |= directory_flag
+            next_descriptor = _open_no_follow(
+                part,
+                component_flags,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return _read_regular_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _write_github_output(path: Path, result: ValidationResult) -> None:

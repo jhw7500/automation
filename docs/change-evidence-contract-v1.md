@@ -27,6 +27,8 @@ The words MUST, MUST NOT, SHOULD, and MAY in this document are normative.
   or angle-bracket fill instructions are invalid.
 - Prose, list items, fenced code blocks, and links MAY appear inside a field. Additional
   Markdown headings MUST NOT be used because they create an ambiguous field boundary.
+- Link reference definitions are invalid because they render no field evidence. Use
+  inline links when a field needs a URL.
 - A checklist, ordered/unordered list item, or reference counts only when rendered as a
   top-level Markdown structure with zero to three leading spaces. Nested structures and
   text inside fenced or indented code do not satisfy a structural field requirement.
