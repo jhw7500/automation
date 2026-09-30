@@ -1,0 +1,49 @@
+name: Validate change evidence
+description: Validate an Issue, pull request, or commit Markdown document against Change Evidence Contract v1
+inputs:
+  kind:
+    description: Evidence kind (issue, pull-request, or commit)
+    required: true
+  path:
+    description: Normalized path to the Markdown document, relative to github.workspace
+    required: true
+  contract-version:
+    description: Expected Change Evidence Contract version
+    required: false
+    default: v1
+  mode:
+    description: Enforce fails invalid evidence; audit reports it without failing the step
+    required: false
+    default: enforce
+outputs:
+  valid:
+    description: Whether the document satisfies the selected contract
+    value: ${{ steps.validate.outputs.valid }}
+  kind:
+    description: Validated evidence kind
+    value: ${{ steps.validate.outputs.kind }}
+  version:
+    description: Version found in the document
+    value: ${{ steps.validate.outputs.version }}
+  report-json:
+    description: Single-line JSON validation report
+    value: ${{ steps.validate.outputs.report-json }}
+runs:
+  using: composite
+  steps:
+    - id: validate
+      shell: bash
+      env:
+        INPUT_KIND: ${{ inputs.kind }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_CONTRACT_VERSION: ${{ inputs.contract-version }}
+        INPUT_MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        python3 -I -S -B "$GITHUB_ACTION_PATH/../../../scripts/validate_change_evidence.py" \
+          --kind "$INPUT_KIND" \
+          --path "$INPUT_PATH" \
+          --workspace "$GITHUB_WORKSPACE" \
+          --expected-version "$INPUT_CONTRACT_VERSION" \
+          --mode "$INPUT_MODE" \
+          --github-output "$GITHUB_OUTPUT"
