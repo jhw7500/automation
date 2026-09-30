@@ -284,6 +284,20 @@ def test_link_reference_definition_does_not_satisfy_related_issue() -> None:
     }
 
 
+def test_multiline_link_reference_definition_does_not_satisfy_related_issue() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194",
+        "[hidden]:\n  https://github.com/example/repo/issues/194",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "non-rendered-link-definition" in {
+        item.code for item in result.findings
+    }
+
+
 def test_four_backtick_fence_keeps_nested_triple_fence_and_heading_as_code() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text()
     text = text.replace(

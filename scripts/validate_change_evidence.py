@@ -19,7 +19,7 @@ CONTRACT_VERSION = "v1"
 MAX_BYTES = 64 * 1024
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
 FENCE_RE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<rest>[^\r\n]*)$")
-LINK_DEFINITION_RE = re.compile(r"^ {0,3}\[[^\]\r\n]+\]:[ \t]*\S.*$")
+LINK_DEFINITION_RE = re.compile(r"^ {0,3}\[[^\]\r\n]+\]:[ \t]*(?:\S.*)?$")
 SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 PLACEHOLDER_VALUE_RE = re.compile(
     r"(?i)^(?:tbd|todo|fixme|n/?a|none|unknown|미정|추후|없음|\?{2,})[.。]?$"
