@@ -701,6 +701,54 @@ def test_softbreak_pr_label_does_not_satisfy_related_issue() -> None:
     assert "reference-required" in {item.code for item in result.findings}
 
 
+@pytest.mark.parametrize("label", ["PR:", "Pull request:"])
+def test_long_spaced_pr_label_does_not_satisfy_related_issue(label: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", label + " " * 40 + "#194"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        'Context [documentation](https://example.invalid "https://github.com/example/repo/issues/194")',
+        "Context ![](https://github.com/example/repo/issues/194)",
+    ],
+)
+def test_hidden_issue_url_does_not_satisfy_related_issue(reference: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", reference
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "https://github.com/example/repo/issues/194",
+        "<https://github.com/example/repo/issues/194>",
+        "[Issue](https://github.com/example/repo/issues/194)",
+    ],
+)
+def test_rendered_or_navigable_issue_url_satisfies_related_issue(
+    reference: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", reference
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
 def test_nested_issue_reference_does_not_satisfy_related_issue() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Closes #194", "- Parent item\n  - Closes #194"
@@ -843,6 +891,50 @@ def test_nested_task_list_does_not_satisfy_acceptance_criteria() -> None:
     result = validator.validate_text(text, kind="issue")
 
     assert "checklist-required" in {item.code for item in result.findings}
+
+
+def test_contract_headings_nested_in_list_are_rejected() -> None:
+    text = """### Contract version
+v1
+
+### Summary
+Delivered result.
+
+- parent
+  ### Changes
+  - hidden change
+  ### Validation
+  - hidden validation
+  ### Impact and risks
+  Not applicable: no runtime impact.
+  ### Related issue
+  Closes #194
+"""
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "nested-heading" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+)
+def test_non_markdown_line_separator_cannot_create_list_item(
+    separator: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + f"Intro{separator}- hidden change\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "unsupported-line-separator" in {
+        item.code for item in result.findings
+    }
 
 
 @pytest.mark.parametrize(

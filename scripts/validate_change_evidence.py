@@ -39,6 +39,10 @@ BARE_REFERENCE_RE = re.compile(
     r"(?<![A-Za-z0-9_./?=&%+-])#[1-9][0-9]*\b"
 )
 PR_LABEL_RE = re.compile(r"(?i)\b(?:pr|pull request)\s*:?[ \t]*$")
+INLINE_LINK_RE = re.compile(
+    r"\[(?P<label>[^\]\r\n]*)\]\([ \t]*"
+    r"(?P<destination><[^>\r\n]*>|[^\s)\r\n]+)"
+)
 CHANGE_REFERENCE_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_./?=&%+-])#[1-9][0-9]*\b|"
     r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/[1-9][0-9]*\b"
@@ -56,6 +60,9 @@ RAW_HTML_START_RE = re.compile(
 ATX_HEADING_RE = re.compile(r"^#{1,6}(?:[ \t]+(?P<value>.*))?$")
 THEMATIC_BREAK_RE = re.compile(
     r"^(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$"
+)
+UNSUPPORTED_LINE_SEPARATOR_RE = re.compile(
+    "[\x0b\x0c\x1c-\x1e\x85\u2028\u2029]"
 )
 LIST_ITEM_RE = re.compile(
     rf"^ {{0,3}}{LIST_MARKER}\s+(?:\[[ xX]\]\s+)?(?P<value>.*)$"
@@ -181,6 +188,18 @@ def _column_width(value: str) -> int:
     return columns
 
 
+def _markdown_lines(value: str, *, keepends: bool = False) -> list[str]:
+    lines: list[str] = []
+    cursor = 0
+    for match in re.finditer(r"\r\n|\r|\n", value):
+        end = match.end() if keepends else match.start()
+        lines.append(value[cursor:end])
+        cursor = match.end()
+    if cursor < len(value):
+        lines.append(value[cursor:])
+    return lines
+
+
 def _blockquote_allows_lazy_continuation(value: str) -> bool:
     candidate = value.strip()
     if not candidate:
@@ -201,7 +220,7 @@ def _structural_lines(
     list_content_indents: list[int] = []
     previous_line_blank = True
     blockquote_paragraph = False
-    for line in value.splitlines():
+    for line in _markdown_lines(value):
         if not line.strip():
             classified.append((line, False, None))
             previous_line_blank = True
@@ -293,7 +312,7 @@ def _scan_markdown(
     fence_length = 0
     in_comment = False
     offset = 0
-    for line in value.splitlines(keepends=True):
+    for line in _markdown_lines(value, keepends=True):
         line_without_ending = line.rstrip("\r\n")
         fence_match = FENCE_RE.match(line_without_ending)
         if fence_character:
@@ -373,7 +392,7 @@ def _link_definition_start_lines(value: str) -> list[int]:
     starts: list[int] = []
     start: int | None = None
     candidate = ""
-    for index, line in enumerate(value.splitlines()):
+    for index, line in enumerate(_markdown_lines(value)):
         opener = bool(re.match(r"^ {0,3}\[", line))
         if start is None:
             if not opener:
@@ -473,7 +492,7 @@ def _mask_top_level_indented_code(value: str) -> str:
     in_indented_code = False
     fence_character = ""
     fence_length = 0
-    for line in value.splitlines(keepends=True):
+    for line in _markdown_lines(value, keepends=True):
         line_without_ending = line.rstrip("\r\n")
         if not line_without_ending.strip():
             output.append(line)
@@ -570,7 +589,7 @@ def _raw_html_offsets(value: str) -> list[int]:
 
 
 def _contains_placeholder_value(value: str) -> bool:
-    for line in value.splitlines():
+    for line in _markdown_lines(value):
         candidate = line.strip()
         if not candidate:
             continue
@@ -588,8 +607,10 @@ def _contains_placeholder_value(value: str) -> bool:
 
 
 def _inline_visible_text(value: str) -> str:
-    value = re.sub(r"!?\[([^\]\r\n]*)\]\([^\)\r\n]*\)", r"\1", value)
-    value = re.sub(r"!?\[([^\]\r\n]*)\]\[[^\]\r\n]*\]", r"\1", value)
+    value = re.sub(r"!\[[^\]\r\n]*\]\([^\)\r\n]*\)", "", value)
+    value = re.sub(r"\[([^\]\r\n]*)\]\([^\)\r\n]*\)", r"\1", value)
+    value = re.sub(r"!\[[^\]\r\n]*\]\[[^\]\r\n]*\]", "", value)
+    value = re.sub(r"\[([^\]\r\n]*)\]\[[^\]\r\n]*\]", r"\1", value)
     value = re.sub(
         r"</?[A-Za-z][A-Za-z0-9-]*(?:[ \t][^>\r\n]*)?/?>",
         "",
@@ -610,7 +631,7 @@ def _visible_evidence_text(value: str) -> str:
     visible: list[str] = []
     fence_character = ""
     fence_length = 0
-    for line in value.splitlines():
+    for line in _markdown_lines(value):
         fence_match = FENCE_RE.match(line)
         if fence_character:
             if fence_match:
@@ -703,11 +724,21 @@ def _top_level_reference_blocks(value: str) -> list[str]:
 
 def _has_issue_reference(value: str) -> bool:
     for candidate in _top_level_reference_blocks(value):
-        if ISSUE_URL_RE.search(candidate):
-            return True
         visible_candidate = _inline_visible_text(candidate)
+        if ISSUE_URL_RE.search(visible_candidate):
+            return True
+        for link in INLINE_LINK_RE.finditer(candidate):
+            if (
+                link.start() > 0
+                and candidate[link.start() - 1] == "!"
+                and not _backslash_escaped(candidate, link.start() - 1)
+            ):
+                continue
+            destination = link.group("destination").strip("<>")
+            if ISSUE_URL_RE.fullmatch(destination):
+                return True
         for match in BARE_REFERENCE_RE.finditer(visible_candidate):
-            prefix = visible_candidate[max(0, match.start() - 32) : match.start()]
+            prefix = visible_candidate[: match.start()]
             if not PR_LABEL_RE.search(prefix):
                 return True
     return False
@@ -752,13 +783,24 @@ def _parse_sections(
     headings: list[tuple[str, int, int, int]] = []
     findings: list[Finding] = []
     offset = 0
-    for line in scan_text.splitlines(keepends=True):
+    structural_lines = iter(_structural_lines(scan_text))
+    for line in _markdown_lines(scan_text, keepends=True):
+        _classified_line, top_level, _list_match = next(structural_lines)
         match = HEADING_RE.match(line.rstrip("\r\n"))
         if match:
             level = len(match.group(1))
             name = match.group(2)
             line_number = _line_number(text, offset)
-            if level != 3:
+            if not top_level:
+                findings.append(
+                    Finding(
+                        "nested-heading",
+                        "Contract headings must be top-level Markdown structures.",
+                        line_number,
+                        name,
+                    )
+                )
+            elif level != 3:
                 findings.append(
                     Finding(
                         "unexpected-heading-level",
@@ -792,6 +834,15 @@ def validate_text(
     if not text.strip():
         findings.append(Finding("empty-document", "Evidence document is empty."))
         return ValidationResult(False, kind, None, tuple(findings))
+    unsupported_separator = UNSUPPORTED_LINE_SEPARATOR_RE.search(text)
+    if unsupported_separator:
+        findings.append(
+            Finding(
+                "unsupported-line-separator",
+                "Markdown evidence may use only LF, CR, or CRLF line endings.",
+                _line_number(text, unsupported_separator.start()),
+            )
+        )
 
     ambiguous_comment_offsets: list[int] = []
     visible_document = _scan_visible_markdown(text, ambiguous_comment_offsets)
@@ -811,7 +862,7 @@ def validate_text(
                 _line_number(text, offset),
             )
         )
-    visible_lines = visible_document.splitlines()
+    visible_lines = _markdown_lines(visible_document)
     for line_number in _link_definition_start_lines(visible_document):
         findings.append(
             Finding(
@@ -836,7 +887,8 @@ def validate_text(
 
     definition = CONTRACTS[kind]
     if kind == "commit":
-        title_source = _content_without_comments(text.splitlines()[0])
+        text_lines = _markdown_lines(text)
+        title_source = _content_without_comments(text_lines[0])
         title = _visible_evidence_text(title_source)
         if _contains_placeholder_value(title_source):
             findings.append(
@@ -860,7 +912,7 @@ def validate_text(
                     1,
                 )
             )
-        if len(text.splitlines()) < 2 or text.splitlines()[1].strip():
+        if len(text_lines) < 2 or text_lines[1].strip():
             findings.append(
                 Finding("commit-title-separator", "Commit title must be followed by a blank line.", 2)
             )
@@ -883,7 +935,7 @@ def validate_text(
     if version_heading:
         preamble = text[: version_heading.start()]
         if kind == "commit":
-            preamble_lines = preamble.splitlines()
+            preamble_lines = _markdown_lines(preamble)
             extra_preamble = "\n".join(preamble_lines[1:]) if preamble_lines else ""
         else:
             extra_preamble = preamble
