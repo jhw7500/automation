@@ -1,4 +1,4 @@
-Describe the delivered result in 72 characters or fewer
+<Describe the delivered result in 72 characters or fewer>
 
 ### Contract version
 v1

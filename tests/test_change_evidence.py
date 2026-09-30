@@ -56,6 +56,29 @@ def test_invalid_fixtures_fail_with_stable_code(kind: str, name: str, code: str)
     assert code in {finding.code for finding in result.findings}
 
 
+def test_comment_only_commit_title_is_rejected() -> None:
+    text = (FIXTURES / "valid-commit.md").read_text()
+    text = "<!-- hidden title -->" + text[text.index("\n") :]
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert not result.valid
+    assert "commit-title-empty" in {item.code for item in result.findings}
+
+
+def test_canonical_commit_template_title_is_rejected() -> None:
+    text = (FIXTURES / "valid-commit.md").read_text()
+    template_title = (
+        ROOT / "examples/change-evidence/commit-message.md"
+    ).read_text().splitlines()[0]
+    text = template_title + text[text.index("\n") :]
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert not result.valid
+    assert "commit-title-placeholder" in {item.code for item in result.findings}
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -298,6 +321,20 @@ def test_multiline_link_reference_definition_does_not_satisfy_related_issue() ->
     }
 
 
+def test_escaped_label_link_definition_does_not_satisfy_related_issue() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194",
+        r"[hidden\]]: https://github.com/example/repo/issues/194",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "non-rendered-link-definition" in {
+        item.code for item in result.findings
+    }
+
+
 def test_four_backtick_fence_keeps_nested_triple_fence_and_heading_as_code() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text()
     text = text.replace(
@@ -365,6 +402,54 @@ def test_explicit_pr_label_does_not_satisfy_related_issue(reference: str) -> Non
     assert "reference-required" in {item.code for item in result.findings}
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "PR: **#194**",
+        "PR: <strong>#194</strong>",
+        "PR: [#194](https://example.invalid/reference)",
+    ],
+)
+def test_formatted_pr_label_does_not_satisfy_related_issue(reference: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", reference
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+def test_nested_issue_reference_does_not_satisfy_related_issue() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", "- Parent item\n  - Closes #194"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+def test_blockquoted_issue_reference_does_not_satisfy_related_issue() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", "> Closes #194"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+def test_inline_link_issue_label_satisfies_related_issue() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", "Issue: [#194](https://example.invalid/reference)"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
 def test_mixed_issue_and_pr_labels_satisfy_related_issue() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Closes #194", "PR: #193\nIssue: #194"
@@ -396,6 +481,19 @@ def test_ordered_task_list_satisfies_acceptance_criteria(marker: str) -> None:
     result = validator.validate_text(text, kind="issue")
 
     assert result.valid, result.findings
+
+
+def test_nested_task_list_does_not_satisfy_acceptance_criteria() -> None:
+    text = (FIXTURES / "valid-issue.md").read_text()
+    start = text.index("### Acceptance criteria\n") + len(
+        "### Acceptance criteria\n"
+    )
+    end = text.find("\n### ", start)
+    text = text[:start] + "- Parent item\n  - [ ] Nested criterion\n" + text[end:]
+
+    result = validator.validate_text(text, kind="issue")
+
+    assert "checklist-required" in {item.code for item in result.findings}
 
 
 @pytest.mark.parametrize(

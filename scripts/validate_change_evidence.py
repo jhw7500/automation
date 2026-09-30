@@ -19,7 +19,9 @@ CONTRACT_VERSION = "v1"
 MAX_BYTES = 64 * 1024
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
 FENCE_RE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<rest>[^\r\n]*)$")
-LINK_DEFINITION_RE = re.compile(r"^ {0,3}\[[^\]\r\n]+\]:[ \t]*(?:\S.*)?$")
+LINK_DEFINITION_RE = re.compile(
+    r"^ {0,3}\[(?:\\.|[^\]\\\r\n])+\]:[ \t]*(?:\S.*)?$"
+)
 SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 PLACEHOLDER_VALUE_RE = re.compile(
     r"(?i)^(?:tbd|todo|fixme|n/?a|none|unknown|미정|추후|없음|\?{2,})[.。]?$"
@@ -30,15 +32,20 @@ ANGLE_PLACEHOLDER_RE = re.compile(
 ISSUE_URL_RE = re.compile(
     r"(?i)https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*\b"
 )
-BARE_REFERENCE_RE = re.compile(r"#[1-9][0-9]*\b")
+BARE_REFERENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9_./?=&%+-])#[1-9][0-9]*\b"
+)
 PR_LABEL_RE = re.compile(r"(?i)\b(?:pr|pull request)\s*:?[ \t]*$")
 CHANGE_REFERENCE_RE = re.compile(
-    r"(?im)#[1-9][0-9]*\b|"
+    r"(?i)(?<![A-Za-z0-9_./?=&%+-])#[1-9][0-9]*\b|"
     r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/[1-9][0-9]*\b"
 )
 LIST_MARKER = r"(?:[-*+]|[0-9]{1,9}[.)])"
+STRUCTURAL_LIST_ITEM_RE = re.compile(
+    rf"^(?P<indent>[ \t]*)(?P<marker>{LIST_MARKER})(?P<spacing>[ \t]+)(?P<value>.*)$"
+)
+BLOCKQUOTE_RE = re.compile(r"^ {0,3}>")
 CHECKBOX_RE = re.compile(rf"(?m)^ {{0,3}}{LIST_MARKER}\s+\[[ xX]\]\s+\S")
-BULLET_RE = re.compile(rf"(?m)^ {{0,3}}{LIST_MARKER}\s+\S")
 LIST_ITEM_RE = re.compile(
     rf"^ {{0,3}}{LIST_MARKER}\s+(?:\[[ xX]\]\s+)?(?P<value>.*)$"
 )
@@ -150,6 +157,54 @@ def _indent_columns(line: str) -> int:
         else:
             break
     return columns
+
+
+def _column_width(value: str) -> int:
+    columns = 0
+    for character in value:
+        if character == "\t":
+            columns += 4 - (columns % 4)
+        else:
+            columns += 1
+    return columns
+
+
+def _structural_lines(
+    value: str,
+) -> list[tuple[str, bool, re.Match[str] | None]]:
+    """Classify visible lines without treating nested list content as top-level."""
+
+    classified: list[tuple[str, bool, re.Match[str] | None]] = []
+    list_content_indents: list[int] = []
+    previous_line_blank = True
+    for line in value.splitlines():
+        if not line.strip():
+            previous_line_blank = True
+            continue
+
+        if BLOCKQUOTE_RE.match(line):
+            classified.append((line, False, None))
+            previous_line_blank = False
+            continue
+
+        indent = _indent_columns(line)
+        list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(line)
+        if list_match:
+            while list_content_indents and indent < list_content_indents[-1]:
+                list_content_indents.pop()
+            top_level = not list_content_indents
+            classified.append((line, top_level, list_match))
+            content_indent = _column_width(line[: list_match.start("value")])
+            list_content_indents.append(content_indent)
+            previous_line_blank = False
+            continue
+
+        if previous_line_blank:
+            while list_content_indents and indent < list_content_indents[-1]:
+                list_content_indents.pop()
+        classified.append((line, not list_content_indents, None))
+        previous_line_blank = False
+    return classified
 
 
 def _mask_comment_spans(
@@ -282,14 +337,59 @@ def _contains_placeholder_value(value: str) -> bool:
     return False
 
 
+def _inline_visible_text(value: str) -> str:
+    value = re.sub(r"!?\[([^\]\r\n]*)\]\([^\)\r\n]*\)", r"\1", value)
+    value = re.sub(r"!?\[([^\]\r\n]*)\]\[[^\]\r\n]*\]", r"\1", value)
+    value = re.sub(r"</?[A-Za-z][^>\r\n]*>", "", value)
+    value = re.sub(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~\\])", r"\1", value)
+    return value.translate(str.maketrans("", "", "`*_~[]()"))
+
+
+def _top_level_candidate(
+    line: str, list_match: re.Match[str] | None
+) -> str:
+    return list_match.group("value") if list_match else line.strip()
+
+
 def _has_issue_reference(value: str) -> bool:
-    if ISSUE_URL_RE.search(value):
-        return True
-    for match in BARE_REFERENCE_RE.finditer(value):
-        prefix = value[max(0, match.start() - 32) : match.start()]
-        if not PR_LABEL_RE.search(prefix):
+    for line, top_level, list_match in _structural_lines(value):
+        if not top_level:
+            continue
+        candidate = _top_level_candidate(line, list_match)
+        if ISSUE_URL_RE.search(candidate):
             return True
+        visible_candidate = _inline_visible_text(candidate)
+        for match in BARE_REFERENCE_RE.finditer(visible_candidate):
+            prefix = visible_candidate[max(0, match.start() - 32) : match.start()]
+            if not PR_LABEL_RE.search(prefix):
+                return True
     return False
+
+
+def _has_change_reference(value: str) -> bool:
+    return any(
+        top_level
+        and CHANGE_REFERENCE_RE.search(
+            _inline_visible_text(_top_level_candidate(line, list_match))
+        )
+        for line, top_level, list_match in _structural_lines(value)
+    )
+
+
+def _has_top_level_checklist_item(value: str) -> bool:
+    return any(
+        top_level and CHECKBOX_RE.search(line)
+        for line, top_level, _list_match in _structural_lines(value)
+    )
+
+
+def _has_top_level_list_item(value: str) -> bool:
+    return any(
+        top_level
+        and list_match is not None
+        and bool(list_match.group("value").strip())
+        for _line, top_level, list_match in _structural_lines(value)
+    )
 
 
 def _line_number(text: str, offset: int) -> int:
@@ -381,9 +481,17 @@ def validate_text(
 
     definition = CONTRACTS[kind]
     if kind == "commit":
-        title = text.splitlines()[0].strip()
+        title = _content_without_comments(text.splitlines()[0])
         if not title:
             findings.append(Finding("commit-title-empty", "Commit title is required.", 1))
+        elif _contains_placeholder_value(title):
+            findings.append(
+                Finding(
+                    "commit-title-placeholder",
+                    "Commit title must replace the authoring placeholder with a delivered result.",
+                    1,
+                )
+            )
         elif len(title) > 72:
             findings.append(
                 Finding("commit-title-too-long", "Commit title must be 72 characters or fewer.", 1)
@@ -516,7 +624,10 @@ def validate_text(
                     field,
                 )
             )
-        if field in definition.checklist_fields and not CHECKBOX_RE.search(visible_body):
+        if (
+            field in definition.checklist_fields
+            and not _has_top_level_checklist_item(visible_body)
+        ):
             findings.append(
                 Finding(
                     "checklist-required",
@@ -526,7 +637,7 @@ def validate_text(
                 )
             )
         if field in definition.bullet_fields and not (
-            BULLET_RE.search(visible_body)
+            _has_top_level_list_item(visible_body)
             or (field == "Validation" and explicit_absence)
         ):
             findings.append(
@@ -540,7 +651,7 @@ def validate_text(
         reference_valid = (
             _has_issue_reference(visible_body)
             if field in definition.issue_reference_fields
-            else bool(CHANGE_REFERENCE_RE.search(visible_body))
+            else _has_change_reference(visible_body)
             if field in definition.change_reference_fields
             else True
         )

@@ -83,6 +83,8 @@ follow:
 
 `examples/change-evidence/commit-message.md` is the canonical authoring template. A
 repository MAY copy it and configure it with `git config commit.template <path>`.
+Its angle-bracket title and HTML comment bodies are instructions that MUST be replaced
+with visible evidence before validation.
 
 ## Missing information and non-applicable fields
 
