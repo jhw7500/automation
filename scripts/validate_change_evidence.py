@@ -321,14 +321,29 @@ def _markdown_lines(value: str, *, keepends: bool = False) -> list[str]:
 
 
 def _blockquote_allows_lazy_continuation(value: str) -> bool:
-    candidate = value.strip()
-    if not candidate:
-        return False
-    if ATX_HEADING_RE.fullmatch(candidate) or THEMATIC_BREAK_RE.fullmatch(
-        candidate
-    ):
-        return False
-    return True
+    candidate = value
+    while True:
+        if _indent_columns(candidate) >= 4:
+            return False
+        blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+        if blockquote:
+            candidate = blockquote.group("value")
+            continue
+        list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(candidate)
+        if list_match:
+            candidate = _list_marker_value(candidate, list_match)
+            continue
+        break
+
+    stripped = candidate.strip()
+    return bool(
+        stripped
+        and not EMPTY_LIST_MARKER_RE.fullmatch(stripped)
+        and not ATX_HEADING_RE.fullmatch(stripped)
+        and not THEMATIC_BREAK_RE.fullmatch(stripped)
+        and not FENCE_RE.fullmatch(candidate)
+        and not _is_link_definition(candidate)
+    )
 
 
 def _list_can_interrupt_paragraph(list_match: re.Match[str]) -> bool:
@@ -534,12 +549,14 @@ def _structural_lines(
     list_paragraphs: list[bool] = []
     previous_line_blank = True
     blockquote_paragraph = False
+    blockquote_list_indent: int | None = None
     paragraph_open = False
     for line in _markdown_lines(value):
         if not line.strip():
             classified.append((line, False, None))
             previous_line_blank = True
             blockquote_paragraph = False
+            blockquote_list_indent = None
             paragraph_open = False
             if list_paragraphs:
                 list_paragraphs[-1] = False
@@ -549,12 +566,21 @@ def _structural_lines(
             classified.append((line, False, None))
             previous_line_blank = False
             blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(line)
+            blockquote_content = blockquote.group("value") if blockquote else ""
             blockquote_paragraph = bool(
                 blockquote
-                and _blockquote_allows_lazy_continuation(
-                    blockquote.group("value")
+                and (
+                    blockquote_paragraph
+                    and bool(blockquote_content.strip())
+                    and not _line_starts_paragraph_interrupt(
+                        blockquote_content
+                    )
+                    or _blockquote_allows_lazy_continuation(
+                        blockquote_content
+                    )
                 )
             )
+            blockquote_list_indent = None
             paragraph_open = False
             if list_paragraphs:
                 list_paragraphs[-1] = False
@@ -572,14 +598,21 @@ def _structural_lines(
             if not remaining_containers:
                 list_match = None
         if list_match:
-            if blockquote_paragraph and not _list_can_interrupt_paragraph(
-                list_match
+            exits_nested_blockquote = bool(
+                blockquote_list_indent is not None
+                and indent < blockquote_list_indent
+            )
+            if (
+                blockquote_paragraph
+                and not exits_nested_blockquote
+                and not _list_can_interrupt_paragraph(list_match)
             ):
                 classified.append((line, False, None))
                 previous_line_blank = False
                 paragraph_open = False
                 continue
             blockquote_paragraph = False
+            blockquote_list_indent = None
             if (
                 paragraph_open
                 and not list_content_indents
@@ -597,6 +630,16 @@ def _structural_lines(
             content_indent = _list_content_indent(line, list_match)
             list_content_indents.append(content_indent)
             marker_value = _list_marker_value(line, list_match)
+            nested_blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(marker_value)
+            blockquote_paragraph = bool(
+                nested_blockquote
+                and _blockquote_allows_lazy_continuation(
+                    nested_blockquote.group("value")
+                )
+            )
+            blockquote_list_indent = (
+                content_indent if blockquote_paragraph else None
+            )
             list_paragraphs.append(
                 bool(marker_value.strip())
                 and not _list_marker_starts_indented_code(line, list_match)
@@ -630,6 +673,7 @@ def _structural_lines(
             continue
         if paragraph_interrupt:
             blockquote_paragraph = False
+            blockquote_list_indent = None
 
         if previous_line_blank or paragraph_interrupt:
             while list_content_indents and indent < list_content_indents[-1]:
@@ -1762,19 +1806,34 @@ def _top_level_list_items(value: str) -> list[tuple[str, tuple[str, ...]]]:
         if not top_level or list_match is None:
             continue
 
+        marker_value = _list_marker_value(line, list_match)
+        marker_candidate = marker_value.strip()
+        marker_opens_nested_block = bool(
+            BLOCKQUOTE_RE.match(marker_value)
+            or STRUCTURAL_LIST_ITEM_RE.fullmatch(marker_value)
+            or EMPTY_LIST_MARKER_RE.fullmatch(marker_candidate)
+            or ATX_HEADING_RE.fullmatch(marker_candidate)
+            or THEMATIC_BREAK_RE.fullmatch(marker_candidate)
+            or FENCE_RE.fullmatch(marker_value)
+            or _is_link_definition(marker_value)
+        )
         content_indent = _list_content_indent(line, list_match)
         continuations: list[str] = []
         for continuation, continuation_top_level, continuation_match in classified[
             index + 1 :
         ]:
+            if marker_opens_nested_block:
+                break
             if not continuation.strip():
                 break
             if continuation_top_level or continuation_match is not None:
                 break
-            if _indent_columns(continuation) < content_indent:
-                break
-
-            relative = _drop_indent_columns(continuation, content_indent)
+            continuation_indent = _indent_columns(continuation)
+            relative = (
+                _drop_indent_columns(continuation, content_indent)
+                if continuation_indent >= content_indent
+                else continuation
+            )
             candidate = relative.strip()
             if (
                 BLOCKQUOTE_RE.match(relative)
@@ -1788,7 +1847,7 @@ def _top_level_list_items(value: str) -> list[tuple[str, tuple[str, ...]]]:
                 break
             continuations.append(relative)
 
-        items.append((_list_marker_value(line, list_match), tuple(continuations)))
+        items.append((marker_value, tuple(continuations)))
     return items
 
 

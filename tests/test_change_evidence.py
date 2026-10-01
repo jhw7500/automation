@@ -1665,11 +1665,12 @@ def test_pull_request_url_is_valid_commit_reference() -> None:
         ("commit", "valid-commit.md", "References", "Issue: #194"),
     ],
 )
-def test_direct_list_continuation_satisfies_reference_field(
-    kind: str, fixture: str, field: str, original: str
+@pytest.mark.parametrize("indent", ["", "  "])
+def test_list_paragraph_continuation_satisfies_reference_field(
+    kind: str, fixture: str, field: str, original: str, indent: str
 ) -> None:
     text = (FIXTURES / fixture).read_text().replace(
-        original, "- Related issue:\n  #194"
+        original, f"- Related issue:\n{indent}#194"
     )
 
     result = validator.validate_text(text, kind=kind)
@@ -1697,9 +1698,12 @@ def test_non_direct_list_continuation_does_not_satisfy_related_issue(
     assert "reference-required" in {finding.code for finding in result.findings}
 
 
-def test_pr_label_on_direct_list_continuation_does_not_satisfy_related_issue() -> None:
+@pytest.mark.parametrize("indent", ["", "  "])
+def test_pr_label_on_list_continuation_does_not_satisfy_related_issue(
+    indent: str,
+) -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
-        "Closes #194", "- PR:\n  #194"
+        "Closes #194", f"- PR:\n{indent}#194"
     )
 
     result = validator.validate_text(text, kind="pull-request")
@@ -1958,15 +1962,126 @@ def test_nested_issue_reference_does_not_satisfy_related_issue() -> None:
         ),
     ],
 )
-def test_reference_nested_after_indented_code_does_not_count(
+def test_lazy_list_reference_after_indented_code_counts(
     kind: str, fixture: str, original: str, replacement: str
 ) -> None:
     text = (FIXTURES / fixture).read_text().replace(original, replacement)
 
     result = validator.validate_text(text, kind=kind)
 
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    ("kind", "fixture", "original", "reference"),
+    [
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Closes #194",
+            "Closes #194",
+        ),
+        ("commit", "valid-commit.md", "Issue: #194", "PR: #194"),
+    ],
+)
+def test_reference_in_nested_lazy_list_does_not_count(
+    kind: str, fixture: str, original: str, reference: str
+) -> None:
+    text = (FIXTURES / fixture).read_text().replace(
+        original, f"- - child\n{reference}"
+    )
+
+    result = validator.validate_text(text, kind=kind)
+
     assert not result.valid
     assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    ("kind", "fixture", "original", "reference"),
+    [
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Closes #194",
+            "Closes #194",
+        ),
+        ("commit", "valid-commit.md", "Issue: #194", "PR: #194"),
+    ],
+)
+def test_reference_in_nested_lazy_blockquote_does_not_count(
+    kind: str, fixture: str, original: str, reference: str
+) -> None:
+    text = (FIXTURES / fixture).read_text().replace(
+        original, f"- > context\n{reference}"
+    )
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert not result.valid
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize("first_marker", ["-", "1."])
+def test_outer_list_sibling_exits_nested_blockquote(
+    first_marker: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194",
+        f"{first_marker} > context\n2. Closes #194",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "nested_block",
+    ["```", "    code", "-", "2."],
+)
+def test_top_level_reference_after_nested_blockquote_block(
+    nested_block: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", f"- > {nested_block}\nCloses #194"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "quoted_continuation",
+    ["[note]: /target", "    continuation"],
+)
+def test_reference_after_lazy_blockquote_paragraph_does_not_count(
+    quoted_continuation: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194",
+        f"> context\n> {quoted_continuation}\nCloses #194",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    "quote",
+    ["> context\n>", "- > context\n  >"],
+)
+def test_empty_blockquote_line_ends_lazy_paragraph(quote: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", f"{quote}\nCloses #194"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
 
 
 def test_blockquoted_issue_reference_does_not_satisfy_related_issue() -> None:
