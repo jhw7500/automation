@@ -158,6 +158,19 @@ def test_formatted_container_wrapped_absence_sentinels_are_rejected(
     assert "invalid-absence-syntax" in {item.code for item in result.findings}
 
 
+def test_absence_sentinel_cannot_coexist_with_fenced_content() -> None:
+    text = (FIXTURES / "valid-pull-request-no-validation.md").read_text().replace(
+        "Not run: documentation-only change with no executable behavior.",
+        "Not run: documentation-only change with no executable behavior.\n\n"
+        "```text\nextra rendered evidence\n```",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "invalid-absence-syntax" in {item.code for item in result.findings}
+
+
 def test_concrete_prose_may_discuss_placeholder_tokens() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Adds deterministic validation for structured change evidence.",
@@ -428,6 +441,12 @@ def test_syntax_only_task_item_does_not_satisfy_acceptance_criteria() -> None:
             "Related issue",
             "<div>\nCloses #194\n</div>",
         ),
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Related issue",
+            "<![CDATA[Closes #194]]>",
+        ),
     ],
 )
 def test_raw_html_cannot_supply_contract_evidence(
@@ -456,6 +475,11 @@ def test_raw_html_cannot_supply_contract_evidence(
         (
             "Delivered result.\n\n- parent\n    ```html\n"
             "    <span>literal</span>\n    ```",
+            False,
+        ),
+        (
+            "Delivered result.\n\n```xml\n"
+            "<![CDATA[<span>literal</span>]]>\n```",
             False,
         ),
     ],
@@ -1057,6 +1081,26 @@ def test_hidden_issue_url_does_not_satisfy_related_issue(reference: str) -> None
 @pytest.mark.parametrize(
     "reference",
     [
+        "nothttps://github.com/example/repo/issues/194",
+        "Context [](https://github.com/example/repo/issues/194)",
+    ],
+)
+def test_nonstandalone_issue_url_does_not_satisfy_related_issue(
+    reference: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", reference
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
         "https://github.com/example/repo/issues/194",
         "<https://github.com/example/repo/issues/194>",
         "[Issue](https://github.com/example/repo/issues/194)",
@@ -1107,6 +1151,26 @@ def test_hidden_change_url_does_not_satisfy_commit_reference(
 
     result = validator.validate_text(text, kind="commit")
 
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "nothttps://github.com/example/repo/pull/194",
+        "Context [](https://github.com/example/repo/issues/194)",
+    ],
+)
+def test_nonstandalone_change_url_does_not_satisfy_commit_reference(
+    reference: str,
+) -> None:
+    text = (FIXTURES / "valid-commit.md").read_text().replace(
+        "Issue: #194", reference
+    )
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert not result.valid
     assert "reference-required" in {item.code for item in result.findings}
 
 

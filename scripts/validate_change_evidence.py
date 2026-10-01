@@ -37,9 +37,11 @@ ANGLE_PLACEHOLDER_RE = re.compile(
     r"(?i)^<(?:(?:fill|insert|describe|add)[^>]*|[^>]+ here)>$"
 )
 ISSUE_URL_RE = re.compile(
-    r"(?i)https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*\b"
+    r"(?i)(?<![A-Za-z0-9_./?=&%+-])"
+    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*\b"
 )
 CHANGE_URL_PATTERN = (
+    r"(?<![A-Za-z0-9_./?=&%+-])"
     r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/[1-9][0-9]*\b"
 )
 CHANGE_URL_RE = re.compile(CHANGE_URL_PATTERN, re.IGNORECASE)
@@ -63,7 +65,7 @@ BLOCKQUOTE_RE = re.compile(r"^ {0,3}>")
 BLOCKQUOTE_CONTENT_RE = re.compile(r"^ {0,3}>[ \t]?(?P<value>.*)$")
 CHECKBOX_VALUE_RE = re.compile(r"^\[[ xX]\][ \t]+(?P<value>.*)$")
 RAW_HTML_START_RE = re.compile(
-    r"(?i)(?:</?[A-Za-z][A-Za-z0-9-]*(?=[\s/>])|<![A-Z]|<\?)"
+    r"(?i)(?:</?[A-Za-z][A-Za-z0-9-]*(?=[\s/>])|<![A-Z]|<!\[CDATA\[|<\?)"
 )
 ATX_HEADING_RE = re.compile(r"^#{1,6}(?:[ \t]+(?P<value>.*))?$")
 THEMATIC_BREAK_RE = re.compile(
@@ -1130,6 +1132,8 @@ def _has_issue_reference(value: str) -> bool:
                 and not _backslash_escaped(candidate, link.start() - 1)
             ):
                 continue
+            if not _inline_visible_text(link.group("label")).strip():
+                continue
             destination = link.group("destination").strip("<>")
             if ISSUE_URL_RE.fullmatch(destination):
                 return True
@@ -1150,6 +1154,8 @@ def _has_change_reference(value: str) -> bool:
                 and candidate[link.start() - 1] == "!"
                 and not _backslash_escaped(candidate, link.start() - 1)
             ):
+                continue
+            if not _inline_visible_text(link.group("label")).strip():
                 continue
             destination = link.group("destination").strip("<>")
             if CHANGE_URL_RE.fullmatch(destination):
@@ -1519,6 +1525,7 @@ def validate_text(
         absence_match = ABSENCE_RE.fullmatch(visible_structure)
         absence_kind = absence_match.group("kind").casefold() if absence_match else None
         absence_reason = absence_match.group("reason").strip() if absence_match else ""
+        absence_is_complete = visible_structure == visible_evidence
         allowed_absence_kinds = (
             {"unknown", "not applicable"}
             if field in definition.absence_allowed_fields
@@ -1530,11 +1537,14 @@ def validate_text(
             absence_kind in allowed_absence_kinds
             and bool(absence_reason)
             and not _contains_placeholder_value(absence_reason)
+            and absence_is_complete
         )
         if absence_kind and not explicit_absence:
             code = (
                 "absence-not-allowed"
                 if absence_kind not in allowed_absence_kinds
+                else "invalid-absence-syntax"
+                if not absence_is_complete
                 else "invalid-absence-reason"
             )
             findings.append(
