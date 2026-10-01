@@ -184,6 +184,52 @@ def test_formatted_placeholder_only_field_is_rejected(value: str) -> None:
     assert "placeholder" in {item.code for item in result.findings}
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "> TBD",
+        "> TODO",
+        "> N/A",
+        "> unknown",
+        "> 미정",
+        "> 추후",
+        "> <fill this in>",
+    ],
+)
+@pytest.mark.parametrize(
+    ("kind", "fixture", "original", "code"),
+    [
+        (
+            "issue",
+            "valid-issue.md",
+            "Make change evidence structurally consistent across authors and repositories.",
+            "placeholder",
+        ),
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Adds deterministic validation for structured change evidence.",
+            "placeholder",
+        ),
+        (
+            "commit",
+            "valid-commit.md",
+            "Validate change evidence across authoring tools",
+            "commit-title-placeholder",
+        ),
+    ],
+)
+def test_blockquoted_placeholder_only_value_is_rejected(
+    value: str, kind: str, fixture: str, original: str, code: str
+) -> None:
+    text = (FIXTURES / fixture).read_text().replace(original, value)
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert not result.valid
+    assert code in {item.code for item in result.findings}
+
+
 def test_empty_html_markup_does_not_satisfy_required_field() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Adds deterministic validation for structured change evidence.",
@@ -645,6 +691,42 @@ def test_noninterrupting_ordered_marker_does_not_open_container_fence(
     }
 
 
+@pytest.mark.parametrize(
+    ("kind", "fixture", "original", "replacement", "code"),
+    [
+        (
+            "issue",
+            "valid-issue.md",
+            "- [ ] The v1 validator accepts every valid fixture.\n"
+            "- [ ] The validator rejects missing evidence with a stable finding code.",
+            "> quote\n---\nparagraph\n2. [ ] criterion",
+            "checklist-required",
+        ),
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "- Define the v1 headings and field rules.\n"
+            "- Add a dependency-free validator and reusable action.",
+            "> quote\n---\nparagraph\n2. evidence",
+            "bullet-required",
+        ),
+    ],
+)
+def test_thematic_break_ends_lazy_blockquote_before_ordered_paragraph(
+    kind: str,
+    fixture: str,
+    original: str,
+    replacement: str,
+    code: str,
+) -> None:
+    text = (FIXTURES / fixture).read_text().replace(original, replacement)
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert not result.valid
+    assert code in {item.code for item in result.findings}
+
+
 def test_comment_opener_inside_indented_code_is_rejected() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text()
     text = text.replace(
@@ -1035,6 +1117,34 @@ def test_nested_issue_reference_does_not_satisfy_related_issue() -> None:
 
     result = validator.validate_text(text, kind="pull-request")
 
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    ("kind", "fixture", "original", "replacement"),
+    [
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Closes #194",
+            "---\n    code\n2. item\nCloses #194",
+        ),
+        (
+            "commit",
+            "valid-commit.md",
+            "Issue: #194",
+            "---\n    code\n2. item\nPR: #194",
+        ),
+    ],
+)
+def test_reference_nested_after_indented_code_does_not_count(
+    kind: str, fixture: str, original: str, replacement: str
+) -> None:
+    text = (FIXTURES / fixture).read_text().replace(original, replacement)
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert not result.valid
     assert "reference-required" in {item.code for item in result.findings}
 
 

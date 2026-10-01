@@ -292,9 +292,15 @@ def _list_can_interrupt_paragraph(list_match: re.Match[str]) -> bool:
 
 
 def _line_opens_paragraph(line: str) -> bool:
+    return not _line_interrupts_paragraph(line)
+
+
+def _line_interrupts_paragraph(line: str) -> bool:
     candidate = line.strip()
-    return not (
-        THEMATIC_BREAK_RE.fullmatch(candidate)
+    return bool(
+        ATX_HEADING_RE.fullmatch(candidate)
+        or THEMATIC_BREAK_RE.fullmatch(candidate)
+        or FENCE_RE.fullmatch(line)
         or LINK_DEFINITION_RE.fullmatch(line)
     )
 
@@ -333,6 +339,14 @@ def _structural_lines(
         indent = _indent_columns(line)
         list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(line)
         if list_match:
+            if blockquote_paragraph and not _list_can_interrupt_paragraph(
+                list_match
+            ):
+                classified.append((line, False, None))
+                previous_line_blank = False
+                paragraph_open = False
+                continue
+            blockquote_paragraph = False
             if (
                 paragraph_open
                 and not list_content_indents
@@ -352,23 +366,24 @@ def _structural_lines(
             paragraph_open = False
             continue
 
-        heading_interrupt = HEADING_RE.fullmatch(line) is not None
-        if blockquote_paragraph and not heading_interrupt:
+        paragraph_interrupt = _line_interrupts_paragraph(line)
+        if blockquote_paragraph and not paragraph_interrupt:
             classified.append((line, False, None))
             previous_line_blank = False
             paragraph_open = False
             continue
-        if heading_interrupt:
+        if paragraph_interrupt:
             blockquote_paragraph = False
 
-        if previous_line_blank or heading_interrupt:
+        if previous_line_blank or paragraph_interrupt:
             while list_content_indents and indent < list_content_indents[-1]:
                 list_content_indents.pop()
         classified.append((line, not list_content_indents, None))
         previous_line_blank = False
         paragraph_open = (
             not list_content_indents
-            and not heading_interrupt
+            and indent < 4
+            and not paragraph_interrupt
             and _line_opens_paragraph(line)
         )
     return classified
@@ -800,6 +815,7 @@ def _mask_top_level_indented_code(value: str) -> str:
     list_content_indents: list[int] = []
     previous_line_blank = True
     in_indented_code = False
+    paragraph_open = False
     fence_character = ""
     fence_length = 0
     for line in _markdown_lines(value, keepends=True):
@@ -807,6 +823,7 @@ def _mask_top_level_indented_code(value: str) -> str:
         if not line_without_ending.strip():
             output.append(line)
             previous_line_blank = True
+            paragraph_open = False
             continue
 
         indent = _indent_columns(line_without_ending)
@@ -827,10 +844,18 @@ def _mask_top_level_indented_code(value: str) -> str:
                     fence_character = ""
                     fence_length = 0
             previous_line_blank = False
+            paragraph_open = False
             continue
 
         list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(line_without_ending)
         if list_match and not list_content_indents and indent >= 4:
+            list_match = None
+        if (
+            list_match
+            and not list_content_indents
+            and paragraph_open
+            and not _list_can_interrupt_paragraph(list_match)
+        ):
             list_match = None
         if list_match:
             in_indented_code = False
@@ -852,9 +877,11 @@ def _mask_top_level_indented_code(value: str) -> str:
             else:
                 output.append(line)
             previous_line_blank = False
+            paragraph_open = False
             continue
 
-        if previous_line_blank:
+        paragraph_interrupt = _line_interrupts_paragraph(line_without_ending)
+        if previous_line_blank or paragraph_interrupt:
             while list_content_indents and indent < list_content_indents[-1]:
                 list_content_indents.pop()
         relative_line = _drop_indent_columns(
@@ -871,16 +898,32 @@ def _mask_top_level_indented_code(value: str) -> str:
                 output.append(_masked_line(line))
                 previous_line_blank = False
                 in_indented_code = False
+                paragraph_open = False
                 continue
         code_indent = (
             list_content_indents[-1] + 4 if list_content_indents else 4
         )
         if in_indented_code and indent < code_indent:
             in_indented_code = False
-        if not in_indented_code and previous_line_blank and indent >= code_indent:
+        can_start_indented_code = (
+            previous_line_blank
+            if list_content_indents
+            else not paragraph_open
+        )
+        if (
+            not in_indented_code
+            and can_start_indented_code
+            and indent >= code_indent
+        ):
             in_indented_code = True
         output.append(_masked_line(line) if in_indented_code else line)
         previous_line_blank = False
+        paragraph_open = (
+            not in_indented_code
+            and not list_content_indents
+            and not paragraph_interrupt
+            and _line_opens_paragraph(line_without_ending)
+        )
     return "".join(output)
 
 
@@ -905,9 +948,16 @@ def _contains_placeholder_value(value: str) -> bool:
         candidate = line.strip()
         if not candidate:
             continue
-        list_match = LIST_ITEM_RE.fullmatch(line)
-        if list_match:
-            candidate = list_match.group("value").strip()
+        while candidate:
+            blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+            if blockquote:
+                candidate = blockquote.group("value").strip()
+                continue
+            list_match = LIST_ITEM_RE.fullmatch(candidate)
+            if list_match:
+                candidate = list_match.group("value").strip()
+                continue
+            break
         if ANGLE_PLACEHOLDER_RE.fullmatch(candidate):
             return True
         candidate = _inline_visible_text(candidate).strip()
@@ -1425,9 +1475,19 @@ def validate_text(
         ).strip()
         visible_evidence = _visible_evidence_text(body)
         visible_structure = _visible_evidence_text(visible_body)
+        contains_placeholder = _contains_placeholder_value(visible_body)
         if not visible_evidence:
             findings.append(
-                Finding("empty-field", "Contract field must contain evidence.", line_number, field)
+                Finding(
+                    "placeholder"
+                    if field != "Contract version" and contains_placeholder
+                    else "empty-field",
+                    "Use concrete evidence or an allowed absence sentinel with a reason."
+                    if field != "Contract version" and contains_placeholder
+                    else "Contract field must contain evidence.",
+                    line_number,
+                    field,
+                )
             )
             continue
         if field == "Contract version":
@@ -1486,7 +1546,7 @@ def validate_text(
                 )
             )
             continue
-        if not absence_kind and _contains_placeholder_value(visible_body):
+        if not absence_kind and contains_placeholder:
             findings.append(
                 Finding(
                     "placeholder",
