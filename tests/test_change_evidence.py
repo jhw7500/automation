@@ -156,6 +156,17 @@ def test_result_oriented_punctuated_commit_title_is_allowed(title: str) -> None:
     assert result.valid, result.findings
 
 
+@pytest.mark.parametrize("title", ["**" + ("x" * 70) + "**", "&amp;" * 15])
+def test_commit_title_limit_uses_source_length(title: str) -> None:
+    text = (FIXTURES / "valid-commit.md").read_text()
+    text = title + text[text.index("\n") :]
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert not result.valid
+    assert "commit-title-too-long" in {item.code for item in result.findings}
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -1193,6 +1204,77 @@ def test_indented_extra_heading_is_rejected() -> None:
         "heading-contract",
         "unknown-heading",
     }
+
+
+@pytest.mark.parametrize("heading", ["#", "###", "######", "> ###", "- ###"])
+def test_hash_only_atx_heading_is_rejected(heading: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        f"Concrete evidence.\n{heading}",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "empty-heading" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "- item\n    ###",
+        "1. item\n      ######",
+        "> - item\n>     ###",
+        "- > item\n    ###",
+        "1. > item\n    ###",
+        "10. > item\n       ###",
+        "-   - item\n    ###",
+        "1.  - item\n    ###",
+        "10.   - item\n      ###",
+        "- item\nlazy\n    ###",
+        "> - item\n> - next\n>     ###",
+        "> - item\n> outside\n>     ###",
+        "- item\n  \t###",
+        "- > item\n  \t###",
+    ],
+)
+def test_hash_only_heading_in_list_continuation_is_rejected(
+    value: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.", value
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "empty-heading" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Concrete evidence.\n\n    ###",
+        "- item\n      ###",
+        "- > item\n      ###",
+        "- item\n\n      - ###",
+        "- item\n      - ###",
+        "Concrete evidence.\n\n>     - ###",
+        "Concrete evidence.\n\n> -     - ###",
+        "Concrete evidence.\n\n> - item\n> -     - ###",
+        "- item\n\t  ###",
+        "- > item\n\t  ###",
+        "> - item\n>\t\t###",
+    ],
+)
+def test_hash_only_syntax_in_indented_code_is_allowed(value: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.", value
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
 
 
 @pytest.mark.parametrize(

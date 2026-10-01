@@ -24,6 +24,7 @@ MAX_REPORT_JSON_UTF16_BYTES = 512 * 1024
 REPORT_ENVELOPE_UTF16_RESERVE = 4 * 1024
 MAX_REPORTED_VERSION_CHARACTERS = 256
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
+EMPTY_ATX_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]*$")
 FENCE_RE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<rest>[^\r\n]*)$")
 SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 PLACEHOLDER_VALUE_RE = re.compile(
@@ -889,6 +890,61 @@ def _line_in_ordered_container(
             return None
         candidate = _drop_indent_columns(candidate, indent)
     return candidate
+
+
+def _line_in_ordered_container_prefix(
+    line: str, prefixes: Sequence[tuple[str, int]]
+) -> tuple[str, tuple[tuple[str, int], ...]] | None:
+    """Return content relative to the longest matching container prefix."""
+
+    candidate = line.expandtabs(4)
+    consumed: list[tuple[str, int]] = []
+    for kind, indent in prefixes:
+        if kind == "blockquote":
+            blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+            if not blockquote:
+                return (candidate, tuple(consumed)) if consumed else None
+            candidate = blockquote.group("value")
+            consumed.append((kind, indent))
+            continue
+        if kind != "list":
+            return None
+        if not candidate.strip():
+            return "", tuple(prefixes)
+        if _indent_columns(candidate) < indent:
+            return (candidate, tuple(consumed)) if consumed else None
+        leading_columns = _indent_columns(candidate)
+        leading_length = len(candidate) - len(candidate.lstrip(" \t"))
+        candidate = (
+            " " * (leading_columns - indent) + candidate[leading_length:]
+        )
+        consumed.append((kind, indent))
+    return candidate, tuple(consumed)
+
+
+def _line_in_ordered_marker_prefix(
+    line: str, prefixes: Sequence[tuple[str, int]]
+) -> tuple[str, tuple[tuple[str, int], ...]]:
+    """Consume rendered marker prefixes without promoting indented code."""
+
+    candidate = line.expandtabs(4)
+    consumed: list[tuple[str, int]] = []
+    for kind, indent in prefixes:
+        if kind == "blockquote":
+            blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+            if not blockquote:
+                break
+            candidate = blockquote.group("value")
+            consumed.append((kind, indent))
+            continue
+        if kind != "list" or _indent_columns(candidate) >= 4:
+            break
+        list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(candidate)
+        if not list_match:
+            break
+        candidate = _list_marker_value(candidate, list_match)
+        consumed.append((kind, indent))
+    return candidate, tuple(consumed)
 
 
 def _line_starts_paragraph_interrupt(line: str) -> bool:
@@ -1977,6 +2033,7 @@ def _parse_sections(
     offset = 0
     structural_lines = iter(_structural_lines(scan_text))
     blockquote_list_rendering = _blockquote_list_rendering(scan_text)
+    active_list_prefixes: tuple[tuple[str, int], ...] = ()
     for line_index, line in enumerate(_markdown_lines(scan_text, keepends=True)):
         _classified_line, top_level, list_match = next(structural_lines)
         line_without_ending = line.rstrip("\r\n")
@@ -1987,9 +2044,92 @@ def _parse_sections(
                 blockquote_list_rendered=blockquote_list_rendering[line_index],
             )
         )
+        ordered_relative, ordered_prefixes, starts_list_item = (
+            _ordered_container_line_info(
+                line_without_ending,
+                list_match,
+                blockquote_list_rendered=blockquote_list_rendering[line_index],
+            )
+        )
+        empty_heading_line = relative_line
+        active_continuation = (
+            _line_in_ordered_container_prefix(
+                line_without_ending, active_list_prefixes
+            )
+            if active_list_prefixes
+            else None
+        )
+        if active_continuation is not None:
+            previous_list_prefixes = active_list_prefixes
+            continuation, matched_prefixes = active_continuation
+            active_list_prefixes = (
+                matched_prefixes
+                if any(kind == "list" for kind, _indent in matched_prefixes)
+                else ()
+            )
+            empty_heading_line = continuation
+            if continuation.strip() and _indent_columns(continuation) < 4:
+                nested_relative, nested_prefixes, _nested_list = (
+                    _ordered_container_line_info(
+                        continuation,
+                        None,
+                        blockquote_list_rendered=True,
+                        allow_unclassified_list=True,
+                    )
+                )
+                if nested_prefixes:
+                    marker_line, rendered_nested_prefixes = (
+                        _line_in_ordered_marker_prefix(
+                            continuation, nested_prefixes
+                        )
+                    )
+                    empty_heading_line = marker_line
+                    combined_prefixes = (
+                        matched_prefixes + rendered_nested_prefixes
+                    )
+                    active_list_prefixes = (
+                        combined_prefixes
+                        if any(
+                            kind == "list"
+                            for kind, _indent in combined_prefixes
+                        )
+                        else ()
+                    )
+                elif (
+                    not active_list_prefixes
+                    and not top_level
+                    and not _line_starts_paragraph_interrupt(continuation)
+                ):
+                    active_list_prefixes = previous_list_prefixes
+        elif active_list_prefixes and not top_level:
+            if _line_starts_paragraph_interrupt(line_without_ending):
+                active_list_prefixes = ()
+        elif starts_list_item:
+            marker_line, rendered_prefixes = _line_in_ordered_marker_prefix(
+                line_without_ending, ordered_prefixes
+            )
+            active_list_prefixes = (
+                rendered_prefixes
+                if any(kind == "list" for kind, _indent in rendered_prefixes)
+                else ()
+            )
+            empty_heading_line = marker_line
+        else:
+            active_list_prefixes = ()
         match = HEADING_RE.match(line_without_ending)
         if match is None and nested:
             match = HEADING_RE.match(relative_line)
+        empty_heading = EMPTY_ATX_HEADING_RE.fullmatch(empty_heading_line)
+        if empty_heading:
+            findings.append(
+                Finding(
+                    "empty-heading",
+                    "Markdown headings must include text.",
+                    _line_number(text, offset),
+                )
+            )
+            offset += len(line)
+            continue
         if match:
             level = len(match.group(1))
             name = match.group(2)
@@ -2090,7 +2230,7 @@ def validate_text(
             )
         elif not title:
             findings.append(Finding("commit-title-empty", "Commit title is required.", 1))
-        elif len(title) > 72:
+        elif len(text_lines[0]) > 72:
             findings.append(
                 Finding("commit-title-too-long", "Commit title must be 72 characters or fewer.", 1)
             )
