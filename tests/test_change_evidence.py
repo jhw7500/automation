@@ -2539,6 +2539,50 @@ def test_github_outputs_cannot_be_injected_by_multiline_version(tmp_path: Path) 
     assert report["valid"] is False
 
 
+def test_escaped_version_cannot_exceed_github_output_budget(
+    tmp_path: Path,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "### Contract version\nv1\n",
+        "### Contract version\nv2" + ("\x01" * 59_998) + "\n",
+    )
+    source = tmp_path / "evidence.md"
+    source.write_text(text)
+    github_output = tmp_path / "github-output"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--kind",
+            "pull-request",
+            "--path",
+            str(source),
+            "--mode",
+            "audit",
+            "--format",
+            "json",
+            "--github-output",
+            str(github_output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout)
+    assert len(report["version"]) == validator.MAX_REPORTED_VERSION_CHARACTERS
+    assert report["version"].endswith("…")
+    assert "version-mismatch" in {
+        finding["code"] for finding in report["findings"]
+    }
+    assert (
+        len(github_output.read_text().encode("utf-16-le"))
+        < validator.MAX_REPORT_JSON_UTF16_BYTES
+    )
+
+
 def test_workspace_mode_rejects_symlink_evidence(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

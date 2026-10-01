@@ -22,6 +22,7 @@ MAX_BYTES = 64 * 1024
 MAX_FINDINGS = 128
 MAX_REPORT_JSON_UTF16_BYTES = 512 * 1024
 REPORT_ENVELOPE_UTF16_RESERVE = 4 * 1024
+MAX_REPORTED_VERSION_CHARACTERS = 256
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
 FENCE_RE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<rest>[^\r\n]*)$")
 SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
@@ -1564,6 +1565,12 @@ def _without_terminal_punctuation(value: str) -> str:
     return candidate
 
 
+def _bounded_reported_version(value: str) -> str:
+    if len(value) <= MAX_REPORTED_VERSION_CHARACTERS:
+        return value
+    return value[: MAX_REPORTED_VERSION_CHARACTERS - 1] + "…"
+
+
 def _contains_placeholder_value(value: str) -> bool:
     for line in _markdown_lines(value):
         candidate = line.strip()
@@ -2173,7 +2180,7 @@ def validate_text(
             )
             continue
         if field == "Contract version":
-            version = body
+            version = _bounded_reported_version(body)
             if body != expected_version:
                 findings.append(
                     Finding(
