@@ -1741,6 +1741,24 @@ def test_pull_request_url_is_valid_commit_reference() -> None:
 
 
 @pytest.mark.parametrize(
+    ("kind", "fixture", "original"),
+    [
+        ("pull-request", "valid-pull-request.md", "Closes #194"),
+        ("commit", "valid-commit.md", "Issue: #194"),
+    ],
+)
+def test_adjacent_hashes_do_not_satisfy_bare_reference(
+    kind: str, fixture: str, original: str
+) -> None:
+    text = (FIXTURES / fixture).read_text().replace(original, "##194")
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert not result.valid
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
     ("kind", "fixture", "field", "original"),
     [
         ("pull-request", "valid-pull-request.md", "Related issue", "Closes #194"),
@@ -2273,6 +2291,40 @@ def test_ordered_list_satisfies_changes_field() -> None:
     result = validator.validate_text(text, kind="pull-request")
 
     assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    ("marker", "indent"),
+    [("-", "  "), ("-  ", "  "), ("1.", "   "), ("1.  ", "   ")],
+)
+def test_empty_list_marker_with_continuation_satisfies_changes_field(
+    marker: str, indent: str
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + f"{marker}\n{indent}Define the contract.\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    ("marker", "indent"), [("-", "      "), ("1.", "       ")]
+)
+def test_empty_list_marker_with_indented_code_does_not_satisfy_changes_field(
+    marker: str, indent: str
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + f"{marker}\n{indent}Define the contract.\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "bullet-required" in {item.code for item in result.findings}
 
 
 @pytest.mark.parametrize("marker", ["0.", "2.", "10."])

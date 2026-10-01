@@ -50,7 +50,7 @@ CHANGE_URL_PATTERN = (
 )
 CHANGE_URL_RE = re.compile(CHANGE_URL_PATTERN, re.IGNORECASE)
 BARE_REFERENCE_RE = re.compile(
-    r"(?<![A-Za-z0-9_./?=&%+-])#[1-9][0-9]*\b"
+    r"(?<![A-Za-z0-9_./?=&%+#-])#[1-9][0-9]*\b"
 )
 PR_LABEL_RE = re.compile(r"(?i)\b(?:pr|pull request)\s*:?[ \t]*$")
 INLINE_LINK_RE = re.compile(
@@ -58,12 +58,13 @@ INLINE_LINK_RE = re.compile(
     r"(?P<destination><[^>\r\n]*>|[^\s)\r\n]+)"
 )
 CHANGE_REFERENCE_RE = re.compile(
-    r"(?<![A-Za-z0-9_./?=&%+-])#[1-9][0-9]*\b|" + CHANGE_URL_PATTERN,
+    r"(?<![A-Za-z0-9_./?=&%+#-])#[1-9][0-9]*\b|" + CHANGE_URL_PATTERN,
     re.IGNORECASE,
 )
 LIST_MARKER = r"(?:[-*+]|[0-9]{1,9}[.)])"
 STRUCTURAL_LIST_ITEM_RE = re.compile(
-    rf"^(?P<indent>[ \t]*)(?P<marker>{LIST_MARKER})(?P<spacing>[ \t]+)(?P<value>.*)$"
+    rf"^(?P<indent>[ \t]*)(?P<marker>{LIST_MARKER})"
+    r"(?P<spacing>[ \t]+|(?=$))(?P<value>.*)$"
 )
 BLOCKQUOTE_RE = re.compile(r"^ {0,3}>")
 BLOCKQUOTE_CONTENT_RE = re.compile(r"^ {0,3}>[ \t]?(?P<value>.*)$")
@@ -287,7 +288,9 @@ def _list_marker_padding_columns(
 def _list_content_indent(line: str, list_match: re.Match[str]) -> int:
     marker_end = _column_width(line[: list_match.end("marker")])
     padding = _list_marker_padding_columns(line, list_match)
-    return marker_end + (padding if padding <= 4 else 1)
+    if not list_match.group("value").strip():
+        padding = 1
+    return marker_end + (padding if 1 <= padding <= 4 else 1)
 
 
 def _list_marker_value(line: str, list_match: re.Match[str]) -> str:
@@ -647,7 +650,7 @@ def _structural_lines(
                 and not _list_marker_starts_indented_code(line, list_match)
                 and not _line_interrupts_paragraph(marker_value)
             )
-            previous_line_blank = False
+            previous_line_blank = not marker_value.strip()
             paragraph_open = False
             continue
 
@@ -1536,7 +1539,7 @@ def _mask_top_level_indented_code(value: str) -> str:
                     output.append(line)
             else:
                 output.append(line)
-            previous_line_blank = False
+            previous_line_blank = not marker_value.strip()
             paragraph_open = False
             continue
 
