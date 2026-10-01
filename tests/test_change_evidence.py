@@ -133,6 +133,30 @@ def test_formatted_generic_commit_title_is_rejected(title: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "title",
+    ["Fix!", "Update?", "WIP:", "수정!", "작업……"],
+)
+def test_punctuated_generic_commit_title_is_rejected(title: str) -> None:
+    text = (FIXTURES / "valid-commit.md").read_text()
+    text = title + text[text.index("\n") :]
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert not result.valid
+    assert "commit-title-generic" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize("title", ["Fix parser!", "Update API?", "WIP: document result"])
+def test_result_oriented_punctuated_commit_title_is_allowed(title: str) -> None:
+    text = (FIXTURES / "valid-commit.md").read_text()
+    text = title + text[text.index("\n") :]
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("Validation", "Unknown: the test owner has not replied."),
@@ -584,6 +608,116 @@ def test_zero_to_three_space_indent_remains_a_top_level_list_item(
     start = text.index("### Changes\n") + len("### Changes\n")
     end = text.find("\n### ", start)
     text = text[:start] + f"{indent}- Rendered change.\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize("spacing", ["     ", "\t\t", " \t  "])
+@pytest.mark.parametrize(
+    ("kind", "fixture", "field", "marker", "code"),
+    [
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Changes",
+            "-",
+            "bullet-required",
+        ),
+        (
+            "issue",
+            "valid-issue.md",
+            "Acceptance criteria",
+            "-",
+            "checklist-required",
+        ),
+    ],
+)
+def test_code_indented_marker_content_does_not_satisfy_list_fields(
+    spacing: str,
+    kind: str,
+    fixture: str,
+    field: str,
+    marker: str,
+    code: str,
+) -> None:
+    text = (FIXTURES / fixture).read_text()
+    start = text.index(f"### {field}\n") + len(f"### {field}\n")
+    end = text.find("\n### ", start)
+    value = "[ ] hidden criterion" if kind == "issue" else "hidden change"
+    text = text[:start] + f"{marker}{spacing}{value}\n" + text[end:]
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert not result.valid
+    assert code in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize("marker", ["-", "1."])
+def test_code_indented_marker_reference_is_not_rendered(marker: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Related issue\n") + len("### Related issue\n")
+    text = text[:start] + f"{marker}     Closes #194\n"
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+def test_list_item_prose_after_code_indented_first_block_is_rendered() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + "-     hidden code\n  Rendered change.\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize("separator", ["\r", "\r\n"])
+def test_line_ending_after_code_first_list_item_is_preserved(
+    separator: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = (
+        text[:start]
+        + f"-     hidden code{separator}Rendered prose.\n"
+        + text[end:]
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "bullet-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize("separator", ["\r", "\r\n"])
+def test_line_ending_keeps_prose_inside_code_first_list_item(
+    separator: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = (
+        text[:start]
+        + f"-     hidden code{separator}  Rendered change.\n"
+        + text[end:]
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+def test_top_level_reference_after_code_first_list_item_is_rendered() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Related issue\n") + len("### Related issue\n")
+    text = text[:start] + "-     hidden code\nCloses #194\n"
 
     result = validator.validate_text(text, kind="pull-request")
 
@@ -1228,6 +1362,170 @@ def test_rendered_colon_prose_is_not_a_link_definition(value: str) -> None:
     result = validator.validate_text(text, kind="pull-request")
 
     assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Concrete evidence.\n[note]: /target",
+        "Concrete evidence.\n[first]: /one\n[second]: /two",
+        "Concrete evidence.\n    continued prose.\n[note]: /target",
+        "Concrete evidence.\n    # literal heading\n[note]: /target",
+        "- Concrete evidence.\n  [note]: /target",
+        "- Concrete evidence.\n[note]: /target",
+        "> Concrete evidence.\n> [note]: /target",
+        "> Concrete evidence.\n[note]: /target",
+        "> Concrete evidence.\nlazy continuation\n> [note]: /target",
+        "- > Concrete evidence.\n[note]: /target",
+        "- > Concrete evidence.\n  [note]: /target",
+    ],
+)
+def test_link_definition_syntax_does_not_interrupt_an_open_paragraph(
+    value: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.", value
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize("line_ending", ["\r\n", "\r"])
+@pytest.mark.parametrize("prefix", ["- Concrete evidence.", "> Concrete evidence."])
+def test_lazy_container_paragraph_preserves_link_syntax_across_line_endings(
+    line_ending: str, prefix: str
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        f"{prefix}{line_ending}[note]: /target",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[incomplete]:\n> [hidden]: /target",
+        "[incomplete]:\n- [hidden]: /target",
+        "- >     hidden code\n[hidden]: /target",
+        "- >     hidden code\n  [hidden]: /target",
+        "- > Concrete evidence.\n> [hidden]: /target",
+        "1. > Concrete evidence.\n> [hidden]: /target",
+    ],
+)
+def test_link_definition_starts_after_a_distinct_closed_container(
+    value: str,
+) -> None:
+    assert validator._link_definition_line_ranges(value) == [(2, 2)]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1. Concrete evidence.\n2. [hidden]: /target",
+        "- Concrete evidence.\n2. [hidden]: /target",
+        "> 1. Concrete evidence.\n> 2. [hidden]: /target",
+    ],
+)
+def test_ordered_sibling_starts_a_new_definition_container(value: str) -> None:
+    assert validator._link_definition_line_ranges(value) == [(2, 2)]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1. [hidden\n2. label]: /url",
+        "> 1. [hidden\n> 2. label]: /url",
+        '1. [hidden]: /target "multi\n2. title"',
+    ],
+)
+def test_ordered_sibling_does_not_continue_a_link_definition(
+    value: str,
+) -> None:
+    assert validator._link_definition_line_ranges(value) == []
+
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.", value
+    )
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '> [hidden]: /target\n  "title"',
+        '- [hidden]: /target\n"title"',
+        '- > [hidden]: /target\n  "title"',
+    ],
+)
+def test_multiline_link_title_allows_lazy_container_continuation(
+    value: str,
+) -> None:
+    assert validator._link_definition_line_ranges(value) == [(1, 2)]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '[hidden]: /target "title"\n"rendered"',
+        '> [hidden]: /target "title"\n> "rendered"',
+        '- [hidden]: /target "title"\n  "rendered"',
+    ],
+)
+def test_inline_link_title_does_not_consume_following_quote_line(
+    value: str,
+) -> None:
+    assert validator._link_definition_line_ranges(value) == [(1, 1)]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "> [hidden]:\n/target",
+        "- [hidden]:\n/target",
+        "- > [hidden]:\n  /target",
+        "> - [hidden]:\n/target",
+    ],
+)
+def test_multiline_link_destination_allows_lazy_container_continuation(
+    value: str,
+) -> None:
+    assert validator._link_definition_line_ranges(value) == [(1, 2)]
+
+
+@pytest.mark.parametrize("continuation", ['> "title"', '- "title"', '# title'])
+def test_multiline_link_candidate_stops_before_a_new_block(
+    continuation: str,
+) -> None:
+    value = f"[hidden]:\n{continuation}"
+
+    assert validator._link_definition_line_ranges(value) == []
+
+
+def test_four_space_nested_quote_list_can_start_a_definition() -> None:
+    value = "> Concrete evidence.\n    > - [hidden]: /target"
+
+    assert validator._link_definition_line_ranges(value) == [(2, 2)]
+
+
+def test_four_space_list_marker_remains_lazy_quote_paragraph_text() -> None:
+    value = "> Concrete evidence.\n    - [hidden]: /target"
+
+    assert validator._link_definition_line_ranges(value) == []
+
+
+@pytest.mark.parametrize("tail", ['> title"', '- title"', '# title"'])
+def test_multiline_link_title_stops_before_a_new_block(tail: str) -> None:
+    value = f'[hidden]: /target\n"multi\n{tail}'
+
+    assert validator._link_definition_line_ranges(value) == [(1, 1)]
 
 
 @pytest.mark.parametrize(

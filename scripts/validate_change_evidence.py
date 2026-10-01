@@ -247,7 +247,9 @@ class ValidationResult:
 
 
 def _masked_line(line: str) -> str:
-    return "".join("\n" if character == "\n" else " " for character in line)
+    return "".join(
+        character if character in "\r\n" else " " for character in line
+    )
 
 
 def _indent_columns(line: str) -> int:
@@ -270,6 +272,40 @@ def _column_width(value: str) -> int:
         else:
             columns += 1
     return columns
+
+
+def _list_marker_padding_columns(
+    line: str, list_match: re.Match[str]
+) -> int:
+    marker_end = _column_width(line[: list_match.end("marker")])
+    value_start = _column_width(line[: list_match.start("value")])
+    return value_start - marker_end
+
+
+def _list_content_indent(line: str, list_match: re.Match[str]) -> int:
+    marker_end = _column_width(line[: list_match.end("marker")])
+    padding = _list_marker_padding_columns(line, list_match)
+    return marker_end + (padding if padding <= 4 else 1)
+
+
+def _list_marker_value(line: str, list_match: re.Match[str]) -> str:
+    padding = _list_marker_padding_columns(line, list_match)
+    if padding <= 4:
+        return list_match.group("value")
+    return " " * (padding - 1) + list_match.group("value")
+
+
+def _list_marker_starts_indented_code(
+    line: str, list_match: re.Match[str]
+) -> bool:
+    marker_value = _list_marker_value(line, list_match)
+    return bool(marker_value.strip()) and _indent_columns(marker_value) >= 4
+
+
+def _mask_list_marker_code(line: str, list_match: re.Match[str]) -> str:
+    marker_end = list_match.end("marker")
+    padding_end = marker_end + 1
+    return line[:marker_end] + " " + _masked_line(line[padding_end:])
 
 
 def _markdown_lines(value: str, *, keepends: bool = False) -> list[str]:
@@ -304,8 +340,13 @@ def _list_can_interrupt_paragraph(list_match: re.Match[str]) -> bool:
     return True
 
 
-def _link_definition_status(value: str) -> int:
+def _parse_link_definition_status(
+    value: str, title_present: list[bool] | None = None
+) -> int:
     """Classify a complete or extendable CommonMark link definition."""
+
+    if title_present is not None:
+        title_present[:] = [False]
 
     index = 0
     while index < len(value) and value[index] == " " and index < 3:
@@ -440,13 +481,23 @@ def _link_definition_status(value: str) -> int:
             return LINK_DEFINITION_INVALID
         if character == closer:
             index += 1
-            return (
-                LINK_DEFINITION_VALID
-                if not value[index:].strip(" \t")
-                else LINK_DEFINITION_INVALID
-            )
+            if value[index:].strip(" \t"):
+                return LINK_DEFINITION_INVALID
+            if title_present is not None:
+                title_present[0] = True
+            return LINK_DEFINITION_VALID
         index += 1
     return LINK_DEFINITION_INCOMPLETE
+
+
+def _link_definition_status(value: str) -> int:
+    return _parse_link_definition_status(value)
+
+
+def _link_definition_has_inline_title(value: str) -> bool:
+    title_present: list[bool] = []
+    status = _parse_link_definition_status(value, title_present)
+    return status == LINK_DEFINITION_VALID and title_present[0]
 
 
 def _is_link_definition(value: str) -> bool:
@@ -457,14 +508,20 @@ def _line_opens_paragraph(line: str) -> bool:
     return not _line_interrupts_paragraph(line)
 
 
-def _line_interrupts_paragraph(line: str) -> bool:
+def _line_interrupts_open_paragraph(line: str) -> bool:
+    if _indent_columns(line) >= 4:
+        return False
     candidate = line.strip()
     return bool(
         ATX_HEADING_RE.fullmatch(candidate)
         or THEMATIC_BREAK_RE.fullmatch(candidate)
         or FENCE_RE.fullmatch(line)
-        or _is_link_definition(line)
+        or BLOCKQUOTE_RE.match(line)
     )
+
+
+def _line_interrupts_paragraph(line: str) -> bool:
+    return _line_interrupts_open_paragraph(line) or _is_link_definition(line)
 
 
 def _structural_lines(
@@ -474,6 +531,7 @@ def _structural_lines(
 
     classified: list[tuple[str, bool, re.Match[str] | None]] = []
     list_content_indents: list[int] = []
+    list_paragraphs: list[bool] = []
     previous_line_blank = True
     blockquote_paragraph = False
     paragraph_open = False
@@ -483,6 +541,8 @@ def _structural_lines(
             previous_line_blank = True
             blockquote_paragraph = False
             paragraph_open = False
+            if list_paragraphs:
+                list_paragraphs[-1] = False
             continue
 
         if BLOCKQUOTE_RE.match(line):
@@ -496,6 +556,8 @@ def _structural_lines(
                 )
             )
             paragraph_open = False
+            if list_paragraphs:
+                list_paragraphs[-1] = False
             continue
 
         indent = _indent_columns(line)
@@ -529,15 +591,38 @@ def _structural_lines(
             blockquote_paragraph = False
             while list_content_indents and indent < list_content_indents[-1]:
                 list_content_indents.pop()
+                list_paragraphs.pop()
             top_level = not list_content_indents
             classified.append((line, top_level, list_match))
-            content_indent = _column_width(line[: list_match.start("value")])
+            content_indent = _list_content_indent(line, list_match)
             list_content_indents.append(content_indent)
+            marker_value = _list_marker_value(line, list_match)
+            list_paragraphs.append(
+                bool(marker_value.strip())
+                and not _list_marker_starts_indented_code(line, list_match)
+                and not _line_interrupts_paragraph(marker_value)
+            )
             previous_line_blank = False
             paragraph_open = False
             continue
 
-        paragraph_interrupt = _line_interrupts_paragraph(line)
+        while (
+            list_content_indents
+            and indent < list_content_indents[-1]
+            and not list_paragraphs[-1]
+        ):
+            list_content_indents.pop()
+            list_paragraphs.pop()
+        relative_line = (
+            _drop_indent_columns(line, list_content_indents[-1])
+            if list_content_indents and indent >= list_content_indents[-1]
+            else line
+        )
+        paragraph_interrupt = (
+            _line_interrupts_open_paragraph(relative_line)
+            if list_paragraphs and list_paragraphs[-1]
+            else _line_interrupts_paragraph(relative_line)
+        )
         if blockquote_paragraph and not paragraph_interrupt:
             classified.append((line, False, None))
             previous_line_blank = False
@@ -549,14 +634,25 @@ def _structural_lines(
         if previous_line_blank or paragraph_interrupt:
             while list_content_indents and indent < list_content_indents[-1]:
                 list_content_indents.pop()
+                list_paragraphs.pop()
         classified.append((line, not list_content_indents, None))
         previous_line_blank = False
-        paragraph_open = (
-            not list_content_indents
-            and indent < 4
-            and not paragraph_interrupt
-            and _line_opens_paragraph(line)
-        )
+        if list_content_indents:
+            list_paragraphs[-1] = bool(
+                relative_line.strip()
+                and not paragraph_interrupt
+                and (
+                    list_paragraphs[-1]
+                    or _indent_columns(relative_line) < 4
+                )
+            )
+            paragraph_open = False
+        else:
+            paragraph_open = (
+                indent < 4
+                and not paragraph_interrupt
+                and _line_opens_paragraph(line)
+            )
     return classified
 
 
@@ -609,8 +705,8 @@ def _container_line_info(line: str) -> tuple[str, bool, int, int]:
         list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(candidate)
         if not list_match:
             break
-        list_indent += _column_width(candidate[: list_match.start("value")])
-        candidate = list_match.group("value")
+        list_indent += _list_content_indent(candidate, list_match)
+        candidate = _list_marker_value(candidate, list_match)
     return (
         candidate,
         bool(blockquote_depth or list_indent),
@@ -689,6 +785,102 @@ def _line_in_container(
             return None
         candidate = _drop_indent_columns(candidate, list_indent)
     return candidate
+
+
+def _ordered_container_line_info(
+    line: str,
+    structural_list_match: re.Match[str] | None,
+    *,
+    blockquote_list_rendered: bool,
+    allow_unclassified_list: bool = False,
+) -> tuple[str, tuple[tuple[str, int], ...], bool]:
+    candidate = line
+    prefixes: list[tuple[str, int]] = []
+    has_list_marker = False
+    while True:
+        blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+        if blockquote:
+            prefixes.append(("blockquote", 0))
+            candidate = blockquote.group("value")
+            continue
+
+        list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(candidate)
+        if not list_match:
+            break
+        if (
+            not prefixes
+            and structural_list_match is None
+            and not allow_unclassified_list
+        ):
+            break
+        if (
+            prefixes
+            and not has_list_marker
+            and not blockquote_list_rendered
+        ):
+            break
+        prefixes.append(("list", _list_content_indent(candidate, list_match)))
+        candidate = _list_marker_value(candidate, list_match)
+        has_list_marker = True
+    return candidate, tuple(prefixes), has_list_marker
+
+
+def _line_in_ordered_container(
+    line: str, prefixes: Sequence[tuple[str, int]]
+) -> str | None:
+    candidate = line
+    for kind, indent in prefixes:
+        if kind == "blockquote":
+            blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+            if not blockquote:
+                return None
+            candidate = blockquote.group("value")
+            continue
+        if kind != "list":
+            return None
+        if not candidate.strip():
+            return ""
+        if _indent_columns(candidate) < indent:
+            return None
+        candidate = _drop_indent_columns(candidate, indent)
+    return candidate
+
+
+def _line_starts_paragraph_interrupt(line: str) -> bool:
+    list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(line)
+    return bool(
+        _line_interrupts_open_paragraph(line)
+        or (
+            list_match
+            and _indent_columns(line) < 4
+            and _list_can_interrupt_paragraph(list_match)
+        )
+    )
+
+
+def _line_in_open_paragraph_container(
+    line: str, prefixes: Sequence[tuple[str, int]]
+) -> str | None:
+    candidate = line
+    if not prefixes and _line_starts_paragraph_interrupt(candidate):
+        return None
+    for kind, indent in prefixes:
+        if kind == "blockquote":
+            blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+            if blockquote:
+                candidate = blockquote.group("value")
+            elif _line_starts_paragraph_interrupt(candidate):
+                return None
+            continue
+        if kind != "list":
+            return None
+        if not candidate.strip():
+            return ""
+        if _indent_columns(candidate) >= indent:
+            candidate = _drop_indent_columns(candidate, indent)
+        elif _line_starts_paragraph_interrupt(candidate):
+            return None
+    return None if _line_starts_paragraph_interrupt(candidate) else candidate
 
 
 def _scan_markdown(
@@ -821,12 +1013,24 @@ def _multiline_link_title_end(
     *,
     blockquote_depth: int,
     list_indent: int,
+    container_prefixes: Sequence[tuple[str, int]] | None = None,
+    starts_list_items: Sequence[bool] | None = None,
 ) -> int | None:
-    title = _line_in_container(
-        lines[start],
-        blockquote_depth=blockquote_depth,
-        list_indent=list_indent,
+    if starts_list_items is not None and starts_list_items[start]:
+        return None
+    title = (
+        _line_in_ordered_container(lines[start], container_prefixes)
+        if container_prefixes is not None
+        else _line_in_container(
+            lines[start],
+            blockquote_depth=blockquote_depth,
+            list_indent=list_indent,
+        )
     )
+    if title is None and container_prefixes is not None:
+        title = _line_in_open_paragraph_container(
+            lines[start], container_prefixes
+        )
     if not title:
         return None
     title = title.lstrip(" \t")
@@ -857,12 +1061,24 @@ def _multiline_link_title_end(
         cursor += 1
         if cursor >= len(lines):
             return None
-        title = _line_in_container(
-            lines[cursor],
-            blockquote_depth=blockquote_depth,
-            list_indent=list_indent,
+        if starts_list_items is not None and starts_list_items[cursor]:
+            return None
+        title = (
+            _line_in_ordered_container(lines[cursor], container_prefixes)
+            if container_prefixes is not None
+            else _line_in_container(
+                lines[cursor],
+                blockquote_depth=blockquote_depth,
+                list_indent=list_indent,
+            )
         )
+        if title is None and container_prefixes is not None:
+            title = _line_in_open_paragraph_container(
+                lines[cursor], container_prefixes
+            )
         if title is None or not title.strip():
+            return None
+        if _line_starts_paragraph_interrupt(title):
             return None
 
 
@@ -870,65 +1086,183 @@ def _link_definition_line_ranges(value: str) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     start: int | None = None
     candidate = ""
-    blockquote_depth = 0
-    list_indent = 0
+    candidate_prefixes: tuple[tuple[str, int], ...] = ()
     lines = _markdown_lines(value)
     classified = _structural_lines(value)
     blockquote_list_rendering = _blockquote_list_rendering(value)
+    ordered_lines = [
+        _ordered_container_line_info(
+            line,
+            classified[index][2],
+            blockquote_list_rendered=blockquote_list_rendering[index],
+        )
+        for index, line in enumerate(lines)
+    ]
+    starts_list_items = tuple(item[2] for item in ordered_lines)
     skip_through = -1
+    paragraph_open = False
+    active_prefixes: tuple[tuple[str, int], ...] = ()
     for index, line in enumerate(lines):
         if index <= skip_through:
             continue
-        structural_list_match = classified[index][2]
-        relative_line, _nested, fresh_blockquote_depth, fresh_list_indent = (
-            _effective_container_line_info(
-                line,
-                structural_list_match,
-                blockquote_list_rendered=blockquote_list_rendering[index],
+        relative_line, current_prefixes, starts_list_item = ordered_lines[index]
+        if paragraph_open and not starts_list_item:
+            lazy_continuation = _line_in_open_paragraph_container(
+                line, active_prefixes
             )
-        )
+            if lazy_continuation is not None:
+                four_space_nested_list = False
+                if active_prefixes and _indent_columns(lazy_continuation) >= 4:
+                    nested_candidate = _drop_indent_columns(
+                        lazy_continuation, 4
+                    )
+                    (
+                        nested_relative,
+                        _nested_prefixes,
+                        nested_list_item,
+                    ) = _ordered_container_line_info(
+                        nested_candidate,
+                        None,
+                        blockquote_list_rendered=True,
+                        allow_unclassified_list=True,
+                    )
+                    if (
+                        nested_list_item
+                        and BLOCKQUOTE_RE.match(nested_candidate)
+                    ):
+                        relative_line = nested_relative
+                        current_prefixes = active_prefixes
+                        starts_list_item = True
+                        four_space_nested_list = True
+                if not four_space_nested_list:
+                    relative_line = lazy_continuation
+                    current_prefixes = active_prefixes
+                    starts_list_item = False
+            elif active_prefixes:
+                strict_continuation = _line_in_ordered_container(
+                    line, active_prefixes
+                )
+                if strict_continuation is not None:
+                    (
+                        nested_relative,
+                        nested_prefixes,
+                        nested_list_item,
+                    ) = _ordered_container_line_info(
+                        strict_continuation,
+                        None,
+                        blockquote_list_rendered=True,
+                        allow_unclassified_list=True,
+                    )
+                    if nested_prefixes:
+                        relative_line = nested_relative
+                        current_prefixes = active_prefixes + nested_prefixes
+                        starts_list_item = nested_list_item
+                elif _indent_columns(line) >= 4:
+                    nested_candidate = _drop_indent_columns(line, 4)
+                    (
+                        nested_relative,
+                        _nested_prefixes,
+                        nested_list_item,
+                    ) = _ordered_container_line_info(
+                        nested_candidate,
+                        None,
+                        blockquote_list_rendered=True,
+                        allow_unclassified_list=True,
+                    )
+                    if (
+                        nested_list_item
+                        and BLOCKQUOTE_RE.match(nested_candidate)
+                    ):
+                        relative_line = nested_relative
+                        current_prefixes = active_prefixes
+                        starts_list_item = True
+        container_changed = current_prefixes != active_prefixes
         opener = bool(re.match(r"^ {0,3}\[", relative_line))
         if start is None:
-            if not opener:
+            if starts_list_item or container_changed:
+                paragraph_open = False
+            active_prefixes = current_prefixes
+            if not relative_line.strip():
+                paragraph_open = False
+                continue
+            if not opener or paragraph_open:
+                if not opener:
+                    paragraph_open = bool(
+                        paragraph_open
+                        and not _line_interrupts_open_paragraph(relative_line)
+                        or not paragraph_open
+                        and _indent_columns(relative_line) < 4
+                        and not _line_interrupts_paragraph(relative_line)
+                    )
                 continue
             start = index
             candidate = relative_line
-            blockquote_depth = fresh_blockquote_depth
-            list_indent = fresh_list_indent
+            candidate_prefixes = current_prefixes
         else:
-            continuation = _line_in_container(
-                line,
-                blockquote_depth=blockquote_depth,
-                list_indent=list_indent,
-            )
+            continuation = None
+            if not starts_list_item:
+                continuation = _line_in_ordered_container(
+                    line, candidate_prefixes
+                )
+            if (
+                continuation is not None
+                and _line_starts_paragraph_interrupt(continuation)
+            ):
+                continuation = None
+            if continuation is None and not starts_list_item:
+                continuation = _line_in_open_paragraph_container(
+                    line, candidate_prefixes
+                )
             if not line.strip() or continuation is None:
                 start = None
                 candidate = ""
-                blockquote_depth = 0
-                list_indent = 0
+                candidate_prefixes = ()
+                if not relative_line.strip():
+                    paragraph_open = False
+                    active_prefixes = current_prefixes
+                    continue
+                paragraph_open = False
+                active_prefixes = current_prefixes
                 if not opener:
+                    paragraph_open = bool(
+                        _indent_columns(relative_line) < 4
+                        and not _line_interrupts_paragraph(relative_line)
+                    )
                     continue
                 start = index
                 candidate = relative_line
-                blockquote_depth = fresh_blockquote_depth
-                list_indent = fresh_list_indent
+                candidate_prefixes = current_prefixes
             elif opener:
-                start = index
-                candidate = relative_line
-                blockquote_depth = fresh_blockquote_depth
-                list_indent = fresh_list_indent
+                if current_prefixes != candidate_prefixes or starts_list_item:
+                    start = index
+                    candidate = relative_line
+                    candidate_prefixes = current_prefixes
+                    paragraph_open = False
+                else:
+                    start = None
+                    candidate = ""
+                    candidate_prefixes = ()
+                    paragraph_open = True
+                active_prefixes = current_prefixes
+                if start is None:
+                    continue
             else:
                 candidate += "\n" + continuation
 
         status = _link_definition_status(candidate)
         if status == LINK_DEFINITION_VALID:
             end = index
-            if index + 1 < len(lines):
+            if (
+                index + 1 < len(lines)
+                and not _link_definition_has_inline_title(candidate)
+            ):
                 title_end = _multiline_link_title_end(
                     lines,
                     index + 1,
-                    blockquote_depth=blockquote_depth,
-                    list_indent=list_indent,
+                    blockquote_depth=0,
+                    list_indent=0,
+                    container_prefixes=candidate_prefixes,
+                    starts_list_items=starts_list_items,
                 )
                 if title_end is not None:
                     end = title_end
@@ -936,13 +1270,15 @@ def _link_definition_line_ranges(value: str) -> list[tuple[int, int]]:
             skip_through = end
             start = None
             candidate = ""
-            blockquote_depth = 0
-            list_indent = 0
+            candidate_prefixes = ()
+            paragraph_open = False
+            active_prefixes = current_prefixes
         elif status == LINK_DEFINITION_INVALID or len(candidate) > 4096:
             start = None
             candidate = ""
-            blockquote_depth = 0
-            list_indent = 0
+            candidate_prefixes = ()
+            paragraph_open = True
+            active_prefixes = current_prefixes
     return ranges
 
 
@@ -1076,14 +1412,19 @@ def _mask_top_level_indented_code(value: str) -> str:
         ):
             list_match = None
         if list_match:
-            in_indented_code = False
             while list_content_indents and indent < list_content_indents[-1]:
                 list_content_indents.pop()
             list_content_indents.append(
-                _column_width(line_without_ending[: list_match.start("value")])
+                _list_content_indent(line_without_ending, list_match)
             )
-            fence_match = FENCE_RE.match(list_match.group("value"))
-            if fence_match:
+            marker_value = _list_marker_value(line_without_ending, list_match)
+            in_indented_code = _list_marker_starts_indented_code(
+                line_without_ending, list_match
+            )
+            fence_match = None if in_indented_code else FENCE_RE.match(marker_value)
+            if in_indented_code:
+                output.append(_mask_list_marker_code(line, list_match))
+            elif fence_match:
                 run = fence_match.group("run")
                 rest = fence_match.group("rest")
                 if run[0] != "`" or "`" not in rest:
@@ -1170,6 +1511,13 @@ def _is_placeholder_value(value: str) -> bool:
         if PLACEHOLDER_VALUE_RE.fullmatch(candidate):
             return True
     return False
+
+
+def _without_terminal_punctuation(value: str) -> str:
+    candidate = value.rstrip()
+    while candidate and unicodedata.category(candidate[-1]).startswith("P"):
+        candidate = candidate[:-1].rstrip()
+    return candidate
 
 
 def _contains_placeholder_value(value: str) -> bool:
@@ -1319,7 +1667,7 @@ def _visible_evidence_text(value: str) -> str:
 def _top_level_candidate(
     line: str, list_match: re.Match[str] | None
 ) -> str:
-    return list_match.group("value") if list_match else line.strip()
+    return _list_marker_value(line, list_match) if list_match else line.strip()
 
 
 def _top_level_reference_blocks(value: str) -> list[str]:
@@ -1414,7 +1762,7 @@ def _top_level_list_items(value: str) -> list[tuple[str, tuple[str, ...]]]:
         if not top_level or list_match is None:
             continue
 
-        content_indent = _column_width(line[: list_match.start("value")])
+        content_indent = _list_content_indent(line, list_match)
         continuations: list[str] = []
         for continuation, continuation_top_level, continuation_match in classified[
             index + 1 :
@@ -1440,7 +1788,7 @@ def _top_level_list_items(value: str) -> list[tuple[str, tuple[str, ...]]]:
                 break
             continuations.append(relative)
 
-        items.append((list_match.group("value"), tuple(continuations)))
+        items.append((_list_marker_value(line, list_match), tuple(continuations)))
     return items
 
 
@@ -1680,7 +2028,7 @@ def validate_text(
             findings.append(
                 Finding("commit-title-too-long", "Commit title must be 72 characters or fewer.", 1)
             )
-        elif title.casefold().rstrip(".。") in GENERIC_COMMIT_TITLES:
+        elif _without_terminal_punctuation(title).casefold() in GENERIC_COMMIT_TITLES:
             findings.append(
                 Finding(
                     "commit-title-generic",
