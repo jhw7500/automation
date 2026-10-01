@@ -2,6 +2,11 @@
 
 This directory contains GitHub Actions workflows for automated code review and quality assurance using Claude Code, Gemini, and OpenCode.
 
+Repository change records use the model-independent
+[`Change Evidence Contract v1`](../docs/change-evidence-contract-v1.md). The bundled
+Issue form and pull request template share the same headings as the dependency-free
+validator and reusable composite action.
+
 ## Workflows
 
 ### Claude Code Workflows

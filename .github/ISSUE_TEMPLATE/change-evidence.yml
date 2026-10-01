@@ -1,0 +1,50 @@
+name: Change request
+description: Propose a change using Change Evidence Contract v1
+title: ""
+body:
+  - type: dropdown
+    id: contract-version
+    attributes:
+      label: Contract version
+      description: Select the contract version supported by this repository.
+      options:
+        - v1
+    validations:
+      required: true
+  - type: textarea
+    id: context-and-problem
+    attributes:
+      label: Context and problem
+      description: Describe the observed problem and the evidence that makes it actionable.
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: State the result this change must produce.
+    validations:
+      required: true
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: Non-goals
+      description: State excluded outcomes, or use “Unknown:”/“Not applicable:” followed by the reason.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: Provide one or more Markdown task-list items.
+      value: |
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: constraints-and-impact
+    attributes:
+      label: Constraints and impact
+      description: Record affected systems, compatibility, rollout, or a reasoned “Unknown:”/“Not applicable:” statement.
+    validations:
+      required: true
