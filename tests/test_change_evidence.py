@@ -530,6 +530,86 @@ def test_direct_task_list_continuation_satisfies_checklist_field() -> None:
     assert result.valid, result.findings
 
 
+@pytest.mark.parametrize("indent", ["    ", "\t", "  \t"])
+@pytest.mark.parametrize(
+    ("kind", "fixture", "field", "marker", "code"),
+    [
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Changes",
+            "- not a rendered list item",
+            "bullet-required",
+        ),
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Validation",
+            "1. not a rendered list item",
+            "bullet-required",
+        ),
+        (
+            "issue",
+            "valid-issue.md",
+            "Acceptance criteria",
+            "- [ ] not a rendered task item",
+            "checklist-required",
+        ),
+    ],
+)
+def test_over_indented_marker_after_prose_is_not_a_top_level_list_item(
+    indent: str,
+    kind: str,
+    fixture: str,
+    field: str,
+    marker: str,
+    code: str,
+) -> None:
+    text = (FIXTURES / fixture).read_text()
+    start = text.index(f"### {field}\n") + len(f"### {field}\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + f"Intro\n{indent}{marker}\n" + text[end:]
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert not result.valid
+    assert code in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize("indent", ["", " ", "  ", "   "])
+def test_zero_to_three_space_indent_remains_a_top_level_list_item(
+    indent: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + f"{indent}- Rendered change.\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize("indent", ["    ", "\t", "  \t"])
+def test_over_indented_marker_is_not_promoted_after_list_dedent(
+    indent: str,
+) -> None:
+    text = (FIXTURES / "valid-issue.md").read_text()
+    field = "Acceptance criteria"
+    start = text.index(f"### {field}\n") + len(f"### {field}\n")
+    end = text.find("\n### ", start)
+    text = (
+        text[:start]
+        + f"Intro\n   - Parent\n{indent}- [ ] not a task\n"
+        + text[end:]
+    )
+
+    result = validator.validate_text(text, kind="issue")
+
+    assert not result.valid
+    assert "checklist-required" in {item.code for item in result.findings}
+
+
 @pytest.mark.parametrize(
     "item",
     [

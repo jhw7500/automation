@@ -500,6 +500,15 @@ def _structural_lines(
 
         indent = _indent_columns(line)
         list_match = STRUCTURAL_LIST_ITEM_RE.fullmatch(line)
+        if list_match and indent >= 4:
+            remaining_containers = len(list_content_indents)
+            while (
+                remaining_containers
+                and indent < list_content_indents[remaining_containers - 1]
+            ):
+                remaining_containers -= 1
+            if not remaining_containers:
+                list_match = None
         if list_match:
             if blockquote_paragraph and not _list_can_interrupt_paragraph(
                 list_match
