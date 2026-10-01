@@ -79,6 +79,45 @@ def test_canonical_commit_template_title_is_rejected() -> None:
     assert "commit-title-placeholder" in {item.code for item in result.findings}
 
 
+def test_canonical_commit_template_survives_default_git_cleanup() -> None:
+    text = (ROOT / "examples/change-evidence/commit-message.md").read_text()
+    text = (
+        text.replace(
+            "<Describe the delivered result in 72 characters or fewer>",
+            "Preserve contract headings through Git cleanup",
+        )
+        .replace(
+            "<!-- Explain why the change was needed. -->",
+            "Git removes column-zero comment lines from edited commit messages.",
+        )
+        .replace(
+            "<!-- List the material changes as Markdown bullets. -->",
+            "- Keep the canonical headings after cleanup.",
+        )
+        .replace(
+            "<!-- List commands and observed results, or use “Not run: <reason>”. -->",
+            "- `git stripspace --strip-comments` preserved every heading.",
+        )
+        .replace(
+            "<!-- Use “Issue: #123”, “PR: #456”, or a full GitHub Issue/PR URL. -->",
+            "Issue: #194",
+        )
+    )
+
+    cleaned = subprocess.run(
+        ["git", "-c", "core.commentChar=#", "stripspace", "--strip-comments"],
+        cwd=ROOT,
+        input=text,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+    result = validator.validate_text(cleaned, kind="commit")
+
+    assert result.valid
+    assert result.findings == ()
+
+
 @pytest.mark.parametrize(
     "title",
     ["**Update**", "[Fix](https://example.invalid)", "`WIP`"],

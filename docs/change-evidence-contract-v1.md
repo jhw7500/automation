@@ -89,6 +89,9 @@ follow:
 
 `examples/change-evidence/commit-message.md` is the canonical authoring template. A
 repository MAY copy it and configure it with `git config commit.template <path>`.
+The single leading ASCII space on each field heading is intentional: Git's default
+edited-message cleanup strips column-zero `#` comment lines. Keep exactly that one space
+when copying the template; it remains a top-level Markdown heading for this contract.
 Its angle-bracket title and HTML comment bodies are instructions that MUST be replaced
 with visible evidence before validation.
 

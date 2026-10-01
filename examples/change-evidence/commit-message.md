@@ -1,16 +1,16 @@
 <Describe the delivered result in 72 characters or fewer>
 
-### Contract version
+ ### Contract version
 v1
 
-### Why
+ ### Why
 <!-- Explain why the change was needed. -->
 
-### Changes
+ ### Changes
 <!-- List the material changes as Markdown bullets. -->
 
-### Validation
+ ### Validation
 <!-- List commands and observed results, or use “Not run: <reason>”. -->
 
-### References
+ ### References
 <!-- Use “Issue: #123”, “PR: #456”, or a full GitHub Issue/PR URL. -->
