@@ -375,6 +375,9 @@ def test_empty_html_markup_does_not_satisfy_required_field() -> None:
         '![outer [TODO]](image.png "title )")',
         "![alt\ntext](image.png)",
         "![alt\r\ntext](image.png)",
+        '![alt](image.png "first\nsecond")',
+        '![alt](image.png "first\r\nsecond")',
+        '![alt](image.png "first\rsecond")',
     ],
 )
 def test_image_with_nested_alt_label_does_not_satisfy_required_field(
@@ -395,6 +398,38 @@ def test_blank_line_ends_multiline_image_label() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Adds deterministic validation for structured change evidence.",
         "![alt\n\ntext](image.png)",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+def test_blank_line_invalidates_multiline_image_title() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        '![alt](image.png "first\n\nsecond")',
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        '![alt](image.png "first\n- second")',
+        '![alt](image.png "first\n> second")',
+        '1. ![alt](image.png "first\n2. second")',
+    ],
+)
+def test_block_boundary_invalidates_multiline_image_title(
+    replacement: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        replacement,
     )
 
     result = validator.validate_text(text, kind="pull-request")
@@ -1922,6 +1957,36 @@ def test_invalid_bare_reference_boundaries_do_not_satisfy_reference(
 
 
 @pytest.mark.parametrize(
+    ("kind", "fixture", "original", "replacement"),
+    [
+        ("pull-request", "valid-pull-request.md", "Closes #194", "`#194`"),
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Closes #194",
+            "`https://github.com/jhw7500/automation/issues/194`",
+        ),
+        ("commit", "valid-commit.md", "Issue: #194", "`#194`"),
+        (
+            "commit",
+            "valid-commit.md",
+            "Issue: #194",
+            "`https://github.com/jhw7500/automation/pull/194`",
+        ),
+    ],
+)
+def test_inline_code_does_not_satisfy_reference(
+    kind: str, fixture: str, original: str, replacement: str
+) -> None:
+    text = (FIXTURES / fixture).read_text().replace(original, replacement)
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert not result.valid
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
     ("kind", "fixture", "field", "original"),
     [
         ("pull-request", "valid-pull-request.md", "Related issue", "Closes #194"),
@@ -2658,6 +2723,23 @@ def test_finding_line_numbers_follow_supported_line_endings(
     )
 
     assert finding.line == expected_line
+
+
+def test_validation_builds_line_index_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    original = validator._line_starts
+
+    def counted_line_starts(text: str) -> list[int]:
+        nonlocal calls
+        calls += 1
+        return original(text)
+
+    monkeypatch.setattr(validator, "_line_starts", counted_line_starts)
+
+    result = validator.validate_text("#\n" * 8000, kind="pull-request")
+
+    assert not result.valid
+    assert calls == 1
 
 
 @pytest.mark.parametrize(

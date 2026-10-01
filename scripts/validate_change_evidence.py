@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from dataclasses import asdict, dataclass
 import errno
 import html
@@ -1672,7 +1673,28 @@ def _inline_title_end(value: str, cursor: int) -> int | None:
     while cursor < len(value):
         character = value[cursor]
         if character in "\r\n":
-            return None
+            line_end = cursor + 1
+            if character == "\r" and line_end < len(value) and value[line_end] == "\n":
+                line_end += 1
+            next_line = line_end
+            while next_line < len(value) and value[next_line] in " \t":
+                next_line += 1
+            next_line_end = next_line
+            while next_line_end < len(value) and value[next_line_end] not in "\r\n":
+                next_line_end += 1
+            current_line_start = max(
+                value.rfind("\n", 0, cursor), value.rfind("\r", 0, cursor)
+            ) + 1
+            if (
+                next_line < len(value)
+                and value[next_line] in "\r\n"
+                or _inline_soft_break_interrupts(
+                    value[current_line_start:cursor], value[line_end:next_line_end]
+                )
+            ):
+                return None
+            cursor = line_end
+            continue
         if (
             character == "\\"
             and cursor + 1 < len(value)
@@ -2154,6 +2176,7 @@ def _top_level_reference_blocks(value: str) -> list[str]:
 
 def _has_issue_reference(value: str) -> bool:
     for candidate in _top_level_reference_blocks(value):
+        candidate = _mask_inline_code_spans(candidate)
         visible_candidate = _inline_visible_text(candidate)
         if ISSUE_URL_RE.search(visible_candidate):
             return True
@@ -2181,6 +2204,7 @@ def _has_issue_reference(value: str) -> bool:
 
 def _has_change_reference(value: str) -> bool:
     for candidate in _top_level_reference_blocks(value):
+        candidate = _mask_inline_code_spans(candidate)
         if CHANGE_REFERENCE_RE.search(_inline_visible_text(candidate)):
             return True
         for (
@@ -2282,8 +2306,12 @@ def _has_top_level_list_item(value: str) -> bool:
     )
 
 
-def _line_number(text: str, offset: int) -> int:
-    return len(MARKDOWN_LINE_ENDING_RE.findall(text, 0, offset)) + 1
+def _line_starts(text: str) -> list[int]:
+    return [0, *(match.end() for match in MARKDOWN_LINE_ENDING_RE.finditer(text))]
+
+
+def _line_number(line_starts: Sequence[int], offset: int) -> int:
+    return bisect_right(line_starts, offset)
 
 
 def _setext_heading_findings(value: str) -> list[Finding]:
@@ -2476,7 +2504,7 @@ def _parse_sections(
                 Finding(
                     "empty-heading",
                     "Markdown headings must include text.",
-                    _line_number(text, offset),
+                    line_index + 1,
                 )
             )
             offset += len(line)
@@ -2484,7 +2512,7 @@ def _parse_sections(
         if match:
             level = len(match.group(1))
             name = match.group(2)
-            line_number = _line_number(text, offset)
+            line_number = line_index + 1
             if nested or not top_level:
                 findings.append(
                     Finding(
@@ -2523,6 +2551,7 @@ def validate_text(
         raise ValueError(f"unsupported contract version: {expected_version}")
 
     findings = FindingAccumulator()
+    line_starts = _line_starts(text)
     if "\x00" in text:
         findings.append(Finding("nul-byte", "NUL bytes are not valid Markdown evidence."))
     if not text.strip():
@@ -2534,7 +2563,7 @@ def validate_text(
             Finding(
                 "unsupported-line-separator",
                 "Markdown evidence may use only LF, CR, or CRLF line endings.",
-                _line_number(text, unsupported_separator.start()),
+                _line_number(line_starts, unsupported_separator.start()),
             )
         )
 
@@ -2545,7 +2574,7 @@ def validate_text(
             Finding(
                 "ambiguous-comment-opener",
                 "HTML comment openers must begin a line; use fenced code for literal '<!--'.",
-                _line_number(text, offset),
+                _line_number(line_starts, offset),
             )
         )
     for offset in _raw_html_offsets(text):
@@ -2553,7 +2582,7 @@ def validate_text(
             Finding(
                 "raw-html",
                 "Raw HTML is not valid contract evidence; use Markdown or fenced code.",
-                _line_number(text, offset),
+                _line_number(line_starts, offset),
             )
         )
     for line_number in _link_definition_start_lines(visible_document):
