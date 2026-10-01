@@ -49,16 +49,17 @@ CHANGE_URL_PATTERN = (
     + CHANGE_URL_END
 )
 CHANGE_URL_RE = re.compile(CHANGE_URL_PATTERN, re.IGNORECASE)
-BARE_REFERENCE_RE = re.compile(
-    r"(?<![A-Za-z0-9_./?=&%+#-])#[1-9][0-9]*\b"
+BARE_REFERENCE_PATTERN = (
+    r"(?<![A-Za-z0-9_./?=&%+#-])#[1-9][0-9]*" + CHANGE_URL_END
 )
+BARE_REFERENCE_RE = re.compile(BARE_REFERENCE_PATTERN)
 PR_LABEL_RE = re.compile(r"(?i)\b(?:pr|pull request)\s*:?[ \t]*$")
 INLINE_LINK_RE = re.compile(
     r"\[(?P<label>[^\]\r\n]*)\]\([ \t]*"
     r"(?P<destination><[^>\r\n]*>|[^\s)\r\n]+)"
 )
 CHANGE_REFERENCE_RE = re.compile(
-    r"(?<![A-Za-z0-9_./?=&%+#-])#[1-9][0-9]*\b|" + CHANGE_URL_PATTERN,
+    BARE_REFERENCE_PATTERN + "|" + CHANGE_URL_PATTERN,
     re.IGNORECASE,
 )
 LIST_MARKER = r"(?:[-*+]|[0-9]{1,9}[.)])"

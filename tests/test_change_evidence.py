@@ -1747,10 +1747,11 @@ def test_pull_request_url_is_valid_commit_reference() -> None:
         ("commit", "valid-commit.md", "Issue: #194"),
     ],
 )
-def test_adjacent_hashes_do_not_satisfy_bare_reference(
-    kind: str, fixture: str, original: str
+@pytest.mark.parametrize("replacement", ["##194", "#194/not-an-issue"])
+def test_invalid_bare_reference_boundaries_do_not_satisfy_reference(
+    kind: str, fixture: str, original: str, replacement: str
 ) -> None:
-    text = (FIXTURES / fixture).read_text().replace(original, "##194")
+    text = (FIXTURES / fixture).read_text().replace(original, replacement)
 
     result = validator.validate_text(text, kind=kind)
 
