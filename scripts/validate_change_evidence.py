@@ -1591,6 +1591,38 @@ def _mask_top_level_indented_code(value: str) -> str:
     return "".join(output)
 
 
+def _blockquote_relative_depth(line: str) -> tuple[str, int]:
+    depth = 0
+    candidate = line
+    while True:
+        blockquote = BLOCKQUOTE_CONTENT_RE.fullmatch(candidate)
+        if not blockquote:
+            return candidate, depth
+        candidate = blockquote.group("value")
+        depth += 1
+
+
+def _inline_soft_break_interrupts(current_line: str, next_line: str) -> bool:
+    current_relative, current_depth = _blockquote_relative_depth(current_line)
+    next_relative, next_depth = _blockquote_relative_depth(next_line)
+    current_list = STRUCTURAL_LIST_ITEM_RE.fullmatch(current_relative)
+    next_list = STRUCTURAL_LIST_ITEM_RE.fullmatch(next_relative)
+    if (
+        current_list
+        and next_list
+        and _indent_columns(current_relative) == _indent_columns(next_relative)
+    ):
+        return True
+    if not _line_starts_paragraph_interrupt(next_line):
+        return False
+    return not (
+        current_depth
+        and current_depth == next_depth
+        and bool(next_relative.strip())
+        and not _line_starts_paragraph_interrupt(next_relative)
+    )
+
+
 def _inline_label_pairs(value: str) -> dict[int, int]:
     pairs: dict[int, int] = {}
     openers: list[int] = []
@@ -1598,8 +1630,32 @@ def _inline_label_pairs(value: str) -> dict[int, int]:
     while cursor < len(value):
         character = value[cursor]
         if character in "\r\n":
-            openers.clear()
-        elif character == "\\" and cursor + 1 < len(value):
+            line_end = cursor + 1
+            if character == "\r" and line_end < len(value) and value[line_end] == "\n":
+                line_end += 1
+            next_line = line_end
+            while next_line < len(value) and value[next_line] in " \t":
+                next_line += 1
+            next_line_end = next_line
+            while next_line_end < len(value) and value[next_line_end] not in "\r\n":
+                next_line_end += 1
+            current_line_start = max(
+                value.rfind("\n", 0, cursor), value.rfind("\r", 0, cursor)
+            ) + 1
+            current_line = value[current_line_start:cursor]
+            next_line_value = value[line_end:next_line_end]
+            if (
+                next_line < len(value)
+                and value[next_line] in "\r\n"
+                or _inline_soft_break_interrupts(current_line, next_line_value)
+            ):
+                openers.clear()
+            cursor = line_end - 1
+        elif (
+            character == "\\"
+            and cursor + 1 < len(value)
+            and value[cursor + 1] in ASCII_MARKDOWN_PUNCTUATION
+        ):
             cursor += 1
         elif character == "[":
             openers.append(cursor)
@@ -1617,7 +1673,11 @@ def _inline_title_end(value: str, cursor: int) -> int | None:
         character = value[cursor]
         if character in "\r\n":
             return None
-        if character == "\\" and cursor + 1 < len(value):
+        if (
+            character == "\\"
+            and cursor + 1 < len(value)
+            and value[cursor + 1] in ASCII_MARKDOWN_PUNCTUATION
+        ):
             cursor += 2
             continue
         if character == closer:
@@ -1642,7 +1702,11 @@ def _inline_destination_end(value: str, cursor: int) -> int | None:
             character = value[cursor]
             if character in "\r\n<":
                 return None
-            if character == "\\" and cursor + 1 < len(value):
+            if (
+                character == "\\"
+                and cursor + 1 < len(value)
+                and value[cursor + 1] in ASCII_MARKDOWN_PUNCTUATION
+            ):
                 cursor += 2
                 continue
             if character == ">":
@@ -1656,7 +1720,11 @@ def _inline_destination_end(value: str, cursor: int) -> int | None:
         depth = 0
         while cursor < len(value):
             character = value[cursor]
-            if character == "\\" and cursor + 1 < len(value):
+            if (
+                character == "\\"
+                and cursor + 1 < len(value)
+                and value[cursor + 1] in ASCII_MARKDOWN_PUNCTUATION
+            ):
                 cursor += 2
                 continue
             if character in " \t\r\n":
@@ -1715,7 +1783,11 @@ def _inline_link_token(
             character = value[cursor]
             if character in "\r\n[":
                 return None
-            if character == "\\" and cursor + 1 < len(value):
+            if (
+                character == "\\"
+                and cursor + 1 < len(value)
+                and value[cursor + 1] in ASCII_MARKDOWN_PUNCTUATION
+            ):
                 cursor += 2
                 continue
             if character == "]":
@@ -1769,6 +1841,51 @@ def _inline_link_tokens(
     ]
 
 
+def _inline_link_destination(
+    value: str, label_end: int, token_end: int
+) -> str:
+    cursor = label_end + 2
+    while cursor < token_end and value[cursor] in " \t":
+        cursor += 1
+    if cursor >= token_end - 1 or value[cursor] == ")":
+        return ""
+    if value[cursor] == "<":
+        destination_start = cursor + 1
+        cursor = destination_start
+        while cursor < token_end and value[cursor] != ">":
+            if (
+                value[cursor] == "\\"
+                and cursor + 1 < token_end
+                and value[cursor + 1] in ASCII_MARKDOWN_PUNCTUATION
+            ):
+                cursor += 2
+            else:
+                cursor += 1
+        return value[destination_start:cursor]
+
+    destination_start = cursor
+    depth = 0
+    while cursor < token_end:
+        character = value[cursor]
+        if (
+            character == "\\"
+            and cursor + 1 < token_end
+            and value[cursor + 1] in ASCII_MARKDOWN_PUNCTUATION
+        ):
+            cursor += 2
+            continue
+        if character in " \t\r\n":
+            break
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            if not depth:
+                break
+            depth -= 1
+        cursor += 1
+    return value[destination_start:cursor]
+
+
 def _mask_ranges(value: str, ranges: Sequence[tuple[int, int]]) -> str:
     deltas = [0] * (len(value) + 1)
     for start, end in ranges:
@@ -1782,6 +1899,23 @@ def _mask_ranges(value: str, ranges: Sequence[tuple[int, int]]) -> str:
             " " if depth and character not in {"\r", "\n"} else character
         )
     return "".join(characters)
+
+
+def _inline_visibility_ranges(value: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    for (
+        opener,
+        end,
+        _label_start,
+        label_end,
+        is_image,
+        _is_inline,
+    ) in _inline_link_tokens(value, allow_reference=True):
+        if is_image:
+            ranges.append((opener - 1, end))
+        else:
+            ranges.extend(((opener, opener + 1), (label_end, end)))
+    return ranges
 
 
 def _mask_inline_link_destinations(value: str) -> str:
@@ -1861,20 +1995,7 @@ def _contains_placeholder_value(value: str) -> bool:
 
 
 def _inline_visible_text(value: str) -> str:
-    masked_ranges: list[tuple[int, int]] = []
-    for (
-        opener,
-        end,
-        _label_start,
-        label_end,
-        is_image,
-        _is_inline,
-    ) in _inline_link_tokens(value, allow_reference=True):
-        if is_image:
-            masked_ranges.append((opener - 1, end))
-        else:
-            masked_ranges.extend(((opener, opener + 1), (label_end, end)))
-    value = _mask_ranges(value, masked_ranges)
+    value = _mask_ranges(value, _inline_visibility_ranges(value))
     value = re.sub(
         r"</?[A-Za-z][A-Za-z0-9-]*(?:[ \t][^>\r\n]*)?/?>",
         "",
@@ -1898,6 +2019,10 @@ def _is_visible_character(character: str) -> bool:
 
 
 def _visible_evidence_text(value: str) -> str:
+    inline_candidates = _mask_inline_code_spans(
+        _scan_markdown(value, mask_code=True, mask_indented_code=False)
+    )
+    value = _mask_ranges(value, _inline_visibility_ranges(inline_candidates))
     visible: list[str] = []
     fence_character = ""
     fence_length = 0
@@ -2032,16 +2157,19 @@ def _has_issue_reference(value: str) -> bool:
         visible_candidate = _inline_visible_text(candidate)
         if ISSUE_URL_RE.search(visible_candidate):
             return True
-        for link in INLINE_LINK_RE.finditer(candidate):
-            if (
-                link.start() > 0
-                and candidate[link.start() - 1] == "!"
-                and not _backslash_escaped(candidate, link.start() - 1)
-            ):
+        for (
+            _opener,
+            end,
+            label_start,
+            label_end,
+            is_image,
+            _is_inline,
+        ) in _inline_link_tokens(candidate, allow_reference=False):
+            if is_image or not _inline_visible_text(
+                candidate[label_start:label_end]
+            ).strip():
                 continue
-            if not _inline_visible_text(link.group("label")).strip():
-                continue
-            destination = link.group("destination").strip("<>")
+            destination = _inline_link_destination(candidate, label_end, end)
             if ISSUE_URL_RE.fullmatch(destination):
                 return True
         for match in BARE_REFERENCE_RE.finditer(visible_candidate):
@@ -2055,16 +2183,19 @@ def _has_change_reference(value: str) -> bool:
     for candidate in _top_level_reference_blocks(value):
         if CHANGE_REFERENCE_RE.search(_inline_visible_text(candidate)):
             return True
-        for link in INLINE_LINK_RE.finditer(candidate):
-            if (
-                link.start() > 0
-                and candidate[link.start() - 1] == "!"
-                and not _backslash_escaped(candidate, link.start() - 1)
-            ):
+        for (
+            _opener,
+            end,
+            label_start,
+            label_end,
+            is_image,
+            _is_inline,
+        ) in _inline_link_tokens(candidate, allow_reference=False):
+            if is_image or not _inline_visible_text(
+                candidate[label_start:label_end]
+            ).strip():
                 continue
-            if not _inline_visible_text(link.group("label")).strip():
-                continue
-            destination = link.group("destination").strip("<>")
+            destination = _inline_link_destination(candidate, label_end, end)
             if CHANGE_URL_RE.fullmatch(destination):
                 return True
     return False

@@ -373,6 +373,8 @@ def test_empty_html_markup_does_not_satisfy_required_field() -> None:
         "![outer [TODO]](image.png)",
         "![outer [TODO]](<image(>)",
         '![outer [TODO]](image.png "title )")',
+        "![alt\ntext](image.png)",
+        "![alt\r\ntext](image.png)",
     ],
 )
 def test_image_with_nested_alt_label_does_not_satisfy_required_field(
@@ -381,6 +383,50 @@ def test_image_with_nested_alt_label_does_not_satisfy_required_field(
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Adds deterministic validation for structured change evidence.",
         image,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "empty-field" in {item.code for item in result.findings}
+
+
+def test_blank_line_ends_multiline_image_label() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        "![alt\n\ntext](image.png)",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "- ![alt\n- text](image.png)",
+        "1. ![alt\n2. text](image.png)",
+        "![alt\n- text](image.png)",
+        "![alt\n> text](image.png)",
+        "> ![alt\n>\n> text](image.png)",
+    ],
+)
+def test_block_boundary_ends_multiline_image_label(replacement: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        replacement,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+def test_multiline_image_label_may_continue_in_same_blockquote() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        "> ![alt\n> text](image.png)",
     )
 
     result = validator.validate_text(text, kind="pull-request")
@@ -961,6 +1007,7 @@ def test_angle_enclosed_link_destination_is_not_raw_html() -> None:
     [
         "See [documentation](<b> bad).",
         "See [documentation][<b>].",
+        r"See [documentation](foo\ <b>).",
         "[outer [inner](x)](<b>)",
     ],
 )
@@ -983,6 +1030,33 @@ def test_link_may_contain_an_image() -> None:
     )
 
     result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    ("kind", "fixture", "original", "replacement"),
+    [
+        (
+            "pull-request",
+            "valid-pull-request.md",
+            "Closes #194",
+            "[Issue [194]](https://github.com/jhw7500/automation/issues/194)",
+        ),
+        (
+            "commit",
+            "valid-commit.md",
+            "Issue: #194",
+            "[Change [194]](https://github.com/jhw7500/automation/pull/194)",
+        ),
+    ],
+)
+def test_nested_link_label_preserves_navigable_reference(
+    kind: str, fixture: str, original: str, replacement: str
+) -> None:
+    text = (FIXTURES / fixture).read_text().replace(original, replacement)
+
+    result = validator.validate_text(text, kind=kind)
 
     assert result.valid, result.findings
 
