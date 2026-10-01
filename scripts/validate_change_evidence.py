@@ -1114,10 +1114,17 @@ def _top_level_reference_blocks(value: str) -> list[str]:
         candidate = _top_level_candidate(line, list_match)
         if list_match:
             flush_paragraph()
-            blocks.append(candidate)
         else:
             paragraph.append(candidate)
     flush_paragraph()
+    for marker_value, continuations in _top_level_list_items(value):
+        parts = [
+            part.strip()
+            for part in (marker_value, *continuations)
+            if part.strip()
+        ]
+        if parts:
+            blocks.append(" ".join(parts))
     return blocks
 
 

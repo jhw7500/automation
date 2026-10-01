@@ -1148,6 +1148,56 @@ def test_pull_request_url_is_valid_commit_reference() -> None:
     assert result.valid, result.findings
 
 
+@pytest.mark.parametrize(
+    ("kind", "fixture", "field", "original"),
+    [
+        ("pull-request", "valid-pull-request.md", "Related issue", "Closes #194"),
+        ("commit", "valid-commit.md", "References", "Issue: #194"),
+    ],
+)
+def test_direct_list_continuation_satisfies_reference_field(
+    kind: str, fixture: str, field: str, original: str
+) -> None:
+    text = (FIXTURES / fixture).read_text().replace(
+        original, "- Related issue:\n  #194"
+    )
+
+    result = validator.validate_text(text, kind=kind)
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "- Related issue:\n  - #194",
+        "- Related issue:\n\n  #194",
+    ],
+)
+def test_non_direct_list_continuation_does_not_satisfy_related_issue(
+    reference: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", reference
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "reference-required" in {finding.code for finding in result.findings}
+
+
+def test_pr_label_on_direct_list_continuation_does_not_satisfy_related_issue() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194", "- PR:\n  #194"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "reference-required" in {finding.code for finding in result.findings}
+
+
 @pytest.mark.parametrize("reference", ["PR: #194", "PR #194", "Pull request #194"])
 def test_explicit_pr_label_does_not_satisfy_related_issue(reference: str) -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
