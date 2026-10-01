@@ -454,6 +454,104 @@ def test_syntax_only_task_item_does_not_satisfy_acceptance_criteria() -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "item"),
+    [
+        ("Changes", "- \n  Define the contract and validator behavior."),
+        ("Validation", "1. \n   `pytest -q` passed."),
+    ],
+)
+def test_direct_list_continuation_satisfies_bullet_field(
+    field: str, item: str
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index(f"### {field}\n") + len(f"### {field}\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + item + "\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+def test_direct_task_list_continuation_satisfies_checklist_field() -> None:
+    text = (FIXTURES / "valid-issue.md").read_text()
+    start = text.index("### Acceptance criteria\n") + len(
+        "### Acceptance criteria\n"
+    )
+    end = text.find("\n### ", start)
+    text = (
+        text[:start]
+        + "- [ ] \n  Validator accepts rendered continuation text.\n"
+        + text[end:]
+    )
+
+    result = validator.validate_text(text, kind="issue")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        "- \n  - Nested content only.",
+        "- \n\n  Detached field prose.",
+        "- \n  ```text\n  Fenced code only.\n  ```",
+    ],
+)
+def test_non_direct_list_continuation_does_not_satisfy_bullet_field(
+    item: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + item + "\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "bullet-required" in {finding.code for finding in result.findings}
+
+
+def test_syntax_only_list_continuation_does_not_satisfy_bullet_field() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text()
+    start = text.index("### Changes\n") + len("### Changes\n")
+    end = text.find("\n### ", start)
+    text = text[:start] + "- \n  []()\n" + text[end:]
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert {finding.code for finding in result.findings} & {
+        "empty-field",
+        "bullet-required",
+    }
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        "- [ ] \n  - Nested criterion only.",
+        "- [ ] \n\n  Detached criterion prose.",
+        "- [ ] \n  ```text\n  Fenced criterion only.\n  ```",
+    ],
+)
+def test_non_direct_task_continuation_does_not_satisfy_checklist_field(
+    item: str,
+) -> None:
+    text = (FIXTURES / "valid-issue.md").read_text()
+    start = text.index("### Acceptance criteria\n") + len(
+        "### Acceptance criteria\n"
+    )
+    end = text.find("\n### ", start)
+    text = text[:start] + item + "\n" + text[end:]
+
+    result = validator.validate_text(text, kind="issue")
+
+    assert not result.valid
+    assert "checklist-required" in {finding.code for finding in result.findings}
+
+
+@pytest.mark.parametrize(
     ("kind", "fixture", "field", "replacement"),
     [
         (

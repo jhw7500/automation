@@ -64,6 +64,7 @@ STRUCTURAL_LIST_ITEM_RE = re.compile(
 BLOCKQUOTE_RE = re.compile(r"^ {0,3}>")
 BLOCKQUOTE_CONTENT_RE = re.compile(r"^ {0,3}>[ \t]?(?P<value>.*)$")
 CHECKBOX_VALUE_RE = re.compile(r"^\[[ xX]\][ \t]+(?P<value>.*)$")
+CHECKBOX_ITEM_RE = re.compile(r"^\[[ xX]\](?:[ \t]+(?P<value>.*))?$")
 RAW_HTML_START_RE = re.compile(
     r"(?i)(?:</?[A-Za-z][A-Za-z0-9-]*(?=[\s/>])|<![A-Z]|<!\[CDATA\[|<\?)"
 )
@@ -1173,22 +1174,59 @@ def _absence_uses_markdown_container(value: str) -> bool:
     return False
 
 
-def _has_top_level_checklist_item(value: str) -> bool:
-    for _line, top_level, list_match in _structural_lines(value):
+def _top_level_list_items(value: str) -> list[tuple[str, tuple[str, ...]]]:
+    """Return marker-line values and direct continuation lines for top-level items."""
+
+    classified = _structural_lines(value)
+    items: list[tuple[str, tuple[str, ...]]] = []
+    for index, (line, top_level, list_match) in enumerate(classified):
         if not top_level or list_match is None:
             continue
-        checkbox = CHECKBOX_VALUE_RE.fullmatch(list_match.group("value"))
-        if checkbox and _visible_evidence_text(checkbox.group("value")):
+
+        content_indent = _column_width(line[: list_match.start("value")])
+        continuations: list[str] = []
+        for continuation, continuation_top_level, continuation_match in classified[
+            index + 1 :
+        ]:
+            if not continuation.strip():
+                break
+            if continuation_top_level or continuation_match is not None:
+                break
+            if _indent_columns(continuation) < content_indent:
+                break
+
+            relative = _drop_indent_columns(continuation, content_indent)
+            candidate = relative.strip()
+            if (
+                BLOCKQUOTE_RE.match(relative)
+                or STRUCTURAL_LIST_ITEM_RE.fullmatch(relative)
+                or EMPTY_LIST_MARKER_RE.fullmatch(candidate)
+                or ATX_HEADING_RE.fullmatch(candidate)
+                or THEMATIC_BREAK_RE.fullmatch(candidate)
+                or FENCE_RE.fullmatch(relative)
+                or LINK_DEFINITION_RE.fullmatch(relative)
+            ):
+                break
+            continuations.append(relative)
+
+        items.append((list_match.group("value"), tuple(continuations)))
+    return items
+
+
+def _has_top_level_checklist_item(value: str) -> bool:
+    for marker_value, continuations in _top_level_list_items(value):
+        checkbox = CHECKBOX_ITEM_RE.fullmatch(marker_value)
+        if checkbox and _visible_evidence_text(
+            "\n".join(((checkbox.group("value") or ""), *continuations))
+        ):
             return True
     return False
 
 
 def _has_top_level_list_item(value: str) -> bool:
     return any(
-        top_level
-        and list_match is not None
-        and bool(_visible_evidence_text(list_match.group("value")))
-        for _line, top_level, list_match in _structural_lines(value)
+        _visible_evidence_text("\n".join((marker_value, *continuations)))
+        for marker_value, continuations in _top_level_list_items(value)
     )
 
 
