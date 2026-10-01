@@ -367,6 +367,40 @@ def test_empty_html_markup_does_not_satisfy_required_field() -> None:
     assert "raw-html" in {item.code for item in result.findings}
 
 
+@pytest.mark.parametrize(
+    "image",
+    [
+        "![outer [TODO]](image.png)",
+        "![outer [TODO]](<image(>)",
+        '![outer [TODO]](image.png "title )")',
+    ],
+)
+def test_image_with_nested_alt_label_does_not_satisfy_required_field(
+    image: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        image,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "empty-field" in {item.code for item in result.findings}
+
+
+def test_issue_url_in_nested_image_alt_does_not_satisfy_reference() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194",
+        "![outer [https://github.com/jhw7500/automation/issues/194]](image.png)",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "empty-field" in {item.code for item in result.findings}
+
+
 @pytest.mark.parametrize("field", ["Summary", "Impact and risks"])
 def test_default_ignorable_unicode_does_not_satisfy_required_field(
     field: str,
@@ -904,6 +938,60 @@ def test_raw_html_respects_escapes_and_list_relative_indentation(
 def test_markdown_autolink_issue_reference_remains_valid() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text().replace(
         "Closes #194", "<https://github.com/jhw7500/automation/issues/194>"
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+def test_angle_enclosed_link_destination_is_not_raw_html() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        "See [documentation](<guide>) for the contract.",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "See [documentation](<b> bad).",
+        "See [documentation][<b>].",
+        "[outer [inner](x)](<b>)",
+    ],
+)
+def test_invalid_link_syntax_does_not_hide_raw_html(replacement: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        replacement,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "raw-html" in {item.code for item in result.findings}
+
+
+def test_link_may_contain_an_image() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        "[outer ![inner](image.png)](target)",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+def test_deeply_nested_link_labels_do_not_exhaust_python_recursion() -> None:
+    replacement = "[" * 1100 + "text" + "](x)" * 1100
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        replacement,
     )
 
     result = validator.validate_text(text, kind="pull-request")
