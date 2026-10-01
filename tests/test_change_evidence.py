@@ -238,6 +238,44 @@ def test_formatted_placeholder_only_field_is_rejected(value: str) -> None:
 
 @pytest.mark.parametrize(
     "value",
+    ["TODO!", "TBD…", "N/A！", "TODO??", "**TODO!**", "> N/A!", "- TBD…"],
+)
+def test_punctuated_placeholder_only_field_is_rejected(value: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.", value
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "placeholder" in {item.code for item in result.findings}
+
+
+def test_punctuated_placeholder_absence_reason_is_rejected() -> None:
+    text = (FIXTURES / "valid-pull-request-no-validation.md").read_text().replace(
+        "Not run: documentation-only change with no executable behavior.",
+        "Not run: TBD!",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "invalid-absence-reason" in {item.code for item in result.findings}
+
+
+def test_placeholder_prefix_with_concrete_explanation_is_allowed() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        "TODO: replace the parser with exact grammar.",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "value",
     [
         "> TBD",
         "> TODO",
@@ -457,6 +495,8 @@ def test_syntax_only_task_item_does_not_satisfy_acceptance_criteria() -> None:
     ("field", "item"),
     [
         ("Changes", "- \n  Define the contract and validator behavior."),
+        ("Changes", "- \n  [Define the contract and validator behavior."),
+        ("Changes", "- \n  [note]:\n  this is concrete evidence"),
         ("Validation", "1. \n   `pytest -q` passed."),
     ],
 )
@@ -1092,6 +1132,98 @@ def test_escaped_label_link_definition_does_not_satisfy_related_issue() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[note]: this is concrete evidence",
+        '[note]: /target "title" trailing prose',
+        '[note]: /target "unclosed title',
+    ],
+)
+def test_rendered_colon_prose_is_not_a_link_definition(value: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.", value
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        "[hidden]: relative/path",
+        r"[hidden]: relative(foo\)bar)",
+        "[hidden]: foo>bar",
+        "[hidden]: foo\N{NO-BREAK SPACE}bar",
+        '[hidden]: <> "empty destination"',
+        "[hidden]: /target 'single-quoted title'",
+        "[hidden]: /target (parenthesized title)",
+    ],
+)
+def test_valid_link_definition_destination_and_title_forms_are_non_rendered(
+    definition: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.", definition
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+    codes = {item.code for item in result.findings}
+
+    assert "non-rendered-link-definition" in codes
+    assert "empty-field" in codes
+
+
+def test_multiline_link_definition_title_is_non_rendered() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        '[hidden]: /target\n  "multiline\n  title"',
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+    codes = {item.code for item in result.findings}
+
+    assert "non-rendered-link-definition" in codes
+    assert "empty-field" in codes
+
+
+def test_multiline_link_definition_title_is_scanned_incrementally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanned_lengths: list[int] = []
+    original = validator._link_definition_status
+
+    def recording_status(value: str) -> int:
+        scanned_lengths.append(len(value))
+        return original(value)
+
+    monkeypatch.setattr(validator, "_link_definition_status", recording_status)
+    value = "[hidden]: /target\n  \"" + ("x" * 70 + "\n") * 400 + 'title"'
+
+    ranges = validator._link_definition_line_ranges(value)
+
+    assert ranges == [(1, len(value.splitlines()))]
+    assert max(scanned_lengths) < 256
+
+
+def test_invalid_next_line_title_does_not_hide_rendered_prose() -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        '[hidden]: /target\n"unclosed title',
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+    codes = {item.code for item in result.findings}
+    summary_findings = [
+        item for item in result.findings if item.field == "Summary"
+    ]
+
+    assert "non-rendered-link-definition" in codes
+    assert "empty-field" not in {item.code for item in summary_findings}
+
+
 def test_four_backtick_fence_keeps_nested_triple_fence_and_heading_as_code() -> None:
     text = (FIXTURES / "valid-pull-request.md").read_text()
     text = text.replace(
@@ -1286,11 +1418,36 @@ def test_nonstandalone_issue_url_does_not_satisfy_related_issue(
 
 
 @pytest.mark.parametrize(
+    "suffix",
+    ["/", "/not-an-issue", ".json", "-notes"],
+)
+def test_issue_url_path_or_token_suffix_does_not_satisfy_related_issue(
+    suffix: str,
+) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Closes #194",
+        f"https://github.com/example/repo/issues/194{suffix}",
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert not result.valid
+    assert "reference-required" in {item.code for item in result.findings}
+
+
+@pytest.mark.parametrize(
     "reference",
     [
         "https://github.com/example/repo/issues/194",
         "<https://github.com/example/repo/issues/194>",
         "[Issue](https://github.com/example/repo/issues/194)",
+        "Tracked by https://github.com/example/repo/issues/194.",
+        'See "https://github.com/example/repo/issues/194".',
+        "https://github.com/example/repo/issues/194?q=1#comment-2",
+        "<https://github.com/example/repo/issues/194?q=1#comment-2>",
+        "[Issue](https://github.com/example/repo/issues/194?q=1#comment-2)",
+        '[Issue](<https://github.com/example/repo/issues/194?q=1#comment-2> "tracker")',
+        '[Issue](<https://github.com/example/repo/issues/194?q=(foo)> "tracker")',
     ],
 )
 def test_rendered_or_navigable_issue_url_satisfies_related_issue(
@@ -1320,6 +1477,41 @@ def test_navigable_change_url_satisfies_commit_reference(reference: str) -> None
     result = validator.validate_text(text, kind="commit")
 
     assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "https://github.com/example/repo/pull/194?q=1#discussion_r1",
+        "[Pull request](https://github.com/example/repo/pull/194?q=1#discussion_r1)",
+    ],
+)
+def test_change_url_query_or_fragment_satisfies_commit_reference(
+    reference: str,
+) -> None:
+    text = (FIXTURES / "valid-commit.md").read_text().replace(
+        "Issue: #194", reference
+    )
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize("change_kind", ["issues", "pull"])
+@pytest.mark.parametrize("suffix", ["/", "/not-a-change", ".json", "-notes"])
+def test_change_url_path_or_token_suffix_does_not_satisfy_commit_reference(
+    change_kind: str, suffix: str
+) -> None:
+    text = (FIXTURES / "valid-commit.md").read_text().replace(
+        "Issue: #194",
+        f"https://github.com/example/repo/{change_kind}/194{suffix}",
+    )
+
+    result = validator.validate_text(text, kind="commit")
+
+    assert not result.valid
+    assert "reference-required" in {item.code for item in result.findings}
 
 
 @pytest.mark.parametrize(

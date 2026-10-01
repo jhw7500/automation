@@ -24,25 +24,27 @@ MAX_REPORT_JSON_UTF16_BYTES = 512 * 1024
 REPORT_ENVELOPE_UTF16_RESERVE = 4 * 1024
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
 FENCE_RE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<rest>[^\r\n]*)$")
-LINK_DEFINITION_RE = re.compile(
-    r"^ {0,3}\[(?:\\.|[^\[\]\\])+\]:[ \t]*"
-    r"(?:\n[ \t]*)?(?:\S.*)?$",
-    re.DOTALL,
-)
 SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 PLACEHOLDER_VALUE_RE = re.compile(
-    r"(?i)^(?:tbd|todo|fixme|n/?a|none|unknown|미정|추후|없음|\?{2,})[.。]?$"
+    r"(?i)^(?:tbd|todo|fixme|n/?a|none|unknown|미정|추후|없음|\?{2,})$"
 )
 ANGLE_PLACEHOLDER_RE = re.compile(
     r"(?i)^<(?:(?:fill|insert|describe|add)[^>]*|[^>]+ here)>$"
 )
-ISSUE_URL_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_./?=&%+-])"
-    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*\b"
+CHANGE_URL_QUERY_OR_FRAGMENT = r"(?:[?#][^\s<>\[\]]*)?"
+CHANGE_URL_END = r"(?=$|[\s)\]}>\"']|[.,!;:](?=$|[\s)\]}>\"']))"
+ISSUE_URL_PATTERN = (
+    r"(?<![A-Za-z0-9_./?=&%+-])"
+    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*"
+    + CHANGE_URL_QUERY_OR_FRAGMENT
+    + CHANGE_URL_END
 )
+ISSUE_URL_RE = re.compile(ISSUE_URL_PATTERN, re.IGNORECASE)
 CHANGE_URL_PATTERN = (
     r"(?<![A-Za-z0-9_./?=&%+-])"
-    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/[1-9][0-9]*\b"
+    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/[1-9][0-9]*"
+    + CHANGE_URL_QUERY_OR_FRAGMENT
+    + CHANGE_URL_END
 )
 CHANGE_URL_RE = re.compile(CHANGE_URL_PATTERN, re.IGNORECASE)
 BARE_REFERENCE_RE = re.compile(
@@ -116,6 +118,14 @@ DEFAULT_IGNORABLE_CODE_POINT_RANGES = (
     (0x1BCA0, 0x1BCA3),
     (0x1D173, 0x1D17A),
     (0xE0000, 0xE0FFF),
+)
+LINK_DEFINITION_INVALID = 0
+LINK_DEFINITION_INCOMPLETE = 1
+LINK_DEFINITION_VALID = 2
+ASCII_MARKDOWN_PUNCTUATION = frozenset(
+    character
+    for character in map(chr, range(0x21, 0x7F))
+    if unicodedata.category(character).startswith(("P", "S"))
 )
 
 
@@ -294,6 +304,155 @@ def _list_can_interrupt_paragraph(list_match: re.Match[str]) -> bool:
     return True
 
 
+def _link_definition_status(value: str) -> int:
+    """Classify a complete or extendable CommonMark link definition."""
+
+    index = 0
+    while index < len(value) and value[index] == " " and index < 3:
+        index += 1
+    if index >= len(value) or value[index] != "[":
+        return LINK_DEFINITION_INVALID
+
+    index += 1
+    label_length = 0
+    label_has_content = False
+    while index < len(value):
+        character = value[index]
+        if (
+            character == "\\"
+            and index + 1 < len(value)
+            and value[index + 1] in ASCII_MARKDOWN_PUNCTUATION
+        ):
+            label_length += 1
+            label_has_content = True
+            index += 2
+            continue
+        if character == "[":
+            return LINK_DEFINITION_INVALID
+        if character == "]":
+            break
+        if character not in " \t\n":
+            label_has_content = True
+        label_length += 1
+        if label_length > 999:
+            return LINK_DEFINITION_INVALID
+        index += 1
+    else:
+        return LINK_DEFINITION_INCOMPLETE
+
+    if not label_has_content:
+        return LINK_DEFINITION_INVALID
+    index += 1
+    if index >= len(value) or value[index] != ":":
+        return LINK_DEFINITION_INVALID
+    index += 1
+
+    while index < len(value) and value[index] in " \t":
+        index += 1
+    if index == len(value):
+        return LINK_DEFINITION_INCOMPLETE
+    if value[index] == "\n":
+        index += 1
+        while index < len(value) and value[index] in " \t":
+            index += 1
+        if index == len(value):
+            return LINK_DEFINITION_INCOMPLETE
+        if value[index] == "\n":
+            return LINK_DEFINITION_INVALID
+
+    if value[index] == "<":
+        index += 1
+        while index < len(value):
+            character = value[index]
+            if (
+                character == "\\"
+                and index + 1 < len(value)
+                and value[index + 1] in ASCII_MARKDOWN_PUNCTUATION
+            ):
+                index += 2
+                continue
+            if character == ">":
+                index += 1
+                break
+            if character in "<\n" or ord(character) < 0x20:
+                return LINK_DEFINITION_INVALID
+            index += 1
+        else:
+            return LINK_DEFINITION_INVALID
+    else:
+        destination_start = index
+        parenthesis_depth = 0
+        while index < len(value) and value[index] not in " \t\n":
+            character = value[index]
+            if (
+                character == "\\"
+                and index + 1 < len(value)
+                and value[index + 1] in ASCII_MARKDOWN_PUNCTUATION
+            ):
+                index += 2
+                continue
+            if character == "(":
+                parenthesis_depth += 1
+                if parenthesis_depth > 32:
+                    return LINK_DEFINITION_INVALID
+            elif character == ")":
+                if not parenthesis_depth:
+                    return LINK_DEFINITION_INVALID
+                parenthesis_depth -= 1
+            if ord(character) < 0x20 or ord(character) == 0x7F:
+                return LINK_DEFINITION_INVALID
+            index += 1
+        if index == destination_start or parenthesis_depth:
+            return LINK_DEFINITION_INVALID
+
+    if index == len(value):
+        return LINK_DEFINITION_VALID
+    if value[index] not in " \t\n":
+        return LINK_DEFINITION_INVALID
+    while index < len(value) and value[index] in " \t":
+        index += 1
+    if index == len(value):
+        return LINK_DEFINITION_VALID
+    if value[index] == "\n":
+        index += 1
+        while index < len(value) and value[index] in " \t":
+            index += 1
+        if index == len(value):
+            return LINK_DEFINITION_VALID
+        if value[index] == "\n":
+            return LINK_DEFINITION_INVALID
+
+    opener = value[index]
+    if opener not in "\"'(":
+        return LINK_DEFINITION_INVALID
+    closer = ")" if opener == "(" else opener
+    index += 1
+    while index < len(value):
+        character = value[index]
+        if (
+            character == "\\"
+            and index + 1 < len(value)
+            and value[index + 1] in ASCII_MARKDOWN_PUNCTUATION
+        ):
+            index += 2
+            continue
+        if opener == "(" and character == "(":
+            return LINK_DEFINITION_INVALID
+        if character == closer:
+            index += 1
+            return (
+                LINK_DEFINITION_VALID
+                if not value[index:].strip(" \t")
+                else LINK_DEFINITION_INVALID
+            )
+        index += 1
+    return LINK_DEFINITION_INCOMPLETE
+
+
+def _is_link_definition(value: str) -> bool:
+    return _link_definition_status(value) == LINK_DEFINITION_VALID
+
+
 def _line_opens_paragraph(line: str) -> bool:
     return not _line_interrupts_paragraph(line)
 
@@ -304,7 +463,7 @@ def _line_interrupts_paragraph(line: str) -> bool:
         ATX_HEADING_RE.fullmatch(candidate)
         or THEMATIC_BREAK_RE.fullmatch(candidate)
         or FENCE_RE.fullmatch(line)
-        or LINK_DEFINITION_RE.fullmatch(line)
+        or _is_link_definition(line)
     )
 
 
@@ -496,7 +655,7 @@ def _blockquote_list_rendering(value: str) -> list[bool]:
         elif (
             HEADING_RE.fullmatch(candidate)
             or THEMATIC_BREAK_RE.fullmatch(stripped)
-            or LINK_DEFINITION_RE.fullmatch(candidate)
+            or _is_link_definition(candidate)
             or FENCE_RE.fullmatch(candidate)
         ):
             paragraph_open = False
@@ -647,6 +806,57 @@ def _scan_visible_markdown(
     )
 
 
+def _multiline_link_title_end(
+    lines: Sequence[str],
+    start: int,
+    *,
+    blockquote_depth: int,
+    list_indent: int,
+) -> int | None:
+    title = _line_in_container(
+        lines[start],
+        blockquote_depth=blockquote_depth,
+        list_indent=list_indent,
+    )
+    if not title:
+        return None
+    title = title.lstrip(" \t")
+    if not title.startswith(("\"", "'", "(")):
+        return None
+
+    opener = title[0]
+    closer = ")" if opener == "(" else opener
+    cursor = start
+    title = title[1:]
+    while True:
+        index = 0
+        while index < len(title):
+            character = title[index]
+            if (
+                character == "\\"
+                and index + 1 < len(title)
+                and title[index + 1] in ASCII_MARKDOWN_PUNCTUATION
+            ):
+                index += 2
+                continue
+            if opener == "(" and character == "(":
+                return None
+            if character == closer:
+                return cursor if not title[index + 1 :].strip(" \t") else None
+            index += 1
+
+        cursor += 1
+        if cursor >= len(lines):
+            return None
+        title = _line_in_container(
+            lines[cursor],
+            blockquote_depth=blockquote_depth,
+            list_indent=list_indent,
+        )
+        if title is None or not title.strip():
+            return None
+
+
 def _link_definition_line_ranges(value: str) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     start: int | None = None
@@ -656,7 +866,10 @@ def _link_definition_line_ranges(value: str) -> list[tuple[int, int]]:
     lines = _markdown_lines(value)
     classified = _structural_lines(value)
     blockquote_list_rendering = _blockquote_list_rendering(value)
+    skip_through = -1
     for index, line in enumerate(lines):
+        if index <= skip_through:
+            continue
         structural_list_match = classified[index][2]
         relative_line, _nested, fresh_blockquote_depth, fresh_list_indent = (
             _effective_container_line_info(
@@ -698,32 +911,25 @@ def _link_definition_line_ranges(value: str) -> list[tuple[int, int]]:
             else:
                 candidate += "\n" + continuation
 
-        match = LINK_DEFINITION_RE.fullmatch(candidate)
-        expects_destination = bool(
-            match
-            and candidate.rstrip().endswith(":")
-            and index + 1 < len(lines)
-        )
-        if expects_destination:
-            next_line = _line_in_container(
-                lines[index + 1],
-                blockquote_depth=blockquote_depth,
-                list_indent=list_indent,
-            )
-            expects_destination = bool(
-                next_line
-                and HEADING_RE.fullmatch(next_line) is None
-                and STRUCTURAL_LIST_ITEM_RE.fullmatch(next_line) is None
-                and not BLOCKQUOTE_RE.match(next_line)
-                and _line_opens_paragraph(next_line)
-            )
-        if match and not expects_destination:
-            ranges.append((start + 1, index + 1))
+        status = _link_definition_status(candidate)
+        if status == LINK_DEFINITION_VALID:
+            end = index
+            if index + 1 < len(lines):
+                title_end = _multiline_link_title_end(
+                    lines,
+                    index + 1,
+                    blockquote_depth=blockquote_depth,
+                    list_indent=list_indent,
+                )
+                if title_end is not None:
+                    end = title_end
+            ranges.append((start + 1, end + 1))
+            skip_through = end
             start = None
             candidate = ""
             blockquote_depth = 0
             list_indent = 0
-        elif len(candidate) > 4096:
+        elif status == LINK_DEFINITION_INVALID or len(candidate) > 4096:
             start = None
             candidate = ""
             blockquote_depth = 0
@@ -946,6 +1152,17 @@ def _raw_html_offsets(value: str) -> list[int]:
     ]
 
 
+def _is_placeholder_value(value: str) -> bool:
+    candidate = value.rstrip()
+    if PLACEHOLDER_VALUE_RE.fullmatch(candidate):
+        return True
+    while candidate and unicodedata.category(candidate[-1]).startswith("P"):
+        candidate = candidate[:-1].rstrip()
+        if PLACEHOLDER_VALUE_RE.fullmatch(candidate):
+            return True
+    return False
+
+
 def _contains_placeholder_value(value: str) -> bool:
     for line in _markdown_lines(value):
         candidate = line.strip()
@@ -964,9 +1181,7 @@ def _contains_placeholder_value(value: str) -> bool:
         if ANGLE_PLACEHOLDER_RE.fullmatch(candidate):
             return True
         candidate = _inline_visible_text(candidate).strip()
-        if PLACEHOLDER_VALUE_RE.fullmatch(candidate) or ANGLE_PLACEHOLDER_RE.fullmatch(
-            candidate
-        ):
+        if _is_placeholder_value(candidate) or ANGLE_PLACEHOLDER_RE.fullmatch(candidate):
             return True
     return False
 
@@ -1211,7 +1426,7 @@ def _top_level_list_items(value: str) -> list[tuple[str, tuple[str, ...]]]:
                 or ATX_HEADING_RE.fullmatch(candidate)
                 or THEMATIC_BREAK_RE.fullmatch(candidate)
                 or FENCE_RE.fullmatch(relative)
-                or LINK_DEFINITION_RE.fullmatch(relative)
+                or _is_link_definition(relative)
             ):
                 break
             continuations.append(relative)
