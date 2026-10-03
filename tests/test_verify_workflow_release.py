@@ -240,7 +240,6 @@ def fallback_release_repo(tmp_path):
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
-    restore_pre_v179_carryover_none(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -354,6 +353,7 @@ def test_v1782_workflows_are_rejected_on_the_v179_release_line(fallback_release_
 
     repo, _ = fallback_release_repo
     restore_pre_v179_filtered_candidate_preservation(repo)
+    restore_pre_v179_carryover_none(repo)
     old = commit(repo, "v1.78.2 review workflows")
     assert release_verifier.verify_commit_content(repo, "v1.78.2", old) == old
     with pytest.raises(ReleaseVerificationError):
@@ -394,8 +394,7 @@ def test_carryover_none_release_boundary() -> None:
 
 
 def test_v179_accepts_carryover_none_canonicalizer(fallback_release_repo):
-    repo, _ = fallback_release_repo
-    candidate = prepare_v179(repo)
+    repo, candidate = fallback_release_repo
 
     assert release_verifier.verify_commit_content(repo, "v1.79", candidate) == candidate
 
@@ -415,7 +414,9 @@ def test_v179_canonicalizer_is_rejected_on_v1782_release_line(fallback_release_r
 
 
 def test_v1782_canonicalizer_is_rejected_on_v179_release_line(fallback_release_repo):
-    repo, candidate = fallback_release_repo
+    repo, _ = fallback_release_repo
+    restore_pre_v179_carryover_none(repo)
+    candidate = commit(repo, "v1.78.2 canonicalizer on the v1.79 line")
 
     with pytest.raises(
         ReleaseVerificationError, match="canonicalize-review helper contract is invalid",
