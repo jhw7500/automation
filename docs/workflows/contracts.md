@@ -1047,11 +1047,13 @@ After an attempted Claude or Gemini canonicalization that does not produce
 `document-valid=true`, the workflow uploads the bounded schema-1
 `<reviewer>-review-result.json` as a uniquely named, non-overwriting diagnostic artifact for one
 day. Each reviewer additionally uploads the rejected raw candidate as
-`<reviewer>-candidate-<run>-<attempt>` under that same rejection-only condition, only when the
+`<reviewer>-candidate-<run>-<attempt>` under that same condition, only when the
 candidate file actually exists, and with the same one-day, non-overwriting bound, because the
 structural code alone cannot separate a prompt/format regression from an over-strict validator.
-The upload is bounded to rejected rounds, whose text is by definition never published,
-and it stays untrusted provider output that no program reads: the upsert program never names or
+From v1.79 both uploads also run when a valid document had findings removed by the quality filter
+(`filtered-count` above zero), because those findings are otherwise lost without a trace (#163);
+the upload steps' `if:` expressions are authoritative. The upload is bounded to rounds where
+candidate text was rejected or filtered, and it stays untrusted provider output that no program reads: the upsert program never names or
 opens the raw file, and the failure comment cites only the artifact name, and only when that
 upload step reported success. The workspace path is safe because the reset step removes it with
 `rm -f --` before generation and the canonicalizer runs only after that reset succeeds, so no

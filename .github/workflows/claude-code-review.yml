@@ -1049,6 +1049,8 @@ jobs:
           FILTERED_COUNT: ${{ steps.canonicalize-review.outputs.filtered-count }}
           FILTERED_MAX_SEVERITY: ${{ steps.canonicalize-review.outputs.filtered-max-severity }}
           FILTERED_REASONS: ${{ steps.canonicalize-review.outputs.filtered-reasons }}
+          CANDIDATE_ARTIFACT_NAME: claude-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          DIAGNOSTIC_ARTIFACT_NAME: claude-review-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           [[ "$FILTERED_COUNT" =~ ^[0-9]+$ ]]
@@ -1058,13 +1060,14 @@ jobs:
             printf '### Claude filtered findings\n\n'
             printf -- "- Filtered: \`%s\` (max severity \`%s\`)\n" "$FILTERED_COUNT" "$FILTERED_MAX_SEVERITY"
             printf -- "- Reasons: \`%s\`\n" "$FILTERED_REASONS"
+            printf -- "- Candidate artifacts (if uploaded): \`%s\`, \`%s\`\n" "$CANDIDATE_ARTIFACT_NAME" "$DIAGNOSTIC_ARTIFACT_NAME"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # 거부된 후보의 원문이 없으면 프롬프트/포맷 회귀와 검증기 과잉을 구분할 수 없다.
-      # 노출을 최소화하기 위해 거부된 라운드에서만, 원문이 실제로 있을 때만 보존한다.
+      # 노출을 최소화하기 위해 거부되거나 finding 이 필터된 라운드에서만, 원문이 실제로 있을 때만 보존한다.
       - name: Upload Claude review candidate
         id: upload-candidate
-        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.document-valid != 'true' && hashFiles('claude-review.md') != '' }}
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.canonicalize-review.outcome != 'skipped' && (steps.canonicalize-review.outputs.document-valid != 'true' || (steps.canonicalize-review.outputs.filtered-count != '' && steps.canonicalize-review.outputs.filtered-count != '0')) && hashFiles('claude-review.md') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: claude-candidate-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1074,7 +1077,7 @@ jobs:
           overwrite: false
 
       - name: Upload rejected Claude review diagnostic
-        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.canonicalize-review.outcome != 'skipped' && steps.canonicalize-review.outputs.document-valid != 'true' }}
+        if: ${{ always() && steps.review-budget-claim.outputs.allow-invocation == 'true' && steps.canonicalize-review.outcome != 'skipped' && (steps.canonicalize-review.outputs.document-valid != 'true' || (steps.canonicalize-review.outputs.filtered-count != '' && steps.canonicalize-review.outputs.filtered-count != '0')) }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: claude-review-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}

@@ -2774,7 +2774,9 @@ def test_rejected_candidates_retain_only_canonicalizer_owned_diagnostics(
             "${{ always() "
             "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
             "&& steps.canonicalize-review.outcome != 'skipped' "
-            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+            "&& (steps.canonicalize-review.outputs.document-valid != 'true' || "
+            "(steps.canonicalize-review.outputs.filtered-count != '' && "
+            "steps.canonicalize-review.outputs.filtered-count != '0')) }}"
         )
     assert upload == {
         "name": upload_step_name,
@@ -18689,7 +18691,9 @@ def test_gemini_uploads_the_raw_candidate_alongside_the_rejected_diagnostic():
         "${{ always() "
         "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
         "&& steps.canonicalize-review.outcome != 'skipped' "
-        "&& steps.canonicalize-review.outputs.document-valid != 'true' "
+        "&& (steps.canonicalize-review.outputs.document-valid != 'true' || "
+        "(steps.canonicalize-review.outputs.filtered-count != '' && "
+        "steps.canonicalize-review.outputs.filtered-count != '0')) "
         "&& hashFiles('gemini_review.md') != '' }}"
     )
     assert candidate["with"] == {
@@ -18789,7 +18793,9 @@ def test_claude_uploads_the_raw_candidate_alongside_the_rejected_diagnostic():
         "${{ always() "
         "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
         "&& steps.canonicalize-review.outcome != 'skipped' "
-        "&& steps.canonicalize-review.outputs.document-valid != 'true' "
+        "&& (steps.canonicalize-review.outputs.document-valid != 'true' || "
+        "(steps.canonicalize-review.outputs.filtered-count != '' && "
+        "steps.canonicalize-review.outputs.filtered-count != '0')) "
         "&& hashFiles('claude-review.md') != '' }}"
     )
     assert candidate["with"] == {
@@ -18991,6 +18997,145 @@ def test_filtered_findings_reach_the_run_summary(workflow, job, name):
     assert '[[ "$FILTERED_REASONS" =~ ^[a-z_]+(,[a-z_]+)*$ ]]' in step["run"]
     assert '>> "$GITHUB_STEP_SUMMARY"' in step["run"]
     assert "filtered-count != '0'" in step["if"]
+
+
+
+# --- a valid round whose quality filter dropped findings keeps its raw evidence (issue #163) ---
+
+PRESERVATION_UPLOADS = (
+    ("claude-code-review.yml", "claude-review", "Claude", "claude-review.md"),
+    ("gemini-auto-review.yml", "gemini-review", "Gemini", "gemini_review.md"),
+)
+
+
+def _evaluate_step_condition(condition, outputs, *, raw_present=True):
+    """Evaluate the small `if:` grammar the upload steps use against fixed step outputs."""
+
+    assert condition.startswith("${{ ") and condition.endswith(" }}")
+    expression = condition[4:-3]
+
+    def step_value(match):
+        return repr(outputs[match.group(0)])
+
+    expression = re.sub(
+        r"steps\.[a-z-]+\.(?:outputs\.[a-z-]+|outcome)", step_value, expression
+    )
+    expression = re.sub(
+        r"hashFiles\('[^']+'\)", repr("digest" if raw_present else ""), expression
+    )
+    expression = expression.replace("always()", "True")
+    expression = expression.replace("&&", " and ").replace("||", " or ")
+    assert re.fullmatch(r"[\sA-Za-z0-9'()!=_-]*", expression), expression
+    return eval(expression, {"__builtins__": {}}, {})
+
+
+def _round_outputs(document_valid, filtered_count, *, allowed="true", outcome="success"):
+    return {
+        "steps.review-budget-claim.outputs.allow-invocation": allowed,
+        "steps.canonicalize-review.outcome": outcome,
+        "steps.canonicalize-review.outputs.document-valid": document_valid,
+        "steps.canonicalize-review.outputs.filtered-count": filtered_count,
+    }
+
+
+def _preservation_uploads(workflow, job, reviewer):
+    document = _load(workflow)
+    return (
+        _step(document, job, f"Upload {reviewer} review candidate"),
+        _step(document, job, f"Upload rejected {reviewer} review diagnostic"),
+    )
+
+
+@pytest.mark.parametrize(("workflow", "job", "reviewer", "raw"), PRESERVATION_UPLOADS)
+@pytest.mark.parametrize("filtered_count", ("1", "3"))
+def test_valid_round_with_filtered_findings_preserves_candidate_and_diagnostic(
+    workflow, job, reviewer, raw, filtered_count,
+):
+    for upload in _preservation_uploads(workflow, job, reviewer):
+        assert _evaluate_step_condition(
+            upload["if"], _round_outputs("true", filtered_count)
+        ), upload["name"]
+
+
+@pytest.mark.parametrize(("workflow", "job", "reviewer", "raw"), PRESERVATION_UPLOADS)
+@pytest.mark.parametrize("filtered_count", ("0", ""))
+def test_clean_valid_round_preserves_nothing(workflow, job, reviewer, raw, filtered_count):
+    for upload in _preservation_uploads(workflow, job, reviewer):
+        assert not _evaluate_step_condition(
+            upload["if"], _round_outputs("true", filtered_count)
+        ), upload["name"]
+
+
+@pytest.mark.parametrize(("workflow", "job", "reviewer", "raw"), PRESERVATION_UPLOADS)
+@pytest.mark.parametrize("filtered_count", ("0", "", "2"))
+def test_rejected_round_still_preserves_candidate_and_diagnostic(
+    workflow, job, reviewer, raw, filtered_count,
+):
+    for upload in _preservation_uploads(workflow, job, reviewer):
+        assert _evaluate_step_condition(
+            upload["if"], _round_outputs("false", filtered_count)
+        ), upload["name"]
+
+
+@pytest.mark.parametrize(("workflow", "job", "reviewer", "raw"), PRESERVATION_UPLOADS)
+def test_filtered_round_preservation_keeps_the_admission_and_presence_gates(
+    workflow, job, reviewer, raw,
+):
+    candidate, diagnostic = _preservation_uploads(workflow, job, reviewer)
+    filtered = _round_outputs("true", "2")
+
+    assert f"hashFiles('{raw}') != ''" in candidate["if"]
+    assert not _evaluate_step_condition(candidate["if"], filtered, raw_present=False)
+    for upload in (candidate, diagnostic):
+        assert not _evaluate_step_condition(
+            upload["if"], _round_outputs("true", "2", allowed="false")
+        ), upload["name"]
+        assert not _evaluate_step_condition(
+            upload["if"], _round_outputs("true", "2", outcome="skipped")
+        ), upload["name"]
+
+
+@pytest.mark.parametrize(("workflow", "job", "reviewer", "raw"), PRESERVATION_UPLOADS)
+def test_filtered_findings_summary_names_the_preserved_artifacts(
+    workflow, job, reviewer, raw, tmp_path,
+):
+    document = _load(workflow)
+    step = _step(document, job, f"Summarize filtered {reviewer} findings")
+    candidate, diagnostic = _preservation_uploads(workflow, job, reviewer)
+
+    def resolve(value):
+        return (
+            value.replace("${{ github.run_id }}", "42")
+            .replace("${{ github.run_attempt }}", "1")
+        )
+
+    summary = tmp_path / "step-summary"
+    summary.write_text("", encoding="utf-8")
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "FILTERED_COUNT": "2",
+            "FILTERED_MAX_SEVERITY": "HIGH",
+            "FILTERED_REASONS": "missing_trigger_evidence",
+            "CANDIDATE_ARTIFACT_NAME": resolve(step["env"]["CANDIDATE_ARTIFACT_NAME"]),
+            "DIAGNOSTIC_ARTIFACT_NAME": resolve(step["env"]["DIAGNOSTIC_ARTIFACT_NAME"]),
+            "GITHUB_STEP_SUMMARY": str(summary),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert step["env"]["CANDIDATE_ARTIFACT_NAME"] == candidate["with"]["name"]
+    assert step["env"]["DIAGNOSTIC_ARTIFACT_NAME"] == diagnostic["with"]["name"]
+    prefix = reviewer.lower()
+    assert (
+        f"- Candidate artifacts (if uploaded): `{prefix}-candidate-42-1`, "
+        f"`{prefix}-review-diagnostic-42-1`"
+    ) in summary.read_text(encoding="utf-8")
 
 
 # --- v1.64: the request label starts a review on an already-open pull request (issue #111) ---

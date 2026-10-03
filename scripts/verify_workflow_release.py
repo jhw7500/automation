@@ -63,6 +63,7 @@ from scripts.workflow_release_inventory import (
     release_supports_opencode_recovery,
     release_supports_claude_rollout_fallback,
     release_supports_observational_token_estimates,
+    release_supports_filtered_candidate_preservation,
     release_supports_carryover_none,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
@@ -856,6 +857,10 @@ EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256 = {
     **EXPECTED_CLAUDE_VALIDATION_WORKFLOW_SHA256,
     "opencode": "9cc171e9c11de4c6719d73922fed0373c5db0281feae7488c55c7447025bf0ab",
 }
+# v1.79 also preserves the Gemini candidate and diagnostic when findings were filtered.
+EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256 = (
+    "9c2e725dfc175d70f5961e95ffbcc8bab28643714e92f4e195bab3fb7e74ed50"
+)
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176 = "3e8decf2bf21d007d40c0dc011b173ed0af6b2e15ae8827ae51f6986e90b813f"
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V177 = "5b53efd67b4728e01ddbd029c13dd039d93cc0c94b86bccb4e1fc1a4486c6cda"
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_AST_SHA256_V177 = "e6596be9b7670a75cad740496a34b5f3f1714e0b37b5c0dab06a7f4762ce323e"
@@ -6261,10 +6266,20 @@ def _verify_review_invocation_budget(
                     < CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE
             ):
                 expected = V1781_CLAUDE_REVIEW_SHA256
+            elif (
+                relative == ".github/workflows/claude-code-review.yml"
+                and not release_supports_filtered_candidate_preservation(ref)
+            ):
+                expected = V1782_CLAUDE_REVIEW_SHA256
             if hashlib.sha256(payload).hexdigest() != expected:
                 raise ReleaseVerificationError("invocation-budget authenticated source digest differs")
         require_budget_workflow_contract(tree, "gemini-auto-review.yml", "gemini", review_policy=True)
-        if hashlib.sha256(tree.read_file(".github/workflows/gemini-auto-review.yml")).hexdigest() != EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["gemini"]:
+        expected_gemini = (
+            EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256
+            if release_supports_filtered_candidate_preservation(ref)
+            else EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["gemini"]
+        )
+        if hashlib.sha256(tree.read_file(".github/workflows/gemini-auto-review.yml")).hexdigest() != expected_gemini:
             raise ReleaseVerificationError("invocation-budget authenticated source digest differs")
         return
     action_path = REVIEW_INVOCATION_BUDGET_ACTION_ROOT.path.as_posix()
@@ -6763,10 +6778,22 @@ def _expected_prepared_head_checkout_step(*, budget: bool = False) -> dict[str, 
     }
 
 
+def _preserved_review_round_clause(filtered: bool) -> str:
+    # v1.79 also preserves a valid round whose quality filter dropped findings.
+    if filtered:
+        return (
+            "(steps.canonicalize-review.outputs.document-valid != 'true' || "
+            "(steps.canonicalize-review.outputs.filtered-count != '' && "
+            "steps.canonicalize-review.outputs.filtered-count != '0'))"
+        )
+    return "steps.canonicalize-review.outputs.document-valid != 'true'"
+
+
 def _expected_rejected_review_diagnostic_upload_step(
     contract: dict[str, str],
     *,
     budget: bool = False,
+    filtered: bool = False,
 ) -> dict[str, object]:
     reviewer = contract["reviewer"]
     return {
@@ -6779,7 +6806,7 @@ def _expected_rejected_review_diagnostic_upload_step(
                 else ""
             )
             + "steps.canonicalize-review.outcome != 'skipped' "
-            "&& steps.canonicalize-review.outputs.document-valid != 'true' }}"
+            f"&& {_preserved_review_round_clause(filtered)} }}}}"
         ),
         "uses": UPLOAD_ARTIFACT_ACTION,
         "with": {
@@ -6797,6 +6824,8 @@ def _expected_rejected_review_diagnostic_upload_step(
 
 def _expected_review_candidate_upload_step(
     contract: dict[str, str],
+    *,
+    filtered: bool = False,
 ) -> dict[str, object]:
     reviewer = contract["reviewer"]
     return {
@@ -6806,7 +6835,7 @@ def _expected_review_candidate_upload_step(
             "${{ always() "
             "&& steps.review-budget-claim.outputs.allow-invocation == 'true' "
             "&& steps.canonicalize-review.outcome != 'skipped' "
-            "&& steps.canonicalize-review.outputs.document-valid != 'true' "
+            f"&& {_preserved_review_round_clause(filtered)} "
             f"&& hashFiles('{contract['raw']}') != '' }}}}"
         ),
         "uses": UPLOAD_ARTIFACT_ACTION,
@@ -6907,7 +6936,8 @@ def _verify_review_publication_contracts(
             if (
                 rejected_diagnostic_upload
                 != _expected_rejected_review_diagnostic_upload_step(
-                    contract, budget=budget
+                    contract, budget=budget,
+                    filtered=release_supports_filtered_candidate_preservation(ref),
                 )
             ):
                 raise ValueError("rejected review diagnostic differs")
@@ -6933,7 +6963,8 @@ def _verify_review_publication_contracts(
                     f"Upload {contract['reviewer'].capitalize()} review candidate",
                 )
                 if candidate_upload != _expected_review_candidate_upload_step(
-                    contract
+                    contract,
+                    filtered=release_supports_filtered_candidate_preservation(ref),
                 ):
                     raise ValueError("review candidate upload differs")
                 if not (
@@ -7613,7 +7644,7 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
 
 
 # Reviewed fallback inputs, never calculated from the candidate at verification time.
-# The current seals require the v1.78.2 review pre-admission hardening. Separate
+# The current seals require the v1.79 filtered-candidate preservation. Separate
 # historical router and review seals preserve exact immutable releases. Parsed
 # seals retain all existing policy statements, and raw seals additionally
 # authenticate exact bytes.
@@ -7624,7 +7655,7 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
-    ".github/workflows/claude-code-review.yml": "4042a50e7d4e5155c82677a27692482f64766eb660be07aaf88829b925f8be15",
+    ".github/workflows/claude-code-review.yml": "8e7e4e6040a23668f05ada28e60f2eb6ff8593362cbb8b6d9e6ea183eba48486",
     ".github/workflows/opencode-auto-review.yml": "ca6cbf2b1f1c9c57f524c45d4de0c863ac2bb249d0e261bbcf1da7e2017c5ea1",
     ".github/actions/recover-opencode-review/evidence.py": "1eacc5e56ad5554324eeb0ce7a9d6872d1c8e22ca95828ce34758ccc2be0fee1",
     ".github/actions/recover-opencode-review/replay.js": "1587bc1c858708d30edf1da3559cc37486d6eaa6e8fbe7d57ab6debf24e6f503",
@@ -7637,7 +7668,7 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
-    ".github/workflows/claude-code-review.yml": "8239044289476276719047121bff873731ea2c425457976379513de75182184b",
+    ".github/workflows/claude-code-review.yml": "4197edd1965b88b5a3ca2251bb854160a9d3ff726e22fcba64fbb3dd4aeab7ca",
     ".github/workflows/opencode-auto-review.yml": "da90fcad95d03f2b51120447edcf187eeb5fbdaa050ded885bb9c9907f3d7f9e",
     ".github/actions/recover-opencode-review/evidence.py": "4e27f7f7f11b3726c67f9e459554de1fc9d00586b37f18d67b7aaf67c5ff0d5b",
 }
@@ -7654,6 +7685,12 @@ V1781_CLAUDE_REVIEW_SHA256 = (
 )
 V1781_CLAUDE_REVIEW_PARSED_SHA256 = (
     "130a3ee4164a2561ce6554e1fd6ddac25de11c734e7ec9504c8980841339407f"
+)
+V1782_CLAUDE_REVIEW_SHA256 = (
+    "4042a50e7d4e5155c82677a27692482f64766eb660be07aaf88829b925f8be15"
+)
+V1782_CLAUDE_REVIEW_PARSED_SHA256 = (
+    "8239044289476276719047121bff873731ea2c425457976379513de75182184b"
 )
 FALLBACK_ACTION = "$/.github/actions/claude-rollout-fallback"
 FALLBACK_INPUT_OUTPUTS = {
@@ -7699,6 +7736,11 @@ def _fallback_parsed_seal(relative: str, value: object, ref: str = "v1.78.1") ->
         and _release_version(ref) < CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE
     ):
         expected = V1781_CLAUDE_REVIEW_PARSED_SHA256
+    elif (
+        relative == ".github/workflows/claude-code-review.yml"
+        and not release_supports_filtered_candidate_preservation(ref)
+    ):
+        expected = V1782_CLAUDE_REVIEW_PARSED_SHA256
     if hashlib.sha256(payload.encode()).hexdigest() != expected:
         raise ReleaseVerificationError("Claude fallback parsed contract differs: " + relative)
 
@@ -7955,6 +7997,11 @@ def verify_claude_rollout_fallback_contract(
                     < CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE
             ):
                 expected = V1781_CLAUDE_REVIEW_SHA256
+            elif (
+                relative == ".github/workflows/claude-code-review.yml"
+                and not release_supports_filtered_candidate_preservation(ref)
+            ):
+                expected = V1782_CLAUDE_REVIEW_SHA256
             if hashlib.sha256((root / relative).read_bytes()).hexdigest() != expected:
                 raise ReleaseVerificationError("Claude fallback authenticated source digest differs: " + relative)
     except (OSError, TypeError, ValueError, yaml.YAMLError):
