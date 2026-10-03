@@ -19179,6 +19179,32 @@ def test_opencode_empty_repair_stream_after_text_keeps_a_summary(tmp_path):
     assert "SECRETPROMPT" not in raw and "malformed review" not in raw
 
 
+def test_opencode_provider_error_redacts_mixed_case_url_schemes(tmp_path):
+    """An uppercase scheme is still a URL and must not reach the public artifact."""
+    def prepare(runner_temp):
+        _write_stream(
+            runner_temp,
+            "opencode-review.jsonl",
+            [json.dumps({
+                "type": "error",
+                "error": {"name": "APIError", "data": {
+                    "statusCode": 500,
+                    "message": "see HTTPS://internal/a?token=123 or Http://x/y",
+                }},
+            })],
+        )
+
+    envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+    raw = (diagnostic_dir / "provider_error.json").read_text(encoding="ascii")
+    message = json.loads(raw)["errors"][0]["message"]
+    assert message == "see [REDACTED] or [REDACTED]"
+    assert "internal" not in raw and "token=123" not in raw
+
+
 def test_opencode_successful_stream_writes_no_provider_diagnostic(tmp_path):
     envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
         tmp_path, [_opencode_candidate()], "success", lambda runner_temp: None

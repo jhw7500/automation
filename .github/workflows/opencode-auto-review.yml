@@ -3357,7 +3357,8 @@ jobs:
               token = re.compile(
                   r"https?://\S+"
                   r"|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-                  r"|[A-Za-z0-9_\-.+/=]{20,}"
+                  r"|[A-Za-z0-9_\-.+/=]{20,}",
+                  re.IGNORECASE,
               )
 
               def short(value, pattern):
