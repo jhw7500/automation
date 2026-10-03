@@ -27,6 +27,33 @@ PRE_V178_FILES = (
 )
 
 
+V1782_CARRYOVER_NONE_BOUNDARY_COMMIT = "74afc0057c4732993ecd76601590b8856e2a3bb3"
+CANONICALIZE_REVIEW_HELPER = ".github/actions/canonicalize-review/canonicalize_review.py"
+
+
+def restore_pre_v179_carryover_none(repo: Path) -> None:
+    """Restore the authenticated v1.78.2 canonicalizer over copied current bytes.
+
+    Like the v1.78 downgrade, restore only a current file so deliberately mutated
+    test bytes survive repeated restore chains.
+    """
+    from scripts.verify_workflow_release import (
+        EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163,
+        VerifiedCommitTree,
+    )
+
+    root = Path(__file__).resolve().parents[1]
+    path = repo / CANONICALIZE_REVIEW_HELPER
+    if path.is_file() and path.read_bytes() == (root / CANONICALIZE_REVIEW_HELPER).read_bytes():
+        tree = VerifiedCommitTree.open(root, V1782_CARRYOVER_NONE_BOUNDARY_COMMIT)
+        payload = tree.read_file(CANONICALIZE_REVIEW_HELPER)
+        assert (
+            hashlib.sha256(payload).hexdigest()
+            == EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163
+        )
+        path.write_bytes(payload)
+
+
 def restore_pre_v178_claude_rollout_fallback(repo: Path) -> None:
     """Downgrade copied current bytes before applying any older fixture patches.
 
@@ -35,6 +62,8 @@ def restore_pre_v178_claude_rollout_fallback(repo: Path) -> None:
     tree supplies the old ledger, publisher key sets, caller and catalog ceiling.
     """
     from scripts.verify_workflow_release import VerifiedCommitTree
+
+    restore_pre_v179_carryover_none(repo)
 
     root = Path(__file__).resolve().parents[1]
     tree = None

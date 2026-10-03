@@ -34,6 +34,7 @@ from release_fixture_helpers import (
     restore_pre_v172_opencode_context_budget,
     restore_pre_v173_opencode_active_section_order,
     restore_pre_v176_opencode_recovery,
+    restore_pre_v179_carryover_none,
     restore_pre_v178_claude_rollout_fallback,
     restore_pre_v170_opencode_finding_ids,
     restore_retired_manual_pr_review,
@@ -238,6 +239,7 @@ def fallback_release_repo(tmp_path):
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v179_carryover_none(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -320,6 +322,46 @@ def test_hardened_claude_fallback_candidate_is_accepted(fallback_release_repo):
     repo, candidate = fallback_release_repo
     release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.78.2")
     assert release_verifier.verify_commit_content(repo, "v1.78.2", candidate) == candidate
+
+
+CANONICALIZE_REVIEW_HELPER = ".github/actions/canonicalize-review/canonicalize_review.py"
+
+
+def prepare_v179(repo: Path) -> str:
+    shutil.copy2(ROOT / CANONICALIZE_REVIEW_HELPER, repo / CANONICALIZE_REVIEW_HELPER)
+    return commit(repo, "v1.79 carryover None candidate")
+
+
+def test_carryover_none_release_boundary() -> None:
+    assert release_inventory.release_supports_carryover_none("v1.78.2") is False
+    assert release_inventory.release_supports_carryover_none("v1.78.3") is False
+    assert release_inventory.release_supports_carryover_none("v1.79") is True
+
+
+def test_v179_accepts_carryover_none_canonicalizer(fallback_release_repo):
+    repo, _ = fallback_release_repo
+    candidate = prepare_v179(repo)
+
+    assert release_verifier.verify_commit_content(repo, "v1.79", candidate) == candidate
+
+
+def test_v179_canonicalizer_is_rejected_on_v1782_release_line(fallback_release_repo):
+    repo, _ = fallback_release_repo
+    candidate = prepare_v179(repo)
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract is invalid",
+    ):
+        release_verifier.verify_commit_content(repo, "v1.78.2", candidate)
+
+
+def test_v1782_canonicalizer_is_rejected_on_v179_release_line(fallback_release_repo):
+    repo, candidate = fallback_release_repo
+
+    with pytest.raises(
+        ReleaseVerificationError, match="canonicalize-review helper contract is invalid",
+    ):
+        release_verifier.verify_commit_content(repo, "v1.79", candidate)
 
 
 FALLBACK_MUTATIONS = {
