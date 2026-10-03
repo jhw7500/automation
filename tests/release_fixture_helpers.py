@@ -122,6 +122,45 @@ V179_FILTERED_PRESERVATION_EDITS = {
 }
 
 
+V180_PROVIDER_CLASSIFICATION_BOUNDARY_COMMIT = "1e2dc6610c96b73bf6ec0f12ea05322f17f3122a"
+PRE_V181_FILES = (
+    ".github/workflows/opencode-auto-review.yml",
+    ".github/actions/recover-opencode-review/evidence.py",
+    ".github/actions/recover-opencode-review/replay.js",
+)
+
+
+def restore_pre_v181_opencode_provider_failure_classification(repo: Path) -> None:
+    """Restore the authenticated v1.80 OpenCode workflow and recovery evidence.
+
+    Restore only a current file, so older restore chains that already replaced
+    these files, and deliberately mutated test bytes, survive.
+    """
+    from scripts.verify_workflow_release import (
+        V180_OPENCODE_AUTO_REVIEW_SHA256,
+        V180_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+        V180_OPENCODE_RECOVERY_REPLAY_SHA256,
+        VerifiedCommitTree,
+    )
+
+    expected = dict(zip(PRE_V181_FILES, (
+        V180_OPENCODE_AUTO_REVIEW_SHA256, V180_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+        V180_OPENCODE_RECOVERY_REPLAY_SHA256,
+    )))
+    root = Path(__file__).resolve().parents[1]
+    tree = None
+    for relative in PRE_V181_FILES:
+        path = repo / relative
+        if path.is_file() and path.read_bytes() == (root / relative).read_bytes():
+            if tree is None:
+                tree = VerifiedCommitTree.open(
+                    root, V180_PROVIDER_CLASSIFICATION_BOUNDARY_COMMIT
+                )
+            payload = tree.read_file(relative)
+            assert hashlib.sha256(payload).hexdigest() == expected[relative]
+            path.write_bytes(payload)
+
+
 V179_PROVIDER_ERROR_BOUNDARY_COMMIT = "dd12d04d5a0392616ead83b9654a8ea1745fbc3d"
 PRE_V180_FILES = (
     ".github/workflows/opencode-auto-review.yml",
@@ -132,23 +171,33 @@ PRE_V180_FILES = (
 def restore_pre_v180_opencode_provider_error_preservation(repo: Path) -> None:
     """Restore the authenticated v1.79 OpenCode workflow and recovery evidence.
 
-    Restore only a current file, so older restore chains that already replaced
-    these files, and deliberately mutated test bytes, survive.
+    Undo v1.81 first, then restore only a file still on exact v1.80 bytes, so
+    older restore chains that already replaced these files, and deliberately
+    mutated test bytes, survive.
     """
     from scripts.verify_workflow_release import (
         V179_OPENCODE_AUTO_REVIEW_SHA256,
         V179_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+        V180_OPENCODE_AUTO_REVIEW_SHA256,
+        V180_OPENCODE_RECOVERY_EVIDENCE_SHA256,
         VerifiedCommitTree,
     )
 
+    restore_pre_v181_opencode_provider_failure_classification(repo)
     expected = dict(zip(PRE_V180_FILES, (
         V179_OPENCODE_AUTO_REVIEW_SHA256, V179_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+    )))
+    current = dict(zip(PRE_V180_FILES, (
+        V180_OPENCODE_AUTO_REVIEW_SHA256, V180_OPENCODE_RECOVERY_EVIDENCE_SHA256,
     )))
     root = Path(__file__).resolve().parents[1]
     tree = None
     for relative in PRE_V180_FILES:
         path = repo / relative
-        if path.is_file() and path.read_bytes() == (root / relative).read_bytes():
+        if (
+            path.is_file()
+            and hashlib.sha256(path.read_bytes()).hexdigest() == current[relative]
+        ):
             if tree is None:
                 tree = VerifiedCommitTree.open(root, V179_PROVIDER_ERROR_BOUNDARY_COMMIT)
             payload = tree.read_file(relative)

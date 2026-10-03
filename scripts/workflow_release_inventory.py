@@ -182,6 +182,7 @@ CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 78)
 OBSERVATIONAL_TOKEN_ESTIMATES_RELEASE = (1, 77)
 FILTERED_CANDIDATE_PRESERVATION_RELEASE = (1, 79)
 OPENCODE_PROVIDER_ERROR_PRESERVATION_RELEASE = (1, 80)
+OPENCODE_PROVIDER_FAILURE_CLASSIFICATION_RELEASE = (1, 81)
 CARRYOVER_NONE_RELEASE = (1, 79)
 
 
@@ -341,6 +342,11 @@ def release_supports_filtered_candidate_preservation(ref: str) -> bool:
 def release_supports_opencode_provider_error_preservation(ref: str) -> bool:
     """Return whether OpenCode preserves a redacted provider-error or empty-stream diagnostic."""
     return _release_version(ref) >= OPENCODE_PROVIDER_ERROR_PRESERVATION_RELEASE
+
+
+def release_supports_opencode_provider_failure_classification(ref: str) -> bool:
+    """Return whether OpenCode refines provider_failed into the Gemini provider-failure reasons."""
+    return _release_version(ref) >= OPENCODE_PROVIDER_FAILURE_CLASSIFICATION_RELEASE
 
 
 def _with_claude_rollout_fallback_roots(
