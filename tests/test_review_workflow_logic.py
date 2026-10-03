@@ -18973,6 +18973,321 @@ def test_opencode_rejected_candidate_preservation_is_symlink_safe():
     assert "60_000" in failure_branch
 
 
+# --- provider failures and empty streams keep a redacted diagnostic (issues #199, #145) ---
+
+OPENCODE_PROVIDER_ERROR_EVENT = {
+    "type": "error",
+    "timestamp": 1,
+    "sessionID": "ses_0123456789abcdefghijklmnop",
+    "error": {
+        "name": "APIError",
+        "data": {
+            "message": (
+                "Insufficient balance or no resource package. Please recharge."
+                "\x1b See https://z.ai/billing?token=abc for help,"
+                " contact ops@example.com, key sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+            ),
+            "statusCode": 429,
+            "isRetryable": False,
+            "url": "https://api.z.ai/api/coding/paas/v4/chat/completions",
+            "responseHeaders": {
+                "set-cookie": "session=SECRETCOOKIEVALUE; Path=/",
+                "x-request-id": "REQUESTID-0001",
+            },
+            "responseBody": json.dumps(
+                {"error": {"code": "1113", "message": "SECRETBODYTEXT"}}
+            ),
+        },
+    },
+}
+
+
+def _run_opencode_materialize_with_stream(
+    tmp_path: Path, responses: list[str], outcome: str, prepare
+) -> tuple[dict[str, object], dict[str, str], Path]:
+    _run_opencode_model_step(tmp_path, responses)
+    runner_temp = tmp_path / "runner"
+    prepare(runner_temp)
+    envelope = _run_opencode_materialize_step(tmp_path, outcome)
+    outputs = _github_outputs(tmp_path / "materialize-output")
+    return envelope, outputs, runner_temp / "opencode-provider-error"
+
+
+def _write_stream(runner_temp: Path, name: str, lines: list[str]) -> None:
+    (runner_temp / name).write_text(
+        "".join(line + "\n" for line in lines), encoding="utf-8"
+    )
+
+
+def _assert_provider_failure_unchanged(envelope, outputs):
+    assert envelope["outcome"] == "failure"
+    assert envelope["failure_reason"] == "provider_failed"
+    assert set(outputs) == {
+        "review_call_count",
+        "rejected_candidate",
+        "review_elapsed_seconds",
+        "review_model_route_json",
+    }
+    assert outputs["rejected_candidate"] == "false"
+
+
+def test_opencode_provider_error_keeps_only_whitelisted_redacted_fields(tmp_path):
+    long_message = "잔액" * 200 + " sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    repair_error = {
+        "type": "error",
+        "error": {"name": "UnknownError", "data": {"message": long_message}},
+    }
+
+    def prepare(runner_temp):
+        _write_stream(
+            runner_temp,
+            "opencode-review.jsonl",
+            [json.dumps({"type": "step_start"}), json.dumps(OPENCODE_PROVIDER_ERROR_EVENT)],
+        )
+        _write_stream(
+            runner_temp, "opencode-format-repair.jsonl", [json.dumps(repair_error)]
+        )
+
+    envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+    diagnostic_path = diagnostic_dir / "provider_error.json"
+    raw = diagnostic_path.read_text(encoding="ascii")
+    diagnostic = json.loads(raw)
+    assert diagnostic == {
+        "error_events": 2,
+        "errors": [
+            {
+                "source": "opencode-review.jsonl",
+                "name": "APIError",
+                "status_code": 429,
+                "provider_code": "1113",
+                "message": (
+                    "Insufficient balance or no resource package. Please recharge."
+                    " See [REDACTED] for help, contact [REDACTED], key [REDACTED]"
+                ),
+            },
+            {
+                "source": "opencode-format-repair.jsonl",
+                "name": "UnknownError",
+                "status_code": None,
+                "provider_code": None,
+                "message": "잔액" * 33,
+            },
+        ],
+    }
+    assert len(diagnostic["errors"][1]["message"].encode("utf-8")) <= 200
+    for secret in (
+        "SECRETCOOKIEVALUE",
+        "REQUESTID",
+        "SECRETBODYTEXT",
+        "z.ai",
+        "ops@example.com",
+        "ABCDEFGHIJKLMNOP",
+        "ses_0123456789",
+        "\\u001b",
+    ):
+        assert secret not in raw
+    assert diagnostic_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_opencode_provider_error_caps_events_and_rejects_unsafe_codes(tmp_path):
+    hostile = {
+        "type": "error",
+        "error": {
+            "name": "Bad Name; rm -rf /",
+            "data": {
+                "message": "quota",
+                "statusCode": True,
+                "responseBody": json.dumps({"code": "x" * 33}),
+            },
+        },
+    }
+
+    def prepare(runner_temp):
+        _write_stream(
+            runner_temp, "opencode-review.jsonl", [json.dumps(hostile)] * 6
+        )
+
+    _, _, diagnostic_dir = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+
+    diagnostic = json.loads(
+        (diagnostic_dir / "provider_error.json").read_text(encoding="ascii")
+    )
+    assert diagnostic["error_events"] == 6
+    assert diagnostic["errors"] == [
+        {
+            "source": "opencode-review.jsonl",
+            "name": None,
+            "status_code": None,
+            "provider_code": None,
+            "message": "quota",
+        }
+    ] * 4
+
+
+def test_opencode_empty_model_stream_keeps_only_an_event_type_summary(tmp_path):
+    def prepare(runner_temp):
+        _write_stream(
+            runner_temp,
+            "opencode-review.jsonl",
+            [
+                json.dumps({"type": "step_start", "part": {"text": "SECRETPROMPT"}}),
+                json.dumps({"type": "step_finish", "sessionID": "ses_secret"}),
+                json.dumps({"type": "Bad Type With Spaces"}),
+            ],
+        )
+
+    envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+    raw = (diagnostic_dir / "provider_error.json").read_text(encoding="ascii")
+    assert json.loads(raw) == {
+        "error_events": 0,
+        "events": ["step_finish", "step_start"],
+    }
+    assert "SECRETPROMPT" not in raw and "ses_secret" not in raw
+
+
+def test_opencode_empty_repair_stream_after_text_keeps_a_summary(tmp_path):
+    """A repair stream with no text or error is evidence even when the first stream had text."""
+    def prepare(runner_temp):
+        _write_stream(
+            runner_temp,
+            "opencode-review.jsonl",
+            [json.dumps({"type": "text", "part": {"text": "malformed review"}})],
+        )
+        _write_stream(
+            runner_temp,
+            "opencode-format-repair.jsonl",
+            [json.dumps({"type": "step_start", "part": {"text": "SECRETPROMPT"}})],
+        )
+
+    envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+    raw = (diagnostic_dir / "provider_error.json").read_text(encoding="ascii")
+    assert json.loads(raw) == {"error_events": 0, "events": ["step_start", "text"]}
+    assert "SECRETPROMPT" not in raw and "malformed review" not in raw
+
+
+def test_opencode_provider_error_redacts_mixed_case_url_schemes(tmp_path):
+    """An uppercase scheme is still a URL and must not reach the public artifact."""
+    def prepare(runner_temp):
+        _write_stream(
+            runner_temp,
+            "opencode-review.jsonl",
+            [json.dumps({
+                "type": "error",
+                "error": {"name": "APIError", "data": {
+                    "statusCode": 500,
+                    "message": "see HTTPS://internal/a?token=123 or Http://x/y",
+                }},
+            })],
+        )
+
+    envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+    raw = (diagnostic_dir / "provider_error.json").read_text(encoding="ascii")
+    message = json.loads(raw)["errors"][0]["message"]
+    assert message == "see [REDACTED] or [REDACTED]"
+    assert "internal" not in raw and "token=123" not in raw
+
+
+def test_opencode_successful_stream_writes_no_provider_diagnostic(tmp_path):
+    envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
+        tmp_path, [_opencode_candidate()], "success", lambda runner_temp: None
+    )
+
+    assert envelope["outcome"] == "success"
+    assert outputs["rejected_candidate"] == "false"
+    assert not diagnostic_dir.exists()
+
+
+@pytest.mark.parametrize("variant", ("missing", "symlink", "malformed", "oversized"))
+def test_opencode_unusable_stream_is_skipped_without_changing_materialize(
+    tmp_path, variant
+):
+    def prepare(runner_temp):
+        stream = runner_temp / "opencode-review.jsonl"
+        stream.unlink(missing_ok=True)
+        if variant == "symlink":
+            target = runner_temp / "elsewhere.jsonl"
+            _write_stream(runner_temp, target.name, [json.dumps(OPENCODE_PROVIDER_ERROR_EVENT)])
+            stream.symlink_to(target)
+        elif variant == "malformed":
+            _write_stream(
+                runner_temp,
+                stream.name,
+                ["not json", json.dumps(OPENCODE_PROVIDER_ERROR_EVENT)],
+            )
+        elif variant == "oversized":
+            _write_stream(
+                runner_temp,
+                stream.name,
+                [json.dumps(OPENCODE_PROVIDER_ERROR_EVENT)]
+                + [json.dumps({"type": "step_start", "pad": "x" * 1000})] * 1000,
+            )
+
+    envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+    assert not diagnostic_dir.exists()
+
+
+def test_opencode_provider_diagnostic_failure_does_not_fail_materialize(tmp_path):
+    def prepare(runner_temp):
+        _write_stream(
+            runner_temp, "opencode-review.jsonl", [json.dumps(OPENCODE_PROVIDER_ERROR_EVENT)]
+        )
+        # A non-directory in the output slot makes the diagnostic write raise.
+        (runner_temp / "opencode-provider-error").write_text("", encoding="ascii")
+
+    envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+    assert diagnostic_dir.is_file()
+
+
+def test_opencode_provider_error_upload_is_separate_and_short_lived():
+    workflow = _load("opencode-auto-review.yml")
+    names = [step.get("name") for step in workflow["jobs"]["opencode-review"]["steps"]]
+    upload = _step(workflow, "opencode-review", "Upload OpenCode provider error")
+
+    assert upload["id"] == "upload-provider-error"
+    assert upload["if"] == (
+        "${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}"
+    )
+    assert upload["with"] == {
+        "name": (
+            "opencode-provider-error-${{ github.run_id }}-${{ github.run_attempt }}"
+        ),
+        "path": "${{ runner.temp }}/opencode-provider-error",
+        "if-no-files-found": "ignore",
+        "retention-days": "1",
+        "overwrite": "false",
+        "include-hidden-files": "false",
+    }
+    assert names.index("Materialize sealed OpenCode candidate") < names.index(
+        "Upload OpenCode provider error"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 
