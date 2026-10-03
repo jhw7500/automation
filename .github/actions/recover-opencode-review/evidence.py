@@ -96,6 +96,7 @@ APPROVED_WORKFLOW_SHA256 = frozenset({
     "9cc171e9c11de4c6719d73922fed0373c5db0281feae7488c55c7447025bf0ab",
     "ff4b2acfb3a87f66a77e5e9821d0d60237b6335cbe2a7afd6e7af484a80d66bb",
     "ca6cbf2b1f1c9c57f524c45d4de0c863ac2bb249d0e261bbcf1da7e2017c5ea1",
+    "bf402074b540b8352bd578a2488e3869ce0aeb23ea1acd9a2def036640e4c53a",
 })
 
 def _budget_module():

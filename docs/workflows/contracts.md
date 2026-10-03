@@ -1080,6 +1080,16 @@ such as `preamble`, `unknown_section_before_document`,
 that message. The two unknown-section codes reveal only whether an allowed section had already
 started, never the untrusted heading text.
 
+A provider failure leaves its cause only in the model's stdout JSONL, which is never uploaded,
+so the round previously showed `provider_failed` with no reason; an empty stream showed
+`candidate_contract_failed` with no evidence (#199, #145). From v1.80 the end of `Materialize
+sealed OpenCode candidate` extracts a whitelisted, redacted summary of those streams, and
+`Upload OpenCode provider error` uploads it as its own one-day, non-overwriting
+`opencode-provider-error-<run>-<attempt>` artifact. The step's code is the contract for which
+fields are kept and how messages are masked and truncated; headers, response bodies (beyond a
+short error code) and model text are never copied. The extraction is fail-open — it never changes the step's outcome,
+outputs, `failure_reason` or `candidate.json` — and nothing reads the summary back.
+
 Once the document boundary and trusted scope are valid, a bad individual block does not discard
 valid siblings. It is filtered or normalized with exactly one of `invalid_anchor`,
 `invalid_trigger_evidence`, `invalid_severity`, `invalid_impact_class`,

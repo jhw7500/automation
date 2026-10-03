@@ -3348,6 +3348,142 @@ jobs:
                   + json.dumps(model_route, separators=(",", ":"))
                   + "\n"
               )
+
+          # 공급자 실패(#199)와 빈 모델 스트림(#145)은 stdout JSONL 에만 흔적이 남는다.
+          # 진단은 fail-open 이다: 이상 입력은 조용히 건너뛰고 이 스텝의 결과·출력을
+          # 바꾸지 않으며, 화이트리스트 필드만 마스킹·길이 제한 후 별도 디렉터리에 쓴다.
+          def provider_error_diagnostic() -> None:
+              runner_temp = Path(os.environ["RUNNER_TEMP"])
+              token = re.compile(
+                  r"https?://\S+"
+                  r"|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+                  r"|[A-Za-z0-9_\-.+/=]{20,}"
+              )
+
+              def short(value, pattern):
+                  if isinstance(value, int) and not isinstance(value, bool):
+                      value = str(value)
+                  if isinstance(value, str) and re.fullmatch(pattern, value):
+                      return value
+                  return None
+
+              def redacted(value):
+                  if not isinstance(value, str):
+                      return None
+                  value = "".join(
+                      character
+                      for character in value[:4096]
+                      if character.isprintable()
+                  )
+                  value = token.sub("[REDACTED]", value)
+                  return value.encode("utf-8")[:200].decode("utf-8", "ignore")
+
+              errors = []
+              error_count = 0
+              types = set()
+              has_text = False
+              streams = 0
+              for source in ("opencode-review.jsonl", "opencode-format-repair.jsonl"):
+                  path = runner_temp / source
+                  try:
+                      details = path.lstat()
+                  except OSError:
+                      continue
+                  if (
+                      not stat.S_ISREG(details.st_mode)
+                      or stat.S_ISLNK(details.st_mode)
+                      or details.st_size > 1_000_000
+                  ):
+                      continue
+                  try:
+                      descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                  except OSError:
+                      continue
+                  try:
+                      if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                          continue
+                      raw = os.read(descriptor, 1_000_001)
+                  except OSError:
+                      continue
+                  finally:
+                      os.close(descriptor)
+                  if len(raw) > 1_000_000:
+                      continue
+                  try:
+                      parsed = [
+                          json.loads(line)
+                          for line in raw.decode("utf-8").splitlines()
+                          if line.strip()
+                      ]
+                  except ValueError:
+                      continue
+                  if not all(isinstance(event, dict) for event in parsed):
+                      continue
+                  streams += 1
+                  for event in parsed:
+                      kind = event.get("type")
+                      if isinstance(kind, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", kind):
+                          types.add(kind)
+                      part = event.get("part")
+                      if kind == "text" and isinstance(part, dict) and isinstance(part.get("text"), str):
+                          has_text = True
+                      if kind != "error":
+                          continue
+                      error_count += 1
+                      if len(errors) >= 4:
+                          continue
+                      error = event.get("error")
+                      error = error if isinstance(error, dict) else {}
+                      data = error.get("data")
+                      data = data if isinstance(data, dict) else {}
+                      status_code = data.get("statusCode")
+                      if (
+                          isinstance(status_code, bool)
+                          or not isinstance(status_code, int)
+                          or not 100 <= status_code <= 599
+                      ):
+                          status_code = None
+                      provider_code = None
+                      body = data.get("responseBody")
+                      if isinstance(body, str) and len(body) <= 16_384:
+                          try:
+                              body = json.loads(body)
+                          except ValueError:
+                              body = None
+                          if isinstance(body, dict):
+                              nested = body.get("error")
+                              code = nested.get("code") if isinstance(nested, dict) else None
+                              provider_code = short(
+                                  code if code is not None else body.get("code"),
+                                  r"[A-Za-z0-9_.-]{1,32}",
+                              )
+                      errors.append({
+                          "source": source,
+                          "name": short(error.get("name"), r"[A-Za-z0-9_.-]{1,64}"),
+                          "status_code": status_code,
+                          "provider_code": provider_code,
+                          "message": redacted(data.get("message")),
+                      })
+              if error_count:
+                  diagnostic = {"error_events": error_count, "errors": errors}
+              elif streams and not has_text:
+                  diagnostic = {"error_events": 0, "events": sorted(types)[:20]}
+              else:
+                  return
+              diagnostic_dir = runner_temp / "opencode-provider-error"
+              diagnostic_dir.mkdir(mode=0o700, exist_ok=True)
+              diagnostic_path = diagnostic_dir / "provider_error.json"
+              diagnostic_path.write_text(
+                  json.dumps(diagnostic, ensure_ascii=True, sort_keys=True) + "\n",
+                  encoding="ascii",
+              )
+              diagnostic_path.chmod(0o600)
+              print("OpenCode provider diagnostic preserved")
+
+          try:
+              provider_error_diagnostic()
+          except Exception:
+              print("OpenCode provider diagnostic skipped")
           PY
 
       # 거부된 후보의 원문은 sealed handoff 와 신뢰 등급이 달라 별도 아티팩트로 올린다.
@@ -3358,6 +3494,19 @@ jobs:
         with:
           name: opencode-rejected-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/opencode-rejected
+          if-no-files-found: ignore
+          overwrite: false
+          include-hidden-files: false
+          retention-days: 1
+
+      # 공급자 오류 진단은 provider 출력에서 화이트리스트 필드만 뽑은 것이라 별도 아티팩트로 올린다.
+      - name: Upload OpenCode provider error
+        id: upload-provider-error
+        if: ${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-provider-error-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/opencode-provider-error
           if-no-files-found: ignore
           overwrite: false
           include-hidden-files: false
