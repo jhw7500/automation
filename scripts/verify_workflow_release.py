@@ -64,6 +64,7 @@ from scripts.workflow_release_inventory import (
     release_supports_claude_rollout_fallback,
     release_supports_observational_token_estimates,
     release_supports_filtered_candidate_preservation,
+    release_supports_carryover_none,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
     release_supports_review_policy,
@@ -565,6 +566,9 @@ EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V162 = (
 )
 EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163 = (
     "36a2a9301e60f806c4ee32441a0bb98fccad091d96dfb63b6ca25773d3a28b3e"
+)
+EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V179 = (
+    "f5f7b4bbf2c5e0d3e0276fccdb4bfb9fccadb24bfa1ad32057ff2660ec306cc1"
 )
 EXPECTED_REVIEW_SCOPE_HELPER_SHA256 = (
     "68779c9038c31aa09a846b643bc0178b147798527e1a34ee5821ab539f10b19a"
@@ -3296,7 +3300,9 @@ def _verify_canonicalize_review_helpers(tree: VerifiedCommitTree, ref: str) -> N
         if (
             hashlib.sha256(canonical_source).hexdigest()
             != (
-                EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163
+                EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V179
+                if release_supports_carryover_none(ref)
+                else EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V163
                 if release_supports_finding_dismissal(ref)
                 else EXPECTED_CANONICALIZE_REVIEW_HELPER_SHA256_V162
                 if release_supports_filter_reason_surface(ref)

@@ -181,6 +181,7 @@ OPENCODE_RECOVERY_RELEASE = (1, 76)
 CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 78)
 OBSERVATIONAL_TOKEN_ESTIMATES_RELEASE = (1, 77)
 FILTERED_CANDIDATE_PRESERVATION_RELEASE = (1, 79)
+CARRYOVER_NONE_RELEASE = (1, 79)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -312,6 +313,12 @@ def release_supports_observational_token_estimates(ref: str) -> bool:
     """Return whether estimated input tokens are telemetry rather than invocation gates."""
 
     return _release_version(ref) >= OBSERVATIONAL_TOKEN_ESTIMATES_RELEASE
+
+
+def release_supports_carryover_none(ref: str) -> bool:
+    """Return whether the canonicalizer accepts a lone ``None`` carryover section."""
+
+    return _release_version(ref) >= CARRYOVER_NONE_RELEASE
 
 
 def release_retires_manual_pr_review(ref: str) -> bool:
