@@ -50,6 +50,64 @@ def restore_pre_v178_claude_rollout_fallback(repo: Path) -> None:
         "scripts/verify_claude_rollout_fallback.py",
     ):
         (repo / relative).unlink(missing_ok=True)
+    restore_pre_v179_filtered_candidate_preservation(repo)
+
+
+V179_PRESERVED_ROUND = (
+    "(steps.canonicalize-review.outputs.document-valid != 'true' || "
+    "(steps.canonicalize-review.outputs.filtered-count != '' && "
+    "steps.canonicalize-review.outputs.filtered-count != '0'))"
+)
+PRE_V179_PRESERVED_ROUND = "steps.canonicalize-review.outputs.document-valid != 'true'"
+V179_FILTERED_PRESERVATION_EDITS = {
+    ".github/workflows/claude-code-review.yml": (
+        (
+            "      # 노출을 최소화하기 위해 거부되거나 finding 이 필터된 라운드에서만, 원문이 실제로 있을 때만 보존한다.\n",
+            "      # 노출을 최소화하기 위해 거부된 라운드에서만, 원문이 실제로 있을 때만 보존한다.\n",
+        ),
+        (
+            "          CANDIDATE_ARTIFACT_NAME: claude-candidate-${{ github.run_id }}-${{ github.run_attempt }}\n"
+            "          DIAGNOSTIC_ARTIFACT_NAME: claude-review-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}\n",
+            "",
+        ),
+        (
+            '            printf -- "- Preserved: artifacts \\`%s\\`, \\`%s\\`\\n" "$CANDIDATE_ARTIFACT_NAME" "$DIAGNOSTIC_ARTIFACT_NAME"\n',
+            "",
+        ),
+    ),
+    ".github/workflows/gemini-auto-review.yml": (
+        (
+            "      # 노출을 최소화하기 위해 거부되거나 finding 이 필터된 라운드에서만, 진단과 같은 조건으로 보존한다.\n",
+            "      # 노출을 최소화하기 위해 거부된 라운드에서만, 진단과 같은 조건으로 보존한다.\n",
+        ),
+        (
+            "          CANDIDATE_ARTIFACT_NAME: gemini-candidate-${{ github.run_id }}-${{ github.run_attempt }}\n"
+            "          DIAGNOSTIC_ARTIFACT_NAME: gemini-review-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}\n",
+            "",
+        ),
+        (
+            "            printf -- '- Preserved: artifacts `%s`, `%s`\\n' \"$CANDIDATE_ARTIFACT_NAME\" \"$DIAGNOSTIC_ARTIFACT_NAME\"\n",
+            "",
+        ),
+    ),
+}
+
+
+def restore_pre_v179_filtered_candidate_preservation(repo: Path) -> None:
+    """Undo the v1.79 filtered-round preservation edits, only where they are present."""
+    for relative, edits in V179_FILTERED_PRESERVATION_EDITS.items():
+        path = repo / relative
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if V179_PRESERVED_ROUND not in text:
+            continue
+        assert text.count(V179_PRESERVED_ROUND) == 2
+        text = text.replace(V179_PRESERVED_ROUND, PRE_V179_PRESERVED_ROUND)
+        for new, old in edits:
+            assert text.count(new) == 1, (relative, new)
+            text = text.replace(new, old, 1)
+        path.write_text(text, encoding="utf-8")
 
 
 def restore_pre_v176_opencode_recovery(repo: Path) -> None:

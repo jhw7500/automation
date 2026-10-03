@@ -180,6 +180,7 @@ CLAUDE_WORKFLOW_VALIDATION_RELEASE = (1, 75)
 OPENCODE_RECOVERY_RELEASE = (1, 76)
 CLAUDE_ROLLOUT_FALLBACK_RELEASE = (1, 78)
 OBSERVATIONAL_TOKEN_ESTIMATES_RELEASE = (1, 77)
+FILTERED_CANDIDATE_PRESERVATION_RELEASE = (1, 79)
 
 
 def _release_version(ref: str) -> tuple[int, ...]:
@@ -322,6 +323,11 @@ def release_retires_manual_pr_review(ref: str) -> bool:
 def release_supports_claude_rollout_fallback(ref: str) -> bool:
     """Return whether the release owns the managed Claude rollout fallback."""
     return _release_version(ref) >= CLAUDE_ROLLOUT_FALLBACK_RELEASE
+
+
+def release_supports_filtered_candidate_preservation(ref: str) -> bool:
+    """Return whether Claude and Gemini also preserve the raw candidate when findings were filtered."""
+    return _release_version(ref) >= FILTERED_CANDIDATE_PRESERVATION_RELEASE
 
 
 def _with_claude_rollout_fallback_roots(
