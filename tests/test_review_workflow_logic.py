@@ -19155,6 +19155,30 @@ def test_opencode_empty_model_stream_keeps_only_an_event_type_summary(tmp_path):
     assert "SECRETPROMPT" not in raw and "ses_secret" not in raw
 
 
+def test_opencode_empty_repair_stream_after_text_keeps_a_summary(tmp_path):
+    """A repair stream with no text or error is evidence even when the first stream had text."""
+    def prepare(runner_temp):
+        _write_stream(
+            runner_temp,
+            "opencode-review.jsonl",
+            [json.dumps({"type": "text", "part": {"text": "malformed review"}})],
+        )
+        _write_stream(
+            runner_temp,
+            "opencode-format-repair.jsonl",
+            [json.dumps({"type": "step_start", "part": {"text": "SECRETPROMPT"}})],
+        )
+
+    envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+    raw = (diagnostic_dir / "provider_error.json").read_text(encoding="ascii")
+    assert json.loads(raw) == {"error_events": 0, "events": ["step_start", "text"]}
+    assert "SECRETPROMPT" not in raw and "malformed review" not in raw
+
+
 def test_opencode_successful_stream_writes_no_provider_diagnostic(tmp_path):
     envelope, outputs, diagnostic_dir = _run_opencode_materialize_with_stream(
         tmp_path, [_opencode_candidate()], "success", lambda runner_temp: None

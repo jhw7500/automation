@@ -3381,7 +3381,7 @@ jobs:
               errors = []
               error_count = 0
               types = set()
-              has_text = False
+              empty_stream = False
               streams = 0
               for source in ("opencode-review.jsonl", "opencode-format-repair.jsonl"):
                   path = runner_temp / source
@@ -3420,13 +3420,19 @@ jobs:
                   if not all(isinstance(event, dict) for event in parsed):
                       continue
                   streams += 1
+                  # Judge each stream on its own: a repair stream can be empty after a first stream with text.
+                  stream_text = any(
+                      event.get("type") == "text"
+                      and isinstance(event.get("part"), dict)
+                      and isinstance(event["part"].get("text"), str)
+                      for event in parsed
+                  )
+                  if not stream_text and not any(event.get("type") == "error" for event in parsed):
+                      empty_stream = True
                   for event in parsed:
                       kind = event.get("type")
                       if isinstance(kind, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", kind):
                           types.add(kind)
-                      part = event.get("part")
-                      if kind == "text" and isinstance(part, dict) and isinstance(part.get("text"), str):
-                          has_text = True
                       if kind != "error":
                           continue
                       error_count += 1
@@ -3466,7 +3472,7 @@ jobs:
                       })
               if error_count:
                   diagnostic = {"error_events": error_count, "errors": errors}
-              elif streams and not has_text:
+              elif empty_stream:
                   diagnostic = {"error_events": 0, "events": sorted(types)[:20]}
               else:
                   return
