@@ -996,7 +996,10 @@ may remain as additional evidence when a distinct trigger is also present. Other
 findings are unaffected.
 
 The document boundary is closed: non-blank prose before the first allowed section, after the last
-section, or in place of a declared carryover section is `ambiguous_document`. A no-finding section
+section, or in place of a declared carryover section is `ambiguous_document`. A declared carryover
+section whose body is only the lone `None` the model writes for "nothing here" is read as empty;
+the accepted bodies are the ones `_parse_document` in
+`.github/actions/canonicalize-review/canonicalize_review.py` lists (#150). A no-finding section
 accepts only the closed workflow-owned no-findings form; `None` cannot terminate parsing and hide a
 later provider error or caveat. Unknown bullets inside a finding are not silently discarded. They
 remain candidate prose and participate in proof-deficit checks, so wording such as “cannot verify”

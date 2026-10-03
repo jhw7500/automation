@@ -331,7 +331,7 @@ def _parse_document(text: str) -> dict[str, list[_Block]]:
                     "invalid_empty_new_findings",
                     meaningful[0][0] if meaningful else section_heading_lines[section],
                 )
-            if section != "New findings" and meaningful:
+            if section != "New findings" and meaningful_lines not in ([], ["None"]):
                 raise _CandidateSyntaxError("content_without_finding", meaningful[0][0])
             continue
         if section == "New findings" and any(line.strip() == "None" for line in contents):

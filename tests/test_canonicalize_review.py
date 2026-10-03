@@ -741,6 +741,44 @@ def test_candidate_symlink_is_not_followed(case_factory):
     assert canonical is None
 
 
+@pytest.mark.parametrize("section", ("Still open", "Resolved", "Retracted"))
+def test_lone_none_in_an_empty_carryover_section_is_a_clean_declaration(case_factory, section):
+    """A lone None under an empty carryover section means empty, not an ambiguous document (#150)."""
+    payload = f"### New findings\nNone\n\n### {section}\nNone\n".encode("utf-8")
+    result, canonical = case_factory(payload).run()
+    assert result.document_valid is True
+    assert result.failure_reason == ""
+    assert (result.accepted_count, result.filtered_count) == (0, 0)
+    assert f"### {section}" not in canonical
+
+
+def test_gemini_all_sections_none_document_is_a_clean_declaration(case_factory):
+    """The exact 81-byte Gemini output from #150 must canonicalize as a clean review."""
+    payload = b"### New findings\nNone\n\n### Still open\nNone\n\n### Resolved\nNone\n\n### Retracted\nNone"
+    assert len(payload) == 81
+    result, canonical = case_factory(payload).run()
+    assert result.document_valid is True
+    assert result.filtered_max_severity == "none"
+    assert canonical == "### New findings\n\nNone\n\nNo validated blocking issues found.\n"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b"### New findings\nNone\n### Still open\nNone\nunreviewed tail",
+        b"### New findings\nNone\n### Resolved\nNone\nNone",
+        b"### New findings\nNone\n### Retracted\nnone",
+    ),
+)
+def test_carryover_none_tolerance_stays_exact(case_factory, payload):
+    """Only a single exact None line is absorbed; any other content stays content_without_finding."""
+    result, canonical = case_factory(payload).run()
+    assert result.document_valid is False
+    assert result.failure_reason == "ambiguous_document"
+    assert result.to_dict()["candidate_validations"][0]["rule"] == "content_without_finding"
+    assert canonical is None
+
+
 def test_clean_canonical_output_round_trips_with_summary_prose(case_factory):
     """Canonical clean output must remain a valid clean declaration when fed back as input."""
     first, canonical = case_factory(b"No blocking issues found.").run()
