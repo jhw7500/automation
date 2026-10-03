@@ -1060,7 +1060,7 @@ jobs:
             printf '### Claude filtered findings\n\n'
             printf -- "- Filtered: \`%s\` (max severity \`%s\`)\n" "$FILTERED_COUNT" "$FILTERED_MAX_SEVERITY"
             printf -- "- Reasons: \`%s\`\n" "$FILTERED_REASONS"
-            printf -- "- Preserved: artifacts \`%s\`, \`%s\`\n" "$CANDIDATE_ARTIFACT_NAME" "$DIAGNOSTIC_ARTIFACT_NAME"
+            printf -- "- Candidate artifacts (if uploaded): \`%s\`, \`%s\`\n" "$CANDIDATE_ARTIFACT_NAME" "$DIAGNOSTIC_ARTIFACT_NAME"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # 거부된 후보의 원문이 없으면 프롬프트/포맷 회귀와 검증기 과잉을 구분할 수 없다.

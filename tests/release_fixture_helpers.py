@@ -100,7 +100,7 @@ V179_FILTERED_PRESERVATION_EDITS = {
             "",
         ),
         (
-            '            printf -- "- Preserved: artifacts \\`%s\\`, \\`%s\\`\\n" "$CANDIDATE_ARTIFACT_NAME" "$DIAGNOSTIC_ARTIFACT_NAME"\n',
+            '            printf -- "- Candidate artifacts (if uploaded): \\`%s\\`, \\`%s\\`\\n" "$CANDIDATE_ARTIFACT_NAME" "$DIAGNOSTIC_ARTIFACT_NAME"\n',
             "",
         ),
     ),
@@ -115,7 +115,7 @@ V179_FILTERED_PRESERVATION_EDITS = {
             "",
         ),
         (
-            "            printf -- '- Preserved: artifacts `%s`, `%s`\\n' \"$CANDIDATE_ARTIFACT_NAME\" \"$DIAGNOSTIC_ARTIFACT_NAME\"\n",
+            "            printf -- '- Candidate artifacts (if uploaded): `%s`, `%s`\\n' \"$CANDIDATE_ARTIFACT_NAME\" \"$DIAGNOSTIC_ARTIFACT_NAME\"\n",
             "",
         ),
     ),

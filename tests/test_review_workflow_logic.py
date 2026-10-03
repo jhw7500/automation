@@ -19133,7 +19133,7 @@ def test_filtered_findings_summary_names_the_preserved_artifacts(
     assert step["env"]["DIAGNOSTIC_ARTIFACT_NAME"] == diagnostic["with"]["name"]
     prefix = reviewer.lower()
     assert (
-        f"- Preserved: artifacts `{prefix}-candidate-42-1`, "
+        f"- Candidate artifacts (if uploaded): `{prefix}-candidate-42-1`, "
         f"`{prefix}-review-diagnostic-42-1`"
     ) in summary.read_text(encoding="utf-8")
 

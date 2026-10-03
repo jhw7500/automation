@@ -859,7 +859,7 @@ EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256 = {
 }
 # v1.79 also preserves the Gemini candidate and diagnostic when findings were filtered.
 EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256 = (
-    "1360c6aa2c9b593265a7eda7c2adccb3e345caaa71db2c3bee58538352ed62dd"
+    "9c2e725dfc175d70f5961e95ffbcc8bab28643714e92f4e195bab3fb7e74ed50"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176 = "3e8decf2bf21d007d40c0dc011b173ed0af6b2e15ae8827ae51f6986e90b813f"
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V177 = "5b53efd67b4728e01ddbd029c13dd039d93cc0c94b86bccb4e1fc1a4486c6cda"
@@ -7655,7 +7655,7 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
-    ".github/workflows/claude-code-review.yml": "8936fbc4d312df1ec5290b29335b39fa375ec6e60b76d28fbbf93fe4730fc6a3",
+    ".github/workflows/claude-code-review.yml": "8e7e4e6040a23668f05ada28e60f2eb6ff8593362cbb8b6d9e6ea183eba48486",
     ".github/workflows/opencode-auto-review.yml": "ca6cbf2b1f1c9c57f524c45d4de0c863ac2bb249d0e261bbcf1da7e2017c5ea1",
     ".github/actions/recover-opencode-review/evidence.py": "1eacc5e56ad5554324eeb0ce7a9d6872d1c8e22ca95828ce34758ccc2be0fee1",
     ".github/actions/recover-opencode-review/replay.js": "1587bc1c858708d30edf1da3559cc37486d6eaa6e8fbe7d57ab6debf24e6f503",
@@ -7668,7 +7668,7 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
-    ".github/workflows/claude-code-review.yml": "6806154b688068503f0429cd6847b4a6fe42ad371535e4cb7d3299cdfb9894d3",
+    ".github/workflows/claude-code-review.yml": "4197edd1965b88b5a3ca2251bb854160a9d3ff726e22fcba64fbb3dd4aeab7ca",
     ".github/workflows/opencode-auto-review.yml": "da90fcad95d03f2b51120447edcf187eeb5fbdaa050ded885bb9c9907f3d7f9e",
     ".github/actions/recover-opencode-review/evidence.py": "4e27f7f7f11b3726c67f9e459554de1fc9d00586b37f18d67b7aaf67c5ff0d5b",
 }
