@@ -1091,8 +1091,9 @@ short error code) and model text are never copied. The extraction is fail-open â
 or outputs â€” and nothing reads the summary back.
 
 From v1.81 the same step, before it writes `candidate.json`, refines an incoming `provider_failed`
-from the last `error` event of the last-invoked stream (the format-repair stream when it is
-usable, otherwise the review stream) into `authentication_failed`, `quota_exhausted` or
+from the last `error` event of the last-invoked stream (the format-repair stream whenever that
+call ran, otherwise the review stream; an unusable repair stream keeps `provider_failed` rather
+than borrowing an error the review call recovered from) into `authentication_failed`, `quota_exhausted` or
 `rate_limited`, the names Gemini uses; that classifier in the step is the contract for the
 mapping. Anything it cannot classify, a classifier error, and any other incoming reason leave
 `failure_reason` unchanged, and the canonicalizer and the budget stop reason carry the refined
