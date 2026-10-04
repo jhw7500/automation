@@ -66,6 +66,7 @@ from scripts.workflow_release_inventory import (
     release_supports_filtered_candidate_preservation,
     release_supports_opencode_provider_error_preservation,
     release_supports_opencode_provider_failure_classification,
+    release_supports_opencode_dismissal_coverage,
     release_supports_carryover_none,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
@@ -2611,6 +2612,7 @@ def verify_opencode_runtime(
         EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["opencode"],
         V179_OPENCODE_AUTO_REVIEW_SHA256,
         V180_OPENCODE_AUTO_REVIEW_SHA256,
+        V181_OPENCODE_AUTO_REVIEW_SHA256,
         EXPECTED_CLAUDE_FALLBACK_SHA256[".github/workflows/opencode-auto-review.yml"],
     }
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
@@ -2654,6 +2656,7 @@ def verify_opencode_runtime(
             EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["opencode"],
             V179_OPENCODE_AUTO_REVIEW_SHA256,
             V180_OPENCODE_AUTO_REVIEW_SHA256,
+            V181_OPENCODE_AUTO_REVIEW_SHA256,
             EXPECTED_CLAUDE_FALLBACK_SHA256[".github/workflows/opencode-auto-review.yml"],
         }
         and run_step.get("shell") == "bash"
@@ -6287,6 +6290,11 @@ def _verify_review_invocation_budget(
                 and not release_supports_opencode_provider_failure_classification(ref)
             ):
                 expected = V180_OPENCODE_AUTO_REVIEW_SHA256
+            elif (
+                relative == ".github/workflows/opencode-auto-review.yml"
+                and not release_supports_opencode_dismissal_coverage(ref)
+            ):
+                expected = V181_OPENCODE_AUTO_REVIEW_SHA256
             if hashlib.sha256(payload).hexdigest() != expected:
                 raise ReleaseVerificationError("invocation-budget authenticated source digest differs")
         require_budget_workflow_contract(tree, "gemini-auto-review.yml", "gemini", review_policy=True)
@@ -7670,6 +7678,18 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
                 and not release_supports_opencode_provider_failure_classification(ref)
             ):
                 expected = V180_OPENCODE_RECOVERY_REPLAY_SHA256
+            elif (
+                relative == ".github/actions/recover-opencode-review/evidence.py"
+                and release_supports_claude_rollout_fallback(ref)
+                and not release_supports_opencode_dismissal_coverage(ref)
+            ):
+                expected = V181_OPENCODE_RECOVERY_EVIDENCE_SHA256
+            elif (
+                relative == ".github/actions/recover-opencode-review/replay.js"
+                and release_supports_claude_rollout_fallback(ref)
+                and not release_supports_opencode_dismissal_coverage(ref)
+            ):
+                expected = V181_OPENCODE_RECOVERY_REPLAY_SHA256
             if hashlib.sha256(tree.read_file(relative)).hexdigest() != expected:
                 raise ReleaseVerificationError("OpenCode recovery authenticated source digest differs: " + relative)
     except (AttributeError, KeyError, TypeError, ValueError, yaml.YAMLError):
@@ -7678,7 +7698,7 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
 
 
 # Reviewed fallback inputs, never calculated from the candidate at verification time.
-# The current seals require the v1.81 OpenCode provider-failure classification. Separate
+# The current seals require the v1.82 OpenCode dismissal coverage. Separate
 # historical router and review seals preserve exact immutable releases. Parsed
 # seals retain all existing policy statements, and raw seals additionally
 # authenticate exact bytes.
@@ -7690,9 +7710,9 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
     ".github/workflows/claude-code-review.yml": "8e7e4e6040a23668f05ada28e60f2eb6ff8593362cbb8b6d9e6ea183eba48486",
-    ".github/workflows/opencode-auto-review.yml": "d9776d1b0ad3449f9f149f008fecffc842c07a536f4e9bcd4335cac29e7b970c",
-    ".github/actions/recover-opencode-review/evidence.py": "6c83ca7b47eefe4dcc6af3c09071baa9fc8e89f65b89439a1f63533a97f59f75",
-    ".github/actions/recover-opencode-review/replay.js": "7acabe04b1b08120e835e3f4a7cfe9a1d11ddc163b1981a4f3365896855852cd",
+    ".github/workflows/opencode-auto-review.yml": "2d09c40dffb85aacbb25308593186500b4e08d9c1f1fd2c14ff1d4ec44228a98",
+    ".github/actions/recover-opencode-review/evidence.py": "5b2245282d5ff7a567219afb934e4a81f4c3c017b8305accfa5917605453b0bf",
+    ".github/actions/recover-opencode-review/replay.js": "128889cd11729b034e9b26d3577a03adb8bb647148d0eeceb66550e2005ff564",
     ".github/actions/recover-opencode-review/receipt.js": "49a10b88745fce3ef3e43d6f4b5a0448b70d5e37b40e358d530a0f99dcd51d82",
 }
 EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
@@ -7703,8 +7723,8 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
     ".github/workflows/claude-code-review.yml": "4197edd1965b88b5a3ca2251bb854160a9d3ff726e22fcba64fbb3dd4aeab7ca",
-    ".github/workflows/opencode-auto-review.yml": "745731c25c5cbd02511f2c801b6d0984af81bda13a04969d2718fdcb2d0d36a1",
-    ".github/actions/recover-opencode-review/evidence.py": "8b28d81bd44059f59364086acf495bbbd0a762dc81cad8082f5083d34074b88b",
+    ".github/workflows/opencode-auto-review.yml": "655a7e2e4682d8cfda4b3927deef454cdf96219c8754c98201e6cb97a254d71f",
+    ".github/actions/recover-opencode-review/evidence.py": "7d58e85eca2e67d054b9196f3b609a5de66b62534467730872d5e61b71205658",
 }
 CLAUDE_FALLBACK_HARDENING_RELEASE = (1, 78, 1)
 CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE = (1, 78, 2)
@@ -7752,6 +7772,21 @@ V180_OPENCODE_RECOVERY_EVIDENCE_PARSED_SHA256 = (
 )
 V180_OPENCODE_RECOVERY_REPLAY_SHA256 = (
     "1587bc1c858708d30edf1da3559cc37486d6eaa6e8fbe7d57ab6debf24e6f503"
+)
+V181_OPENCODE_AUTO_REVIEW_SHA256 = (
+    "d9776d1b0ad3449f9f149f008fecffc842c07a536f4e9bcd4335cac29e7b970c"
+)
+V181_OPENCODE_AUTO_REVIEW_PARSED_SHA256 = (
+    "745731c25c5cbd02511f2c801b6d0984af81bda13a04969d2718fdcb2d0d36a1"
+)
+V181_OPENCODE_RECOVERY_EVIDENCE_SHA256 = (
+    "6c83ca7b47eefe4dcc6af3c09071baa9fc8e89f65b89439a1f63533a97f59f75"
+)
+V181_OPENCODE_RECOVERY_EVIDENCE_PARSED_SHA256 = (
+    "21528dd22ff4f61d9983cc2c7dcde01af279391b5d175bcb3dbccd207b7dfa70"
+)
+V181_OPENCODE_RECOVERY_REPLAY_SHA256 = (
+    "7acabe04b1b08120e835e3f4a7cfe9a1d11ddc163b1981a4f3365896855852cd"
 )
 FALLBACK_ACTION = "$/.github/actions/claude-rollout-fallback"
 FALLBACK_INPUT_OUTPUTS = {
@@ -7822,6 +7857,16 @@ def _fallback_parsed_seal(relative: str, value: object, ref: str = "v1.78.1") ->
         and not release_supports_opencode_provider_failure_classification(ref)
     ):
         expected = V180_OPENCODE_RECOVERY_EVIDENCE_PARSED_SHA256
+    elif (
+        relative == ".github/workflows/opencode-auto-review.yml"
+        and not release_supports_opencode_dismissal_coverage(ref)
+    ):
+        expected = V181_OPENCODE_AUTO_REVIEW_PARSED_SHA256
+    elif (
+        relative == ".github/actions/recover-opencode-review/evidence.py"
+        and not release_supports_opencode_dismissal_coverage(ref)
+    ):
+        expected = V181_OPENCODE_RECOVERY_EVIDENCE_PARSED_SHA256
     if hashlib.sha256(payload.encode()).hexdigest() != expected:
         raise ReleaseVerificationError("Claude fallback parsed contract differs: " + relative)
 
@@ -8108,6 +8153,21 @@ def verify_claude_rollout_fallback_contract(
                 and not release_supports_opencode_provider_failure_classification(ref)
             ):
                 expected = V180_OPENCODE_RECOVERY_REPLAY_SHA256
+            elif (
+                relative == ".github/workflows/opencode-auto-review.yml"
+                and not release_supports_opencode_dismissal_coverage(ref)
+            ):
+                expected = V181_OPENCODE_AUTO_REVIEW_SHA256
+            elif (
+                relative == ".github/actions/recover-opencode-review/evidence.py"
+                and not release_supports_opencode_dismissal_coverage(ref)
+            ):
+                expected = V181_OPENCODE_RECOVERY_EVIDENCE_SHA256
+            elif (
+                relative == ".github/actions/recover-opencode-review/replay.js"
+                and not release_supports_opencode_dismissal_coverage(ref)
+            ):
+                expected = V181_OPENCODE_RECOVERY_REPLAY_SHA256
             if hashlib.sha256((root / relative).read_bytes()).hexdigest() != expected:
                 raise ReleaseVerificationError("Claude fallback authenticated source digest differs: " + relative)
     except (OSError, TypeError, ValueError, yaml.YAMLError):

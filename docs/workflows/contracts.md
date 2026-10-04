@@ -791,7 +791,12 @@ identifier is omitted with reason `model_assigned_id`, because identifiers are w
 model-chosen one would decide what the budget ledger records as remaining. A block whose derived
 identifier equals one an authenticated active prior finding already holds is omitted with reason
 `duplicate_prior_id`; before identifiers existed the identical heading text alone stopped the model
-from re-reporting a finding it was also carrying over.
+from re-reporting a finding it was also carrying over. From `v1.82` a block whose heading has no
+valid severity is omitted the way the shared canonicalizer omits it: severity exactly `LOW` with
+reason `non_actionable_category`, and any other severity that is not exactly `CRITICAL`, `HIGH`, or
+`MEDIUM` — including a missing one or a different casing such as `[High]` — with reason
+`invalid_severity`. Such a heading receives no identifier, so publishing it let a dismissed finding
+return under a lower or unreadable severity that no dismissal could name.
 
 From `v1.71` a carryover block is checked on its own instead of with every other carryover anchor at
 once, because one stale anchor — routine once the head advances past an earlier finding — discarded
@@ -937,8 +942,13 @@ re-derived, so a moved anchor cannot silently void a dismissal naming it. Carryo
 unchanged and still keys on exact heading text, so a review published before this version—whose
 headings carry no identifier—still binds, and its findings receive an identifier on the first round
 after the upgrade, derived from the anchor they hold at that moment. A heading whose severity is
-absent or outside the closed set keeps its exact bytes and receives no identifier: such a finding
-cannot be named by a dismissal, and nothing that publishes today changes shape. `Resolved` and
+absent or outside the closed set receives no identifier. `v1.71` through `v1.81` published such a
+block unchanged, as a non-finding without an identifier that no dismissal could name; from `v1.82`
+it is retired instead — filtered as a new finding (see the omission reasons above) and, when a
+prior body still holds one, dropped with normalization reason `invalid_severity` wherever it would
+stay in or return to `Still open`: a valid `Still open` block, or a `Resolved`/`Retracted` block
+whose out-of-scope anchor would otherwise republish it there. Every other carryover check still
+applies first, so such a block with invalid evidence still fails the round closed. `Resolved` and
 `Retracted` blocks leave the active set and are republished unchanged.
 If every new block is omitted, the canonical section becomes exactly `### New findings` followed by
 `None`; the successful attested comment reports `filtered_invalid_new_findings=N` and the sorted
@@ -1617,10 +1627,17 @@ request stops applying until enough comments are deleted; the bound is twice the
 remaining-finding cap and is not expected to be reached in normal use. Deleting a comment
 revokes its dismissal on the next run; editing it re-targets it. A refused claim — including
 `round_budget_exhausted` after every round is spent — still records the snapshot and rewrites the
-ledger comment, so a dismissal takes effect without a new model round. From `v1.71` the OpenCode
+ledger comment, so a dismissal takes effect in the ledger without a new model round. From `v1.71` the OpenCode
 ledger records and reports dismissals like every other reviewer; until `v1.70` gave that reviewer
 `RVW-` identifiers there was nothing for a dismissal to name, and the exclusion has no reason to
-survive that.
+survive that. The OpenCode review body follows the ledger on every published round: a model round
+drops dismissed blocks during canonicalization, and from `v1.82` an `unchanged` reuse round, which
+runs no model, removes every `New findings` or `Still open` block whose identifier is dismissed
+from the republished previous body, writes `None` into a section that removal empties, and derives
+its remaining IDs from that body. A reuse round with no dismissed identifier in the previous body, or
+whose previous body does not parse, republishes it byte-for-byte as before; a failed or stale
+round republishes the previous body unchanged, so there the body catches up on the next successful
+round.
 
 The ledger key `dismissed_findings` is written only when at least one dismissal exists; a ledger
 without one keeps its exact pre-`v1.63` bytes, so every open pull request stays valid across the

@@ -8,7 +8,8 @@ const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const approved = new Set(['b8804d0c387e4f7e554443a1d0edd5862d9c4b1c1435de4140c621c241a25df5',
   '3915f9bc32985745996d2246017cff9122460d25a071ca72568ac73c75339371',
   'deb5353681c02b8932b9da47c49c28549654f6b8dc5852c58e7497de84e6623a',
-  '451d33c21930acdbd74674dddb7031fecc4d9d9d4e3e22289f40b4c1d2aa7c8a']);
+  '451d33c21930acdbd74674dddb7031fecc4d9d9d4e3e22289f40b4c1d2aa7c8a',
+  'd7dc09163605415f95669565a6ff170912f1c0def83f5fe430fc7bd9cec7c7ee']);
 if (!approved.has(crypto.createHash('sha256').update(input.source).digest('hex'))) {
   throw new Error('original_replay_unsupported');
 }
