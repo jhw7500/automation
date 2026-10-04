@@ -19378,9 +19378,7 @@ def test_opencode_provider_failure_uses_the_last_error_event(tmp_path, events, e
 
 
 @pytest.mark.parametrize("variant", ("symlink", "malformed", "oversized", "non-object"))
-def test_opencode_unusable_repair_stream_falls_back_to_the_review_stream(
-    tmp_path, variant
-):
+def test_opencode_unusable_repair_stream_keeps_provider_failed(tmp_path, variant):
     def prepare(runner_temp):
         _write_stream(runner_temp, "opencode-review.jsonl", [_provider_error(401)])
         repair = runner_temp / "opencode-format-repair.jsonl"
@@ -19404,7 +19402,8 @@ def test_opencode_unusable_repair_stream_falls_back_to_the_review_stream(
         tmp_path, [], "failure", prepare
     )
 
-    _assert_provider_failure_unchanged(envelope, outputs, "authentication_failed")
+    # The repair call ran, so the review stream's 401 must not label its failure.
+    _assert_provider_failure_unchanged(envelope, outputs)
 
 
 @pytest.mark.parametrize(
@@ -19422,8 +19421,26 @@ def test_opencode_provider_classification_error_keeps_provider_failed(tmp_path):
     # A deeply nested body makes the JSON decoder raise RecursionError, not ValueError.
     body = '{"error":' + "[" * 8000 + "]" * 8000 + "}"
     assert len(body) <= 16_384
+    # The step runs PATH python3; newer interpreters parse this depth without raising.
+    probe = subprocess.run(
+        ["python3", "-c", "import json,sys; json.loads(sys.stdin.read())"],
+        input=body, text=True, capture_output=True,
+    )
+    if "RecursionError" not in probe.stderr:
+        pytest.skip("python3 parses this nesting without RecursionError")
     envelope, outputs = _classify_opencode_streams(
         tmp_path, [_provider_error(429, body=body)]
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+
+
+def test_opencode_unusable_repair_stream_does_not_inherit_review_errors(tmp_path):
+    """A repair call that ran but left an unusable stream must not reuse the review call's error."""
+    envelope, outputs = _classify_opencode_streams(
+        tmp_path,
+        [_provider_error(429, "1113"), json.dumps({"type": "text", "part": {"text": "draft"}})],
+        repair=['{"type": "error", "error": {"name": "APIError"'],
     )
 
     _assert_provider_failure_unchanged(envelope, outputs)

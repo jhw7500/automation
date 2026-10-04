@@ -3391,8 +3391,12 @@ jobs:
           # 마지막 error 이벤트만으로 세분한다. 판단할 수 없으면 provider_failed 를 유지한다.
           def classified_provider_failure() -> str:
               runner_temp = Path(os.environ["RUNNER_TEMP"])
-              events = read_provider_stream(runner_temp / "opencode-format-repair.jsonl")
-              if events is None:
+              repair = runner_temp / "opencode-format-repair.jsonl"
+              # Once the repair call ran, its stream alone decides: an unusable repair stream
+              # must not inherit an error the earlier review call already recovered from.
+              if os.path.lexists(repair):
+                  events = read_provider_stream(repair)
+              else:
                   events = read_provider_stream(runner_temp / "opencode-review.jsonl")
               errors = [event for event in events or () if event.get("type") == "error"]
               if not errors:
