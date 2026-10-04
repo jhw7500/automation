@@ -1087,8 +1087,17 @@ sealed OpenCode candidate` extracts a whitelisted, redacted summary of those str
 `Upload OpenCode provider error` uploads it as its own one-day, non-overwriting
 `opencode-provider-error-<run>-<attempt>` artifact. The step's code is the contract for which
 fields are kept and how messages are masked and truncated; headers, response bodies (beyond a
-short error code) and model text are never copied. The extraction is fail-open — it never changes the step's outcome,
-outputs, `failure_reason` or `candidate.json` — and nothing reads the summary back.
+short error code) and model text are never copied. The extraction is fail-open — it never changes the step's outcome
+or outputs — and nothing reads the summary back.
+
+From v1.81 the same step, before it writes `candidate.json`, refines an incoming `provider_failed`
+from the last `error` event of the last-invoked stream (the format-repair stream whenever that
+call ran, otherwise the review stream; an unusable repair stream keeps `provider_failed` rather
+than borrowing an error the review call recovered from) into `authentication_failed`, `quota_exhausted` or
+`rate_limited`, the names Gemini uses; that classifier in the step is the contract for the
+mapping. Anything it cannot classify, a classifier error, and any other incoming reason leave
+`failure_reason` unchanged, and the canonicalizer and the budget stop reason carry the refined
+reason through.
 
 Once the document boundary and trusted scope are valid, a bad individual block does not discard
 valid siblings. It is filtered or normalized with exactly one of `invalid_anchor`,
@@ -1374,8 +1383,9 @@ Finding-like content or an allowed review section after an enclosing fence is li
 rather than treated as wrapper text. An
 unsafe-to-sign or malformed repair is terminal; there is no third call and no candidate upload. The
 model job reports `model_job_failed` for setup/infrastructure failure, `provider_failed` only when a
-model process fails, and `candidate_contract_failed` when post-response preflight rejects the
-candidate. The candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name
+model process fails (sealed from v1.81 as `authentication_failed`, `quota_exhausted` or
+`rate_limited` when the provider error identifies one, see above), and
+`candidate_contract_failed` when post-response preflight rejects the candidate. The candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name
 artifact. This preflight never replaces or relaxes the clean canonicalizer's semantic, scope, and
 provenance checks.
 

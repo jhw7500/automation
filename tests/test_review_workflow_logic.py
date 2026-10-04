@@ -14211,7 +14211,8 @@ def _run_opencode_canonicalize(
                 failure_reason
                 if failure_reason in {
                     "model_job_failed", "provider_failed", "candidate_contract_failed",
-                    "call_budget_exhausted",
+                    "call_budget_exhausted", "quota_exhausted", "rate_limited",
+                    "authentication_failed",
                 }
                 else "provider_failed"
             ),
@@ -19019,9 +19020,9 @@ def _write_stream(runner_temp: Path, name: str, lines: list[str]) -> None:
     )
 
 
-def _assert_provider_failure_unchanged(envelope, outputs):
+def _assert_provider_failure_unchanged(envelope, outputs, reason="provider_failed"):
     assert envelope["outcome"] == "failure"
-    assert envelope["failure_reason"] == "provider_failed"
+    assert envelope["failure_reason"] == reason
     assert set(outputs) == {
         "review_call_count",
         "rejected_candidate",
@@ -19260,8 +19261,310 @@ def test_opencode_provider_diagnostic_failure_does_not_fail_materialize(tmp_path
         tmp_path, [], "failure", prepare
     )
 
-    _assert_provider_failure_unchanged(envelope, outputs)
+    # The classification does not depend on the diagnostic write succeeding.
+    _assert_provider_failure_unchanged(envelope, outputs, "quota_exhausted")
     assert diagnostic_dir.is_file()
+
+
+def _provider_error(status_code=None, provider_code=None, body=None) -> str:
+    data = {"message": "provider said no"}
+    if status_code is not None:
+        data["statusCode"] = status_code
+    if body is not None:
+        data["responseBody"] = body
+    elif provider_code is not None:
+        data["responseBody"] = json.dumps({"error": {"code": provider_code}})
+    return json.dumps({"type": "error", "error": {"name": "APIError", "data": data}})
+
+
+def _classify_opencode_streams(tmp_path, review, repair=None, reason=None):
+    def prepare(runner_temp):
+        (runner_temp / "opencode-format-repair.jsonl").unlink(missing_ok=True)
+        _write_stream(runner_temp, "opencode-review.jsonl", review)
+        if repair is not None:
+            _write_stream(runner_temp, "opencode-format-repair.jsonl", repair)
+        if reason is not None:
+            # A later line wins in the model step output the materialize harness reads.
+            with (tmp_path / "github-output").open("a", encoding="utf-8") as output:
+                output.write(f"failure_reason={reason}\n")
+
+    envelope, outputs, _ = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+    return envelope, outputs
+
+
+@pytest.mark.parametrize(
+    ("status_code", "provider_code", "expected"),
+    (
+        (429, "1113", "quota_exhausted"),
+        (429, 1113, "quota_exhausted"),
+        (429, "1302", "rate_limited"),
+        (429, None, "rate_limited"),
+        (401, None, "authentication_failed"),
+        (401, "1113", "authentication_failed"),
+        (403, "1113", "provider_failed"),
+        (500, None, "provider_failed"),
+        (None, "1113", "provider_failed"),
+        ("429", "1113", "provider_failed"),
+        (True, "1113", "provider_failed"),
+    ),
+)
+def test_opencode_provider_failure_is_classified_from_the_last_error(
+    tmp_path, status_code, provider_code, expected
+):
+    """The sealed envelope carries the classified reason, not the model step's provider_failed."""
+    envelope, outputs = _classify_opencode_streams(
+        tmp_path,
+        [json.dumps({"type": "step_start"}), _provider_error(status_code, provider_code)],
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs, expected)
+    # The model step itself only ever reports provider_failed.
+    assert _github_outputs(tmp_path / "github-output")["failure_reason"] == "provider_failed"
+
+
+def test_opencode_provider_failure_without_an_error_event_stays_provider_failed(tmp_path):
+    envelope, outputs = _classify_opencode_streams(
+        tmp_path, [json.dumps({"type": "step_start"})]
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+
+
+@pytest.mark.parametrize(
+    ("review", "repair", "expected"),
+    (
+        # The first stream recovered from a 429; the repair stream's own error decides.
+        ([_provider_error(429, "1113")], [_provider_error(500)], "provider_failed"),
+        ([_provider_error(500)], [_provider_error(401)], "authentication_failed"),
+        # An error-free repair stream means nothing to classify, whatever the first one said.
+        (
+            [_provider_error(429, "1113")],
+            [json.dumps({"type": "step_start"})],
+            "provider_failed",
+        ),
+    ),
+    ids=("repair-500", "repair-401", "repair-without-error"),
+)
+def test_opencode_provider_failure_reads_only_the_last_invoked_stream(
+    tmp_path, review, repair, expected
+):
+    envelope, outputs = _classify_opencode_streams(tmp_path, review, repair)
+
+    _assert_provider_failure_unchanged(envelope, outputs, expected)
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    (
+        (
+            [
+                _provider_error(429, "1113"),
+                json.dumps({"type": "text", "part": {"text": "retrying"}}),
+                _provider_error(500),
+            ],
+            "provider_failed",
+        ),
+        ([_provider_error(500), _provider_error(429, "1302")], "rate_limited"),
+        ([_provider_error(403)] * 5 + [_provider_error(429, "1113")], "quota_exhausted"),
+    ),
+    ids=("later-500", "later-429", "beyond-diagnostic-cap"),
+)
+def test_opencode_provider_failure_uses_the_last_error_event(tmp_path, events, expected):
+    envelope, outputs = _classify_opencode_streams(tmp_path, events)
+
+    _assert_provider_failure_unchanged(envelope, outputs, expected)
+
+
+@pytest.mark.parametrize("variant", ("symlink", "malformed", "oversized", "non-object"))
+def test_opencode_unusable_repair_stream_keeps_provider_failed(tmp_path, variant):
+    def prepare(runner_temp):
+        _write_stream(runner_temp, "opencode-review.jsonl", [_provider_error(401)])
+        repair = runner_temp / "opencode-format-repair.jsonl"
+        repair.unlink(missing_ok=True)
+        if variant == "symlink":
+            _write_stream(runner_temp, "elsewhere.jsonl", [_provider_error(429, "1113")])
+            repair.symlink_to(runner_temp / "elsewhere.jsonl")
+        elif variant == "malformed":
+            _write_stream(runner_temp, repair.name, ["not json", _provider_error(429)])
+        elif variant == "oversized":
+            _write_stream(
+                runner_temp,
+                repair.name,
+                [_provider_error(429, "1113")]
+                + [json.dumps({"type": "step_start", "pad": "x" * 1000})] * 1000,
+            )
+        else:
+            _write_stream(runner_temp, repair.name, [_provider_error(429), "[]"])
+
+    envelope, outputs, _ = _run_opencode_materialize_with_stream(
+        tmp_path, [], "failure", prepare
+    )
+
+    # The repair call ran, so the review stream's 401 must not label its failure.
+    _assert_provider_failure_unchanged(envelope, outputs)
+
+
+@pytest.mark.parametrize(
+    "reason", ("candidate_contract_failed", "model_job_failed", "call_budget_exhausted")
+)
+def test_opencode_provider_classification_leaves_other_reasons_untouched(tmp_path, reason):
+    envelope, outputs = _classify_opencode_streams(
+        tmp_path, [_provider_error(429, "1113")], reason=reason
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs, reason)
+
+
+def test_opencode_provider_classification_error_keeps_provider_failed(tmp_path):
+    # A deeply nested body makes the JSON decoder raise RecursionError, not ValueError.
+    body = '{"error":' + "[" * 8000 + "]" * 8000 + "}"
+    assert len(body) <= 16_384
+    # The step runs PATH python3; newer interpreters parse this depth without raising.
+    probe = subprocess.run(
+        ["python3", "-c", "import json,sys; json.loads(sys.stdin.read())"],
+        input=body, text=True, capture_output=True,
+    )
+    if "RecursionError" not in probe.stderr:
+        pytest.skip("python3 parses this nesting without RecursionError")
+    envelope, outputs = _classify_opencode_streams(
+        tmp_path, [_provider_error(429, body=body)]
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+
+
+def test_opencode_unusable_repair_stream_does_not_inherit_review_errors(tmp_path):
+    """A repair call that ran but left an unusable stream must not reuse the review call's error."""
+    envelope, outputs = _classify_opencode_streams(
+        tmp_path,
+        [_provider_error(429, "1113"), json.dumps({"type": "text", "part": {"text": "draft"}})],
+        repair=['{"type": "error", "error": {"name": "APIError"'],
+    )
+
+    _assert_provider_failure_unchanged(envelope, outputs)
+
+
+def test_opencode_provider_classification_is_skipped_on_success(tmp_path):
+    def prepare(runner_temp):
+        _write_stream(runner_temp, "opencode-format-repair.jsonl", [_provider_error(401)])
+
+    envelope, outputs, _ = _run_opencode_materialize_with_stream(
+        tmp_path, [_opencode_candidate()], "success", prepare
+    )
+
+    assert envelope["outcome"] == "success"
+    assert envelope["failure_reason"] == "none"
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("status_code", "provider_code", "expected"),
+    (
+        (429, "1113", "quota_exhausted"),
+        (429, "1302", "rate_limited"),
+        (401, None, "authentication_failed"),
+    ),
+)
+def test_opencode_classified_provider_failure_is_accepted_by_the_canonicalizer(
+    tmp_path, status_code, provider_code, expected
+):
+    """Feed the reason the materialize step actually sealed into the canonicalizer."""
+    materialize_dir = tmp_path / "materialize"
+    materialize_dir.mkdir()
+    envelope, _ = _classify_opencode_streams(
+        materialize_dir, [_provider_error(status_code, provider_code)]
+    )
+    assert envelope["failure_reason"] == expected
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [],
+        outcome="failure",
+        candidate_envelope_changes={"failure_reason": envelope["failure_reason"]},
+    )
+
+    outputs = {
+        name: [call[2] for call in calls if call[0] == "output" and call[1] == name]
+        for name in ("budget_metrics_valid", "validated_failure_reason")
+    }
+    assert outputs["budget_metrics_valid"][-1] == "true"
+    assert outputs["validated_failure_reason"] == [expected]
+    body = _single_mutation_body(calls)
+    assert f"Reason: {expected}" in body
+    assert "Reason: model_job_failed" not in body
+
+
+@node_required
+def test_opencode_canonicalizer_still_rejects_an_unknown_failure_reason(tmp_path):
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [],
+        [],
+        outcome="failure",
+        candidate_envelope_changes={"failure_reason": "insufficient_balance"},
+    )
+
+    assert [
+        call[2] for call in calls
+        if call[0] == "output" and call[1] == "budget_metrics_valid"
+    ] == ["false"]
+    assert not [
+        call for call in calls
+        if call[0] == "output" and call[1] == "validated_failure_reason"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_stop"),
+    (
+        ("quota_exhausted", "quota_exhausted"),
+        ("rate_limited", "rate_limited"),
+        ("authentication_failed", "authentication_failed"),
+        ("provider_failed", "provider_failed"),
+        ("model_job_failed", "model_job_failed"),
+        ("candidate_contract_failed", "candidate_contract_failed"),
+        ("unexpected_reason", "provider_failure"),
+    ),
+)
+def test_opencode_budget_outcome_passes_classified_provider_reasons(
+    tmp_path, reason, expected_stop
+):
+    step = _step(
+        _load("opencode-auto-review.yml"),
+        "opencode-canonicalize",
+        "Resolve OpenCode budget outcome",
+    )
+    failed_review = (
+        '{"success":false,"head_sha":null,"full_diff_sha256":null,'
+        '"remaining_finding_ids":[]}'
+    )
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={
+            **os.environ,
+            "PROVIDER_OUTCOME": "failure",
+            "PROVIDER_FAILURE_REASON": reason,
+            "CALL_COUNT": "1",
+            "ELAPSED_SECONDS": "5",
+            "PUBLICATION_SUCCEEDED": "true",
+            "REVIEW_SUCCEEDED": "false",
+            "QUALITY_FILTERED": "false",
+            "PUBLISHED_AUTHENTICATED_REVIEW_JSON": failed_review,
+            "PUBLISHED_REMAINING_FINDING_IDS_JSON": "[]",
+            "PREVIOUS_AUTHENTICATED_REVIEW_JSON": failed_review,
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False, capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    values = _github_outputs(output)
+    assert values["outcome"] == "provider_failure"
+    assert values["stop_reason"] == expected_stop
 
 
 def test_opencode_provider_error_upload_is_separate_and_short_lived():

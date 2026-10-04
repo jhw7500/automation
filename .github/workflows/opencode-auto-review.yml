@@ -3197,6 +3197,9 @@ jobs:
               "provider_failed",
               "candidate_contract_failed",
               "call_budget_exhausted",
+              "quota_exhausted",
+              "rate_limited",
+              "authentication_failed",
           }
           validation_rules = {
               "candidate_contract",
@@ -3310,6 +3313,107 @@ jobs:
           for attempt in ("initial", "repair"):
               (candidate_dir / f"{attempt}-validation.json").unlink(missing_ok=True)
 
+          # 모델 스트림은 신뢰할 수 없는 입력이다: 정규 파일·비심링크·크기 상한을 통과하고
+          # 모든 줄이 JSON 객체일 때만 이벤트 목록을 돌려주며, 그 밖에는 None 이다.
+          def read_provider_stream(path: Path):
+              try:
+                  details = path.lstat()
+              except OSError:
+                  return None
+              if (
+                  not stat.S_ISREG(details.st_mode)
+                  or stat.S_ISLNK(details.st_mode)
+                  or details.st_size > 1_000_000
+              ):
+                  return None
+              try:
+                  descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+              except OSError:
+                  return None
+              try:
+                  if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                      return None
+                  raw = os.read(descriptor, 1_000_001)
+              except OSError:
+                  return None
+              finally:
+                  os.close(descriptor)
+              if len(raw) > 1_000_000:
+                  return None
+              try:
+                  parsed = [
+                      json.loads(line)
+                      for line in raw.decode("utf-8").splitlines()
+                      if line.strip()
+                  ]
+              except ValueError:
+                  return None
+              if not all(isinstance(event, dict) for event in parsed):
+                  return None
+              return parsed
+
+          def short(value, pattern):
+              if isinstance(value, int) and not isinstance(value, bool):
+                  value = str(value)
+              if isinstance(value, str) and re.fullmatch(pattern, value):
+                  return value
+              return None
+
+          def provider_error_codes(event):
+              error = event.get("error")
+              error = error if isinstance(error, dict) else {}
+              data = error.get("data")
+              data = data if isinstance(data, dict) else {}
+              status_code = data.get("statusCode")
+              if (
+                  isinstance(status_code, bool)
+                  or not isinstance(status_code, int)
+                  or not 100 <= status_code <= 599
+              ):
+                  status_code = None
+              provider_code = None
+              body = data.get("responseBody")
+              if isinstance(body, str) and len(body) <= 16_384:
+                  try:
+                      body = json.loads(body)
+                  except ValueError:
+                      body = None
+                  if isinstance(body, dict):
+                      nested = body.get("error")
+                      code = nested.get("code") if isinstance(nested, dict) else None
+                      provider_code = short(
+                          code if code is not None else body.get("code"),
+                          r"[A-Za-z0-9_.-]{1,32}",
+                      )
+              return error, data, status_code, provider_code
+
+          # 공급자 실패(#199)는 마지막으로 호출된 스트림(있으면 format-repair, 아니면 review)의
+          # 마지막 error 이벤트만으로 세분한다. 판단할 수 없으면 provider_failed 를 유지한다.
+          def classified_provider_failure() -> str:
+              runner_temp = Path(os.environ["RUNNER_TEMP"])
+              repair = runner_temp / "opencode-format-repair.jsonl"
+              # Once the repair call ran, its stream alone decides: an unusable repair stream
+              # must not inherit an error the earlier review call already recovered from.
+              if os.path.lexists(repair):
+                  events = read_provider_stream(repair)
+              else:
+                  events = read_provider_stream(runner_temp / "opencode-review.jsonl")
+              errors = [event for event in events or () if event.get("type") == "error"]
+              if not errors:
+                  return "provider_failed"
+              _, _, status_code, provider_code = provider_error_codes(errors[-1])
+              if status_code == 401:
+                  return "authentication_failed"
+              if status_code == 429:
+                  return "quota_exhausted" if provider_code == "1113" else "rate_limited"
+              return "provider_failed"
+
+          if failure_reason == "provider_failed":
+              try:
+                  failure_reason = classified_provider_failure()
+              except Exception:
+                  failure_reason = "provider_failed"
+
           envelope = {
               "schema": 2,
               "repository": identity["repository"],
@@ -3361,13 +3465,6 @@ jobs:
                   re.IGNORECASE,
               )
 
-              def short(value, pattern):
-                  if isinstance(value, int) and not isinstance(value, bool):
-                      value = str(value)
-                  if isinstance(value, str) and re.fullmatch(pattern, value):
-                      return value
-                  return None
-
               def redacted(value):
                   if not isinstance(value, str):
                       return None
@@ -3385,40 +3482,8 @@ jobs:
               empty_stream = False
               streams = 0
               for source in ("opencode-review.jsonl", "opencode-format-repair.jsonl"):
-                  path = runner_temp / source
-                  try:
-                      details = path.lstat()
-                  except OSError:
-                      continue
-                  if (
-                      not stat.S_ISREG(details.st_mode)
-                      or stat.S_ISLNK(details.st_mode)
-                      or details.st_size > 1_000_000
-                  ):
-                      continue
-                  try:
-                      descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-                  except OSError:
-                      continue
-                  try:
-                      if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                          continue
-                      raw = os.read(descriptor, 1_000_001)
-                  except OSError:
-                      continue
-                  finally:
-                      os.close(descriptor)
-                  if len(raw) > 1_000_000:
-                      continue
-                  try:
-                      parsed = [
-                          json.loads(line)
-                          for line in raw.decode("utf-8").splitlines()
-                          if line.strip()
-                      ]
-                  except ValueError:
-                      continue
-                  if not all(isinstance(event, dict) for event in parsed):
+                  parsed = read_provider_stream(runner_temp / source)
+                  if parsed is None:
                       continue
                   streams += 1
                   # Judge each stream on its own: a repair stream can be empty after a first stream with text.
@@ -3439,31 +3504,7 @@ jobs:
                       error_count += 1
                       if len(errors) >= 4:
                           continue
-                      error = event.get("error")
-                      error = error if isinstance(error, dict) else {}
-                      data = error.get("data")
-                      data = data if isinstance(data, dict) else {}
-                      status_code = data.get("statusCode")
-                      if (
-                          isinstance(status_code, bool)
-                          or not isinstance(status_code, int)
-                          or not 100 <= status_code <= 599
-                      ):
-                          status_code = None
-                      provider_code = None
-                      body = data.get("responseBody")
-                      if isinstance(body, str) and len(body) <= 16_384:
-                          try:
-                              body = json.loads(body)
-                          except ValueError:
-                              body = None
-                          if isinstance(body, dict):
-                              nested = body.get("error")
-                              code = nested.get("code") if isinstance(nested, dict) else None
-                              provider_code = short(
-                                  code if code is not None else body.get("code"),
-                                  r"[A-Za-z0-9_.-]{1,32}",
-                              )
+                      error, data, status_code, provider_code = provider_error_codes(event)
                       errors.append({
                           "source": source,
                           "name": short(error.get("name"), r"[A-Za-z0-9_.-]{1,64}"),
@@ -3958,7 +3999,8 @@ jobs:
                     !== JSON.stringify(['zai-coding-plan/glm-4.7'])
                   || !['success', 'failure'].includes(candidateEnvelope.outcome)
                   || !new Set(['none', 'model_job_failed', 'provider_failed',
-                    'candidate_contract_failed', 'call_budget_exhausted'])
+                    'candidate_contract_failed', 'call_budget_exhausted',
+                    'quota_exhausted', 'rate_limited', 'authentication_failed'])
                     .has(candidateEnvelope.failure_reason)) {
                   throw new Error('candidate metrics invalid');
                 }
@@ -4020,7 +4062,8 @@ jobs:
               ? candidateEnvelope.failure_reason : (process.env.REVIEW_FAILURE_REASON || '');
             const modelFailureReason = new Set([
               'model_job_failed', 'provider_failed', 'candidate_contract_failed',
-              'call_budget_exhausted',
+              'call_budget_exhausted', 'quota_exhausted', 'rate_limited',
+              'authentication_failed',
             ]).has(reportedReviewFailure) ? reportedReviewFailure : 'model_job_failed';
             const parseRecord = (comment) => {
               const lines = (comment.body || '').split('\n');
@@ -5595,7 +5638,7 @@ jobs:
           elif [[ "$PROVIDER_OUTCOME" == 'failure' ]]; then
             outcome='provider_failure'
             case "$PROVIDER_FAILURE_REASON" in
-              model_job_failed|provider_failed|candidate_contract_failed)
+              model_job_failed|provider_failed|candidate_contract_failed|quota_exhausted|rate_limited|authentication_failed)
                 stop_reason="$PROVIDER_FAILURE_REASON"
                 ;;
               *)
