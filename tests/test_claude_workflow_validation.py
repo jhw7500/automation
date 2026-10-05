@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -304,7 +305,7 @@ def _new_step(name):
     return next((step for step in steps if step.get("name") == name), {})
 
 
-def _preflight(tmp_path, **changes):
+def _preflight(tmp_path, script=None, **changes):
     fixture = {
         "workflowRef": "o/r/.github/workflows/claude.yml@refs/pull/326/merge",
         "workflowSha": "a" * 40,
@@ -314,11 +315,12 @@ def _preflight(tmp_path, **changes):
         "defaultBlob": "c" * 40,
         **changes,
     }
-    script = _new_step("Validate Claude caller workflow").get("with", {}).get("script", "")
+    if script is None:
+        script = _new_step("Validate Claude caller workflow").get("with", {}).get("script", "")
     harness = r"""
 const fx = JSON.parse(process.argv[1]);
 const script = JSON.parse(process.argv[2]);
-const calls = [], outputs = {}, failures = [];
+const calls = [], outputs = {}, failures = [], notices = [], summary = [];
 const context = {repo: {owner: 'o', repo: 'r'}};
 process.env.WORKFLOW_REF = fx.workflowRef;
 process.env.WORKFLOW_SHA = fx.workflowSha;
@@ -337,17 +339,25 @@ const github = {rest: {repos: {
   getContent: async args => respond(
     args.ref === fx.workflowSha ? 'current' : 'default', args,
     {type: fx.fileType || 'file', path: '.github/workflows/claude.yml',
-     sha: args.ref === fx.workflowSha ? fx.currentBlob : fx.defaultBlob}
+     sha: args.ref === fx.workflowSha ? fx.currentBlob : fx.defaultBlob,
+     ...((args.ref === fx.workflowSha ? fx.currentContent : fx.defaultContent) === undefined ? {} : {
+       encoding: 'base64',
+       content: Buffer.from(args.ref === fx.workflowSha ? fx.currentContent : fx.defaultContent)
+         .toString('base64').replace(/(.{60})/g, '$1\n')})}
   ),
 }}};
 const core = {
   setOutput: (key, value) => {outputs[key] = value;},
   setFailed: message => failures.push(message),
 };
+if (!fx.legacyCore) {
+  core.notice = message => notices.push(message);
+  core.summary = {addRaw(text) { summary.push(text); return this; }, write: async () => {}};
+}
 (async () => {
   await new Function('github', 'context', 'core',
     'return (async () => {' + script + '})();')(github, context, core);
-  console.log(JSON.stringify({calls, outputs, failures}));
+  console.log(JSON.stringify({calls, outputs, failures, notices, summary}));
 })().catch(error => {console.error(error); process.exit(1);});
 """
     result = subprocess.run(
@@ -473,3 +483,103 @@ def test_nonexecution_publishes_reason_without_candidate_missing(tmp_path, reaso
     assert _posted_state(body)["attempt_status"] == "failure"
     assert f"`{reason}`" in body
     assert "candidate_missing" not in body
+
+
+OLD_PIN = "3d60f3baaa45820f7260912efea3ffcf45c10b07"
+NEW_PIN = "444a7347aee169ed178aae80e8bd8d10eca52e02"
+RECOVERY_ANCHOR = "docs/workflows/contracts.md#open-work-branches-after-a-fleet-rollout"
+
+
+def _caller(*uses):
+    lines = "".join(f"    uses: {value}\n" for value in uses)
+    return f"name: Claude\non:\n  pull_request:\njobs:\n  claude:\n{lines}    secrets: inherit\n"
+
+
+def _pin_ref(pin):
+    return f"jhw7500/automation/.github/workflows/claude.yml@{pin}"
+
+
+def _v182_script():
+    from release_fixture_helpers import V182_CALLER_PIN_DIAGNOSTICS_BOUNDARY_COMMIT
+    from scripts.verify_workflow_release import VerifiedCommitTree, _load_release_yaml
+
+    root = Path(__file__).resolve().parents[1]
+    workflow = _load_release_yaml(VerifiedCommitTree.open(
+        root, V182_CALLER_PIN_DIAGNOSTICS_BOUNDARY_COMMIT,
+    ).read_file(".github/workflows/claude-code-review.yml"), reject_duplicate_keys=True)
+    steps = workflow["jobs"]["claude-review"]["steps"]
+    step = next(step for step in steps if step.get("name") == "Validate Claude caller workflow")
+    return step["with"]["script"]
+
+
+@node_required
+def test_mismatch_names_running_and_default_branch_caller_pins(tmp_path):
+    result = _preflight(
+        tmp_path, defaultBlob="d" * 40,
+        currentContent=_caller(_pin_ref(OLD_PIN)),
+        defaultContent=_caller(f"'{_pin_ref(NEW_PIN)}' # v1.76"),
+    )
+    assert result["outputs"] == {"allowed": "false", "reason": "workflow_validation_mismatch"}
+    assert result["failures"] == ["workflow_validation_mismatch"]
+    assert len(result["notices"]) == 1
+    notice = result["notices"][0]
+    assert f"running caller pin {OLD_PIN}" in notice
+    assert f"default-branch caller pin {NEW_PIN}" in notice
+    assert "omit --ref" in notice and RECOVERY_ANCHOR in notice
+    assert result["summary"] == [f"workflow_validation_mismatch: {notice}\n"]
+
+
+@node_required
+@pytest.mark.parametrize(("current", "default", "running", "branch"), [
+    (_caller("./.github/workflows/local.yml"), _caller(_pin_ref(NEW_PIN)), "unavailable", NEW_PIN),
+    (_caller(_pin_ref(OLD_PIN), _pin_ref(OLD_PIN)), _caller(_pin_ref(NEW_PIN)), "ambiguous", NEW_PIN),
+    (_caller(_pin_ref(OLD_PIN)), _caller(_pin_ref(OLD_PIN), _pin_ref(NEW_PIN)), OLD_PIN, "ambiguous"),
+    (_caller(_pin_ref("abc123")), None, "unavailable", "unavailable"),
+    (None, _caller(_pin_ref(NEW_PIN)), "unavailable", NEW_PIN),
+])
+def test_mismatch_pin_diagnostic_never_guesses(tmp_path, current, default, running, branch):
+    fixture = {"defaultBlob": "d" * 40}
+    if current is not None:
+        fixture["currentContent"] = current
+    if default is not None:
+        fixture["defaultContent"] = default
+    result = _preflight(tmp_path, **fixture)
+    assert result["outputs"] == {"allowed": "false", "reason": "workflow_validation_mismatch"}
+    assert len(result["notices"]) == 1
+    assert f"running caller pin {running} /" in result["notices"][0]
+    assert f"default-branch caller pin {branch} /" in result["notices"][0]
+
+
+@node_required
+def test_missing_default_caller_reports_unavailable_default_pin(tmp_path):
+    result = _preflight(
+        tmp_path, errorMethod="default", errorStatus=404,
+        currentContent=_caller(_pin_ref(OLD_PIN)),
+    )
+    assert result["outputs"] == {"allowed": "false", "reason": "workflow_validation_mismatch"}
+    assert len(result["notices"]) == 1
+    assert f"running caller pin {OLD_PIN} / default-branch caller pin unavailable /" in result["notices"][0]
+
+
+@node_required
+@pytest.mark.parametrize("changes", [
+    {},
+    {"currentContent": _caller(_pin_ref(OLD_PIN)), "defaultContent": _caller(_pin_ref(OLD_PIN))},
+    {"defaultBlob": "d" * 40},
+    {"defaultBlob": "d" * 40, "currentContent": _caller(_pin_ref(OLD_PIN)),
+     "defaultContent": _caller(_pin_ref(NEW_PIN))},
+    {"errorMethod": "default", "errorStatus": 404, "currentContent": _caller(_pin_ref(OLD_PIN))},
+    {"errorMethod": "default", "errorStatus": 403},
+    {"errorMethod": "current", "errorStatus": 404},
+    {"fileType": "symlink", "defaultBlob": "d" * 40},
+    {"workflowSha": ""},
+    {"defaultBlob": "d" * 40, "currentContent": _caller(_pin_ref(OLD_PIN)), "legacyCore": True},
+])
+def test_pin_diagnostic_leaves_the_v182_decision_unchanged(tmp_path, changes):
+    old = _preflight(tmp_path, script=_v182_script(), **changes)
+    new = _preflight(tmp_path, **changes)
+    for key in ("outputs", "failures", "calls"):
+        assert new[key] == old[key], key
+    assert not old["notices"] and not old["summary"]
+    mismatch = new["outputs"]["reason"] == "workflow_validation_mismatch"
+    assert len(new["notices"]) == (mismatch and not changes.get("legacyCore"))

@@ -122,6 +122,28 @@ V179_FILTERED_PRESERVATION_EDITS = {
 }
 
 
+V182_CALLER_PIN_DIAGNOSTICS_BOUNDARY_COMMIT = "effa74038020263f158c0ef54343577db4040d1b"
+CLAUDE_REVIEW_WORKFLOW = ".github/workflows/claude-code-review.yml"
+
+
+def restore_pre_v183_claude_caller_pin_diagnostics(repo: Path) -> None:
+    """Restore the authenticated v1.82 Claude review workflow over copied current bytes.
+
+    Restore only a current file, so older restore chains that already replaced
+    it, and deliberately mutated test bytes, survive.
+    """
+    from scripts.verify_workflow_release import V182_CLAUDE_REVIEW_SHA256, VerifiedCommitTree
+
+    root = Path(__file__).resolve().parents[1]
+    path = repo / CLAUDE_REVIEW_WORKFLOW
+    if path.is_file() and path.read_bytes() == (root / CLAUDE_REVIEW_WORKFLOW).read_bytes():
+        payload = VerifiedCommitTree.open(
+            root, V182_CALLER_PIN_DIAGNOSTICS_BOUNDARY_COMMIT
+        ).read_file(CLAUDE_REVIEW_WORKFLOW)
+        assert hashlib.sha256(payload).hexdigest() == V182_CLAUDE_REVIEW_SHA256
+        path.write_bytes(payload)
+
+
 V181_DISMISSAL_COVERAGE_BOUNDARY_COMMIT = "136e377eb5d3c91aff2a025d4b389c5e9d9de528"
 PRE_V182_FILES = (
     ".github/workflows/opencode-auto-review.yml",
@@ -143,6 +165,7 @@ def restore_pre_v182_opencode_dismissal_coverage(repo: Path) -> None:
         VerifiedCommitTree,
     )
 
+    restore_pre_v183_claude_caller_pin_diagnostics(repo)
     expected = dict(zip(PRE_V182_FILES, (
         V181_OPENCODE_AUTO_REVIEW_SHA256, V181_OPENCODE_RECOVERY_EVIDENCE_SHA256,
         V181_OPENCODE_RECOVERY_REPLAY_SHA256,
