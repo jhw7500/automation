@@ -4817,6 +4817,14 @@ jobs:
                     continue;
                   }
                   if (currentPair && noRemovedPair) {
+                    // v1.71-v1.81 published a block without a readable severity as a non-finding
+                    // with no id. Keeping it open would keep it active for good, since no
+                    // dismissal can name it, so it is dropped the way the shared canonicalizer
+                    // rejects such a carryover.
+                    if (section.name === 'Still open' && !hasFindingSeverity(block.heading)) {
+                      normalizedBlocks.push({ block, reason: 'invalid_severity' });
+                      continue;
+                    }
                     const anchor = { ...evidence.changedAnchors[0],
                       currentLine: evidence.currentLines[0] };
                     parsedBlocks.push({ sectionIndex, section: section.name, block,
@@ -5140,9 +5148,13 @@ jobs:
             // visible-text escaping nor its Unicode case folding, because OpenCode publishes the
             // title verbatim and JavaScript has no case folding. Ids are namespaced by reviewer,
             // so nothing compares the two. Severity is read from the heading rather than required
-            // by the grammar: a heading whose severity is absent or unrecognized keeps its exact
-            // bytes and receives no id, which leaves every finding published today byte-identical.
+            // by the grammar: a heading whose severity is absent or unrecognized receives no id.
+            // From v1.82 such a block is filtered as a new finding and dropped as a carryover,
+            // because a block no dismissal can name must not stay in the active set.
             const FINDING_HEADING = /^#### \[(CRITICAL|HIGH|MEDIUM)\] (\S.*)$/;
+            const LOW_FINDING_HEADING = /^#### \[LOW\] (\S.*)$/;
+            const hasFindingSeverity = (heading) => CARRIED_FINDING_HEADING.test(heading)
+              || FINDING_HEADING.test(heading);
             const CARRIED_FINDING_HEADING = /^#### (RVW-[0-9a-f]{12}) \[(CRITICAL|HIGH|MEDIUM)\] (\S.*)$/;
             const normalizeTitle = (title) => title.trim().split(/\s+/).join(' ').toLowerCase();
             const deriveFindingId = (path, line, severity, title) => 'RVW-' + sha256(
@@ -5192,6 +5204,7 @@ jobs:
               const newFindings = parsedReview.blocks.filter((entry) =>
                 entry.section === 'New findings');
               const duplicatePriorEntries = new Set();
+              const severityFilteredEntries = new Set();
               for (const entry of newFindings) {
                 // Ids belong to the workflow. A new heading that already carries one was
                 // written by the model, and publishing it would let the model choose what the
@@ -5203,7 +5216,17 @@ jobs:
                 }
                 const findingId = blockFindingId(
                   entry.block.heading, entry.evidence.anchors[0]);
-                if (findingId === null) continue;
+                // A heading without a readable severity receives no id, so no dismissal can
+                // ever name it, and publishing it would make it an active block for good.
+                // Filtered exactly as the shared canonicalizer filters it (v1.82). Its anchor
+                // is still validated below, so a validation failure stays a hard failure.
+                if (findingId === null) {
+                  severityFilteredEntries.add(entry);
+                  filteredNewFindings.push({ entry,
+                    reason: LOW_FINDING_HEADING.test(entry.block.heading)
+                      ? 'non_actionable_category' : 'invalid_severity' });
+                  continue;
+                }
                 // A dismissal has to outlive the round that retires the finding. Removing the
                 // block from the published body is what retires it, and that same removal drops
                 // the id from the next round's prior set — so re-reporting the identical defect
@@ -5224,6 +5247,7 @@ jobs:
                 const result = validateAnchorEvidence(entry.evidence);
                 if (result === 'valid') continue;
                 if (result === 'invalid') {
+                  if (severityFilteredEntries.has(entry)) continue;
                   filteredNewFindings.push({ entry, reason: 'anchor_out_of_scope' });
                 } else {
                   anchorValidationFailed = true;
@@ -5248,6 +5272,12 @@ jobs:
                 // the map empty, which fails closed exactly as it did before.
                 const priorBlock = priorActiveBlocks.get(entry.block.heading);
                 if (!priorBlock) { anchorValidationFailed = true; break; }
+                // Re-carrying a block without a readable severity would return it to
+                // `Still open`, the active set no dismissal can name it in.
+                if (!hasFindingSeverity(priorBlock.heading)) {
+                  normalizedCarryover.push({ entry, reason: 'invalid_severity', dropped: true });
+                  continue;
+                }
                 entry.block = priorBlock;
                 entry.carriedForward = true;
                 // A disposition the model cannot prove is discarded rather than believed. The
@@ -5296,7 +5326,31 @@ jobs:
             const succeeded = modelSucceeded || unchangedSucceeded;
             const recordedMode = ['full', 'delta', 'unchanged', 'unavailable'].includes(diffMode)
               ? diffMode : 'unavailable';
-            const successBody = unchangedSucceeded ? previousBody : canonicalReview;
+            // An unchanged reuse runs no model round, so a dismissal posted since the last one
+            // would otherwise republish the dismissed block. Only the dismissed blocks leave the
+            // active sections; a body with none, or one this job cannot parse, stays byte-identical.
+            const withoutDismissed = (body) => {
+              const sections = splitSections(body);
+              if (!sections || dismissedFindingIds.size === 0) return body;
+              let removed = false;
+              const rendered = sections.map((section) => {
+                const blocks = section.name === 'New findings' || section.name === 'Still open'
+                  ? sectionBlocks(section) : null;
+                if (!blocks) return `### ${section.name}\n${section.lines.join('\n').trim()}`;
+                const retained = blocks.filter((block) => {
+                  const carried = CARRIED_FINDING_HEADING.exec(block.heading);
+                  return !(carried && dismissedFindingIds.has(carried[1]));
+                });
+                if (retained.length !== blocks.length) removed = true;
+                const sectionBody = retained.length === 0
+                  ? 'None'
+                  : retained.map((block) => [block.heading, ...block.lines]
+                    .join('\n').trim()).join('\n\n');
+                return `### ${section.name}\n${sectionBody}`;
+              });
+              return removed ? rendered.join('\n\n') : body;
+            };
+            const successBody = unchangedSucceeded ? withoutDismissed(previousBody) : canonicalReview;
             const failureReason = !diffReady ? 'diff_unavailable'
               : !artifactsValid ? 'prepared_artifact_invalid'
               : !modelOk ? modelFailureReason

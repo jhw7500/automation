@@ -8672,7 +8672,7 @@ def _opencode_review(*findings: str) -> str:
     if not findings:
         return f"{OPENCODE_MARKER}\n### New findings\nNone"
     blocks = "\n\n".join(
-        f"#### Finding {index}\n- Changed anchor: "
+        f"#### [HIGH] Finding {index}\n- Changed anchor: "
         f"{json.dumps({'path': OPENCODE_SCOPE_PATH, 'line': 1}, ensure_ascii=False, separators=(',', ':'))}\n"
         f'- Current line: "added line 1"\n'
         f"{finding}"
@@ -14447,7 +14447,7 @@ def test_opencode_rereview_accepts_exact_still_open_resolved_and_retracted_bindi
     )
     prior_body = (
         "### New findings\n"
-        f"#### Remains active\n- Changed anchor: {anchor}\nprior A\n"
+        f"#### [HIGH] Remains active\n- Changed anchor: {anchor}\nprior A\n"
         f"#### Fixed now\n- Changed anchor: {anchor}\nprior B\n"
         f"#### Was incorrect\n- Changed anchor: {anchor}\nprior C"
     )
@@ -14458,7 +14458,7 @@ def test_opencode_rereview_accepts_exact_still_open_resolved_and_retracted_bindi
     )
     current = (
         f"{OPENCODE_MARKER}\n### New findings\nNone\n"
-        f"### Still open\n#### Remains active\n- Changed anchor: {anchor}\n"
+        f"### Still open\n#### [HIGH] Remains active\n- Changed anchor: {anchor}\n"
         '- Current line: "added line 1"\nstill present\n'
         f"### Resolved\n#### Fixed now\n- Changed anchor: {anchor}\n"
         '- Current line: "added line 1"\n'
@@ -14476,7 +14476,7 @@ def test_opencode_rereview_accepts_exact_still_open_resolved_and_retracted_bindi
     body = next(call[1]["body"] for call in calls if call[0] == "create")
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "success"
-    assert "#### Remains active" in body
+    assert "[HIGH] Remains active" in body
     assert "#### Fixed now" in body
     assert "#### Was incorrect" in body
 
@@ -14588,14 +14588,19 @@ def test_opencode_new_finding_heading_receives_shared_recipe_id(tmp_path, title)
 
 @node_required
 @pytest.mark.parametrize(
-    "heading",
-    ["Finding without severity", "[LOW] Style nit", "[medium] lowercase severity"],
+    ("heading", "reason"),
+    [
+        ("Finding without severity", "invalid_severity"),
+        ("[LOW] Style nit", "non_actionable_category"),
+        ("[medium] lowercase severity", "invalid_severity"),
+    ],
 )
-def test_opencode_heading_without_known_severity_keeps_exact_bytes(tmp_path, heading):
-    """severity 를 읽을 수 없는 heading 은 ID 없이 원문 그대로 발행된다 (#128).
+def test_opencode_heading_without_known_severity_is_filtered(tmp_path, heading, reason):
+    """severity 를 읽을 수 없는 heading 은 v1.82 부터 발행되지 않는다 (#156).
 
-    OpenCode 문법은 severity 를 요구한 적이 없다 (`/^#### \\S.*$/`). ID 를 붙이려고
-    문법을 조이면 오늘 통과하던 finding 이 소비자 저장소에서 조용히 탈락한다.
+    v1.70-v1.81 은 그런 heading 을 ID 없이 원문 그대로 발행했다 (#128 의 바이트 호환
+    선택). 기각이 켜진 뒤 그것은 어떤 기각도 지목할 수 없는 active 블록이 됐으므로,
+    공유 정규화기처럼 걸러낸다.
     """
     anchor = json.dumps(
         {"path": OPENCODE_SCOPE_PATH, "line": 1},
@@ -14617,8 +14622,9 @@ def test_opencode_heading_without_known_severity_keeps_exact_bytes(tmp_path, hea
     body = next(call[1]["body"] for call in calls if call[0] == "create")
     state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
     assert state["attempt_status"] == "success"
-    assert f"#### {heading}\n" in body
+    assert f"#### {heading}" not in body
     assert "RVW-" not in body
+    assert f"- Validation: filtered_invalid_new_findings=1; reasons={reason}" in body
 
 
 @node_required
@@ -15586,7 +15592,7 @@ def test_opencode_rereview_verifies_authenticated_removed_line(
     )
     prior_body = (
         "### New findings\n"
-        f"#### Deleted defect\n- Changed anchor: {anchor}\n"
+        f"#### [HIGH] Deleted defect\n- Changed anchor: {anchor}\n"
         '- Current line: "vulnerable = True"\nprior evidence'
     )
     prior = _bot(
@@ -15598,7 +15604,7 @@ def test_opencode_rereview_verifies_authenticated_removed_line(
     )
     current = (
         f"{OPENCODE_MARKER}\n### New findings\nNone\n"
-        f"### Resolved\n#### Deleted defect\n- Removed anchor: {anchor}\n"
+        f"### Resolved\n#### [HIGH] Deleted defect\n- Removed anchor: {anchor}\n"
         '- Removed line: "vulnerable = True"\nremoval resolves the defect'
     )
     manifest = {
@@ -15637,7 +15643,7 @@ def test_opencode_rereview_verifies_authenticated_removed_line(
         # 으로 강등해 active 로 남기고 모델이 낸 removal 근거만 버린다 — 블록을 빼면
         # 발행 본문이 곧 active 집합이라 아무것도 고치지 않은 finding 이 은퇴한다.
         assert "### Still open" in body
-        assert "#### Deleted defect" in body
+        assert "#### [HIGH] Deleted defect" in body
         assert "prior evidence" in body
         assert "- Removed line:" not in body
         assert "### Resolved\nNone" in body
@@ -17377,7 +17383,7 @@ def test_opencode_new_finding_scope_filters_invalid_locations_but_keeps_validati
     )
     candidate = _bot(
         "github-actions[bot]",
-        f"{OPENCODE_MARKER}\n### New findings\n#### Finding\n"
+        f"{OPENCODE_MARKER}\n### New findings\n#### [HIGH] Finding\n"
         f"- Changed anchor: {anchor}\n"
         f"- Current line: {json.dumps(current_line)}",
         10,
@@ -17399,7 +17405,7 @@ def test_opencode_new_finding_scope_filters_invalid_locations_but_keeps_validati
     assert state["attempt_status"] == expected_status
     if expected_status == "success":
         assert "### New findings\nNone" in body
-        assert "filtered_invalid_new_findings=1" in body
+        assert "filtered_invalid_new_findings=1; reasons=anchor_out_of_scope" in body
     else:
         assert "Reason: anchor_out_of_scope" in body
         assert "filtered_invalid_new_findings" not in body
@@ -17426,7 +17432,7 @@ def test_opencode_removed_manifest_status_mismatch_remains_hard_failure(tmp_path
     calls = _run_opencode_canonicalize(
         tmp_path,
         [],
-        [_anchor_candidate(path, 1, "Manifest status mismatch", "after")],
+        [_anchor_candidate(path, 1, "[HIGH] Manifest status mismatch", "after")],
         attempt_head=head,
         current_head=head,
         manifest=manifest,
@@ -17556,7 +17562,7 @@ def _commit_anchor_repo(path: Path, message: str) -> str:
 
 
 def _anchor_candidate(
-    path: str, line: int, title: str = "Finding", current_line: str = "added line 1"
+    path: str, line: int, title: str = "[HIGH] Finding", current_line: str = "added line 1"
 ) -> dict:
     anchor = json.dumps(
         {"path": path, "line": line}, ensure_ascii=False, separators=(",", ":")
@@ -17915,7 +17921,7 @@ def test_opencode_pure_rename_does_not_turn_unchanged_destination_lines_into_add
     calls = _run_opencode_canonicalize(
         tmp_path,
         [],
-        [_anchor_candidate(new_path, 1, "Pure rename")],
+        [_anchor_candidate(new_path, 1, "[HIGH] Pure rename")],
         attempt_head=head,
         current_head=head,
         manifest=manifest,
@@ -17925,8 +17931,8 @@ def test_opencode_pure_rename_does_not_turn_unchanged_destination_lines_into_add
     assert _published_opencode_state(calls)["attempt_status"] == "success"
     body = _single_mutation_body(calls)
     assert "### New findings\nNone" in body
-    assert "#### Pure rename" not in body
-    assert "filtered_invalid_new_findings=1" in body
+    assert "[HIGH] Pure rename" not in body
+    assert "filtered_invalid_new_findings=1; reasons=anchor_out_of_scope" in body
 
 
 @node_required
@@ -17960,7 +17966,7 @@ def test_opencode_modified_rename_accepts_only_the_real_added_destination_line(t
     calls = _run_opencode_canonicalize(
         tmp_path,
         [],
-        [_anchor_candidate(new_path, 6, "Modified rename", "real added line")],
+        [_anchor_candidate(new_path, 6, "[HIGH] Modified rename", "real added line")],
         attempt_head=head,
         current_head=head,
         manifest=manifest,
@@ -17969,7 +17975,7 @@ def test_opencode_modified_rename_accepts_only_the_real_added_destination_line(t
 
     assert _published_opencode_state(calls)["attempt_status"] == "success"
     accepted_body = _single_mutation_body(calls)
-    assert "#### Modified rename" in accepted_body
+    assert "[HIGH] Modified rename" in accepted_body
     assert "filtered_invalid_new_findings" not in accepted_body
 
     unchanged_dir = tmp_path / "unchanged-line"
@@ -17977,7 +17983,7 @@ def test_opencode_modified_rename_accepts_only_the_real_added_destination_line(t
     unchanged_calls = _run_opencode_canonicalize(
         unchanged_dir,
         [],
-        [_anchor_candidate(new_path, 5, "Rename context")],
+        [_anchor_candidate(new_path, 5, "[HIGH] Rename context")],
         attempt_head=head,
         current_head=head,
         manifest=manifest,
@@ -17986,7 +17992,7 @@ def test_opencode_modified_rename_accepts_only_the_real_added_destination_line(t
     assert _published_opencode_state(unchanged_calls)["attempt_status"] == "success"
     filtered_body = _single_mutation_body(unchanged_calls)
     assert "### New findings\nNone" in filtered_body
-    assert "#### Rename context" not in filtered_body
+    assert "[HIGH] Rename context" not in filtered_body
     assert "filtered_invalid_new_findings=1" in filtered_body
 
 
@@ -18094,7 +18100,7 @@ def test_opencode_anchor_uses_only_added_lines_under_hostile_inter_hunk_context(
         [_anchor_candidate(
             path,
             line,
-            "Inter-hunk bridge",
+            "[HIGH] Inter-hunk bridge",
             {1: "after one", 2: "unchanged bridge", 3: "after three"}[line],
         )],
         attempt_head=head,
@@ -18106,11 +18112,11 @@ def test_opencode_anchor_uses_only_added_lines_under_hostile_inter_hunk_context(
     assert _published_opencode_state(calls)["attempt_status"] == "success"
     body = _single_mutation_body(calls)
     if expected_retained:
-        assert "#### Inter-hunk bridge" in body
+        assert "[HIGH] Inter-hunk bridge" in body
         assert "filtered_invalid_new_findings" not in body
     else:
         assert "### New findings\nNone" in body
-        assert "#### Inter-hunk bridge" not in body
+        assert "[HIGH] Inter-hunk bridge" not in body
         assert "filtered_invalid_new_findings=1" in body
 
 
@@ -18136,7 +18142,7 @@ def test_opencode_anchor_diff_forces_no_color(tmp_path):
     calls = _run_opencode_canonicalize(
         tmp_path,
         [],
-        [_anchor_candidate(path, 1, "Colored diff", "after")],
+        [_anchor_candidate(path, 1, "[HIGH] Colored diff", "after")],
         attempt_head=head,
         current_head=head,
         manifest=manifest,
@@ -20172,3 +20178,304 @@ def test_dispatch_review_notes_step_takes_the_text_only_through_env():
     step = _step(_load("gemini-dispatch.yml"), "review", "Prepare review request notes")
     assert step["env"]["REQUEST_NOTES"] == "${{ needs.dispatch.outputs.additional_context }}"
     assert "${{" not in step["run"]
+
+
+def _opencode_anchor_json() -> str:
+    return json.dumps(
+        {"path": OPENCODE_SCOPE_PATH, "line": 1},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("severity", "reason"),
+    (
+        ("LOW", "non_actionable_category"),
+        ("NOTE", "invalid_severity"),
+        ("High", "invalid_severity"),
+        ("low", "invalid_severity"),
+    ),
+)
+def test_opencode_new_finding_without_valid_severity_is_filtered(tmp_path, severity, reason):
+    """severity 를 읽을 수 없는 New finding 은 발행되지 않는다 (#156 경로 1).
+
+    v1.71-v1.81 은 그런 heading 을 ID 없이 발행했다. 기각된 `[HIGH]` finding 을 같은
+    제목·앵커의 `[LOW]` 로 재보고하면 ID 가 파생되지 않아 기각 대조를 건너뛰고 발행됐고,
+    발행 본문이 active 집합이므로 어떤 기각도 지목할 수 없는 영구 캐리오버가 됐다.
+    공유 정규화기처럼 `LOW` 는 `non_actionable_category`, 나머지는 `invalid_severity` 로
+    거른다. 대소문자는 정규화하지 않는다.
+    """
+    head = "ab" * 20
+    anchor_json = _opencode_anchor_json()
+    title = "Dismissed as a false positive"
+    finding_id = _opencode_finding_id(OPENCODE_SCOPE_PATH, 1, "HIGH", title)
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), "### New findings\nNone"),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        f"#### [{severity}] {title}\n- Changed anchor: {anchor_json}\n"
+        '- Current line: "added line 1"\nConcrete impact.'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+        dismissed_findings=[{"comment_id": 555, "finding_id": finding_id}],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+
+    assert state["attempt_status"] == "success"
+    assert title not in body
+    assert body.endswith("### New findings\nNone")
+    assert f"- Validation: filtered_invalid_new_findings=1; reasons={reason}" in body
+    assert json.loads(outputs["remaining_finding_ids_json"]) == []
+    assert outputs["quality_filtered"] == "true"
+
+
+@node_required
+@pytest.mark.parametrize("severity", ("CRITICAL", "HIGH", "MEDIUM"))
+def test_opencode_new_finding_with_valid_severity_is_still_published(tmp_path, severity):
+    """보존 검사: 유효한 severity 의 New finding 은 v1.82 필터와 무관하게 ID 를 받아 발행된다."""
+    head = "ab" * 20
+    anchor_json = _opencode_anchor_json()
+    title = "Real defect"
+    finding_id = _opencode_finding_id(OPENCODE_SCOPE_PATH, 1, severity, title)
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), "### New findings\nNone"),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\n"
+        f"#### [{severity}] {title}\n- Changed anchor: {anchor_json}\n"
+        '- Current line: "added line 1"\nConcrete impact.'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path, [prior], [prior, _bot("github-actions[bot]", current, 10, updated="u2")]
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+    assert f"#### {finding_id} [{severity}] {title}" in body
+    assert "- Validation:" not in body
+    assert json.loads(outputs["remaining_finding_ids_json"]) == [finding_id]
+
+
+@node_required
+@pytest.mark.parametrize("heading", ("#### [LOW] Legacy note", "#### Legacy note"))
+def test_opencode_severity_less_prior_block_is_dropped_when_carried(tmp_path, heading):
+    """v1.71-v1.81 이 ID 없이 발행한 severity 없는 블록은 캐리오버되지 않는다 (#156).
+
+    그 블록은 기각이 지목할 수 없으므로, 모델이 `Still open` 으로 옮겨 실을 때마다
+    영구히 살아남았다. v1.82 부터는 `invalid_severity` 로 정규화되어 떨어진다.
+    """
+    head = "ab" * 20
+    anchor_json = _opencode_anchor_json()
+    prior_body = (
+        "### New findings\n"
+        f"{heading}\n- Changed anchor: {anchor_json}\n"
+        '- Current line: "added line 1"\nprior evidence'
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Still open\n{heading}\n"
+        f"- Changed anchor: {anchor_json}\n"
+        '- Current line: "added line 1"\nstill present'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+
+    assert state["attempt_status"] == "success"
+    assert "Legacy note" not in body
+    assert "### Still open\nNone" in body
+    assert "- Normalization: normalized_blocks=1; reasons=invalid_severity" in body
+    assert json.loads(outputs["remaining_finding_ids_json"]) == []
+
+
+def _opencode_reuse_prior(ids: list[str]) -> str:
+    anchor_json = _opencode_anchor_json()
+
+    def block(finding_id: str, severity: str, title: str) -> str:
+        return (
+            f"#### {finding_id} [{severity}] {title}\n- Changed anchor: {anchor_json}\n"
+            f'- Current line: "added line 1"\nevidence for {title}'
+        )
+
+    return (
+        "### New findings\n"
+        f"{block(ids[0], 'HIGH', 'Dismissed new')}\n\n"
+        f"{block(ids[1], 'MEDIUM', 'Kept new')}\n\n"
+        "### Still open\n"
+        f"{block(ids[2], 'HIGH', 'Dismissed carryover')}\n\n"
+        "### Resolved\n"
+        f"{block(ids[3], 'HIGH', 'Fixed earlier')}"
+    )
+
+
+def _run_opencode_unchanged_reuse(tmp_path, prior_review: str, dismissed: list[str]):
+    full_hash = hashlib.sha256(b"TRUSTED FULL DIFF\n").hexdigest()
+    old = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(
+            _state_line("opencode", 7, 41, "ab" * 20, full_diff_sha256=full_hash),
+            prior_review,
+        ),
+        9,
+        updated="u1",
+    )
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [old],
+        [old],
+        outcome="skipped",
+        diff_mode="unchanged",
+        unchanged_since_previous="true",
+        attempt_head="cd" * 20,
+        dismissed_findings=[
+            {"comment_id": 555 + index, "finding_id": finding_id}
+            for index, finding_id in enumerate(dismissed)
+        ],
+    )
+    body = _single_mutation_body(calls)
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+    return body, outputs, state
+
+
+OPENCODE_REUSE_IDS = [
+    "RVW-111111111111", "RVW-222222222222", "RVW-333333333333", "RVW-444444444444",
+]
+
+
+@node_required
+def test_opencode_unchanged_reuse_removes_dismissed_blocks_from_previous_body(tmp_path):
+    """unchanged 재사용 라운드도 기각된 블록을 재발행하지 않는다 (#156 경로 2).
+
+    모델 라운드가 없으므로 이전 본문을 그대로 재발행했고, 마지막 모델 라운드 이후의
+    기각이 스티키와 잔존 ID 에 반영되지 않았다. 기각 ID 가 active 섹션에 있을 때만
+    그 블록을 걷어내고, 비워진 섹션은 `None` 으로 채운다.
+    """
+    ids = OPENCODE_REUSE_IDS
+    body, outputs, state = _run_opencode_unchanged_reuse(
+        tmp_path, _opencode_reuse_prior(ids), [ids[0], ids[2]]
+    )
+
+    assert state["attempt_status"] == "success"
+    assert state["diff_mode"] == "unchanged"
+    assert ids[0] not in body and "Dismissed new" not in body
+    assert ids[2] not in body and "Dismissed carryover" not in body
+    assert f"#### {ids[1]} [MEDIUM] Kept new" in body
+    assert "### Still open\nNone" in body
+    # Resolved 는 active 집합이 아니므로 그대로 남는다.
+    assert f"#### {ids[3]} [HIGH] Fixed earlier" in body
+    assert json.loads(outputs["remaining_finding_ids_json"]) == [ids[1]]
+    assert json.loads(outputs["authenticated_review_json"])["remaining_finding_ids"] == [ids[1]]
+
+
+@node_required
+@pytest.mark.parametrize(
+    "dismissed",
+    (["RVW-999999999999"], [OPENCODE_REUSE_IDS[3]]),
+    ids=("not-in-body", "resolved-only"),
+)
+def test_opencode_unchanged_reuse_without_active_dismissal_keeps_previous_body_bytes(
+    tmp_path, dismissed,
+):
+    """보존 검사: active 섹션과 교집합이 없으면 이전 본문을 바이트 그대로 재발행한다."""
+    ids = OPENCODE_REUSE_IDS
+    prior_review = _opencode_reuse_prior(ids)
+    body, outputs, state = _run_opencode_unchanged_reuse(tmp_path, prior_review, dismissed)
+
+    assert state["attempt_status"] == "success"
+    assert body.endswith("\n\n" + prior_review)
+    assert json.loads(outputs["remaining_finding_ids_json"]) == ids[:3]
+
+
+@node_required
+def test_opencode_failure_keeps_previous_body_bytes_despite_dismissal(tmp_path):
+    """보존 검사: 실패/stale 경로는 기각과 무관하게 이전 본문을 바이트 그대로 유지한다."""
+    ids = OPENCODE_REUSE_IDS
+    prior_review = _opencode_reuse_prior(ids)
+    old = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 41, "ab" * 20), prior_review),
+        9,
+        updated="u1",
+    )
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [old],
+        [old],
+        outcome="failure",
+        dismissed_findings=[{"comment_id": 555, "finding_id": ids[0]}],
+    )
+    body = _single_mutation_body(calls)
+    assert "- Status: stale" in body
+    assert body.endswith("\n\n" + prior_review)
+
+
+@node_required
+def test_opencode_severity_less_prior_block_is_not_recarried_to_still_open(tmp_path):
+    """범위 밖 앵커의 Retracted 블록은 prior 블록으로 `Still open` 에 되실리지만,
+    severity 없는 prior 블록은 되실리지 않고 `invalid_severity` 로 떨어진다 (#156)."""
+    head = "ab" * 20
+    in_scope = _opencode_anchor_json()
+    out_of_scope = json.dumps(
+        {"path": ".github/workflows/gemini-auto-review.yml", "line": 74},
+        separators=(",", ":"),
+    )
+    heading = "#### [LOW] Legacy note"
+    prior_body = (
+        "### New findings\n"
+        f"{heading}\n- Changed anchor: {in_scope}\n"
+        '- Current line: "added line 1"\nprior evidence'
+    )
+    prior = _bot(
+        "github-actions[bot]",
+        _opencode_v2_body(_state_line("opencode", 7, 1, head), prior_body),
+        1,
+    )
+    current = (
+        f"{OPENCODE_MARKER}\n### New findings\nNone\n"
+        f"### Retracted\n{heading}\n"
+        f"- Changed anchor: {out_of_scope}\n"
+        '- Current line: "      publisher_app_id: x"\nnot a defect'
+    )
+
+    calls = _run_opencode_canonicalize(
+        tmp_path,
+        [prior],
+        [prior, _bot("github-actions[bot]", current, 10, updated="u2")],
+    )
+
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    outputs = {call[1]: call[2] for call in calls if call[0] == "output"}
+    state = json.loads(re.search(r"<!-- automation-state:(\{.*\}) -->", body).group(1))
+
+    assert state["attempt_status"] == "success"
+    assert "Legacy note" not in body
+    assert "- Normalization: normalized_blocks=1; reasons=invalid_severity" in body
+    assert json.loads(outputs["remaining_finding_ids_json"]) == []
