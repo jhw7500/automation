@@ -1,0 +1,28 @@
+# Let `@claude` mentions on this repo's own issues and PRs reach Claude.
+# The reusable `claude.yml` is `on: workflow_call`; consumer repos install the thin
+# caller from examples/baseline-workflows. This is that caller for automation itself,
+# using a LOCAL path like the other self callers. Without it the Claude App only adds
+# 👀 and no run starts (#212). Guards (author association, '@claude', managed prefix)
+# live in the reusable workflow; main is protected by the `protect-main` ruleset.
+name: Self Claude Code
+run-name: jhw-review-comment-${{ github.event.comment.id || github.run_id }}
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+
+jobs:
+  claude:
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      issues: read
+      pull-requests: write
+    uses: ./.github/workflows/claude.yml
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

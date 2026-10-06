@@ -729,3 +729,22 @@ def test_v178_catalog_ceiling_and_nested_claude_permissions_agree() -> None:
                  if entry.path.as_posix() == ".github/workflows/claude.yml")
     assert len(entry.caller_jobs) == 1
     assert dict(entry.caller_jobs[0].permissions) == FALLBACK_PERMISSIONS
+
+
+def test_self_claude_caller_mirrors_the_consumer_template() -> None:
+    template = load_yaml(CANONICAL / "workflows/claude.yml")
+    caller = load_yaml(ROOT / ".github/workflows/_self-claude.yml")
+    job = caller["jobs"]["claude"]
+    template_job = template["jobs"]["claude"]
+
+    assert caller["name"] != template["name"]
+    assert caller["run-name"] == template["run-name"]
+    assert caller["on"] == template["on"]
+    assert set(caller["jobs"]) == {"claude"}
+    assert job["permissions"] == template_job["permissions"]
+    assert job["uses"] == "./.github/workflows/claude.yml"
+    assert job["secrets"] == {
+        "CLAUDE_CODE_OAUTH_TOKEN": "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}",
+    }
+    assert "with" not in job
+    assert not (CANONICAL / "workflows/_self-claude.yml").exists()
