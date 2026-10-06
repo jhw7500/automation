@@ -490,12 +490,9 @@ Request bodies and markers are:
 
 @gemini 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.
 <!-- jhw-issue:review-request reviewer=gemini -->
-
-@codex 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.
-<!-- jhw-issue:review-request reviewer=codex -->
 ```
 
-Post each in its own issue comment. On resume, reuse exactly one actor-owned matching marker; multiple markers are `FAILED`.
+Post each planned reviewer's body in its own issue comment. Codex has no issue request body while standalone-issue review is inactive under spec section 10 (#125). On resume, reuse exactly one actor-owned matching marker; multiple markers are `FAILED`.
 
 - [ ] **Step 6: Add the issue contract to install safety**
 
