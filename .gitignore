@@ -2,3 +2,15 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .worktrees/
+
+# Local agent and tool state (never committed)
+.omc/
+.omx/
+.serena/
+.review/
+.code-review-graph/
+.codex/
+.agents/
+.ai/
+# Per-session checkpoints; the tracked HANDOFF.md is not matched
+HANDOFF.*.md
