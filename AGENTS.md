@@ -78,7 +78,8 @@ python3 -m scripts.verify_workflow_release --ref <tag> --expected-commit <40-cha
     메시지 파일로 커밋한다: `git commit --cleanup=verbatim --file <msg-file>`.
   - PR 본문: `Contract version`, `Summary`, `Changes`, `Validation`, `Impact and risks`,
     `Related issue`. 템플릿은 `.github/pull_request_template.md`.
-  - 커밋 제목은 영문 `type(scope): 결과` 형식이다. 최근 `git log`가 예다.
+  - 계약이 요구하는 제목 규칙은 결과 중심·72자 이하뿐이다. 저장소 관례는 영문 `type(scope): 결과` 또는
+    `type: 결과`이고 scope는 선택이다. 최근 `git log`를 따른다.
 - PR 생성은 pre-PR tribunal 훅을 통과해야 한다. 브랜치 체크아웃 안에서 아래 형식 그대로 실행한다.
   `cd … &&` 결합, `--head`, `--repo`는 쓰지 않는다. PR이 생긴 뒤의 push는 게이트되지 않는다.
 
@@ -114,9 +115,13 @@ PATH=/usr/bin:/bin /usr/bin/gh pr create --base main --title "<title>" --body-fi
 
 ## 하지 않는 것
 
-- `secrets: inherit`, `secrets.GITHUB_TOKEN` 사용 — `tests/test_workflow_secret_contracts.py`가 막는다.
-  기본 토큰은 `github.token` 컨텍스트로 쓴다.
-- pin하지 않은 action 참조 — `tests/test_action_pins.py`가 승인된 SHA를 강제한다.
+- `secrets: inherit`, `secrets.GITHUB_TOKEN` 사용 — `tests/test_workflow_secret_contracts.py`가
+  `.github/workflows/*.yml`에서 막는다(소비자 caller 트리는 이 검사 범위 밖). 기본 토큰은
+  `github.token` 컨텍스트로 쓴다.
+- 주변 workflow와 다른 방식의 action 참조 — 같은 action은 기존 참조와 같은 pin을 쓴다.
+  `tests/test_action_pins.py`는 일부 action(checkout, setup-python, Claude action 등)만 승인된 SHA로
+  검사하고, 의도적으로 태그로 참조하는 action도 있다. 테스트가 모든 `uses:`를 막아 준다고
+  가정하지 않으며, 기존 예외 참조를 임의로 바꾸지 않는다.
 - 태그 이동·재생성, 예산 원장 코멘트의 편집·절단·삭제 (복구도 원장을 그대로 둔다).
 - 세션 체크포인트 `HANDOFF.<세션>.md`와 도구 상태 디렉터리(`.omc`, `.omx`, `.serena`, `.review`,
   `.code-review-graph`, `.codex`, `.agents`)를 커밋하지 않는다. `.gitignore`가 이들을 막지 않으므로
