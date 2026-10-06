@@ -1,0 +1,20 @@
+# Temporary canary for #173: does the Codex GitHub App react to `@codex review`
+# posted by github-actions[bot]? Runs only on the canary branch's own PR; never merged.
+name: Canary Codex bot mention
+on:
+  pull_request:
+    types: [opened]
+permissions: {}
+jobs:
+  mention:
+    if: github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'canary/codex-bot-mention')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post @codex review as github-actions[bot]
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr comment "$PR" --repo "$REPO" --body '@codex review'
