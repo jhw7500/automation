@@ -257,9 +257,13 @@ separately reviewed setup change; unrelated keys are never regenerated or remove
 - Claude is eligible when the managed issue-mention caller is installed and enabled.
 - Central Gemini is eligible when the managed issue chat/dispatch caller is installed, enabled, and
   configured.
-- Codex issue mention is eligible only for repositories where the connector/environment has been
-  explicitly configured and a canary has demonstrated standalone-issue response. Official Codex
-  code-review documentation guarantees PR review, so issue support is never inferred from PR setup.
+- Codex issue mention is planned but inactive. It may become eligible only for repositories where
+  the connector/environment has been explicitly configured and a canary has demonstrated
+  standalone-issue response, but this contract does not yet define how that canary is created
+  (issue, request comment and accepted evidence), how its URL reaches the command, or how the
+  configuration is confirmed. Until those are specified here, Codex is not planned for standalone
+  issues, and preparing a canary does not make it eligible. Official Codex code-review
+  documentation guarantees PR review, so issue support is never inferred from PR setup.
 - Gemini Code Assist `/gemini review` is PR-only and is not requested or awaited on standalone
   issues.
 - OpenCode's current safe-review contract is PR-only and is not requested or awaited on standalone
