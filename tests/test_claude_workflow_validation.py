@@ -338,7 +338,7 @@ const github = {rest: {repos: {
   getBranch: async args => respond('branch', args, {commit: {sha: fx.defaultSha}}),
   getContent: async args => respond(
     args.ref === fx.workflowSha ? 'current' : 'default', args,
-    {type: fx.fileType || 'file', path: '.github/workflows/claude.yml',
+    {type: fx.fileType || 'file', path: fx.contentPath || '.github/workflows/claude.yml',
      sha: args.ref === fx.workflowSha ? fx.currentBlob : fx.defaultBlob,
      ...((args.ref === fx.workflowSha ? fx.currentContent : fx.defaultContent) === undefined ? {} : {
        encoding: 'base64',
@@ -548,6 +548,38 @@ def test_mismatch_pin_diagnostic_never_guesses(tmp_path, current, default, runni
     assert len(result["notices"]) == 1
     assert f"running caller pin {running} /" in result["notices"][0]
     assert f"default-branch caller pin {branch} /" in result["notices"][0]
+
+
+@node_required
+def test_review_caller_mismatch_names_its_own_reusable_workflow_pins(tmp_path):
+    def review_ref(pin):
+        return f"jhw7500/automation/.github/workflows/claude-code-review.yml@{pin}"
+
+    result = _preflight(
+        tmp_path, defaultBlob="d" * 40,
+        workflowRef="o/r/.github/workflows/claude-code-review.yml@refs/heads/work",
+        contentPath=".github/workflows/claude-code-review.yml",
+        currentContent=_caller(review_ref(OLD_PIN)),
+        defaultContent=_caller(review_ref(NEW_PIN)),
+    )
+    assert result["outputs"] == {"allowed": "false", "reason": "workflow_validation_mismatch"}
+    assert len(result["notices"]) == 1
+    assert (f"running caller pin {OLD_PIN} / default-branch caller pin {NEW_PIN} /"
+            in result["notices"][0])
+
+
+@node_required
+def test_pin_diagnostic_ignores_other_reusable_workflows(tmp_path):
+    result = _preflight(
+        tmp_path, defaultBlob="d" * 40,
+        workflowRef="o/r/.github/workflows/claude-code-review.yml@refs/heads/work",
+        contentPath=".github/workflows/claude-code-review.yml",
+        currentContent=_caller(_pin_ref(OLD_PIN)),
+        defaultContent=_caller(_pin_ref(NEW_PIN)),
+    )
+    assert result["outputs"] == {"allowed": "false", "reason": "workflow_validation_mismatch"}
+    assert ("running caller pin unavailable / default-branch caller pin unavailable /"
+            in result["notices"][0])
 
 
 @node_required

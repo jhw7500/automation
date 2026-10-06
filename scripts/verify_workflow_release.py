@@ -7715,7 +7715,7 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
-    ".github/workflows/claude-code-review.yml": "9e09c6baccdd598ed15008f2262b824f0499d2cca871567014f71263cd944c0e",
+    ".github/workflows/claude-code-review.yml": "6d9dca1e1e6c2fd8c9b862bf00a44631ecf71766d3f0758898878204cf87ef01",
     ".github/workflows/opencode-auto-review.yml": "2d09c40dffb85aacbb25308593186500b4e08d9c1f1fd2c14ff1d4ec44228a98",
     ".github/actions/recover-opencode-review/evidence.py": "5b2245282d5ff7a567219afb934e4a81f4c3c017b8305accfa5917605453b0bf",
     ".github/actions/recover-opencode-review/replay.js": "128889cd11729b034e9b26d3577a03adb8bb647148d0eeceb66550e2005ff564",
@@ -7728,7 +7728,7 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
-    ".github/workflows/claude-code-review.yml": "5fa80c13a832923cf510059b05e0678f9953d2851cea840b49c83b310f647403",
+    ".github/workflows/claude-code-review.yml": "afdac4a6c166997a41ca670ecc9c3b452dad1474fe7c46ed6843650d4539073b",
     ".github/workflows/opencode-auto-review.yml": "655a7e2e4682d8cfda4b3927deef454cdf96219c8754c98201e6cb97a254d71f",
     ".github/actions/recover-opencode-review/evidence.py": "7d58e85eca2e67d054b9196f3b609a5de66b62534467730872d5e61b71205658",
 }

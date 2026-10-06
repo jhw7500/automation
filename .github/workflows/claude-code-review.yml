@@ -681,8 +681,9 @@ jobs:
                 const uses = line.match(/^ *(?:- +)?uses: +(.*)$/);
                 if (!uses) continue;
                 const value = uses[1].replace(/^(['"])(.*)\1[ ]*(?:#.*)?$/, '$2').split(/ +#/)[0].trim();
-                const pin = value.match(/^jhw7500\/automation\/\.github\/workflows\/claude\.yml@([0-9a-f]{40})$/);
-                if (pin) pins.push(pin[1]);
+                const reusable = `jhw7500/automation/${path}@`;
+                const pin = value.startsWith(reusable) ? value.slice(reusable.length) : '';
+                if (/^[0-9a-f]{40}$/.test(pin)) pins.push(pin);
               }
               return pins.length === 1 ? pins[0] : pins.length ? 'ambiguous' : 'unavailable';
             };
