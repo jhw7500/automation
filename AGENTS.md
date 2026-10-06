@@ -58,7 +58,9 @@ python3 -m scripts.verify_workflow_release --ref <tag> --expected-commit <40-cha
 
 ## 워크플로·액션 바이트를 바꿀 때 같이 고칠 것
 
-릴리스된 태그의 바이트는 검증기에 봉인되어 있다. 새 바이트는 새 릴리스 라인에 묶는다.
+릴리스 인벤토리에 속한 파일의 바이트는 검증기에 봉인되어 있다. 대상인지는
+`scripts/workflow_release_inventory.py`의 `RELEASE_ROOTS`와 `release_roots_for()`로 확인한다. 대상
+밖의 action·파일 정비에는 아래 체크리스트를 적용하지 않는다. 대상 파일의 새 바이트는 새 릴리스 라인에 묶는다.
 예시는 `git show --stat be8fb11` (v1.83 라인 추가)와 그 커밋 메시지의 "Release binding" 항목이다.
 
 - `scripts/workflow_release_inventory.py` — 새 릴리스 상수와 `release_supports_*` 게이트를 추가한다.
@@ -66,8 +68,9 @@ python3 -m scripts.verify_workflow_release --ref <tag> --expected-commit <40-cha
   라인은 직전 태그에서 측정한 `V<NNN>_*` 상수로 기존 digest를 유지한다.
 - `tests/release_fixture_helpers.py` — 과거 릴리스 fixture가 옛 바이트를 복원하는 `restore_pre_v*`
   함수를 추가한다.
-- 소비자 caller가 바뀌면 `examples/baseline-workflows/`와 `scripts/workflow-catalog.json`도
-  같이 움직인다. 동작 계약이 바뀌면 `docs/workflows/contracts.md`를 고친다.
+- 소비자 caller는 `examples/baseline-workflows/`에서 고친다. `scripts/workflow-catalog.json`은 catalog가
+  모델링하는 필드(`scripts/workflow_catalog.py`의 `CatalogEntry`: 경로·종류·central workflow·인증·
+  trigger·job 계약)가 바뀔 때만 함께 고친다. 동작 계약이 바뀌면 `docs/workflows/contracts.md`를 고친다.
 
 ## 커밋과 PR
 
