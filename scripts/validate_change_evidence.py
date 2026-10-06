@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 import errno
 import html
@@ -131,6 +132,12 @@ ASCII_MARKDOWN_PUNCTUATION = frozenset(
     character
     for character in map(chr, range(0x21, 0x7F))
     if unicodedata.category(character).startswith(("P", "S"))
+)
+MAX_LINK_LABEL_CHARACTERS = 999
+# Normalized labels of the link reference definitions in the document being
+# validated; reference-style links and images resolve only against these.
+LINK_REFERENCE_LABELS: ContextVar[frozenset[str]] = ContextVar(
+    "link_reference_labels", default=frozenset()
 )
 
 
@@ -363,7 +370,9 @@ def _list_can_interrupt_paragraph(list_match: re.Match[str]) -> bool:
 
 
 def _parse_link_definition_status(
-    value: str, title_present: list[bool] | None = None
+    value: str,
+    title_present: list[bool] | None = None,
+    label: list[str] | None = None,
 ) -> int:
     """Classify a complete or extendable CommonMark link definition."""
 
@@ -377,6 +386,7 @@ def _parse_link_definition_status(
         return LINK_DEFINITION_INVALID
 
     index += 1
+    label_start = index
     label_length = 0
     label_has_content = False
     while index < len(value):
@@ -397,7 +407,7 @@ def _parse_link_definition_status(
         if character not in " \t\n":
             label_has_content = True
         label_length += 1
-        if label_length > 999:
+        if label_length > MAX_LINK_LABEL_CHARACTERS:
             return LINK_DEFINITION_INVALID
         index += 1
     else:
@@ -405,6 +415,8 @@ def _parse_link_definition_status(
 
     if not label_has_content:
         return LINK_DEFINITION_INVALID
+    if label is not None:
+        label[:] = [value[label_start:index]]
     index += 1
     if index >= len(value) or value[index] != ":":
         return LINK_DEFINITION_INVALID
@@ -524,6 +536,10 @@ def _link_definition_has_inline_title(value: str) -> bool:
 
 def _is_link_definition(value: str) -> bool:
     return _link_definition_status(value) == LINK_DEFINITION_VALID
+
+
+def _normalize_link_label(value: str) -> str:
+    return re.sub(r"[ \t\r\n]+", " ", value.strip(" \t\r\n")).casefold()
 
 
 def _line_opens_paragraph(line: str) -> bool:
@@ -1188,7 +1204,9 @@ def _multiline_link_title_end(
             return None
 
 
-def _link_definition_line_ranges(value: str) -> list[tuple[int, int]]:
+def _link_definition_line_ranges(
+    value: str, labels: list[str] | None = None
+) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     start: int | None = None
     candidate = ""
@@ -1373,6 +1391,10 @@ def _link_definition_line_ranges(value: str) -> list[tuple[int, int]]:
                 if title_end is not None:
                     end = title_end
             ranges.append((start + 1, end + 1))
+            if labels is not None:
+                label: list[str] = []
+                _parse_link_definition_status(candidate, label=label)
+                labels.append(_normalize_link_label(label[0]))
             skip_through = end
             start = None
             candidate = ""
@@ -1388,8 +1410,10 @@ def _link_definition_line_ranges(value: str) -> list[tuple[int, int]]:
     return ranges
 
 
-def _link_definition_start_lines(value: str) -> list[int]:
-    return [start for start, _end in _link_definition_line_ranges(value)]
+def _link_definition_start_lines(
+    value: str, labels: list[str] | None = None
+) -> list[int]:
+    return [start for start, _end in _link_definition_line_ranges(value, labels)]
 
 
 def _mask_line_ranges(value: str, ranges: Sequence[tuple[int, int]]) -> str:
@@ -1789,35 +1813,61 @@ def _inline_link_token(
     label_end: int,
     *,
     allow_reference: bool,
+    reference_labels: frozenset[str] = frozenset(),
+    bracket_openers: Sequence[int] = (),
 ) -> tuple[int, int, int, bool, bool] | None:
-    """Return end, label bounds, and image status for valid link syntax."""
+    """Return end, label bounds, and image status for valid link syntax.
 
-    if label_end + 1 >= len(value):
-        return None
-    delimiter = value[label_end + 1]
-    if delimiter == "(":
+    Reference forms count only when their normalized label is defined.
+    """
+
+    delimiter = value[label_end + 1] if label_end + 1 < len(value) else ""
+    end = None
+    is_inline = delimiter == "("
+    if is_inline:
         end = _inline_destination_end(value, label_end + 2)
-        is_inline = True
-    elif delimiter == "[" and allow_reference:
+    if end is None and allow_reference:
         is_inline = False
-        cursor = label_end + 2
-        while cursor < len(value):
-            character = value[cursor]
-            if character in "\r\n[":
-                return None
+        reference_label = None
+        if delimiter == "[":
+            cursor = label_end + 2
+            while cursor < len(value):
+                character = value[cursor]
+                if character in "\r\n":
+                    return None
+                if character == "[":
+                    break
+                if (
+                    character == "\\"
+                    and cursor + 1 < len(value)
+                    and value[cursor + 1] in ASCII_MARKDOWN_PUNCTUATION
+                ):
+                    cursor += 2
+                    continue
+                if character == "]":
+                    break
+                cursor += 1
             if (
-                character == "\\"
-                and cursor + 1 < len(value)
-                and value[cursor + 1] in ASCII_MARKDOWN_PUNCTUATION
+                cursor < len(value)
+                and value[cursor] == "]"
+                and cursor - label_end - 2 <= MAX_LINK_LABEL_CHARACTERS
             ):
-                cursor += 2
-                continue
-            if character == "]":
-                break
-            cursor += 1
-        end = cursor + 1 if cursor < len(value) else None
-    else:
-        return None
+                end = cursor + 1
+                if cursor > label_end + 2:
+                    reference_label = value[label_end + 2 : cursor]
+        if reference_label is None:
+            if end is None:
+                end = label_end + 1
+            inner_opener = bisect_right(bracket_openers, opener)
+            if (
+                label_end - opener - 1 > MAX_LINK_LABEL_CHARACTERS
+                or inner_opener < len(bracket_openers)
+                and bracket_openers[inner_opener] < label_end
+            ):
+                return None
+            reference_label = value[opener + 1 : label_end]
+        if _normalize_link_label(reference_label) not in reference_labels:
+            return None
     if end is None:
         return None
     is_image = (
@@ -1829,12 +1879,22 @@ def _inline_link_token(
 
 
 def _inline_link_tokens(
-    value: str, *, allow_reference: bool
+    value: str,
+    *,
+    allow_reference: bool,
+    reference_labels: frozenset[str] = frozenset(),
 ) -> list[tuple[int, int, int, int, bool, bool]]:
     tokens: list[tuple[int, int, int, int, bool, bool]] = []
-    for opener, label_end in _inline_label_pairs(value).items():
+    pairs = _inline_label_pairs(value)
+    bracket_openers = sorted(pairs)
+    for opener, label_end in pairs.items():
         token = _inline_link_token(
-            value, opener, label_end, allow_reference=allow_reference
+            value,
+            opener,
+            label_end,
+            allow_reference=allow_reference and bool(reference_labels),
+            reference_labels=reference_labels,
+            bracket_openers=bracket_openers,
         )
         if token is not None:
             end, label_start, parsed_label_end, is_image, is_inline = token
@@ -1848,18 +1908,23 @@ def _inline_link_tokens(
                     is_inline,
                 )
             )
+    # Drop links whose label contains an inline link; suffix minima of the
+    # nested links' ends keep this check logarithmic per token.
+    nested_links = sorted(
+        (token[0], token[1]) for token in tokens if token[5] and not token[4]
+    )
+    nested_starts = [start for start, _end in nested_links]
+    nested_min_ends = [end for _start, end in nested_links]
+    for index in range(len(nested_min_ends) - 2, -1, -1):
+        nested_min_ends[index] = min(
+            nested_min_ends[index], nested_min_ends[index + 1]
+        )
     return [
         token
         for token in tokens
         if token[4]
-        or not any(
-            nested[5]
-            and not nested[4]
-            and token[2] <= nested[0]
-            and nested[1] <= token[3]
-            for nested in tokens
-            if nested is not token
-        )
+        or (index := bisect_left(nested_starts, token[2])) == len(nested_starts)
+        or nested_min_ends[index] > token[3]
     ]
 
 
@@ -1932,7 +1997,11 @@ def _inline_visibility_ranges(value: str) -> list[tuple[int, int]]:
         label_end,
         is_image,
         _is_inline,
-    ) in _inline_link_tokens(value, allow_reference=True):
+    ) in _inline_link_tokens(
+        value,
+        allow_reference=True,
+        reference_labels=LINK_REFERENCE_LABELS.get(),
+    ):
         if is_image:
             ranges.append((opener - 1, end))
         else:
@@ -2545,6 +2614,16 @@ def _parse_sections(
 def validate_text(
     text: str, *, kind: str, expected_version: str = CONTRACT_VERSION
 ) -> ValidationResult:
+    token = LINK_REFERENCE_LABELS.set(frozenset())
+    try:
+        return _validate_text(text, kind=kind, expected_version=expected_version)
+    finally:
+        LINK_REFERENCE_LABELS.reset(token)
+
+
+def _validate_text(
+    text: str, *, kind: str, expected_version: str
+) -> ValidationResult:
     if kind not in CONTRACTS:
         raise ValueError(f"unsupported evidence kind: {kind}")
     if expected_version != CONTRACT_VERSION:
@@ -2585,7 +2664,10 @@ def validate_text(
                 _line_number(line_starts, offset),
             )
         )
-    for line_number in _link_definition_start_lines(visible_document):
+    reference_labels: list[str] = []
+    for line_number in _link_definition_start_lines(
+        visible_document, reference_labels
+    ):
         findings.append(
             Finding(
                 "non-rendered-link-definition",
@@ -2593,6 +2675,7 @@ def validate_text(
                 line_number,
             )
         )
+    LINK_REFERENCE_LABELS.set(frozenset(reference_labels))
     findings.extend(_setext_heading_findings(visible_document))
 
     definition = CONTRACTS[kind]

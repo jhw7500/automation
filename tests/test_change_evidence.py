@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 import yaml
@@ -480,6 +481,120 @@ def test_issue_url_in_nested_image_alt_does_not_satisfy_reference() -> None:
 
     assert not result.valid
     assert "empty-field" in {item.code for item in result.findings}
+
+
+def _summary_with_reference_definitions(summary: str, definitions: str) -> str:
+    return (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        summary,
+    ).replace(
+        "Repositories must adopt the template before enabling enforcement.",
+        "Repositories must adopt the template before enabling enforcement.\n\n"
+        + definitions,
+    )
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "![concrete evidence][missing]",
+        "![concrete evidence][]",
+        "![concrete evidence]",
+        "[][missing]",
+    ],
+)
+def test_unresolved_reference_image_stays_visible(summary: str) -> None:
+    text = (FIXTURES / "valid-pull-request.md").read_text().replace(
+        "Adds deterministic validation for structured change evidence.",
+        summary,
+    )
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert result.valid, result.findings
+
+
+@pytest.mark.parametrize(
+    ("summary", "definitions"),
+    [
+        ("![concrete evidence][ref]", "[ref]: https://example.invalid/a.png"),
+        ("![ref][]", "[ref]: https://example.invalid/a.png"),
+        ("![ref]", "[ref]: https://example.invalid/a.png"),
+        ("![ref](", "[ref]: https://example.invalid/a.png"),
+        ("[][ref]", "[ref]: https://example.invalid"),
+        ("![x][REF]", "[ref]: /a.png"),
+        ("![x][  Ref \t One ]", "[ref one]: /a.png"),
+        ("![Ref\nOne]", "[REF ONE]: /a.png"),
+        ("![x][STRASSE]", "[straße]: /a.png"),
+        (r"![x][a\]b]", r"[a\]b]: /a.png"),
+        ("![x][ref]", "[ref]: /first.png\n[ref]: /second.png"),
+        ("![x][ref]", "[ref]: <bad\n\n[ref]: /a.png"),
+        ("![x][ref]", "> [ref]: /a.png"),
+        ("![x][ref]", "- [ref]: /a.png"),
+        ("![x][ref]", "[ref]:\n  /a.png\n  'title'"),
+    ],
+)
+def test_resolved_reference_image_does_not_satisfy_required_field(
+    summary: str, definitions: str
+) -> None:
+    text = _summary_with_reference_definitions(summary, definitions)
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    codes = {(item.code, item.field) for item in result.findings}
+    assert ("empty-field", "Summary") in codes
+    assert ("non-rendered-link-definition", None) in codes
+
+
+@pytest.mark.parametrize(
+    ("summary", "definitions"),
+    [
+        ("![x][ref]", "[ref]: <bad"),
+        ("![x][ref]", "[ref]: /a.png 'title' trailing"),
+        ("![x][]", "[]: /a.png"),
+        ("![x][ ]", "[ ]: /a.png"),
+        ("![" + "a" * 1000 + "]", "[" + "a" * 1000 + "]: /a.png"),
+        (r"![x][a\!b]", "[a!b]: /a.png"),
+        ("![x][ref]", "```\n[ref]: /a.png\n```"),
+        ("![x][ref]", "<!--\n[ref]: /a.png\n-->"),
+        ("![x][ref]", "    [ref]: /a.png"),
+        ("![x][ref]", "Paragraph continues\n[ref]: /a.png"),
+        ("![x][other]", "[ref]: /a.png"),
+        ("![ref][other]", "[ref]: /a.png"),
+        ("![a [b] c]", "[a [b] c]: /a.png"),
+    ],
+)
+def test_reference_image_without_valid_definition_stays_visible(
+    summary: str, definitions: str
+) -> None:
+    text = _summary_with_reference_definitions(summary, definitions)
+
+    result = validator.validate_text(text, kind="pull-request")
+
+    assert ("empty-field", "Summary") not in {
+        (item.code, item.field) for item in result.findings
+    }
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "[a]" * 20000,
+        "![a]" * 15000,
+        "![a][a]" * 9000,
+        "[a](b)" * 4000 + "[a]" * 12000,
+        "[" * 30000 + "a" + "]" * 30000,
+    ],
+    ids=["shortcut-links", "shortcut-images", "full-images", "mixed", "nested"],
+)
+def test_reference_resolution_is_bounded_on_adversarial_input(summary: str) -> None:
+    text = _summary_with_reference_definitions(summary, "[a]: /a.png")
+    assert len(text.encode()) <= validator.MAX_BYTES
+
+    started = time.perf_counter()
+    validator.validate_text(text, kind="pull-request")
+
+    assert time.perf_counter() - started < 5
 
 
 @pytest.mark.parametrize("field", ["Summary", "Impact and risks"])
