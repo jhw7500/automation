@@ -90,16 +90,18 @@ PATH=/usr/bin:/bin /usr/bin/gh pr create --base main --title "<title>" --body-fi
 
 ## 리뷰
 
-- 관리형 리뷰(Claude·Gemini·OpenCode)는 PR에 `review:request` 라벨을 붙여야 돈다.
-  `.github/workflow-config.yml`의 `review.auto`가 `false`다. `review:skip`과 함께 붙이면
-  `conflict`로 실패한다 (`docs/workflows/contracts.md` 「Review controls and external App operation」).
+- 관리형 리뷰(Claude·Gemini·OpenCode)는 `.github/workflow-config.yml`의 `review.auto`가 `false`라
+  자동으로 돌지 않는다. 보통은 PR에 `review:request` 라벨을 붙여 요청한다. 다른 요청 경로(수동
+  dispatch, 예산 override)와 라벨 조합 규칙은 `docs/workflows/contracts.md`
+  「Review controls and external App operation」이 정본이다.
 - `@claude` 멘션은 `.github/workflows/_self-claude.yml`이 받아 대화형 Claude 리뷰를 돌린다.
 - `@codex review`는 사람 계정이 단 코멘트여야 한다. 봇이 단 멘션은 거부된다.
 - 결과는 sticky 코멘트로 제자리 갱신된다. 머리의 `automation-state` JSON을 읽는다. 공통 필드는
   `attempt_status`·`attempt_head`·`successful_head` 등이다. Claude·Gemini(schema 3)는
-  `review_execution`(`performed`/`not_performed`)과 `accepted_count`·`filtered_count`를 더 낸다.
-  OpenCode는 schema 2를 유지해 이 필드들이 없다. 필드 정의는 `docs/workflows/contracts.md`의
-  state 절이 정본이다. job success만으로 리뷰가 돌았다고 판정하지 않는다.
+  `review_execution`과 `accepted_count`·`filtered_count` 같은 품질 필드를 더 내고, OpenCode는
+  schema 2를 유지해 이 필드들이 없다. 각 필드가 가질 수 있는 값과 의미는 여기 옮기지 않는다 —
+  `docs/workflows/contracts.md`의 state 절이 정본이다. job success만으로 리뷰가 돌았다고
+  판정하지 않는다.
 - OpenCode는 현재 구독이 없어 `quota_exhausted`로 실패한다. 이것을 리뷰 결과로 읽지 않는다.
 
 ## 릴리스와 롤아웃
