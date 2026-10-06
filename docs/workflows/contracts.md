@@ -406,25 +406,32 @@ the exact ready-for-review, draft-guard, label, dispatch, and configuration-prec
 their managed callers. These inventory and semantic checks apply only to `v1.51+`; `v1.50` and every
 earlier release retain their existing closed inventories and historical caller contracts.
 
-`/jhw:pr` posts `@codex review` and `/gemini review` after the final ready head, so manual
-App review remains available. Operators must keep Codex Code review enabled while disabling
-Automatic reviews in ChatGPT Codex settings. Gemini disables only PR-open automatic review:
+`/jhw:pr` posts `@codex review` after the final ready head, so manual Codex review remains
+available. Operators must keep Codex Code review enabled while disabling Automatic reviews in
+ChatGPT Codex settings. The Gemini Code Assist GitHub App is disabled outright:
 
 ```yaml
 code_review:
+  disable: true
   pull_request_opened:
     code_review: false
 ```
 
-This uses only `pull_request_opened.code_review: false`; it does not set `code_review.disable`
-and preserves unrelated existing Gemini configuration keys. `review:skip` cannot cancel an App
-or managed-workflow review that has already started. Fleet activation stops unless an operator
-confirms the Codex setting and the Gemini configuration is mechanically verified.
+`code_review.disable: true` turns off App reviews, including `/gemini review`. The
+`pull_request_opened.code_review: false` key stays so the PR-open automatic-review prohibition still
+holds if `disable` is ever removed. Unrelated existing Gemini configuration keys are preserved.
+This applies only to the Gemini Code Assist App (`gemini-code-assist[bot]`); the managed Gemini CLI
+workflow (`Gemini Auto PR Review`, `@gemini-cli /review`, `GEMINI_API_KEY`) is a separate channel and
+is unaffected. The fleet tools do not deploy `.gemini/config.yaml`; each repository keeps its own
+file. `review:skip` cannot cancel an App or managed-workflow review that has already started. Fleet
+activation stops unless an operator confirms the Codex setting and the Gemini configuration is
+mechanically verified.
 
-To roll back the external-App opt-in, restore only Gemini's
-`pull_request_opened.code_review` value to `true` and re-enable Automatic reviews in ChatGPT
-Codex settings; keep Codex Code review enabled. No label or managed-workflow policy changes are
-needed for this rollback.
+Re-enabling the App (for example under an Enterprise account) requires explicitly removing
+`code_review.disable` and a capability canary on the same repository before any review process
+relies on it. To roll back the Codex opt-in, re-enable Automatic reviews in ChatGPT Codex settings
+and keep Codex Code review enabled. No label or managed-workflow policy changes are needed for
+either change.
 
 ### Opt-in per review channel
 
@@ -434,10 +441,10 @@ Every review channel is off by default and requires an explicit opt-in:
 | --- | --- | --- |
 | Managed Actions reviewers (Claude, Gemini, OpenCode) | off, from `default_auto_false` or the baseline `review.auto: false` | the `review:request` label, `workflows.<name>.auto: true`, or `review.auto: true` |
 | Codex Code review | off, because Automatic reviews stays disabled in ChatGPT Codex settings | a `@codex review` pull-request comment |
-| Gemini Code Assist App | off, from `pull_request_opened.code_review: false` | a `/gemini review` pull-request comment |
+| Gemini Code Assist App | disabled, from `code_review.disable: true` | none while disabled; re-enabling follows the conditions above |
 
-`/jhw:pr --review` applies the label and posts both mentions, so opting one pull request into all
-three channels is a single command.
+`/jhw:pr --review` applies the label and posts the Codex mention, so opting one pull request into
+both available channels is a single command.
 
 The labels themselves are a fleet precondition. Every configured repository must define
 `review:request` (`0E8A16`, "Explicitly request AI review"), `review:skip` (`BFDADC`,

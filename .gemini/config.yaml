@@ -1,3 +1,4 @@
 code_review:
+  disable: true
   pull_request_opened:
     code_review: false
