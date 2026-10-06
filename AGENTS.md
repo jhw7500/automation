@@ -69,8 +69,7 @@ python3 -m scripts.verify_workflow_release --ref <tag> --expected-commit <40-cha
 - `tests/release_fixture_helpers.py` — 과거 릴리스 fixture가 옛 바이트를 복원하는 `restore_pre_v*`
   함수를 추가한다.
 - 소비자 caller는 `examples/baseline-workflows/`에서 고친다. `scripts/workflow-catalog.json`은 catalog가
-  모델링하는 필드(`scripts/workflow_catalog.py`의 `CatalogEntry`: 경로·종류·central workflow·인증·
-  trigger·job 계약)가 바뀔 때만 함께 고친다. 동작 계약이 바뀌면 `docs/workflows/contracts.md`를 고친다.
+  모델링하는 필드(`scripts/workflow_catalog.py`의 `CatalogEntry` 정의가 정본)가 바뀔 때만 함께 고친다. 동작 계약이 바뀌면 `docs/workflows/contracts.md`를 고친다.
 
 ## 커밋과 PR
 
