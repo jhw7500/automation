@@ -24,7 +24,7 @@
 - `--no-review` invokes and awaits no AI reviewer; CI, target, head, mergeability, and explicit merge requirements remain.
 - App requests are idempotent per reviewer and PR head.
 - Issue review never edits/closes the issue or implements feedback automatically.
-- Codex standalone-issue review is planned only after demonstrated connector/environment support; Gemini Assist and OpenCode are not issue reviewers.
+- Codex standalone-issue review is planned but inactive: spec section 10 makes it eligible only after its canary procedure, URL interface and configuration check are specified, which has not happened (#125). Gemini Assist and OpenCode are not issue reviewers.
 - Do not modify Notion databases, Project Control state, or issue #52.
 - Automation `v1.51` remote verification and the canary caller rollout are prerequisites.
 - Every shell command in this environment starts with `rtk`.
@@ -423,7 +423,7 @@ rtk git commit -m "docs(skills): publish jhw pr and deprecate ship"
 
 **Interfaces:**
 - Produces: modes `request`, `skip`, `auto` with the same mutual exclusion as PR.
-- Produces: planned issue reviewer set from enabled Claude, enabled central Gemini, and capability-proven Codex.
+- Produces: planned issue reviewer set from enabled Claude and enabled central Gemini; Codex is never planned while spec section 10 marks it inactive (#125).
 - Produces: issue labels and one hidden request marker per planned reviewer.
 
 - [ ] **Step 1: Write RED issue option and no-mutation tests**
@@ -468,7 +468,7 @@ The first phase resolves title/body, repository, mode, timeout, permission, labe
 
 - [ ] **Step 4: Implement reviewer discovery without secret guessing**
 
-Claude is eligible only when `.github/workflows/claude.yml` exists and `workflows.claude.enabled` is true. Central Gemini is eligible only when `gemini-chat.yml` or its documented managed mention route exists and the corresponding config is enabled. Codex is eligible only when repository-local capability evidence named in the skill exists or the operator explicitly confirms a successful issue canary for that repository. GitHub secret values are never claimed during preflight.
+Claude is eligible only when `.github/workflows/claude.yml` exists and `workflows.claude.enabled` is true. Central Gemini is eligible only when `gemini-chat.yml` or its documented managed mention route exists and the corresponding config is enabled. Codex is not eligible: spec section 10 marks standalone-issue review inactive until its canary procedure, URL interface and configuration check are specified (#125), and neither repository evidence nor operator confirmation of a canary overrides that. GitHub secret values are never claimed during preflight.
 
 If mode is `auto`, read global `review.auto`, default true only when missing, and turn the reviewer plan on/off accordingly. `skip` plans no reviewer. `request` requires at least one eligible reviewer.
 
@@ -490,12 +490,9 @@ Request bodies and markers are:
 
 @gemini 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.
 <!-- jhw-issue:review-request reviewer=gemini -->
-
-@codex 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.
-<!-- jhw-issue:review-request reviewer=codex -->
 ```
 
-Post each in its own issue comment. On resume, reuse exactly one actor-owned matching marker; multiple markers are `FAILED`.
+Post each planned reviewer's body in its own issue comment. Codex has no issue request body while standalone-issue review is inactive under spec section 10 (#125). On resume, reuse exactly one actor-owned matching marker; multiple markers are `FAILED`.
 
 - [ ] **Step 6: Add the issue contract to install safety**
 
@@ -645,7 +642,7 @@ Merge only when required CI, PR/issue skill tests, sync check, install safety, r
 
 - [ ] **Step 1: Run a standalone issue canary in jhw-notion**
 
-Create one clearly marked review canary issue using `/jhw:issue --review --timeout 20`. Require Claude and central Gemini when enabled. Include Codex only if the repository's connector/environment was proven during preflight. Record request comment IDs, acknowledgments, response URLs, terminal classifications, and the final summary.
+Create one clearly marked review canary issue using `/jhw:issue --review --timeout 20`. Require Claude and central Gemini when enabled. Do not include Codex; standalone-issue review is inactive under spec section 10 (#125). Record request comment IDs, acknowledgments, response URLs, terminal classifications, and the final summary.
 
 - [ ] **Step 2: Verify preservation behavior**
 
