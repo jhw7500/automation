@@ -67,6 +67,7 @@ from scripts.workflow_release_inventory import (
     release_supports_opencode_provider_error_preservation,
     release_supports_opencode_provider_failure_classification,
     release_supports_opencode_dismissal_coverage,
+    release_supports_claude_caller_pin_diagnostics,
     release_supports_carryover_none,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
@@ -6281,6 +6282,11 @@ def _verify_review_invocation_budget(
             ):
                 expected = V1782_CLAUDE_REVIEW_SHA256
             elif (
+                relative == ".github/workflows/claude-code-review.yml"
+                and not release_supports_claude_caller_pin_diagnostics(ref)
+            ):
+                expected = V182_CLAUDE_REVIEW_SHA256
+            elif (
                 relative == ".github/workflows/opencode-auto-review.yml"
                 and not release_supports_opencode_provider_error_preservation(ref)
             ):
@@ -7698,7 +7704,7 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
 
 
 # Reviewed fallback inputs, never calculated from the candidate at verification time.
-# The current seals require the v1.82 OpenCode dismissal coverage. Separate
+# The current seals require the v1.83 Claude caller pin diagnostics. Separate
 # historical router and review seals preserve exact immutable releases. Parsed
 # seals retain all existing policy statements, and raw seals additionally
 # authenticate exact bytes.
@@ -7709,7 +7715,7 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
-    ".github/workflows/claude-code-review.yml": "8e7e4e6040a23668f05ada28e60f2eb6ff8593362cbb8b6d9e6ea183eba48486",
+    ".github/workflows/claude-code-review.yml": "6d9dca1e1e6c2fd8c9b862bf00a44631ecf71766d3f0758898878204cf87ef01",
     ".github/workflows/opencode-auto-review.yml": "2d09c40dffb85aacbb25308593186500b4e08d9c1f1fd2c14ff1d4ec44228a98",
     ".github/actions/recover-opencode-review/evidence.py": "5b2245282d5ff7a567219afb934e4a81f4c3c017b8305accfa5917605453b0bf",
     ".github/actions/recover-opencode-review/replay.js": "128889cd11729b034e9b26d3577a03adb8bb647148d0eeceb66550e2005ff564",
@@ -7722,7 +7728,7 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
-    ".github/workflows/claude-code-review.yml": "4197edd1965b88b5a3ca2251bb854160a9d3ff726e22fcba64fbb3dd4aeab7ca",
+    ".github/workflows/claude-code-review.yml": "afdac4a6c166997a41ca670ecc9c3b452dad1474fe7c46ed6843650d4539073b",
     ".github/workflows/opencode-auto-review.yml": "655a7e2e4682d8cfda4b3927deef454cdf96219c8754c98201e6cb97a254d71f",
     ".github/actions/recover-opencode-review/evidence.py": "7d58e85eca2e67d054b9196f3b609a5de66b62534467730872d5e61b71205658",
 }
@@ -7745,6 +7751,12 @@ V1782_CLAUDE_REVIEW_SHA256 = (
 )
 V1782_CLAUDE_REVIEW_PARSED_SHA256 = (
     "8239044289476276719047121bff873731ea2c425457976379513de75182184b"
+)
+V182_CLAUDE_REVIEW_SHA256 = (
+    "8e7e4e6040a23668f05ada28e60f2eb6ff8593362cbb8b6d9e6ea183eba48486"
+)
+V182_CLAUDE_REVIEW_PARSED_SHA256 = (
+    "4197edd1965b88b5a3ca2251bb854160a9d3ff726e22fcba64fbb3dd4aeab7ca"
 )
 V179_OPENCODE_AUTO_REVIEW_SHA256 = (
     "ca6cbf2b1f1c9c57f524c45d4de0c863ac2bb249d0e261bbcf1da7e2017c5ea1"
@@ -7837,6 +7849,11 @@ def _fallback_parsed_seal(relative: str, value: object, ref: str = "v1.78.1") ->
         and not release_supports_filtered_candidate_preservation(ref)
     ):
         expected = V1782_CLAUDE_REVIEW_PARSED_SHA256
+    elif (
+        relative == ".github/workflows/claude-code-review.yml"
+        and not release_supports_claude_caller_pin_diagnostics(ref)
+    ):
+        expected = V182_CLAUDE_REVIEW_PARSED_SHA256
     elif (
         relative == ".github/workflows/opencode-auto-review.yml"
         and not release_supports_opencode_provider_error_preservation(ref)
@@ -8128,6 +8145,11 @@ def verify_claude_rollout_fallback_contract(
                 and not release_supports_filtered_candidate_preservation(ref)
             ):
                 expected = V1782_CLAUDE_REVIEW_SHA256
+            elif (
+                relative == ".github/workflows/claude-code-review.yml"
+                and not release_supports_claude_caller_pin_diagnostics(ref)
+            ):
+                expected = V182_CLAUDE_REVIEW_SHA256
             elif (
                 relative == ".github/workflows/opencode-auto-review.yml"
                 and not release_supports_opencode_provider_error_preservation(ref)

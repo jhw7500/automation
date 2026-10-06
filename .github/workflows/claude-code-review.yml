@@ -671,6 +671,32 @@ jobs:
             }
             const path = match[1];
             const options = { owner, repo, request: { timeout: 15000 } };
+            // Diagnostics only (#185): name both automation pins from the blobs already
+            // fetched. Values are 40-hex or fixed words; failures never change the decision.
+            const callerPin = (file) => {
+              if (file?.encoding !== 'base64' || typeof file.content !== 'string') return 'unavailable';
+              const text = Buffer.from(file.content.replace(/\s/g, ''), 'base64').toString('utf8');
+              const pins = [];
+              for (const line of text.split('\n')) {
+                const uses = line.match(/^ *(?:- +)?uses: +(.*)$/);
+                if (!uses) continue;
+                const value = uses[1].replace(/^(['"])(.*)\1[ ]*(?:#.*)?$/, '$2').split(/ +#/)[0].trim();
+                const reusable = `jhw7500/automation/${path}@`;
+                const pin = value.startsWith(reusable) ? value.slice(reusable.length) : '';
+                if (/^[0-9a-f]{40}$/.test(pin)) pins.push(pin);
+              }
+              return pins.length === 1 ? pins[0] : pins.length ? 'ambiguous' : 'unavailable';
+            };
+            const diagnose = async (current, baseline) => {
+              try {
+                const message = `running caller pin ${callerPin(current)} / `
+                  + `default-branch caller pin ${callerPin(baseline)} / `
+                  + 'recovery: re-dispatch from the default branch (omit --ref) or use the rollout '
+                  + 'fallback path; see docs/workflows/contracts.md#open-work-branches-after-a-fleet-rollout';
+                core.notice(message);
+                await core.summary.addRaw(`workflow_validation_mismatch: ${message}\n`).write();
+              } catch {}
+            };
             try {
               const { data: repository } = await github.rest.repos.get(options);
               if (typeof repository.default_branch !== 'string' || !repository.default_branch) {
@@ -697,6 +723,7 @@ jobs:
               } catch (error) {
                 stop(Number(error?.status) === 404
                   ? 'workflow_validation_mismatch' : 'workflow_validation_unavailable');
+                if (Number(error?.status) === 404) await diagnose(current, undefined);
                 return;
               }
               const regular = (file) => file?.type === 'file' && file.path === path
@@ -707,6 +734,7 @@ jobs:
               }
               if (current.sha !== baseline.sha) {
                 stop('workflow_validation_mismatch');
+                await diagnose(current, baseline);
                 return;
               }
               core.setOutput('reason', '');

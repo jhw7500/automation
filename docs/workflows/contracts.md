@@ -1593,6 +1593,41 @@ Budget exhaustion is not approval: the ledger cannot publish findings, report CL
 or authorize merge. `/jhw:ship` polls existing review comments and CI signals
 deterministically and does not parse this budget ledger as review evidence.
 
+### Open work branches after a fleet rollout
+
+A fleet rollout changes the caller on the default branch only. A work branch opened
+earlier keeps its own copy of the caller, so a dispatch with `--ref <work-branch>` runs
+the automation pin recorded in that copy, while automatic runs of the same PR may
+already use the new pin. Both read and write the same budget ledger, and an older
+reader can refuse a ledger written by a newer writer (#185: a v1.73 dispatch failed
+with `handoff_invalid` on a ledger written by v1.76). From v1.75 the caller check
+described above refuses such a dispatch before the claim; a pin older than v1.75 has
+no caller check and reaches the ledger.
+
+To diagnose a run:
+
+- From v1.83, when `Validate Claude caller workflow` in
+  `.github/workflows/claude-code-review.yml` reports `workflow_validation_mismatch`, it
+  prints the running and default-branch caller pins as a notice and in the step
+  summary. `unavailable` or `ambiguous` means the pin could not be read; it is never
+  guessed. The diagnostic does not change the decision.
+- For any run, compare the SHA in the run's `referenced_workflows` (Actions run API)
+  with the default caller pin, read the way `parse_default_caller_pin` in
+  `scripts/verify_claude_rollout_fallback.py` reads it.
+- The pin that last wrote the ledger is the latest `invocations[].referenced_workflow_sha`
+  in the `automation-budget-state` comment.
+
+Recovery leaves the ledger as it is. Either dispatch from the default branch, which is
+the dispatch procedure above without `--ref`, or use the default-branch rollout
+fallback in [Claude rollout request v1](#claude-rollout-request-v1).
+
+These are not recovery: editing, truncating or deleting the ledger; reusing a consumed
+override event; bypassing trust or provenance checks; running an arbitrary newer
+automation ref; dispatching again with the work-branch ref. Syncing the work branch
+with the default branch or requesting another review changes the PR or spends budget,
+so each needs its own approval and must preserve the existing ledger, review comment,
+and failed run and checkpoint evidence.
+
 ### Dismissing a finding
 
 From `v1.63` a collaborator can retire a false-positive finding without spending a round and

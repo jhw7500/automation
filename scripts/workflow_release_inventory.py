@@ -184,6 +184,7 @@ FILTERED_CANDIDATE_PRESERVATION_RELEASE = (1, 79)
 OPENCODE_PROVIDER_ERROR_PRESERVATION_RELEASE = (1, 80)
 OPENCODE_PROVIDER_FAILURE_CLASSIFICATION_RELEASE = (1, 81)
 OPENCODE_DISMISSAL_COVERAGE_RELEASE = (1, 82)
+CLAUDE_CALLER_PIN_DIAGNOSTICS_RELEASE = (1, 83)
 CARRYOVER_NONE_RELEASE = (1, 79)
 
 
@@ -353,6 +354,11 @@ def release_supports_opencode_provider_failure_classification(ref: str) -> bool:
 def release_supports_opencode_dismissal_coverage(ref: str) -> bool:
     """Return whether OpenCode retires severity-less blocks and dismissals on unchanged reuse."""
     return _release_version(ref) >= OPENCODE_DISMISSAL_COVERAGE_RELEASE
+
+
+def release_supports_claude_caller_pin_diagnostics(ref: str) -> bool:
+    """Return whether a Claude caller mismatch names both automation pins."""
+    return _release_version(ref) >= CLAUDE_CALLER_PIN_DIAGNOSTICS_RELEASE
 
 
 def _with_claude_rollout_fallback_roots(

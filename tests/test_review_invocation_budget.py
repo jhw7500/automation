@@ -2122,3 +2122,65 @@ def test_invalid_claim_after_a_dismissal_still_renders_a_checkpoint():
     assert transition.state.dismissed_findings == (dismissed(),)
     assert transition.state.handoff.remaining_finding_ids == (FINDING_2,)
     budget.render_checkpoint(transition.state)
+
+
+V173_BUDGET_READER_COMMIT = "3d60f3baaa45820f7260912efea3ffcf45c10b07"
+
+
+def _issue_185_ledger():
+    """Write the #185 shape with the current writer: five finalized automatic rounds."""
+    state = None
+    for index in range(5):
+        values = {"head": str(index + 1) * 40, "full_hash": str(index + 1) * 64, "run_id": 800 + index}
+        claim_request = request(**values)
+        claimed = budget.claim(state, claim_request, claim_provenances(state, claim_request))
+        assert claimed.allow_invocation
+        provenances = valid_provenances(claimed.state)
+        key = (claim_request.run_id, claim_request.run_attempt)
+        provenances[key] = replace(provenances[key], conclusion="success")
+        finalized = budget.finalize(claimed.state, finalize_request(**values), provenances)
+        assert finalized.decision == "finalized"
+        state = finalized.state
+    raw = json.loads(budget.serialize_ledger(state))
+    assert len(raw["handoff"]["round_usage"]) == len(raw["invocations"]) == 5
+    assert raw["budgets"]["max_rounds"] == 5
+    assert raw["budgets"]["max_override_rounds"] == 2
+    assert raw["consumed_override_event_ids"] == []
+    return state, raw
+
+
+def test_issue_185_current_reader_accepts_the_current_writer_ledger():
+    state, raw = _issue_185_ledger()
+
+    assert budget.Handoff.from_dict(raw["handoff"]) == state.handoff
+    assert budget.LedgerState.from_dict(raw) == state
+    assert budget.parse_ledger(
+        ledger_body(state), repository=REPOSITORY, pr=PR, reviewer="claude",
+    ) == state
+    budget._validate_state_shape(budget.LedgerState.from_dict(raw))
+
+
+def test_issue_185_v173_reader_rejects_the_current_writer_ledger():
+    from scripts.verify_workflow_release import VerifiedCommitTree
+
+    state, raw = _issue_185_ledger()
+    source = VerifiedCommitTree.open(Path(__file__).parents[1], V173_BUDGET_READER_COMMIT).read_file(
+        ".github/actions/review-invocation-budget/review_invocation_budget.py",
+    )
+    spec = importlib.util.spec_from_loader("_v173_review_invocation_budget", loader=None)
+    old = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = old
+    try:
+        exec(compile(source, "v1.73/review_invocation_budget.py", "exec"), old.__dict__)
+        with pytest.raises(old.BudgetStateError, match="^handoff_invalid$"):
+            old.Handoff.from_dict(raw["handoff"])
+        # The current writer emits schema 2, which v1.73 refuses before the handoff;
+        # the #185 comment (schema 1, v1.76 writer) reached handoff_invalid instead.
+        assert raw["schema"] == 2
+        with pytest.raises(old.BudgetStateError, match="^schema_invalid$"):
+            old.LedgerState.from_dict(raw)
+        # The state the current reader parses still violates the v1.73 override policy.
+        with pytest.raises(old.BudgetStateError, match="^budgets_invalid$"):
+            old._validate_state_shape(state)
+    finally:
+        sys.modules.pop(spec.name, None)

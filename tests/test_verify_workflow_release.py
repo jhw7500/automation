@@ -320,8 +320,8 @@ def test_v1781_immutable_candidate_remains_accepted():
 
 def test_hardened_claude_fallback_candidate_is_accepted(fallback_release_repo):
     repo, candidate = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.82")
-    assert release_verifier.verify_commit_content(repo, "v1.82", candidate) == candidate
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
+    assert release_verifier.verify_commit_content(repo, "v1.83", candidate) == candidate
 
 
 def test_filtered_candidate_preservation_release_boundary():
@@ -510,7 +510,11 @@ def test_opencode_dismissal_coverage_release_boundary():
 def test_v182_opencode_dismissal_coverage_is_rejected_on_the_v181_release_line(
     fallback_release_repo,
 ):
-    repo, candidate = fallback_release_repo
+    from release_fixture_helpers import restore_pre_v183_claude_caller_pin_diagnostics
+
+    repo, _ = fallback_release_repo
+    restore_pre_v183_claude_caller_pin_diagnostics(repo)
+    candidate = commit(repo, "v1.82 Claude review workflow")
     release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.82")
     assert release_verifier.verify_commit_content(repo, "v1.82", candidate) == candidate
     with pytest.raises(ReleaseVerificationError):
@@ -544,9 +548,15 @@ def test_v181_opencode_bytes_are_rejected_on_the_v182_release_line(fallback_rele
 def test_one_opencode_file_left_across_the_v182_line_is_rejected(
     fallback_release_repo, relative,
 ):
-    from release_fixture_helpers import V181_DISMISSAL_COVERAGE_BOUNDARY_COMMIT
+    from release_fixture_helpers import (
+        V181_DISMISSAL_COVERAGE_BOUNDARY_COMMIT,
+        restore_pre_v183_claude_caller_pin_diagnostics,
+    )
 
-    repo, candidate = fallback_release_repo
+    repo, _ = fallback_release_repo
+    # Start from exact v1.82 bytes so only the one file differs from that line.
+    restore_pre_v183_claude_caller_pin_diagnostics(repo)
+    candidate = commit(repo, "v1.82 Claude review workflow")
     assert release_verifier.verify_commit_content(repo, "v1.82", candidate) == candidate
     tree = release_verifier.VerifiedCommitTree.open(
         ROOT, V181_DISMISSAL_COVERAGE_BOUNDARY_COMMIT
@@ -586,6 +596,41 @@ def test_v182_recovery_evidence_replays_v181_and_v182_canonicalizers():
             module.replay_source(narrowed)
     finally:
         sys.modules.pop(spec.name, None)
+
+
+def test_claude_caller_pin_diagnostics_release_boundary():
+    supports = release_inventory.release_supports_claude_caller_pin_diagnostics
+    assert release_inventory.CLAUDE_CALLER_PIN_DIAGNOSTICS_RELEASE == (1, 83)
+    for ref in ("v1.81", "v1.82", "v1.82.0", "v1.82.1", "v1.82.99"):
+        assert not supports(ref), ref
+    for ref in ("v1.83", "v1.83.0", "v1.83.1", "v1.84"):
+        assert supports(ref), ref
+
+
+def test_v183_claude_caller_pin_diagnostics_are_rejected_on_the_v182_release_line(
+    fallback_release_repo,
+):
+    repo, candidate = fallback_release_repo
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
+    assert release_verifier.verify_commit_content(repo, "v1.83", candidate) == candidate
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.82")
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.82", candidate)
+
+
+def test_v182_claude_review_bytes_are_rejected_on_the_v183_release_line(fallback_release_repo):
+    from release_fixture_helpers import restore_pre_v183_claude_caller_pin_diagnostics
+
+    repo, _ = fallback_release_repo
+    restore_pre_v183_claude_caller_pin_diagnostics(repo)
+    old = commit(repo, "v1.82 Claude review workflow")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.82")
+    assert release_verifier.verify_commit_content(repo, "v1.82", old) == old
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.83", old)
 
 
 def test_v1782_immutable_candidate_remains_accepted():
@@ -799,10 +844,10 @@ def test_v1782_rejects_claude_router_pre_admission_regressions(
     fallback_release_repo, mutate, error,
 ):
     repo, _ = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.82")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
     mutate(repo / ".github/workflows/claude.yml")
     with pytest.raises(ReleaseVerificationError, match=error):
-        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.82")
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
 
 
 @pytest.mark.parametrize(
@@ -836,24 +881,24 @@ def test_v1782_rejects_claude_review_pre_admission_regressions(
     fallback_release_repo, mutate, error,
 ):
     repo, _ = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.82")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
     mutate(repo / ".github/workflows/claude-code-review.yml")
     with pytest.raises(ReleaseVerificationError, match=error):
-        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.82")
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
 
 
 @pytest.mark.parametrize("mutation", list(FALLBACK_MUTATIONS))
 def test_v1782_rejects_fallback_contract_mutation(fallback_release_repo, mutation):
     repo, _ = fallback_release_repo
     # Establish acceptance first: an older seal must not mask a missing current seal.
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.82")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
     relative, old, new = FALLBACK_MUTATIONS[mutation]
     replace(repo / relative, old, new, count=1)
     bad = commit(repo, f"mutate {mutation}")
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.82")
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_commit_content(repo, "v1.82", bad)
+        release_verifier.verify_commit_content(repo, "v1.83", bad)
 
 RECOVERY_RELEASE_FILES = (
     ".github/actions/recover-opencode-review/evidence.py",
