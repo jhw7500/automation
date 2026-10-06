@@ -1624,9 +1624,21 @@ To diagnose a run:
 - The pin that last wrote the ledger is the latest `invocations[].referenced_workflow_sha`
   in the `automation-budget-state` comment.
 
+Gemini (`gemini-auto-review.yml`) has no caller check at any version, so a dispatch on a
+stale pin always reaches the ledger. An older reader that cannot parse a newer ledger
+records `Decision: state_invalid` and `Stop reason: <field>_invalid` in the step summary
+and the budget checkpoint; it calls no provider, spends no budget and leaves the sticky
+comment unchanged. The run then fails at `Enforce authenticated review budget decision`
+with `Gemini review has no authenticated checkpoint for this attempt (state_invalid)`.
+With `force_review=true` it fails earlier with `force-review was not authorized by the
+bounded review budget`; that does not mean the override budget is exhausted, so do not
+apply the override label again. A corrupted ledger gives the same signals, so confirm
+the mismatch with the pin that last wrote the ledger (previous bullet) before treating
+it as stale. Gemini has no rollout fallback.
+
 Recovery leaves the ledger as it is. Either dispatch from the default branch, which is
-the dispatch procedure above without `--ref`, or use the default-branch rollout
-fallback in [Claude rollout request v1](#claude-rollout-request-v1).
+the dispatch procedure above without `--ref`, or, for Claude only, use the
+default-branch rollout fallback in [Claude rollout request v1](#claude-rollout-request-v1).
 
 These are not recovery: editing, truncating or deleting the ledger; reusing a consumed
 override event; bypassing trust or provenance checks; running an arbitrary newer
