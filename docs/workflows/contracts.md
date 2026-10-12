@@ -1079,8 +1079,10 @@ checkout-seeded symlink target survives. A missing result is ignored.
 A Gemini provider failure or process-deadline timeout never writes into the candidate file.
 Writing it there made the canonicalizer read provider text as a document and report
 `ambiguous_document`/`preamble`, so a provider outage looked like a model format regression.
-The reason still travels through `gemini_failure_reason.txt` to the sticky comment, and the
-provider text is uploaded as its own one-day, non-overwriting `gemini-provider-error-<run>-<attempt>`
+The reason still travels through `gemini_failure_reason.txt` to the sticky comment's error body;
+a failure that keeps an earlier successful review (`preserveSuccess` in the upsert step) shows
+`Status: stale` and the failed run without the reason (tracked in #187). The provider text is
+uploaded as its own one-day, non-overwriting `gemini-provider-error-<run>-<attempt>`
 artifact — never merged into the canonicalizer-owned diagnostic, which stays bounded schema-1
 output. With no candidate file the canonicalizer reports `candidate_missing`, which is what
 actually happened.
@@ -1255,6 +1257,12 @@ authentication failure, an unsupported caller location, or a canonical-format fa
 triggers the model fallback because changing models cannot repair that failure class. An
 unsupported caller location is published as `unsupported_location` rather than collapsed into
 `provider_failed`.
+
+From v1.84, when the primary failed with `quota_exhausted` and the fallback request then fails
+with a reason in the workflow's `FALLBACK_FAILURE_REASONS`, the recorded reason stays
+`quota_exhausted` (#222). The daily quota is the cause an operator acts on; the fallback's own
+error remains in the run log and the provider-error artifact. A fallback failure outside that set
+keeps its own reason.
 
 A provider-side HTTP `500`, `502`, `503`, or `504` failure receives at most one same-model retry
 after a short bounded delay inside the already-claimed review round. If that retry also fails, the

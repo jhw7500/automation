@@ -1235,12 +1235,14 @@ jobs:
                   time.sleep(max(EMPTY_RETRY_SLEEP, 0) * (2 ** attempt))
               raise EmptyModelResponse('empty Gemini review')
 
+          failure_reason_override = ''
           try:
               prompt = build_prompt(pr_diff)
               models = [gemini_model]
               if fallback_model and fallback_model != gemini_model:
                   models.append(fallback_model)
               review_text = ''
+              primary_reason = ''
               for model_index, model in enumerate(models):
                   try:
                       # Preserve the pre-fallback three-request ceiling: when a distinct
@@ -1263,7 +1265,16 @@ jobs:
                               f"Gemini primary failed with {reason}; "
                               "trying configured fallback"
                           )
+                          primary_reason = reason
                           continue
+                      # A primary daily-quota failure is the cause to act on; a
+                      # provider-class fallback failure must not replace it (#222).
+                      if primary_reason == 'quota_exhausted' and reason in FALLBACK_FAILURE_REASONS:
+                          print(
+                              f"Gemini fallback failed with {reason}; "
+                              "recording the primary quota_exhausted"
+                          )
+                          failure_reason_override = 'quota_exhausted'
                       raise
                   break
               if not review_text:
@@ -1276,7 +1287,7 @@ jobs:
               print("Review generated successfully")
           except Exception as e:
               print(f"Error generating review: {e}")
-              record_failure_reason(provider_failure_reason(e))
+              record_failure_reason(failure_reason_override or provider_failure_reason(e))
               # 후보 문서에는 모델 출력만 담는다. provider 오류를 여기에 쓰면
               # 정규화기가 그것을 산문으로 읽어 ambiguous_document 로 거부하고,
               # provider 실패가 문서 포맷 오류로 위장된다.

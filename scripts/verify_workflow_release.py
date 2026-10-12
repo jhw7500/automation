@@ -68,6 +68,7 @@ from scripts.workflow_release_inventory import (
     release_supports_opencode_provider_failure_classification,
     release_supports_opencode_dismissal_coverage,
     release_supports_claude_caller_pin_diagnostics,
+    release_supports_gemini_fallback_quota_reason,
     release_supports_carryover_none,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
@@ -864,6 +865,10 @@ EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256 = {
 # v1.79 also preserves the Gemini candidate and diagnostic when findings were filtered.
 EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256 = (
     "9c2e725dfc175d70f5961e95ffbcc8bab28643714e92f4e195bab3fb7e74ed50"
+)
+# v1.84 keeps a primary quota_exhausted when the Gemini fallback then fails with a provider-class reason.
+EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256 = (
+    "7115acb25ee3a9010dd7801e06526e374fe64d846cf0349199556cbd476c455f"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176 = "3e8decf2bf21d007d40c0dc011b173ed0af6b2e15ae8827ae51f6986e90b813f"
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V177 = "5b53efd67b4728e01ddbd029c13dd039d93cc0c94b86bccb4e1fc1a4486c6cda"
@@ -6305,7 +6310,9 @@ def _verify_review_invocation_budget(
                 raise ReleaseVerificationError("invocation-budget authenticated source digest differs")
         require_budget_workflow_contract(tree, "gemini-auto-review.yml", "gemini", review_policy=True)
         expected_gemini = (
-            EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256
+            EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256
+            if release_supports_gemini_fallback_quota_reason(ref)
+            else EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256
             if release_supports_filtered_candidate_preservation(ref)
             else EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256["gemini"]
         )

@@ -8121,6 +8121,65 @@ def test_gemini_fallback_preserves_three_request_ceiling(tmp_path):
     assert (tmp_path / "gemini_failure_reason.txt").read_text() == "provider_failed"
 
 
+@pytest.mark.parametrize(
+    ("fallback_error", "expected_reason"),
+    [
+        # Changed by #222: the fallback's provider failure used to replace the primary quota.
+        ("503 UNAVAILABLE. The model is overloaded due to high demand.", "quota_exhausted"),
+        # Preserved: a fallback quota failure already recorded quota_exhausted.
+        (
+            "429 Quota exceeded for metric: generate_content_free_tier_requests; "
+            "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+            "quota_exhausted",
+        ),
+        # Preserved: a non-provider fallback failure keeps its own reason.
+        ("API key expired. Please renew the API key.", "authentication_failed"),
+    ],
+)
+def test_gemini_fallback_failure_after_primary_quota(tmp_path, fallback_error, expected_reason):
+    """A primary daily-quota failure stays the recorded reason when the fallback fails differently (#222)."""
+    (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
+    stub = tmp_path / "stub" / "google"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "generativeai.py").write_text(
+        "import pathlib\n"
+        "def configure(api_key=None): pass\n"
+        "class GenerativeModel:\n"
+        "    def __init__(self, name): self.name = name\n"
+        "    def generate_content(self, prompt):\n"
+        "        path = pathlib.Path('models.txt')\n"
+        "        with path.open('a') as f: f.write(self.name + '\\n')\n"
+        "        if self.name == 'primary-model':\n"
+        "            raise RuntimeError(\n"
+        "                '429 Quota exceeded for metric: generate_content_free_tier_requests; '\n"
+        "                'quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier'\n"
+        "            )\n"
+        f"        raise RuntimeError({fallback_error!r})\n",
+        encoding="utf-8",
+    )
+    _write_gemini_script_inputs(tmp_path)
+    env = _gemini_script_env(tmp_path)
+    env.update({
+        "GEMINI_MODEL": "primary-model",
+        "GEMINI_FALLBACK_MODEL": "fallback-model",
+        "GEMINI_429_RETRY_SLEEP": "0",
+        "GEMINI_429_RETRY_JITTER": "0",
+    })
+
+    result = subprocess.run(
+        ["python3", "gemini_review.py"], cwd=tmp_path, env=env, check=False,
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "models.txt").read_text().splitlines() == [
+        "primary-model", "fallback-model",
+    ]
+    assert (tmp_path / "gemini_failure_reason.txt").read_text() == expected_reason
+    assert fallback_error in result.stdout
+
+
 def test_gemini_rejects_nonempty_max_tokens_response(tmp_path):
     """A partial response ending at MAX_TOKENS must never become a success checkpoint."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")

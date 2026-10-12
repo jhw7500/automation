@@ -122,6 +122,34 @@ V179_FILTERED_PRESERVATION_EDITS = {
 }
 
 
+V183_GEMINI_FALLBACK_QUOTA_REASON_BOUNDARY_COMMIT = "60ecce40bf50022bb9ca793643a5015e358869b3"
+GEMINI_REVIEW_WORKFLOW = ".github/workflows/gemini-auto-review.yml"
+
+
+def restore_pre_v184_gemini_fallback_quota_reason(repo: Path) -> None:
+    """Restore the authenticated v1.83 Gemini review workflow over copied current bytes.
+
+    Restore only a current file, so older restore chains that already replaced
+    it, and deliberately mutated test bytes, survive.
+    """
+    from scripts.verify_workflow_release import (
+        EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256,
+        VerifiedCommitTree,
+    )
+
+    root = Path(__file__).resolve().parents[1]
+    path = repo / GEMINI_REVIEW_WORKFLOW
+    if path.is_file() and path.read_bytes() == (root / GEMINI_REVIEW_WORKFLOW).read_bytes():
+        payload = VerifiedCommitTree.open(
+            root, V183_GEMINI_FALLBACK_QUOTA_REASON_BOUNDARY_COMMIT
+        ).read_file(GEMINI_REVIEW_WORKFLOW)
+        assert (
+            hashlib.sha256(payload).hexdigest()
+            == EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256
+        )
+        path.write_bytes(payload)
+
+
 V182_CALLER_PIN_DIAGNOSTICS_BOUNDARY_COMMIT = "effa74038020263f158c0ef54343577db4040d1b"
 CLAUDE_REVIEW_WORKFLOW = ".github/workflows/claude-code-review.yml"
 
@@ -134,6 +162,7 @@ def restore_pre_v183_claude_caller_pin_diagnostics(repo: Path) -> None:
     """
     from scripts.verify_workflow_release import V182_CLAUDE_REVIEW_SHA256, VerifiedCommitTree
 
+    restore_pre_v184_gemini_fallback_quota_reason(repo)
     root = Path(__file__).resolve().parents[1]
     path = repo / CLAUDE_REVIEW_WORKFLOW
     if path.is_file() and path.read_bytes() == (root / CLAUDE_REVIEW_WORKFLOW).read_bytes():

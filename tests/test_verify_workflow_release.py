@@ -320,8 +320,8 @@ def test_v1781_immutable_candidate_remains_accepted():
 
 def test_hardened_claude_fallback_candidate_is_accepted(fallback_release_repo):
     repo, candidate = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
-    assert release_verifier.verify_commit_content(repo, "v1.83", candidate) == candidate
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
+    assert release_verifier.verify_commit_content(repo, "v1.84", candidate) == candidate
 
 
 def test_filtered_candidate_preservation_release_boundary():
@@ -610,7 +610,11 @@ def test_claude_caller_pin_diagnostics_release_boundary():
 def test_v183_claude_caller_pin_diagnostics_are_rejected_on_the_v182_release_line(
     fallback_release_repo,
 ):
-    repo, candidate = fallback_release_repo
+    from release_fixture_helpers import restore_pre_v184_gemini_fallback_quota_reason
+
+    repo, _ = fallback_release_repo
+    restore_pre_v184_gemini_fallback_quota_reason(repo)
+    candidate = commit(repo, "v1.83 Gemini review workflow")
     release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
     assert release_verifier.verify_commit_content(repo, "v1.83", candidate) == candidate
     with pytest.raises(ReleaseVerificationError):
@@ -631,6 +635,51 @@ def test_v182_claude_review_bytes_are_rejected_on_the_v183_release_line(fallback
         release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
     with pytest.raises(ReleaseVerificationError):
         release_verifier.verify_commit_content(repo, "v1.83", old)
+
+
+def test_gemini_fallback_quota_reason_release_boundary():
+    supports = release_inventory.release_supports_gemini_fallback_quota_reason
+    assert release_inventory.GEMINI_FALLBACK_QUOTA_REASON_RELEASE == (1, 84)
+    for ref in ("v1.82", "v1.83", "v1.83.0", "v1.83.1", "v1.83.99"):
+        assert not supports(ref), ref
+    for ref in ("v1.84", "v1.84.0", "v1.84.1", "v1.85"):
+        assert supports(ref), ref
+
+
+def test_v184_gemini_fallback_quota_reason_is_rejected_on_the_v183_release_line(
+    fallback_release_repo,
+):
+    repo, candidate = fallback_release_repo
+    assert release_verifier.verify_commit_content(repo, "v1.84", candidate) == candidate
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.83", candidate)
+
+
+def test_v183_gemini_review_bytes_are_rejected_on_the_v184_release_line(fallback_release_repo):
+    from release_fixture_helpers import restore_pre_v184_gemini_fallback_quota_reason
+
+    repo, _ = fallback_release_repo
+    restore_pre_v184_gemini_fallback_quota_reason(repo)
+    old = commit(repo, "v1.83 Gemini review workflow")
+    assert release_verifier.verify_commit_content(repo, "v1.83", old) == old
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.84", old)
+
+
+def test_v184_rejects_mutated_gemini_review_bytes(fallback_release_repo):
+    repo, candidate = fallback_release_repo
+    # Establish acceptance first: an older seal must not mask a missing current seal.
+    assert release_verifier.verify_commit_content(repo, "v1.84", candidate) == candidate
+    replace(
+        repo / ".github/workflows/gemini-auto-review.yml",
+        "failure_reason_override = 'quota_exhausted'",
+        "failure_reason_override = ''",
+        count=1,
+    )
+    bad = commit(repo, "drop the Gemini primary quota_exhausted override")
+    for ref in ("v1.84", "v1.83"):
+        with pytest.raises(ReleaseVerificationError):
+            release_verifier.verify_commit_content(repo, ref, bad)
 
 
 def test_v1782_immutable_candidate_remains_accepted():
@@ -844,10 +893,10 @@ def test_v1782_rejects_claude_router_pre_admission_regressions(
     fallback_release_repo, mutate, error,
 ):
     repo, _ = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
     mutate(repo / ".github/workflows/claude.yml")
     with pytest.raises(ReleaseVerificationError, match=error):
-        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
 
 
 @pytest.mark.parametrize(
@@ -881,24 +930,24 @@ def test_v1782_rejects_claude_review_pre_admission_regressions(
     fallback_release_repo, mutate, error,
 ):
     repo, _ = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
     mutate(repo / ".github/workflows/claude-code-review.yml")
     with pytest.raises(ReleaseVerificationError, match=error):
-        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
 
 
 @pytest.mark.parametrize("mutation", list(FALLBACK_MUTATIONS))
 def test_v1782_rejects_fallback_contract_mutation(fallback_release_repo, mutation):
     repo, _ = fallback_release_repo
     # Establish acceptance first: an older seal must not mask a missing current seal.
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
     relative, old, new = FALLBACK_MUTATIONS[mutation]
     replace(repo / relative, old, new, count=1)
     bad = commit(repo, f"mutate {mutation}")
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.83")
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_commit_content(repo, "v1.83", bad)
+        release_verifier.verify_commit_content(repo, "v1.84", bad)
 
 RECOVERY_RELEASE_FILES = (
     ".github/actions/recover-opencode-review/evidence.py",
