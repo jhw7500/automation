@@ -568,6 +568,81 @@ jobs:
           retention-days: 7
           overwrite: false
 
+      # Diagnostics only (#209): a dispatch whose caller pins an older automation commit
+      # can stop at state_invalid. Name the running and default-branch caller pins from the
+      # initial full-history checkout, with no token or API call; the decision, the budget
+      # and every later step are unchanged.
+      - name: Diagnose Gemini caller pins on an invalid budget state
+        if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && steps.review-budget-claim.outputs.decision == 'state_invalid' }}
+        shell: bash
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          python3 - <<'PY' || true
+          import os
+          import re
+          import subprocess
+
+          # Pins are 40-hex or fixed words and are never guessed; a failure only weakens the message.
+          REUSABLE = 'jhw7500/automation/.github/workflows/gemini-auto-review.yml@'
+          LOCAL = './.github/workflows/gemini-auto-review.yml'
+          SHA1 = re.compile(r'[0-9a-f]{40}')
+
+          def caller_pin(revision, path):
+              if not path:
+                  return 'unavailable'
+              shown = subprocess.run(['git', 'show', f'{revision}:{path}'],
+                                     capture_output=True, text=True, check=False)
+              if shown.returncode != 0:
+                  return 'unavailable'
+              pins = []
+              for line in shown.stdout.split('\n'):
+                  uses = re.match(r'^ *(?:- +)?uses: +(.*)$', line)
+                  if not uses:
+                      continue
+                  value = re.sub(r'^([\'"])(.*)\1[ ]*(?:#.*)?$', r'\2', uses.group(1))
+                  value = re.split(r' +#', value)[0].strip()
+                  if value == LOCAL:
+                      pins.append('local')
+                  pin = value[len(REUSABLE):] if value.startswith(REUSABLE) else ''
+                  if SHA1.fullmatch(pin):
+                      pins.append(pin)
+              return pins[0] if len(pins) == 1 else 'ambiguous' if pins else 'unavailable'
+
+          try:
+              prefix = os.environ.get('REPOSITORY', '') + '/'
+              workflow_ref = os.environ.get('WORKFLOW_REF', '')
+              relative = workflow_ref[len(prefix):] if prefix != '/' and workflow_ref.startswith(prefix) else ''
+              match = re.fullmatch(r'(\.github/workflows/[^/@]+\.ya?ml)@refs/.+', relative)
+              path = match.group(1) if match else ''
+              workflow_sha = os.environ.get('WORKFLOW_SHA', '')
+              running = caller_pin(workflow_sha, path) if SHA1.fullmatch(workflow_sha) else 'unavailable'
+              branch = os.environ.get('DEFAULT_BRANCH', '')
+              branch_valid = bool(branch) and subprocess.run(
+                  ['git', 'check-ref-format', '--branch', branch],
+                  capture_output=True, check=False).returncode == 0
+              baseline = caller_pin(f'refs/remotes/origin/{branch}', path) if branch_valid else 'unavailable'
+              if not (SHA1.fullmatch(running) and SHA1.fullmatch(baseline)):
+                  reading = 'a pin could not be read as a commit; compare the callers by hand'
+              elif running == baseline:
+                  reading = ('the pins match, so the caller pin is not the cause; '
+                             'check the stop reason and the pin that last wrote the ledger')
+              else:
+                  reading = 'the pins differ; re-dispatch from the default branch (omit --ref)'
+              message = (f'running caller pin {running} / default-branch caller pin {baseline} / '
+                         f'{reading}; see docs/workflows/contracts.md#open-work-branches-after-a-fleet-rollout')
+              print(f'::notice::{message}')
+              summary = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary:
+                  with open(summary, 'a', encoding='utf-8') as handle:
+                      handle.write(f'state_invalid: {message}\n')
+          except Exception:
+              pass
+          PY
+
       - name: Enforce force-review claim
         if: ${{ always() && !cancelled() && inputs.force_review && steps.review-budget-claim.outputs.allow-invocation != 'true' }}
         run: |

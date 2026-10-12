@@ -8180,6 +8180,154 @@ def test_gemini_fallback_failure_after_primary_quota(tmp_path, fallback_error, e
     assert fallback_error in result.stdout
 
 
+GEMINI_PIN_DIAGNOSTIC_STEP = "Diagnose Gemini caller pins on an invalid budget state"
+GEMINI_OLD_PIN = "3d60f3baaa45820f7260912efea3ffcf45c10b07"
+GEMINI_NEW_PIN = "444a7347aee169ed178aae80e8bd8d10eca52e02"
+GEMINI_RECOVERY_ANCHOR = "docs/workflows/contracts.md#open-work-branches-after-a-fleet-rollout"
+GEMINI_CALLER_PATH = ".github/workflows/gemini-auto-review.yml"
+
+
+def _gemini_baseline_caller(pin):
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "examples/baseline-workflows" / GEMINI_CALLER_PATH).read_text(encoding="utf-8")
+    assert text.count("__AUTOMATION_COMMIT__") == 1
+    return text.replace("__AUTOMATION_COMMIT__", pin)
+
+
+def _gemini_self_caller():
+    root = Path(__file__).resolve().parents[1]
+    return (root / ".github/workflows/_self-gemini-auto-review.yml").read_text(encoding="utf-8")
+
+
+def _gemini_pin_diagnostic_step():
+    steps = _load("gemini-auto-review.yml")["jobs"]["gemini-review"]["steps"]
+    return next(step for step in steps if step.get("name") == GEMINI_PIN_DIAGNOSTIC_STEP)
+
+
+def _git(repo, *args):
+    return subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _gemini_caller_commit(repo, path, content):
+    target = repo / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "caller")
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _gemini_pin_diagnostic(tmp_path, current, default, *, path=GEMINI_CALLER_PATH, **env_changes):
+    """Run the step script the way Actions runs a bash step, in a full-history checkout."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "work")
+    workflow_sha = _gemini_caller_commit(repo, path, current)
+    _git(repo, "checkout", "-q", "--orphan", "base")
+    _git(repo, "rm", "-rq", "--cached", ".", "--ignore-unmatch")
+    _git(repo, "update-ref", "refs/remotes/origin/main", _gemini_caller_commit(repo, path, default))
+    _git(repo, "checkout", "-q", "work")
+    summary = tmp_path / "summary.md"
+    env = {
+        **os.environ,
+        "WORKFLOW_REF": f"o/r/{path}@refs/heads/work",
+        "WORKFLOW_SHA": workflow_sha,
+        "REPOSITORY": "o/r",
+        "DEFAULT_BRANCH": "main",
+        "GITHUB_STEP_SUMMARY": str(summary),
+        **env_changes,
+    }
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", _gemini_pin_diagnostic_step()["run"]],
+        cwd=env.pop("DIAGNOSTIC_CWD", repo), env=env, capture_output=True, text=True, check=False,
+    )
+    notices = [line[len("::notice::"):] for line in result.stdout.splitlines()
+               if line.startswith("::notice::")]
+    return result, notices, summary.read_text(encoding="utf-8") if summary.exists() else ""
+
+
+def test_gemini_pin_diagnostic_runs_only_on_dispatch_state_invalid_before_enforcement():
+    """#209: the diagnostic sits before the first enforcement, uses no token and cannot change the decision."""
+    steps = _load("gemini-auto-review.yml")["jobs"]["gemini-review"]["steps"]
+    names = [step.get("name") for step in steps]
+    index = names.index(GEMINI_PIN_DIAGNOSTIC_STEP)
+    step = steps[index]
+    assert step["if"] == (
+        "${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && "
+        "steps.review-budget-claim.outputs.decision == 'state_invalid' }}"
+    )
+    assert names.index("Claim Gemini review budget") < index < names.index("Enforce force-review claim")
+    assert set(step) == {"name", "if", "shell", "env", "run"}
+    values = json.dumps(step)
+    assert "github.token" not in values and "secrets." not in values
+    assert "GITHUB_OUTPUT" not in step["run"] and "::error" not in step["run"]
+    assert step["run"].startswith("python3 - <<'PY' || true\n")
+
+
+def test_gemini_pin_diagnostic_names_running_and_default_branch_pins(tmp_path):
+    result, notices, summary = _gemini_pin_diagnostic(
+        tmp_path, _gemini_baseline_caller(GEMINI_OLD_PIN), _gemini_baseline_caller(GEMINI_NEW_PIN))
+    assert result.returncode == 0, result.stderr
+    assert len(notices) == 1
+    notice = notices[0]
+    assert f"running caller pin {GEMINI_OLD_PIN} / default-branch caller pin {GEMINI_NEW_PIN} /" in notice
+    assert "omit --ref" in notice and GEMINI_RECOVERY_ANCHOR in notice
+    assert summary == f"state_invalid: {notice}\n"
+
+
+def test_gemini_pin_diagnostic_does_not_blame_matching_pins(tmp_path):
+    result, notices, _ = _gemini_pin_diagnostic(
+        tmp_path, _gemini_baseline_caller(GEMINI_OLD_PIN), _gemini_baseline_caller(GEMINI_OLD_PIN))
+    assert result.returncode == 0, result.stderr
+    notice = notices[0]
+    assert f"running caller pin {GEMINI_OLD_PIN} / default-branch caller pin {GEMINI_OLD_PIN} /" in notice
+    assert "caller pin is not the cause" in notice and "omit --ref" not in notice
+
+
+@pytest.mark.parametrize(("case", "running", "default"), [
+    ("self", "local", "local"),
+    ("ambiguous", "ambiguous", GEMINI_NEW_PIN),
+    ("no-default-branch", GEMINI_OLD_PIN, "unavailable"),
+    ("missing-default-ref", GEMINI_OLD_PIN, "unavailable"),
+    ("short-pin", "unavailable", GEMINI_NEW_PIN),
+    ("bad-sha", "unavailable", GEMINI_NEW_PIN),
+    ("other-repository", "unavailable", "unavailable"),
+    ("not-a-checkout", "unavailable", "unavailable"),
+])
+def test_gemini_pin_diagnostic_never_guesses(tmp_path, case, running, default):
+    current = _gemini_baseline_caller(GEMINI_OLD_PIN)
+    baseline = _gemini_baseline_caller(GEMINI_NEW_PIN)
+    options = {}
+    if case == "self":
+        current = baseline = _gemini_self_caller()
+        options["path"] = ".github/workflows/_self-gemini-auto-review.yml"
+    elif case == "ambiguous":
+        current = current + _gemini_baseline_caller(GEMINI_NEW_PIN)
+    elif case == "no-default-branch":
+        options["DEFAULT_BRANCH"] = ""
+    elif case == "missing-default-ref":
+        options["DEFAULT_BRANCH"] = "gone"
+    elif case == "short-pin":
+        current = _gemini_baseline_caller("abc123")
+    elif case == "bad-sha":
+        options["WORKFLOW_SHA"] = "main"
+    elif case == "other-repository":
+        options["REPOSITORY"] = "other/repo"
+    elif case == "not-a-checkout":
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        options["DIAGNOSTIC_CWD"] = str(empty)
+    result, notices, _ = _gemini_pin_diagnostic(tmp_path, current, baseline, **options)
+    assert result.returncode == 0, result.stderr
+    assert len(notices) == 1
+    notice = notices[0]
+    assert f"running caller pin {running} / default-branch caller pin {default} /" in notice
+    assert "could not be read as a commit" in notice and "omit --ref" not in notice
+
+
 def test_gemini_rejects_nonempty_max_tokens_response(tmp_path):
     """A partial response ending at MAX_TOKENS must never become a success checkpoint."""
     (tmp_path / "gemini_review.py").write_text(_extract_gemini_python(), encoding="utf-8")
