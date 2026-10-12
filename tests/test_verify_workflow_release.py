@@ -320,8 +320,8 @@ def test_v1781_immutable_candidate_remains_accepted():
 
 def test_hardened_claude_fallback_candidate_is_accepted(fallback_release_repo):
     repo, candidate = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
-    assert release_verifier.verify_commit_content(repo, "v1.84", candidate) == candidate
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.85")
+    assert release_verifier.verify_commit_content(repo, "v1.85", candidate) == candidate
 
 
 def test_filtered_candidate_preservation_release_boundary():
@@ -649,7 +649,11 @@ def test_gemini_fallback_quota_reason_release_boundary():
 def test_v184_gemini_fallback_quota_reason_is_rejected_on_the_v183_release_line(
     fallback_release_repo,
 ):
-    repo, candidate = fallback_release_repo
+    from release_fixture_helpers import restore_pre_v185_opencode_abandoned_check_cleanup
+
+    repo, _ = fallback_release_repo
+    restore_pre_v185_opencode_abandoned_check_cleanup(repo)
+    candidate = commit(repo, "v1.84 OpenCode workflow and recovery evidence")
     assert release_verifier.verify_commit_content(repo, "v1.84", candidate) == candidate
     with pytest.raises(ReleaseVerificationError):
         release_verifier.verify_commit_content(repo, "v1.83", candidate)
@@ -667,7 +671,11 @@ def test_v183_gemini_review_bytes_are_rejected_on_the_v184_release_line(fallback
 
 
 def test_v184_rejects_mutated_gemini_review_bytes(fallback_release_repo):
-    repo, candidate = fallback_release_repo
+    from release_fixture_helpers import restore_pre_v185_opencode_abandoned_check_cleanup
+
+    repo, _ = fallback_release_repo
+    restore_pre_v185_opencode_abandoned_check_cleanup(repo)
+    candidate = commit(repo, "v1.84 OpenCode workflow and recovery evidence")
     # Establish acceptance first: an older seal must not mask a missing current seal.
     assert release_verifier.verify_commit_content(repo, "v1.84", candidate) == candidate
     replace(
@@ -678,6 +686,51 @@ def test_v184_rejects_mutated_gemini_review_bytes(fallback_release_repo):
     )
     bad = commit(repo, "drop the Gemini primary quota_exhausted override")
     for ref in ("v1.84", "v1.83"):
+        with pytest.raises(ReleaseVerificationError):
+            release_verifier.verify_commit_content(repo, ref, bad)
+
+
+def test_opencode_abandoned_check_cleanup_release_boundary():
+    supports = release_inventory.release_supports_opencode_abandoned_check_cleanup
+    assert release_inventory.OPENCODE_ABANDONED_CHECK_CLEANUP_RELEASE == (1, 85)
+    for ref in ("v1.82", "v1.84", "v1.84.0", "v1.84.1", "v1.84.99"):
+        assert not supports(ref), ref
+    for ref in ("v1.85", "v1.85.0", "v1.85.1", "v1.86"):
+        assert supports(ref), ref
+
+
+def test_v185_opencode_abandoned_check_cleanup_is_rejected_on_the_v184_release_line(
+    fallback_release_repo,
+):
+    repo, candidate = fallback_release_repo
+    assert release_verifier.verify_commit_content(repo, "v1.85", candidate) == candidate
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.84", candidate)
+
+
+def test_v184_opencode_bytes_are_rejected_on_the_v185_release_line(fallback_release_repo):
+    from release_fixture_helpers import restore_pre_v185_opencode_abandoned_check_cleanup
+
+    repo, _ = fallback_release_repo
+    restore_pre_v185_opencode_abandoned_check_cleanup(repo)
+    old = commit(repo, "v1.84 OpenCode workflow and recovery evidence")
+    assert release_verifier.verify_commit_content(repo, "v1.84", old) == old
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.85", old)
+
+
+def test_v185_rejects_mutated_opencode_check_cleanup(fallback_release_repo):
+    repo, candidate = fallback_release_repo
+    # Establish acceptance first: an older seal must not mask a missing current seal.
+    assert release_verifier.verify_commit_content(repo, "v1.85", candidate) == candidate
+    replace(
+        repo / ".github/workflows/opencode-auto-review.yml",
+        "check_name: 'automation/opencode-canonical-review', filter: 'all', per_page: 100,",
+        "check_name: 'automation/opencode-canonical-review', per_page: 100,",
+        count=1,
+    )
+    bad = commit(repo, "list only the latest OpenCode canonical check")
+    for ref in ("v1.85", "v1.84"):
         with pytest.raises(ReleaseVerificationError):
             release_verifier.verify_commit_content(repo, ref, bad)
 
@@ -893,10 +946,10 @@ def test_v1782_rejects_claude_router_pre_admission_regressions(
     fallback_release_repo, mutate, error,
 ):
     repo, _ = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.85")
     mutate(repo / ".github/workflows/claude.yml")
     with pytest.raises(ReleaseVerificationError, match=error):
-        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.85")
 
 
 @pytest.mark.parametrize(
@@ -930,24 +983,24 @@ def test_v1782_rejects_claude_review_pre_admission_regressions(
     fallback_release_repo, mutate, error,
 ):
     repo, _ = fallback_release_repo
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.85")
     mutate(repo / ".github/workflows/claude-code-review.yml")
     with pytest.raises(ReleaseVerificationError, match=error):
-        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.85")
 
 
 @pytest.mark.parametrize("mutation", list(FALLBACK_MUTATIONS))
 def test_v1782_rejects_fallback_contract_mutation(fallback_release_repo, mutation):
     repo, _ = fallback_release_repo
     # Establish acceptance first: an older seal must not mask a missing current seal.
-    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.85")
     relative, old, new = FALLBACK_MUTATIONS[mutation]
     replace(repo / relative, old, new, count=1)
     bad = commit(repo, f"mutate {mutation}")
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.84")
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.85")
     with pytest.raises(ReleaseVerificationError):
-        release_verifier.verify_commit_content(repo, "v1.84", bad)
+        release_verifier.verify_commit_content(repo, "v1.85", bad)
 
 RECOVERY_RELEASE_FILES = (
     ".github/actions/recover-opencode-review/evidence.py",

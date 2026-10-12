@@ -1467,6 +1467,22 @@ completed successfully; cancelled runs therefore leave no trusted state. Older a
 comments may be marker-free tombstoned, but the newest prior fallback is retained until a
 future completed run can authenticate the successor.
 
+The canonicalizer reserves that Check Run `in_progress` under the external ID
+`automation-opencode-pending:<repository>:<run_id>:<run_attempt>` before it writes the comment.
+Every failure path it controls completes the reservation as `failure` under the same pending ID;
+only the success path replaces it with the attested ID. A create whose response is lost after
+GitHub stored the Check, or a step that ends between reservation and completion, used to leave the
+reservation `in_progress` indefinitely, which stalls tools that wait for every check (#227). From
+v1.85 the `Close abandoned OpenCode canonical check` step runs after the canonicalizer whenever the
+canonicalizer was not skipped. It closes as `failure` ("OpenCode canonical review abandoned") every
+still-incomplete `github-actions` reservation of the same run whose attempt is no newer than the
+current one. When the canonicalizer did not succeed it lists the Checks up to three times, because a
+Check stored behind a failed create may surface late. List and update errors are warnings and
+never change the job result; a reservation it cannot close is retried by a later attempt of the same
+run whose canonicalizer runs. A closed reservation keeps the pending ID and carries no
+attestation, so receipt discovery treats it like the canonicalizer's own failure closures. A
+runner lost mid-step still leaves the reservation open.
+
 Receipt discovery never starts from a comment-provided Check ID. Both prepare and live
 canonicalization first query a bounded horizon of recent `pull_request` Actions run IDs and
 server-authored heads without filtering on the latest attempt status. They retain only runs with

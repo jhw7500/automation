@@ -5618,6 +5618,75 @@ jobs:
               core.setFailed(`OpenCode review checkpoint failed: ${failureReason}`);
             }
 
+      - name: Close abandoned OpenCode canonical check
+        id: close-abandoned-opencode-check
+        if: ${{ always() && steps.canonicalize-opencode-review.outcome != 'skipped' }}
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
+        env:
+          CANONICALIZE_OUTCOME: ${{ steps.canonicalize-opencode-review.outcome }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_HEAD: ${{ needs.opencode-prepare.outputs.workflow_head_sha }}
+          REPOSITORY: ${{ github.repository }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            // The canonicalizer reserves an in_progress check and completes it on every path it
+            // controls. A create whose response was lost after GitHub stored the check, or a step
+            // that ended between reservation and completion, leaves it in_progress forever. Close
+            // such reservations of this run, earlier attempts included, as failure: the shape of
+            // the canonicalizer's own failure closures, which provenance never accepts as a receipt.
+            const runIdRaw = process.env.RUN_ID || '';
+            const runAttemptRaw = process.env.RUN_ATTEMPT || '';
+            const workflowHead = process.env.WORKFLOW_HEAD || '';
+            const repository = process.env.REPOSITORY || '';
+            const safeInteger = (raw) => /^[1-9][0-9]*$/.test(raw) && Number.isSafeInteger(Number(raw));
+            if (!safeInteger(runIdRaw) || !safeInteger(runAttemptRaw)
+              || !/^[0-9a-f]{40}$/.test(workflowHead) || !repository) {
+              core.notice('Skipping OpenCode canonical check cleanup with invalid run identity');
+              return;
+            }
+            const runAttempt = Number(runAttemptRaw);
+            const prefix = `automation-opencode-pending:${repository}:${runIdRaw}:`;
+            const abandoned = (check) => {
+              if (check.status === 'completed' || check.app?.slug !== 'github-actions'
+                || typeof check.external_id !== 'string' || !check.external_id.startsWith(prefix)) {
+                return false;
+              }
+              const attempt = check.external_id.slice(prefix.length);
+              return safeInteger(attempt) && Number(attempt) <= runAttempt;
+            };
+            // A check stored behind a failed create may surface late, so a step that did not
+            // succeed lists again before concluding that nothing was abandoned.
+            const passes = process.env.CANONICALIZE_OUTCOME === 'success' ? 1 : 3;
+            let pending = [];
+            for (let pass = 1; pass <= passes; pass += 1) {
+              try {
+                const checks = await github.paginate(github.rest.checks.listForRef, {
+                  owner: context.repo.owner, repo: context.repo.repo, ref: workflowHead,
+                  check_name: 'automation/opencode-canonical-review', filter: 'all', per_page: 100,
+                });
+                pending = checks.filter(abandoned);
+                if (pending.length > 0) break;
+              } catch (error) {
+                core.warning(`OpenCode canonical checks could not be listed: ${error.message}`);
+              }
+              if (pass < passes) await new Promise((resolve) => setTimeout(resolve, 3000 * pass));
+            }
+            for (const check of pending) {
+              try {
+                await github.rest.checks.update({
+                  owner: context.repo.owner, repo: context.repo.repo, check_run_id: check.id,
+                  status: 'completed', conclusion: 'failure', completed_at: new Date().toISOString(),
+                  output: { title: 'OpenCode canonical review abandoned',
+                    summary: 'The canonicalizer ended before completing this reservation.' },
+                });
+                core.notice(`Closed abandoned OpenCode canonical check ${check.id}`);
+              } catch (error) {
+                core.warning(`Abandoned OpenCode canonical check ${check.id} could not be closed: ${error.message}`);
+              }
+            }
+
       - name: Resolve OpenCode budget outcome
         id: opencode-budget-outcome
         if: ${{ always() && needs.opencode-prepare.outputs.allow_invocation == 'true' && steps.canonicalize-opencode-review.outputs.budget_metrics_valid == 'true' }}

@@ -4278,6 +4278,7 @@ let listCommentCalls = 0;
 let pullRequestCalls = 0;
 let listWorkflowRunCalls = 0;
 let listCheckRunCalls = 0;
+let paginateCheckRunCalls = 0;
 let nextCommentId = Math.max(100, ...comments.map((item) => Number(item.id) || 0)) + 1;
 let nextCheckId = Math.max(1000, ...checkRuns.map((item) => Number(item.id) || 0)) + 1;
 const failUpdateCommentIds = new Set(fx.failUpdateCommentIds || []);
@@ -4290,8 +4291,15 @@ const github = {
       headers: { accept: 'application/vnd.github+json' },
     }),
   },
-  paginate: async (method) => {
-    if (method === github.rest.checks.listForRef) return checkRuns;
+  paginate: async (method, a) => {
+    if (method === github.rest.checks.listForRef) {
+      const responses = fx.checkRunPaginateResponses;
+      if (!Array.isArray(responses) || !responses.length) return checkRuns;
+      calls.push(['paginate-checks', a]);
+      const response = responses[Math.min(paginateCheckRunCalls++, responses.length - 1)];
+      if (response === null) throw new Error('check list unavailable');
+      return JSON.parse(JSON.stringify(response));
+    }
     if (method === github.rest.actions.listJobsForWorkflowRunAttempt) return fx.runJobs || [];
     if (method === github.rest.pulls.listCommits) return fx.pullCommits || [];
     listCommentCalls += 1;
@@ -4348,9 +4356,12 @@ const github = {
         calls.push(['create-check', a]);
         const check = { id: nextCheckId++, name: a.name, head_sha: a.head_sha, status: a.status, conclusion: a.conclusion, external_id: a.external_id, output: a.output, app: { slug: 'github-actions' } };
         checkRuns.push(check);
+        // GitHub can store the check and still fail the response (HTTP 500, empty body).
+        if (fx.failCreateCheckAfterStore) throw new Error('Unexpected end of JSON input');
         return { data: check };
       },
       update: async (a) => {
+        if ((fx.failUpdateCheckIds || []).includes(a.check_run_id)) throw new Error('check update unavailable');
         calls.push(['update-check', a]);
         const check = checkRuns.find((item) => item.id === a.check_run_id);
         Object.assign(check, a);
@@ -4483,6 +4494,9 @@ def _run_upsert(
     pull_request: dict | None = None,
     pull_request_sequence: list[dict] | None = None,
     pull_commits: list[dict] | None = None,
+    check_run_paginate_responses: list[list[dict] | None] | None = None,
+    fail_create_check_after_store: bool = False,
+    fail_update_check_ids: list[int] | None = None,
 ) -> list:
     workflow = _load(workflow_file)
     script = _step(workflow, job, step_name)["with"]["script"]
@@ -4533,6 +4547,9 @@ def _run_upsert(
         "pullCommits": pull_commits or [],
         "runJobs": [{"name": "OpenCode Auto PR Review / opencode-canonicalize", "conclusion": "success"}],
         "runJobsByAttempt": run_jobs_by_attempt or {},
+        "checkRunPaginateResponses": check_run_paginate_responses,
+        "failCreateCheckAfterStore": fail_create_check_after_store,
+        "failUpdateCheckIds": fail_update_check_ids or [],
     }
     (tmp_path / "fixture.json").write_text(json.dumps(fixture), encoding="utf-8")
     node_env = None
@@ -14104,6 +14121,7 @@ def _run_opencode_canonicalize(
     candidate_envelope_changes: dict | None = None,
     dismissed_findings: list | None = None,
     node_preload: Path | None = None,
+    fail_create_check_after_store: bool = False,
 ) -> list:
     workflow = _load("opencode-auto-review.yml")
     script = _step(workflow, "opencode-canonicalize", "Canonicalize OpenCode review")["with"]["script"]
@@ -14508,6 +14526,7 @@ def _run_opencode_canonicalize(
         current_workflow_run=current_workflow_run,
         inject_comments_at_list_call=inject_comments_at_list_call,
         node_preload=node_preload,
+        fail_create_check_after_store=fail_create_check_after_store,
     )
 
 
@@ -17149,6 +17168,185 @@ def test_opencode_fresh_generation_before_receipt_success_aborts_and_discards_ow
         for call in calls
     )
     assert any(call[0] in {"update", "delete"} for call in calls)
+
+
+OPENCODE_CANONICAL_CHECK = "automation/opencode-canonical-review"
+OPENCODE_CHECK_CLEANUP_STEP = "Close abandoned OpenCode canonical check"
+
+
+def _opencode_pending_check(
+    check_id: int,
+    run_id: str,
+    attempt: str,
+    *,
+    status: str = "in_progress",
+    app: str = "github-actions",
+    repository: str = "o/r",
+) -> dict:
+    return {
+        "id": check_id, "name": OPENCODE_CANONICAL_CHECK, "head_sha": "ab" * 20, "status": status,
+        "conclusion": "failure" if status == "completed" else None,
+        "external_id": f"automation-opencode-pending:{repository}:{run_id}:{attempt}",
+        "output": {"title": "OpenCode canonical review pending"}, "app": {"slug": app},
+    }
+
+
+def _run_opencode_check_cleanup(
+    tmp_path: Path,
+    check_runs: list[dict],
+    *,
+    outcome: str = "failure",
+    run_id: str = "77",
+    run_attempt: str = "2",
+    head: str = "ab" * 20,
+    repository: str = "o/r",
+    responses: list[list[dict] | None] | None = None,
+    fail_update_check_ids: list[int] | None = None,
+) -> list:
+    preload = tmp_path / "instant-timers.js"
+    preload.write_text("global.setTimeout = (fn) => setImmediate(fn);\n", encoding="utf-8")
+    env = {
+        "CANONICALIZE_OUTCOME": outcome, "RUN_ID": run_id, "RUN_ATTEMPT": run_attempt,
+        "WORKFLOW_HEAD": head, "REPOSITORY": repository,
+    }
+    return _run_upsert(
+        tmp_path, "opencode-auto-review.yml", "opencode-canonicalize", OPENCODE_CHECK_CLEANUP_STEP, env, [],
+        check_runs=check_runs,
+        check_run_paginate_responses=responses if responses is not None else [check_runs],
+        fail_update_check_ids=fail_update_check_ids,
+        node_preload=preload,
+    )
+
+
+def test_opencode_check_cleanup_follows_the_canonicalizer_with_its_reservation_identity():
+    steps = _load("opencode-auto-review.yml")["jobs"]["opencode-canonicalize"]["steps"]
+    names = [step.get("name") for step in steps]
+    index = names.index("Canonicalize OpenCode review")
+    assert names[index + 1] == OPENCODE_CHECK_CLEANUP_STEP
+    canonicalize, cleanup = steps[index], steps[index + 1]
+    assert cleanup["if"] == "${{ always() && steps.canonicalize-opencode-review.outcome != 'skipped' }}"
+    assert cleanup["uses"] == canonicalize["uses"]
+    assert cleanup["with"]["github-token"] == canonicalize["with"]["github-token"] == "${{ github.token }}"
+    for key in ("RUN_ID", "RUN_ATTEMPT", "WORKFLOW_HEAD", "REPOSITORY"):
+        assert cleanup["env"][key] == canonicalize["env"][key]
+    assert cleanup["env"]["CANONICALIZE_OUTCOME"] == "${{ steps.canonicalize-opencode-review.outcome }}"
+    assert (
+        "external_id: `automation-opencode-pending:${repository}:${runId}:${runAttempt}`"
+        in canonicalize["with"]["script"]
+    )
+    assert "const prefix = `automation-opencode-pending:${repository}:${runIdRaw}:`;" in cleanup["with"]["script"]
+
+
+@node_required
+def test_opencode_check_cleanup_closes_a_reservation_whose_create_response_was_lost(tmp_path):
+    raw = _bot("github-actions[bot]", _opencode_review(), 10, updated="u2")
+    canonicalize_dir = tmp_path / "canonicalize"
+    canonicalize_dir.mkdir()
+    calls = _run_opencode_canonicalize(
+        canonicalize_dir, [], [raw], fail_create_check_after_store=True, expect_error=True,
+    )
+    reserved = [call[1] for call in calls if call[0] == "create-check"]
+    assert len(reserved) == 1
+    assert reserved[0]["status"] == "in_progress"
+    assert not [call for call in calls if call[0] == "update-check"]
+    identity = re.fullmatch(r"automation-opencode-pending:(.+):([0-9]+):([0-9]+)", reserved[0]["external_id"])
+    assert identity
+    stuck = {
+        "id": 1001, "name": reserved[0]["name"], "head_sha": reserved[0]["head_sha"],
+        "status": reserved[0]["status"], "conclusion": None, "external_id": reserved[0]["external_id"],
+        "output": reserved[0]["output"], "app": {"slug": "github-actions"},
+    }
+    cleanup_dir = tmp_path / "cleanup"
+    cleanup_dir.mkdir()
+
+    cleanup = _run_opencode_check_cleanup(
+        cleanup_dir, [stuck], repository=identity.group(1), run_id=identity.group(2),
+        run_attempt=identity.group(3), head=reserved[0]["head_sha"],
+    )
+
+    closed = [call[1] for call in cleanup if call[0] == "update-check"]
+    assert [update["check_run_id"] for update in closed] == [1001]
+    assert closed[0]["status"] == "completed"
+    assert closed[0]["conclusion"] == "failure"
+    assert closed[0]["output"]["title"] == "OpenCode canonical review abandoned"
+
+
+@node_required
+def test_opencode_check_cleanup_closes_only_this_runs_abandoned_reservations(tmp_path):
+    checks = [
+        _opencode_pending_check(1001, "77", "2"),
+        _opencode_pending_check(1002, "77", "1"),
+        _opencode_pending_check(1003, "77", "3"),
+        _opencode_pending_check(1004, "78", "1"),
+        _opencode_pending_check(1005, "77", "2", status="completed"),
+        _opencode_pending_check(1006, "77", "2", app="other-app"),
+        _opencode_pending_check(1007, "77", "2", repository="o/other"),
+        dict(_opencode_pending_check(1008, "77", "2"), external_id="automation-opencode-pending:o/r:77:02"),
+        dict(_opencode_pending_check(1009, "77", "2"), external_id="automation-opencode:o/r:77:2"),
+    ]
+
+    calls = _run_opencode_check_cleanup(tmp_path, checks)
+
+    assert [call[1] for call in calls if call[0] == "paginate-checks"] == [{
+        "owner": "o", "repo": "r", "ref": "ab" * 20, "check_name": OPENCODE_CANONICAL_CHECK,
+        "filter": "all", "per_page": 100,
+    }]
+    closed = {call[1]["check_run_id"]: call[1] for call in calls if call[0] == "update-check"}
+    assert sorted(closed) == [1001, 1002]
+    for update in closed.values():
+        assert update["status"] == "completed"
+        assert update["conclusion"] == "failure"
+        assert update["output"]["title"] == "OpenCode canonical review abandoned"
+    assert not [call for call in calls if call[0] in {"failed", "warning"}]
+
+
+@node_required
+def test_opencode_check_cleanup_lists_again_when_a_failed_canonicalizer_left_nothing_visible(tmp_path):
+    late = _opencode_pending_check(1001, "77", "2")
+
+    calls = _run_opencode_check_cleanup(tmp_path, [late], responses=[[], [late]])
+
+    assert len([call for call in calls if call[0] == "paginate-checks"]) == 2
+    assert [call[1]["check_run_id"] for call in calls if call[0] == "update-check"] == [1001]
+
+
+@node_required
+def test_opencode_check_cleanup_lists_once_after_a_successful_canonicalizer(tmp_path):
+    late = _opencode_pending_check(1001, "77", "2")
+
+    calls = _run_opencode_check_cleanup(tmp_path, [late], outcome="success", responses=[[], [late]])
+
+    assert len([call for call in calls if call[0] == "paginate-checks"]) == 1
+    assert not [call for call in calls if call[0] == "update-check"]
+
+
+@node_required
+def test_opencode_check_cleanup_reports_api_failures_without_failing_the_job(tmp_path):
+    stuck = _opencode_pending_check(1001, "77", "2")
+    list_dir = tmp_path / "list"
+    list_dir.mkdir()
+    update_dir = tmp_path / "update"
+    update_dir.mkdir()
+
+    unlisted = _run_opencode_check_cleanup(list_dir, [stuck], responses=[None])
+    unclosed = _run_opencode_check_cleanup(update_dir, [stuck], fail_update_check_ids=[1001])
+
+    list_warnings = [call[1] for call in unlisted if call[0] == "warning"]
+    assert len(list_warnings) == 3
+    assert all("could not be listed" in warning for warning in list_warnings)
+    assert [call[1] for call in unclosed if call[0] == "warning"] == [
+        "Abandoned OpenCode canonical check 1001 could not be closed: check update unavailable"
+    ]
+    for calls in (unlisted, unclosed):
+        assert not [call for call in calls if call[0] in {"failed", "update-check"}]
+
+
+@node_required
+def test_opencode_check_cleanup_skips_an_invalid_run_identity(tmp_path):
+    calls = _run_opencode_check_cleanup(tmp_path, [_opencode_pending_check(1001, "77", "2")], run_attempt="0")
+
+    assert ["notice", "Skipping OpenCode canonical check cleanup with invalid run identity"] in calls
+    assert not [call for call in calls if call[0] in {"paginate-checks", "update-check"}]
 
 
 @node_required
