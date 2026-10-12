@@ -607,6 +607,30 @@ cannot leave behind a file too large to be read. Measured pull requests across t
 at a median near 9 KB, with about 7% above the 200,000-byte default.
 
 
+### Self-review callers in this repository
+
+This repository reviews its own pull requests through four callers that reference the reusable
+workflows by local path: `_self-claude-review.yml`, `_self-gemini-auto-review.yml` and
+`_self-opencode-auto-review.yml` (`pull_request` and `workflow_dispatch`), and `_self-claude.yml`
+(comment and issue events). A local `uses: ./.github/workflows/<file>` reference runs that file from
+the same commit as the caller run. For a pull request event that is the pull request's merge commit,
+so a review round on a pull request that changes `claude-code-review.yml`, `gemini-auto-review.yml`,
+`opencode-auto-review.yml` or `claude.yml` runs the changed bytes, and its sticky comment, budget
+ledger comment and artifacts are evidence produced by them.
+
+That evidence covers only what the round reached:
+
+- A step whose `if:` the event does not satisfy did not run. For example, v1.84's `Diagnose Gemini
+  caller pins on an invalid budget state` runs only for `workflow_dispatch`, so an automatic round
+  says nothing about it. Check the step outcomes in the run before citing the round.
+- Managed reviews run here only when requested (see [Opt-in per review channel](#opt-in-per-review-channel)).
+  A round whose review job was skipped exercised nothing.
+- Consumers call the workflows pinned to a release commit through the caller tree in
+  `examples/baseline-workflows/`. A self round runs neither that caller tree, the release seals nor
+  the fleet tools; tests, `scripts/verify_workflow_release.py` and the fleet audit cover those.
+- The reviewer under review is the one running, so a change that breaks it can surface as a failed
+  or skipped round rather than as a finding.
+
 ## Deterministic automated-review input
 
 Claude, Gemini, and OpenCode call the same composite action:
