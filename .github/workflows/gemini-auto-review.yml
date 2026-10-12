@@ -628,10 +628,11 @@ jobs:
               if not (SHA1.fullmatch(running) and SHA1.fullmatch(baseline)):
                   reading = 'a pin could not be read as a commit; compare the callers by hand'
               elif running == baseline:
-                  reading = ('the pins match, so the caller pin is not the cause; '
-                             'check the stop reason and the pin that last wrote the ledger')
+                  reading = ('the pins match, so this run used the default-branch pin; '
+                             'compare it with the pin that last wrote the ledger and check the stop reason')
               else:
-                  reading = 'the pins differ; re-dispatch from the default branch (omit --ref)'
+                  reading = ('the pins differ; compare both with the pin that last wrote the ledger, '
+                             'and re-dispatch from the default branch (omit --ref) if this run used a work branch')
               message = (f'running caller pin {running} / default-branch caller pin {baseline} / '
                          f'{reading}; see docs/workflows/contracts.md#open-work-branches-after-a-fleet-rollout')
               print(f'::notice::{message}')

@@ -1629,10 +1629,11 @@ To diagnose a run:
 - From v1.84, when a Gemini `workflow_dispatch` run claims `state_invalid`,
   `Diagnose Gemini caller pins on an invalid budget state` in
   `.github/workflows/gemini-auto-review.yml` prints the running and default-branch caller
-  pins the same way (`local` for a same-repository `./` caller). Matching pins mean the
-  caller pin is not the cause; check the stop reason and the pin that last wrote the
-  ledger (below). A caller pinned before v1.84 cannot print it, and the diagnostic does
-  not change the decision.
+  pins the same way (`local` for a same-repository `./` caller). Matching pins only show
+  that the run used the default-branch pin: the pin that last wrote the ledger (below)
+  can still differ, for example after automatic runs of a pull request that changes the
+  caller pin. A caller pinned before v1.84 cannot print it, and the diagnostic does not
+  change the decision.
 - For any run, compare the SHA in the run's `referenced_workflows` (Actions run API)
   with the default caller pin, read the way `parse_default_caller_pin` in
   `scripts/verify_claude_rollout_fallback.py` reads it.

@@ -8275,6 +8275,7 @@ def test_gemini_pin_diagnostic_names_running_and_default_branch_pins(tmp_path):
     notice = notices[0]
     assert f"running caller pin {GEMINI_OLD_PIN} / default-branch caller pin {GEMINI_NEW_PIN} /" in notice
     assert "omit --ref" in notice and GEMINI_RECOVERY_ANCHOR in notice
+    assert "pin that last wrote the ledger" in notice
     assert summary == f"state_invalid: {notice}\n"
 
 
@@ -8284,7 +8285,10 @@ def test_gemini_pin_diagnostic_does_not_blame_matching_pins(tmp_path):
     assert result.returncode == 0, result.stderr
     notice = notices[0]
     assert f"running caller pin {GEMINI_OLD_PIN} / default-branch caller pin {GEMINI_OLD_PIN} /" in notice
-    assert "caller pin is not the cause" in notice and "omit --ref" not in notice
+    assert "this run used the default-branch pin" in notice and "omit --ref" not in notice
+    # The ledger can be written by automatic runs on another pin, so matching pins never
+    # rule the caller pin out (#224 review).
+    assert "not the cause" not in notice and "pin that last wrote the ledger" in notice
 
 
 @pytest.mark.parametrize(("case", "running", "default"), [
