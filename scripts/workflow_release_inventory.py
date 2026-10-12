@@ -363,7 +363,10 @@ def release_supports_claude_caller_pin_diagnostics(ref: str) -> bool:
 
 
 def release_supports_gemini_fallback_quota_reason(ref: str) -> bool:
-    """Return whether Gemini keeps a primary quota_exhausted over a provider-class fallback failure."""
+    """Return whether Gemini keeps a primary quota_exhausted over a provider-class fallback failure.
+
+    The same v1.84 bytes also name both caller pins when a dispatch claims state_invalid.
+    """
     return _release_version(ref) >= GEMINI_FALLBACK_QUOTA_REASON_RELEASE
 
 

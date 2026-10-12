@@ -866,9 +866,10 @@ EXPECTED_OPENCODE_RECOVERY_WORKFLOW_SHA256 = {
 EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256 = (
     "9c2e725dfc175d70f5961e95ffbcc8bab28643714e92f4e195bab3fb7e74ed50"
 )
-# v1.84 keeps a primary quota_exhausted when the Gemini fallback then fails with a provider-class reason.
+# v1.84 keeps a primary quota_exhausted when the Gemini fallback then fails with a provider-class reason
+# (#222), and names both caller pins when a dispatch claims state_invalid (#209).
 EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256 = (
-    "7115acb25ee3a9010dd7801e06526e374fe64d846cf0349199556cbd476c455f"
+    "aa74613974030ae753c08852abf56c91f731b6fe6c229cbc4a321636b9894ff7"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176 = "3e8decf2bf21d007d40c0dc011b173ed0af6b2e15ae8827ae51f6986e90b813f"
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V177 = "5b53efd67b4728e01ddbd029c13dd039d93cc0c94b86bccb4e1fc1a4486c6cda"
