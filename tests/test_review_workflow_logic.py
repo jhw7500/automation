@@ -17301,6 +17301,34 @@ def test_opencode_check_cleanup_closes_only_this_runs_abandoned_reservations(tmp
 
 
 @node_required
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_opencode_check_cleanup_leaves_a_check_a_lagging_list_still_shows_as_reserved(tmp_path, outcome):
+    attestation = json.dumps({"run_id": 77, "run_attempt": 2, "workflow_head": "ab" * 20}, separators=(",", ":"))
+    attested = dict(
+        _opencode_pending_check(1001, "77", "2"), status="completed", conclusion="success",
+        external_id="automation-opencode-canonical:o/r:pr:5:run:77:2:comment:300",
+        output={"title": "OpenCode canonical review attested",
+                "text": f"<!-- automation-attestation:{attestation} -->"},
+    )
+    lagging = _opencode_pending_check(1001, "77", "2")
+
+    calls = _run_opencode_check_cleanup(tmp_path, [attested], outcome=outcome, responses=[[lagging]])
+
+    assert not [call for call in calls if call[0] in {"update-check", "failed", "warning"}]
+    reads = [call[1]["check_run_id"] for call in calls if call[0] == "get-check"]
+    assert reads == ([] if outcome == "success" else [1001])
+
+
+@node_required
+def test_opencode_check_cleanup_after_a_successful_canonicalizer_closes_only_earlier_attempts(tmp_path):
+    checks = [_opencode_pending_check(1001, "77", "2"), _opencode_pending_check(1002, "77", "1")]
+
+    calls = _run_opencode_check_cleanup(tmp_path, checks, outcome="success")
+
+    assert [call[1]["check_run_id"] for call in calls if call[0] == "update-check"] == [1002]
+
+
+@node_required
 def test_opencode_check_cleanup_lists_again_when_a_failed_canonicalizer_left_nothing_visible(tmp_path):
     late = _opencode_pending_check(1001, "77", "2")
 

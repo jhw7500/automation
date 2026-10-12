@@ -5631,11 +5631,12 @@ jobs:
         with:
           github-token: ${{ github.token }}
           script: |
-            // The canonicalizer reserves an in_progress check and completes it on every path it
-            // controls. A create whose response was lost after GitHub stored the check, or a step
-            // that ended between reservation and completion, leaves it in_progress forever. Close
-            // such reservations of this run, earlier attempts included, as failure: the shape of
-            // the canonicalizer's own failure closures, which provenance never accepts as a receipt.
+            // The canonicalizer reserves an in_progress check and completes it on success and on the
+            // aborts it detects itself. A create whose response was lost after GitHub stored the
+            // check, any other throw after the reservation, or a step that ended mid-way leaves it
+            // in_progress forever. Close such reservations of this run, earlier attempts included, as
+            // failure: the shape of the canonicalizer's own failure closures, which provenance never
+            // accepts as a receipt.
             const runIdRaw = process.env.RUN_ID || '';
             const runAttemptRaw = process.env.RUN_ATTEMPT || '';
             const workflowHead = process.env.WORKFLOW_HEAD || '';
@@ -5647,6 +5648,7 @@ jobs:
               return;
             }
             const runAttempt = Number(runAttemptRaw);
+            const succeeded = process.env.CANONICALIZE_OUTCOME === 'success';
             const prefix = `automation-opencode-pending:${repository}:${runIdRaw}:`;
             const abandoned = (check) => {
               if (check.status === 'completed' || check.app?.slug !== 'github-actions'
@@ -5654,11 +5656,13 @@ jobs:
                 return false;
               }
               const attempt = check.external_id.slice(prefix.length);
-              return safeInteger(attempt) && Number(attempt) <= runAttempt;
+              // A successful canonicalizer completed its own reservation; only earlier ones can be open.
+              return safeInteger(attempt)
+                && (succeeded ? Number(attempt) < runAttempt : Number(attempt) <= runAttempt);
             };
             // A check stored behind a failed create may surface late, so a step that did not
             // succeed lists again before concluding that nothing was abandoned.
-            const passes = process.env.CANONICALIZE_OUTCOME === 'success' ? 1 : 3;
+            const passes = succeeded ? 1 : 3;
             let pending = [];
             for (let pass = 1; pass <= passes; pass += 1) {
               try {
@@ -5673,8 +5677,14 @@ jobs:
               }
               if (pass < passes) await new Promise((resolve) => setTimeout(resolve, 3000 * pass));
             }
-            for (const check of pending) {
+            for (const listed of pending) {
               try {
+                // The list can lag behind the canonicalizer's own completion; close only what a
+                // direct read still shows as an open reservation of this run.
+                const { data: check } = await github.rest.checks.get({
+                  owner: context.repo.owner, repo: context.repo.repo, check_run_id: listed.id,
+                });
+                if (!check || check.id !== listed.id || !abandoned(check)) continue;
                 await github.rest.checks.update({
                   owner: context.repo.owner, repo: context.repo.repo, check_run_id: check.id,
                   status: 'completed', conclusion: 'failure', completed_at: new Date().toISOString(),
@@ -5683,7 +5693,7 @@ jobs:
                 });
                 core.notice(`Closed abandoned OpenCode canonical check ${check.id}`);
               } catch (error) {
-                core.warning(`Abandoned OpenCode canonical check ${check.id} could not be closed: ${error.message}`);
+                core.warning(`Abandoned OpenCode canonical check ${listed.id} could not be closed: ${error.message}`);
               }
             }
 
