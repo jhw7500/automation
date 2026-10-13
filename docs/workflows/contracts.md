@@ -640,9 +640,20 @@ Rules for reading the result:
   notices, such as the `Workflow Skipped` notice and runner messages, whose `title` is empty.
 - The notice is on the reviewer's review-job check run (`<caller job> / claude-review`) or on
   `<caller job> / Workflow Skipped`.
-- When the commit has more than one run of the same reviewer, take the newest run or attempt in
-  which that reviewer's review job or `Workflow Skipped` job ran, that is, whose conclusion is not
-  `SKIPPED`.
+- A run's check suite belongs to the run's own commit (its `head_sha`). For a `pull_request` run
+  that is the pull request head, so the query above finds it. Detached runs are rooted at the commit
+  of the ref they ran on, not at the pull request head (the budget transport records the same fact
+  for its claims): the bounded force-review dispatch, documented below without `--ref`, runs on the
+  default branch, and so does the Claude rollout fallback admitted from an `issue_comment`. To
+  include them, list the caller workflow's runs for those events, for example
+  `gh run list --repo OWNER/REPO --workflow <caller file> --event workflow_dispatch --json databaseId,headSha,createdAt`
+  (and `--event issue_comment`), and run the same query for each listed `headSha`.
+- Across everything collected, keep only notices whose `pr=` is the pull request and whose `head=`
+  is the head being asked about. A default-branch commit carries notices for every pull request, so
+  these two fields, not the commit queried, decide which pull request and head a notice describes.
+- When more than one matching notice remains for a reviewer, take the one from the newest run or
+  attempt in which that reviewer's review job or `Workflow Skipped` job ran, that is, whose
+  conclusion is not `SKIPPED`.
 - No `review-outcome` annotation means unknown, never performed. A caller pinned before v1.86, a
   job that never started, and a job stopped before the step ran (for example a lost runner) all
   leave none.
