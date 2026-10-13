@@ -125,9 +125,9 @@ PATH=/usr/bin:/bin /usr/bin/gh pr create --base main --title "<title>" --body-fi
   검사하고, 의도적으로 태그로 참조하는 action도 있다. 테스트가 모든 `uses:`를 막아 준다고
   가정하지 않으며, 기존 예외 참조를 임의로 바꾸지 않는다.
 - 태그 이동·재생성, 예산 원장 코멘트의 편집·절단·삭제 (복구도 원장을 그대로 둔다).
-- 세션 체크포인트 `HANDOFF.<세션>.md`와 도구 상태 디렉터리를 커밋하지 않는다. 목록은 `.gitignore`가
-  정본이다. 루트 `HANDOFF.md`와 `.superpowers/`·`.gemini/`의 일부 파일은 이미 추적 중이므로 무시
-  대상이 아니다. 새 도구 디렉터리가 생기면 스테이징 전에 `git status`로 확인한다.
+- 세션 체크포인트 `HANDOFF.md`·`HANDOFF.<세션>.md`와 도구 상태 디렉터리를 커밋하지 않는다. 목록은
+  `.gitignore`가 정본이다. `.superpowers/`·`.gemini/`의 일부 파일은 이미 추적 중이므로 무시 대상이
+  아니다. 새 도구 디렉터리가 생기면 스테이징 전에 `git status`로 확인한다.
 
 ## 정본 문서
 

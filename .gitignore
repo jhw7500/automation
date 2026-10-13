@@ -12,5 +12,6 @@ __pycache__/
 .codex/
 .agents/
 .ai/
-# Per-session checkpoints; the tracked HANDOFF.md is not matched
+# Session checkpoints; task state lives in jhw-control
+HANDOFF.md
 HANDOFF.*.md
