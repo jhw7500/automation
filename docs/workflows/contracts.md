@@ -1470,8 +1470,11 @@ future completed run can authenticate the successor.
 The canonicalizer reserves that Check Run `in_progress` under the external ID
 `automation-opencode-pending:<repository>:<run_id>:<run_attempt>` before it writes the comment.
 It completes the reservation itself only on success, replacing the ID with the attested one, and on
-the aborts it detects: a head/generation CAS failure, a receipt it cannot verify exactly, and a
-comment that changed after attestation (each `failure`, pending ID kept). Any other exit after the
+the aborts it detects, each as `failure`: a head/generation CAS failure, which happens before the
+success update and so keeps the pending ID, and a receipt it cannot verify exactly or a comment that
+changed after attestation, which are invalidated after the success update and so keep the attested
+ID unless that update never applied. Receipt readers require `conclusion: success`, so none of these
+is a receipt whichever ID it carries. Any other exit after the
 reservation used to leave it `in_progress` indefinitely, which stalls tools that wait for every check
 (#227): a create whose response is lost after GitHub stored the Check, a failed comment create, list
 or exact-byte refetch, a failed PR or live-evidence read, a failed invalidation update, or a step
@@ -1485,8 +1488,8 @@ canonicalizer did not succeed it lists the Checks up to three times, keeping eve
 until the current attempt's reservation appears, because a Check stored behind a failed create may
 surface late. List, read and update errors are warnings and never change the job
 result; a reservation it cannot close is retried by a later attempt of the same run whose
-canonicalizer runs. A closed reservation keeps the pending ID and carries no attestation, so receipt
-discovery treats it like the canonicalizer's own failure closures. A runner lost mid-step still
+canonicalizer runs. A closed reservation keeps the pending ID, carries no attestation and is
+`failure`, so receipt discovery never accepts it. A runner lost mid-step still
 leaves the reservation open.
 
 Receipt discovery never starts from a comment-provided Check ID. Both prepare and live
