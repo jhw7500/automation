@@ -545,6 +545,124 @@ The `skipped` job's `if:` condition is unchanged: it still covers both causes, a
 verifier requires it to keep testing `policy_run != 'true'`.
 
 
+### Review outcome annotation
+
+From v1.86 every run of `claude-code-review.yml` and `gemini-auto-review.yml` leaves one notice
+that says what happened to the review (#187). A run's conclusion could not say it: a Claude budget
+refusal ends `success` with no sticky update. The sticky comment and its `automation-state` are
+unchanged, so readers in older releases are unaffected.
+
+```text
+::notice title=review-outcome::reviewer=<claude|gemini> outcome=<outcome> reason=<reason> head=<sha> pr=<number>
+```
+
+The step `Report review outcome` prints it. It is the last step of the review job (`claude-review`,
+`gemini-review`; in Gemini after `Enforce authenticated review budget decision`) and a separate step
+after `Notice` in the `Workflow Skipped` job. Both run with `if: ${{ always() }}`, take every input
+through `env:`, never fail and print only a notice, so job conclusions and the Claude rollout
+fallback contract (exactly one failure-level annotation on the original run) are unchanged. Before
+printing, `head` must match `^[0-9a-f]{40}$` and `pr` `^[1-9][0-9]{0,9}$`, otherwise `unknown`;
+`outcome` and `reason` must match `^[a-z_]{1,64}$`, otherwise `invalid`. The line therefore cannot
+carry another workflow command.
+
+`outcome` is one of `performed`, `reused`, `skipped`, `refused`, `failed`, `cancelled`. The step's
+`if`/`case` order is the definition; in outline:
+
+| `outcome` | when, and where `reason` comes from |
+| --- | --- |
+| `cancelled` | `job.status` is `cancelled`; reason `cancelled`. Checked first. |
+| `skipped` | the `Workflow Skipped` job ran: `workflow_disabled` when `check-enabled`'s `enabled` is not `true`, otherwise its `policy_reason` (the vocabulary in [Why a managed reviewer did not run](#why-a-managed-reviewer-did-not-run)). |
+| `refused` | the claim step's `decision` is one of the refusals in the step's first `case` arm; the reason is that decision. |
+| `reused` | `decision` is `authenticated_reuse` and the upsert either did not run or published a success; reason `authenticated_reuse`. |
+| `performed` | `decision` is `claimed`, the upsert published a success, and `Resolve … budget outcome` reported `success` or `quality_filtered`; the reason is that value. |
+| `failed` | everything else; the reason is the first source that applies, in the step's order. |
+
+Sources of a `failed` reason, each defined where it is named:
+
+- Claude before the claim: the `reason` output of `Validate Claude fallback admission`,
+  `fallback_inputs_partial` when `Resolve Claude fallback mode` failed, `fallback_admission_mismatch`
+  when `Authenticate Claude fallback request` failed, and the `reason` output of
+  `Validate Claude caller workflow`.
+- `review_context_unavailable` when the collector step (`Collect previous review context`,
+  `Get PR details`) failed; `budget_unavailable` when the claim step produced no `decision`; any
+  other `decision` (`state_invalid`, `diff_unavailable`) verbatim.
+- Claude after a claim: the `failure_reason` output of `Resolve Claude execution` when it is
+  `provider_failure` or `provider_not_executed`.
+- The upsert's `attempt_reason` (below); `publication_failed` when the upsert recorded a success
+  but did not publish; then the budget outcome's own value, or `checkpoint_failure` when it did not
+  run.
+
+The upsert step exposes `attempt_status` and `attempt_reason` for this step only; no sticky or state
+byte depends on them. `recordAttempt` in the step script sets them: `unpublished` with
+`publication_failed` until the attempt is decided (left in place when the script throws),
+`state_provenance_uncertain` or `attempt_identity_invalid`; `discarded` with `stale_head` or
+`stale_generation`; `failure` with the script's `failureReason`; `success` with an empty reason. A
+`stale_head` discard names a head the pull request has already left, so a reader that queries the
+current head does not see it.
+
+From v1.86 the canonical Gemini failure reason is this annotation's `reason=` (#222). It is the
+upsert's `failureReason`, the value its `setFailed` message names, and it is present also when a
+failure keeps an earlier success and the sticky shows `Status: stale` without a reason. Aligning the
+sticky formats across reviewers is left to a later state schema.
+
+`opencode-auto-review.yml` follows in the same release. Until it does, an OpenCode run has no
+annotation. Codex is a GitHub App and leaves no run.
+
+Read the annotations for a commit with one GraphQL query (REST `check-runs` returns only
+`annotations_count`):
+
+```bash
+gh api graphql -f owner=OWNER -f name=REPO -f sha=HEAD_SHA -f query='
+query($owner: String!, $name: String!, $sha: String!) {
+  repository(owner: $owner, name: $name) {
+    object(expression: $sha) {
+      ... on Commit {
+        checkSuites(first: 50) {
+          nodes {
+            workflowRun { databaseId runNumber workflow { name } }
+            checkRuns(first: 50) {
+              nodes {
+                name conclusion
+                annotations(first: 50) { nodes { title message annotationLevel } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}'
+```
+
+Rules for reading the result:
+
+- Keep only annotations whose `title` is `review-outcome`. The same check runs also carry other
+  notices, such as the `Workflow Skipped` notice and runner messages, whose `title` is empty.
+- The notice is on the reviewer's review-job check run (`<caller job> / claude-review`) or on
+  `<caller job> / Workflow Skipped`.
+- A run's check suite belongs to the run's own commit (its `head_sha`). For a `pull_request` run
+  that is the pull request head, so the query above finds it. Detached runs are rooted at the commit
+  of the ref they ran on, not at the pull request head (the budget transport records the same fact
+  for its claims): the bounded force-review dispatch, documented below without `--ref`, runs on the
+  default branch, and so does the Claude rollout fallback admitted from an `issue_comment`. To
+  include them, list the caller workflow's runs for those events, for example
+  `gh run list --repo OWNER/REPO --workflow <caller file> --event workflow_dispatch --json databaseId,headSha,createdAt`
+  (and `--event issue_comment`), and run the same query for each listed `headSha`.
+- Across everything collected, keep only notices whose `pr=` is the pull request and whose `head=`
+  is the head being asked about. A default-branch commit carries notices for every pull request, so
+  these two fields, not the commit queried, decide which pull request and head a notice describes.
+- When more than one matching notice remains for a reviewer, take the one from the newest run or
+  attempt in which that reviewer's review job or `Workflow Skipped` job ran, that is, whose
+  conclusion is not `SKIPPED`.
+- No `review-outcome` annotation means unknown, never performed. A caller pinned before v1.86, a
+  job that never started, and a job stopped before the step ran (for example a lost runner) all
+  leave none.
+- Job and check conclusions are not part of this contract and differ by reviewer for the same
+  outcome: a Claude refusal ends `success`, a Gemini refusal fails in
+  `Enforce authenticated review budget decision`. v1.86 does not change them, so required checks
+  and merge gates are unaffected.
+
+
 ### What the requester asked
 
 Text written after `@gemini-cli /review` reached no prompt until `v1.68`. A request that listed five
@@ -1105,7 +1223,8 @@ Writing it there made the canonicalizer read provider text as a document and rep
 `ambiguous_document`/`preamble`, so a provider outage looked like a model format regression.
 The reason still travels through `gemini_failure_reason.txt` to the sticky comment's error body;
 a failure that keeps an earlier successful review (`preserveSuccess` in the upsert step) shows
-`Status: stale` and the failed run without the reason (tracked in #187). The provider text is
+`Status: stale` and the failed run without the reason; from v1.86 the run's
+[review outcome annotation](#review-outcome-annotation) carries it. The provider text is
 uploaded as its own one-day, non-overwriting `gemini-provider-error-<run>-<attempt>`
 artifact — never merged into the canonicalizer-owned diagnostic, which stays bounded schema-1
 output. With no candidate file the canonicalizer reports `candidate_missing`, which is what

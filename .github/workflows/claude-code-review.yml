@@ -1152,6 +1152,12 @@ jobs:
           script: |
             const fs = require('fs');
             core.setOutput('published', 'false');
+            // Read only by "Report review outcome" (#187); sticky and state bytes do not use them.
+            const recordAttempt = (status, reason) => {
+              core.setOutput('attempt_status', status);
+              core.setOutput('attempt_reason', reason);
+            };
+            recordAttempt('unpublished', 'publication_failed');
             const header = '## Claude Code Review (latest)';
             const marker = '<!-- automation:claude-code-review:v3 -->';
             const v2Marker = '<!-- automation:claude-code-review:v2 -->';
@@ -1369,6 +1375,7 @@ jobs:
             }
             if (provenanceLookupUncertain) {
               core.notice('Claude review state provenance lookup is uncertain; left existing sticky state unchanged.');
+              recordAttempt('unpublished', 'state_provenance_uncertain');
               return;
             }
             const exactDisplayTarget = (displayMarker) => [...comments].reverse().find((comment) => {
@@ -1381,6 +1388,7 @@ jobs:
             const v2Target = existing ? null : exactDisplayTarget(v2Marker);
             if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead) || !serverUrl || !repository || !botLogin) {
               core.notice('Claude review trusted attempt identity is invalid; left the existing sticky state unchanged.');
+              recordAttempt('unpublished', 'attempt_identity_invalid');
               return;
             }
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: issueNumber });
@@ -1388,11 +1396,13 @@ jobs:
               || (fallbackMode && (!validFallbackRoute(fallbackRoute)
                 || pr.base?.sha !== fallbackRoute.reviewed_base_sha))) {
               core.notice(`Discarding stale review for ${attemptHead}; current head is ${pr.head?.sha || 'unknown'}`);
+              recordAttempt('discarded', 'stale_head');
               return;
             }
             if (existing && (existing.state.run_id > runId
               || (existing.state.run_id === runId && existing.state.run_attempt >= runAttempt))) {
               core.notice(`Discarding stale review generation (${runId}, ${runAttempt}); state is already at (${existing.state.run_id}, ${existing.state.run_attempt}).`);
+              recordAttempt('discarded', 'stale_generation');
               return;
             }
 
@@ -1480,6 +1490,7 @@ jobs:
             const preserveSuccess = checkpointFailed && existing
               && sha1(existing.state.successful_head) && preservedProse.length > 0;
             const state = buildState(checkpointFailed, preserveSuccess);
+            recordAttempt(checkpointFailed ? 'failure' : 'success', checkpointFailed ? failureReason : '');
             const content = checkpointFailed
               ? (preserveSuccess ? preservedProse
                 : `### Error\n\nClaude review failed: \`${failureReason}\`. (See run logs: ${runUrl})${candidatePointer}`)
@@ -1499,6 +1510,7 @@ jobs:
             if (publicationPr.head?.sha !== attemptHead
               || (fallbackMode && publicationPr.base?.sha !== fallbackRoute.reviewed_base_sha)) {
               core.notice('Claude review publication coordinates changed; left sticky state unchanged.');
+              recordAttempt('discarded', 'stale_head');
               return;
             }
             const target = existing?.comment || v2Target;
@@ -1615,6 +1627,84 @@ jobs:
           retention-days: 7
           overwrite: false
 
+      # One fixed-format review-outcome notice per run (#187); docs/workflows/contracts.md
+      # "Review outcome annotation". Inputs arrive only through env and are validated before
+      # printing. The step never fails and never emits a failure-level annotation, so the
+      # job conclusion and the rollout fallback contract are unchanged.
+      - name: Report review outcome
+        if: ${{ always() }}
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          HEAD_SHA: ${{ steps.prepare-diff.outputs.head-sha || needs.check-enabled.outputs.policy_head }}
+          FALLBACK_MODE_OUTCOME: ${{ steps.fallback-mode.outcome }}
+          FALLBACK_ADMISSION_OUTCOME: ${{ steps.fallback-admission.outcome }}
+          FALLBACK_ADMISSION_REASON: ${{ steps.fallback-admission-validation.outputs.reason }}
+          CONTEXT_OUTCOME: ${{ steps.prepare-review-input.outcome }}
+          VALIDATION_REASON: ${{ steps.claude-workflow-validation.outputs.reason }}
+          DECISION: ${{ steps.review-budget-claim.outputs.decision }}
+          EXECUTION_FAILURE_REASON: ${{ steps.claude-execution.outputs.failure_reason }}
+          ATTEMPT_STATUS: ${{ steps.upsert-review-comment.outputs.attempt_status }}
+          ATTEMPT_REASON: ${{ steps.upsert-review-comment.outputs.attempt_reason }}
+          PUBLISHED: ${{ steps.upsert-review-comment.outputs.published }}
+          BUDGET_OUTCOME: ${{ steps.review-budget-outcome.outputs.outcome }}
+        run: |
+          set +e
+          if [[ "$JOB_STATUS" == 'cancelled' ]]; then
+            outcome='cancelled'; reason='cancelled'
+          elif [[ -n "$FALLBACK_ADMISSION_REASON" ]]; then
+            outcome='failed'; reason="$FALLBACK_ADMISSION_REASON"
+          elif [[ "$FALLBACK_MODE_OUTCOME" == 'failure' ]]; then
+            outcome='failed'; reason='fallback_inputs_partial'
+          elif [[ "$FALLBACK_ADMISSION_OUTCOME" == 'failure' ]]; then
+            outcome='failed'; reason='fallback_admission_mismatch'
+          elif [[ "$CONTEXT_OUTCOME" == 'failure' ]]; then
+            outcome='failed'; reason='review_context_unavailable'
+          elif [[ -n "$VALIDATION_REASON" ]]; then
+            outcome='failed'; reason="$VALIDATION_REASON"
+          else
+            case "$DECISION" in
+              duplicate_head|duplicate_effective_diff|round_budget_exhausted|input_budget_exhausted|total_usage_budget_exhausted)
+                outcome='refused'; reason="$DECISION" ;;
+              authenticated_reuse)
+                if [[ -z "$ATTEMPT_STATUS" || ( "$ATTEMPT_STATUS" == 'success' && "$PUBLISHED" == 'true' ) ]]; then
+                  outcome='reused'; reason='authenticated_reuse'
+                elif [[ "$ATTEMPT_STATUS" == 'success' ]]; then
+                  outcome='failed'; reason='publication_failed'
+                else
+                  outcome='failed'; reason="$ATTEMPT_REASON"
+                fi ;;
+              claimed)
+                if [[ "$EXECUTION_FAILURE_REASON" == 'provider_failure' || "$EXECUTION_FAILURE_REASON" == 'provider_not_executed' ]]; then
+                  outcome='failed'; reason="$EXECUTION_FAILURE_REASON"
+                elif [[ "$ATTEMPT_STATUS" == 'success' && "$PUBLISHED" == 'true' ]]; then
+                  case "$BUDGET_OUTCOME" in
+                    success|quality_filtered) outcome='performed'; reason="$BUDGET_OUTCOME" ;;
+                    '') outcome='failed'; reason='checkpoint_failure' ;;
+                    *) outcome='failed'; reason="$BUDGET_OUTCOME" ;;
+                  esac
+                elif [[ "$ATTEMPT_STATUS" == 'success' ]]; then
+                  outcome='failed'; reason='publication_failed'
+                elif [[ -n "$ATTEMPT_STATUS" ]]; then
+                  outcome='failed'; reason="$ATTEMPT_REASON"
+                else
+                  outcome='failed'; reason='checkpoint_failure'
+                fi ;;
+              '') outcome='failed'; reason='budget_unavailable' ;;
+              *) outcome='failed'; reason="$DECISION" ;;
+            esac
+          fi
+          if [[ ! "$outcome" =~ ^[a-z_]{1,64}$ ]]; then outcome='invalid'; fi
+          if [[ ! "$reason" =~ ^[a-z_]{1,64}$ ]]; then reason='invalid'; fi
+          head="$HEAD_SHA"
+          if [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then head='unknown'; fi
+          pr="$PR_NUMBER"
+          if [[ ! "$pr" =~ ^[1-9][0-9]{0,9}$ ]]; then pr='unknown'; fi
+          printf '::notice title=review-outcome::reviewer=%s outcome=%s reason=%s head=%s pr=%s\n' \
+            'claude' "$outcome" "$reason" "$head" "$pr"
+          exit 0
+
 
   skipped:
     permissions: {}
@@ -1656,3 +1746,26 @@ jobs:
             printf '## Workflow Skipped\n'
             printf 'Claude Code Review did not run because %s.\n' "$detail"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The fixed-format review-outcome notice for a policy skip (#187). It reads only the
+      # check-enabled outputs above and never fails.
+      - name: Report review outcome
+        if: ${{ always() }}
+        shell: bash
+        env:
+          WORKFLOW_ENABLED: ${{ needs.check-enabled.outputs.enabled }}
+          POLICY_REASON: ${{ needs.check-enabled.outputs.policy_reason }}
+          HEAD_SHA: ${{ needs.check-enabled.outputs.policy_head }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        run: |
+          set +e
+          reason="$POLICY_REASON"
+          if [[ "$WORKFLOW_ENABLED" != 'true' ]]; then reason='workflow_disabled'; fi
+          if [[ ! "$reason" =~ ^[a-z_]{1,64}$ ]]; then reason='invalid'; fi
+          head="$HEAD_SHA"
+          if [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then head='unknown'; fi
+          pr="$PR_NUMBER"
+          if [[ ! "$pr" =~ ^[1-9][0-9]{0,9}$ ]]; then pr='unknown'; fi
+          printf '::notice title=review-outcome::reviewer=%s outcome=%s reason=%s head=%s pr=%s\n' \
+            'claude' 'skipped' "$reason" "$head" "$pr"
+          exit 0

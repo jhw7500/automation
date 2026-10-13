@@ -427,6 +427,25 @@ def test_admission_binds_failure_before_provider_or_budget() -> None:
     assert canonical_request_body(admission.request) == REQUEST_BODY
 
 
+@pytest.mark.parametrize(("conclusion", "accepted"), [("success", True), ("failure", False)])
+def test_admission_accepts_the_review_outcome_step_only_while_it_succeeds(
+    conclusion: str, accepted: bool,
+) -> None:
+    # From v1.86 the original review job ends with an always() "Report review outcome"
+    # step (#187). The contract takes it as long as it succeeds, which is why the step
+    # never fails.
+    bundle = valid_bundle()
+    values = {name: deepcopy(getattr(bundle, name)) for name in EvidenceBundle.__dataclass_fields__}
+    values["original_jobs"]["jobs"][0]["steps"].append(
+        {"number": 5, "name": "Report review outcome", "status": "completed", "conclusion": conclusion}
+    )
+    if accepted:
+        assert admit(EvidenceBundle(**values)).request.original_run_id == 34549275027
+    else:
+        with pytest.raises(ContractError, match="^original_jobs_invalid$"):
+            admit(EvidenceBundle(**values))
+
+
 @pytest.mark.parametrize(
     "change",
     [
