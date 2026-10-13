@@ -186,6 +186,7 @@ OPENCODE_PROVIDER_FAILURE_CLASSIFICATION_RELEASE = (1, 81)
 OPENCODE_DISMISSAL_COVERAGE_RELEASE = (1, 82)
 CLAUDE_CALLER_PIN_DIAGNOSTICS_RELEASE = (1, 83)
 GEMINI_FALLBACK_QUOTA_REASON_RELEASE = (1, 84)
+OPENCODE_ABANDONED_CHECK_CLEANUP_RELEASE = (1, 85)
 CARRYOVER_NONE_RELEASE = (1, 79)
 
 
@@ -368,6 +369,11 @@ def release_supports_gemini_fallback_quota_reason(ref: str) -> bool:
     The same v1.84 bytes also name both caller pins when a dispatch claims state_invalid.
     """
     return _release_version(ref) >= GEMINI_FALLBACK_QUOTA_REASON_RELEASE
+
+
+def release_supports_opencode_abandoned_check_cleanup(ref: str) -> bool:
+    """Return whether OpenCode closes canonical-review check reservations its canonicalizer abandoned."""
+    return _release_version(ref) >= OPENCODE_ABANDONED_CHECK_CLEANUP_RELEASE
 
 
 def _with_claude_rollout_fallback_roots(
