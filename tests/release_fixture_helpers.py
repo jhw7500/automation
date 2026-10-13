@@ -122,6 +122,40 @@ V179_FILTERED_PRESERVATION_EDITS = {
 }
 
 
+V185_REVIEW_OUTCOME_BOUNDARY_COMMIT = "b9c46ab8f3218a0e5cdc79715517f071f47979d2"
+PRE_V186_FILES = (
+    ".github/workflows/claude-code-review.yml",
+    ".github/workflows/gemini-auto-review.yml",
+)
+
+
+def restore_pre_v186_review_outcome_annotation(repo: Path) -> None:
+    """Restore the authenticated v1.85 Claude and Gemini review workflows.
+
+    Restore only a current file, so older restore chains that already replaced
+    these files, and deliberately mutated test bytes, survive.
+    """
+    from scripts.verify_workflow_release import (
+        EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256,
+        V183_CLAUDE_REVIEW_SHA256,
+        VerifiedCommitTree,
+    )
+
+    expected = dict(zip(PRE_V186_FILES, (
+        V183_CLAUDE_REVIEW_SHA256, EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256,
+    )))
+    root = Path(__file__).resolve().parents[1]
+    tree = None
+    for relative in PRE_V186_FILES:
+        path = repo / relative
+        if path.is_file() and path.read_bytes() == (root / relative).read_bytes():
+            if tree is None:
+                tree = VerifiedCommitTree.open(root, V185_REVIEW_OUTCOME_BOUNDARY_COMMIT)
+            payload = tree.read_file(relative)
+            assert hashlib.sha256(payload).hexdigest() == expected[relative]
+            path.write_bytes(payload)
+
+
 V184_ABANDONED_CHECK_CLEANUP_BOUNDARY_COMMIT = "0ea33644d840b1172d9713df3f1f8866fc519679"
 PRE_V185_FILES = (
     ".github/workflows/opencode-auto-review.yml",
@@ -132,8 +166,8 @@ PRE_V185_FILES = (
 def restore_pre_v185_opencode_abandoned_check_cleanup(repo: Path) -> None:
     """Restore the authenticated v1.84 OpenCode workflow and recovery evidence.
 
-    Restore only a current file, so older restore chains that already replaced
-    these files, and deliberately mutated test bytes, survive.
+    Undo v1.86 first, then restore only a current file, so older restore chains
+    that already replaced these files, and deliberately mutated test bytes, survive.
     """
     from scripts.verify_workflow_release import (
         V182_OPENCODE_AUTO_REVIEW_SHA256,
@@ -141,6 +175,7 @@ def restore_pre_v185_opencode_abandoned_check_cleanup(repo: Path) -> None:
         VerifiedCommitTree,
     )
 
+    restore_pre_v186_review_outcome_annotation(repo)
     expected = dict(zip(PRE_V185_FILES, (
         V182_OPENCODE_AUTO_REVIEW_SHA256, V182_OPENCODE_RECOVERY_EVIDENCE_SHA256,
     )))
@@ -163,18 +198,24 @@ GEMINI_REVIEW_WORKFLOW = ".github/workflows/gemini-auto-review.yml"
 def restore_pre_v184_gemini_fallback_quota_reason(repo: Path) -> None:
     """Restore the authenticated v1.83 Gemini review workflow over copied current bytes.
 
-    Restore only a current file, so older restore chains that already replaced
-    it, and deliberately mutated test bytes, survive.
+    Undo v1.86 first, then restore only a file still on exact v1.84 bytes (v1.85
+    left them unchanged), so older restore chains that already replaced it, and
+    deliberately mutated test bytes, survive.
     """
     from scripts.verify_workflow_release import (
         EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256,
+        EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256,
         VerifiedCommitTree,
     )
 
     restore_pre_v185_opencode_abandoned_check_cleanup(repo)
     root = Path(__file__).resolve().parents[1]
     path = repo / GEMINI_REVIEW_WORKFLOW
-    if path.is_file() and path.read_bytes() == (root / GEMINI_REVIEW_WORKFLOW).read_bytes():
+    if (
+        path.is_file()
+        and hashlib.sha256(path.read_bytes()).hexdigest()
+        == EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256
+    ):
         payload = VerifiedCommitTree.open(
             root, V183_GEMINI_FALLBACK_QUOTA_REASON_BOUNDARY_COMMIT
         ).read_file(GEMINI_REVIEW_WORKFLOW)
@@ -192,15 +233,23 @@ CLAUDE_REVIEW_WORKFLOW = ".github/workflows/claude-code-review.yml"
 def restore_pre_v183_claude_caller_pin_diagnostics(repo: Path) -> None:
     """Restore the authenticated v1.82 Claude review workflow over copied current bytes.
 
-    Restore only a current file, so older restore chains that already replaced
+    Undo v1.86 first, then restore only a file still on exact v1.83 bytes (v1.84
+    and v1.85 left them unchanged), so older restore chains that already replaced
     it, and deliberately mutated test bytes, survive.
     """
-    from scripts.verify_workflow_release import V182_CLAUDE_REVIEW_SHA256, VerifiedCommitTree
+    from scripts.verify_workflow_release import (
+        V182_CLAUDE_REVIEW_SHA256,
+        V183_CLAUDE_REVIEW_SHA256,
+        VerifiedCommitTree,
+    )
 
     restore_pre_v184_gemini_fallback_quota_reason(repo)
     root = Path(__file__).resolve().parents[1]
     path = repo / CLAUDE_REVIEW_WORKFLOW
-    if path.is_file() and path.read_bytes() == (root / CLAUDE_REVIEW_WORKFLOW).read_bytes():
+    if (
+        path.is_file()
+        and hashlib.sha256(path.read_bytes()).hexdigest() == V183_CLAUDE_REVIEW_SHA256
+    ):
         payload = VerifiedCommitTree.open(
             root, V182_CALLER_PIN_DIAGNOSTICS_BOUNDARY_COMMIT
         ).read_file(CLAUDE_REVIEW_WORKFLOW)

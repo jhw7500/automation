@@ -70,6 +70,7 @@ from scripts.workflow_release_inventory import (
     release_supports_claude_caller_pin_diagnostics,
     release_supports_gemini_fallback_quota_reason,
     release_supports_opencode_abandoned_check_cleanup,
+    release_supports_review_outcome_annotation,
     release_supports_carryover_none,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
@@ -868,9 +869,13 @@ EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256 = (
     "9c2e725dfc175d70f5961e95ffbcc8bab28643714e92f4e195bab3fb7e74ed50"
 )
 # v1.84 keeps a primary quota_exhausted when the Gemini fallback then fails with a provider-class reason
-# (#222), and names both caller pins when a dispatch claims state_invalid (#209).
+# (#222), and names both caller pins when a dispatch claims state_invalid (#209). v1.84 and v1.85.
 EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256 = (
     "aa74613974030ae753c08852abf56c91f731b6fe6c229cbc4a321636b9894ff7"
+)
+# v1.86 emits one fixed-format review-outcome notice per run (#187).
+EXPECTED_GEMINI_REVIEW_OUTCOME_SHA256 = (
+    "17cd9d49cbea83745604904a96afc03e473b8b53dc92d3eb7e16229801686ce5"
 )
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V176 = "3e8decf2bf21d007d40c0dc011b173ed0af6b2e15ae8827ae51f6986e90b813f"
 EXPECTED_REVIEW_INVOCATION_BUDGET_HELPER_SHA256_V177 = "5b53efd67b4728e01ddbd029c13dd039d93cc0c94b86bccb4e1fc1a4486c6cda"
@@ -1511,6 +1516,10 @@ REVIEW_PUBLICATION_CONTRACTS = {
         ),
         "upsert_sha256_v147": (
             "62f29ebd7ca5fe47f4449cfa43a03ebb5a04e6b051a170b2221a670986c04ea8"
+        ),
+        # v1.86 exposes attempt_status/attempt_reason for the review-outcome notice.
+        "upsert_sha256_v186": (
+            "18ac69ded8ed1f4d51a34478fef9435a1b143fc2f5499c5446385a3c18f28d22"
         ),
         "bot_login": "${{ steps.auth.outputs.bot-login }}",
         "auth_mode": "${{ inputs.repo_write_auth }}",
@@ -6296,6 +6305,11 @@ def _verify_review_invocation_budget(
             ):
                 expected = V182_CLAUDE_REVIEW_SHA256
             elif (
+                relative == ".github/workflows/claude-code-review.yml"
+                and not release_supports_review_outcome_annotation(ref)
+            ):
+                expected = V183_CLAUDE_REVIEW_SHA256
+            elif (
                 relative == ".github/workflows/opencode-auto-review.yml"
                 and not release_supports_opencode_provider_error_preservation(ref)
             ):
@@ -6319,7 +6333,9 @@ def _verify_review_invocation_budget(
                 raise ReleaseVerificationError("invocation-budget authenticated source digest differs")
         require_budget_workflow_contract(tree, "gemini-auto-review.yml", "gemini", review_policy=True)
         expected_gemini = (
-            EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256
+            EXPECTED_GEMINI_REVIEW_OUTCOME_SHA256
+            if release_supports_review_outcome_annotation(ref)
+            else EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256
             if release_supports_gemini_fallback_quota_reason(ref)
             else EXPECTED_FILTERED_CANDIDATE_PRESERVATION_GEMINI_SHA256
             if release_supports_filtered_candidate_preservation(ref)
@@ -7155,6 +7171,9 @@ def _verify_review_publication_contracts(
                     "upsert_sha256_v175"
                     if contract["reviewer"] == "claude"
                     and release_supports_claude_workflow_validation(ref) else
+                    "upsert_sha256_v186"
+                    if contract["reviewer"] == "gemini"
+                    and release_supports_review_outcome_annotation(ref) else
                     "upsert_sha256_v147" if budget else "upsert_sha256"
                 ]
             ):
@@ -7726,7 +7745,7 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
 
 
 # Reviewed fallback inputs, never calculated from the candidate at verification time.
-# The current seals require the v1.85 OpenCode abandoned-check cleanup. Separate
+# The current seals require the v1.86 review-outcome annotation. Separate
 # historical router and review seals preserve exact immutable releases. Parsed
 # seals retain all existing policy statements, and raw seals additionally
 # authenticate exact bytes.
@@ -7737,7 +7756,7 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
-    ".github/workflows/claude-code-review.yml": "6d9dca1e1e6c2fd8c9b862bf00a44631ecf71766d3f0758898878204cf87ef01",
+    ".github/workflows/claude-code-review.yml": "ad4f40a6e04e988a0c7e948be4c9d81704225dee995ca5b5ee31ba11c2f67357",
     ".github/workflows/opencode-auto-review.yml": "16b5c5f0b010467b26ecbc44406001a9a76a4f666ca939362fe484b284aaf13b",
     ".github/actions/recover-opencode-review/evidence.py": "603d90d4d110fd6e98b9fb2c2904a8d67d209d2477e130b5eb750fcdaa3c333f",
     ".github/actions/recover-opencode-review/replay.js": "128889cd11729b034e9b26d3577a03adb8bb647148d0eeceb66550e2005ff564",
@@ -7750,7 +7769,7 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
-    ".github/workflows/claude-code-review.yml": "afdac4a6c166997a41ca670ecc9c3b452dad1474fe7c46ed6843650d4539073b",
+    ".github/workflows/claude-code-review.yml": "2ab2a37c6c074cea927086b8c50953b6c8ed6eebfdaeb58f85b347479389a2e2",
     ".github/workflows/opencode-auto-review.yml": "11eb152d61b5992cc4320a4a271f5512f99c2e98a1aad9e62419b13590606a8f",
     ".github/actions/recover-opencode-review/evidence.py": "7f20958e4ddecfe2311a8d72c48e2021a83b3a94b64cf494ef78a53844a087ff",
 }
@@ -7779,6 +7798,13 @@ V182_CLAUDE_REVIEW_SHA256 = (
 )
 V182_CLAUDE_REVIEW_PARSED_SHA256 = (
     "4197edd1965b88b5a3ca2251bb854160a9d3ff726e22fcba64fbb3dd4aeab7ca"
+)
+# v1.83 through v1.85 Claude review bytes, before the v1.86 review-outcome annotation.
+V183_CLAUDE_REVIEW_SHA256 = (
+    "6d9dca1e1e6c2fd8c9b862bf00a44631ecf71766d3f0758898878204cf87ef01"
+)
+V183_CLAUDE_REVIEW_PARSED_SHA256 = (
+    "afdac4a6c166997a41ca670ecc9c3b452dad1474fe7c46ed6843650d4539073b"
 )
 V179_OPENCODE_AUTO_REVIEW_SHA256 = (
     "ca6cbf2b1f1c9c57f524c45d4de0c863ac2bb249d0e261bbcf1da7e2017c5ea1"
@@ -7890,6 +7916,11 @@ def _fallback_parsed_seal(relative: str, value: object, ref: str = "v1.78.1") ->
         and not release_supports_claude_caller_pin_diagnostics(ref)
     ):
         expected = V182_CLAUDE_REVIEW_PARSED_SHA256
+    elif (
+        relative == ".github/workflows/claude-code-review.yml"
+        and not release_supports_review_outcome_annotation(ref)
+    ):
+        expected = V183_CLAUDE_REVIEW_PARSED_SHA256
     elif (
         relative == ".github/workflows/opencode-auto-review.yml"
         and not release_supports_opencode_provider_error_preservation(ref)
@@ -8196,6 +8227,11 @@ def verify_claude_rollout_fallback_contract(
                 and not release_supports_claude_caller_pin_diagnostics(ref)
             ):
                 expected = V182_CLAUDE_REVIEW_SHA256
+            elif (
+                relative == ".github/workflows/claude-code-review.yml"
+                and not release_supports_review_outcome_annotation(ref)
+            ):
+                expected = V183_CLAUDE_REVIEW_SHA256
             elif (
                 relative == ".github/workflows/opencode-auto-review.yml"
                 and not release_supports_opencode_provider_error_preservation(ref)

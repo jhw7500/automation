@@ -1605,6 +1605,12 @@ jobs:
           script: |
             const fs = require('fs');
             core.setOutput('published', 'false');
+            // Read only by "Report review outcome" (#187); sticky and state bytes do not use them.
+            const recordAttempt = (status, reason) => {
+              core.setOutput('attempt_status', status);
+              core.setOutput('attempt_reason', reason);
+            };
+            recordAttempt('unpublished', 'publication_failed');
             // 'Get PR details' 스텝의 canonical collection prefix와 반드시 동일하게 유지.
             const header = '## 🔎 Gemini Code Review';
             const marker = '<!-- automation:gemini-auto-review:v3 -->';
@@ -1833,6 +1839,7 @@ jobs:
             }
             if (provenanceLookupUncertain) {
               core.notice('Gemini review state provenance lookup is uncertain; left existing sticky state unchanged.');
+              recordAttempt('unpublished', 'state_provenance_uncertain');
               return;
             }
             const exactDisplayTarget = (displayMarker) => [...comments].reverse().find((comment) => {
@@ -1846,16 +1853,19 @@ jobs:
             if (!runIdIsValid || !runAttemptIsValid || !sha1(attemptHead) || !serverUrl || !repository || !botLogin || !actionsToken
               || !['github_app', 'github_token'].includes(authMode) || !publisherAppIdIsValid) {
               core.notice('Gemini review trusted attempt identity is invalid; left the existing sticky state unchanged.');
+              recordAttempt('unpublished', 'attempt_identity_invalid');
               return;
             }
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: issueNumber });
             if (pr.head?.sha !== attemptHead) {
               core.notice(`Discarding stale Gemini review for ${attemptHead}; current head is ${pr.head?.sha || 'unknown'}`);
+              recordAttempt('discarded', 'stale_head');
               return;
             }
             if (existing && (existing.state.run_id > runId
               || (existing.state.run_id === runId && existing.state.run_attempt >= runAttempt))) {
               core.notice(`Discarding stale Gemini generation (${runId}, ${runAttempt}); state is already at (${existing.state.run_id}, ${existing.state.run_attempt}).`);
+              recordAttempt('discarded', 'stale_generation');
               return;
             }
 
@@ -1936,6 +1946,7 @@ jobs:
             const preserveSuccess = checkpointFailed && existing
               && sha1(existing.state.successful_head) && preservedProse.length > 0;
             const state = buildState(checkpointFailed, preserveSuccess);
+            recordAttempt(checkpointFailed ? 'failure' : 'success', checkpointFailed ? failureReason : '');
             const content = checkpointFailed
               ? (preserveSuccess ? preservedProse
                 : `### Error\n\nReason: ${failureReason}\n\nGemini review did not produce a valid covered review. (See run logs: ${runUrl})${candidatePointer}`)
@@ -2087,6 +2098,69 @@ jobs:
           echo "::error::Gemini review has no authenticated checkpoint for this attempt ($BUDGET_DECISION)"
           exit 1
 
+      # One fixed-format review-outcome notice per run (#187); docs/workflows/contracts.md
+      # "Review outcome annotation". Inputs arrive only through env and are validated before
+      # printing. The step never fails, so the job conclusion is unchanged. The failure reason
+      # is the upsert's own failureReason, the same value its setFailed message names.
+      - name: Report review outcome
+        if: ${{ always() }}
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          HEAD_SHA: ${{ steps.prepare-diff.outputs.head-sha || needs.check-enabled.outputs.policy_head }}
+          CONTEXT_OUTCOME: ${{ steps.pr-details.outcome }}
+          DECISION: ${{ steps.review-budget-claim.outputs.decision }}
+          ATTEMPT_STATUS: ${{ steps.upsert-review-comment.outputs.attempt_status }}
+          ATTEMPT_REASON: ${{ steps.upsert-review-comment.outputs.attempt_reason }}
+          PUBLISHED: ${{ steps.upsert-review-comment.outputs.published }}
+          BUDGET_OUTCOME: ${{ steps.review-budget-outcome.outputs.outcome }}
+        run: |
+          set +e
+          if [[ "$JOB_STATUS" == 'cancelled' ]]; then
+            outcome='cancelled'; reason='cancelled'
+          elif [[ "$CONTEXT_OUTCOME" == 'failure' ]]; then
+            outcome='failed'; reason='review_context_unavailable'
+          else
+            case "$DECISION" in
+              duplicate_head|duplicate_effective_diff|round_budget_exhausted|input_budget_exhausted|total_usage_budget_exhausted)
+                outcome='refused'; reason="$DECISION" ;;
+              authenticated_reuse)
+                if [[ -z "$ATTEMPT_STATUS" || ( "$ATTEMPT_STATUS" == 'success' && "$PUBLISHED" == 'true' ) ]]; then
+                  outcome='reused'; reason='authenticated_reuse'
+                elif [[ "$ATTEMPT_STATUS" == 'success' ]]; then
+                  outcome='failed'; reason='publication_failed'
+                else
+                  outcome='failed'; reason="$ATTEMPT_REASON"
+                fi ;;
+              claimed)
+                if [[ "$ATTEMPT_STATUS" == 'success' && "$PUBLISHED" == 'true' ]]; then
+                  case "$BUDGET_OUTCOME" in
+                    success|quality_filtered) outcome='performed'; reason="$BUDGET_OUTCOME" ;;
+                    '') outcome='failed'; reason='checkpoint_failure' ;;
+                    *) outcome='failed'; reason="$BUDGET_OUTCOME" ;;
+                  esac
+                elif [[ "$ATTEMPT_STATUS" == 'success' ]]; then
+                  outcome='failed'; reason='publication_failed'
+                elif [[ -n "$ATTEMPT_STATUS" ]]; then
+                  outcome='failed'; reason="$ATTEMPT_REASON"
+                else
+                  outcome='failed'; reason='checkpoint_failure'
+                fi ;;
+              '') outcome='failed'; reason='budget_unavailable' ;;
+              *) outcome='failed'; reason="$DECISION" ;;
+            esac
+          fi
+          if [[ ! "$outcome" =~ ^[a-z_]{1,64}$ ]]; then outcome='invalid'; fi
+          if [[ ! "$reason" =~ ^[a-z_]{1,64}$ ]]; then reason='invalid'; fi
+          head="$HEAD_SHA"
+          if [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then head='unknown'; fi
+          pr="$PR_NUMBER"
+          if [[ ! "$pr" =~ ^[1-9][0-9]{0,9}$ ]]; then pr='unknown'; fi
+          printf '::notice title=review-outcome::reviewer=%s outcome=%s reason=%s head=%s pr=%s\n' \
+            'gemini' "$outcome" "$reason" "$head" "$pr"
+          exit 0
+
   skipped:
     permissions: {}
     name: Workflow Skipped
@@ -2127,3 +2201,26 @@ jobs:
             printf '## Workflow Skipped\n'
             printf 'Gemini Auto PR Review did not run because %s.\n' "$detail"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The fixed-format review-outcome notice for a policy skip (#187). It reads only the
+      # check-enabled outputs above and never fails.
+      - name: Report review outcome
+        if: ${{ always() }}
+        shell: bash
+        env:
+          WORKFLOW_ENABLED: ${{ needs.check-enabled.outputs.enabled }}
+          POLICY_REASON: ${{ needs.check-enabled.outputs.policy_reason }}
+          HEAD_SHA: ${{ needs.check-enabled.outputs.policy_head }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        run: |
+          set +e
+          reason="$POLICY_REASON"
+          if [[ "$WORKFLOW_ENABLED" != 'true' ]]; then reason='workflow_disabled'; fi
+          if [[ ! "$reason" =~ ^[a-z_]{1,64}$ ]]; then reason='invalid'; fi
+          head="$HEAD_SHA"
+          if [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then head='unknown'; fi
+          pr="$PR_NUMBER"
+          if [[ ! "$pr" =~ ^[1-9][0-9]{0,9}$ ]]; then pr='unknown'; fi
+          printf '::notice title=review-outcome::reviewer=%s outcome=%s reason=%s head=%s pr=%s\n' \
+            'gemini' 'skipped' "$reason" "$head" "$pr"
+          exit 0

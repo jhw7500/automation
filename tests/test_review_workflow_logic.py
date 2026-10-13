@@ -20363,6 +20363,294 @@ def test_skipped_notice_takes_the_reason_through_env_and_rejects_stray_text(
 
 
 # ---------------------------------------------------------------------------
+# review outcome annotation: one fixed-format notice per run (#187)
+# ---------------------------------------------------------------------------
+
+REVIEW_OUTCOME_STEP = "Report review outcome"
+REVIEW_OUTCOME_JOBS = {
+    "claude-code-review.yml": ("claude", "claude-review"),
+    "gemini-auto-review.yml": ("gemini", "gemini-review"),
+}
+REVIEW_OUTCOME_HEAD = "35" * 20
+REVIEW_OUTCOME_LINE = re.compile(
+    r"::notice title=review-outcome::reviewer=(claude|gemini) outcome=([a-z_]{1,64}) "
+    r"reason=([a-z_]{1,64}) head=([0-9a-f]{40}|unknown) pr=([1-9][0-9]{0,9}|unknown)"
+)
+
+
+def _run_review_outcome(workflow_name: str, job: str, env: dict[str, str]) -> tuple[str, ...]:
+    """Run the step as `shell: bash` does and return the fields of its one notice line."""
+    step = _step(_load(workflow_name), job, REVIEW_OUTCOME_STEP)
+    assert set(env) <= set(step["env"]), sorted(set(env) - set(step["env"]))
+    values = {key: "" for key in step["env"]}
+    values.update({"HEAD_SHA": REVIEW_OUTCOME_HEAD, "PR_NUMBER": "95"})
+    values.update({"JOB_STATUS": "success"} if "JOB_STATUS" in step["env"] else {})
+    values.update({"WORKFLOW_ENABLED": "true"} if "WORKFLOW_ENABLED" in step["env"] else {})
+    values.update(env)
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
+        env={"PATH": os.environ["PATH"], "LANG": "C.UTF-8", **values},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    lines = result.stdout.split("\n")
+    assert lines[-1] == "" and len(lines) == 2, result.stdout
+    match = REVIEW_OUTCOME_LINE.fullmatch(lines[0])
+    assert match, lines[0]
+    assert match.group(1) == REVIEW_OUTCOME_JOBS[workflow_name][0]
+    return match.groups()[1:]
+
+
+_CLAIMED_SUCCESS = {
+    "DECISION": "claimed", "ATTEMPT_STATUS": "success", "ATTEMPT_REASON": "", "PUBLISHED": "true",
+}
+REVIEW_OUTCOME_COMMON_ROWS = (
+    # The #187 reproduction: Claude's job succeeds and its upsert is skipped.
+    ({"DECISION": "round_budget_exhausted"}, ("refused", "round_budget_exhausted")),
+    # Gemini's enforce step fails the job; the outcome is still read from the decision.
+    ({"JOB_STATUS": "failure", "DECISION": "round_budget_exhausted"}, ("refused", "round_budget_exhausted")),
+    ({"DECISION": "duplicate_head"}, ("refused", "duplicate_head")),
+    ({"DECISION": "duplicate_effective_diff"}, ("refused", "duplicate_effective_diff")),
+    ({"DECISION": "input_budget_exhausted"}, ("refused", "input_budget_exhausted")),
+    ({"DECISION": "total_usage_budget_exhausted"}, ("refused", "total_usage_budget_exhausted")),
+    ({"JOB_STATUS": "cancelled", **_CLAIMED_SUCCESS, "BUDGET_OUTCOME": "success"}, ("cancelled", "cancelled")),
+    ({"JOB_STATUS": "cancelled", "DECISION": "round_budget_exhausted"}, ("cancelled", "cancelled")),
+    ({"DECISION": "authenticated_reuse"}, ("reused", "authenticated_reuse")),
+    ({**_CLAIMED_SUCCESS, "DECISION": "authenticated_reuse"}, ("reused", "authenticated_reuse")),
+    ({**_CLAIMED_SUCCESS, "DECISION": "authenticated_reuse", "PUBLISHED": "false"}, ("failed", "publication_failed")),
+    ({"DECISION": "authenticated_reuse", "ATTEMPT_STATUS": "failure", "ATTEMPT_REASON": "provider_failure",
+      "PUBLISHED": "true"}, ("failed", "provider_failure")),
+    ({"DECISION": "authenticated_reuse", "ATTEMPT_STATUS": "discarded", "ATTEMPT_REASON": "stale_head"},
+     ("failed", "stale_head")),
+    ({**_CLAIMED_SUCCESS, "BUDGET_OUTCOME": "success"}, ("performed", "success")),
+    ({**_CLAIMED_SUCCESS, "BUDGET_OUTCOME": "quality_filtered"}, ("performed", "quality_filtered")),
+    ({**_CLAIMED_SUCCESS, "BUDGET_OUTCOME": "wall_time_exhausted"}, ("failed", "wall_time_exhausted")),
+    ({**_CLAIMED_SUCCESS}, ("failed", "checkpoint_failure")),
+    ({**_CLAIMED_SUCCESS, "PUBLISHED": "false", "BUDGET_OUTCOME": "checkpoint_failure"},
+     ("failed", "publication_failed")),
+    ({"DECISION": "claimed", "ATTEMPT_STATUS": "failure", "ATTEMPT_REASON": "candidate_oversize",
+      "PUBLISHED": "false", "BUDGET_OUTCOME": "success"}, ("failed", "candidate_oversize")),
+    ({"DECISION": "claimed", "ATTEMPT_STATUS": "discarded", "ATTEMPT_REASON": "stale_head",
+      "BUDGET_OUTCOME": "checkpoint_failure"}, ("failed", "stale_head")),
+    ({"DECISION": "claimed", "ATTEMPT_STATUS": "discarded", "ATTEMPT_REASON": "stale_generation"},
+     ("failed", "stale_generation")),
+    ({"DECISION": "claimed", "ATTEMPT_STATUS": "unpublished", "ATTEMPT_REASON": "state_provenance_uncertain"},
+     ("failed", "state_provenance_uncertain")),
+    ({"DECISION": "claimed", "ATTEMPT_STATUS": "unpublished", "ATTEMPT_REASON": "publication_failed"},
+     ("failed", "publication_failed")),
+    ({"DECISION": "claimed"}, ("failed", "checkpoint_failure")),
+    ({"DECISION": "state_invalid"}, ("failed", "state_invalid")),
+    ({"DECISION": "diff_unavailable", "ATTEMPT_STATUS": "failure", "ATTEMPT_REASON": "diff_unavailable"},
+     ("failed", "diff_unavailable")),
+    ({}, ("failed", "budget_unavailable")),
+    ({"CONTEXT_OUTCOME": "failure"}, ("failed", "review_context_unavailable")),
+)
+REVIEW_OUTCOME_CLAUDE_ROWS = (
+    ({"FALLBACK_ADMISSION_REASON": "fallback_admission_mismatch", "FALLBACK_MODE_OUTCOME": "success",
+      "FALLBACK_ADMISSION_OUTCOME": "success", "CONTEXT_OUTCOME": "skipped"},
+     ("failed", "fallback_admission_mismatch")),
+    ({"FALLBACK_MODE_OUTCOME": "failure", "CONTEXT_OUTCOME": "skipped"}, ("failed", "fallback_inputs_partial")),
+    ({"FALLBACK_MODE_OUTCOME": "success", "FALLBACK_ADMISSION_OUTCOME": "failure",
+      "CONTEXT_OUTCOME": "skipped"}, ("failed", "fallback_admission_mismatch")),
+    ({"CONTEXT_OUTCOME": "success", "VALIDATION_REASON": "workflow_validation_mismatch",
+      "ATTEMPT_STATUS": "failure", "ATTEMPT_REASON": "workflow_validation_mismatch", "PUBLISHED": "true"},
+     ("failed", "workflow_validation_mismatch")),
+    ({"CONTEXT_OUTCOME": "success", "VALIDATION_REASON": "workflow_validation_unavailable"},
+     ("failed", "workflow_validation_unavailable")),
+    ({"JOB_STATUS": "cancelled", "FALLBACK_ADMISSION_REASON": "fallback_admission_mismatch"},
+     ("cancelled", "cancelled")),
+    # The provider execution reason precedes whatever the upsert later did.
+    ({"DECISION": "claimed", "EXECUTION_FAILURE_REASON": "provider_failure", "ATTEMPT_STATUS": "discarded",
+      "ATTEMPT_REASON": "stale_head"}, ("failed", "provider_failure")),
+    ({"DECISION": "claimed", "EXECUTION_FAILURE_REASON": "provider_not_executed", "ATTEMPT_STATUS": "failure",
+      "ATTEMPT_REASON": "provider_not_executed", "PUBLISHED": "true"}, ("failed", "provider_not_executed")),
+)
+REVIEW_OUTCOME_GEMINI_ROWS = (
+    # #222: the upsert's failureReason is the canonical Gemini reason, preserved success or not.
+    ({"DECISION": "claimed", "ATTEMPT_STATUS": "failure", "ATTEMPT_REASON": "quota_exhausted",
+      "PUBLISHED": "true", "BUDGET_OUTCOME": "provider_failure"}, ("failed", "quota_exhausted")),
+    ({"DECISION": "claimed", "ATTEMPT_STATUS": "failure", "ATTEMPT_REASON": "coverage_truncated",
+      "PUBLISHED": "true"}, ("failed", "coverage_truncated")),
+)
+
+
+@pytest.mark.parametrize(
+    ("workflow_name", "env", "expected"),
+    [
+        *[(name, env, expected) for name in REVIEW_OUTCOME_JOBS
+          for env, expected in REVIEW_OUTCOME_COMMON_ROWS],
+        *[("claude-code-review.yml", env, expected) for env, expected in REVIEW_OUTCOME_CLAUDE_ROWS],
+        *[("gemini-auto-review.yml", env, expected) for env, expected in REVIEW_OUTCOME_GEMINI_ROWS],
+    ],
+)
+def test_review_outcome_maps_each_run_to_one_outcome_and_reason(workflow_name, env, expected):
+    job = REVIEW_OUTCOME_JOBS[workflow_name][1]
+    outcome, reason, head, pr = _run_review_outcome(workflow_name, job, env)
+    assert (outcome, reason) == expected
+    assert (head, pr) == (REVIEW_OUTCOME_HEAD, "95")
+
+
+@pytest.mark.parametrize("workflow_name", REVIEW_OUTCOME_JOBS)
+@pytest.mark.parametrize(
+    ("enabled", "reason", "expected"),
+    [
+        ("true", "default_auto_false", "default_auto_false"),
+        ("true", "review_mode_label_mismatch", "review_mode_label_mismatch"),
+        ("true", "unsafe_pr", "unsafe_pr"),
+        ("false", "workflow_disabled", "workflow_disabled"),
+        ("false", "", "workflow_disabled"),
+        ("true", "", "invalid"),
+    ],
+)
+def test_review_outcome_reports_a_policy_skip_from_the_skipped_job(
+    workflow_name, enabled, reason, expected
+):
+    outcome, reported, head, pr = _run_review_outcome(
+        workflow_name, "skipped", {"WORKFLOW_ENABLED": enabled, "POLICY_REASON": reason}
+    )
+    assert (outcome, reported, head, pr) == ("skipped", expected, REVIEW_OUTCOME_HEAD, "95")
+
+
+GARBAGE = "x\n::error::forged"
+
+
+@pytest.mark.parametrize("workflow_name", REVIEW_OUTCOME_JOBS)
+@pytest.mark.parametrize("job_kind", ("review", "skipped"))
+def test_review_outcome_prints_one_validated_line_for_any_input(workflow_name, job_kind, tmp_path):
+    job = REVIEW_OUTCOME_JOBS[workflow_name][1] if job_kind == "review" else "skipped"
+    step = _step(_load(workflow_name), job, REVIEW_OUTCOME_STEP)
+    hostile = {key: GARBAGE for key in step["env"]}
+    # A garbage WORKFLOW_ENABLED is not 'true', so the skipped job names the config.
+    expected = ("failed", "invalid") if job_kind == "review" else ("skipped", "workflow_disabled")
+    assert _run_review_outcome(workflow_name, job, hostile) == (*expected, "unknown", "unknown")
+    if job_kind == "skipped":
+        assert _run_review_outcome(workflow_name, job, {**hostile, "WORKFLOW_ENABLED": "true"}) == (
+            "skipped", "invalid", "unknown", "unknown",
+        )
+
+    name = "DECISION" if job_kind == "review" else "POLICY_REASON"
+    for value in ("ROUND_BUDGET_EXHAUSTED", "a" * 65, "%n%s", "round budget", f"$(touch {tmp_path}/x)"):
+        _, reason, head, pr = _run_review_outcome(
+            workflow_name, job, {name: value, "HEAD_SHA": "AB" * 20, "PR_NUMBER": "095"}
+        )
+        assert (reason, head, pr) == ("invalid", "unknown", "unknown"), value
+    assert not (tmp_path / "x").exists()
+    _, reason, _, pr = _run_review_outcome(workflow_name, job, {name: "a" * 64, "PR_NUMBER": "9" * 10})
+    assert (reason, pr) == ("a" * 64, "9" * 10)
+
+
+@pytest.mark.parametrize("workflow_name", REVIEW_OUTCOME_JOBS)
+@pytest.mark.parametrize("job_kind", ("review", "skipped"))
+def test_review_outcome_step_is_last_always_env_only_and_never_fails(workflow_name, job_kind):
+    workflow = _load(workflow_name)
+    job = REVIEW_OUTCOME_JOBS[workflow_name][1] if job_kind == "review" else "skipped"
+    steps = workflow["jobs"][job]["steps"]
+    step = steps[-1]
+    assert [s.get("name") for s in steps].count(REVIEW_OUTCOME_STEP) == 1
+    assert step["name"] == REVIEW_OUTCOME_STEP
+    assert step["if"] == "${{ always() }}"
+    assert step["shell"] == "bash"
+    assert "id" not in step and "uses" not in step and "continue-on-error" not in step
+    run = step["run"]
+    assert "${{" not in run
+    assert run.startswith("set +e\n") and run.rstrip("\n").endswith("exit 0")
+    assert "set -e" not in run and "exit 1" not in run
+    assert "::error" not in run and "::warning" not in run
+    assert run.count("::notice title=review-outcome::") == 1
+    for value in step["env"].values():
+        assert value.startswith("${{ ") and value.endswith(" }}"), value
+    if job_kind == "skipped":
+        assert set(step["env"]) == {"WORKFLOW_ENABLED", "POLICY_REASON", "HEAD_SHA", "PR_NUMBER"}
+        assert step["env"]["HEAD_SHA"] == "${{ needs.check-enabled.outputs.policy_head }}"
+        assert workflow["jobs"]["skipped"]["permissions"] == {}
+        assert [s.get("name") for s in steps] == ["Notice", REVIEW_OUTCOME_STEP]
+    else:
+        assert step["env"]["JOB_STATUS"] == "${{ job.status }}"
+        assert step["env"]["DECISION"] == "${{ steps.review-budget-claim.outputs.decision }}"
+        assert step["env"]["ATTEMPT_STATUS"] == (
+            "${{ steps.upsert-review-comment.outputs.attempt_status }}"
+        )
+    if workflow_name == "gemini-auto-review.yml" and job_kind == "review":
+        names = [s.get("name") for s in steps]
+        assert names.index("Enforce authenticated review budget decision") == len(names) - 2
+
+
+def _upsert_outputs(calls: list) -> dict[str, str]:
+    return {call[1]: call[2] for call in calls if call[0] == "output"}
+
+
+@node_required
+@pytest.mark.parametrize("reviewer", ("claude", "gemini"))
+def test_upsert_reports_a_stale_head_discard_to_the_outcome_step(tmp_path, reviewer):
+    upsert = _claude_upsert if reviewer == "claude" else _gemini_upsert
+    calls = upsert(tmp_path, "success", [], with_review=True, attempt_head="ab" * 20, current_head="cd" * 20)
+    assert not any(call[0] in {"create", "update"} for call in calls)
+    outputs = _upsert_outputs(calls)
+    assert (outputs["attempt_status"], outputs["attempt_reason"], outputs["published"]) == (
+        "discarded", "stale_head", "false",
+    )
+
+
+@node_required
+@pytest.mark.parametrize("reviewer", ("claude", "gemini"))
+def test_upsert_reports_a_stale_generation_discard_to_the_outcome_step(tmp_path, reviewer):
+    head = "cd" * 20
+    header, marker = (CLAUDE_HEADER, CLAUDE_V2_MARKER) if reviewer == "claude" else (GEMINI_HEADER, GEMINI_V2_MARKER)
+    newer = _bot("github-actions[bot]", _v2_body(header, marker, _state_line(reviewer, 7, 43, head), "NEWER"), 11)
+    upsert = _claude_upsert if reviewer == "claude" else _gemini_upsert
+    calls = upsert(tmp_path, "success", [newer], with_review=True, run_id="42", attempt_head=head, current_head=head)
+    assert not any(call[0] in {"create", "update"} for call in calls)
+    outputs = _upsert_outputs(calls)
+    assert (outputs["attempt_status"], outputs["attempt_reason"]) == ("discarded", "stale_generation")
+
+
+@node_required
+@pytest.mark.parametrize("reviewer", ("claude", "gemini"))
+def test_upsert_reports_a_published_success_to_the_outcome_step(tmp_path, reviewer):
+    upsert = _claude_upsert if reviewer == "claude" else _gemini_upsert
+    calls = upsert(tmp_path, "success", [], with_review=True)
+    assert _posted_state(_single_mutation_body(calls))["attempt_status"] == "success"
+    outputs = _upsert_outputs(calls)
+    assert (outputs["attempt_status"], outputs["attempt_reason"], outputs["published"]) == (
+        "success", "", "true",
+    )
+
+
+@node_required
+def test_claude_upsert_reports_the_published_failure_reason(tmp_path):
+    calls = _claude_upsert(tmp_path, "failure", [], with_review=False)
+    state = _posted_state(_single_mutation_body(calls))
+    outputs = _upsert_outputs(calls)
+    assert state["failure_reason"] == "provider_failure"
+    assert (outputs["attempt_status"], outputs["attempt_reason"], outputs["published"]) == (
+        "failure", "provider_failure", "true",
+    )
+
+
+@node_required
+def test_gemini_reason_reaches_the_outcome_step_when_success_is_preserved(tmp_path):
+    # #222: a failure that keeps the earlier success shows `Status: stale` and no reason in
+    # the sticky; the outcome step gets the same reason the setFailed message names.
+    old_body = _v2_body(GEMINI_HEADER, GEMINI_V2_MARKER, _state_line("gemini", 7, 1, "ab" * 20), "LAST GOOD")
+    calls = _gemini_upsert(
+        tmp_path, "failure", [_bot("github-actions[bot]", old_body, 11)],
+        with_review=False, failure_reason="quota_exhausted",
+    )
+    body = _single_mutation_body(calls)
+    assert "- Status: stale" in body and "quota_exhausted" not in body
+    assert [call for call in calls if call[0] == "failed"] == [
+        ["failed", "Gemini review checkpoint failed: quota_exhausted"]
+    ]
+    outputs = _upsert_outputs(calls)
+    assert (outputs["attempt_status"], outputs["attempt_reason"], outputs["published"]) == (
+        "failure", "quota_exhausted", "true",
+    )
+
+
+# ---------------------------------------------------------------------------
 # dispatch review diff: the manual /review path must see the change (#133)
 # ---------------------------------------------------------------------------
 

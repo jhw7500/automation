@@ -485,6 +485,24 @@ def test_exact_chain_emits_effective_clean_receipt(verifier, exact_evidence):
     assert receipt["effective_status"] == "CLEAN"
 
 
+def test_exact_chain_accepts_the_review_outcome_notice_and_step(verifier, exact_evidence):
+    # v1.86 adds a notice-level review-outcome annotation and a final always() step to
+    # both runs (#187). Only failure-level annotations are counted.
+    f = exact_evidence
+    f.provider.annotations = [
+        *f.provider.annotations,
+        {"annotation_level": "notice", "title": "review-outcome",
+         "message": f"reviewer=claude outcome=failed reason=workflow_validation_mismatch "
+                    f"head={f.request.expected_head} pr={f.request.pr}"},
+    ]
+    for job in (f.job, f.fallback_job):
+        job["steps"].append({"number": len(job["steps"]) + 1, "name": "Report review outcome",
+                             "status": "completed", "conclusion": "success"})
+    receipt = verifier.verify(f.request, f.provider)
+    assert receipt["automatic"]["reason"] == "workflow_validation_mismatch"
+    assert receipt["effective_status"] == "CLEAN"
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["missing_document", "wrong_execution", "wrong_reviewed", "active_high_zero_count"],
