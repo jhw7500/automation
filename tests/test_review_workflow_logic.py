@@ -17339,6 +17339,19 @@ def test_opencode_check_cleanup_lists_again_when_a_failed_canonicalizer_left_not
 
 
 @node_required
+def test_opencode_check_cleanup_keeps_listing_until_the_current_attempt_reservation_appears(tmp_path):
+    earlier = _opencode_pending_check(1002, "77", "1")
+    current = _opencode_pending_check(1001, "77", "2")
+
+    calls = _run_opencode_check_cleanup(
+        tmp_path, [earlier, current], responses=[[earlier], [earlier, current], [earlier, current]],
+    )
+
+    assert len([call for call in calls if call[0] == "paginate-checks"]) == 2
+    assert sorted(call[1]["check_run_id"] for call in calls if call[0] == "update-check") == [1001, 1002]
+
+
+@node_required
 def test_opencode_check_cleanup_lists_once_after_a_successful_canonicalizer(tmp_path):
     late = _opencode_pending_check(1001, "77", "2")
 

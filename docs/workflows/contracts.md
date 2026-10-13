@@ -1481,8 +1481,9 @@ canonical review abandoned") every still-incomplete `github-actions` reservation
 from an earlier attempt, or from the current attempt when the canonicalizer did not succeed. Because
 the list can lag behind the canonicalizer's own completion, it re-reads each candidate by ID just
 before closing it and skips any the read no longer shows as an open reservation. When the
-canonicalizer did not succeed it lists the Checks up to three times, because a Check stored behind a
-failed create may surface late. List, read and update errors are warnings and never change the job
+canonicalizer did not succeed it lists the Checks up to three times, keeping every candidate found,
+until the current attempt's reservation appears, because a Check stored behind a failed create may
+surface late. List, read and update errors are warnings and never change the job
 result; a reservation it cannot close is retried by a later attempt of the same run whose
 canonicalizer runs. A closed reservation keeps the pending ID and carries no attestation, so receipt
 discovery treats it like the canonicalizer's own failure closures. A runner lost mid-step still

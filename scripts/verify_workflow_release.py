@@ -7738,8 +7738,8 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
     ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
     ".github/workflows/claude-code-review.yml": "6d9dca1e1e6c2fd8c9b862bf00a44631ecf71766d3f0758898878204cf87ef01",
-    ".github/workflows/opencode-auto-review.yml": "266af6f3042a60fd348502f28c397bf966b54956a706714850ec932f33cad37a",
-    ".github/actions/recover-opencode-review/evidence.py": "7cb72cb5d3397bc322fe2e97a42b6ea3fb5b1da15c246d14ec56fe91152f4012",
+    ".github/workflows/opencode-auto-review.yml": "16b5c5f0b010467b26ecbc44406001a9a76a4f666ca939362fe484b284aaf13b",
+    ".github/actions/recover-opencode-review/evidence.py": "603d90d4d110fd6e98b9fb2c2904a8d67d209d2477e130b5eb750fcdaa3c333f",
     ".github/actions/recover-opencode-review/replay.js": "128889cd11729b034e9b26d3577a03adb8bb647148d0eeceb66550e2005ff564",
     ".github/actions/recover-opencode-review/receipt.js": "49a10b88745fce3ef3e43d6f4b5a0448b70d5e37b40e358d530a0f99dcd51d82",
 }
@@ -7751,8 +7751,8 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
     ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
     ".github/workflows/claude-code-review.yml": "afdac4a6c166997a41ca670ecc9c3b452dad1474fe7c46ed6843650d4539073b",
-    ".github/workflows/opencode-auto-review.yml": "849bbed2e509428ac7cedfff007ac3a6a16f10ca7126481cab8bbb8547450cce",
-    ".github/actions/recover-opencode-review/evidence.py": "2bbfd19ca2dc6ecf2aad67292e0cc72c160666dbe14aa5a570315056ffa23c31",
+    ".github/workflows/opencode-auto-review.yml": "11eb152d61b5992cc4320a4a271f5512f99c2e98a1aad9e62419b13590606a8f",
+    ".github/actions/recover-opencode-review/evidence.py": "7f20958e4ddecfe2311a8d72c48e2021a83b3a94b64cf494ef78a53844a087ff",
 }
 CLAUDE_FALLBACK_HARDENING_RELEASE = (1, 78, 1)
 CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE = (1, 78, 2)

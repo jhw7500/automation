@@ -5661,23 +5661,25 @@ jobs:
                 && (succeeded ? Number(attempt) < runAttempt : Number(attempt) <= runAttempt);
             };
             // A check stored behind a failed create may surface late, so a step that did not
-            // succeed lists again before concluding that nothing was abandoned.
+            // succeed lists again until this attempt's reservation appears. An earlier attempt's
+            // open reservation does not show that this attempt's has surfaced.
             const passes = succeeded ? 1 : 3;
-            let pending = [];
+            const current = `${prefix}${runAttempt}`;
+            const pending = new Map();
             for (let pass = 1; pass <= passes; pass += 1) {
               try {
                 const checks = await github.paginate(github.rest.checks.listForRef, {
                   owner: context.repo.owner, repo: context.repo.repo, ref: workflowHead,
                   check_name: 'automation/opencode-canonical-review', filter: 'all', per_page: 100,
                 });
-                pending = checks.filter(abandoned);
-                if (pending.length > 0) break;
+                for (const check of checks.filter(abandoned)) pending.set(check.id, check);
+                if ([...pending.values()].some((check) => check.external_id === current)) break;
               } catch (error) {
                 core.warning(`OpenCode canonical checks could not be listed: ${error.message}`);
               }
               if (pass < passes) await new Promise((resolve) => setTimeout(resolve, 3000 * pass));
             }
-            for (const listed of pending) {
+            for (const listed of pending.values()) {
               try {
                 // The list can lag behind the canonicalizer's own completion; close only what a
                 // direct read still shows as an open reservation of this run.
