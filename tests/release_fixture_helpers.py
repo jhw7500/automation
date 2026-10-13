@@ -126,11 +126,13 @@ V185_REVIEW_OUTCOME_BOUNDARY_COMMIT = "b9c46ab8f3218a0e5cdc79715517f071f47979d2"
 PRE_V186_FILES = (
     ".github/workflows/claude-code-review.yml",
     ".github/workflows/gemini-auto-review.yml",
+    ".github/workflows/opencode-auto-review.yml",
+    ".github/actions/recover-opencode-review/evidence.py",
 )
 
 
 def restore_pre_v186_review_outcome_annotation(repo: Path) -> None:
-    """Restore the authenticated v1.85 Claude and Gemini review workflows.
+    """Restore the authenticated v1.85 review workflows and OpenCode recovery evidence.
 
     Restore only a current file, so older restore chains that already replaced
     these files, and deliberately mutated test bytes, survive.
@@ -138,11 +140,14 @@ def restore_pre_v186_review_outcome_annotation(repo: Path) -> None:
     from scripts.verify_workflow_release import (
         EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256,
         V183_CLAUDE_REVIEW_SHA256,
+        V185_OPENCODE_AUTO_REVIEW_SHA256,
+        V185_OPENCODE_RECOVERY_EVIDENCE_SHA256,
         VerifiedCommitTree,
     )
 
     expected = dict(zip(PRE_V186_FILES, (
         V183_CLAUDE_REVIEW_SHA256, EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256,
+        V185_OPENCODE_AUTO_REVIEW_SHA256, V185_OPENCODE_RECOVERY_EVIDENCE_SHA256,
     )))
     root = Path(__file__).resolve().parents[1]
     tree = None
@@ -166,12 +171,15 @@ PRE_V185_FILES = (
 def restore_pre_v185_opencode_abandoned_check_cleanup(repo: Path) -> None:
     """Restore the authenticated v1.84 OpenCode workflow and recovery evidence.
 
-    Undo v1.86 first, then restore only a current file, so older restore chains
-    that already replaced these files, and deliberately mutated test bytes, survive.
+    Undo v1.86 first, then restore only a file still on exact v1.85 bytes, so
+    older restore chains that already replaced these files, and deliberately
+    mutated test bytes, survive.
     """
     from scripts.verify_workflow_release import (
         V182_OPENCODE_AUTO_REVIEW_SHA256,
         V182_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+        V185_OPENCODE_AUTO_REVIEW_SHA256,
+        V185_OPENCODE_RECOVERY_EVIDENCE_SHA256,
         VerifiedCommitTree,
     )
 
@@ -179,11 +187,17 @@ def restore_pre_v185_opencode_abandoned_check_cleanup(repo: Path) -> None:
     expected = dict(zip(PRE_V185_FILES, (
         V182_OPENCODE_AUTO_REVIEW_SHA256, V182_OPENCODE_RECOVERY_EVIDENCE_SHA256,
     )))
+    current = dict(zip(PRE_V185_FILES, (
+        V185_OPENCODE_AUTO_REVIEW_SHA256, V185_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+    )))
     root = Path(__file__).resolve().parents[1]
     tree = None
     for relative in PRE_V185_FILES:
         path = repo / relative
-        if path.is_file() and path.read_bytes() == (root / relative).read_bytes():
+        if (
+            path.is_file()
+            and hashlib.sha256(path.read_bytes()).hexdigest() == current[relative]
+        ):
             if tree is None:
                 tree = VerifiedCommitTree.open(root, V184_ABANDONED_CHECK_CLEANUP_BOUNDARY_COMMIT)
             payload = tree.read_file(relative)

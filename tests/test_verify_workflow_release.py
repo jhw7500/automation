@@ -780,7 +780,12 @@ def test_v185_review_bytes_are_rejected_on_the_v186_release_line(fallback_releas
 
 @pytest.mark.parametrize(
     "relative",
-    (".github/workflows/claude-code-review.yml", ".github/workflows/gemini-auto-review.yml"),
+    (
+        ".github/workflows/claude-code-review.yml",
+        ".github/workflows/gemini-auto-review.yml",
+        ".github/workflows/opencode-auto-review.yml",
+        ".github/actions/recover-opencode-review/evidence.py",
+    ),
 )
 def test_one_review_workflow_left_across_the_v186_line_is_rejected(
     fallback_release_repo, relative,
@@ -800,7 +805,11 @@ def test_one_review_workflow_left_across_the_v186_line_is_rejected(
 
 @pytest.mark.parametrize(
     "relative",
-    (".github/workflows/claude-code-review.yml", ".github/workflows/gemini-auto-review.yml"),
+    (
+        ".github/workflows/claude-code-review.yml",
+        ".github/workflows/gemini-auto-review.yml",
+        ".github/workflows/opencode-auto-review.yml",
+    ),
 )
 def test_v186_rejects_mutated_review_outcome_step(fallback_release_repo, relative):
     repo, candidate = fallback_release_repo
@@ -816,6 +825,90 @@ def test_v186_rejects_mutated_review_outcome_step(fallback_release_repo, relativ
     for ref in ("v1.86", "v1.85"):
         with pytest.raises(ReleaseVerificationError):
             release_verifier.verify_commit_content(repo, ref, bad)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (".github/workflows/opencode-auto-review.yml", ".github/actions/recover-opencode-review/evidence.py"),
+)
+def test_v186_opencode_bytes_are_rejected_on_the_v185_release_line(fallback_release_repo, relative):
+    from release_fixture_helpers import (
+        PRE_V186_FILES,
+        V185_REVIEW_OUTCOME_BOUNDARY_COMMIT,
+        restore_pre_v186_review_outcome_annotation,
+    )
+
+    repo, _ = fallback_release_repo
+    tree = release_verifier.VerifiedCommitTree.open(ROOT, V185_REVIEW_OUTCOME_BOUNDARY_COMMIT)
+    # Every other v1.86 file goes back to v1.85; only `relative` keeps its v1.86 bytes.
+    for other in PRE_V186_FILES:
+        if other != relative:
+            (repo / other).write_bytes(tree.read_file(other))
+    mixed = commit(repo, f"keep only {relative} on v1.86 bytes")
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.85", mixed)
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.85")
+    # Positive control: the same tree with `relative` restored as well is the v1.85 line.
+    restore_pre_v186_review_outcome_annotation(repo)
+    old = commit(repo, f"restore {relative} to v1.85 bytes")
+    release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.85")
+    assert release_verifier.verify_commit_content(repo, "v1.85", old) == old
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        # The prepare step would stay silent for a reuse the canonicalizer never sees.
+        (
+            "if [[ \"$DECISION\" == 'authenticated_reuse' && \"$DIFF_MODE\" == 'unchanged' ]]; then exit 0; fi",
+            "if [[ \"$DECISION\" == 'authenticated_reuse' ]]; then exit 0; fi",
+        ),
+        # The canonicalize step would report a discarded publication as performed.
+        ("outcome='failed'; reason='publication_discarded'", "outcome='performed'; reason='publication_discarded'"),
+        # The canonicalizer would hide the reason the sticky names.
+        (
+            "core.setOutput('failure_reason', succeeded ? '' : failureReason);",
+            "core.setOutput('failure_reason', '');",
+        ),
+    ],
+)
+def test_v186_rejects_mutated_opencode_review_outcome(fallback_release_repo, old, new):
+    repo, candidate = fallback_release_repo
+    # Establish acceptance first: an older seal must not mask a missing current seal.
+    assert release_verifier.verify_commit_content(repo, "v1.86", candidate) == candidate
+    replace(repo / ".github/workflows/opencode-auto-review.yml", old, new, count=1)
+    bad = commit(repo, "mutate the OpenCode review outcome")
+    for ref in ("v1.86", "v1.85"):
+        with pytest.raises(ReleaseVerificationError):
+            release_verifier.verify_commit_content(repo, ref, bad)
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.86")
+
+
+def test_v186_recovery_evidence_replays_the_unchanged_v185_canonicalizer():
+    import importlib.util
+
+    from release_fixture_helpers import V185_REVIEW_OUTCOME_BOUNDARY_COMMIT
+
+    path = ROOT / ".github/actions/recover-opencode-review/evidence.py"
+    spec = importlib.util.spec_from_file_location("_v186_recovery_evidence", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        live = (ROOT / ".github/workflows/opencode-auto-review.yml").read_text(encoding="utf-8")
+        v185 = release_verifier.VerifiedCommitTree.open(
+            ROOT, V185_REVIEW_OUTCOME_BOUNDARY_COMMIT
+        ).read_file(".github/workflows/opencode-auto-review.yml").decode("utf-8")
+        assert live != v185
+        # v1.86 adds steps and an output after the replay prefix; the prefix bytes stay.
+        assert module.replay_source(live) == module.replay_source(v185)
+        assert hashlib.sha256(module.replay_source(live).encode()).hexdigest() in (
+            module.APPROVED_REPLAY_SHA256
+        )
+    finally:
+        sys.modules.pop(spec.name, None)
 
 
 def test_v1782_immutable_candidate_remains_accepted():

@@ -547,26 +547,31 @@ verifier requires it to keep testing `policy_run != 'true'`.
 
 ### Review outcome annotation
 
-From v1.86 every run of `claude-code-review.yml` and `gemini-auto-review.yml` leaves one notice
-that says what happened to the review (#187). A run's conclusion could not say it: a Claude budget
-refusal ends `success` with no sticky update. The sticky comment and its `automation-state` are
-unchanged, so readers in older releases are unaffected.
+From v1.86 every run of `claude-code-review.yml`, `gemini-auto-review.yml` and
+`opencode-auto-review.yml` leaves one notice that says what happened to the review (#187). A run's
+conclusion could not say it: a Claude budget refusal ends `success` with no sticky update. The sticky
+comment and its `automation-state` are unchanged, so readers in older releases are unaffected.
 
 ```text
-::notice title=review-outcome::reviewer=<claude|gemini> outcome=<outcome> reason=<reason> head=<sha> pr=<number>
+::notice title=review-outcome::reviewer=<claude|gemini|opencode> outcome=<outcome> reason=<reason> head=<sha> pr=<number>
 ```
 
 The step `Report review outcome` prints it. It is the last step of the review job (`claude-review`,
 `gemini-review`; in Gemini after `Enforce authenticated review budget decision`) and a separate step
-after `Notice` in the `Workflow Skipped` job. Both run with `if: ${{ always() }}`, take every input
-through `env:`, never fail and print only a notice, so job conclusions and the Claude rollout
-fallback contract (exactly one failure-level annotation on the original run) are unchanged. Before
-printing, `head` must match `^[0-9a-f]{40}$` and `pr` `^[1-9][0-9]{0,9}$`, otherwise `unknown`;
-`outcome` and `reason` must match `^[a-z_]{1,64}$`, otherwise `invalid`. The line therefore cannot
-carry another workflow command.
+after `Notice` in the `Workflow Skipped` job. OpenCode splits a run over jobs, so the step is also
+the last step of `opencode-prepare` and of `opencode-canonicalize`: the prepare step prints only when
+`opencode-canonicalize` will not run (its first `if` is that job's `if:` on the same outputs and the
+prepare job's status), and the canonicalize step prints for every run in which that job runs. All of
+them run with `if: ${{ always() }}`, take every input through `env:`, never fail and print only a
+notice, so job conclusions and the Claude rollout fallback contract (exactly one failure-level
+annotation on the original run) are unchanged. Before printing, `head` must match
+`^[0-9a-f]{40}$` and `pr` `^[1-9][0-9]{0,9}$`, otherwise `unknown`; `outcome` and `reason` must
+match `^[a-z_]{1,64}$`, otherwise `invalid`. The line therefore cannot carry another workflow
+command.
 
-`outcome` is one of `performed`, `reused`, `skipped`, `refused`, `failed`, `cancelled`. The step's
-`if`/`case` order is the definition; in outline:
+`outcome` is one of `performed`, `reused`, `skipped`, `refused`, `failed`, `cancelled`. Each step's
+`if`/`case` order is the definition; in outline (the OpenCode differences are listed with the
+`failed` sources below):
 
 | `outcome` | when, and where `reason` comes from |
 | --- | --- |
@@ -591,39 +596,57 @@ Sources of a `failed` reason, each defined where it is named:
 - The upsert's `attempt_reason` (below); `publication_failed` when the upsert recorded a success
   but did not publish; then the budget outcome's own value, or `checkpoint_failure` when it did not
   run.
+- OpenCode, printed by `opencode-prepare`: `prepare_failed` when the claim was `claimed` or
+  `authenticated_reuse` but the job failed after it. An `authenticated_reuse` whose prepare
+  succeeded with a diff mode other than `unchanged` runs no canonicalizer and is `reused`.
+- OpenCode, printed by `opencode-canonicalize`, where `Canonicalize OpenCode review` takes the
+  upsert's place: `canonicalizer_not_run` when that step did not run; when its
+  `publication_succeeded` output is not `true`, `publication_failed` if the step failed and
+  `publication_discarded` if it returned without publishing (its `Discarding …` or `Deferring …`
+  notice, or its `Cannot validate sealed OpenCode handoff` warning, names why); after a publication
+  whose `review_succeeded` is not `true`, its `failure_reason` output, the `failureReason` the
+  sticky's `- Reason:` line shows.
 
 The upsert step exposes `attempt_status` and `attempt_reason` for this step only; no sticky or state
 byte depends on them. `recordAttempt` in the step script sets them: `unpublished` with
 `publication_failed` until the attempt is decided (left in place when the script throws),
-`state_provenance_uncertain` or `attempt_identity_invalid`; `discarded` with `stale_head` or
-`stale_generation`; `failure` with the script's `failureReason`; `success` with an empty reason. A
-`stale_head` discard names a head the pull request has already left, so a reader that queries the
-current head does not see it.
+`state_provenance_uncertain` or `attempt_identity_invalid`; `discarded` with `stale_head`,
+`stale_base`, `fallback_route_invalid` or `stale_generation`; `failure` with the script's
+`failureReason`; `success` with an empty reason. `stale_head` means the pull request head moved, so
+it names a head the pull request has already left and a reader that queries the current head does
+not see it. In Claude rollout fallback mode the head can stay while the base moves away from the
+route's `reviewed_base_sha` (`stale_base`) or the route is invalid (`fallback_route_invalid`); those
+name the current head.
 
 From v1.86 the canonical Gemini failure reason is this annotation's `reason=` (#222). It is the
 upsert's `failureReason`, the value its `setFailed` message names, and it is present also when a
 failure keeps an earlier success and the sticky shows `Status: stale` without a reason. Aligning the
 sticky formats across reviewers is left to a later state schema.
 
-`opencode-auto-review.yml` follows in the same release. Until it does, an OpenCode run has no
-annotation. Codex is a GitHub App and leaves no run.
+Codex is a GitHub App and leaves no run.
 
-Read the annotations for a commit with one GraphQL query (REST `check-runs` returns only
-`annotations_count`):
+Read the annotations for a commit with a GraphQL query (REST `check-runs` returns only
+`annotations_count`). Every connection is bounded, so the query asks each one for its `pageInfo`:
 
 ```bash
-gh api graphql -f owner=OWNER -f name=REPO -f sha=HEAD_SHA -f query='
-query($owner: String!, $name: String!, $sha: String!) {
+gh api graphql --paginate --slurp -f owner=OWNER -f name=REPO -f sha=HEAD_SHA -f query='
+query($owner: String!, $name: String!, $sha: String!, $endCursor: String) {
   repository(owner: $owner, name: $name) {
     object(expression: $sha) {
       ... on Commit {
-        checkSuites(first: 50) {
+        checkSuites(first: 50, after: $endCursor) {
+          pageInfo { hasNextPage endCursor }
           nodes {
-            workflowRun { databaseId runNumber workflow { name } }
+            id
+            workflowRun { databaseId runNumber event workflow { name } }
             checkRuns(first: 50) {
+              pageInfo { hasNextPage endCursor }
               nodes {
-                name conclusion
-                annotations(first: 50) { nodes { title message annotationLevel } }
+                id name conclusion
+                annotations(first: 50) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { title message annotationLevel }
+                }
               }
             }
           }
@@ -634,31 +657,56 @@ query($owner: String!, $name: String!, $sha: String!) {
 }'
 ```
 
+`--paginate` follows only the first `pageInfo` in the response, which is `checkSuites`'s, and
+`--slurp` returns every page in one array. A check suite with more check runs, or a check run with
+more annotations, than the query fetched reports `hasNextPage: true` in its own `pageInfo`. Fetch the
+rest of that connection from its `endCursor`, for example with
+`node(id: <check suite or check run id>) { ... on CheckRun { annotations(first: 50, after: <endCursor>) { ... } } }`
+(`... on CheckSuite { checkRuns(...) }` for check runs), or treat that reviewer's outcome for the
+commit as unknown. A notice missing from a truncated result is unknown, never absent.
+
 Rules for reading the result:
 
 - Keep only annotations whose `title` is `review-outcome`. The same check runs also carry other
   notices, such as the `Workflow Skipped` notice and runner messages, whose `title` is empty.
-- The notice is on the reviewer's review-job check run (`<caller job> / claude-review`) or on
-  `<caller job> / Workflow Skipped`.
+- The notice is on the reviewer's review-job check run (`<caller job> / claude-review`,
+  `<caller job> / gemini-review`, `<caller job> / opencode-prepare` or
+  `<caller job> / opencode-canonicalize`) or on `<caller job> / Workflow Skipped`. The Claude
+  rollout fallback nests one more job (below); its review-job check run name still ends in
+  `claude-review`, which is how the fallback contract finds it
+  (`.github/actions/claude-rollout-fallback/contract.py`).
 - A run's check suite belongs to the run's own commit (its `head_sha`). For a `pull_request` run
   that is the pull request head, so the query above finds it. Detached runs are rooted at the commit
   of the ref they ran on, not at the pull request head (the budget transport records the same fact
-  for its claims): the bounded force-review dispatch, documented below without `--ref`, runs on the
-  default branch, and so does the Claude rollout fallback admitted from an `issue_comment`. To
-  include them, list the caller workflow's runs for those events, for example
-  `gh run list --repo OWNER/REPO --workflow <caller file> --event workflow_dispatch --json databaseId,headSha,createdAt`
-  (and `--event issue_comment`), and run the same query for each listed `headSha`.
+  for its claims). Two documented routes run on the default branch:
+  - The bounded force-review dispatch, documented below without `--ref`, is a `workflow_dispatch`
+    run of the consumer's review caller workflow (`claude-code-review.yml`,
+    `gemini-auto-review.yml` or `opencode-auto-review.yml` in
+    `examples/baseline-workflows/.github/workflows/`).
+  - The Claude rollout fallback is an `issue_comment` run of the consumer's `claude.yml` router
+    caller (workflow `Claude Code`). Its central router job `managed-rollout-review`
+    (`.github/workflows/claude.yml`) calls `claude-code-review.yml`.
+
+  List those runs per route, for example
+  `gh run list --repo OWNER/REPO --workflow claude.yml --event issue_comment --created ">=PUSHED_AT" --limit 1000 --json databaseId,headSha,createdAt`
+  with `PUSHED_AT` the time the head was pushed (an ISO 8601 timestamp), and run the query above for
+  each listed `headSha`. `gh run list` returns 20 runs unless `--limit` says otherwise, so bound the
+  listing by `--created` to the head's lifetime and give a `--limit` above the number of runs in that
+  window. A listing that returns exactly `--limit` runs may be truncated, and a notice it may have
+  missed is unknown.
 - Across everything collected, keep only notices whose `pr=` is the pull request and whose `head=`
   is the head being asked about. A default-branch commit carries notices for every pull request, so
   these two fields, not the commit queried, decide which pull request and head a notice describes.
 - When more than one matching notice remains for a reviewer, take the one from the newest run or
   attempt in which that reviewer's review job or `Workflow Skipped` job ran, that is, whose
-  conclusion is not `SKIPPED`.
+  conclusion is not `SKIPPED`. For OpenCode the run's notice is on `opencode-prepare` or on
+  `opencode-canonicalize`, never both.
 - No `review-outcome` annotation means unknown, never performed. A caller pinned before v1.86, a
   job that never started, and a job stopped before the step ran (for example a lost runner) all
-  leave none.
+  leave none, and so does an OpenCode run cancelled after `opencode-prepare` succeeded and before
+  `opencode-canonicalize` started.
 - Job and check conclusions are not part of this contract and differ by reviewer for the same
-  outcome: a Claude refusal ends `success`, a Gemini refusal fails in
+  outcome: a Claude refusal ends `success`, a Gemini or OpenCode refusal fails in
   `Enforce authenticated review budget decision`. v1.86 does not change them, so required checks
   and merge gates are unaffected.
 

@@ -1396,7 +1396,8 @@ jobs:
               || (fallbackMode && (!validFallbackRoute(fallbackRoute)
                 || pr.base?.sha !== fallbackRoute.reviewed_base_sha))) {
               core.notice(`Discarding stale review for ${attemptHead}; current head is ${pr.head?.sha || 'unknown'}`);
-              recordAttempt('discarded', 'stale_head');
+              recordAttempt('discarded', pr.head?.sha !== attemptHead ? 'stale_head'
+                : !validFallbackRoute(fallbackRoute) ? 'fallback_route_invalid' : 'stale_base');
               return;
             }
             if (existing && (existing.state.run_id > runId
@@ -1510,7 +1511,7 @@ jobs:
             if (publicationPr.head?.sha !== attemptHead
               || (fallbackMode && publicationPr.base?.sha !== fallbackRoute.reviewed_base_sha)) {
               core.notice('Claude review publication coordinates changed; left sticky state unchanged.');
-              recordAttempt('discarded', 'stale_head');
+              recordAttempt('discarded', publicationPr.head?.sha !== attemptHead ? 'stale_head' : 'stale_base');
               return;
             }
             const target = existing?.comment || v2Target;
