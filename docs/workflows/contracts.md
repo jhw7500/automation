@@ -667,6 +667,13 @@ commit as unknown. A notice missing from a truncated result is unknown, never ab
 
 Rules for reading the result:
 
+- A notice is a diagnostic, not an authenticated record. Whatever workflow runs on the commit
+  prints it, and a `pull_request` run executes the workflow files of the pull request itself, so a
+  fork pull request can add a job that prints an identical line under any job name. Discard notices
+  from runs whose head repository is not this repository (REST `actions/runs/{id}`
+  `head_repository.full_name`). For an authenticated answer use the reviewer's sticky comment and
+  its `automation-state`, which the reviewers authenticate (state sections above); the notice
+  explains a run, it does not certify one.
 - Keep only annotations whose `title` is `review-outcome`. The same check runs also carry other
   notices, such as the `Workflow Skipped` notice and runner messages, whose `title` is empty.
 - The notice is on the reviewer's review-job check run (`<caller job> / claude-review`,
@@ -688,9 +695,10 @@ Rules for reading the result:
     (`.github/workflows/claude.yml`) calls `claude-code-review.yml`.
 
   List those runs per route, for example
-  `gh run list --repo OWNER/REPO --workflow claude.yml --event issue_comment --created ">=PUSHED_AT" --limit 1000 --json databaseId,headSha,createdAt`
+  `gh run list --repo OWNER/REPO --workflow claude.yml --all --event issue_comment --created ">=PUSHED_AT" --limit 1000 --json databaseId,headSha,createdAt`
   with `PUSHED_AT` the time the head was pushed (an ISO 8601 timestamp), and run the query above for
-  each listed `headSha`. `gh run list` returns 20 runs unless `--limit` says otherwise, so bound the
+  each listed `headSha`. `--workflow` with a workflow name lists no runs of a disabled workflow
+  unless `--all` is given (see `gh run list --help`), so keep `--all`. `gh run list` returns 20 runs unless `--limit` says otherwise, so bound the
   listing by `--created` to the head's lifetime and give a `--limit` above the number of runs in that
   window. A listing that returns exactly `--limit` runs may be truncated, and a notice it may have
   missed is unknown.
