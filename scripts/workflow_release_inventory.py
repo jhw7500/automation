@@ -378,7 +378,7 @@ def release_supports_opencode_abandoned_check_cleanup(ref: str) -> bool:
 
 
 def release_supports_review_outcome_annotation(ref: str) -> bool:
-    """Return whether the Claude and Gemini review workflows emit the review-outcome notice."""
+    """Return whether the Claude, Gemini and OpenCode review workflows emit the review-outcome notice."""
     return _release_version(ref) >= REVIEW_OUTCOME_ANNOTATION_RELEASE
 
 

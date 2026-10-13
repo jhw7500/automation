@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import html.entities
 import importlib.util
+import itertools
 import json
 import os
 import re
@@ -20371,15 +20372,30 @@ REVIEW_OUTCOME_JOBS = {
     "claude-code-review.yml": ("claude", "claude-review"),
     "gemini-auto-review.yml": ("gemini", "gemini-review"),
 }
+OPENCODE_OUTCOME_WORKFLOW = "opencode-auto-review.yml"
+REVIEW_OUTCOME_REVIEWERS = {
+    **{name: reviewer for name, (reviewer, _) in REVIEW_OUTCOME_JOBS.items()},
+    OPENCODE_OUTCOME_WORKFLOW: "opencode",
+}
 REVIEW_OUTCOME_HEAD = "35" * 20
 REVIEW_OUTCOME_LINE = re.compile(
-    r"::notice title=review-outcome::reviewer=(claude|gemini) outcome=([a-z_]{1,64}) "
+    r"::notice title=review-outcome::reviewer=(claude|gemini|opencode) outcome=([a-z_]{1,64}) "
     r"reason=([a-z_]{1,64}) head=([0-9a-f]{40}|unknown) pr=([1-9][0-9]{0,9}|unknown)"
 )
 
 
 def _run_review_outcome(workflow_name: str, job: str, env: dict[str, str]) -> tuple[str, ...]:
     """Run the step as `shell: bash` does and return the fields of its one notice line."""
+    lines = _review_outcome_lines(workflow_name, job, env)
+    assert len(lines) == 1, lines
+    match = REVIEW_OUTCOME_LINE.fullmatch(lines[0])
+    assert match, lines[0]
+    assert match.group(1) == REVIEW_OUTCOME_REVIEWERS[workflow_name]
+    return match.groups()[1:]
+
+
+def _review_outcome_lines(workflow_name: str, job: str, env: dict[str, str]) -> list[str]:
+    """Run the step as `shell: bash` does and return the lines it printed."""
     step = _step(_load(workflow_name), job, REVIEW_OUTCOME_STEP)
     assert set(env) <= set(step["env"]), sorted(set(env) - set(step["env"]))
     values = {key: "" for key in step["env"]}
@@ -20397,11 +20413,8 @@ def _run_review_outcome(workflow_name: str, job: str, env: dict[str, str]) -> tu
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     lines = result.stdout.split("\n")
-    assert lines[-1] == "" and len(lines) == 2, result.stdout
-    match = REVIEW_OUTCOME_LINE.fullmatch(lines[0])
-    assert match, lines[0]
-    assert match.group(1) == REVIEW_OUTCOME_JOBS[workflow_name][0]
-    return match.groups()[1:]
+    assert lines[-1] == "", result.stdout
+    return lines[:-1]
 
 
 _CLAIMED_SUCCESS = {
@@ -20493,7 +20506,7 @@ def test_review_outcome_maps_each_run_to_one_outcome_and_reason(workflow_name, e
     assert (head, pr) == (REVIEW_OUTCOME_HEAD, "95")
 
 
-@pytest.mark.parametrize("workflow_name", REVIEW_OUTCOME_JOBS)
+@pytest.mark.parametrize("workflow_name", (*REVIEW_OUTCOME_JOBS, OPENCODE_OUTCOME_WORKFLOW))
 @pytest.mark.parametrize(
     ("enabled", "reason", "expected"),
     [
@@ -20648,6 +20661,322 @@ def test_gemini_reason_reaches_the_outcome_step_when_success_is_preserved(tmp_pa
     assert (outputs["attempt_status"], outputs["attempt_reason"], outputs["published"]) == (
         "failure", "quota_exhausted", "true",
     )
+
+
+_FALLBACK_ROUTE_JSON = json.dumps(FALLBACK_STATE_ROUTE, separators=(",", ":"))
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("route_json", "current_head", "current_base", "expected"),
+    [
+        # A moved base or an invalid route leaves the head where it was, so the discard
+        # must not claim the head moved (#187, PR #233 review).
+        (_FALLBACK_ROUTE_JSON, None, "ee" * 20, "stale_base"),
+        ("{}", None, "bb" * 20, "fallback_route_invalid"),
+        (_FALLBACK_ROUTE_JSON, "ef" * 20, "ee" * 20, "stale_head"),
+        ("{}", "ef" * 20, "bb" * 20, "stale_head"),
+    ],
+)
+def test_claude_fallback_discard_names_what_moved(
+    tmp_path, route_json, current_head, current_base, expected
+):
+    calls = _claude_upsert(
+        tmp_path, "success", [], with_review=True, fallback_mode="fallback",
+        fallback_state_route_json=route_json, current_head=current_head,
+        current_base=current_base, full_diff_sha256="cc" * 32,
+    )
+    assert not any(call[0] in {"create", "update"} for call in calls)
+    outputs = _upsert_outputs(calls)
+    assert (outputs["attempt_status"], outputs["attempt_reason"]) == ("discarded", expected)
+
+
+@node_required
+@pytest.mark.parametrize(
+    ("second_read", "expected"),
+    [
+        ({"head": {"sha": "cd" * 20}, "base": {"sha": "ee" * 20}}, "stale_base"),
+        ({"head": {"sha": "ef" * 20}, "base": {"sha": "bb" * 20}}, "stale_head"),
+    ],
+)
+def test_claude_fallback_publication_recheck_names_what_moved(tmp_path, second_read, expected):
+    calls = _claude_upsert(
+        tmp_path, "success", [], with_review=True, fallback_mode="fallback",
+        fallback_state_route_json=_FALLBACK_ROUTE_JSON, current_base="bb" * 20,
+        full_diff_sha256="cc" * 32,
+        pull_request_sequence=[{"head": {"sha": "cd" * 20}, "base": {"sha": "bb" * 20}}, second_read],
+    )
+    assert not any(call[0] in {"create", "update"} for call in calls)
+    outputs = _upsert_outputs(calls)
+    assert (outputs["attempt_status"], outputs["attempt_reason"]) == ("discarded", expected)
+
+
+# OpenCode splits a run over opencode-prepare and opencode-canonicalize; exactly one of them
+# reports it (#187).
+OPENCODE_PREPARE_ROWS = (
+    # The #187 shape for OpenCode: the budget refuses and the enforce step fails the job.
+    ({"JOB_STATUS": "failure", "ALLOW_INVOCATION": "false", "DECISION": "round_budget_exhausted"},
+     ("refused", "round_budget_exhausted")),
+    ({"JOB_STATUS": "failure", "ALLOW_INVOCATION": "false", "DECISION": "duplicate_head"},
+     ("refused", "duplicate_head")),
+    ({"JOB_STATUS": "failure", "ALLOW_INVOCATION": "false", "DECISION": "duplicate_effective_diff"},
+     ("refused", "duplicate_effective_diff")),
+    ({"JOB_STATUS": "failure", "ALLOW_INVOCATION": "false", "DECISION": "input_budget_exhausted"},
+     ("refused", "input_budget_exhausted")),
+    ({"JOB_STATUS": "failure", "ALLOW_INVOCATION": "false", "DECISION": "total_usage_budget_exhausted"},
+     ("refused", "total_usage_budget_exhausted")),
+    ({"JOB_STATUS": "cancelled", "ALLOW_INVOCATION": "true", "DECISION": "claimed", "DIFF_MODE": "full"},
+     ("cancelled", "cancelled")),
+    # Reuse of a changed diff skips the canonicalizer; the authenticated review stands.
+    ({"ALLOW_INVOCATION": "false", "DECISION": "authenticated_reuse", "DIFF_MODE": "full"},
+     ("reused", "authenticated_reuse")),
+    ({"JOB_STATUS": "failure", "ALLOW_INVOCATION": "false", "DECISION": "authenticated_reuse",
+      "DIFF_MODE": "unchanged"}, ("failed", "prepare_failed")),
+    ({"JOB_STATUS": "failure", "ALLOW_INVOCATION": "true", "DECISION": "claimed", "DIFF_MODE": "full"},
+     ("failed", "prepare_failed")),
+    ({"JOB_STATUS": "failure", "CONTEXT_OUTCOME": "failure"}, ("failed", "review_context_unavailable")),
+    ({"JOB_STATUS": "failure", "CONTEXT_OUTCOME": "success"}, ("failed", "budget_unavailable")),
+    ({"JOB_STATUS": "failure", "ALLOW_INVOCATION": "false", "DECISION": "state_invalid"},
+     ("failed", "state_invalid")),
+    ({"JOB_STATUS": "failure", "ALLOW_INVOCATION": "false", "DECISION": "diff_unavailable"},
+     ("failed", "diff_unavailable")),
+    # opencode-canonicalize runs and reports these.
+    ({"ALLOW_INVOCATION": "true", "DECISION": "claimed", "DIFF_MODE": "full"}, None),
+    ({"ALLOW_INVOCATION": "false", "DECISION": "authenticated_reuse", "DIFF_MODE": "unchanged"}, None),
+)
+
+
+@pytest.mark.parametrize(("env", "expected"), OPENCODE_PREPARE_ROWS)
+def test_opencode_prepare_reports_only_runs_the_canonicalizer_will_not_report(env, expected):
+    lines = _review_outcome_lines(OPENCODE_OUTCOME_WORKFLOW, "opencode-prepare", env)
+    if expected is None:
+        assert lines == []
+        return
+    outcome, reason, head, pr = _run_review_outcome(OPENCODE_OUTCOME_WORKFLOW, "opencode-prepare", env)
+    assert ((outcome, reason), head, pr) == (expected, REVIEW_OUTCOME_HEAD, "95")
+
+
+_PUBLISHED_SUCCESS = {
+    "CANONICALIZE_OUTCOME": "success", "PUBLICATION_SUCCEEDED": "true", "REVIEW_SUCCEEDED": "true",
+}
+OPENCODE_CANONICALIZE_ROWS = (
+    ({**_PUBLISHED_SUCCESS, "DECISION": "claimed", "BUDGET_OUTCOME": "success"}, ("performed", "success")),
+    ({**_PUBLISHED_SUCCESS, "DECISION": "claimed", "BUDGET_OUTCOME": "quality_filtered"},
+     ("performed", "quality_filtered")),
+    ({**_PUBLISHED_SUCCESS, "DECISION": "claimed", "BUDGET_OUTCOME": "wall_time_exhausted"},
+     ("failed", "wall_time_exhausted")),
+    ({**_PUBLISHED_SUCCESS, "DECISION": "claimed"}, ("failed", "checkpoint_failure")),
+    ({**_PUBLISHED_SUCCESS, "DECISION": "authenticated_reuse"}, ("reused", "authenticated_reuse")),
+    ({**_PUBLISHED_SUCCESS, "DECISION": ""}, ("failed", "budget_unavailable")),
+    # A published failure sticky: the canonicalizer's own failureReason, which it also prints.
+    ({"CANONICALIZE_OUTCOME": "failure", "PUBLICATION_SUCCEEDED": "true", "REVIEW_SUCCEEDED": "false",
+      "FAILURE_REASON": "quota_exhausted", "DECISION": "claimed", "BUDGET_OUTCOME": "provider_failure"},
+     ("failed", "quota_exhausted")),
+    ({"CANONICALIZE_OUTCOME": "failure", "PUBLICATION_SUCCEEDED": "true", "REVIEW_SUCCEEDED": "false",
+      "FAILURE_REASON": "output_grammar_invalid", "DECISION": "authenticated_reuse"},
+     ("failed", "output_grammar_invalid")),
+    ({"CANONICALIZE_OUTCOME": "failure", "PUBLICATION_SUCCEEDED": "false", "DECISION": "claimed"},
+     ("failed", "publication_failed")),
+    # The canonicalizer returned before publishing (stale head or generation, pending
+    # provenance, invalid prepared input); its notice names which.
+    ({"CANONICALIZE_OUTCOME": "success", "PUBLICATION_SUCCEEDED": "false", "DECISION": "claimed",
+      "BUDGET_OUTCOME": "checkpoint_failure"}, ("failed", "publication_discarded")),
+    ({"CANONICALIZE_OUTCOME": "skipped", "DECISION": "claimed"}, ("failed", "canonicalizer_not_run")),
+    ({"CANONICALIZE_OUTCOME": "", "DECISION": "claimed"}, ("failed", "canonicalizer_not_run")),
+    ({**_PUBLISHED_SUCCESS, "JOB_STATUS": "cancelled", "DECISION": "claimed", "BUDGET_OUTCOME": "success"},
+     ("cancelled", "cancelled")),
+    ({"JOB_STATUS": "cancelled", "CANONICALIZE_OUTCOME": "cancelled"}, ("cancelled", "cancelled")),
+)
+
+
+@pytest.mark.parametrize(("env", "expected"), OPENCODE_CANONICALIZE_ROWS)
+def test_opencode_canonicalize_reports_every_run_it_runs_in(env, expected):
+    outcome, reason, head, pr = _run_review_outcome(
+        OPENCODE_OUTCOME_WORKFLOW, "opencode-canonicalize", env
+    )
+    assert ((outcome, reason), head, pr) == (expected, REVIEW_OUTCOME_HEAD, "95")
+
+
+def _evaluate_job_condition(condition: str, values: dict[str, str], *, cancelled: bool) -> bool:
+    """Evaluate a job `if:` built from needs outputs, ==, !=, &&, ||, always() and !cancelled()."""
+    expression = re.sub(
+        r"needs\.[a-z-]+\.(?:outputs\.[a-z_]+|result)",
+        lambda match: repr(values[match.group(0)]),
+        condition,
+    )
+    expression = expression.replace("!cancelled()", repr(not cancelled))
+    expression = expression.replace("always()", "True")
+    expression = expression.replace("&&", " and ").replace("||", " or ")
+    assert re.fullmatch(r"[\sA-Za-z0-9'()=!_-]*", expression), expression
+    return eval(expression, {"__builtins__": {}}, {})
+
+
+def test_opencode_review_outcome_is_reported_by_exactly_one_job():
+    workflow = _load(OPENCODE_OUTCOME_WORKFLOW)
+    prepare = workflow["jobs"]["opencode-prepare"]
+    step = _step(workflow, "opencode-prepare", REVIEW_OUTCOME_STEP)
+    # The prepare step reads the very values the canonicalize job's `if:` reads.
+    assert step["env"]["JOB_STATUS"] == "${{ job.status }}"
+    assert step["env"]["ALLOW_INVOCATION"] == prepare["outputs"]["allow_invocation"]
+    assert step["env"]["DECISION"] == prepare["outputs"]["budget_decision"]
+    assert step["env"]["DIFF_MODE"] == prepare["outputs"]["diff_mode"]
+    # The prepare job runs only when both check-enabled outputs are 'true'.
+    assert _evaluate_job_condition(prepare["if"], {
+        "needs.check-enabled.outputs.enabled": "true",
+        "needs.check-enabled.outputs.policy_run": "true",
+    }, cancelled=False)
+    condition = workflow["jobs"]["opencode-canonicalize"]["if"]
+    seen = {True: 0, False: 0}
+    for status, allow, decision, diff_mode in itertools.product(
+        ("success", "failure", "cancelled"),
+        ("true", "false", ""),
+        ("claimed", "authenticated_reuse", "duplicate_head", "round_budget_exhausted",
+         "state_invalid", ""),
+        ("full", "delta", "unchanged", "unavailable", ""),
+    ):
+        canonicalize_runs = _evaluate_job_condition(condition, {
+            "needs.check-enabled.outputs.enabled": "true",
+            "needs.check-enabled.outputs.policy_run": "true",
+            "needs.opencode-prepare.result": status,
+            "needs.opencode-prepare.outputs.allow_invocation": allow,
+            "needs.opencode-prepare.outputs.budget_decision": decision,
+            "needs.opencode-prepare.outputs.diff_mode": diff_mode,
+        }, cancelled=status == "cancelled")
+        lines = _review_outcome_lines(OPENCODE_OUTCOME_WORKFLOW, "opencode-prepare", {
+            "JOB_STATUS": status, "ALLOW_INVOCATION": allow, "DECISION": decision,
+            "DIFF_MODE": diff_mode, "CONTEXT_OUTCOME": "success",
+        })
+        assert len(lines) == (0 if canonicalize_runs else 1), (status, allow, decision, diff_mode)
+        seen[canonicalize_runs] += 1
+    assert seen[True] > 0 and seen[False] > 0, seen
+
+
+@pytest.mark.parametrize("job", ("opencode-prepare", "opencode-canonicalize", "skipped"))
+def test_opencode_review_outcome_prints_one_validated_line_for_any_input(job, tmp_path):
+    step = _step(_load(OPENCODE_OUTCOME_WORKFLOW), job, REVIEW_OUTCOME_STEP)
+    hostile = {key: GARBAGE for key in step["env"]}
+    expected = {
+        "opencode-prepare": ("failed", "invalid"),
+        "opencode-canonicalize": ("failed", "canonicalizer_not_run"),
+        "skipped": ("skipped", "workflow_disabled"),
+    }[job]
+    assert _run_review_outcome(OPENCODE_OUTCOME_WORKFLOW, job, hostile) == (*expected, "unknown", "unknown")
+    carrier = {
+        "opencode-prepare": ("DECISION", {"JOB_STATUS": "failure"}),
+        "opencode-canonicalize": ("FAILURE_REASON", {
+            "CANONICALIZE_OUTCOME": "failure", "PUBLICATION_SUCCEEDED": "true", "REVIEW_SUCCEEDED": "false",
+        }),
+        "skipped": ("POLICY_REASON", {}),
+    }
+    name, base = carrier[job]
+    for value in ("ROUND_BUDGET_EXHAUSTED", "a" * 65, "%n%s", "round budget", f"$(touch {tmp_path}/x)", GARBAGE):
+        _, reason, head, pr = _run_review_outcome(
+            OPENCODE_OUTCOME_WORKFLOW, job, {**base, name: value, "HEAD_SHA": "AB" * 20, "PR_NUMBER": "095"}
+        )
+        assert (reason, head, pr) == ("invalid", "unknown", "unknown"), value
+    assert not (tmp_path / "x").exists()
+
+
+def test_opencode_review_outcome_steps_are_last_always_env_only_and_never_fail():
+    workflow = _load(OPENCODE_OUTCOME_WORKFLOW)
+    expected_env = {
+        "opencode-prepare": {
+            "JOB_STATUS": "${{ job.status }}",
+            "PR_NUMBER": "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
+            "HEAD_SHA": "${{ steps.prepare-diff.outputs.head-sha || needs.check-enabled.outputs.policy_head }}",
+            "CONTEXT_OUTCOME": "${{ steps.ctx.outcome }}",
+            "ALLOW_INVOCATION": "${{ steps.review-budget-claim.outputs.allow-invocation }}",
+            "DECISION": "${{ steps.review-budget-claim.outputs.decision }}",
+            "DIFF_MODE": "${{ steps.prepare-diff.outputs.diff-mode }}",
+        },
+        "opencode-canonicalize": {
+            "JOB_STATUS": "${{ job.status }}",
+            "PR_NUMBER": "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
+            "HEAD_SHA": "${{ needs.opencode-prepare.outputs.head_sha }}",
+            "DECISION": "${{ needs.opencode-prepare.outputs.budget_decision }}",
+            "CANONICALIZE_OUTCOME": "${{ steps.canonicalize-opencode-review.outcome }}",
+            "PUBLICATION_SUCCEEDED": "${{ steps.canonicalize-opencode-review.outputs.publication_succeeded }}",
+            "REVIEW_SUCCEEDED": "${{ steps.canonicalize-opencode-review.outputs.review_succeeded }}",
+            "FAILURE_REASON": "${{ steps.canonicalize-opencode-review.outputs.failure_reason }}",
+            "BUDGET_OUTCOME": "${{ steps.opencode-budget-outcome.outputs.outcome }}",
+        },
+        "skipped": {
+            "WORKFLOW_ENABLED": "${{ needs.check-enabled.outputs.enabled }}",
+            "POLICY_REASON": "${{ needs.check-enabled.outputs.policy_reason }}",
+            "HEAD_SHA": "${{ needs.check-enabled.outputs.policy_head }}",
+            "PR_NUMBER": "${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}",
+        },
+    }
+    previous = {
+        "opencode-prepare": "Enforce authenticated review budget decision",
+        "opencode-canonicalize": "Upload OpenCode review budget final checkpoint",
+        "skipped": "Notice",
+    }
+    for job, env in expected_env.items():
+        steps = workflow["jobs"][job]["steps"]
+        names = [s.get("name") for s in steps]
+        assert names.count(REVIEW_OUTCOME_STEP) == 1, job
+        assert names[-2:] == [previous[job], REVIEW_OUTCOME_STEP], job
+        step = steps[-1]
+        assert step["if"] == "${{ always() }}"
+        assert step["shell"] == "bash"
+        assert "id" not in step and "uses" not in step and "continue-on-error" not in step
+        assert step["env"] == env, job
+        run = step["run"]
+        assert "${{" not in run
+        assert run.startswith("set +e\n") and run.rstrip("\n").endswith("exit 0")
+        assert "set -e" not in run and "exit 1" not in run
+        assert "::error" not in run and "::warning" not in run
+        assert run.count("::notice title=review-outcome::") == 1
+        assert "'opencode'" in run
+    # No job, name or permission changes ride along.
+    assert list(workflow["jobs"]) == [
+        "check-enabled", "opencode-prepare", "opencode-review", "opencode-canonicalize", "skipped",
+    ]
+    assert "permissions" not in workflow["jobs"]["skipped"]
+    assert workflow["jobs"]["skipped"]["name"] == "Workflow Skipped"
+
+
+def test_opencode_failure_reason_output_follows_the_replay_prefix():
+    script = _step(
+        _load(OPENCODE_OUTCOME_WORKFLOW), "opencode-canonicalize", "Canonicalize OpenCode review"
+    )["with"]["script"]
+    output = "core.setOutput('failure_reason', succeeded ? '' : failureReason);"
+    assert script.count(output) == 1
+    assert script.index("if (!(await repairComments())) return;") < script.index(output)
+    assert script.index("core.setOutput('review_succeeded',") < script.index(output) < script.index(
+        "core.setOutput('quality_filtered', qualityFiltered"
+    )
+
+
+@node_required
+def test_opencode_canonicalizer_reports_no_failure_reason_for_a_published_success(tmp_path):
+    candidate = _bot("github-actions[bot]", _opencode_review("real finding"), 10, updated="u2")
+    calls = _run_opencode_canonicalize(tmp_path, [], [candidate])
+    outputs = _upsert_outputs(calls)
+    assert (outputs["publication_succeeded"], outputs["review_succeeded"], outputs["failure_reason"]) == (
+        "true", "true", "",
+    )
+
+
+@node_required
+def test_opencode_canonicalizer_reports_the_published_failure_reason(tmp_path):
+    calls = _run_opencode_canonicalize(tmp_path, [], [], outcome="failure", failure_reason="quota_exhausted")
+    body = next(call[1]["body"] for call in calls if call[0] == "create")
+    outputs = _upsert_outputs(calls)
+    assert (outputs["publication_succeeded"], outputs["review_succeeded"]) == ("true", "false")
+    assert outputs["failure_reason"] == "quota_exhausted"
+    assert f"- Reason: {outputs['failure_reason']}" in body.split("\n")
+
+
+@node_required
+def test_opencode_canonicalizer_reports_nothing_when_it_discards_a_stale_run(tmp_path):
+    candidate = _bot("github-actions[bot]", _opencode_review("real finding"), 10, updated="u2")
+    calls = _run_opencode_canonicalize(tmp_path, [], [candidate], current_head="ef" * 20)
+    assert not any(call[0] in {"create", "failed"} for call in calls)
+    outputs = _upsert_outputs(calls)
+    assert outputs["publication_succeeded"] == "false"
+    assert "failure_reason" not in outputs
 
 
 # ---------------------------------------------------------------------------

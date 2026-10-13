@@ -740,6 +740,57 @@ jobs:
           echo "::error::OpenCode review has no authenticated checkpoint for this attempt ($BUDGET_DECISION)"
           exit 1
 
+      # One fixed-format review-outcome notice per run (#187); docs/workflows/contracts.md
+      # "Review outcome annotation". This step prints only when opencode-canonicalize will not
+      # run: the first test below is that job's `if:` on the same outputs. Otherwise the last
+      # step of opencode-canonicalize prints. Inputs arrive only through env and are validated
+      # before printing, and the step never fails, so the job conclusion is unchanged.
+      - name: Report review outcome
+        if: ${{ always() }}
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+          HEAD_SHA: ${{ steps.prepare-diff.outputs.head-sha || needs.check-enabled.outputs.policy_head }}
+          CONTEXT_OUTCOME: ${{ steps.ctx.outcome }}
+          ALLOW_INVOCATION: ${{ steps.review-budget-claim.outputs.allow-invocation }}
+          DECISION: ${{ steps.review-budget-claim.outputs.decision }}
+          DIFF_MODE: ${{ steps.prepare-diff.outputs.diff-mode }}
+        run: |
+          set +e
+          if [[ "$JOB_STATUS" == 'success' ]]; then
+            if [[ "$ALLOW_INVOCATION" == 'true' ]]; then exit 0; fi
+            if [[ "$DECISION" == 'authenticated_reuse' && "$DIFF_MODE" == 'unchanged' ]]; then exit 0; fi
+          fi
+          if [[ "$JOB_STATUS" == 'cancelled' ]]; then
+            outcome='cancelled'; reason='cancelled'
+          elif [[ "$CONTEXT_OUTCOME" == 'failure' ]]; then
+            outcome='failed'; reason='review_context_unavailable'
+          else
+            case "$DECISION" in
+              duplicate_head|duplicate_effective_diff|round_budget_exhausted|input_budget_exhausted|total_usage_budget_exhausted)
+                outcome='refused'; reason="$DECISION" ;;
+              authenticated_reuse)
+                if [[ "$JOB_STATUS" == 'success' ]]; then
+                  outcome='reused'; reason='authenticated_reuse'
+                else
+                  outcome='failed'; reason='prepare_failed'
+                fi ;;
+              claimed) outcome='failed'; reason='prepare_failed' ;;
+              '') outcome='failed'; reason='budget_unavailable' ;;
+              *) outcome='failed'; reason="$DECISION" ;;
+            esac
+          fi
+          if [[ ! "$outcome" =~ ^[a-z_]{1,64}$ ]]; then outcome='invalid'; fi
+          if [[ ! "$reason" =~ ^[a-z_]{1,64}$ ]]; then reason='invalid'; fi
+          head="$HEAD_SHA"
+          if [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then head='unknown'; fi
+          pr="$PR_NUMBER"
+          if [[ ! "$pr" =~ ^[1-9][0-9]{0,9}$ ]]; then pr='unknown'; fi
+          printf '::notice title=review-outcome::reviewer=%s outcome=%s reason=%s head=%s pr=%s\n' \
+            'opencode' "$outcome" "$reason" "$head" "$pr"
+          exit 0
+
   opencode-review:
     needs: [check-enabled, opencode-prepare]
     if: >-
@@ -5574,6 +5625,8 @@ jobs:
                   remaining_finding_ids: remainingFindingIds };
             core.setOutput('publication_succeeded', 'true');
             core.setOutput('review_succeeded', succeeded ? 'true' : 'false');
+            // Read only by "Report review outcome" (#187); the published sticky names the same reason.
+            core.setOutput('failure_reason', succeeded ? '' : failureReason);
             core.setOutput('quality_filtered', qualityFiltered ? 'true' : 'false');
             core.setOutput('authenticated_review_json', JSON.stringify(authenticatedReview));
             core.setOutput('remaining_finding_ids_json', JSON.stringify(remainingFindingIds));
@@ -5823,6 +5876,59 @@ jobs:
           retention-days: 7
           overwrite: false
 
+      # One fixed-format review-outcome notice for every run in which this job runs (#187);
+      # opencode-prepare prints it for the others. Inputs arrive only through env and are
+      # validated before printing, and the step never fails, so the job conclusion is unchanged.
+      - name: Report review outcome
+        if: ${{ always() }}
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+          HEAD_SHA: ${{ needs.opencode-prepare.outputs.head_sha }}
+          DECISION: ${{ needs.opencode-prepare.outputs.budget_decision }}
+          CANONICALIZE_OUTCOME: ${{ steps.canonicalize-opencode-review.outcome }}
+          PUBLICATION_SUCCEEDED: ${{ steps.canonicalize-opencode-review.outputs.publication_succeeded }}
+          REVIEW_SUCCEEDED: ${{ steps.canonicalize-opencode-review.outputs.review_succeeded }}
+          FAILURE_REASON: ${{ steps.canonicalize-opencode-review.outputs.failure_reason }}
+          BUDGET_OUTCOME: ${{ steps.opencode-budget-outcome.outputs.outcome }}
+        run: |
+          set +e
+          if [[ "$JOB_STATUS" == 'cancelled' ]]; then
+            outcome='cancelled'; reason='cancelled'
+          elif [[ "$CANONICALIZE_OUTCOME" != 'success' && "$CANONICALIZE_OUTCOME" != 'failure' ]]; then
+            outcome='failed'; reason='canonicalizer_not_run'
+          elif [[ "$PUBLICATION_SUCCEEDED" != 'true' ]]; then
+            if [[ "$CANONICALIZE_OUTCOME" == 'failure' ]]; then
+              outcome='failed'; reason='publication_failed'
+            else
+              outcome='failed'; reason='publication_discarded'
+            fi
+          elif [[ "$REVIEW_SUCCEEDED" != 'true' ]]; then
+            outcome='failed'; reason="$FAILURE_REASON"
+          else
+            case "$DECISION" in
+              authenticated_reuse) outcome='reused'; reason='authenticated_reuse' ;;
+              claimed)
+                case "$BUDGET_OUTCOME" in
+                  success|quality_filtered) outcome='performed'; reason="$BUDGET_OUTCOME" ;;
+                  '') outcome='failed'; reason='checkpoint_failure' ;;
+                  *) outcome='failed'; reason="$BUDGET_OUTCOME" ;;
+                esac ;;
+              '') outcome='failed'; reason='budget_unavailable' ;;
+              *) outcome='failed'; reason="$DECISION" ;;
+            esac
+          fi
+          if [[ ! "$outcome" =~ ^[a-z_]{1,64}$ ]]; then outcome='invalid'; fi
+          if [[ ! "$reason" =~ ^[a-z_]{1,64}$ ]]; then reason='invalid'; fi
+          head="$HEAD_SHA"
+          if [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then head='unknown'; fi
+          pr="$PR_NUMBER"
+          if [[ ! "$pr" =~ ^[1-9][0-9]{0,9}$ ]]; then pr='unknown'; fi
+          printf '::notice title=review-outcome::reviewer=%s outcome=%s reason=%s head=%s pr=%s\n' \
+            'opencode' "$outcome" "$reason" "$head" "$pr"
+          exit 0
+
   skipped:
     name: Workflow Skipped
     needs: check-enabled
@@ -5864,3 +5970,26 @@ jobs:
             printf '## Workflow Skipped\n'
             printf 'OpenCode Auto PR Review did not run because %s.\n' "$detail"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The fixed-format review-outcome notice for a policy skip (#187). It reads only the
+      # check-enabled outputs above and never fails.
+      - name: Report review outcome
+        if: ${{ always() }}
+        shell: bash
+        env:
+          WORKFLOW_ENABLED: ${{ needs.check-enabled.outputs.enabled }}
+          POLICY_REASON: ${{ needs.check-enabled.outputs.policy_reason }}
+          HEAD_SHA: ${{ needs.check-enabled.outputs.policy_head }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          set +e
+          reason="$POLICY_REASON"
+          if [[ "$WORKFLOW_ENABLED" != 'true' ]]; then reason='workflow_disabled'; fi
+          if [[ ! "$reason" =~ ^[a-z_]{1,64}$ ]]; then reason='invalid'; fi
+          head="$HEAD_SHA"
+          if [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then head='unknown'; fi
+          pr="$PR_NUMBER"
+          if [[ ! "$pr" =~ ^[1-9][0-9]{0,9}$ ]]; then pr='unknown'; fi
+          printf '::notice title=review-outcome::reviewer=%s outcome=%s reason=%s head=%s pr=%s\n' \
+            'opencode' 'skipped' "$reason" "$head" "$pr"
+          exit 0
