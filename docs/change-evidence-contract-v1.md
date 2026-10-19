@@ -95,6 +95,16 @@ when copying the template; it remains a top-level Markdown heading for this cont
 Its angle-bracket title and HTML comment bodies are instructions that MUST be replaced
 with visible evidence before validation.
 
+### Language convention (not validated)
+
+The title's result text (after any `type(scope): ` prefix) and the content of every field
+SHOULD be written in Korean. Machine-read tokens stay as written: the `type(scope)` prefix,
+field headings, trailers, commands, paths, identifiers, error codes, and fixed phrases that
+tools read, such as the `Not run:` sentinel, issue-closing keywords like `Closes #N`, and
+`review-fix round N`.
+The validator does not check language, and this convention changes no field, order,
+requiredness, or finding.
+
 ## Missing information and non-applicable fields
 
 Authors MUST NOT infer commands, results, impact, or tracker relationships that they did

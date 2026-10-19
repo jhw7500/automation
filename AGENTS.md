@@ -80,8 +80,8 @@ python3 -m scripts.verify_workflow_release --ref <tag> --expected-commit <40-cha
     메시지 파일로 커밋한다: `git commit --cleanup=verbatim --file <msg-file>`.
   - PR 본문: `Contract version`, `Summary`, `Changes`, `Validation`, `Impact and risks`,
     `Related issue`. 템플릿은 `.github/pull_request_template.md`.
-  - 계약이 요구하는 제목 규칙은 결과 중심·72자 이하뿐이다. 저장소 관례는 영문 `type(scope): 결과` 또는
-    `type: 결과`이고 scope는 선택이다. 최근 `git log`를 따른다.
+  - 계약이 요구하는 제목 규칙은 결과 중심·72자 이하뿐이다. 제목은 영문 `type(scope): ` 또는 `type: `
+    접두어(scope는 선택) 뒤에 한국어 결과를 쓰고, 필드 내용도 한국어로 쓴다(계약 "Language convention").
 - PR 생성은 pre-PR tribunal 훅을 통과해야 한다. 브랜치 체크아웃 안에서 아래 형식 그대로 실행한다.
   `cd … &&` 결합, `--head`, `--repo`는 쓰지 않는다. PR이 생긴 뒤의 push는 게이트되지 않는다.
 
