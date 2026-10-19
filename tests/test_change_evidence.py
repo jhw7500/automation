@@ -3209,3 +3209,11 @@ def test_change_evidence_fixtures_trigger_fleet_tests() -> None:
     workflow = (ROOT / ".github/workflows/test-fleet-tools.yml").read_text()
 
     assert workflow.count("- 'tests/fixtures/change-evidence/**'") == 2
+
+
+def test_contract_documents_unvalidated_commit_language_convention() -> None:
+    text = (ROOT / "docs/change-evidence-contract-v1.md").read_text()
+    commit_section = text.split("## Commit fields", 1)[1].split("\n## ", 1)[0]
+    assert "### Language convention (not validated)" in commit_section
+    assert "SHOULD be written in Korean" in commit_section
+    assert "The validator does not check language" in commit_section
