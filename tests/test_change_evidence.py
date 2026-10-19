@@ -3217,3 +3217,4 @@ def test_contract_documents_unvalidated_commit_language_convention() -> None:
     assert "### Language convention (not validated)" in commit_section
     assert "SHOULD be written in Korean" in commit_section
     assert "The validator does not check language" in commit_section
+    assert "the `Not run:` sentinel" in commit_section

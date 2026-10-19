@@ -99,7 +99,9 @@ with visible evidence before validation.
 
 The title's result text (after any `type(scope): ` prefix) and the content of every field
 SHOULD be written in Korean. Machine-read tokens stay as written: the `type(scope)` prefix,
-field headings, trailers, commands, paths, identifiers, and error codes.
+field headings, trailers, commands, paths, identifiers, error codes, and fixed phrases that
+tools read, such as the `Not run:` sentinel, issue-closing keywords like `Closes #N`, and
+`review-fix round N`.
 The validator does not check language, and this convention changes no field, order,
 requiredness, or finding.
 
