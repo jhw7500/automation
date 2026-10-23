@@ -77,7 +77,7 @@ def test_title_over_72_is_validator_only() -> None:
     assert len(title) == 73
     result = checker.check_message(VALID.replace(VALID.splitlines()[0], title, 1))
     assert "commit-title-too-long" in result["evidence_findings"]
-    assert "commit-title-too-long" not in result["title_findings"]
+    assert result["title_findings"] == []
     assert result["valid"] is False
 
 
@@ -124,3 +124,46 @@ def test_sources_digest_matches_files() -> None:
     }
     assert result["sources"] == expected
     assert checker.source_digests() == expected
+
+
+def _padded(total_bytes: int) -> str:
+    base = VALID
+    pad = total_bytes - len(base.encode("utf-8"))
+    assert pad >= 0
+    return base + "a" * pad
+
+
+def test_oversize_message_is_reported_not_validated() -> None:
+    limit = checker._validator.MAX_BYTES
+    over = checker.check_message(_padded(limit + 1))
+    assert over["valid"] is False
+    assert over["auto"] is False
+    assert "document-too-large" in over["evidence_findings"]
+    exact = checker.check_message(_padded(limit))
+    assert "document-too-large" not in exact["evidence_findings"]
+
+
+def test_oversize_auto_looking_message_is_not_auto() -> None:
+    limit = checker._validator.MAX_BYTES
+    result = checker.check_message("Merge branch 'x'\n" + "a" * limit)
+    assert result["auto"] is False
+    assert result["valid"] is False
+    assert result["evidence_findings"] == ["document-too-large"]
+
+
+def test_cli_oversize_exit_code(tmp_path: Path) -> None:
+    path = tmp_path / "big.txt"
+    path.write_text(_padded(checker._validator.MAX_BYTES + 1), encoding="utf-8")
+    assert run_cli("--path", str(path)).returncode == 1
+
+
+def test_cli_unexpected_exception_exits_2(tmp_path: Path, monkeypatch, capsys) -> None:
+    path = tmp_path / "m.txt"
+    path.write_text(VALID, encoding="utf-8")
+
+    def boom(_message: str):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(checker, "check_message", boom)
+    assert checker.main(["--path", str(path)]) == 2
+    assert "check_commit_message: internal error: RuntimeError: boom" in capsys.readouterr().err

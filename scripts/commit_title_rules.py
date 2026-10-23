@@ -64,7 +64,7 @@ def check_title(message: str) -> tuple[TitleFinding, ...]:
             )
     if not subject:
         findings.append(TitleFinding("title-subject-empty", "Title needs a subject after the colon."))
-    elif header.endswith(".") and not header.endswith("..."):
+    if header.endswith(".") and not header.endswith("..."):
         findings.append(TitleFinding("title-subject-full-stop", "Title subject must not end with a period."))
     if header != header.strip():
         findings.append(
@@ -74,7 +74,7 @@ def check_title(message: str) -> tuple[TitleFinding, ...]:
 
 
 # --- automatic messages: @commitlint/is-ignored 19.8.1 default list ---------
-# JS "." excludes \n \r    ; JS multiline ^ and $ break on the same set.
+# JS "." excludes \n \r U+2028 U+2029; JS multiline ^ and $ break on the same set.
 _D = "[^\\n\\r\\u2028\\u2029]"
 _BOL = "(?:\\A|(?<=[\\n\\r\\u2028\\u2029]))"
 _EOL = "(?=[\\n\\r\\u2028\\u2029]|\\Z)"

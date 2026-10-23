@@ -57,6 +57,7 @@ def test_valid_titles_pass(title: str) -> None:
         ("fix: a..", {"title-subject-full-stop"}),
         (" fix: 고친다", {"title-header-trim", "title-type-empty", "title-subject-empty"}),
         ("고친다", {"title-type-empty", "title-subject-empty"}),
+        ("고친다.", {"title-type-empty", "title-subject-empty", "title-subject-full-stop"}),
         ("기능(x): 추가", {"title-type-empty", "title-subject-empty"}),
     ],
 )

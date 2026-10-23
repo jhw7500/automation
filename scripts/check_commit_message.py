@@ -50,6 +50,15 @@ def source_digests() -> dict[str, str]:
 
 def check_message(message: str) -> dict[str, object]:
     sources = source_digests()
+    if len(message.encode("utf-8")) > _validator.MAX_BYTES:
+        return {
+            "auto": False,
+            "valid": False,
+            "title_findings": [finding.code for finding in _rules.check_title(message)],
+            "evidence_findings": ["document-too-large"],
+            "rules_version": _rules.RULES_VERSION,
+            "sources": sources,
+        }
     if _rules.is_auto_message(message):
         return {
             "auto": True,
@@ -86,7 +95,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"check_commit_message: cannot read {args.path}: {error}", file=sys.stderr)
         return 2
 
-    report = check_message(message)
+    try:
+        report = check_message(message)
+    except Exception as error:  # noqa: BLE001 - any internal failure is an I/O-class error, not a verdict
+        print(f"check_commit_message: internal error: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
     if args.format == "json":
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     elif report["auto"]:
