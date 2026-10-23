@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts/check_commit_message.py"
+
+SPEC = importlib.util.spec_from_file_location("check_commit_message", SCRIPT)
+assert SPEC and SPEC.loader
+checker = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = checker
+SPEC.loader.exec_module(checker)
+
+VALID = """feat(commit): 직접 커밋에도 변경 증거를 남긴다
+
+ ### Contract version
+v1
+
+ ### Why
+직접 커밋은 PR 본문 검증을 거치지 않아 변경 이유가 남지 않았다.
+
+ ### Changes
+- 커밋 제목 규칙과 메시지 검사기를 추가한다.
+- 검사기가 계약 validator를 함께 호출한다.
+
+ ### Validation
+- `python3 -m pytest -q tests/test_check_commit_message.py` 통과.
+
+ ### References
+- https://github.com/jhw7500/automation/issues/237
+"""
+
+
+def test_contract_valid_message_passes() -> None:
+    result = checker.check_message(VALID)
+    assert result["valid"] is True
+    assert result["auto"] is False
+    assert result["title_findings"] == []
+    assert result["evidence_findings"] == []
+    assert result["rules_version"] == "1"
+
+
+def test_missing_fields_reported_as_evidence_findings() -> None:
+    result = checker.check_message("feat: 필드가 없다\n\n본문만 있다.\n")
+    assert result["title_findings"] == []
+    assert result["evidence_findings"]
+    assert result["valid"] is False
+
+
+def test_title_and_evidence_findings_combined() -> None:
+    result = checker.check_message("Fix: 고친다.\n\n본문만 있다.\n")
+    assert set(result["title_findings"]) == {
+        "title-type-case",
+        "title-type-enum",
+        "title-subject-full-stop",
+    }
+    assert result["evidence_findings"]
+    assert result["valid"] is False
+
+
+def test_auto_message_skips_both() -> None:
+    result = checker.check_message('Revert "x"\n\nThis reverts commit abc.\n')
+    assert result["auto"] is True
+    assert result["valid"] is True
+    assert result["title_findings"] == []
+    assert result["evidence_findings"] == []
+
+
+def test_title_over_72_is_validator_only() -> None:
+    title = "feat: " + "가" * 67
+    assert len(title) == 73
+    result = checker.check_message(VALID.replace(VALID.splitlines()[0], title, 1))
+    assert "commit-title-too-long" in result["evidence_findings"]
+    assert "commit-title-too-long" not in result["title_findings"]
+    assert result["valid"] is False
+
+
+def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-I", str(SCRIPT), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_cli_exit_codes(tmp_path: Path) -> None:
+    good = tmp_path / "good.txt"
+    good.write_text(VALID, encoding="utf-8")
+    bad = tmp_path / "bad.txt"
+    bad.write_text("Fix: 고친다.\n", encoding="utf-8")
+    auto = tmp_path / "auto.txt"
+    auto.write_text("Merge branch 'x'\n", encoding="utf-8")
+
+    assert run_cli("--path", str(good)).returncode == 0
+    assert run_cli("--path", str(auto)).returncode == 0
+    failed = run_cli("--path", str(bad), "--format", "json")
+    assert failed.returncode == 1
+    assert json.loads(failed.stdout)["valid"] is False
+    assert run_cli("--path", str(tmp_path / "missing.txt")).returncode == 2
+
+
+def test_cli_non_utf8_is_io_error(tmp_path: Path) -> None:
+    path = tmp_path / "latin.txt"
+    path.write_bytes(b"feat: \xff\xfe\n")
+    assert run_cli("--path", str(path)).returncode == 2
+
+
+def test_sources_digest_matches_files() -> None:
+    result = checker.check_message(VALID)
+    expected = {
+        name: hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest()
+        for name in (
+            "validate_change_evidence.py",
+            "commit_title_rules.py",
+            "check_commit_message.py",
+        )
+    }
+    assert result["sources"] == expected
+    assert checker.source_digests() == expected
