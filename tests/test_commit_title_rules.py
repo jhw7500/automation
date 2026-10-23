@@ -53,6 +53,8 @@ def test_valid_titles_pass(title: str) -> None:
         ("feature: 추가한다", {"title-type-enum"}),
         ("fix: ", {"title-subject-empty", "title-header-trim"}),
         ("fix: 고친다.", {"title-subject-full-stop"}),
+        ("fix: 계속...", set()),
+        ("fix: a..", {"title-subject-full-stop"}),
         (" fix: 고친다", {"title-header-trim", "title-type-empty", "title-subject-empty"}),
         ("고친다", {"title-type-empty", "title-subject-empty"}),
         ("기능(x): 추가", {"title-type-empty", "title-subject-empty"}),
@@ -80,6 +82,10 @@ def test_only_first_line_is_checked() -> None:
         "Merge remote-tracking branch 'origin/main'",
         "Automatic merge from x",
         "Auto-merged a into b",
+        "1.2.3",
+        "v1.2.3",
+        "feat: x\n\nMerge branch 'main'",
+        "feat: x\rMerge branch 'y'",
     ],
 )
 def test_auto_messages(message: str) -> None:
@@ -88,7 +94,8 @@ def test_auto_messages(message: str) -> None:
 
 @pytest.mark.parametrize(
     "message",
-    ["feat: merge branch", "chore: release 1.2", "chore: 1.2", "chore: 01.2.3"],
+    ["feat: merge branch", "chore: release 1.2", "chore: 1.2", "chore: 01.2.3",
+     "=1.2.3", "vv1.2.3", "chore: =1.2.3", "chore: vv1.2.3", "Merged foo\ninto bar"],
 )
 def test_non_auto_messages(message: str) -> None:
     assert rules.is_auto_message(message) is False

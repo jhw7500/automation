@@ -41,7 +41,7 @@ jhw7500 fleet의 커밋 제목 규칙 정본 산문이다. 구현은 `scripts/co
 | `title-type-case` | type이 소문자가 아니다 |
 | `title-type-empty` | type이 없다(헤더가 문법에 맞지 않는 경우 포함) |
 | `title-subject-empty` | subject가 없다(헤더가 문법에 맞지 않는 경우 포함) |
-| `title-subject-full-stop` | subject가 `.`로 끝난다 |
+| `title-subject-full-stop` | 첫 줄이 `.`로 끝난다(`...`로 끝나면 제외) |
 | `title-header-trim` | 첫 줄 앞뒤에 공백이 있다 |
 
 72자 제한은 계약 validator의 `commit-title-too-long`만 맡는다. 제목 규칙은 중복 finding을 내지 않는다.
@@ -61,7 +61,7 @@ JS 정규식과 같은 뜻으로 옮겼다(`.`와 멀티라인 `^`·`$`는 `\n`,
 3. `^(R|r)evert (.*)`
 4. `^(R|r)eapply (.*)`
 5. `^(amend|fixup|squash)!`
-6. 첫 줄에서 `^chore(\([^)]+\))?:`를 떼고 trim한 값이 semver: npm `semver.valid()`처럼 앞의 `v`·`=`를 허용하는 SemVer 2.0.0 정식 문법
+6. 첫 줄에서 `^chore(\([^)]+\))?:`를 떼고 trim한 값이 semver: npm `semver.valid()`처럼 앞의 `v` 하나를 허용하는 SemVer 2.0.0 정식 문법(엄격 모드)
 7. `^(Merged (.*?)(in|into) (.*)|Merged PR (.*): (.*))`
 8. `^Merge remote-tracking branch(\s*)(.*)`
 9. `^Automatic merge(.*)`

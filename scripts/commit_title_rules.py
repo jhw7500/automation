@@ -64,7 +64,7 @@ def check_title(message: str) -> tuple[TitleFinding, ...]:
             )
     if not subject:
         findings.append(TitleFinding("title-subject-empty", "Title needs a subject after the colon."))
-    elif subject.endswith("."):
+    elif header.endswith(".") and not header.endswith("..."):
         findings.append(TitleFinding("title-subject-full-stop", "Title subject must not end with a period."))
     if header != header.strip():
         findings.append(
@@ -97,7 +97,7 @@ _AUTO_RES = tuple(re.compile(p) for p in _MULTILINE_PATTERNS) + tuple(
 )
 
 _CHORE_PREFIX_RE = re.compile(r"^chore(\([^)]+\))?:")
-_SEMVER_LEAD_RE = re.compile(r"^[=v]+")
+_SEMVER_LEAD_RE = re.compile(r"^v?")
 _NUM = r"(0|[1-9][0-9]*)"
 _PRE_ID = r"(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)"
 _SEMVER_RE = re.compile(
@@ -109,7 +109,7 @@ _SEMVER_MAX_LENGTH = 256
 
 
 def _is_semver(value: str) -> bool:
-    """npm semver.valid(): optional leading v/=, SemVer 2.0.0 strict grammar."""
+    """npm semver.valid(): at most one leading v, SemVer 2.0.0 strict grammar."""
     value = _SEMVER_LEAD_RE.sub("", value.strip())
     if len(value) > _SEMVER_MAX_LENGTH or not _SEMVER_RE.fullmatch(value):
         return False
@@ -123,4 +123,4 @@ def is_auto_message(message: str) -> bool:
         return True
     first_line = message.split("\n", 1)[0]
     stripped = _CHORE_PREFIX_RE.sub("", first_line, count=1)
-    return stripped != first_line and _is_semver(stripped)
+    return _is_semver(stripped)

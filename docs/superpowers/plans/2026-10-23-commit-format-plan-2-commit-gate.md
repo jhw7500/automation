@@ -30,7 +30,7 @@
   - `^(R|r)evert (.*)`
   - `^(R|r)eapply (.*)`
   - `^(amend|fixup|squash)!`
-  - 첫 줄에서 `^chore(\([^)]+\))?:`를 떼고 trim한 값이 semver인 경우. 판정 기준은 npm `semver.valid()`, 곧 앞의 `v`·`=`를 허용하는 SemVer 2.0.0 정식 문법이다.
+  - 첫 줄에서 `^chore(\([^)]+\))?:`를 떼고 trim한 값이 semver인 경우. 판정 기준은 npm `semver.valid()`, 곧 앞의 `v` 하나를 허용하는 SemVer 2.0.0 정식 문법(엄격 모드)이다.
   - `^(Merged (.*?)(in|into) (.*)|Merged PR (.*): (.*))`
   - `^Merge remote-tracking branch(\s*)(.*)`
   - `^Automatic merge(.*)`
