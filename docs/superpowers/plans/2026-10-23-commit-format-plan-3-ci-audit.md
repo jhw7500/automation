@@ -43,6 +43,7 @@
 3. **커밋이 많은 PR도 잡을 실패시키지 않는다.** 250건을 넘으면 앞 250건만 감사하고 생략 수를 적는다. → Task 1 `test_commit_limit_truncates_with_note`
 4. **내부 오류도 실패가 아니다.** 메시지를 읽지 못하거나 범위가 잘못돼도 warning과 summary 한 줄로 끝내고 exit 0이다. → Task 1 `test_internal_error_is_warning_not_failure`
 5. **commitlint 파일이 있는 5개 저장소만 삭제 변경을 받는다.** pim-package-jhw, pcap-analyzer, jhw-notion, personal-ops, claude-config가 해당한다. 나머지 11개는 caller 추가만 받는다. jhw-notion은 기본 브랜치가 `main`인데 파일에는 `[master]`가 적혀 있다. 그래도 같은 경로라 함께 지워진다. → Task 2 `test_retired_commitlint_paths_are_deleted_only_where_present`
+   - 근거(2026-10-23): `gh api repos/jhw7500/<repo>/contents/<path>?ref=<기본 브랜치>`로 16개 저장소를 조회했다. 위 5곳은 두 파일(`.github/workflows/commitlint.yml`, `.github/commitlint.config.mjs`)이 모두 있다. pcap-analyzer는 `0c8e5276`/`5e27133b`다. 나머지 11곳은 두 파일 모두 404다.
 
 ---
 
@@ -73,8 +74,10 @@
   - 단계:
     1. 중앙 SHA 해석(precedent 방식)
     2. automation checkout: `repository: jhw7500/automation`, `ref: <central sha>`, `path: automation-audit`, `persist-credentials: false`
-    3. 소비자 checkout: `fetch-depth: 0`. PR이면 `ref: ${{ github.event.pull_request.head.sha }}`, `persist-credentials: false`
-    4. `python3 -I automation-audit/scripts/audit_commits.py … --summary-path "$GITHUB_STEP_SUMMARY"`
+    3. 소비자 checkout: `path: audit-target`, `fetch-depth: 0`. PR이면 `ref: ${{ github.event.pull_request.head.sha }}`, `persist-credentials: false`
+       - 별도 `path`가 필요한 이유: 경로 없이 workspace 루트에 받으면, pin된 `actions/checkout`이 `.git` 없는 대상의 내용을 지운다(`src/git-directory-helper.ts:28`, `:120`, Codex 리뷰 P2). 그러면 step 2의 `automation-audit`이 함께 지워진다.
+       - 선례: `opencode-recover-finalization.yml`의 `review-target`
+    4. `python3 -I automation-audit/scripts/audit_commits.py --repo-dir audit-target … --summary-path "$GITHUB_STEP_SUMMARY"`
   - 마지막 step에 `continue-on-error: true`를 둔다. 이중 안전장치이며, 스크립트 자체도 exit 0이다.
 
 - [ ] **Step 1: 실패하는 테스트 작성** — `tests/test_audit_commits.py`는 tmp에 실제 git 저장소를 만들어 쓴다.
@@ -91,6 +94,7 @@
   - `test_audit_never_fails` — 마지막 step의 `continue-on-error`
   - `test_audit_checkout_uses_central_sha_not_workflow_sha` — 파일에 `github.workflow_sha`가 없다.
   - `test_audit_does_not_persist_credentials`
+  - `test_audit_checkouts_use_separate_paths` — 두 checkout step의 `path`가 각각 `automation-audit`·`audit-target`으로 서로 다르고, 실행 step의 `--repo-dir`가 `audit-target`이다
 - [ ] **Step 2: 실패 확인** — `python3 -m pytest -q -p no:cacheprovider tests/test_audit_commits.py tests/test_commit_evidence_audit_workflow.py`
 - [ ] **Step 3: 구현**
 - [ ] **Step 4: 통과 확인** — 같은 명령. 이어서 `python3 scripts/check_workflow_shell_syntax.py`와 기존 pin·secret 테스트 `python3 -m pytest -q -p no:cacheprovider tests/test_action_pins.py tests/test_workflow_secret_contracts.py tests/test_workflow_shell_syntax.py`를 돌린다.

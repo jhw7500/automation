@@ -184,7 +184,7 @@
   - `--git-dir`·`--work-tree`가 있으면 `unknown`이다.
 - 토큰화 전에 `-m "$(cat <<'DELIM'` … `DELIM` … `)"` 형태를 먼저 찾는다. 구분자는 `'DELIM'` 또는 `"DELIM"`처럼 따옴표로 감싼 것이다. 찾으면 heredoc 본문을 그대로 `literal` 메시지로 쓰고, 그 부분을 자리표시 토큰으로 바꾼 뒤 나머지를 해석한다. 따옴표 없는 구분자는 셸 확장이 일어나므로 이 규칙에서 제외한다.
 - 그 밖의 동적 구성(원문의 `$`, 백틱, `<<`, `eval`, `bash -c`, `sh -c`)이 있는 명령에서 감지된 커밋은 모두 `unknown`이다. 판정하지 않으며, 게이트는 통과시킨다(설계 §12).
-- 어떤 토큰 안에 `\bgit\b[^;&|]*\bcommit\b` 문자열이 들어 있으면(`bash -c`·`eval`의 인자처럼 다른 셸에 넘기는 문자열), cwd 기준 `unknown` 1건을 만든다. 독립 토큰 `commit`이 git 하위 명령 자리에 있지 않으면 커밋이 아니다(`git log --grep=commit`).
+- 어떤 토큰 안에 `\bgit\b(?:\s+(?:-C|-c)\s+\S+|\s+--?[A-Za-z][\w-]*(?:=\S+)?)*\s+commit\b`가 맞는 문자열이 있으면, cwd 기준 `unknown` 1건을 만든다. 이런 토큰은 `bash -c`·`eval`의 인자처럼 다른 셸에 넘기는 문자열이다. 이 정규식은 `commit`이 git 하위 명령 자리, 즉 전역 옵션 뒤에 올 때만 맞는다. `git log --grep=commit`은 최상위에서든 `bash -c` 안에서든 커밋이 아니다.
 - 메시지 출처는 다음과 같다.
   - `-F/--file <p>`, `--file=<p>`, `-F<p>`이면 `file`이다. `<p>`가 `-`이면 `unknown`이다.
   - `-m/--message`가 1개 이상이면 `literal`이다. 값이 여러 개면 `"\n\n"`로 잇는다(git 동작).
@@ -203,7 +203,7 @@
   - `test_auto_sources` — `--fixup HEAD`, `--amend --no-edit`, MERGE_HEAD가 있는 repo의 `--no-edit`
   - `test_env_prefix_and_wrappers` — `GIT_AUTHOR_NAME=x env git commit -F m.md` → `file`
   - `test_nested_shell_commit_is_unknown` — `bash -c "git commit -F m.md"`는 cwd 기준 `unknown` 1건이다
-  - `test_git_log_grep_commit_is_not_a_commit` — `git log --grep=commit`과 `git show HEAD -- commit.md`는 `()`다
+  - `test_git_log_grep_commit_is_not_a_commit` — `git log --grep=commit`, `git show HEAD -- commit.md`, `bash -c "git log --grep=commit"`는 `()`다
 - [ ] **Step 2: 실패 확인** — `python3 -m pytest -q tests/commit_gate/test_commit_scan.py`
 - [ ] **Step 3: 구현**
 - [ ] **Step 4: 통과 확인**
