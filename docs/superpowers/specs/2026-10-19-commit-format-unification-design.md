@@ -73,6 +73,9 @@ redmine 주간보고도 같은 방식으로 읽기 어렵다. 어느 저장소�
 4. **강제 수준**: Claude·Codex가 `git commit`을 실행하는 시점에 막고, 사용자가 승인하면 그 커밋 1건만
    통과한다. CI는 audit(보고)만 하고 머지를 막지 않는다. (처음에는 "차단 없음"으로 정했다가
    "커밋 시점 차단 + 승인 통과"로 바꿨다.)
+5. **제목 규칙 엔진** (2026-10-23 사용자 결정, §11): commitlint 대신 automation의 Python 공유 모듈 하나로
+   제목을 검사하고, 게이트와 CI가 같은 automation 커밋의 모듈을 쓴다. 현재 commitlint가 쓰는 오류 규칙과
+   기본 무시 목록은 그대로 옮긴다.
 
 예시:
 
@@ -127,16 +130,18 @@ v1
 ### C. 감사 경로 — 위반을 보이게 (automation → fleet)
 
 1. **재사용 워크플로** (예: `.github/workflows/commit-evidence.yml`): 대상 커밋마다
-   - commitlint를 **automation이 가진 단일 설정**으로 돌린다(호출 시 pin된 automation 커밋에서 설정을
-     읽는다). 소비자 저장소 설정 사본을 쓰지 않는다.
+   - 제목을 **automation이 가진 공유 규칙 모듈**로 검사한다(호출 시 pin된 automation 커밋에서 모듈을
+     읽는다). 소비자 저장소 설정 사본을 쓰지 않는다. (2026-10-23 개정: commitlint 대신 Python 모듈, §11)
    - `validate-change-evidence`를 `kind: commit`, `mode: audit`로 돌린다.
    - 결과를 커밋별 표(SHA, 제목, commitlint 결과, validator finding code)로 step summary에 남긴다.
    - **잡은 실패하지 않는다**(차단은 E에서만). 위반은 summary와 warning annotation으로만 보인다.
 2. **대상 커밋**: PR의 커밋들, 그리고 기본 브랜치로 직접 push된 커밋. merge 커밋은 제외.
-3. **통일 commitlint 설정**: 현재 type 목록(`feat|fix|chore|refactor|docs|test|build|ci|perf|style`) 유지,
-   제목 길이는 계약과 같은 72자, 본문·footer 줄 길이 제한 해제(Validation의 명령을 줄바꿈하지 않기
-   위해 — claude-config에서 이미 이 이유로 해제했다), `subject-case` 해제(한국어), `review-fix` 예외
-   없음.
+3. **통일 제목 규칙** (2026-10-23 개정, §11): 현재 type 목록(`feat|fix|chore|refactor|docs|test|build|ci|perf|style`)
+   유지, 제목 길이는 계약과 같은 72자(validator의 `commit-title-too-long`이 맡는다), 본문·footer 줄 길이 제한
+   해제(Validation의 명령을 줄바꿈하지 않기 위해 — claude-config에서 이미 이 이유로 해제했다),
+   `subject-case` 해제(한국어), `review-fix` 예외 없음. config-conventional에서 상속하던 오류 규칙
+   (`type-case`, `type-empty`, `subject-empty`, `subject-full-stop`, `header-trim`)과 commitlint 기본 무시 목록은
+   유지한다.
 4. **baseline caller와 catalog**: `examples/baseline-workflows/.github/workflows/`에 caller를 추가하고
    `scripts/workflow-catalog.json`에 등록한다. 모든 fleet 저장소에 같은 규칙이 목적이므로 required
    caller로 둔다(§8 판단 3).
@@ -160,10 +165,11 @@ v1
 2. **적용 저장소**: origin이 `github.com/jhw7500/*`인 저장소만. 그 밖의 저장소는 그대로 통과한다
    (§8 판단 7).
 3. **검사 규칙**: CI audit(C)와 **같은 규칙**으로 검사한다 — 계약 validator(`kind: commit`)와 통일
-   commitlint 규칙. 게이트와 CI가 같은 출처(pin된 automation 커밋)의 규칙·validator를 쓰게 해
+   제목 규칙 모듈(§11). 게이트와 CI가 같은 출처(pin된 automation 커밋)의 규칙·validator를 쓰게 해
    판정이 갈라지지 않게 한다. 언어는 검사하지 않는다.
 4. **메시지를 확정할 수 없는 커밋**: 편집기를 여는 `git commit`처럼 메시지를 미리 알 수 없는 명령은
-   막고 `--file` 사용을 안내한다(§8 판단 8). merge·revert처럼 Git이 메시지를 만드는 경우는 통과시킨다.
+   ~~막고 `--file` 사용을 안내한다~~ 통과시키고 경고만 남긴다. CI audit가 결과를 보여 준다(2026-10-23 개정,
+   §12). merge·revert처럼 Git이 메시지를 만드는 경우는 통과시킨다.
 5. **승인**: 위반이면 막고 finding을 보여 준다. 사용자가 승인하면 그 메시지·저장소·HEAD에 묶인
    **일회성 승인**으로 그 커밋 1건만 통과하고, 승인은 쓰는 순간 소비된다. 승인 기록 방식과 보증
    수준은 `pr_override_grant.py`를 따른다.
@@ -187,8 +193,8 @@ v1
 ## 7. 빌더에게 맡기는 것
 
 - 재사용 워크플로의 이름, 커밋 범위 계산 방식, summary 표 모양.
-- commitlint 실행 방식(현재 소비자는 `wagoid/commitlint-github-action@v6`)과 action pin 방식 —
-  이 저장소의 기존 pin 관례를 따른다.
+- ~~commitlint 실행 방식~~ — 2026-10-23 개정으로 commitlint를 쓰지 않는다(§11). 제목 규칙 모듈의
+  내부 구조는 빌더가 정한다.
 - 계약 문서에 넣을 언어 규칙 문장의 정확한 위치와 문구.
 - 저장소별 commitlint 사본 제거 방법.
 - 게이트가 validator·commitlint 규칙을 공급받는 방식(§5-E-3의 "같은 출처" 조건 안에서).
@@ -208,8 +214,8 @@ v1
    머지를 막지 않지만, 실패 시 빨간 체크를 남기고 설정이 통일 규칙과 다르다.
 7. 게이트는 origin이 `github.com/jhw7500/*`인 저장소에만 건다. 외부 fork나 회사 GitLab 저장소까지 계약
    형식을 강제하지 않는다.
-8. 메시지를 미리 알 수 없는 `git commit`(편집기 사용 등)은 통과가 아니라 차단하고 `--file`을 안내한다.
-   작성 스킬이 이미 `--file`을 쓰므로 정상 경로는 영향이 없다.
+8. ~~메시지를 미리 알 수 없는 `git commit`(편집기 사용 등)은 통과가 아니라 차단하고 `--file`을 안내한다.~~
+   2026-10-23 개정(§12): 통과시키고 경고만 남긴다. 게이트가 확실히 판정할 수 있는 위반만 막는다.
 
 ## 9. 후속
 
@@ -255,3 +261,57 @@ v1
     관련 닫힌 Issue: automation#194(계약 v1 정의, 주간보고 점검이 계기, rollout·audit를 범위에 둠),
     claude-config#151(commitlint skip 결함, PR #157로 `review-fix` 예외 추가), claude-config#175(전역
     activation), jhw-notion#165(작성 스킬 통합).
+
+## 11. 개정 (2026-10-23) — 제목 규칙 엔진
+
+**결정**: 통일 제목 규칙을 commitlint 설정이 아니라 automation의 Python 공유 모듈 하나로 구현한다. 계약
+validator와 이 모듈을 함께 부르는 실행기를 CI audit와 커밋 시점 게이트가 같은 automation 커밋에서 쓴다.
+fleet의 commitlint 파일은 걷어낸다. (설계 메모 → critic 판정 "조건부 수용" → 사용자 승인)
+
+**이유**: 게이트는 `/usr/bin/python3` 3.10 훅이고, claude-config 훅과 automation `.github`·`examples` 어디에도
+Node·commitlint 사용 이력이 없다. commitlint를 쓰면 게이트와 CI 양쪽에 Node 런타임과 npm 패키지 고정을 새로
+들여와야 하고, JS 설정과 Python validator 두 엔진의 판정을 따로 맞춰야 한다(반목표 "게이트와 CI가 서로 다른
+규칙"). 제목 규칙을 validator에 넣는 안은 계약 v1의 requiredness 변경(= v2)이라 택하지 않았다.
+
+**규칙** (현재 commitlint가 실제로 쓰는 것을 옮긴다):
+- 헤더 문법: conventionalcommits preset 7.0.2 `headerPattern` `^(\w*)(?:\((.*)\))?!?: (.*)$` (JS `\w`는 ASCII).
+- 오류 규칙: `type-enum`(위 10종), `type-case`(소문자), `type-empty`, `subject-empty`, `subject-full-stop`(`.`),
+  `header-trim`. 72자 제한은 validator의 `commit-title-too-long`만 맡는다(중복 finding 방지).
+- 뺀 것: `header-max-length` 100(→ validator 72), `body/footer-max-line-length`(해제), `subject-case`(해제),
+  경고 등급 `body-leading-blank`·`footer-leading-blank`, `review-fix` 예외.
+- 자동 메시지(commitlint `@commitlint/is-ignored` 19.8.1 기본 목록): 제목 규칙과 validator를 모두 건너뛴다.
+  목록은 모듈 안에 두어 게이트와 CI가 같은 목록을 쓴다.
+
+**critic이 낸 위험과 대응** (계획 2·3에 반영):
+1. 규칙 집합이 말없이 줄어든다 → 위 규칙 목록을 1차 출처에서 옮기고, commitlint가 실제로 판정한 3개
+   저장소(claude-config·personal-ops·pim-package-jhw)의 커밋 이력으로 판정 동등성을 확인한다.
+2. 규칙의 소유·버전이 없다 → 모듈은 접두 문법과 위 규칙만 맡고 `RULES_VERSION`을 둔다. 정본 산문은
+   `docs/commit-title-rules.md`. ~~모듈·실행기·validator를 릴리스 인벤토리에 넣는다~~ 넣지 않는다(§12).
+   소비자는 커밋 SHA로 pin하므로 바이트는 고정되고, 봉인하면 이후 validator 수정마다 릴리스 라인이 필요해진다.
+3. pin 어긋남과 인터프리터 하한 → 게이트 사본은 automation 커밋 SHA가 아니라 파일 digest로 비교한다.
+   게이트 차단 메시지와 CI summary가 automation SHA와 규칙 digest를 출력한다. automation CI에 Python 3.10
+   대상 테스트를 넣는다(계획 3).
+
+**범위 밖**: redmine `lib/collector.js`의 커밋 type 파싱(다른 type 목록, 대소문자 무시)은 주간보고 분류용
+세 번째 소비자로, 이 규칙과 맞추지 않는다.
+
+**근거**: config-conventional 19.1.0 `lib/index.js` 규칙 목록, is-ignored 19.8.1 `lib/defaults.js`,
+conventional-changelog-conventionalcommits 7.0.2 `parserOpts.js:7` (wagoid/commitlint-github-action v6.2.1
+`package.json`의 `^19.1.0` 의존성에서 출발, 2026-10-23 npm 레지스트리·unpkg에서 받음).
+
+## 12. 개정 (2026-10-23) — 개발 마찰 최소화
+
+**사용자 지시**: "너무 깐깐하게 해서 실제 개발을 어렵게 만들지는 마."
+
+**원칙**: 커밋 시점 게이트는 **확실히 판정할 수 있는 명백한 위반만** 막는다. 판정할 수 없거나 게이트 자체가
+실패하면 커밋을 통과시키고 경고만 남긴다. 놓친 것은 CI audit가 보여 준다(차단 없는 안전망). 승인으로 1건만
+통과시키는 규칙(§4-4)은 그대로 둔다.
+
+**바뀐 것**:
+- 메시지를 알 수 없는 커밋(편집기, 해석하지 못한 동적 치환, `bash -c` 안의 커밋)은 통과 + 경고(§5-E-4, §8 판단 8).
+- Claude Code의 기본 형태 `git commit -m "$(cat <<'EOF' … EOF)"`(따옴표로 감싼 heredoc 구분자)는 정적 텍스트로
+  꺼내 검사한다. 이 형태 때문에 `--file`로 다시 쓰게 하지 않는다.
+- `-m` 메시지 위반도 승인할 수 있다(메시지 해시로 바인딩). 파일로 다시 쓰게 하지 않는다.
+- 게이트 내부 오류는 통과 + 경고(fail-open).
+- 차단 사유에는 무엇이 빠졌는지와 바로 쓸 수 있는 고침 방법을 짧게 준다.
+- 규칙 파일·validator를 릴리스 인벤토리에 봉인하지 않는다(§11 대응 2 철회).
