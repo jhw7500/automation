@@ -13,7 +13,7 @@ jhw7500 fleet의 커밋 제목 규칙 정본 산문이다. 구현은 `scripts/co
 
 ## 헤더 문법
 
-첫 줄만 본다. 정규식은 `^(\w*)(?:\((.*)\))?!?: (.*)$`이고 `re.ASCII`로 컴파일한다(JS `\w`와 같은 ASCII).
+첫 줄만 보며, 첫 줄은 첫 `\r\n`·`\r`·`\n`에서 끝난다(validator의 `MARKDOWN_LINE_ENDING_RE`와 같은 경계). 정규식은 `^(\w*)(?:\((.*)\))?!?: (.*)$`이고 `re.ASCII`로 컴파일한다(JS `\w`와 같은 ASCII).
 맞지 않으면 type과 subject를 비어 있다고 본다.
 
 ## type 목록
@@ -79,7 +79,8 @@ JS 정규식과 같은 뜻으로 옮겼다(`.`와 멀티라인 `^`·`$`는 `\n`,
 commitlint와 남아 있는 차이다.
 
 - 숫자로 시작하는 type(`2FA: x`)은 여기서 `title-type-case`가 붙고 commitlint는 붙이지 않는다(둘 다 `type-enum`은 실패).
-- `HEADER_RE`의 `.`는 `\r`와 U+2028에도 맞는데 JS는 아니다(validator는 그런 제목을 거부한다).
+- 제목은 첫 `\r\n`·`\r`·`\n`에서 끝난다(validator 경계). commitlint는 단독 `\r`을 헤더 안에 두고 `type-empty`/`subject-empty`로 실패시킨다.
+- 제목 안의 U+2028은 여기서 `.`에 맞는다(JS는 아니며 validator는 그런 제목을 거부한다).
 - `header-trim`의 공백 집합이 다르다: JS trim은 BOM을 포함하고 Python strip은 `\x1c`-`\x1f`를 포함한다.
 - 앞쪽 빈 줄은 바이트 그대로 검사한다(commitlint는 trim, validator도 거부한다).
 

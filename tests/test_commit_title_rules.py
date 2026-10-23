@@ -124,3 +124,10 @@ def test_rule_files_parse_as_python_310() -> None:
                 continue
             for name in names:
                 assert name in sys.stdlib_module_names, (path.name, name)
+
+
+def test_lone_cr_ends_the_title_like_the_validator() -> None:
+    codes = lambda m: {f.code for f in rules.check_title(m)}  # noqa: E731
+    assert codes("feat: 결과를 고친다.\rbody") == {"title-subject-full-stop"}
+    assert codes("feat: x \rbody") == {"title-header-trim"}
+    assert rules.is_auto_message("chore: 1.2.3\rbody") is True

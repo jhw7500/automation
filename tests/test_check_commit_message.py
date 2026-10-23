@@ -167,3 +167,13 @@ def test_cli_unexpected_exception_exits_2(tmp_path: Path, monkeypatch, capsys) -
     monkeypatch.setattr(checker, "check_message", boom)
     assert checker.main(["--path", str(path)]) == 2
     assert "check_commit_message: internal error: RuntimeError: boom" in capsys.readouterr().err
+
+
+def test_cr_only_line_endings_use_the_validator_title_boundary() -> None:
+    cr_valid = VALID.replace("\n", "\r")
+    ok = checker.check_message(cr_valid)
+    assert ok["valid"] is True
+    assert ok["title_findings"] == []
+    bad = checker.check_message(cr_valid.replace("남긴다\r", "남긴다.\r", 1))
+    assert bad["valid"] is False
+    assert bad["title_findings"] == ["title-subject-full-stop"]

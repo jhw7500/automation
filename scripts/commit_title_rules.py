@@ -30,6 +30,14 @@ TYPES: tuple[str, ...] = (
 HEADER_RE = re.compile(r"^(\w*)(?:\((.*)\))?!?: (.*)$", re.ASCII)
 
 
+# Same first-line boundary as validate_change_evidence.MARKDOWN_LINE_ENDING_RE.
+_LINE_ENDING_RE = re.compile(r"\r\n|\r|\n")
+
+
+def _first_line(message: str) -> str:
+    return _LINE_ENDING_RE.split(message, maxsplit=1)[0]
+
+
 @dataclass(frozen=True)
 class TitleFinding:
     code: str
@@ -38,9 +46,7 @@ class TitleFinding:
 
 def check_title(message: str) -> tuple[TitleFinding, ...]:
     """Check the first line of a commit message. Auto messages are not considered."""
-    header = message.split("\n", 1)[0]
-    if header.endswith("\r"):
-        header = header[:-1]
+    header = _first_line(message)
 
     type_name: str | None = None
     subject: str | None = None
@@ -121,6 +127,6 @@ def is_auto_message(message: str) -> bool:
     """True for merge/revert/fixup/release messages that skip every title and evidence rule."""
     if any(pattern.search(message) for pattern in _AUTO_RES):
         return True
-    first_line = message.split("\n", 1)[0]
+    first_line = _first_line(message)
     stripped = _CHORE_PREFIX_RE.sub("", first_line, count=1)
     return _is_semver(stripped)
