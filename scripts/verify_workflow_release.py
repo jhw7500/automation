@@ -68,6 +68,7 @@ from scripts.workflow_release_inventory import (
     release_supports_opencode_provider_failure_classification,
     release_supports_opencode_dismissal_coverage,
     release_supports_claude_caller_pin_diagnostics,
+    release_supports_commit_audit,
     release_supports_gemini_fallback_quota_reason,
     release_supports_opencode_abandoned_check_cleanup,
     release_supports_review_outcome_annotation,
@@ -80,6 +81,8 @@ from scripts.workflow_release_inventory import (
 
 
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+COMMIT_AUDIT_CALLER = ".github/workflows/commit-evidence-audit.yml"
+COMMIT_AUDIT_WORKFLOW = "commit-evidence-audit.yml"
 CHECK_WORKFLOW_ENABLED_ACTION = (
     "jhw7500/automation/.github/actions/check-workflow-enabled@"
     "a08141d644ab1036cadd8167d48158e827dcd978"
@@ -3576,6 +3579,22 @@ def _verify_tag_catalog(
                 "tag v1.40 violates the approved v1.40 semantic identity"
             )
 
+        commit_audit_entries = [
+            entry
+            for entry in catalog.callers
+            if entry.path.as_posix() == COMMIT_AUDIT_CALLER
+            and entry.central_workflow == COMMIT_AUDIT_WORKFLOW
+        ]
+        if release_supports_commit_audit(ref):
+            if len(commit_audit_entries) != 1:
+                raise ReleaseVerificationError(
+                    "commit-evidence audit caller is missing from its release line"
+                )
+        elif commit_audit_entries:
+            raise ReleaseVerificationError(
+                "commit-evidence audit caller predates its release line"
+            )
+
         canonical_names = {entry.path.as_posix() for entry in tree.files(paths[2])}
         expected_names = {
             f"{config.canonical_dir}/{entry.path.relative_to('.github')}"
@@ -3633,6 +3652,8 @@ def _verify_tag_catalog(
         except yaml.YAMLError as exc:
             raise ReleaseVerificationError(f"{config_name} is invalid YAML") from exc
         expected_workflows = {entry.path.stem for entry in catalog.callers}
+        if release_supports_commit_audit(ref):
+            expected_workflows.remove(PurePosixPath(COMMIT_AUDIT_CALLER).stem)
         workflow_values = (
             canonical_config.get("workflows", {})
             if isinstance(canonical_config, dict)
@@ -7786,6 +7807,12 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/workflows/opencode-auto-review.yml": "572c7b12db12cc8feea2b9c151a1c55e539e1edab0abbe1fde7c81d9701a3124",
     ".github/actions/recover-opencode-review/evidence.py": "f053524acd6ad32fea1454f5bb524d4c299366c11f1c19d1048b6641b595b034",
 }
+EXPECTED_COMMIT_AUDIT_SHA256 = (
+    "57d007295afc5baa259084e251c1332482e51cbe3aaa95aa82a687c6641a3f54"
+)
+EXPECTED_COMMIT_AUDIT_PARSED_SHA256 = (
+    "5c894117ea272c155e7194de1e8f27ca5b4798516a9b1022e14d4e0a0956e4d3"
+)
 CLAUDE_FALLBACK_HARDENING_RELEASE = (1, 78, 1)
 CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE = (1, 78, 2)
 V178_CLAUDE_ROUTER_SHA256 = (
@@ -8335,6 +8362,72 @@ def verify_claude_rollout_fallback_contract(
         raise ReleaseVerificationError("Claude fallback contract is invalid") from None
 
 
+def _verify_commit_audit_workflow(tree: VerifiedCommitTree, ref: str) -> None:
+    path = ".github/workflows/commit-evidence-audit.yml"
+    entry = tree.entry(path)
+    if not release_supports_commit_audit(ref):
+        if entry is not None:
+            raise ReleaseVerificationError(
+                "commit-evidence audit workflow predates its release line"
+            )
+        return
+    if entry is None or entry.object_type != "blob" or entry.mode != "100644":
+        raise ReleaseVerificationError("commit-evidence audit workflow is missing")
+    raw = tree.read_file(path)
+    try:
+        document = _load_release_yaml(raw, reject_duplicate_keys=True)
+        payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
+        job = document["jobs"]["audit"]
+        steps = job["steps"]
+        resolver, source, target, report = steps
+        if (
+            document.get("on") != {"workflow_call": {}}
+            or set(document.get("jobs", {})) != {"audit"}
+            or job.get("continue-on-error") != "true"
+            or job.get("permissions") != {"actions": "read", "contents": "read"}
+            or len(steps) != 4
+            or any(step.get("continue-on-error") != "true" for step in steps)
+            or resolver.get("uses")
+                != "actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea"
+            or resolver.get("id") != "central"
+            or "referenced_workflows" not in resolver.get("with", {}).get("script", "")
+            or "refs.length !== 1" not in resolver.get("with", {}).get("script", "")
+            or "refs[0].path !== prefix + refs[0].sha"
+                not in resolver.get("with", {}).get("script", "")
+            or source.get("uses") != CHECKOUT_ACTION
+            or source.get("with", {}).get("repository") != "jhw7500/automation"
+            or source.get("with", {}).get("ref")
+                != "${{ steps.central.outputs.central_sha }}"
+            or source.get("with", {}).get("path") != "automation-audit"
+            or source.get("with", {}).get("persist-credentials") != "false"
+            or target.get("uses") != CHECKOUT_ACTION
+            or target.get("with", {}).get("repository") != "${{ github.repository }}"
+            or target.get("with", {}).get("path") != "audit-target"
+            or target.get("with", {}).get("fetch-depth") != "0"
+            or target.get("with", {}).get("persist-credentials") != "false"
+            or report.get("if") != "always()"
+            or report.get("env") != {
+                "AUDIT_CENTRAL_OUTCOME": "${{ steps.central.outcome }}",
+                "AUDIT_SOURCE_OUTCOME": "${{ steps.source.outcome }}",
+                "AUDIT_TARGET_OUTCOME": "${{ steps.target.outcome }}",
+                "AUDIT_AUTOMATION_COMMIT": "${{ steps.central.outputs.central_sha }}",
+                "AUDIT_EVENT_NAME": "${{ github.event_name }}",
+            }
+        ):
+            raise ValueError("semantic contract differs")
+    except (KeyError, TypeError, ValueError, yaml.YAMLError):
+        raise ReleaseVerificationError(
+            "commit-evidence audit workflow contract is invalid"
+        ) from None
+    if hashlib.sha256(raw).hexdigest() != EXPECTED_COMMIT_AUDIT_SHA256:
+        raise ReleaseVerificationError("commit-evidence audit workflow bytes differ")
+    if (
+        hashlib.sha256(payload.encode()).hexdigest()
+        != EXPECTED_COMMIT_AUDIT_PARSED_SHA256
+    ):
+        raise ReleaseVerificationError("commit-evidence audit parsed contract differs")
+
+
 def _verify_commit_content(
     repo: Path, ref: str, revision: str
 ) -> VerifiedCommitTree:
@@ -8353,6 +8446,7 @@ def _verify_commit_content(
                 target.write_bytes(tree.read_file(blob.path))
             verify_claude_rollout_fallback_contract(candidate_root, ref)
     _verify_opencode_recovery(tree, ref)
+    _verify_commit_audit_workflow(tree, ref)
     if release_supports_prepare_review_diff(ref):
         _verify_prepare_review_diff_action(tree, ref)
     if release_supports_canonicalize_review(ref):

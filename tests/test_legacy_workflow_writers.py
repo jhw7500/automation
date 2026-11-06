@@ -241,7 +241,7 @@ def test_consumer_docs_match_commit_pins_auth_modes_and_catalog_boundary() -> No
     baseline = BASELINE_README.read_text(encoding="utf-8")
     combined = f"{contract}\n{baseline}"
 
-    assert "14 managed caller workflows" in combined
+    assert "13 managed caller workflows" in combined
     assert "scripts/workflow-catalog.json" in combined
     assert "40-character commit" in combined
     assert "repo_write_auth: github_app" in combined

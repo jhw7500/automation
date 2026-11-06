@@ -36,6 +36,7 @@ from release_fixture_helpers import (
     restore_pre_v176_opencode_recovery,
     restore_pre_v179_carryover_none,
     restore_pre_v178_claude_rollout_fallback,
+    restore_pre_v187_commit_audit,
     restore_pre_v170_opencode_finding_ids,
     restore_retired_manual_pr_review,
     restore_pre_v166_label_mismatch_decline,
@@ -240,6 +241,7 @@ def fallback_release_repo(tmp_path):
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    restore_pre_v187_commit_audit(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -750,6 +752,129 @@ def test_review_outcome_annotation_release_boundary():
         assert not supports(ref), ref
     for ref in ("v1.86", "v1.86.0", "v1.86.1", "v1.87"):
         assert supports(ref), ref
+
+
+def test_commit_audit_release_boundary():
+    supports = release_inventory.release_supports_commit_audit
+    assert release_inventory.COMMIT_AUDIT_RELEASE == (1, 87)
+    for ref in ("v1.85", "v1.86", "v1.86.0", "v1.86.1", "v1.86.99"):
+        assert not supports(ref), ref
+    for ref in ("v1.87", "v1.87.0", "v1.87.1", "v1.88"):
+        assert supports(ref), ref
+
+
+def test_fleet_ci_exercises_commit_audit_on_python_310():
+    document = yaml.load(
+        (ROOT / ".github/workflows/test-fleet-tools.yml").read_bytes(),
+        Loader=yaml.BaseLoader,
+    )
+    job = document["jobs"]["pytest-py310"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["steps"][0]["uses"] == (
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    )
+    assert job["steps"][1] == {
+        "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+        "with": {"python-version": "3.10"},
+    }
+    assert job["steps"][2]["run"] == "python -m pip install pytest PyYAML"
+    assert job["steps"][3]["run"] == (
+        "python -m pytest -q "
+        "tests/test_commit_title_rules.py "
+        "tests/test_check_commit_message.py "
+        "tests/test_audit_commits.py "
+        "tests/test_change_evidence.py"
+    )
+
+
+@pytest.fixture
+def commit_audit_workflow_repo(tmp_path):
+    repo = tmp_path / "commit-audit-workflow"
+    target = repo / ".github/workflows/commit-evidence-audit.yml"
+    target.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / target.relative_to(repo), target)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    return repo, commit(repo, "commit audit workflow")
+
+
+def test_v187_seals_commit_audit_workflow(commit_audit_workflow_repo):
+    repo, candidate = commit_audit_workflow_repo
+    tree = release_verifier.VerifiedCommitTree.open(repo, candidate)
+    release_verifier._verify_commit_audit_workflow(tree, "v1.87")
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="predates its release line",
+    ):
+        release_verifier._verify_commit_audit_workflow(tree, "v1.86")
+
+
+def test_v187_rejects_mutated_commit_audit_workflow(commit_audit_workflow_repo):
+    repo, _ = commit_audit_workflow_repo
+    replace(
+        repo / ".github/workflows/commit-evidence-audit.yml",
+        "      actions: read",
+        "      actions: write",
+        count=1,
+    )
+    bad = commit(repo, "widen commit audit permissions")
+    tree = release_verifier.VerifiedCommitTree.open(repo, bad)
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier._verify_commit_audit_workflow(tree, "v1.87")
+
+
+@pytest.fixture
+def commit_audit_release_repo(tmp_path):
+    repo = tmp_path / "commit-audit-release"
+    repo.mkdir()
+    for relative in RELEASE_PATHS:
+        source, target = ROOT / relative, repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            shutil.copy2(source, target)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    return repo, commit(repo, "v1.87 commit audit candidate")
+
+
+def test_v187_commit_audit_candidate_and_v186_fixture_are_mutually_exclusive(
+    commit_audit_release_repo,
+):
+    repo, candidate = commit_audit_release_repo
+    assert release_verifier.verify_commit_content(repo, "v1.87", candidate) == candidate
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.86", candidate)
+
+    restore_pre_v187_commit_audit(repo)
+    old = commit(repo, "restore v1.86 catalog and caller tree")
+    assert release_verifier.verify_commit_content(repo, "v1.86", old) == old
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.87", old)
+
+
+def test_v187_rejects_a_bootstrap_toggle_for_the_always_on_audit(
+    commit_audit_release_repo,
+):
+    repo, _ = commit_audit_release_repo
+    path = repo / "examples/baseline-workflows/.github/workflow-config.yml"
+    text = path.read_text(encoding="utf-8")
+    marker = "workflows:\n"
+    assert text.count(marker) == 1
+    path.write_text(
+        text.replace(
+            marker,
+            marker + "  commit-evidence-audit:\n    enabled: false\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    bad = commit(repo, "make the always-on audit configurable")
+    with pytest.raises(ReleaseVerificationError, match="disabled bootstrap contract"):
+        release_verifier.verify_commit_content(repo, "v1.87", bad)
 
 
 def test_v186_review_outcome_annotation_is_rejected_on_the_v185_release_line(

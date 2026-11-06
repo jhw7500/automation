@@ -52,6 +52,7 @@ def test_catalog_and_profiles_are_closed() -> None:
     by_kind = {kind: {entry.path.name for entry in catalog.entries if entry.kind == kind}
                for kind in ("required", "optional", "config", "retired")}
     assert by_kind["required"] == {
+        "commit-evidence-audit.yml",
         "claude.yml", "claude-code-review.yml", "gemini-auto-review.yml",
         "gemini-dispatch.yml", "gemini-invoke.yml", "gemini-issue-triage.yml",
         "gemini-scheduled-triage.yml", "gemini-triage.yml",
@@ -64,6 +65,7 @@ def test_catalog_and_profiles_are_closed() -> None:
     # v1.68 withdrew the workflow_dispatch pull-request review: it had produced no
     # successful review since January, blocked by its own PATH override.
     assert by_kind["retired"] == {
+        "commitlint.yml", "commitlint.config.mjs",
         "bump-automation-ref.yml", "gemini-pr-review.yml", "gemini-review.yml",
     }
 

@@ -26,6 +26,7 @@ PROVIDER_KEYS = {
 SHA = "1" * 40
 HEAD_SHA = "2" * 40
 PR_HEAD_SHA = "3" * 40
+CHANGE_REFERENCE = "https://github.com/jhw7500/automation/issues/237"
 
 
 def object_oid(kind: str, payload: bytes) -> str:
@@ -36,8 +37,12 @@ def object_oid(kind: str, payload: bytes) -> str:
 
 def atomic_publication_values(
     base_sha: str = SHA,
-    message: str = "ci: adopt common automation workflows (v1.40)",
+    message: str | None = None,
 ) -> dict[str, object]:
+    if message is None:
+        message = workflow_fleet_git.commit_message(
+            "v1.40", change_reference=CHANGE_REFERENCE
+        )
     content = b"name: managed\n"
     blob_sha = object_oid("blob", content)
     base_tree_sha = "4" * 40
@@ -58,6 +63,85 @@ def atomic_publication_values(
         "blob_sha": blob_sha,
         "message": message,
     }
+
+
+@pytest.mark.parametrize(
+    ("reference", "pull"),
+    [
+        ("https://github.com/jhw7500/automation/issues/237", False),
+        ("https://github.com/jhw7500/automation/pull/242", True),
+    ],
+)
+def test_change_reference_verifies_exact_github_identity(
+    reference: str, pull: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    number = int(reference.rsplit("/", 1)[1])
+    payload: dict[str, object] = {
+        "number": number,
+        "html_url": reference,
+        "repository_url": "https://api.github.com/repos/jhw7500/automation",
+    }
+    if pull:
+        payload["pull_request"] = {"url": "https://api.github.com/pulls/x"}
+    observed: list[list[str]] = []
+
+    def fake_run(args, **_kwargs):
+        observed.append(list(args))
+        return completed(args, json.dumps(payload))
+
+    monkeypatch.setattr(workflow_fleet_git.subprocess, "run", fake_run)
+    assert workflow_fleet_git.verify_change_reference(reference) == reference
+    assert observed == [[
+        "gh", "api", "--hostname", "github.com",
+        f"repos/jhw7500/automation/issues/{number}",
+    ]]
+
+
+def test_change_reference_rejects_non_object_url_without_child_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        workflow_fleet_git.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("invalid URL reached a child process"),
+    )
+    with pytest.raises(workflow_fleet_git.FleetGitError, match="issue or pull request"):
+        workflow_fleet_git.verify_change_reference(
+            "https://github.com/jhw7500/automation/releases/tag/v1.87"
+        )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {"number": 238},
+        {"html_url": "https://github.com/jhw7500/automation/issues/238"},
+        {"repository_url": "https://api.github.com/repos/jhw7500/other"},
+        {"pull_request": {"url": "https://api.github.com/pulls/237"}},
+    ],
+    ids=("number", "canonical-url", "repository", "object-type"),
+)
+def test_change_reference_rejects_mismatched_github_identity(
+    replacement: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = "https://github.com/jhw7500/automation/issues/237"
+    payload: dict[str, object] = {
+        "number": 237,
+        "html_url": reference,
+        "repository_url": "https://api.github.com/repos/jhw7500/automation",
+    }
+    payload.update(replacement)
+    monkeypatch.setattr(
+        workflow_fleet_git,
+        "_json",
+        lambda _args: payload,
+    )
+
+    with pytest.raises(
+        workflow_fleet_git.FleetGitError,
+        match="invalid change reference identity",
+    ):
+        workflow_fleet_git.verify_change_reference(reference)
 
 
 def rollout_commit(
@@ -732,7 +816,12 @@ def test_additional_base_rollout_identity_requires_its_exact_digest_and_commit_m
     base_branch = "ported"
     digest = hashlib.sha256(base_branch.encode("utf-8")).hexdigest()
     branch = f"automation/common-workflows-v1.40-{digest}"
-    message = f"ci: adopt common automation workflows (v1.40; base={base_branch})"
+    message = workflow_fleet_git.commit_message(
+        "v1.40",
+        base_branch,
+        "main",
+        change_reference=CHANGE_REFERENCE,
+    )
     item = replace(snapshot(tmp_path / "repo"), base_branch=base_branch)
     values = atomic_publication_values(message=message)
 
@@ -745,18 +834,29 @@ def test_additional_base_rollout_identity_requires_its_exact_digest_and_commit_m
 
     with pytest.raises(RuntimeError, match="reached GitHub API"):
         workflow_fleet_git.create_rollout_branch(
-            item, branch, commit=rollout_commit(values)
+            item,
+            branch,
+            commit=rollout_commit(values),
+            change_reference=CHANGE_REFERENCE,
         )
 
     for invalid_branch, invalid_message in (
         (f"automation/common-workflows-v1.40-{'0' * 64}", message),
         ("automation/common-workflows-v1.40", message),
-        (branch, "ci: adopt common automation workflows (v1.40)"),
+        (
+            branch,
+            workflow_fleet_git.commit_message(
+                "v1.40", change_reference=CHANGE_REFERENCE
+            ),
+        ),
     ):
         invalid_values = atomic_publication_values(message=invalid_message)
         with pytest.raises(workflow_fleet_git.FleetGitError):
             workflow_fleet_git.create_rollout_branch(
-                item, invalid_branch, commit=rollout_commit(invalid_values)
+                item,
+                invalid_branch,
+                commit=rollout_commit(invalid_values),
+                change_reference=CHANGE_REFERENCE,
             )
 
 
@@ -896,6 +996,7 @@ def test_atomic_rollout_branch_creation_uses_only_literal_git_data_post_schemas(
         repo,
         branch,
         commit=rollout_commit(values, deletions=(".github/workflows/deleted.yml",)),
+        change_reference=CHANGE_REFERENCE,
     )
 
     assert result == values["head_sha"]
@@ -997,6 +1098,7 @@ def test_atomic_rollout_branch_creation_rejects_each_mismatched_api_identity(
             repo,
             branch,
             commit=rollout_commit(values),
+            change_reference=CHANGE_REFERENCE,
         )
 
 
@@ -1032,6 +1134,7 @@ def test_atomic_branch_rejects_incoherent_local_commit_identity_before_api(
             repo,
             "automation/common-workflows-v1.40",
             commit=commit,
+            change_reference=CHANGE_REFERENCE,
         )
 
 
@@ -1173,6 +1276,7 @@ def test_atomic_ref_post_blocks_concurrent_branch_without_advancing_it(
             api_repo,
             branch,
             commit=rollout_commit(values),
+            change_reference=CHANGE_REFERENCE,
         )
 
     if succeeds:
@@ -1200,6 +1304,7 @@ def test_atomic_branch_creation_rejects_default_branch_before_any_child(
             snapshot(tmp_path / "repo"),
             "main",
             commit=rollout_commit(atomic_publication_values()),
+            change_reference=CHANGE_REFERENCE,
         )
 
 
@@ -1258,7 +1363,7 @@ def test_snapshot_operation_rejects_effective_push_url_redirects(
                 item,
                 "automation/common-workflows-v1.40",
                 commit=rollout_commit(atomic_publication_values()),
-            ),
+             change_reference=CHANGE_REFERENCE),
             id="atomic-create",
         ),
     ],
@@ -1556,12 +1661,14 @@ def test_adapter_exposes_no_merge_revert_or_prerequisite_write_api() -> None:
         "RolloutCommit",
         "clone_branch",
         "clone_default_branch",
+            "commit_message",
         "create_pull_request",
         "create_rollout_branch",
         "list_rollout_prs",
         "refetch_branch",
         "refetch_default",
         "remote_branch_sha",
+            "verify_change_reference",
     }
 
 

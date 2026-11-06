@@ -441,7 +441,13 @@ refetches and recomputes.
 
 ### 2. Publish independent PRs
 
-Publish requires explicit repositories and confirmation:
+Publish requires explicit repositories, confirmation, and a full URL for an existing
+`jhw7500` GitHub Issue or pull request that records the rollout change. Replace the
+placeholder below with the actual object URL. Before any publication mutation, the tool
+reads that object once and verifies its repository, number, URL, and Issue/PR type. This
+identity check does not prove that the object is related to the release; the operator is
+responsible for supplying the relevant reference. Plan and audit do not require or look up
+this publish-only reference.
 
 ```bash
 python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
@@ -449,6 +455,7 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
   --workspace "$FLEET_WORKSPACE" \
   --mode publish \
   --ref v1.40.1 \
+  --change-reference 'https://github.com/jhw7500/automation/issues/<issue-number>' \
   --repo wlan-package \
   --confirm \
   --actionlint "$ACTIONLINT"
@@ -504,6 +511,7 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
   --workspace "$FLEET_WORKSPACE" \
   --mode publish \
   --ref v1.40.1 \
+  --change-reference 'https://github.com/jhw7500/automation/issues/<issue-number>' \
   --repo cts-email-mcp-server \
   --bootstrap-repo cts-email-mcp-server \
   --confirm \
@@ -534,6 +542,7 @@ python3 "$AUTOMATION_RELEASE_ROOT/scripts/rollout_workflow_fleet.py" \
   --workspace "$FLEET_WORKSPACE" \
   --mode publish \
   --ref v1.40.1 \
+  --change-reference 'https://github.com/jhw7500/automation/issues/<issue-number>' \
   --repo wpa-supplicant \
   --bootstrap-repo wpa-supplicant \
   --confirm \

@@ -1,4 +1,4 @@
-# Canonical Common AI Caller Baseline
+# Canonical Common Workflow Caller Baseline
 
 `examples/baseline-workflows/.github/` is the sole canonical consumer tree used by the
 fleet renderer. Existing repositories should not copy these files manually; use the
@@ -7,10 +7,10 @@ reviewable plan/publish workflow described in
 
 ## Catalog ownership
 
-The authoritative `scripts/workflow-catalog.json` describes **14 managed caller
-workflows** (ten required and four optional), their triggers, inputs, permissions, central
+The authoritative `scripts/workflow-catalog.json` describes **13 managed caller
+workflows** (nine required and four optional), their triggers, inputs, permissions, central
 targets, and exact secret mappings. `scripts/workflow-config.json` selects optional callers
-and the Gemini repository-write mode for each of the 19 repositories. The baseline README
+and the Gemini repository-write mode for each of the 16 repositories. The baseline README
 is explanatory and is not another policy source.
 
 The canonical tree also contains `.github/workflow-config.yml`. Its
@@ -47,8 +47,12 @@ against same-repository pull request heads, and retain their no-OIDC permission 
 
 ## Consumer configuration
 
-The bootstrap config disables every common caller. For an existing repository, the
-renderer preserves comments, formatting, and all config keys except the release identity:
+The bootstrap config disables the configurable review callers. The required
+`commit-evidence-audit.yml` caller is always enabled and has no config switch. It reports
+commit-format findings without failing CI; its rollout also removes the retired
+`.github/workflows/commitlint.yml` and `.github/commitlint.config.mjs` files where present.
+For an existing repository, the renderer preserves comments, formatting, and all config
+keys except the release identity:
 
 ```yaml
 automation_ref: v1.40.1

@@ -188,6 +188,7 @@ CLAUDE_CALLER_PIN_DIAGNOSTICS_RELEASE = (1, 83)
 GEMINI_FALLBACK_QUOTA_REASON_RELEASE = (1, 84)
 OPENCODE_ABANDONED_CHECK_CLEANUP_RELEASE = (1, 85)
 REVIEW_OUTCOME_ANNOTATION_RELEASE = (1, 86)
+COMMIT_AUDIT_RELEASE = (1, 87)
 CARRYOVER_NONE_RELEASE = (1, 79)
 
 
@@ -380,6 +381,12 @@ def release_supports_opencode_abandoned_check_cleanup(ref: str) -> bool:
 def release_supports_review_outcome_annotation(ref: str) -> bool:
     """Return whether the Claude, Gemini and OpenCode review workflows emit the review-outcome notice."""
     return _release_version(ref) >= REVIEW_OUTCOME_ANNOTATION_RELEASE
+
+
+def release_supports_commit_audit(ref: str) -> bool:
+    """Return whether the release owns the non-blocking commit-evidence audit."""
+
+    return _release_version(ref) >= COMMIT_AUDIT_RELEASE
 
 
 def _with_claude_rollout_fallback_roots(

@@ -6,9 +6,10 @@ behavior remains in reusable workflows published by `jhw7500/automation`.
 ## Authoritative managed set
 
 `scripts/workflow-catalog.json` is the only managed-path and caller-contract authority.
-It defines **14 managed caller workflows**: ten required callers and four optional callers.
+It defines **13 managed caller workflows**: nine required callers and four optional callers.
 It also declares the managed config path and the retired
-`.github/workflows/bump-automation-ref.yml` path. Repository membership and the only
+`.github/workflows/bump-automation-ref.yml`, `.github/workflows/commitlint.yml` and
+`.github/commitlint.config.mjs` paths. Repository membership and the only
 allowed profile differences come from `scripts/workflow-config.json`.
 
 The canonical source bytes live only under:
@@ -41,6 +42,33 @@ The renderer may update only these two scalars in an existing
 `.github/workflow-config.yml`; all other keys, formatting, and comments are preserved.
 An explicitly approved bootstrap creates the canonical disabled config. Never hand-edit a
 caller to use a moving tag or branch.
+
+## Commit evidence audit (v1.87)
+
+The required `commit-evidence-audit.yml` caller is always enabled and has no
+`.github/workflow-config.yml` kill switch. It reports commit-message format drift
+without blocking a pull request or default-branch push. Pull requests audit their
+base-to-head commits; pushes audit only the repository's default branch. Merge commits
+are excluded. The exact range, unreachable-before fallback and 250-commit bound are
+owned by `scripts/audit_commits.py`'s `collect_range()` function rather than duplicated
+in workflow policy.
+
+Each audited commit appears in the step summary with its abbreviated SHA, title,
+title-rule findings, Change Evidence findings and verdict. Violations and internal
+audit errors also emit warning annotations; they do not fail the job. Setup and checkout
+failures converge on the same warning-and-summary result instead of becoming a required
+quality gate.
+
+The summary identifies the immutable automation commit and the SHA-256 digests returned
+by `scripts/check_commit_message.py`. The reusable workflow resolves that commit from
+the current run's single authenticated `referenced_workflows` entry, checks out the
+central implementation and consumer repository into separate paths with credentials
+disabled, and executes the shared checker from the central checkout. It does not copy
+or reimplement title or Change Evidence rules in the consumer repository.
+
+The same rollout retires `.github/workflows/commitlint.yml` and
+`.github/commitlint.config.mjs`. The fleet renderer removes those paths where they
+exist; repositories that never carried them receive only the audit caller.
 
 ## OpenCode original-attempt finalization recovery (v1.76)
 

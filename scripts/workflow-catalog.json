@@ -2,6 +2,34 @@
   "schema_version": 1,
   "entries": [
     {
+      "path": ".github/workflows/commit-evidence-audit.yml",
+      "kind": "required",
+      "central_workflow": "commit-evidence-audit.yml",
+      "auth_family": "none",
+      "profile_axis": null,
+      "trigger": {
+        "pull_request": {
+          "types": [
+            "opened",
+            "synchronize",
+            "reopened"
+          ]
+        },
+        "push": ""
+      },
+      "caller_jobs": [
+        {
+          "name": "audit",
+          "permissions": {
+            "actions": "read",
+            "contents": "read"
+          },
+          "with": [],
+          "secrets": []
+        }
+      ]
+    },
+    {
       "path": ".github/workflows/claude.yml",
       "kind": "required",
       "central_workflow": "claude.yml",
@@ -628,6 +656,24 @@
     },
     {
       "path": ".github/workflows/bump-automation-ref.yml",
+      "kind": "retired",
+      "central_workflow": null,
+      "auth_family": "none",
+      "profile_axis": null,
+      "trigger": {},
+      "caller_jobs": []
+    },
+    {
+      "path": ".github/workflows/commitlint.yml",
+      "kind": "retired",
+      "central_workflow": null,
+      "auth_family": "none",
+      "profile_axis": null,
+      "trigger": {},
+      "caller_jobs": []
+    },
+    {
+      "path": ".github/commitlint.config.mjs",
       "kind": "retired",
       "central_workflow": null,
       "auth_family": "none",

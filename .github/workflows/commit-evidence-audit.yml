@@ -1,0 +1,84 @@
+name: Commit evidence audit
+
+on:
+  workflow_call: {}
+
+jobs:
+  audit:
+    if: github.event_name == 'pull_request' || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Resolve trusted audit implementation
+        id: central
+        continue-on-error: true
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # ratchet:actions/github-script@v7
+        with:
+          script: |
+            const {data: run} = await github.rest.actions.getWorkflowRunAttempt({
+              ...context.repo,
+              run_id: Number(process.env.GITHUB_RUN_ID),
+              attempt_number: Number(process.env.GITHUB_RUN_ATTEMPT),
+            });
+            const prefix = 'jhw7500/automation/.github/workflows/commit-evidence-audit.yml@';
+            const refs = (run.referenced_workflows || []).filter((ref) => ref.path?.startsWith(prefix));
+            if (run.id !== Number(process.env.GITHUB_RUN_ID)
+              || run.run_attempt !== Number(process.env.GITHUB_RUN_ATTEMPT)
+              || run.repository?.full_name !== process.env.GITHUB_REPOSITORY
+              || run.event !== context.eventName
+              || !['pull_request', 'push'].includes(run.event)
+              || run.status !== 'in_progress'
+              || refs.length !== 1
+              || !/^[0-9a-f]{40}$/.test(refs[0].sha || '')
+              || refs[0].path !== prefix + refs[0].sha) {
+              throw new Error('audit_implementation_identity_invalid');
+            }
+            core.setOutput('central_sha', refs[0].sha);
+      - name: Checkout trusted audit implementation
+        id: source
+        if: steps.central.outcome == 'success'
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jhw7500/automation
+          ref: ${{ steps.central.outputs.central_sha }}
+          path: automation-audit
+          persist-credentials: false
+      - name: Checkout audited Git objects
+        id: target
+        if: steps.source.outcome == 'success'
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: audit-target
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Report commit evidence
+        if: always()
+        continue-on-error: true
+        env:
+          AUDIT_CENTRAL_OUTCOME: ${{ steps.central.outcome }}
+          AUDIT_SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          AUDIT_TARGET_OUTCOME: ${{ steps.target.outcome }}
+          AUDIT_AUTOMATION_COMMIT: ${{ steps.central.outputs.central_sha }}
+          AUDIT_EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          if [ "${AUDIT_CENTRAL_OUTCOME:-}" != success ] \
+            || [ "${AUDIT_SOURCE_OUTCOME:-}" != success ] \
+            || [ "${AUDIT_TARGET_OUTCOME:-}" != success ]; then
+            printf '%s\n' '::warning title=commit-evidence-audit::Audit setup unavailable; no commit verdict was produced.'
+            printf '%s\n' 'Commit evidence audit: setup unavailable; no commit verdict was produced.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 -I automation-audit/scripts/audit_commits.py \
+            --repo-dir audit-target \
+            --event-name "$AUDIT_EVENT_NAME" \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --automation-commit "$AUDIT_AUTOMATION_COMMIT" \
+            --summary-path "$GITHUB_STEP_SUMMARY"

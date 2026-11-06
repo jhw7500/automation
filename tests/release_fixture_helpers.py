@@ -67,9 +67,19 @@ def restore_pre_v178_claude_rollout_fallback(repo: Path) -> None:
 
     root = Path(__file__).resolve().parents[1]
     tree = None
+    v186_tree = None
     for relative in PRE_V178_FILES:
         path = repo / relative
-        if path.is_file() and path.read_bytes() == (root / relative).read_bytes():
+        if not path.is_file():
+            continue
+        current = path.read_bytes()
+        eligible = current == (root / relative).read_bytes()
+        if relative == "scripts/workflow-catalog.json" and not eligible:
+            v186_tree = VerifiedCommitTree.open(
+                root, V186_COMMIT_AUDIT_BOUNDARY_COMMIT
+            )
+            eligible = current == v186_tree.read_file(relative)
+        if eligible:
             if tree is None:
                 tree = VerifiedCommitTree.open(root, V177_FALLBACK_BOUNDARY_COMMIT)
             path.write_bytes(tree.read_file(relative))
@@ -123,6 +133,16 @@ V179_FILTERED_PRESERVATION_EDITS = {
 
 
 V185_REVIEW_OUTCOME_BOUNDARY_COMMIT = "b9c46ab8f3218a0e5cdc79715517f071f47979d2"
+V186_COMMIT_AUDIT_BOUNDARY_COMMIT = "345cc7916e051e19fcf1480ddd503cf45a6a5ee1"
+V187_COMMIT_AUDIT_PATHS = (
+    ".github/workflows/commit-evidence-audit.yml",
+    "examples/baseline-workflows/.github/workflows/commit-evidence-audit.yml",
+)
+V187_COMMIT_AUDIT_CATALOG_PATHS = frozenset({
+    ".github/workflows/commit-evidence-audit.yml",
+    ".github/workflows/commitlint.yml",
+    ".github/commitlint.config.mjs",
+})
 PRE_V186_FILES = (
     ".github/workflows/claude-code-review.yml",
     ".github/workflows/gemini-auto-review.yml",
@@ -131,12 +151,41 @@ PRE_V186_FILES = (
 )
 
 
+def restore_pre_v187_commit_audit(repo: Path) -> None:
+    """Remove the v1.87 audit caller and commitlint retirement policy.
+
+    The v1.86 bootstrap config intentionally keeps its closed list of disabled
+    review workflows.  The always-on audit caller therefore has no config key.
+    """
+
+    for relative in V187_COMMIT_AUDIT_PATHS:
+        (repo / relative).unlink(missing_ok=True)
+    catalog_path = repo / "scripts/workflow-catalog.json"
+    if not catalog_path.is_file():
+        return
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    entries = catalog.get("entries")
+    if not isinstance(entries, list):
+        return
+    actual_paths = {
+        entry.get("path") for entry in entries if isinstance(entry, dict)
+    }
+    if V187_COMMIT_AUDIT_CATALOG_PATHS <= actual_paths:
+        from scripts.verify_workflow_release import VerifiedCommitTree
+
+        root = Path(__file__).resolve().parents[1]
+        tree = VerifiedCommitTree.open(root, V186_COMMIT_AUDIT_BOUNDARY_COMMIT)
+        catalog_path.write_bytes(tree.read_file("scripts/workflow-catalog.json"))
+
+
 def restore_pre_v186_review_outcome_annotation(repo: Path) -> None:
     """Restore the authenticated v1.85 review workflows and OpenCode recovery evidence.
 
     Restore only a current file, so older restore chains that already replaced
     these files, and deliberately mutated test bytes, survive.
     """
+    restore_pre_v187_commit_audit(repo)
+
     from scripts.verify_workflow_release import (
         EXPECTED_GEMINI_FALLBACK_QUOTA_REASON_SHA256,
         V183_CLAUDE_REVIEW_SHA256,

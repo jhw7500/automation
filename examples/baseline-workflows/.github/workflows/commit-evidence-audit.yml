@@ -1,0 +1,13 @@
+name: Commit evidence audit
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+
+jobs:
+  audit:
+    permissions:
+      actions: read
+      contents: read
+    uses: jhw7500/automation/.github/workflows/commit-evidence-audit.yml@__AUTOMATION_COMMIT__
