@@ -48,7 +48,8 @@ caller to use a moving tag or branch.
 The required `commit-evidence-audit.yml` caller is always enabled and has no
 `.github/workflow-config.yml` kill switch. It reports commit-message format drift
 without blocking a pull request or default-branch push. Pull requests audit their
-base-to-head commits; pushes audit only the repository's default branch. Merge commits
+base-to-head commits; pushes audit only the repository's default branch. Tags, including
+a tag with the same short name as the default branch, do not run the audit. Merge commits
 are excluded. The exact range, unreachable-before fallback and 250-commit bound are
 owned by `scripts/audit_commits.py`'s `collect_range()` function rather than duplicated
 in workflow policy.

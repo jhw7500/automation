@@ -915,6 +915,23 @@ def test_v186_does_not_require_commit_audit_runtime(commit_audit_release_repo):
     assert release_verifier.verify_commit_content(repo, "v1.86", candidate) == candidate
 
 
+@pytest.mark.parametrize("relative", tuple(COMMIT_AUDIT_RUNTIME_FUNCTIONS))
+def test_v187_runtime_admission_does_not_execute_candidate_code(
+    commit_audit_release_repo, relative, tmp_path,
+):
+    repo, _ = commit_audit_release_repo
+    marker = tmp_path / "candidate-code-executed"
+    path = repo / relative
+    path.write_text(
+        path.read_text()
+        + f"\n__import__('pathlib').Path({str(marker)!r}).write_text('executed')\n"
+    )
+    candidate = commit(repo, "candidate runtime side-effect sentinel")
+
+    assert release_verifier.verify_commit_content(repo, "v1.87", candidate) == candidate
+    assert not marker.exists()
+
+
 def test_v187_rejects_a_bootstrap_toggle_for_the_always_on_audit(
     commit_audit_release_repo,
 ):

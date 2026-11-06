@@ -133,6 +133,41 @@ def fake_bundle_context(bundle: ReleaseBundle):
     return nullcontext(bundle)
 
 
+@pytest.mark.parametrize("mode", ["plan", "publish"])
+def test_main_reaches_real_prevalidation_and_writes_a_manifest(
+    tmp_path: Path, bundle: ReleaseBundle, mode: str
+) -> None:
+    """An unsupported prevalidation keyword must not hide behind a loose mock."""
+
+    snap = initialized_canonical_fleet_repository(tmp_path, bundle)
+    workspace = marked_workspace(tmp_path)
+    arguments = ["--mode", mode, "--workspace", str(workspace), "--repo", "gstApp"]
+    if mode == "publish":
+        arguments += ["--confirm", "--change-reference", CHANGE_REFERENCE]
+
+    def publish(
+        _bundle, _workspace, *, repo, base_branch, prevalidated_default_branch,
+        bootstrap, actionlint, change_reference,
+    ):
+        assert mode == "publish"
+        assert change_reference == CHANGE_REFERENCE
+        return rollout.RepoOutcome(repo, "current", "already current", snap.base_sha)
+
+    with (
+        mock.patch.object(rollout, "materialize_release_bundle", return_value=nullcontext(bundle)),
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "refetch_default", return_value=snap.base_sha),
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=None),
+        mock.patch.object(rollout, "publish_repository", side_effect=publish),
+    ):
+        assert rollout.main(arguments) == 0
+
+    manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+    assert len(manifest) == 1
+    assert manifest[0]["status"] == "current"
+    assert manifest[0]["repo"] == "gstApp"
+
+
 def test_public_report_model_and_exact_release_text() -> None:
     assert [item.name for item in fields(rollout.RepoOutcome)] == [
         "repo",
@@ -1698,6 +1733,84 @@ def initialized_repository(tmp_path: Path) -> tuple[RepositorySnapshot, RenderPl
         ),
     )
     return RepositorySnapshot(repo, "main", base, frozenset(), frozenset(), label_names=ALL_LABELS), plan
+
+
+@pytest.mark.parametrize("base_branch", [None, "ported"])
+@pytest.mark.parametrize("existing_pr", [False, True])
+@pytest.mark.parametrize("mutation", [None, "reference", "legacy", "author", "date"])
+def test_publish_attests_existing_commit_identity_before_creating_or_reusing_pr(
+    tmp_path: Path, bundle: ReleaseBundle, base_branch: str | None,
+    existing_pr: bool, mutation: str | None,
+) -> None:
+    """The right tree cannot authorize another message, author, or timestamp."""
+
+    snap, plan = initialized_repository(tmp_path)
+    snap = replace(snap, base_branch=base_branch)
+    constructed = rollout.construct_rollout_commit(
+        snap, snap.base_sha, bundle.ref, plan, bundle.catalog,
+        change_reference=CHANGE_REFERENCE,
+    )
+    raw = subprocess.check_output(
+        ["git", "cat-file", "commit", constructed.head_sha], cwd=snap.path
+    )
+    if mutation == "reference":
+        raw = raw.replace(CHANGE_REFERENCE.encode(), b"https://github.com/jhw7500/automation/issues/238")
+    elif mutation == "legacy":
+        raw = raw.split(b"\n\n", 1)[0] + b"\n\nci: adopt common workflows\n"
+    elif mutation == "author":
+        raw = raw.replace(b"author workflow-fleet <", b"author another-operator <", 1)
+    elif mutation == "date":
+        raw = raw.replace(b"946684800 +0000", b"946684801 +0000", 1)
+    head = subprocess.run(
+        ["git", "hash-object", "-w", "-t", "commit", "--stdin"],
+        cwd=snap.path, input=raw, stdout=subprocess.PIPE, check=True,
+    ).stdout.decode().strip()
+    selected_base = base_branch or "main"
+    branch = rollout.rollout_branch(bundle.ref, selected_base, "main")
+    subprocess.run(["git", "update-ref", f"refs/heads/{branch}", head], cwd=snap.path, check=True)
+    subprocess.run(["git", "reset", "--hard", "-q", head], cwd=snap.path, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(snap.path)], cwd=snap.path, check=True)
+    request = PullRequest(
+        7, "https://github.com/jhw7500/gstApp/pull/7", "OPEN",
+        selected_base, branch, "jhw7500/gstApp", head,
+        rollout.pr_title(bundle.ref, selected_base, "main"),
+        rollout.pr_body(bundle.ref, bundle.commit, (".github/workflows/claude.yml",), selected_base, "main"),
+    )
+    requests = [request] if existing_pr else []
+
+    def create_pr(*_args):
+        requests.append(request)
+        return request
+
+    with (
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "clone_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "refetch_default", return_value=snap.base_sha),
+        mock.patch.object(rollout.fleet_git, "refetch_branch", return_value=snap.base_sha),
+        mock.patch.object(rollout, "_render", return_value=plan),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=head),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", side_effect=lambda *_a: tuple(requests)),
+        mock.patch.object(rollout.fleet_git, "create_pull_request", side_effect=create_pr),
+    ):
+        # Read-only inspection can plan without a reference; publish must attest it.
+        assert rollout.inspect_rollout(snap, snap.base_sha, bundle.ref, bundle.commit, plan).action == (
+            "reuse" if existing_pr else "create_pr"
+        )
+        result = rollout.publish_repository(
+            bundle, tmp_path, repo="gstApp", base_branch=base_branch,
+            bootstrap=False, actionlint=None, change_reference=CHANGE_REFERENCE,
+        )
+
+    if mutation is None:
+        assert result.status == ("reused" if existing_pr else "published")
+        assert result.head_sha == head
+        assert result.pr_url == request.url
+    else:
+        assert result.status == "blocked"
+        assert result.stage == "branch"
+        assert "commit identity" in result.detail
+        assert requests == ([request] if existing_pr else [])
 
 
 def initialized_canonical_fleet_repository(

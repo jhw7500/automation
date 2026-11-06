@@ -488,7 +488,9 @@ is created or reused. The reuse rules are fail-closed:
 
 - an absent rollout branch may be created from the freshly fetched selected base branch;
 - a matching branch may receive its missing PR only when its base, release commit, and
-  managed path/mode/blob diff exactly match the fresh render;
+  managed path/mode/blob diff exactly match the fresh render; publication also requires
+  its complete commit SHA to match the fixed author, committer, timestamp and message
+  containing the currently verified change reference, before creating or reusing a PR;
 - one exact open PR is reusable only when its base branch, head repository, head branch,
   head object ID, title, body, and remote branch object ID all match;
 - a mismatched branch or PR, multiple PRs, or any closed or merged PR history for the

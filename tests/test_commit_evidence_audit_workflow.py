@@ -20,11 +20,34 @@ def audit_job():
     return document["jobs"]["audit"]
 
 
-def test_audit_job_skips_non_default_branch_push(audit_job):
-    assert audit_job["if"] == (
-        "github.event_name == 'pull_request' || "
-        "github.ref_name == github.event.repository.default_branch"
+@pytest.mark.parametrize(
+    ("event", "ref_type", "ref_name", "expected"),
+    [
+        ("pull_request", "branch", "7/merge", True),
+        ("push", "branch", "main", True),
+        ("push", "branch", "feature", False),
+        ("push", "tag", "main", False),
+        ("push", "tag", "v1.87", False),
+        ("workflow_dispatch", "branch", "main", False),
+    ],
+)
+def test_audit_job_selects_only_prs_and_default_branch_pushes(
+    audit_job, event, ref_type, ref_name, expected
+):
+    github = {
+        "event_name": event, "ref_type": ref_type, "ref_name": ref_name,
+        "event": {"repository": {"default_branch": "main"}},
+    }
+    # The workflow's boolean operators and comparisons are also JavaScript;
+    # evaluate the actual condition against event fixtures rather than its text.
+    program = (
+        "const github=" + json.dumps(github) + ";\n"
+        "process.stdout.write(JSON.stringify(Boolean(" + audit_job["if"] + ")));"
     )
+    result = subprocess.run(
+        ["node", "-e", program], capture_output=True, text=True, check=True
+    )
+    assert json.loads(result.stdout) is expected
 
 
 def test_audit_never_fails(audit_job):

@@ -992,6 +992,8 @@ def inspect_rollout(
     ref: str,
     commit: str,
     plan: RenderPlan,
+    *,
+    change_reference: str | None = None,
 ) -> RolloutInspection:
     """Classify the exact release branch and pull-request identity."""
 
@@ -1010,6 +1012,14 @@ def inspect_rollout(
         return RolloutInspection("create_branch")
 
     validate_existing_branch(snapshot, branch_sha, base_sha, plan, branch=branch)
+    if change_reference is not None:
+        message = fleet_git.commit_message(
+            ref, selected_base, snapshot.default_branch,
+            change_reference=change_reference,
+        )
+        tree_sha = git(["rev-parse", f"{branch_sha}^{{tree}}"], cwd=snapshot.path)
+        if branch_sha != fleet_git.rollout_commit_sha(tree_sha, base_sha, message):
+            raise CommandError("rollout branch commit identity does not match the change reference")
     requests = fleet_git.list_rollout_prs(fleet_git.OWNER, snapshot.path.name, branch)
     if fleet_git.remote_branch_sha(snapshot, branch) != branch_sha:
         raise CommandError("rollout branch changed while pull requests were inspected")
@@ -1411,7 +1421,8 @@ def _publish_repository_fresh(
         )
         progress.stage = "branch"
         inspection = inspect_rollout(
-            snapshot, base_sha, bundle.ref, bundle.commit, plan
+            snapshot, base_sha, bundle.ref, bundle.commit, plan,
+            change_reference=change_reference,
         )
         body = pr_body(
             bundle.ref, bundle.commit, changed, selected_base, snapshot.default_branch
@@ -1707,7 +1718,6 @@ def main(argv: list[str] | None = None) -> int:
                                 args.bootstrap_repo == repo and target_branch is None
                             ),
                             actionlint=actionlint,
-                            change_reference=args.change_reference,
                         )
                     )
 

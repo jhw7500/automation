@@ -117,6 +117,7 @@ __all__ = (
     "refetch_branch",
     "refetch_default",
     "remote_branch_sha",
+    "rollout_commit_sha",
     "verify_change_reference",
 )
 
@@ -723,6 +724,25 @@ def _validate_ref_response(
         raise FleetGitError("GitHub returned an invalid ref identity")
 
 
+def rollout_commit_sha(tree_sha: str, base_sha: str, message: str) -> str:
+    """Compute the exact commit identity shared by new and existing rollouts."""
+
+    _validate_sha1(tree_sha, "rollout tree identity")
+    _validate_sha1(base_sha, "default commit identity")
+    if not isinstance(message, str):
+        raise FleetGitError("rollout commit message is invalid")
+    raw_commit = (
+        f"tree {tree_sha}\n"
+        f"parent {base_sha}\n"
+        "author workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
+        "committer workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
+        f"\n{message}\n"
+    ).encode("utf-8")
+    return hashlib.sha1(
+        f"commit {len(raw_commit)}\0".encode("ascii") + raw_commit
+    ).hexdigest()
+
+
 def _validate_rollout_commit(
     commit: RolloutCommit,
     ref: str,
@@ -751,16 +771,7 @@ def _validate_rollout_commit(
         default_branch,
         change_reference=change_reference,
     )
-    raw_commit = (
-        f"tree {commit.tree_sha}\n"
-        f"parent {commit.base_sha}\n"
-        "author workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
-        "committer workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
-        f"\n{commit.message}\n"
-    ).encode("utf-8")
-    computed_head = hashlib.sha1(
-        f"commit {len(raw_commit)}\0".encode("ascii") + raw_commit
-    ).hexdigest()
+    computed_head = rollout_commit_sha(commit.tree_sha, commit.base_sha, commit.message)
     if commit.message != expected_message or commit.head_sha != computed_head:
         raise FleetGitError("rollout commit message is invalid")
     paths: set[str] = set()

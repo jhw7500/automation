@@ -1661,14 +1661,15 @@ def test_adapter_exposes_no_merge_revert_or_prerequisite_write_api() -> None:
         "RolloutCommit",
         "clone_branch",
         "clone_default_branch",
-            "commit_message",
+        "commit_message",
         "create_pull_request",
         "create_rollout_branch",
         "list_rollout_prs",
         "refetch_branch",
         "refetch_default",
         "remote_branch_sha",
-            "verify_change_reference",
+        "rollout_commit_sha",
+        "verify_change_reference",
     }
 
 
