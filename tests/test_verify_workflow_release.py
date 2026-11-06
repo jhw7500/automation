@@ -45,6 +45,12 @@ from release_fixture_helpers import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+COMMIT_AUDIT_RUNTIME_FUNCTIONS = {
+    "scripts/audit_commits.py": "collect_range",
+    "scripts/check_commit_message.py": "check_message",
+    "scripts/commit_title_rules.py": "check_title",
+    "scripts/validate_change_evidence.py": "validate_text",
+}
 V176_REVIEW_BUDGET_COMMIT = "444a7347aee169ed178aae80e8bd8d10eca52e02"
 REVIEW_INVOCATION_BUDGET_HELPER = (
     ".github/actions/review-invocation-budget/review_invocation_budget.py"
@@ -793,6 +799,10 @@ def commit_audit_workflow_repo(tmp_path):
     target = repo / ".github/workflows/commit-evidence-audit.yml"
     target.parent.mkdir(parents=True)
     shutil.copy2(ROOT / target.relative_to(repo), target)
+    for relative in COMMIT_AUDIT_RUNTIME_FUNCTIONS:
+        runtime = repo / relative
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, runtime)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -835,6 +845,10 @@ def commit_audit_release_repo(tmp_path):
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    for relative in COMMIT_AUDIT_RUNTIME_FUNCTIONS:
+        runtime = repo / relative
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, runtime)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -854,6 +868,51 @@ def test_v187_commit_audit_candidate_and_v186_fixture_are_mutually_exclusive(
     assert release_verifier.verify_commit_content(repo, "v1.86", old) == old
     with pytest.raises(ReleaseVerificationError):
         release_verifier.verify_commit_content(repo, "v1.87", old)
+
+
+@pytest.mark.parametrize("relative", tuple(COMMIT_AUDIT_RUNTIME_FUNCTIONS))
+@pytest.mark.parametrize(
+    "mutation", ["missing", "symlink", "syntax", "return", "missing_function", "shadowed_function"]
+)
+def test_v187_rejects_broken_audit_runtime(commit_audit_release_repo, relative, mutation):
+    repo, _ = commit_audit_release_repo
+    path = repo / relative
+    public_name = COMMIT_AUDIT_RUNTIME_FUNCTIONS[relative]
+    if mutation == "missing":
+        path.unlink()
+    elif mutation == "symlink":
+        path.unlink()
+        path.symlink_to("missing-runtime.py")
+    elif mutation == "syntax":
+        path.write_text("def broken(:\n")
+    elif mutation == "return":
+        path.write_text(path.read_text() + "\nreturn 1\n")
+    elif mutation == "missing_function":
+        path.write_text(path.read_text().replace(f"def {public_name}(", f"def removed_{public_name}(", 1))
+    else:
+        path.write_text(path.read_text() + f"\n{public_name} = None\n")
+    candidate = commit(repo, f"break audit runtime {mutation}")
+    with pytest.raises(ReleaseVerificationError, match="commit-evidence audit runtime"):
+        release_verifier.verify_commit_content(repo, "v1.87", candidate)
+
+
+@pytest.mark.parametrize("relative", tuple(COMMIT_AUDIT_RUNTIME_FUNCTIONS))
+def test_v187_runtime_can_evolve_without_a_new_byte_seal(commit_audit_release_repo, relative):
+    repo, _ = commit_audit_release_repo
+    path = repo / relative
+    path.write_text(path.read_text() + "\n# Compatible runtime revision without resealing workflow bytes.\n")
+    candidate = commit(repo, "evolve unsealed audit runtime")
+    assert release_verifier.verify_commit_content(repo, "v1.87", candidate) == candidate
+    assert relative not in release_inventory.release_paths_for("v1.87")
+
+
+def test_v186_does_not_require_commit_audit_runtime(commit_audit_release_repo):
+    repo, _ = commit_audit_release_repo
+    restore_pre_v187_commit_audit(repo)
+    for relative in COMMIT_AUDIT_RUNTIME_FUNCTIONS:
+        (repo / relative).unlink()
+    candidate = commit(repo, "v1.86 without the later audit runtime")
+    assert release_verifier.verify_commit_content(repo, "v1.86", candidate) == candidate
 
 
 def test_v187_rejects_a_bootstrap_toggle_for_the_always_on_audit(

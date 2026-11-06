@@ -8362,6 +8362,42 @@ def verify_claude_rollout_fallback_contract(
         raise ReleaseVerificationError("Claude fallback contract is invalid") from None
 
 
+def _verify_commit_audit_runtime(tree: VerifiedCommitTree) -> None:
+    """Check the committed runtime surface without freezing rule implementation bytes."""
+    contracts = {
+        "scripts/audit_commits.py": (
+            ("collect_range", "audit", "render_summary", "render_annotations", "main"),
+            (),
+        ),
+        "scripts/check_commit_message.py": (
+            ("check_message", "source_digests", "main"), (),
+        ),
+        "scripts/commit_title_rules.py": (
+            ("is_auto_message", "check_title"), ("RULES_VERSION",),
+        ),
+        "scripts/validate_change_evidence.py": (("validate_text",), ("MAX_BYTES",)),
+    }
+    for relative, (functions, values) in contracts.items():
+        entry = tree.entry(relative)
+        if entry is None or entry.object_type != "blob" or entry.mode not in {"100644", "100755"}:
+            raise ReleaseVerificationError(
+                f"commit-evidence audit runtime is missing or not a regular file: {relative}"
+            )
+        try:
+            source = tree.read_text(relative)
+            module = ast.parse(source, filename=relative, feature_version=(3, 10))
+            # Parsing alone accepts a module-level return; compile but never
+            # import or execute candidate code in the release verifier.
+            compile(module, relative, "exec", dont_inherit=True)
+            _require_unique_module_bindings(module, frozenset((*functions, *values)))
+            for name in functions:
+                _function_node(module, name)
+        except (SyntaxError, ValueError, UnicodeError, TypeError, RecursionError):
+            raise ReleaseVerificationError(
+                f"commit-evidence audit runtime contract is invalid: {relative}"
+            ) from None
+
+
 def _verify_commit_audit_workflow(tree: VerifiedCommitTree, ref: str) -> None:
     path = ".github/workflows/commit-evidence-audit.yml"
     entry = tree.entry(path)
@@ -8426,6 +8462,7 @@ def _verify_commit_audit_workflow(tree: VerifiedCommitTree, ref: str) -> None:
         != EXPECTED_COMMIT_AUDIT_PARSED_SHA256
     ):
         raise ReleaseVerificationError("commit-evidence audit parsed contract differs")
+    _verify_commit_audit_runtime(tree)
 
 
 def _verify_commit_content(

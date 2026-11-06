@@ -66,6 +66,13 @@ central implementation and consumer repository into separate paths with credenti
 disabled, and executes the shared checker from the central checkout. It does not copy
 or reimplement title or Change Evidence rules in the consumer repository.
 
+Release verification reads the four runtime Python files from the authenticated
+candidate commit and requires regular blobs, Python 3.10 syntax that compiles, and
+unique required function and value declarations. It never imports or executes that
+candidate code. These admission checks do not freeze the rule implementation bytes
+or add the runtime files to the sealed release inventory: compatible rule changes
+remain possible under the same workflow release line, as specified in design section 12.
+
 The same rollout retires `.github/workflows/commitlint.yml` and
 `.github/commitlint.config.mjs`. The fleet renderer removes those paths where they
 exist; repositories that never carried them receive only the audit caller.
