@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const childProcess = require('node:child_process');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const approved = new Set(['b8804d0c387e4f7e554443a1d0edd5862d9c4b1c1435de4140c621c241a25df5',
+  '392337a3807f9db7fb3166c8acf521f9b4179d4ba1d801b44cf84d1ed81f957d',
   '3915f9bc32985745996d2246017cff9122460d25a071ca72568ac73c75339371',
   'deb5353681c02b8932b9da47c49c28549654f6b8dc5852c58e7497de84e6623a',
   '451d33c21930acdbd74674dddb7031fecc4d9d9d4e3e22289f40b4c1d2aa7c8a',

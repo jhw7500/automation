@@ -61,19 +61,37 @@ def restore_pre_v178_claude_rollout_fallback(repo: Path) -> None:
     earlier historical changes or deliberately mutated test bytes. The immutable
     tree supplies the old ledger, publisher key sets, caller and catalog ceiling.
     """
-    from scripts.verify_workflow_release import VerifiedCommitTree
+    from scripts.verify_workflow_release import (
+        V187_OPENCODE_AUTO_REVIEW_SHA256,
+        V187_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+        V187_OPENCODE_RECOVERY_REPLAY_SHA256,
+        V187_REVIEW_INVOCATION_BUDGET_HELPER_SHA256,
+        VerifiedCommitTree,
+    )
 
     restore_pre_v179_carryover_none(repo)
 
     root = Path(__file__).resolve().parents[1]
     tree = None
     v186_tree = None
+    v187_hashes = {
+        ".github/actions/review-invocation-budget/review_invocation_budget.py":
+            V187_REVIEW_INVOCATION_BUDGET_HELPER_SHA256,
+        ".github/workflows/opencode-auto-review.yml":
+            V187_OPENCODE_AUTO_REVIEW_SHA256,
+        ".github/actions/recover-opencode-review/evidence.py":
+            V187_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+        ".github/actions/recover-opencode-review/replay.js":
+            V187_OPENCODE_RECOVERY_REPLAY_SHA256,
+    }
     for relative in PRE_V178_FILES:
         path = repo / relative
         if not path.is_file():
             continue
         current = path.read_bytes()
         eligible = current == (root / relative).read_bytes()
+        if relative in V188_REVIEW_DIAGNOSTIC_PATHS and not eligible:
+            eligible = hashlib.sha256(current).hexdigest() == v187_hashes[relative]
         if relative == "scripts/workflow-catalog.json" and not eligible:
             v186_tree = VerifiedCommitTree.open(
                 root, V186_COMMIT_AUDIT_BOUNDARY_COMMIT
@@ -134,6 +152,13 @@ V179_FILTERED_PRESERVATION_EDITS = {
 
 V185_REVIEW_OUTCOME_BOUNDARY_COMMIT = "b9c46ab8f3218a0e5cdc79715517f071f47979d2"
 V186_COMMIT_AUDIT_BOUNDARY_COMMIT = "345cc7916e051e19fcf1480ddd503cf45a6a5ee1"
+V187_REVIEW_DIAGNOSTICS_BOUNDARY_COMMIT = "17e7747b76c63b3ea25067c48654935eaf1274ba"
+V188_REVIEW_DIAGNOSTIC_PATHS = (
+    ".github/actions/review-invocation-budget/review_invocation_budget.py",
+    ".github/workflows/opencode-auto-review.yml",
+    ".github/actions/recover-opencode-review/evidence.py",
+    ".github/actions/recover-opencode-review/replay.js",
+)
 V187_COMMIT_AUDIT_PATHS = (
     ".github/workflows/commit-evidence-audit.yml",
     "examples/baseline-workflows/.github/workflows/commit-evidence-audit.yml",
@@ -151,12 +176,34 @@ PRE_V186_FILES = (
 )
 
 
+def restore_pre_v188_review_diagnostics(repo: Path) -> None:
+    """Restore the published v1.87 review bytes over an exact current copy.
+
+    Deliberately mutated fixtures are left untouched. The immutable commit is
+    the source of historical bytes, so later v1.88 edits cannot rewrite the
+    v1.87 fixture by changing this repository checkout.
+    """
+    from scripts.verify_workflow_release import VerifiedCommitTree
+
+    root = Path(__file__).resolve().parents[1]
+    tree = None
+    for relative in V188_REVIEW_DIAGNOSTIC_PATHS:
+        path = repo / relative
+        if not path.is_file() or path.read_bytes() != (root / relative).read_bytes():
+            continue
+        if tree is None:
+            tree = VerifiedCommitTree.open(root, V187_REVIEW_DIAGNOSTICS_BOUNDARY_COMMIT)
+        path.write_bytes(tree.read_file(relative))
+
+
 def restore_pre_v187_commit_audit(repo: Path) -> None:
     """Remove the v1.87 audit caller and commitlint retirement policy.
 
     The v1.86 bootstrap config intentionally keeps its closed list of disabled
     review workflows.  The always-on audit caller therefore has no config key.
     """
+
+    restore_pre_v188_review_diagnostics(repo)
 
     for relative in V187_COMMIT_AUDIT_PATHS:
         (repo / relative).unlink(missing_ok=True)
@@ -191,6 +238,8 @@ def restore_pre_v186_review_outcome_annotation(repo: Path) -> None:
         V183_CLAUDE_REVIEW_SHA256,
         V185_OPENCODE_AUTO_REVIEW_SHA256,
         V185_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+        V187_OPENCODE_AUTO_REVIEW_SHA256,
+        V187_OPENCODE_RECOVERY_EVIDENCE_SHA256,
         VerifiedCommitTree,
     )
 
@@ -200,9 +249,21 @@ def restore_pre_v186_review_outcome_annotation(repo: Path) -> None:
     )))
     root = Path(__file__).resolve().parents[1]
     tree = None
+    v187_hashes = {
+        ".github/workflows/opencode-auto-review.yml":
+            V187_OPENCODE_AUTO_REVIEW_SHA256,
+        ".github/actions/recover-opencode-review/evidence.py":
+            V187_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+    }
     for relative in PRE_V186_FILES:
         path = repo / relative
-        if path.is_file() and path.read_bytes() == (root / relative).read_bytes():
+        if not path.is_file():
+            continue
+        current = path.read_bytes()
+        eligible = current == (root / relative).read_bytes()
+        if relative in V188_REVIEW_DIAGNOSTIC_PATHS and not eligible:
+            eligible = hashlib.sha256(current).hexdigest() == v187_hashes[relative]
+        if eligible:
             if tree is None:
                 tree = VerifiedCommitTree.open(root, V185_REVIEW_OUTCOME_BOUNDARY_COMMIT)
             payload = tree.read_file(relative)
@@ -341,6 +402,7 @@ def restore_pre_v182_opencode_dismissal_coverage(repo: Path) -> None:
         V181_OPENCODE_RECOVERY_REPLAY_SHA256,
         V182_OPENCODE_AUTO_REVIEW_SHA256,
         V182_OPENCODE_RECOVERY_EVIDENCE_SHA256,
+        V187_OPENCODE_RECOVERY_REPLAY_SHA256,
         VerifiedCommitTree,
     )
 
@@ -352,7 +414,7 @@ def restore_pre_v182_opencode_dismissal_coverage(repo: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     current = dict(zip(PRE_V182_FILES, (
         V182_OPENCODE_AUTO_REVIEW_SHA256, V182_OPENCODE_RECOVERY_EVIDENCE_SHA256,
-        hashlib.sha256((root / PRE_V182_FILES[2]).read_bytes()).hexdigest(),
+        V187_OPENCODE_RECOVERY_REPLAY_SHA256,
     )))
     tree = None
     for relative in PRE_V182_FILES:

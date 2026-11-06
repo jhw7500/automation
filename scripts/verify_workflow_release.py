@@ -72,6 +72,7 @@ from scripts.workflow_release_inventory import (
     release_supports_gemini_fallback_quota_reason,
     release_supports_opencode_abandoned_check_cleanup,
     release_supports_review_outcome_annotation,
+    release_supports_review_diagnostics,
     release_supports_carryover_none,
     release_retires_manual_pr_review,
     release_supports_same_head_cancel_guard,
@@ -103,6 +104,9 @@ OPENCODE_REVIEW_RUN_SHA256 = (
 )
 OPENCODE_REVIEW_RUN_V147_SHA256 = (
     "be6e7fc1c937cacc1c789463ec80a1612621395b02a5050b0923fe373fb4265d"
+)
+OPENCODE_REVIEW_RUN_V188_SHA256 = (
+    "05b3457574f610e1767a65c4357b56e6980b27debcfd32e21f44e271cac1cdc7"
 )
 OPENCODE_AUTO_REVIEW_SHA256 = (
     "a38218bc27e672f7f7bde1873b9fa3de811057490f3fab7dc91c74d03d80ba97"
@@ -2635,8 +2639,15 @@ def verify_opencode_runtime(
         V181_OPENCODE_AUTO_REVIEW_SHA256,
         V182_OPENCODE_AUTO_REVIEW_SHA256,
         V185_OPENCODE_AUTO_REVIEW_SHA256,
+        V187_OPENCODE_AUTO_REVIEW_SHA256,
         EXPECTED_CLAUDE_FALLBACK_SHA256[".github/workflows/opencode-auto-review.yml"],
     }
+    inline_review_input_contract = (
+        workflow_sha256
+        == EXPECTED_CLAUDE_FALLBACK_SHA256[
+            ".github/workflows/opencode-auto-review.yml"
+        ]
+    )
     initial_validation_argument = " initial" if current_diagnostics_contract else ""
     repair_validation_argument = " repair" if current_diagnostics_contract else ""
     format_sequence = (
@@ -2681,6 +2692,7 @@ def verify_opencode_runtime(
             V181_OPENCODE_AUTO_REVIEW_SHA256,
             V182_OPENCODE_AUTO_REVIEW_SHA256,
             V185_OPENCODE_AUTO_REVIEW_SHA256,
+            V187_OPENCODE_AUTO_REVIEW_SHA256,
             EXPECTED_CLAUDE_FALLBACK_SHA256[".github/workflows/opencode-auto-review.yml"],
         }
         and run_step.get("shell") == "bash"
@@ -2688,8 +2700,33 @@ def verify_opencode_runtime(
         == "${{ needs.opencode-prepare.outputs.candidate_nonce }}"
         and 'opencode run --model zai-coding-plan/glm-4.7 --format json "$@"'
         in run_script
-        and "--file review-full.diff --file review-scope.json" in run_script
-        and run_script.count("--file") == 2
+        and (
+            (
+                "--file" not in run_script
+                and all(
+                    fragment in run_script
+                    for fragment in (
+                        'python3 - "$initial_prompt" review-full.diff '
+                        "review-scope.json <<'PY'",
+                        'Path(source).read_bytes().decode("utf-8")',
+                        'trusted = os.environ["PROMPT"].rstrip("\\n")',
+                        "BEGIN_UNTRUSTED_REVIEW_INPUT_JSON",
+                        '"\\nEND_UNTRUSTED_REVIEW_INPUT_JSON\\n"',
+                        "ensure_ascii=False",
+                        'separators=(",", ":")',
+                        "sort_keys=True",
+                        "destination.chmod(0o600)",
+                        'run_opencode "$initial_prompt" '
+                        '"$RUNNER_TEMP/opencode-review.jsonl"',
+                    )
+                )
+            )
+            if inline_review_input_contract
+            else (
+                "--file review-full.diff --file review-scope.json" in run_script
+                and run_script.count("--file") == 2
+            )
+        )
         and run_script.count("env -i") == 1
         and run_script.count("run_opencode") == 3
         and run_script.count("extract_candidate") == 3
@@ -2772,7 +2809,11 @@ def verify_opencode_runtime(
         and 'unicodedata.category(character) == "Zs"' in run_script
         and "normalize_wrapper_allowlist_text(" in run_script
         and _opencode_review_run_sha256(run_script)
-        in {OPENCODE_REVIEW_RUN_SHA256, OPENCODE_REVIEW_RUN_V147_SHA256}
+        in {
+            OPENCODE_REVIEW_RUN_SHA256,
+            OPENCODE_REVIEW_RUN_V147_SHA256,
+            OPENCODE_REVIEW_RUN_V188_SHA256,
+        }
         and format_sequence_is_ordered
     )
     selected_generic_contract = format_repair_contract or (
@@ -5660,6 +5701,7 @@ def require_budget_workflow_contract(
     *,
     review_policy: bool = False,
     claude_validation: bool = False,
+    review_diagnostics: bool = False,
 ) -> None:
     """Require reviewer semantics from authenticated commit-tree workflow bytes."""
 
@@ -6230,11 +6272,19 @@ def require_budget_workflow_contract(
                     (),
                 ),
             )
-            expected_invocations = (
-                _ShellCommand(
+            initial_invocation = (
+                'run_opencode "$initial_prompt" '
+                '"$RUNNER_TEMP/opencode-review.jsonl"'
+                if review_diagnostics
+                else (
                     'run_opencode "$initial_prompt" '
                     '"$RUNNER_TEMP/opencode-review.jsonl" '
-                    "--file review-full.diff --file review-scope.json",
+                    "--file review-full.diff --file review-scope.json"
+                )
+            )
+            expected_invocations = (
+                _ShellCommand(
+                    initial_invocation,
                     (),
                 ),
                 _ShellCommand(
@@ -6357,6 +6407,16 @@ def _verify_review_invocation_budget(
                 and not release_supports_review_outcome_annotation(ref)
             ):
                 expected = V185_OPENCODE_AUTO_REVIEW_SHA256
+            elif (
+                relative == ".github/workflows/opencode-auto-review.yml"
+                and not release_supports_review_diagnostics(ref)
+            ):
+                expected = V187_OPENCODE_AUTO_REVIEW_SHA256
+            elif (
+                relative == REVIEW_INVOCATION_BUDGET_HELPER_ROOT.path.as_posix()
+                and not release_supports_review_diagnostics(ref)
+            ):
+                expected = V187_REVIEW_INVOCATION_BUDGET_HELPER_SHA256
             if hashlib.sha256(payload).hexdigest() != expected:
                 raise ReleaseVerificationError("invocation-budget authenticated source digest differs")
         require_budget_workflow_contract(tree, "gemini-auto-review.yml", "gemini", review_policy=True)
@@ -6414,6 +6474,7 @@ def _verify_review_invocation_budget(
             reviewer,
             review_policy=release_supports_review_policy(ref),
             claude_validation=release_supports_claude_workflow_validation(ref),
+            review_diagnostics=release_supports_review_diagnostics(ref),
         )
     rounds_variable = release_supports_review_rounds_variable(ref)
     dismissals = release_supports_finding_dismissal(ref)
@@ -7771,6 +7832,18 @@ def _verify_opencode_recovery(tree: VerifiedCommitTree, ref: str) -> None:
                 and not release_supports_review_outcome_annotation(ref)
             ):
                 expected = V185_OPENCODE_RECOVERY_EVIDENCE_SHA256
+            elif (
+                relative == ".github/actions/recover-opencode-review/evidence.py"
+                and release_supports_claude_rollout_fallback(ref)
+                and not release_supports_review_diagnostics(ref)
+            ):
+                expected = V187_OPENCODE_RECOVERY_EVIDENCE_SHA256
+            elif (
+                relative == ".github/actions/recover-opencode-review/replay.js"
+                and release_supports_claude_rollout_fallback(ref)
+                and not release_supports_review_diagnostics(ref)
+            ):
+                expected = V187_OPENCODE_RECOVERY_REPLAY_SHA256
             if hashlib.sha256(tree.read_file(relative)).hexdigest() != expected:
                 raise ReleaseVerificationError("OpenCode recovery authenticated source digest differs: " + relative)
     except (AttributeError, KeyError, TypeError, ValueError, yaml.YAMLError):
@@ -7788,12 +7861,12 @@ EXPECTED_CLAUDE_FALLBACK_SHA256 = {
     ".github/actions/claude-rollout-fallback/contract.py": "ae39e0f9c0a1faa6831559c93150fca7f768fbaa0257aade70f045abd0eafff6",
     "scripts/verify_claude_rollout_fallback.py": "91b986a63ec0ab97d072b9b7a906b2191d6a4de4adae8025fc5d4855fab883f5",
     ".github/actions/review-invocation-budget/action.yml": "c05acbba8cac7e952867706a181eccaa25bc4f7baf720c5562dcbb71d1a04c90",
-    ".github/actions/review-invocation-budget/review_invocation_budget.py": "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py": "c00dab6c3936a422b6536e845c55cf123c42c76edd82ec01fc5a59e15bd2df46",
     ".github/workflows/claude.yml": "914229686af627e5404bb730e376b18a9db7c4bbb4a707e385a0a6ce3473c82a",
     ".github/workflows/claude-code-review.yml": "2eb0f23451cda794339ca05f52f2b40d0444ca3f3296d23cd8c0bf2dcb556835",
-    ".github/workflows/opencode-auto-review.yml": "5238f38588da2d4d8d97f38cf12c3061c9a516ef7f1c6e5113b96fa14b422739",
-    ".github/actions/recover-opencode-review/evidence.py": "ed831a60bf80f1b2e2c797c7c985120880892ea7f93d0e0562bf4e469da1eca8",
-    ".github/actions/recover-opencode-review/replay.js": "128889cd11729b034e9b26d3577a03adb8bb647148d0eeceb66550e2005ff564",
+    ".github/workflows/opencode-auto-review.yml": "82eda62bc21e042db1f8eeb2dde6bf7f1a1b539e6f50771739b621dabc99ae82",
+    ".github/actions/recover-opencode-review/evidence.py": "a267d8a4c6a490f9c56a9113c1fc1c13de4f1240daea8b0719a9b525dc781a37",
+    ".github/actions/recover-opencode-review/replay.js": "b11e1d9a441377f09ddcfdeadc4996819dbaa097e53f9a05adb681583ee1a46d",
     ".github/actions/recover-opencode-review/receipt.js": "49a10b88745fce3ef3e43d6f4b5a0448b70d5e37b40e358d530a0f99dcd51d82",
 }
 EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
@@ -7801,11 +7874,11 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/actions/claude-rollout-fallback/contract.py": "b2b1c32742bab2642b24ff6e20fd9525432610721ce4e55b501c8255aa09a121",
     "scripts/verify_claude_rollout_fallback.py": "76d20b6674e4323c4971b0c27cbbac35c0641e363856d022fdbcb43ac71ce2f2",
     ".github/actions/review-invocation-budget/action.yml": "4a346ba8d26ea88efe5cc0dfa9f33f080ac8167cf777156d4eef635f1293b8ed",
-    ".github/actions/review-invocation-budget/review_invocation_budget.py": "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde",
+    ".github/actions/review-invocation-budget/review_invocation_budget.py": "237e9f159b00ad50bb99f7c7ec6e55e108c1b08c71dee9b63141a258bae1e502",
     ".github/workflows/claude.yml": "b388e789f7ebc6f720b634abe64e6edc41d3072cf7bca703978186d0f6d262c2",
     ".github/workflows/claude-code-review.yml": "3d1e5a48ae468cd7aa5f90c4d28e089b5e39c0156cbb143244878e5d9ae29ca7",
-    ".github/workflows/opencode-auto-review.yml": "572c7b12db12cc8feea2b9c151a1c55e539e1edab0abbe1fde7c81d9701a3124",
-    ".github/actions/recover-opencode-review/evidence.py": "f053524acd6ad32fea1454f5bb524d4c299366c11f1c19d1048b6641b595b034",
+    ".github/workflows/opencode-auto-review.yml": "e1800dc0609696c2b62fa3c1862c75d92996c370a93265eb1a8d0e0d0cafadf1",
+    ".github/actions/recover-opencode-review/evidence.py": "02753d28299ae71afe293c34be732ab9b6a691779154f3e39ebc2dc4d2cb9d34",
 }
 EXPECTED_COMMIT_AUDIT_SHA256 = (
     "fc6bdbec7a5857a34bd714d39d6f08b14fcedcb30ff6c66a5a033a7bdfd17af2"
@@ -7916,6 +7989,28 @@ V185_OPENCODE_RECOVERY_EVIDENCE_SHA256 = (
 V185_OPENCODE_RECOVERY_EVIDENCE_PARSED_SHA256 = (
     "7f20958e4ddecfe2311a8d72c48e2021a83b3a94b64cf494ef78a53844a087ff"
 )
+# Published v1.87 bytes, before v1.88 adds bounded review diagnostics.
+V187_REVIEW_INVOCATION_BUDGET_HELPER_SHA256 = (
+    "3f1f140b1b95fcc24618851e3f196efca6fe7bb259e244d86a4e972b5c681851"
+)
+V187_REVIEW_INVOCATION_BUDGET_HELPER_PARSED_SHA256 = (
+    "05dd0f27335431fea106d9c84debfa60b39696324eb6474c3b0f58db31695dde"
+)
+V187_OPENCODE_AUTO_REVIEW_SHA256 = (
+    "5238f38588da2d4d8d97f38cf12c3061c9a516ef7f1c6e5113b96fa14b422739"
+)
+V187_OPENCODE_AUTO_REVIEW_PARSED_SHA256 = (
+    "572c7b12db12cc8feea2b9c151a1c55e539e1edab0abbe1fde7c81d9701a3124"
+)
+V187_OPENCODE_RECOVERY_EVIDENCE_SHA256 = (
+    "ed831a60bf80f1b2e2c797c7c985120880892ea7f93d0e0562bf4e469da1eca8"
+)
+V187_OPENCODE_RECOVERY_EVIDENCE_PARSED_SHA256 = (
+    "f053524acd6ad32fea1454f5bb524d4c299366c11f1c19d1048b6641b595b034"
+)
+V187_OPENCODE_RECOVERY_REPLAY_SHA256 = (
+    "128889cd11729b034e9b26d3577a03adb8bb647148d0eeceb66550e2005ff564"
+)
 FALLBACK_ACTION = "$/.github/actions/claude-rollout-fallback"
 FALLBACK_INPUT_OUTPUTS = {
     "fallback_request_comment_id": "request-comment-id",
@@ -8025,6 +8120,21 @@ def _fallback_parsed_seal(relative: str, value: object, ref: str = "v1.78.1") ->
         and not release_supports_review_outcome_annotation(ref)
     ):
         expected = V185_OPENCODE_RECOVERY_EVIDENCE_PARSED_SHA256
+    elif (
+        relative == ".github/workflows/opencode-auto-review.yml"
+        and not release_supports_review_diagnostics(ref)
+    ):
+        expected = V187_OPENCODE_AUTO_REVIEW_PARSED_SHA256
+    elif (
+        relative == ".github/actions/review-invocation-budget/review_invocation_budget.py"
+        and not release_supports_review_diagnostics(ref)
+    ):
+        expected = V187_REVIEW_INVOCATION_BUDGET_HELPER_PARSED_SHA256
+    elif (
+        relative == ".github/actions/recover-opencode-review/evidence.py"
+        and not release_supports_review_diagnostics(ref)
+    ):
+        expected = V187_OPENCODE_RECOVERY_EVIDENCE_PARSED_SHA256
     if hashlib.sha256(payload.encode()).hexdigest() != expected:
         raise ReleaseVerificationError("Claude fallback parsed contract differs: " + relative)
 
@@ -8163,7 +8273,7 @@ def require_claude_fallback_inputs(review: object, ref: str = "v1.78.1") -> None
         raise ReleaseVerificationError("Claude fallback input/publication contract differs") from None
 
 
-def require_budget_schema_two(root: Path) -> None:
+def require_budget_schema_two(root: Path, ref: str = "v1.78.1") -> None:
     relative = ".github/actions/review-invocation-budget/review_invocation_budget.py"
     try:
         source = (root / relative).read_text(encoding="utf-8")
@@ -8180,7 +8290,7 @@ def require_budget_schema_two(root: Path) -> None:
             'if kind != "default_branch_rollout_fallback":',
             'if schema not in {1, SCHEMA}:',
             'InvocationRoute.from_dict(_embedded_json(request, "invocation_route_json"))')
-        _fallback_parsed_seal(relative, module)
+        _fallback_parsed_seal(relative, module, ref)
         action = ".github/actions/review-invocation-budget/action.yml"
         _fallback_parsed_seal(action, _load_release_yaml((root / action).read_bytes(), reject_duplicate_keys=True))
     except (OSError, SyntaxError, TypeError, ValueError):
@@ -8264,7 +8374,7 @@ def verify_claude_rollout_fallback_contract(
         require_claude_fallback_permissions(caller, router, review, ref)
         require_claude_fallback_routes(router, ref)
         require_claude_fallback_inputs(review, ref)
-        require_budget_schema_two(root)
+        require_budget_schema_two(root, ref)
         require_request_and_receipt_contracts(root)
         for relative in (".github/actions/claude-rollout-fallback/action.yml",
                          ".github/workflows/opencode-auto-review.yml"):
@@ -8356,6 +8466,26 @@ def verify_claude_rollout_fallback_contract(
                 and not release_supports_review_outcome_annotation(ref)
             ):
                 expected = V185_OPENCODE_RECOVERY_EVIDENCE_SHA256
+            elif (
+                relative == ".github/workflows/opencode-auto-review.yml"
+                and not release_supports_review_diagnostics(ref)
+            ):
+                expected = V187_OPENCODE_AUTO_REVIEW_SHA256
+            elif (
+                relative == ".github/actions/review-invocation-budget/review_invocation_budget.py"
+                and not release_supports_review_diagnostics(ref)
+            ):
+                expected = V187_REVIEW_INVOCATION_BUDGET_HELPER_SHA256
+            elif (
+                relative == ".github/actions/recover-opencode-review/evidence.py"
+                and not release_supports_review_diagnostics(ref)
+            ):
+                expected = V187_OPENCODE_RECOVERY_EVIDENCE_SHA256
+            elif (
+                relative == ".github/actions/recover-opencode-review/replay.js"
+                and not release_supports_review_diagnostics(ref)
+            ):
+                expected = V187_OPENCODE_RECOVERY_REPLAY_SHA256
             if hashlib.sha256((root / relative).read_bytes()).hexdigest() != expected:
                 raise ReleaseVerificationError("Claude fallback authenticated source digest differs: " + relative)
     except (OSError, TypeError, ValueError, yaml.YAMLError):
@@ -8632,6 +8762,14 @@ def _verify_commit_content(
             upload = next(item for item in prepare["steps"] if item.get("name") == "Upload sealed canonicalization handoff")
             model_download = next(item for item in job["steps"] if item.get("name") == "Download sealed review handoff")
             model_validate = next(item for item in job["steps"] if item.get("name") == "Validate sealed review handoff")
+            materialize_candidate = (
+                next(
+                    item for item in job["steps"]
+                    if item.get("name") == "Materialize sealed OpenCode candidate"
+                )
+                if release_supports_review_diagnostics(ref)
+                else {}
+            )
             candidate_upload = next(item for item in job["steps"] if item.get("name") == "Upload untrusted OpenCode candidate")
             canonical_download = next(item for item in canonical["steps"] if item.get("name") == "Download sealed canonicalization handoff")
             candidate_download = next(item for item in canonical["steps"] if item.get("name") == "Download untrusted OpenCode candidate")
@@ -8651,6 +8789,7 @@ def _verify_commit_content(
         canonical_script = canonical_step.get("with", {}).get("script", "")
         prepare_script = prepare_collect.get("run", "")
         model_validation = model_validate.get("run", "")
+        materialize_script = materialize_candidate.get("run", "")
         anchor_range = (
             "`${manifest.merge_base_sha}..${manifest.head_sha}`, '--', "
             "...pathspecs,"
@@ -8832,10 +8971,18 @@ def _verify_commit_content(
             and repair_call > body_limit_gate
             and canonical_script.count("if (!(await repairComments())) return;") == 1
         )
+        filtered_candidate_condition = (
+            "const filteredCandidateSummary = modelSucceeded\n"
+            "  && (filteredNewFindings.length > 0 "
+            "|| normalizedCarryover.length > 0)"
+            if release_supports_review_diagnostics(ref)
+            else (
+                "const filteredCandidateSummary = modelSucceeded "
+                "&& filteredNewFindings.length > 0"
+            )
+        )
         filtered_candidate_location_contract = (
-            "const filteredCandidateSummary = modelSucceeded "
-            "&& filteredNewFindings.length > 0"
-            in canonical_script
+            filtered_candidate_condition in canonical_script
             and canonical_script.count(
                 "? `\\n- Filtered candidate (raw): artifact "
                 "\\`opencode-candidate-${runId}-${runAttempt}\\` → "
@@ -8876,6 +9023,23 @@ def _verify_commit_content(
                 "|- Filtered candidate \\(raw\\): |"
             )
             == 2
+        )
+        review_diagnostics_contract = (
+            not release_supports_review_diagnostics(ref)
+            or all(
+                fragment in materialize_script
+                for fragment in (
+                    'failure_reason = "empty_output"',
+                    'events is not None and not text_events and not error_events',
+                    'preserve_rejected(review_path, "review.md")',
+                    'preserve_rejected(repaired_path, "review-repaired.md")',
+                    'os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK',
+                    'details = os.fstat(descriptor)',
+                    'chunk = os.read(descriptor, 60_001 - len(payload))',
+                    'os.close(descriptor)',
+                    'destination.chmod(0o600)',
+                )
+            )
         )
         artifact_contract = (
             prepare.get("permissions") == expected_prepare
@@ -8942,6 +9106,7 @@ def _verify_commit_content(
             and (canonical_removed_contract or approved_legacy_opencode_release)
             and canonical_pre_mutation_size_contract
             and (filtered_candidate_location_contract if budget_release else True)
+            and review_diagnostics_contract
             and "github.rest.checks.create" in canonical_script
             and "github.rest.checks.update" in canonical_script
             and "github.rest.actions.listWorkflowRunsForRepo" in canonical_script

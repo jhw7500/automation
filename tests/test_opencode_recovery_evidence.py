@@ -10,14 +10,17 @@ from pathlib import Path
 
 import pytest
 
+from opencode_recovery_fixtures import original_bundle
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE = ROOT / ".github/actions/recover-opencode-review/evidence.py"
+V187_COMMIT = "17e7747b76c63b3ea25067c48654935eaf1274ba"
 
 
-def evidence_module():
-    if not MODULE.is_file():
+def evidence_module(path=MODULE):
+    if not path.is_file():
         pytest.fail("Recovery evidence validator is not implemented")
-    spec = importlib.util.spec_from_file_location("opencode_recovery_evidence", MODULE)
+    spec = importlib.util.spec_from_file_location("opencode_recovery_evidence", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -31,6 +34,55 @@ def test_current_workflow_replays_the_same_original_success(tmp_path):
     result = module.validate_evidence(module.RecoveryTarget(**bundle["target"]), bundle, bundle["workspace"])
     assert result.request.call_count == 1
     assert result.request.elapsed_seconds == 45
+    assert result.canonical_body == bundle["canonical_comment"]["body"]
+
+
+def test_published_v187_evidence_replays_published_v187_workflow(
+    tmp_path, monkeypatch,
+):
+    from scripts.verify_workflow_release import VerifiedCommitTree
+
+    tree = VerifiedCommitTree.open(ROOT, V187_COMMIT)
+    recovery_dir = tmp_path / "recover-opencode-review"
+    recovery_dir.mkdir()
+    historical_module = recovery_dir / "evidence.py"
+    historical_module.write_bytes(
+        tree.read_file(".github/actions/recover-opencode-review/evidence.py")
+    )
+    for name in ("replay.js", "receipt.js"):
+        (recovery_dir / name).write_bytes(
+            tree.read_file(f".github/actions/recover-opencode-review/{name}")
+        )
+    budget_dir = tmp_path / "review-invocation-budget"
+    budget_dir.mkdir()
+    (budget_dir / "review_invocation_budget.py").write_bytes(
+        tree.read_file(
+            ".github/actions/review-invocation-budget/review_invocation_budget.py"
+        )
+    )
+    module = evidence_module(historical_module)
+    bundle = original_bundle(tmp_path, ledger_schema=2)
+    bundle["workflow_source"] = tree.read_text(
+        ".github/workflows/opencode-auto-review.yml"
+    )
+    budget_module_name = "_opencode_recovery_budget"
+    previous_budget_module = sys.modules.get(budget_module_name)
+    monkeypatch.delitem(sys.modules, budget_module_name, raising=False)
+    try:
+        result = module.validate_evidence(
+            module.RecoveryTarget(**bundle["target"]), bundle, bundle["workspace"]
+        )
+        loaded_budget = sys.modules[budget_module_name]
+        assert Path(loaded_budget.__file__).resolve() == (
+            budget_dir / "review_invocation_budget.py"
+        ).resolve()
+    finally:
+        monkeypatch.delitem(sys.modules, budget_module_name, raising=False)
+        if previous_budget_module is not None:
+            monkeypatch.setitem(
+                sys.modules, budget_module_name, previous_budget_module
+            )
+    assert result.request.call_count == 1
     assert result.canonical_body == bundle["canonical_comment"]["body"]
 
 
@@ -121,9 +173,6 @@ def test_json_evidence_rejects_ambiguous_or_nonstandard_values(raw):
     module = evidence_module()
     with pytest.raises(module.RecoveryError):
         module.strict_json(raw)
-
-from opencode_recovery_fixtures import original_bundle
-
 
 def test_verified_original_success_returns_original_metrics(tmp_path):
     module = evidence_module()

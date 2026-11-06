@@ -189,6 +189,7 @@ GEMINI_FALLBACK_QUOTA_REASON_RELEASE = (1, 84)
 OPENCODE_ABANDONED_CHECK_CLEANUP_RELEASE = (1, 85)
 REVIEW_OUTCOME_ANNOTATION_RELEASE = (1, 86)
 COMMIT_AUDIT_RELEASE = (1, 87)
+REVIEW_DIAGNOSTICS_RELEASE = (1, 88)
 CARRYOVER_NONE_RELEASE = (1, 79)
 
 
@@ -387,6 +388,12 @@ def release_supports_commit_audit(ref: str) -> bool:
     """Return whether the release owns the non-blocking commit-evidence audit."""
 
     return _release_version(ref) >= COMMIT_AUDIT_RELEASE
+
+
+def release_supports_review_diagnostics(ref: str) -> bool:
+    """Return whether review failures include the bounded v1.88 diagnostics."""
+
+    return _release_version(ref) >= REVIEW_DIAGNOSTICS_RELEASE
 
 
 def _with_claude_rollout_fallback_roots(

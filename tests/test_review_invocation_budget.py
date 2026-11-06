@@ -594,23 +594,53 @@ def test_reusable_run_accepts_symbolic_ref_resolved_to_workflow_sha():
 
 
 @pytest.mark.parametrize(
-    "changes",
+    "changes,check,fields",
     [
-        {"caller_event": "workflow_dispatch"},
-        {"caller_workflow_path": ""},
-        {"referenced_workflow_path": (
+        ({"caller_event": "workflow_dispatch"}, "route_binding", ("caller_event",)),
+        ({"caller_event": "invalid-event"}, "caller_event", ("caller_event",)),
+        ({"caller_workflow_path": ""}, "caller_workflow_path", ("caller_workflow_path",)),
+        ({"referenced_workflow_path": (
             "jhw7500/automation/.github/workflows/claude-code-review.yml@" + "e" * 40
-        )},
-        {"referenced_workflow_ref": "refs/tags/v1.47\n"},
-        {"referenced_workflow_sha": "not-a-sha"},
+        )}, "referenced_workflow_path", ("referenced_workflow_path",)),
+        ({"referenced_workflow_ref": "refs/tags/v1.47\n"},
+         "referenced_workflow_ref", ("referenced_workflow_ref",)),
+        ({"referenced_workflow_sha": "not-a-sha"},
+         "referenced_workflow_sha", ("referenced_workflow_sha",)),
     ],
 )
-def test_reusable_run_provenance_fails_closed_when_central_identity_is_malformed(changes):
+def test_reusable_run_provenance_fails_closed_when_central_identity_is_malformed(
+    changes, check, fields,
+):
     provenance = replace(reusable_provenance(), **changes)
     result = budget.claim(None, request(), {(700, 1): provenance})
     assert not result.allow_invocation
     assert result.decision == "state_invalid"
     assert result.stop_reason == "provenance_mismatch"
+    assert result.provenance_diagnostic == budget.ProvenanceDiagnostic(
+        check=check,
+        fields=fields,
+        scope="current",
+        run_id=700,
+        run_attempt=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (-1, None),
+        (0, None),
+        (9_007_199_254_740_991, 9_007_199_254_740_991),
+        (9_007_199_254_740_992, None),
+    ],
+)
+def test_provenance_diagnostic_bounds_run_identity(value, expected):
+    diagnostic = budget._provenance_error(
+        "run_identity", ("run_id", "run_attempt"), "current", value, value,
+    ).diagnostic
+
+    assert diagnostic.run_id == expected
+    assert diagnostic.run_attempt == expected
 
 
 def test_fixed_finalize_vectors():
@@ -1101,12 +1131,37 @@ def test_estimate_input_tokens_rejects_non_regular_path(tmp_path):
 def test_claim_fails_closed_when_historical_provenance_mismatches(field, two_round_state, claim_request):
     provenances = claim_provenances(two_round_state, claim_request)
     mismatch = {"repository": "other/repo", "pr": 53, "head_sha": HEAD_B,
-                "caller_workflow_path": "other.yml", "run_attempt": 2}[field]
+                "caller_workflow_path": ".github/workflows/other.yml", "run_attempt": 2}[field]
     provenances[(501, 1)] = replace(provenances[(501, 1)], **{field: mismatch})
     result = budget.claim(two_round_state, claim_request, provenances)
     assert not result.allow_invocation
     assert result.decision == "state_invalid"
     assert result.stop_reason == "provenance_mismatch"
+    expected_check = (
+        "stored_binding" if field == "caller_workflow_path" else "run_identity"
+    )
+    assert result.provenance_diagnostic == budget.ProvenanceDiagnostic(
+        check=expected_check,
+        fields=(field,),
+        scope="historical",
+        run_id=501,
+        run_attempt=1,
+    )
+
+
+def test_finalization_missing_current_provenance_identifies_the_current_run():
+    state = claimed_state()
+
+    result = budget.finalize(state, finalize_request(), {})
+
+    assert result.stop_reason == "provenance_mismatch"
+    assert result.provenance_diagnostic == budget.ProvenanceDiagnostic(
+        check="run_missing",
+        fields=("provenance",),
+        scope="current",
+        run_id=700,
+        run_attempt=1,
+    )
 
 
 @pytest.mark.parametrize("conclusion", ["cancelled", "timed_out"])
@@ -1139,6 +1194,36 @@ def test_claim_rejects_historical_in_progress_provenance(two_round_state, claim_
     assert not result.allow_invocation
     assert result.decision == "state_invalid"
     assert result.stop_reason == "provenance_mismatch"
+    assert result.provenance_diagnostic == budget.ProvenanceDiagnostic(
+        check="run_status",
+        fields=("status",),
+        scope="historical",
+        run_id=501,
+        run_attempt=1,
+    )
+
+
+def test_invalid_stored_provenance_identifies_the_stored_run(
+    two_round_state, claim_request,
+):
+    first = replace(
+        two_round_state.invocations[0], caller_workflow_path="invalid.yml",
+    )
+    malformed = replace(
+        two_round_state, invocations=(first, *two_round_state.invocations[1:]),
+    )
+
+    result = budget.claim(
+        malformed, claim_request, claim_provenances(two_round_state, claim_request),
+    )
+
+    assert result.provenance_diagnostic == budget.ProvenanceDiagnostic(
+        check="caller_workflow_path",
+        fields=("caller_workflow_path",),
+        scope="stored",
+        run_id=501,
+        run_attempt=1,
+    )
 
 
 def test_claim_rejects_boolean_authenticated_success_and_duplicate_run_identity():

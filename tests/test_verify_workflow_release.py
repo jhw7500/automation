@@ -36,6 +36,7 @@ from release_fixture_helpers import (
     restore_pre_v176_opencode_recovery,
     restore_pre_v179_carryover_none,
     restore_pre_v178_claude_rollout_fallback,
+    restore_pre_v188_review_diagnostics,
     restore_pre_v187_commit_audit,
     restore_pre_v170_opencode_finding_ids,
     restore_retired_manual_pr_review,
@@ -61,6 +62,7 @@ V177_COMMIT = "dd13f9dcc64540494c1c04bc3f9c7a4f2ef0ba19"
 V178_COMMIT = "a08141d644ab1036cadd8167d48158e827dcd978"
 V1781_COMMIT = "72e0cfad8020a1fe40352b70ddb6438791c58f00"
 V1782_COMMIT = "74afc0057c4732993ecd76601590b8856e2a3bb3"
+V187_COMMIT = "17e7747b76c63b3ea25067c48654935eaf1274ba"
 CHECK_WORKFLOW_ENABLED_ACTION_PATH = (
     ".github/actions/check-workflow-enabled/action.yml"
 )
@@ -769,6 +771,44 @@ def test_commit_audit_release_boundary():
         assert supports(ref), ref
 
 
+def test_review_diagnostics_release_boundary():
+    supports = release_inventory.release_supports_review_diagnostics
+    assert release_inventory.REVIEW_DIAGNOSTICS_RELEASE == (1, 88)
+    for ref in ("v1.86", "v1.87", "v1.87.0", "v1.87.1", "v1.87.99"):
+        assert not supports(ref), ref
+    for ref in ("v1.88", "v1.88.0", "v1.88.1", "v1.89"):
+        assert supports(ref), ref
+
+
+def test_v187_immutable_candidate_remains_accepted_after_v188_diagnostics():
+    assert release_verifier.verify_commit_content(ROOT, "v1.87", V187_COMMIT) == V187_COMMIT
+
+
+def test_restore_pre_v188_uses_published_v187_bytes_and_preserves_mutations(tmp_path):
+    paths = (
+        ".github/actions/review-invocation-budget/review_invocation_budget.py",
+        ".github/workflows/opencode-auto-review.yml",
+        ".github/actions/recover-opencode-review/evidence.py",
+        ".github/actions/recover-opencode-review/replay.js",
+    )
+    repo = tmp_path / "diagnostic-release"
+    published = release_verifier.VerifiedCommitTree.open(ROOT, V187_COMMIT)
+    for relative in paths:
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((ROOT / relative).read_bytes())
+
+    restore_pre_v188_review_diagnostics(repo)
+
+    for relative in paths:
+        assert (repo / relative).read_bytes() == published.read_file(relative)
+
+    mutated = repo / paths[0]
+    mutated.write_bytes((ROOT / paths[0]).read_bytes() + b"\n# deliberate fixture mutation\n")
+    restore_pre_v188_review_diagnostics(repo)
+    assert mutated.read_bytes().endswith(b"# deliberate fixture mutation\n")
+
+
 def test_fleet_ci_exercises_commit_audit_on_python_310():
     document = yaml.load(
         (ROOT / ".github/workflows/test-fleet-tools.yml").read_bytes(),
@@ -849,6 +889,7 @@ def commit_audit_release_repo(tmp_path):
         runtime = repo / relative
         runtime.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, runtime)
+    restore_pre_v188_review_diagnostics(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
@@ -868,6 +909,61 @@ def test_v187_commit_audit_candidate_and_v186_fixture_are_mutually_exclusive(
     assert release_verifier.verify_commit_content(repo, "v1.86", old) == old
     with pytest.raises(ReleaseVerificationError):
         release_verifier.verify_commit_content(repo, "v1.87", old)
+
+
+@pytest.fixture
+def review_diagnostics_release_repo(tmp_path):
+    repo = tmp_path / "review-diagnostics-release"
+    repo.mkdir()
+    for relative in RELEASE_PATHS:
+        source, target = ROOT / relative, repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            shutil.copy2(source, target)
+    for relative in COMMIT_AUDIT_RUNTIME_FUNCTIONS:
+        runtime = repo / relative
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, runtime)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    return repo, commit(repo, "v1.88 review diagnostics candidate")
+
+
+def test_v188_candidate_and_published_v187_bytes_are_mutually_exclusive(
+    review_diagnostics_release_repo, commit_audit_release_repo,
+):
+    current_repo, current = review_diagnostics_release_repo
+    assert release_verifier.verify_commit_content(current_repo, "v1.88", current) == current
+    assert release_verifier.verify_commit_content(current_repo, "v1.88.0", current) == current
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(current_repo, "v1.87", current)
+
+    historical_repo, historical = commit_audit_release_repo
+    assert release_verifier.verify_commit_content(
+        historical_repo, "v1.87", historical
+    ) == historical
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(historical_repo, "v1.88", historical)
+
+
+@pytest.mark.parametrize("relative", (
+    ".github/actions/review-invocation-budget/review_invocation_budget.py",
+    ".github/workflows/opencode-auto-review.yml",
+    ".github/actions/recover-opencode-review/evidence.py",
+    ".github/actions/recover-opencode-review/replay.js",
+))
+def test_v188_rejects_one_v187_component_in_an_otherwise_current_tree(
+    review_diagnostics_release_repo, relative,
+):
+    repo, _ = review_diagnostics_release_repo
+    published = release_verifier.VerifiedCommitTree.open(ROOT, V187_COMMIT)
+    (repo / relative).write_bytes(published.read_file(relative))
+    mixed = commit(repo, "mix one v1.87 review diagnostic component")
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(repo, "v1.88", mixed)
 
 
 @pytest.mark.parametrize("relative", tuple(COMMIT_AUDIT_RUNTIME_FUNCTIONS))
@@ -1087,25 +1183,34 @@ def test_v186_rejects_mutated_opencode_review_outcome(fallback_release_repo, old
         release_verifier.verify_claude_rollout_fallback_contract(repo, "v1.86")
 
 
-def test_v186_recovery_evidence_replays_the_unchanged_v185_canonicalizer():
+def test_v187_recovery_evidence_replays_the_unchanged_v185_canonicalizer(tmp_path):
     import importlib.util
 
-    from release_fixture_helpers import V185_REVIEW_OUTCOME_BOUNDARY_COMMIT
+    from release_fixture_helpers import (
+        V185_REVIEW_OUTCOME_BOUNDARY_COMMIT,
+        V187_REVIEW_DIAGNOSTICS_BOUNDARY_COMMIT,
+    )
 
-    path = ROOT / ".github/actions/recover-opencode-review/evidence.py"
+    v187_tree = release_verifier.VerifiedCommitTree.open(
+        ROOT, V187_REVIEW_DIAGNOSTICS_BOUNDARY_COMMIT
+    )
+    path = tmp_path / "evidence-v187.py"
+    path.write_bytes(
+        v187_tree.read_file(".github/actions/recover-opencode-review/evidence.py")
+    )
     spec = importlib.util.spec_from_file_location("_v186_recovery_evidence", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
-        live = (ROOT / ".github/workflows/opencode-auto-review.yml").read_text(encoding="utf-8")
+        v187 = v187_tree.read_text(".github/workflows/opencode-auto-review.yml")
         v185 = release_verifier.VerifiedCommitTree.open(
             ROOT, V185_REVIEW_OUTCOME_BOUNDARY_COMMIT
         ).read_file(".github/workflows/opencode-auto-review.yml").decode("utf-8")
-        assert live != v185
-        # v1.86 adds steps and an output after the replay prefix; the prefix bytes stay.
-        assert module.replay_source(live) == module.replay_source(v185)
-        assert hashlib.sha256(module.replay_source(live).encode()).hexdigest() in (
+        assert v187 != v185
+        # v1.86-v1.87 add steps and an output after the replay prefix; the prefix stays.
+        assert module.replay_source(v187) == module.replay_source(v185)
+        assert hashlib.sha256(module.replay_source(v187).encode()).hexdigest() in (
             module.APPROVED_REPLAY_SHA256
         )
     finally:

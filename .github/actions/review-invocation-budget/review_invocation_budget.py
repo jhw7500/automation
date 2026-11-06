@@ -710,6 +710,54 @@ class FinalizeRequest:
 
 
 @dataclass(frozen=True)
+class ProvenanceDiagnostic:
+    check: str
+    fields: tuple[str, ...]
+    scope: str
+    run_id: int | None
+    run_attempt: int | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "check": self.check,
+            "fields": list(self.fields),
+            "run_attempt": self.run_attempt,
+            "run_id": self.run_id,
+            "scope": self.scope,
+        }
+
+
+class ProvenanceError(BudgetStateError):
+    """A provenance refusal with bounded, non-payload diagnostic metadata."""
+
+    def __init__(self, diagnostic: ProvenanceDiagnostic):
+        super().__init__("provenance_mismatch")
+        self.diagnostic = diagnostic
+
+
+def _provenance_error(
+        check: str, fields: tuple[str, ...], scope: str,
+        run_id: int | None, run_attempt: int | None) -> ProvenanceError:
+    def safe_identity(value: int | None) -> int | None:
+        return value if (
+            isinstance(value, int) and not isinstance(value, bool)
+            and 1 <= value <= 9_007_199_254_740_991
+        ) else None
+
+    return ProvenanceError(ProvenanceDiagnostic(
+        check=check,
+        fields=fields,
+        scope=scope,
+        run_id=safe_identity(run_id),
+        run_attempt=safe_identity(run_attempt),
+    ))
+
+
+def _provenance_diagnostic(exc: BaseException) -> ProvenanceDiagnostic | None:
+    return exc.diagnostic if isinstance(exc, ProvenanceError) else None
+
+
+@dataclass(frozen=True)
 class Transition:
     state: LedgerState
     allow_invocation: bool
@@ -718,6 +766,7 @@ class Transition:
     round_number: int | None
     invocation_key: str | None
     mutate_comment: bool
+    provenance_diagnostic: ProvenanceDiagnostic | None = None
 
 
 def effective_budgets(state: LedgerState) -> BudgetPolicy:
@@ -1034,21 +1083,37 @@ def _expected_referenced_workflow_path(reviewer: Reviewer, sha: str) -> str:
 
 
 def _validate_provenance_identity(
-        provenance: RunProvenance, reviewer: Reviewer) -> None:
+        provenance: RunProvenance, reviewer: Reviewer, *, scope: str) -> None:
+    identity = (scope, provenance.run_id, provenance.run_attempt)
+    if provenance.caller_event not in {"pull_request", "workflow_dispatch", "issue_comment"}:
+        raise _provenance_error("caller_event", ("caller_event",), *identity)
     if (
-        provenance.caller_event not in {"pull_request", "workflow_dispatch", "issue_comment"} or
-        not isinstance(provenance.caller_workflow_path, str) or
-        _CALLER_WORKFLOW.fullmatch(provenance.caller_workflow_path) is None or
-        ".." in Path(provenance.caller_workflow_path).parts or
-        not isinstance(provenance.referenced_workflow_ref, str) or
-        _WORKFLOW_REF.fullmatch(provenance.referenced_workflow_ref) is None or
-        provenance.referenced_workflow_path != _expected_referenced_workflow_path(
-            reviewer, provenance.referenced_workflow_sha,
-        ) or
-        not isinstance(provenance.referenced_workflow_sha, str) or
-        _HEAD.fullmatch(provenance.referenced_workflow_sha) is None
+        not isinstance(provenance.caller_workflow_path, str)
+        or _CALLER_WORKFLOW.fullmatch(provenance.caller_workflow_path) is None
+        or ".." in Path(provenance.caller_workflow_path).parts
     ):
-        raise BudgetStateError("provenance_mismatch")
+        raise _provenance_error(
+            "caller_workflow_path", ("caller_workflow_path",), *identity,
+        )
+    if (
+        not isinstance(provenance.referenced_workflow_ref, str)
+        or _WORKFLOW_REF.fullmatch(provenance.referenced_workflow_ref) is None
+    ):
+        raise _provenance_error(
+            "referenced_workflow_ref", ("referenced_workflow_ref",), *identity,
+        )
+    if (
+        not isinstance(provenance.referenced_workflow_sha, str)
+        or _HEAD.fullmatch(provenance.referenced_workflow_sha) is None
+    ):
+        raise _provenance_error(
+            "referenced_workflow_sha", ("referenced_workflow_sha",), *identity,
+        )
+    if provenance.referenced_workflow_path != _expected_referenced_workflow_path(
+            reviewer, provenance.referenced_workflow_sha):
+        raise _provenance_error(
+            "referenced_workflow_path", ("referenced_workflow_path",), *identity,
+        )
 
 
 def expected_caller_event(request: ClaimRequest | FinalizeRequest) -> str:
@@ -1070,19 +1135,23 @@ def provenance_head(
 
 
 def _validate_route_provenance(
-        route: InvocationRoute, provenance: RunProvenance, reviewer: Reviewer) -> None:
+        route: InvocationRoute, provenance: RunProvenance, reviewer: Reviewer, *, scope: str) -> None:
+    identity = (scope, provenance.run_id, provenance.run_attempt)
     if route.kind == "default_branch_rollout_fallback":
         if (
             reviewer != "claude"
             or provenance.caller_event != "issue_comment"
             or provenance.caller_workflow_path != ".github/workflows/claude.yml"
         ):
-            raise BudgetStateError("provenance_mismatch")
+            raise _provenance_error(
+                "route_binding", ("reviewer", "caller_event", "caller_workflow_path"),
+                *identity,
+            )
     elif provenance.caller_event != {
         "automatic": "pull_request",
         "authorized_override": "workflow_dispatch",
     }[route.kind]:
-        raise BudgetStateError("provenance_mismatch")
+        raise _provenance_error("route_binding", ("caller_event",), *identity)
 
 
 def _validate_stored_provenance_identity(
@@ -1101,15 +1170,16 @@ def _validate_stored_provenance_identity(
             status=invocation.status,
             conclusion=invocation.outcome,
         )
-    _validate_provenance_identity(provenance, reviewer)
-    _validate_route_provenance(invocation.route, provenance, reviewer)
+    _validate_provenance_identity(provenance, reviewer, scope="stored")
+    _validate_route_provenance(invocation.route, provenance, reviewer, scope="stored")
 
 
 def _validate_one_provenance(
         provenance: RunProvenance, state: LedgerState,
         request: ClaimRequest | FinalizeRequest, *, current: bool,
         invocation: Invocation | None) -> None:
-    _validate_provenance_identity(provenance, state.reviewer)
+    scope = "current" if current else "historical"
+    _validate_provenance_identity(provenance, state.reviewer, scope=scope)
     expected_head = request.head_sha if invocation is None else invocation.head_sha
     expected_run_id = request.run_id if invocation is None else invocation.run_id
     expected_run_attempt = (
@@ -1117,27 +1187,56 @@ def _validate_one_provenance(
     )
     expected_event = invocation.caller_event if invocation is not None else expected_caller_event(request)
     route = invocation.route if invocation is not None else request.route
-    _validate_route_provenance(route, provenance, state.reviewer)
+    _validate_route_provenance(route, provenance, state.reviewer, scope=scope)
     observed_head = provenance.head_sha if invocation is not None else provenance_head(provenance, request)
+    expected_identity = {
+        "repository": state.repository,
+        "pr": state.pr,
+        "head_sha": expected_head,
+        "caller_event": expected_event,
+        "run_id": expected_run_id,
+        "run_attempt": expected_run_attempt,
+    }
+    observed_identity = {
+        "repository": provenance.repository,
+        "pr": provenance.pr,
+        "head_sha": observed_head,
+        "caller_event": provenance.caller_event,
+        "run_id": provenance.run_id,
+        "run_attempt": provenance.run_attempt,
+    }
+    mismatched = tuple(
+        field for field, expected in expected_identity.items()
+        if observed_identity[field] != expected
+    )
+    if mismatched:
+        raise _provenance_error(
+            "run_identity", mismatched, scope, expected_run_id, expected_run_attempt,
+        )
     if (
-        provenance.repository != state.repository or
-        provenance.pr != state.pr or
-        observed_head != expected_head or
-        provenance.caller_event != expected_event or
-        provenance.run_id != expected_run_id or
-        provenance.run_attempt != expected_run_attempt or
-        (not current and provenance.status != "completed") or
-        (current and provenance.status not in {"in_progress", "completed"})
+        (not current and provenance.status != "completed")
+        or (current and provenance.status not in {"in_progress", "completed"})
     ):
-        raise BudgetStateError("provenance_mismatch")
-    if invocation is not None and (
-        provenance.caller_workflow_path != invocation.caller_workflow_path or
-        provenance.caller_event != invocation.caller_event or
-        provenance.referenced_workflow_path != invocation.referenced_workflow_path or
-        provenance.referenced_workflow_ref != invocation.referenced_workflow_ref or
-        provenance.referenced_workflow_sha != invocation.referenced_workflow_sha
-    ):
-        raise BudgetStateError("provenance_mismatch")
+        raise _provenance_error(
+            "run_status", ("status",), scope, expected_run_id, expected_run_attempt,
+        )
+    if invocation is not None:
+        stored_fields = {
+            "caller_workflow_path": invocation.caller_workflow_path,
+            "caller_event": invocation.caller_event,
+            "referenced_workflow_path": invocation.referenced_workflow_path,
+            "referenced_workflow_ref": invocation.referenced_workflow_ref,
+            "referenced_workflow_sha": invocation.referenced_workflow_sha,
+        }
+        stored_mismatched = tuple(
+            field for field, expected in stored_fields.items()
+            if getattr(provenance, field) != expected
+        )
+        if stored_mismatched:
+            raise _provenance_error(
+                "stored_binding", stored_mismatched, scope,
+                expected_run_id, expected_run_attempt,
+            )
 
 
 def _validate_provenance(
@@ -1146,7 +1245,14 @@ def _validate_provenance(
     for item in state.invocations:
         provenance = provenances.get((item.run_id, item.run_attempt))
         if not isinstance(provenance, RunProvenance):
-            raise BudgetStateError("provenance_mismatch")
+            scope = (
+                "current"
+                if (item.run_id, item.run_attempt) == (request.run_id, request.run_attempt)
+                else "historical"
+            )
+            raise _provenance_error(
+                "run_missing", ("provenance",), scope, item.run_id, item.run_attempt,
+            )
         current = (item.run_id, item.run_attempt) == (request.run_id, request.run_attempt)
         _validate_one_provenance(
             provenance, state, request, current=current, invocation=item,
@@ -1157,7 +1263,10 @@ def _validate_provenance(
     ):
         provenance = provenances.get(current_key)
         if not isinstance(provenance, RunProvenance):
-            raise BudgetStateError("provenance_mismatch")
+            raise _provenance_error(
+                "run_missing", ("provenance",), "current",
+                request.run_id, request.run_attempt,
+            )
         _validate_one_provenance(
             provenance, state, request, current=True, invocation=None,
         )
@@ -1288,17 +1397,22 @@ def append_claim(
 
 
 def _invalid_transition(
-        state: LedgerState | None, request: ClaimRequest | FinalizeRequest, reason: str) -> Transition:
+        state: LedgerState | None, request: ClaimRequest | FinalizeRequest, reason: str,
+        provenance_diagnostic: ProvenanceDiagnostic | None = None) -> Transition:
     if state is None:
         try:
             state = LedgerState.initial(request.repository, request.pr, request.reviewer)
         except (AttributeError, BudgetStateError):
             state = LedgerState.initial("invalid/invalid", 1, "claude")
-    return Transition(state, False, "state_invalid", reason, None, None, False)
+    return Transition(
+        state, False, "state_invalid", reason, None, None, False,
+        provenance_diagnostic,
+    )
 
 
 def _finalization_refusal(
-        state: LedgerState, request: FinalizeRequest, reason: str) -> Transition:
+        state: LedgerState, request: FinalizeRequest, reason: str,
+        provenance_diagnostic: ProvenanceDiagnostic | None = None) -> Transition:
     updated = replace(
         state,
         last_decision=DecisionRecord("state_invalid", reason, request.run_id, request.run_attempt),
@@ -1308,7 +1422,10 @@ def _finalization_refusal(
         handoff=_build_handoff(updated, request, outcome=_handoff_outcome(updated, request)),
     )
     _validate_state_shape(updated)
-    return Transition(updated, False, "state_invalid", reason, None, None, False)
+    return Transition(
+        updated, False, "state_invalid", reason, None, None, False,
+        provenance_diagnostic,
+    )
 
 
 def claim(state: LedgerState | None, request: ClaimRequest,
@@ -1317,7 +1434,9 @@ def claim(state: LedgerState | None, request: ClaimRequest,
         validated = validate_or_initialize(state, request, provenances)
         validated = _apply_dismissals(validated, request.dismiss_events)
     except BudgetStateError as exc:
-        return _invalid_transition(state, request, str(exc))
+        return _invalid_transition(
+            state, request, str(exc), _provenance_diagnostic(exc),
+        )
     same_run = [item for item in validated.invocations if (item.run_id, item.run_attempt) == (request.run_id, request.run_attempt)]
     if same_run and any((item.head_sha, item.full_diff_sha256) != (request.head_sha, request.full_diff_sha256) for item in same_run):
         return _invalid_transition(validated, request, "duplicate_run_identity")
@@ -1437,7 +1556,9 @@ def finalize(
         _validate_provenance(state, request, provenances)
         state = _apply_dismissals(state, request.dismiss_events)
     except BudgetStateError as exc:
-        return _finalization_refusal(state, request, str(exc))
+        return _finalization_refusal(
+            state, request, str(exc), _provenance_diagnostic(exc),
+        )
 
     exact = [
         (index, item) for index, item in enumerate(state.invocations)
@@ -2199,10 +2320,17 @@ def _run_provenances(
             for invocation in state.invocations
         )
     for run_id, run_attempt in sorted(identities):
+        scope = (
+            "current"
+            if (run_id, run_attempt) == (request["run_id"], request["run_attempt"])
+            else "historical"
+        )
         path = output_directory / f"run-{run_id}-{run_attempt}.json"
         value = _read_json(path, "run")
         if not isinstance(value, dict):
-            raise TransportError("provenance_mismatch")
+            raise _provenance_error(
+                "run_payload_type", ("run",), scope, run_id, run_attempt,
+            )
         repository = value.get("repository")
         pulls = value.get("pull_requests")
         referenced = value.get("referenced_workflows")
@@ -2210,7 +2338,16 @@ def _run_provenances(
             not isinstance(repository, dict) or not isinstance(pulls, list) or
             not isinstance(referenced, list)
         ):
-            raise TransportError("provenance_mismatch")
+            fields = tuple(
+                field for field, valid in (
+                    ("repository", isinstance(repository, dict)),
+                    ("pull_requests", isinstance(pulls, list)),
+                    ("referenced_workflows", isinstance(referenced, list)),
+                ) if not valid
+            )
+            raise _provenance_error(
+                "run_payload_shape", fields, scope, run_id, run_attempt,
+            )
         pull_numbers = {
             item.get("number") for item in pulls if isinstance(item, dict) and
             isinstance(item.get("number"), int) and not isinstance(item.get("number"), bool)
@@ -2222,7 +2359,10 @@ def _run_provenances(
             item["path"].startswith(prefix)
         ]
         if len(central) != 1:
-            raise TransportError("provenance_mismatch")
+            raise _provenance_error(
+                "central_reference_count", ("referenced_workflows",),
+                scope, run_id, run_attempt,
+            )
         central = central[0]
         central_ref = central.get("ref") if "ref" in central else central.get("sha")
         stored = stored_by_identity.get((run_id, run_attempt))
@@ -2255,10 +2395,16 @@ def _run_provenances(
                 "authorized_override": "workflow_dispatch",
                 "default_branch_rollout_fallback": "issue_comment",
             }.get(route.kind):
-                raise TransportError("provenance_mismatch")
+                raise _provenance_error(
+                    "detached_event", ("event",), scope, run_id, run_attempt,
+                )
         elif request["pr"] not in pull_numbers:
-            raise TransportError("provenance_mismatch")
-        _validate_provenance_identity(provenance, request["reviewer"])
+            raise _provenance_error(
+                "pull_request_binding", ("pull_requests",), scope, run_id, run_attempt,
+            )
+        _validate_provenance_identity(
+            provenance, request["reviewer"], scope=scope,
+        )
         result[(run_id, run_attempt)] = provenance
     return result
 
@@ -2299,6 +2445,7 @@ def _validated_input_paths(request: Mapping[str, object]) -> tuple[Path, ...]:
 
 def _recorded_refusal(
         state: LedgerState | None, request: ClaimRequest | FinalizeRequest, reason: str,
+        provenance_diagnostic: ProvenanceDiagnostic | None = None,
     ) -> Transition:
     if state is None:
         state = LedgerState.initial(request.repository, request.pr, request.reviewer)
@@ -2309,7 +2456,10 @@ def _recorded_refusal(
         updated, handoff=_build_handoff(updated, request, outcome=_handoff_outcome(updated, request)),
     )
     _validate_state_shape(updated)
-    return Transition(updated, False, "state_invalid", reason, None, None, False)
+    return Transition(
+        updated, False, "state_invalid", reason, None, None, False,
+        provenance_diagnostic,
+    )
 
 
 def _write_transition(
@@ -2317,7 +2467,15 @@ def _write_transition(
         prior_state: LedgerState | None, prior_comment: Mapping[str, object] | None,
     ) -> None:
     checkpoint = render_checkpoint(transition.state)
-    summary = render_summary(transition.state).encode("utf-8") + b"\n"
+    summary_text = render_summary(transition.state)
+    if transition.provenance_diagnostic is not None:
+        diagnostic_json = json.dumps(
+            transition.provenance_diagnostic.to_dict(),
+            ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+        )
+        summary_text += f"\n- Provenance diagnostic: `{diagnostic_json}`\n"
+        print(f"review-budget provenance diagnostic: {diagnostic_json}", flush=True)
+    summary = summary_text.encode("utf-8") + b"\n"
     comment = render_comment(transition.state, server_url=request["server_url"]).encode("utf-8")
     comment_id = "" if prior_comment is None else str(prior_comment["id"])
     mutation = "none"
@@ -2445,9 +2603,14 @@ def _run_transition(
             request_object = _finalize_request(request, dismiss_events=dismissals)
             transition = finalize(state, request_object, provenances)
         if transition.state.handoff.repository is None:
-            transition = _recorded_refusal(state, request_object, transition.stop_reason)
+            transition = _recorded_refusal(
+                state, request_object, transition.stop_reason,
+                transition.provenance_diagnostic,
+            )
     except (BudgetStateError, KeyError, TypeError) as exc:
-        transition = _recorded_refusal(state, request_object, str(exc))
+        transition = _recorded_refusal(
+            state, request_object, str(exc), _provenance_diagnostic(exc),
+        )
     _write_transition(output_directory, request, transition, state, comment)
 
 
