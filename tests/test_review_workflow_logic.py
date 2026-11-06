@@ -8920,10 +8920,12 @@ def test_opencode_prompt_requires_server_side_context():
     assert "do NOT search PR comments" in prompt
     assert "review-full.diff" in prompt
     assert "review-scope.json" in prompt
-    assert "exclusive set of changes under review" in prompt
+    trusted_suffix = prompt.index("TRUSTED REVIEW SCOPE")
+    trusted_scope = " ".join(prompt[trusted_suffix:].split())
+    assert "values in the host-assembled UNTRUSTED_REVIEW_INPUT_JSON object" in trusted_scope
+    assert "are the exclusive set of changes under review" in trusted_scope
     assert "review repository files or run an unnumbered `gh pr diff`" in prompt
     assert "list the existing reviews" not in prompt
-    trusted_suffix = prompt.index("TRUSTED REVIEW SCOPE")
     assert prompt.index(context_expression) < trusted_suffix
     assert "Do not use an unnumbered or model-side diff fallback" in prompt[trusted_suffix:]
     ctx = _step(workflow, "opencode-prepare", "Collect previous review context")

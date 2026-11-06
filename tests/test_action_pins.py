@@ -221,11 +221,15 @@ class ActionPinsTest(unittest.TestCase):
                         '--format json "$@"',
                         run_step["run"],
                     )
+                    self.assertNotIn("--file", run_step["run"])
                     self.assertIn(
-                        "--file review-full.diff --file review-scope.json",
+                        'python3 - "$initial_prompt" review-full.diff review-scope.json',
                         run_step["run"],
                     )
-                    self.assertEqual(2, run_step["run"].count("--file"))
+                    self.assertIn(
+                        'run_opencode "$initial_prompt" "$RUNNER_TEMP/opencode-review.jsonl"',
+                        run_step["run"],
+                    )
                     self.assertEqual(1, run_step["run"].count("env -i"))
                     self.assertEqual(3, run_step["run"].count("run_opencode"))
                     self.assertEqual("true", run_step["env"]["OPENCODE_PURE"])
