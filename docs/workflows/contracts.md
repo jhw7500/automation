@@ -1334,6 +1334,13 @@ such as `preamble`, `unknown_section_before_document`,
 that message. The two unknown-section codes reveal only whether an allowed section had already
 started, never the untrusted heading text.
 
+From v1.88 a failed round independently preserves the initial `review.md` and, when present,
+`review-repaired.md` in that diagnostic artifact. Each file must satisfy the same nonempty,
+regular-file, non-symlink and 60,000-byte limit, and each retained copy has mode `0600`.
+An absent or unsafe repair file does not discard an eligible initial file. The copies retain
+the exact candidate bytes; their validation records remain in `candidate.json`. Neither copy
+is added to the sealed handoff inventory or read back as review authority.
+
 A provider failure leaves its cause only in the model's stdout JSONL, which is never uploaded,
 so the round previously showed `provider_failed` with no reason; an empty stream showed
 `candidate_contract_failed` with no evidence (#199, #145). From v1.80 the end of `Materialize
@@ -1353,6 +1360,31 @@ mapping. Anything it cannot classify, a classifier error, and any other incoming
 `failure_reason` unchanged, and the canonicalizer and the budget stop reason carry the refined
 reason through.
 
+From v1.88 an incoming `candidate_contract_failed` is refined to `empty_output` only when the
+last-invoked stream parses successfully as JSON-object events and contains neither a text
+event accepted by the existing candidate extractor nor an `error` event. A missing, malformed,
+non-object, symlinked or oversized stream retains the original reason; an unusable repair
+stream never borrows the earlier review stream. Text-only malformed reviews and error-only
+streams also retain the original reason. The envelope, canonicalizer and budget carry
+`empty_output` as a provider failure; it never becomes a clean review or advances a successful
+checkpoint. This classification does not change provider calls, retries or budget limits.
+
+From v1.88 the initial OpenCode call receives the complete sealed `review-full.diff` and
+`review-scope.json` text as string values in one untrusted JSON object appended to the trusted
+prompt file. The existing stdin redirection supplies that file; the call no longer uses
+`--file` attachments, and input bodies are not passed through argv or environment variables.
+The trusted prompt identifies the JSON values as review data whose instructions must not be
+followed. The sandbox's read-only source copies and closed model environment remain unchanged.
+
+This avoids the pinned OpenCode v1.18.17 attachment reader's 50 KiB, 2,000-line and
+2,000-character-per-line limits. The official pinned source converts local attachments through
+[the bounded Read tool](https://github.com/anomalyco/opencode/blob/02546dfc2e4515a4f90aaf9ceb3890df2ac2b479/packages/opencode/src/tool/read.ts#L137-L179),
+while [stdin becomes a direct text part](https://github.com/anomalyco/opencode/blob/02546dfc2e4515a4f90aaf9ceb3890df2ac2b479/packages/opencode/src/cli/cmd/run.ts#L859-L865).
+The model's own context limit still applies. The step logs the assembled stdin byte count;
+the existing sealed-input token estimate remains observational telemetry under v1.77 and does
+not claim to measure JSON escaping or provider token usage. No new token-admission gate,
+provider retry or tool permission is introduced.
+
 Once the document boundary and trusted scope are valid, a bad individual block does not discard
 valid siblings. It is filtered or normalized with exactly one of `invalid_anchor`,
 `invalid_trigger_evidence`, `invalid_severity`, `invalid_impact_class`,
@@ -1368,6 +1400,12 @@ unchanged; it still carries counts only. `accepted-count` counts accepted
 new and still-open actionable blocks, `filtered-count` counts soft-rejected blocks, and
 `normalized-count` counts carryover blocks omitted without becoming actionable, including an
 unknown or duplicate prior binding or missing transition proof.
+
+From v1.88 a successful OpenCode round with only carryover normalization also includes the
+existing `Filtered candidate (raw)` artifact pointer. The pointer still names
+`opencode-candidate-<run>-<attempt>` and `review.md`; it is diagnostic metadata and the next
+model-context collector removes it. The normalization count remains separate from the new
+findings filter count and does not make that round `quality_filtered`.
 
 ## Canonical automated-review state
 
@@ -1529,9 +1567,10 @@ artifact ID, with the upload's raw SHA-256 output, the REST `sha256:` digest, re
 identity, an exact conditional file inventory, and per-file hashes all checked. The model job
 has empty job permissions, no repository checkout, and no `GITHUB_TOKEN`, `GH_TOKEN`, or
 `USE_GITHUB_TOKEN`. It runs pinned OpenCode 1.18.17's generic `opencode run` in a fresh
-non-repository directory, sends the prompt on stdin, attaches only `review-full.diff` and
-`review-scope.json`, and enables pure/project-config-disabled mode with sharing and all tools
-denied. Every non-empty stdout line must be a JSON object; the last completed text event becomes
+non-repository directory and sends the trusted prompt plus the complete sealed
+`review-full.diff` and `review-scope.json` text in `BEGIN_UNTRUSTED_REVIEW_INPUT_JSON` on stdin.
+From v1.88 there are no file attachments. Pure/project-config-disabled mode remains enabled,
+with sharing and all tools denied. Every non-empty stdout line must be a JSON object; the last completed text event becomes
 an untrusted `review.md` candidate, while malformed JSONL or no text event fails closed. Before
 upload, a strict outer-format preflight requires the exact review marker, the handoff-bound nonce
 on the next line, `New findings` as the first and only required section, unique allowed sections,
@@ -1645,7 +1684,8 @@ unsafe-to-sign or malformed repair is terminal; there is no third call and no ca
 model job reports `model_job_failed` for setup/infrastructure failure, `provider_failed` only when a
 model process fails (sealed from v1.81 as `authentication_failed`, `quota_exhausted` or
 `rate_limited` when the provider error identifies one, see above), and
-`candidate_contract_failed` when post-response preflight rejects the candidate. The candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name
+`candidate_contract_failed` when post-response preflight rejects the candidate (refined from
+v1.88 to `empty_output` for the strictly empty-output condition above). The candidate is limited to 60,000 UTF-8 bytes and uploaded as a separate exact-name
 artifact. This preflight never replaces or relaxes the clean canonicalizer's semantic, scope, and
 provenance checks.
 
@@ -1863,6 +1903,34 @@ per-round calls/input/wall usage, current decision/outcome/stop reason, the last
 authenticated successful review head/hash, and remaining authenticated finding IDs.
 OpenCode additionally seals the claim checkpoint hash and decision into its prepared
 handoff and validates them before model execution and canonical finalization.
+
+From v1.88 a `provenance_mismatch` refusal emits one bounded JSON diagnostic in the budget
+action's job log, prefixed `review-budget provenance diagnostic:`, and in the step summary
+under `Provenance diagnostic`. It identifies the failed check without printing the compared
+payload values:
+
+| Field | Meaning |
+| --- | --- |
+| `check` | Fixed identifier of the failed provenance check |
+| `fields` | Fixed names of the fields compared by that check |
+| `scope` | `current` run, fetched `historical` run, or `stored` ledger identity |
+| `run_id`, `run_attempt` | Positive safe integer identity, or `null` when unavailable or unsafe |
+
+The fixed check identifiers are `caller_event`, `caller_workflow_path`,
+`referenced_workflow_ref`, `referenced_workflow_sha`, `referenced_workflow_path`,
+`route_binding`, `run_identity`, `run_status`, `stored_binding`, `run_missing`,
+`run_payload_type`, `run_payload_shape`, `central_reference_count`, `detached_event`, and
+`pull_request_binding`. Raw API responses, compared string values, tokens and comment bodies
+are not included. The diagnostic is transient: it is absent from ledger state, deterministic
+checkpoint bytes and action outputs. The refusal remains `state_invalid` with stop reason
+`provenance_mismatch`, no provider invocation and no remote mutation.
+
+A `pull_request_binding` diagnostic means the fetched run metadata did not associate that
+run with the requested PR. It does not authorize deriving the association from a branch name
+or reusable workflow ref. A later API response is not proof of the response at execution
+time: after a PR is merged, even a previously successful run may show an empty
+`pull_requests` list. Keep the original job diagnostic when investigating an intermittent
+failure; do not clear the ledger or weaken provenance checks based on a later lookup.
 
 Budget exhaustion is not approval: the ledger cannot publish findings, report CLEAN,
 or authorize merge. `/jhw:ship` polls existing review comments and CI signals

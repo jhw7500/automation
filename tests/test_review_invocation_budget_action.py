@@ -304,6 +304,18 @@ elif "/actions/runs/700/attempts/1" in endpoint:
         response["referenced_workflows"][0].pop("ref")
     elif config["scenario"] == "current-run-reference-wrong-sha":
         response["referenced_workflows"][0]["sha"] = "not-a-sha"
+    elif config["scenario"] == "current-run-reference-hostile-path":
+        response["referenced_workflows"][0]["path"] = (
+            "secret-value\nother/repo/.github/workflows/claude-code-review.yml@" + "d" * 40
+        )
+    elif config["scenario"] == "current-run-missing-pr":
+        response["pull_requests"] = []
+    elif config["scenario"] == "current-run-payload-list":
+        response = []
+    elif config["scenario"] == "current-run-malformed-shape":
+        response["repository"] = "secret-value\nnot-an-object"
+    elif config["scenario"] == "fallback-event-mismatch":
+        response["event"] = "pull_request"
 elif "/collaborators/" in endpoint and endpoint.endswith("/permission"):
     login = endpoint.split("/collaborators/", 1)[1].rsplit("/permission", 1)[0]
     response = {"permission": config.get("permissions", {}).get(login, "write"), "user": {"login": login}}
@@ -329,6 +341,8 @@ class ActionResult:
     outputs: dict[str, str]
     checkpoint: dict
     calls: list[list[str]]
+    summary: str
+    stdout: str
     provider_started: bool = False
 
 
@@ -372,7 +386,7 @@ class FakeGitHub:
         if scenario in {
             "first-comment-create", "empty-cas-pages",
             "current-run-reference-omits-ref",
-            "fallback-first-claim", "fallback-wrong-base",
+            "fallback-first-claim", "fallback-event-mismatch", "fallback-wrong-base",
             "fallback-base-changed-before-patch",
             "force-review-default-claim",
         }:
@@ -459,7 +473,10 @@ class FakeGitHub:
             "FAKE_PYTHON_ARGV": str(argv_log),
         }
         env.update(env_overrides or {})
-        subprocess.run(["bash", "-c", run], cwd=workspace, env=env, check=True)
+        completed = subprocess.run(
+            ["bash", "-c", run], cwd=workspace, env=env, check=True,
+            capture_output=True, text=True,
+        )
         outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         assert not marker.exists()
@@ -470,7 +487,10 @@ class FakeGitHub:
             ):
                 value = request_values[name]
                 assert sum(part == value for entry in argv for part in entry) == 1, name
-        return ActionResult(outputs, json.loads(checkpoint.read_text()), calls)
+        return ActionResult(
+            outputs, json.loads(checkpoint.read_text()), calls,
+            summary.read_text(), completed.stdout,
+        )
 
 
 @pytest.fixture
@@ -777,26 +797,91 @@ def test_first_claim_uses_resolved_sha_when_github_omits_reusable_workflow_ref(f
     assert result.outputs["allow-invocation"] == "true"
     invocation = result.checkpoint["ledger"]["invocations"][0]
     assert invocation["referenced_workflow_ref"] == CENTRAL_SHA
+    assert "Provenance diagnostic" not in result.summary
+    assert "provenance diagnostic" not in result.stdout
 
 
 @pytest.mark.parametrize(
-    "scenario",
+    "scenario,check,fields",
     [
-        "current-run-reference-missing",
-        "current-run-reference-duplicate",
-        "current-run-reference-wrong-path",
-        "current-run-reference-malformed-ref",
-        "current-run-reference-null-ref",
-        "current-run-reference-wrong-sha",
+        ("current-run-reference-missing", "central_reference_count", ["referenced_workflows"]),
+        ("current-run-reference-duplicate", "central_reference_count", ["referenced_workflows"]),
+        ("current-run-reference-wrong-path", "central_reference_count", ["referenced_workflows"]),
+        ("current-run-reference-malformed-ref", "referenced_workflow_ref", ["referenced_workflow_ref"]),
+        ("current-run-reference-null-ref", "referenced_workflow_ref", ["referenced_workflow_ref"]),
+        ("current-run-reference-wrong-sha", "referenced_workflow_sha", ["referenced_workflow_sha"]),
+        ("current-run-missing-pr", "pull_request_binding", ["pull_requests"]),
+        ("current-run-payload-list", "run_payload_type", ["run"]),
+        ("current-run-malformed-shape", "run_payload_shape", ["repository"]),
     ],
 )
-def test_first_claim_rejects_malformed_reusable_workflow_provenance(fake_github, scenario):
+def test_first_claim_rejects_malformed_reusable_workflow_provenance(
+    fake_github, scenario, check, fields,
+):
     result = fake_github.run_action(mode="claim", scenario=scenario)
     mutations = [call for call in result.calls if "--method" in call]
     assert result.outputs["decision"] == "state_invalid"
     assert result.outputs["allow-invocation"] == "false"
     assert mutations == []
     assert result.checkpoint["handoff"]["stop_reason"] == "provenance_mismatch"
+    assert "provenance_diagnostic" not in json.dumps(result.checkpoint)
+    expected = {
+        "check": check,
+        "fields": fields,
+        "run_attempt": 1,
+        "run_id": 700,
+        "scope": "current",
+    }
+    diagnostic = json.dumps(expected, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    assert f"- Provenance diagnostic: `{diagnostic}`" in result.summary
+    assert result.stdout.count(f"review-budget provenance diagnostic: {diagnostic}\n") == 1
+
+
+def test_provenance_diagnostic_never_echoes_hostile_api_values(fake_github):
+    result = fake_github.run_action(
+        mode="claim", scenario="current-run-reference-hostile-path",
+    )
+
+    assert result.outputs["decision"] == "state_invalid"
+    assert result.checkpoint["handoff"]["stop_reason"] == "provenance_mismatch"
+    assert "secret-value" not in result.summary
+    assert "secret-value" not in result.stdout
+    assert '"check":"central_reference_count"' in result.summary
+
+
+def test_historical_provenance_diagnostic_identifies_the_historical_run(fake_github):
+    result = fake_github.run_action(
+        mode="claim", scenario="historical-run-head-mismatch",
+    )
+
+    expected = {
+        "check": "run_identity",
+        "fields": ["head_sha"],
+        "run_attempt": 1,
+        "run_id": 501,
+        "scope": "historical",
+    }
+    diagnostic = json.dumps(expected, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    assert result.outputs["decision"] == "state_invalid"
+    assert f"- Provenance diagnostic: `{diagnostic}`" in result.summary
+
+
+def test_detached_route_diagnostic_identifies_event_mismatch(fake_github):
+    result = fake_github.run_action(
+        mode="claim", scenario="fallback-event-mismatch",
+        invocation_route=_fallback_route(),
+    )
+
+    expected = {
+        "check": "detached_event",
+        "fields": ["event"],
+        "run_attempt": 1,
+        "run_id": 700,
+        "scope": "current",
+    }
+    diagnostic = json.dumps(expected, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    assert result.outputs["decision"] == "state_invalid"
+    assert f"- Provenance diagnostic: `{diagnostic}`" in result.summary
 
 
 def test_empty_cas_comment_pages_fail_closed_without_mutation(fake_github):
