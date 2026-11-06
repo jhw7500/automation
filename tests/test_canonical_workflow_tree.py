@@ -62,6 +62,10 @@ EXPECTED_WORKFLOW_NAMES = {
 }
 
 EXPECTED_TRIGGERS: dict[str, object] = {
+    "commit-evidence-audit.yml": {
+        "pull_request": {"types": ["opened", "synchronize", "reopened"]},
+        "push": "",
+    },
     "auto-rereview-request.yml": {
         "pull_request": {"types": ["synchronize"]},
         "workflow_dispatch": {
@@ -301,6 +305,7 @@ OPENCODE_ATTESTED_PERMISSIONS = {
 }
 
 EXPECTED_CALLER_PERMISSIONS = {
+    "commit-evidence-audit.yml": ("audit", {"actions": "read", "contents": "read"}),
     "auto-rereview-request.yml": ("rereview", STANDARD_WRITE_PERMISSIONS),
     "claude.yml": ("claude", CLAUDE_COMMAND_PERMISSIONS),
     "claude-code-review.yml": ("claude-review", CLAUDE_REVIEW_PERMISSIONS),

@@ -362,6 +362,20 @@ def test_retired_bump_workflow_is_deleted(tmp_path: Path) -> None:
     assert plan.after(".github/workflows/bump-automation-ref.yml") is None
 
 
+@pytest.mark.parametrize("present", [True, False])
+def test_retired_commitlint_paths_are_deleted_only_where_present(tmp_path: Path, present: bool) -> None:
+    repo = make_existing_repo(tmp_path / "repo")
+    paths = (".github/workflows/commitlint.yml", ".github/commitlint.config.mjs")
+    if present:
+        for path in paths:
+            (repo / path).write_bytes(b"retired commitlint\n")
+    plan = render_profile(repo, "personal-ops")
+    retired = {change.path.as_posix(): change for change in plan.changes if change.path.as_posix() in paths}
+    assert set(retired) == (set(paths) if present else set())
+    assert all(change.before == b"retired commitlint\n" and change.after is None for change in retired.values())
+    assert plan.after(".github/workflows/commit-evidence-audit.yml") is not None
+
+
 def test_missing_required_callers_are_created_from_canonical_bytes(
     tmp_path: Path,
 ) -> None:

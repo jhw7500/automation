@@ -835,6 +835,8 @@ def construct_rollout_commit(
     ref: str,
     plan: RenderPlan,
     catalog: WorkflowCatalog,
+    *,
+    change_reference: str,
 ) -> fleet_git.RolloutCommit:
     """Build the exact managed commit through a private filter-free index."""
 
@@ -858,6 +860,12 @@ def construct_rollout_commit(
             raise RolloutError("render change does not match the managed result")
     selected_base = _selected_base_branch(snapshot)
     branch = rollout_branch(ref, selected_base, snapshot.default_branch)
+    message = fleet_git.commit_message(
+        ref,
+        selected_base,
+        snapshot.default_branch,
+        change_reference=change_reference,
+    )
     with tempfile.TemporaryDirectory(prefix="workflow-fleet-index-") as temporary:
         root = Path(temporary)
         environment = _hermetic_environment(root, root / "index")
@@ -924,7 +932,7 @@ def construct_rollout_commit(
                 ["commit-tree", tree, "-p", base_sha],
                 cwd=snapshot.path,
                 environment=environment,
-                stdin=(pr_title(ref, selected_base, snapshot.default_branch) + "\n").encode("utf-8"),
+                stdin=(message + "\n").encode("utf-8"),
             ).decode("ascii"),
             "rollout commit",
         )
@@ -947,7 +955,7 @@ def construct_rollout_commit(
         tree_sha=tree,
         base_tree_sha=base_tree,
         base_sha=base_sha,
-        message=pr_title(ref, selected_base, snapshot.default_branch),
+        message=message,
         blobs=tuple(blobs),
         deletions=tuple(
             change.path.as_posix()
@@ -984,6 +992,8 @@ def inspect_rollout(
     ref: str,
     commit: str,
     plan: RenderPlan,
+    *,
+    change_reference: str | None = None,
 ) -> RolloutInspection:
     """Classify the exact release branch and pull-request identity."""
 
@@ -1002,6 +1012,14 @@ def inspect_rollout(
         return RolloutInspection("create_branch")
 
     validate_existing_branch(snapshot, branch_sha, base_sha, plan, branch=branch)
+    if change_reference is not None:
+        message = fleet_git.commit_message(
+            ref, selected_base, snapshot.default_branch,
+            change_reference=change_reference,
+        )
+        tree_sha = git(["rev-parse", f"{branch_sha}^{{tree}}"], cwd=snapshot.path)
+        if branch_sha != fleet_git.rollout_commit_sha(tree_sha, base_sha, message):
+            raise CommandError("rollout branch commit identity does not match the change reference")
     requests = fleet_git.list_rollout_prs(fleet_git.OWNER, snapshot.path.name, branch)
     if fleet_git.remote_branch_sha(snapshot, branch) != branch_sha:
         raise CommandError("rollout branch changed while pull requests were inspected")
@@ -1294,6 +1312,7 @@ def publish_new_branch(
     actionlint: Path | None,
     *,
     bundle: ReleaseBundle | None,
+    change_reference: str,
 ) -> str:
     """Create one local commit and publish one previously absent exact branch."""
 
@@ -1312,7 +1331,12 @@ def publish_new_branch(
     if bundle is None:
         raise CommandError("release bundle is required for publication")
     constructed = construct_rollout_commit(
-        snapshot, base_sha, ref, plan, bundle.catalog
+        snapshot,
+        base_sha,
+        ref,
+        plan,
+        bundle.catalog,
+        change_reference=change_reference,
     )
     head_sha = constructed.head_sha
     try:
@@ -1321,7 +1345,10 @@ def publish_new_branch(
         raise BranchPublishError(str(exc), head_sha) from None
     try:
         published = fleet_git.create_rollout_branch(
-            snapshot, branch, commit=constructed
+            snapshot,
+            branch,
+            commit=constructed,
+            change_reference=change_reference,
         )
     except FleetGitError as exc:
         raise BranchPublishError(str(exc), head_sha) from None
@@ -1339,6 +1366,7 @@ def _publish_repository_fresh(
     prevalidated_default_branch: str | None,
     bootstrap: bool,
     actionlint: Path | None,
+    change_reference: str,
     progress: PublicationProgress,
 ) -> RepoOutcome:
     """Refetch/recompute one repository and create or reuse only its exact PR."""
@@ -1393,7 +1421,8 @@ def _publish_repository_fresh(
         )
         progress.stage = "branch"
         inspection = inspect_rollout(
-            snapshot, base_sha, bundle.ref, bundle.commit, plan
+            snapshot, base_sha, bundle.ref, bundle.commit, plan,
+            change_reference=change_reference,
         )
         body = pr_body(
             bundle.ref, bundle.commit, changed, selected_base, snapshot.default_branch
@@ -1421,6 +1450,7 @@ def _publish_repository_fresh(
                     plan,
                     actionlint,
                     bundle=bundle,
+                    change_reference=change_reference,
                 )
             except BranchPublishError as exc:
                 progress.head_sha = exc.head_sha
@@ -1506,6 +1536,7 @@ def publish_repository(
     prevalidated_default_branch: str | None = None,
     bootstrap: bool,
     actionlint: Path | None,
+    change_reference: str,
 ) -> RepoOutcome:
     """Publish one repository while preserving only fresh failure metadata."""
 
@@ -1519,6 +1550,7 @@ def publish_repository(
             prevalidated_default_branch=prevalidated_default_branch,
             bootstrap=bootstrap,
             actionlint=actionlint,
+            change_reference=change_reference,
             progress=progress,
         )
     except (CommandError, FleetGitError, RolloutError) as exc:
@@ -1618,6 +1650,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-repo")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--actionlint", type=Path)
+    parser.add_argument("--change-reference")
     return parser
 
 
@@ -1629,6 +1662,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--mode publish requires --confirm")
     if args.mode == "publish" and not args.repo:
         parser.error("--mode publish requires at least one explicit --repo")
+    if args.mode == "publish" and args.change_reference is None:
+        parser.error("--mode publish requires --change-reference")
     if len(args.repo) != len(set(args.repo)):
         parser.error("--repo values must be unique")
     if VERSION_REF.fullmatch(args.ref) is None:
@@ -1641,6 +1676,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.mode == "publish":
         try:
+            args.change_reference = fleet_git.verify_change_reference(
+                args.change_reference
+            )
             fleet_git.require_workflow_scope()
         except FleetGitError as exc:
             parser.error(str(exc))
@@ -1722,6 +1760,7 @@ def main(argv: list[str] | None = None) -> int:
                                 and item.target_branch is None
                             ),
                             actionlint=actionlint,
+                            change_reference=args.change_reference,
                         )
                     )
                 except (CommandError, FleetGitError, RolloutError) as exc:

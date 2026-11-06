@@ -41,6 +41,11 @@ _ROLLOUT_BRANCH = re.compile(
 _PULL_URL = re.compile(
     r"https://github\.com/jhw7500/([A-Za-z0-9][A-Za-z0-9._-]{0,99})/pull/([1-9][0-9]*)\Z"
 )
+_CHANGE_REFERENCE = re.compile(
+    r"https://github\.com/jhw7500/([A-Za-z0-9][A-Za-z0-9._-]{0,99})/"
+    r"(issues|pull)/([1-9][0-9]*)\Z"
+)
+_VERSION_REF = re.compile(r"v[0-9]+(?:\.[0-9]+)+\Z")
 _GIT_PREFIX = (
     "git",
     "-c",
@@ -105,12 +110,15 @@ __all__ = (
     "RolloutCommit",
     "clone_branch",
     "clone_default_branch",
+    "commit_message",
     "create_rollout_branch",
     "create_pull_request",
     "list_rollout_prs",
     "refetch_branch",
     "refetch_default",
     "remote_branch_sha",
+    "rollout_commit_sha",
+    "verify_change_reference",
 )
 
 
@@ -187,6 +195,85 @@ def _json(args: Sequence[str]) -> object:
     if malformed:
         raise FleetGitError("GitHub returned malformed JSON") from None
     return data
+
+
+def _change_reference_parts(reference: str) -> tuple[str, str, int]:
+    if not isinstance(reference, str):
+        raise FleetGitError("change reference is invalid")
+    match = _CHANGE_REFERENCE.fullmatch(reference)
+    if match is None:
+        raise FleetGitError(
+            "change reference must be a full jhw7500 GitHub issue or pull request URL"
+        )
+    repo, kind, number = match.groups()
+    _validate_target(OWNER, repo)
+    return repo, kind, int(number)
+
+
+def verify_change_reference(reference: str) -> str:
+    """Verify one exact Issue/PR URL without inferring a release relationship."""
+
+    repo, kind, number = _change_reference_parts(reference)
+    data = _json(
+        [
+            "gh",
+            "api",
+            "--hostname",
+            "github.com",
+            f"repos/{OWNER}/{repo}/issues/{number}",
+        ]
+    )
+    is_pull = isinstance(data, dict) and isinstance(data.get("pull_request"), dict)
+    if (
+        not isinstance(data, dict)
+        or data.get("number") != number
+        or data.get("html_url") != reference
+        or data.get("repository_url") != f"https://api.github.com/repos/{OWNER}/{repo}"
+        or is_pull != (kind == "pull")
+    ):
+        raise FleetGitError("GitHub returned an invalid change reference identity")
+    return reference
+
+
+def commit_message(
+    ref: str,
+    base_branch: str | None = None,
+    default_branch: str | None = None,
+    *,
+    change_reference: str,
+) -> str:
+    """Return the exact Change Evidence v1 message for one rollout commit."""
+
+    if not isinstance(ref, str) or _VERSION_REF.fullmatch(ref) is None:
+        raise FleetGitError("release ref is invalid")
+    _change_reference_parts(change_reference)
+    additional = (
+        isinstance(base_branch, str)
+        and isinstance(default_branch, str)
+        and base_branch != default_branch
+    )
+    title = f"ci: 공통 자동화 워크플로를 {ref}로 맞춘다"
+    if additional:
+        candidate = f"{title} (base={base_branch})"
+        if len(candidate) <= 72:
+            title = candidate
+    changes = "- `examples/baseline-workflows` 기준 caller를 렌더링한다."
+    if additional:
+        changes += f"\n- 대상 base branch를 `{base_branch}`로 유지한다."
+    return (
+        f"{title}\n\n"
+        " ### Contract version\n"
+        "v1\n\n"
+        " ### Why\n"
+        f"automation `{ref}` 릴리스를 소비자 저장소에 적용한다.\n\n"
+        " ### Changes\n"
+        f"{changes}\n\n"
+        " ### Validation\n"
+        "Not run: 롤아웃 도구는 소비자 저장소 테스트를 실행하지 않는다.\n\n"
+        " ### References\n"
+        f"- {change_reference}\n"
+        f"- https://github.com/jhw7500/automation/releases/tag/{ref}"
+    )
 
 
 def require_workflow_scope() -> None:
@@ -637,8 +724,32 @@ def _validate_ref_response(
         raise FleetGitError("GitHub returned an invalid ref identity")
 
 
+def rollout_commit_sha(tree_sha: str, base_sha: str, message: str) -> str:
+    """Compute the exact commit identity shared by new and existing rollouts."""
+
+    _validate_sha1(tree_sha, "rollout tree identity")
+    _validate_sha1(base_sha, "default commit identity")
+    if not isinstance(message, str):
+        raise FleetGitError("rollout commit message is invalid")
+    raw_commit = (
+        f"tree {tree_sha}\n"
+        f"parent {base_sha}\n"
+        "author workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
+        "committer workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
+        f"\n{message}\n"
+    ).encode("utf-8")
+    return hashlib.sha1(
+        f"commit {len(raw_commit)}\0".encode("ascii") + raw_commit
+    ).hexdigest()
+
+
 def _validate_rollout_commit(
-    commit: RolloutCommit, ref: str, base_branch: str, default_branch: str
+    commit: RolloutCommit,
+    ref: str,
+    base_branch: str,
+    default_branch: str,
+    *,
+    change_reference: str,
 ) -> None:
     if (
         not isinstance(commit, RolloutCommit)
@@ -654,21 +765,13 @@ def _validate_rollout_commit(
         (commit.base_sha, "default commit identity"),
     ):
         _validate_sha1(value, description)
-    expected_message = f"ci: adopt common automation workflows ({ref})"
-    if base_branch != default_branch:
-        expected_message = (
-            f"ci: adopt common automation workflows ({ref}; base={base_branch})"
-        )
-    raw_commit = (
-        f"tree {commit.tree_sha}\n"
-        f"parent {commit.base_sha}\n"
-        "author workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
-        "committer workflow-fleet <workflow-fleet@invalid> 946684800 +0000\n"
-        f"\n{commit.message}\n"
-    ).encode("utf-8")
-    computed_head = hashlib.sha1(
-        f"commit {len(raw_commit)}\0".encode("ascii") + raw_commit
-    ).hexdigest()
+    expected_message = commit_message(
+        ref,
+        base_branch,
+        default_branch,
+        change_reference=change_reference,
+    )
+    computed_head = rollout_commit_sha(commit.tree_sha, commit.base_sha, commit.message)
     if commit.message != expected_message or commit.head_sha != computed_head:
         raise FleetGitError("rollout commit message is invalid")
     paths: set[str] = set()
@@ -713,6 +816,7 @@ def create_rollout_branch(
     branch: str,
     *,
     commit: RolloutCommit,
+    change_reference: str,
 ) -> str:
     """Atomically create one exact rollout ref through the closed Git Data API."""
 
@@ -729,7 +833,13 @@ def create_rollout_branch(
     elif suffix != hashlib.sha256(base_branch.encode("utf-8")).hexdigest():
         raise FleetGitError("rollout branch publication is not permitted")
     _verify_origin(path, repo)
-    _validate_rollout_commit(commit, ref, base_branch, snapshot.default_branch)
+    _validate_rollout_commit(
+        commit,
+        ref,
+        base_branch,
+        snapshot.default_branch,
+        change_reference=change_reference,
+    )
     if commit.base_sha != snapshot.base_sha:
         raise FleetGitError("rollout base does not match the repository snapshot")
 

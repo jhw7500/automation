@@ -17,6 +17,7 @@ if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts import rollout_workflow_fleet as rollout
+from scripts.check_commit_message import check_message
 from scripts.prepare_workflow_rollout import (
     FileChange,
     ManagedResult,
@@ -38,11 +39,19 @@ from scripts.workflow_release_bundle import ReleaseBundle
 # Every test gets a stub; the few that exercise the preflight itself re-bind
 # this captured original explicitly, so the exception is visible at each site.
 _REAL_REQUIRE_WORKFLOW_SCOPE = rollout.fleet_git.require_workflow_scope
+_REAL_VERIFY_CHANGE_REFERENCE = rollout.fleet_git.verify_change_reference
 
 
 @pytest.fixture(autouse=True)
 def _stub_workflow_scope_probe() -> Iterator[None]:
-    with mock.patch.object(rollout.fleet_git, "require_workflow_scope"):
+    with (
+        mock.patch.object(rollout.fleet_git, "require_workflow_scope"),
+        mock.patch.object(
+            rollout.fleet_git,
+            "verify_change_reference",
+            side_effect=lambda reference: reference,
+        ),
+    ):
         yield
 
 
@@ -50,6 +59,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMMIT = "1" * 40
 BASE = "2" * 40
 HEAD = "3" * 40
+CHANGE_REFERENCE = "https://github.com/jhw7500/automation/issues/237"
 FRESH_BASE = "4" * 40
 FRESH_HEAD = "5" * 40
 ALL_SECRETS = frozenset(
@@ -123,6 +133,41 @@ def fake_bundle_context(bundle: ReleaseBundle):
     return nullcontext(bundle)
 
 
+@pytest.mark.parametrize("mode", ["plan", "publish"])
+def test_main_reaches_real_prevalidation_and_writes_a_manifest(
+    tmp_path: Path, bundle: ReleaseBundle, mode: str
+) -> None:
+    """An unsupported prevalidation keyword must not hide behind a loose mock."""
+
+    snap = initialized_canonical_fleet_repository(tmp_path, bundle)
+    workspace = marked_workspace(tmp_path)
+    arguments = ["--mode", mode, "--workspace", str(workspace), "--repo", "gstApp"]
+    if mode == "publish":
+        arguments += ["--confirm", "--change-reference", CHANGE_REFERENCE]
+
+    def publish(
+        _bundle, _workspace, *, repo, base_branch, prevalidated_default_branch,
+        bootstrap, actionlint, change_reference,
+    ):
+        assert mode == "publish"
+        assert change_reference == CHANGE_REFERENCE
+        return rollout.RepoOutcome(repo, "current", "already current", snap.base_sha)
+
+    with (
+        mock.patch.object(rollout, "materialize_release_bundle", return_value=nullcontext(bundle)),
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "refetch_default", return_value=snap.base_sha),
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=None),
+        mock.patch.object(rollout, "publish_repository", side_effect=publish),
+    ):
+        assert rollout.main(arguments) == 0
+
+    manifest = json.loads((workspace / "rollout-manifest.json").read_text())
+    assert len(manifest) == 1
+    assert manifest[0]["status"] == "current"
+    assert manifest[0]["repo"] == "gstApp"
+
+
 def test_public_report_model_and_exact_release_text() -> None:
     assert [item.name for item in fields(rollout.RepoOutcome)] == [
         "repo",
@@ -146,6 +191,119 @@ def test_public_report_model_and_exact_release_text() -> None:
         "Project-specific workflows are unchanged. This PR does not modify secrets. "
         "Merge and recovery use this repository's normal GitHub controls.\n"
     )
+
+
+def test_rollout_commit_message_passes_shared_rules() -> None:
+    default = rollout.fleet_git.commit_message(
+        "v1.87", change_reference=CHANGE_REFERENCE
+    )
+    ported = rollout.fleet_git.commit_message(
+        "v1.87", "ported", "main", change_reference=CHANGE_REFERENCE
+    )
+    long_branch = "port/" + "x" * 90
+    bounded = rollout.fleet_git.commit_message(
+        "v1.87", long_branch, "main", change_reference=CHANGE_REFERENCE
+    )
+
+    assert check_message(default)["valid"] is True
+    assert check_message(ported)["valid"] is True
+    assert check_message(bounded)["valid"] is True
+    assert len(bounded.splitlines()[0]) <= 72
+    assert long_branch in bounded
+    assert CHANGE_REFERENCE in default
+    assert "releases/tag/v1.87" in default
+
+
+def test_rollout_commit_message_rejects_a_tag_as_the_change_reference() -> None:
+    with pytest.raises(rollout.FleetGitError, match="issue or pull request"):
+        rollout.fleet_git.commit_message(
+            "v1.87",
+            change_reference="https://github.com/jhw7500/automation/releases/tag/v1.87",
+        )
+
+
+def test_plan_does_not_require_or_verify_a_change_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = rollout._parser().parse_args(["--workspace", "/tmp/fleet-plan"])
+    assert args.mode == "plan"
+    assert args.change_reference is None
+    monkeypatch.setattr(
+        rollout.fleet_git,
+        "verify_change_reference",
+        lambda _value: pytest.fail("plan verified a publish-only reference"),
+    )
+    with pytest.raises(SystemExit):
+        rollout.main(["--workspace", str(tmp_path)])
+
+
+def test_publish_requires_change_reference_before_any_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        rollout.fleet_git,
+        "require_workflow_scope",
+        lambda: pytest.fail("missing reference reached GitHub scope probe"),
+    )
+    with pytest.raises(SystemExit):
+        rollout.main(
+            [
+                "--mode", "publish", "--confirm", "--workspace", str(tmp_path),
+                "--repo", "gstApp",
+            ]
+        )
+
+
+def test_invalid_change_reference_stops_before_scope_probe_and_child_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        rollout.fleet_git,
+        "verify_change_reference",
+        _REAL_VERIFY_CHANGE_REFERENCE,
+    )
+    monkeypatch.setattr(
+        rollout.fleet_git,
+        "require_workflow_scope",
+        lambda: pytest.fail("invalid reference reached GitHub scope probe"),
+    )
+    with mock.patch("scripts.workflow_fleet_git.subprocess.run") as child:
+        with pytest.raises(SystemExit):
+            rollout.main(
+                [
+                    "--mode", "publish", "--confirm", "--workspace", str(tmp_path),
+                    "--change-reference",
+                    "https://github.com/jhw7500/automation/releases/tag/v1.87",
+                    "--repo", "gstApp",
+                ]
+            )
+        child.assert_not_called()
+
+
+def test_publish_verifies_change_reference_once_before_scope_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def verify(reference: str) -> str:
+        calls.append("reference")
+        return reference
+
+    monkeypatch.setattr(rollout.fleet_git, "verify_change_reference", verify)
+    monkeypatch.setattr(
+        rollout.fleet_git,
+        "require_workflow_scope",
+        lambda: calls.append("scope"),
+    )
+    with pytest.raises(SystemExit):
+        rollout.main(
+            [
+                "--mode", "publish", "--confirm", "--workspace", str(tmp_path),
+                "--change-reference", CHANGE_REFERENCE,
+                "--repo", "gstApp",
+            ]
+        )
+    assert calls == ["reference", "scope"]
 
 
 def test_ported_identity_binds_the_head_title_body_and_pr_base(
@@ -213,13 +371,24 @@ def test_ported_commit_matches_the_task2_branch_publication_contract(
     ported = replace(snap, base_branch="ported")
 
     constructed = rollout.construct_rollout_commit(
-        ported, ported.base_sha, "v1.40", plan, bundle.catalog
+        ported,
+        ported.base_sha,
+        "v1.40",
+        plan,
+        bundle.catalog,
+        change_reference=CHANGE_REFERENCE,
     )
 
     rollout.fleet_git._validate_rollout_commit(
-        constructed, "v1.40", "ported", "main"
+        constructed,
+        "v1.40",
+        "ported",
+        "main",
+        change_reference=CHANGE_REFERENCE,
     )
-    assert constructed.message == "ci: adopt common automation workflows (v1.40; base=ported)"
+    assert constructed.message == rollout.fleet_git.commit_message(
+        "v1.40", "ported", "main", change_reference=CHANGE_REFERENCE
+    )
     assert rollout.rollout_branch("v1.40", "ported", "main") == (
         "automation/common-workflows-v1.40-"
         "8b6809aa4897b8f29d43ba741152d8c90bd46f96c609af9fc5daaee8e5348ea5"
@@ -285,6 +454,7 @@ def test_ported_pr_creation_and_attestation_bind_the_exact_base(
             prevalidated_default_branch="main",
             bootstrap=False,
             actionlint=Path("/bin/true"),
+            change_reference=CHANGE_REFERENCE,
         )
 
     assert result.status == "published"
@@ -342,6 +512,7 @@ def test_default_metadata_change_after_prevalidation_blocks_publication_before_m
             prevalidated_default_branch="main",
             bootstrap=False,
             actionlint=Path("/bin/true"),
+            change_reference=CHANGE_REFERENCE,
         )
 
     assert result.status == "blocked"
@@ -393,6 +564,7 @@ def test_selected_profile_expands_default_and_ported_before_publication(
         assert rollout.main(
             [
                 "--mode", "publish", "--confirm", "--workspace", str(workspace),
+                "--change-reference", CHANGE_REFERENCE,
                 "--repo", "wlan-driver-v2",
             ]
         ) == 0
@@ -434,6 +606,7 @@ def test_blocked_ported_prevalidation_prevents_all_selected_publication(
         assert rollout.main(
             [
                 "--mode", "publish", "--confirm", "--workspace", str(workspace),
+                "--change-reference", CHANGE_REFERENCE,
                 "--repo", "wlan-driver-v2", "--repo", "gstApp",
             ]
         ) == 1
@@ -493,6 +666,7 @@ def test_inconsistent_resolved_targets_block_the_repository_before_publication(
         rc = rollout.main(
             [
                 "--mode", "publish", "--confirm", "--workspace", str(workspace),
+                "--change-reference", CHANGE_REFERENCE,
                 "--repo", "wlan-driver-v2",
             ]
         )
@@ -719,6 +893,8 @@ def test_publish_blocks_every_write_when_any_prevalidation_blocks(
                 "--mode",
                 "publish",
                 "--confirm",
+                "--change-reference",
+                CHANGE_REFERENCE,
                 "--workspace",
                 str(workspace),
                 "--repo",
@@ -801,6 +977,7 @@ def test_publish_repository_refetches_and_renders_again_before_inspection(
             repo="gstApp",
             bootstrap=False,
             actionlint=Path("/bin/true"),
+            change_reference=CHANGE_REFERENCE,
         )
 
     assert result.status == "reused"
@@ -816,7 +993,8 @@ def test_fresh_publication_rebinds_snapshot_to_refetched_base_before_atomic_crea
     constructed = mock.Mock(head_sha=FRESH_HEAD, base_sha=FRESH_BASE)
     observed_snapshot_bases: list[str] = []
 
-    def create_branch(snapshot_arg, _branch, *, commit):
+    def create_branch(snapshot_arg, _branch, *, commit, change_reference):
+        assert change_reference == CHANGE_REFERENCE
         observed_snapshot_bases.append(snapshot_arg.base_sha)
         if snapshot_arg.base_sha != commit.base_sha:
             raise rollout.FleetGitError(
@@ -861,6 +1039,7 @@ def test_fresh_publication_rebinds_snapshot_to_refetched_base_before_atomic_crea
             repo="gstApp",
             bootstrap=False,
             actionlint=Path("/bin/true"),
+            change_reference=CHANGE_REFERENCE,
         )
 
     assert observed_snapshot_bases == [FRESH_BASE]
@@ -906,6 +1085,7 @@ def test_atomic_branch_success_pr_failure_preserves_fresh_branch_outcome(
             repo="gstApp",
             bootstrap=False,
             actionlint=Path("/bin/true"),
+            change_reference=CHANGE_REFERENCE,
         )
 
     assert result.status == "blocked"
@@ -975,6 +1155,7 @@ def test_fresh_publication_failures_report_fresh_stage_metadata(
             repo="gstApp",
             bootstrap=False,
             actionlint=Path("/bin/true"),
+            change_reference=CHANGE_REFERENCE,
         )
 
     assert result.status == "blocked"
@@ -1027,6 +1208,7 @@ def test_branch_failure_after_commit_reports_the_fresh_prepared_head(
             repo="gstApp",
             bootstrap=False,
             actionlint=Path("/bin/true"),
+            change_reference=CHANGE_REFERENCE,
         )
 
     assert result.status == "blocked"
@@ -1069,6 +1251,8 @@ def test_publish_journal_uses_fresh_failure_metadata_not_prevalidation_base(
                     "--mode",
                     "publish",
                     "--confirm",
+                    "--change-reference",
+                    CHANGE_REFERENCE,
                     "--workspace",
                     str(workspace),
                     "--repo",
@@ -1142,6 +1326,8 @@ def test_main_journals_actual_fresh_stage_failure_after_prevalidation_base_moves
                     "--mode",
                     "publish",
                     "--confirm",
+                    "--change-reference",
+                    CHANGE_REFERENCE,
                     "--workspace",
                     str(workspace),
                     "--repo",
@@ -1199,6 +1385,8 @@ def test_publish_refetches_each_repo_and_reports_partial_rerunnable_outcomes(
                 "--mode",
                 "publish",
                 "--confirm",
+                "--change-reference",
+                CHANGE_REFERENCE,
                 "--workspace",
                 str(workspace),
                 "--repo",
@@ -1547,6 +1735,84 @@ def initialized_repository(tmp_path: Path) -> tuple[RepositorySnapshot, RenderPl
     return RepositorySnapshot(repo, "main", base, frozenset(), frozenset(), label_names=ALL_LABELS), plan
 
 
+@pytest.mark.parametrize("base_branch", [None, "ported"])
+@pytest.mark.parametrize("existing_pr", [False, True])
+@pytest.mark.parametrize("mutation", [None, "reference", "legacy", "author", "date"])
+def test_publish_attests_existing_commit_identity_before_creating_or_reusing_pr(
+    tmp_path: Path, bundle: ReleaseBundle, base_branch: str | None,
+    existing_pr: bool, mutation: str | None,
+) -> None:
+    """The right tree cannot authorize another message, author, or timestamp."""
+
+    snap, plan = initialized_repository(tmp_path)
+    snap = replace(snap, base_branch=base_branch)
+    constructed = rollout.construct_rollout_commit(
+        snap, snap.base_sha, bundle.ref, plan, bundle.catalog,
+        change_reference=CHANGE_REFERENCE,
+    )
+    raw = subprocess.check_output(
+        ["git", "cat-file", "commit", constructed.head_sha], cwd=snap.path
+    )
+    if mutation == "reference":
+        raw = raw.replace(CHANGE_REFERENCE.encode(), b"https://github.com/jhw7500/automation/issues/238")
+    elif mutation == "legacy":
+        raw = raw.split(b"\n\n", 1)[0] + b"\n\nci: adopt common workflows\n"
+    elif mutation == "author":
+        raw = raw.replace(b"author workflow-fleet <", b"author another-operator <", 1)
+    elif mutation == "date":
+        raw = raw.replace(b"946684800 +0000", b"946684801 +0000", 1)
+    head = subprocess.run(
+        ["git", "hash-object", "-w", "-t", "commit", "--stdin"],
+        cwd=snap.path, input=raw, stdout=subprocess.PIPE, check=True,
+    ).stdout.decode().strip()
+    selected_base = base_branch or "main"
+    branch = rollout.rollout_branch(bundle.ref, selected_base, "main")
+    subprocess.run(["git", "update-ref", f"refs/heads/{branch}", head], cwd=snap.path, check=True)
+    subprocess.run(["git", "reset", "--hard", "-q", head], cwd=snap.path, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(snap.path)], cwd=snap.path, check=True)
+    request = PullRequest(
+        7, "https://github.com/jhw7500/gstApp/pull/7", "OPEN",
+        selected_base, branch, "jhw7500/gstApp", head,
+        rollout.pr_title(bundle.ref, selected_base, "main"),
+        rollout.pr_body(bundle.ref, bundle.commit, (".github/workflows/claude.yml",), selected_base, "main"),
+    )
+    requests = [request] if existing_pr else []
+
+    def create_pr(*_args):
+        requests.append(request)
+        return request
+
+    with (
+        mock.patch.object(rollout.fleet_git, "clone_default_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "clone_branch", return_value=snap),
+        mock.patch.object(rollout.fleet_git, "refetch_default", return_value=snap.base_sha),
+        mock.patch.object(rollout.fleet_git, "refetch_branch", return_value=snap.base_sha),
+        mock.patch.object(rollout, "_render", return_value=plan),
+        mock.patch.object(rollout, "validate_managed_result"),
+        mock.patch.object(rollout.fleet_git, "remote_branch_sha", return_value=head),
+        mock.patch.object(rollout.fleet_git, "list_rollout_prs", side_effect=lambda *_a: tuple(requests)),
+        mock.patch.object(rollout.fleet_git, "create_pull_request", side_effect=create_pr),
+    ):
+        # Read-only inspection can plan without a reference; publish must attest it.
+        assert rollout.inspect_rollout(snap, snap.base_sha, bundle.ref, bundle.commit, plan).action == (
+            "reuse" if existing_pr else "create_pr"
+        )
+        result = rollout.publish_repository(
+            bundle, tmp_path, repo="gstApp", base_branch=base_branch,
+            bootstrap=False, actionlint=None, change_reference=CHANGE_REFERENCE,
+        )
+
+    if mutation is None:
+        assert result.status == ("reused" if existing_pr else "published")
+        assert result.head_sha == head
+        assert result.pr_url == request.url
+    else:
+        assert result.status == "blocked"
+        assert result.stage == "branch"
+        assert "commit identity" in result.detail
+        assert requests == ([request] if existing_pr else [])
+
+
 def initialized_canonical_fleet_repository(
     tmp_path: Path, bundle: ReleaseBundle
 ) -> RepositorySnapshot:
@@ -1707,7 +1973,12 @@ def test_real_rollout_repairs_content_and_separate_mode_drift_and_attests_all_ma
 
     plan = rollout._render(snap, bundle, snap.path.name, bootstrap=False)
     constructed = rollout.construct_rollout_commit(
-        snap, base, bundle.ref, plan, bundle.catalog
+        snap,
+        base,
+        bundle.ref,
+        plan,
+        bundle.catalog,
+        change_reference=CHANGE_REFERENCE,
     )
     # Before the fix this returned successfully despite leaving mode_path at 100755.
     rollout.validate_commit_tree(snap, constructed.head_sha, base, plan)
@@ -1767,7 +2038,12 @@ def test_real_mode_only_drift_is_planned_audited_and_published_as_a_repair(
     assert change.after_mode == "100644"
 
     constructed = rollout.construct_rollout_commit(
-        snap, base, bundle.ref, plan, bundle.catalog
+        snap,
+        base,
+        bundle.ref,
+        plan,
+        bundle.catalog,
+        change_reference=CHANGE_REFERENCE,
     )
     rollout.validate_commit_tree(snap, constructed.head_sha, base, plan)
     rollout.fleet_git._validate_rollout_commit(
@@ -1775,6 +2051,7 @@ def test_real_mode_only_drift_is_planned_audited_and_published_as_a_repair(
         bundle.ref,
         snap.base_branch or snap.default_branch,
         snap.default_branch,
+        change_reference=CHANGE_REFERENCE,
     )
     assert tree_entry(snap.path, constructed.head_sha, relative)[:2] == (
         "100644",
@@ -1985,7 +2262,12 @@ def test_commit_plumbing_never_executes_a_configured_clean_filter(
     )
 
     constructed = rollout.construct_rollout_commit(
-        snap, snap.base_sha, "v1.40", plan, bundle.catalog
+        snap,
+        snap.base_sha,
+        "v1.40",
+        plan,
+        bundle.catalog,
+        change_reference=CHANGE_REFERENCE,
     )
 
     assert not marker.exists()
@@ -2024,7 +2306,12 @@ def test_commit_plumbing_normalizes_managed_files_to_canonical_regular_mode(
     (snap.path / ".github/workflows/claude.yml").chmod(0o755)
 
     constructed = rollout.construct_rollout_commit(
-        snap, snap.base_sha, "v1.40", plan, bundle.catalog
+        snap,
+        snap.base_sha,
+        "v1.40",
+        plan,
+        bundle.catalog,
+        change_reference=CHANGE_REFERENCE,
     )
     entry = subprocess.run(
         [
@@ -2049,7 +2336,12 @@ def test_local_commit_identity_matches_atomic_api_commit_contract(
     snap, plan = initialized_repository(tmp_path)
 
     constructed = rollout.construct_rollout_commit(
-        snap, snap.base_sha, "v1.40", plan, bundle.catalog
+        snap,
+        snap.base_sha,
+        "v1.40",
+        plan,
+        bundle.catalog,
+        change_reference=CHANGE_REFERENCE,
     )
 
     rollout.fleet_git._validate_rollout_commit(
@@ -2057,6 +2349,7 @@ def test_local_commit_identity_matches_atomic_api_commit_contract(
         "v1.40",
         snap.base_branch or snap.default_branch,
         snap.default_branch,
+        change_reference=CHANGE_REFERENCE,
     )
 
 
@@ -2075,7 +2368,12 @@ def test_commit_plumbing_never_executes_a_configured_signing_helper(
     )
 
     constructed = rollout.construct_rollout_commit(
-        snap, snap.base_sha, "v1.40", plan, bundle.catalog
+        snap,
+        snap.base_sha,
+        "v1.40",
+        plan,
+        bundle.catalog,
+        change_reference=CHANGE_REFERENCE,
     )
 
     assert not marker.exists()
@@ -2094,7 +2392,9 @@ def test_commit_plumbing_never_executes_a_configured_signing_helper(
     ).stdout.splitlines()
     assert metadata == [
         snap.base_sha,
-        rollout.pr_title("v1.40"),
+            rollout.fleet_git.commit_message(
+                "v1.40", change_reference=CHANGE_REFERENCE
+            ).splitlines()[0],
         "workflow-fleet",
         "workflow-fleet@invalid",
     ]
@@ -2142,7 +2442,14 @@ def test_new_branch_publication_delegates_only_to_atomic_git_data_adapter(
     ):
         assert (
             rollout.publish_new_branch(
-                snap, BASE, "v1.40", COMMIT, plan, Path("/bin/true"), bundle=bundle
+                snap,
+                BASE,
+                "v1.40",
+                COMMIT,
+                plan,
+                Path("/bin/true"),
+                bundle=bundle,
+                change_reference=CHANGE_REFERENCE,
             )
             == HEAD
         )
@@ -2151,6 +2458,7 @@ def test_new_branch_publication_delegates_only_to_atomic_git_data_adapter(
         snap,
         "automation/common-workflows-v1.40",
         commit=constructed,
+            change_reference=CHANGE_REFERENCE,
     )
     flattened = " ".join(" ".join(args) for args in calls)
     for forbidden in (
@@ -2203,7 +2511,14 @@ def test_new_branch_revalidates_before_applying_to_the_publish_clone(
         ),
     ):
         rollout.publish_new_branch(
-            snap, BASE, "v1.40", COMMIT, plan, Path("/bin/true"), bundle=bundle
+            snap,
+            BASE,
+            "v1.40",
+            COMMIT,
+            plan,
+            Path("/bin/true"),
+            bundle=bundle,
+            change_reference=CHANGE_REFERENCE,
         )
 
     assert events == ["validate", "construct"]
@@ -2554,6 +2869,8 @@ def test_manifest_sink_is_prevalidated_before_any_publish(
                     "--mode",
                     "publish",
                     "--confirm",
+                    "--change-reference",
+                    CHANGE_REFERENCE,
                     "--workspace",
                     str(workspace),
                     "--repo",
@@ -2705,6 +3022,7 @@ def test_pr_creation_reconciliation_rejects_fork_or_wrong_head_oid(
             repo="gstApp",
             bootstrap=False,
             actionlint=Path("/bin/true"),
+            change_reference=CHANGE_REFERENCE,
         )
     assert result.status == "blocked"
     assert result.base_sha == FRESH_BASE
@@ -2860,6 +3178,8 @@ def test_publish_stops_before_any_command_when_the_workflow_scope_is_absent(
                     "--mode",
                     "publish",
                     "--confirm",
+                    "--change-reference",
+                    CHANGE_REFERENCE,
                     "--repo",
                     "pim-check",
                     "--workspace",
@@ -2897,6 +3217,8 @@ def test_publish_continues_when_the_scope_probe_cannot_be_answered(
                     "--mode",
                     "publish",
                     "--confirm",
+                    "--change-reference",
+                    CHANGE_REFERENCE,
                     "--repo",
                     "pim-check",
                     "--workspace",
