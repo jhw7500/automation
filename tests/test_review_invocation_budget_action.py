@@ -216,7 +216,11 @@ from pathlib import Path
 
 config = json.loads(Path(os.environ["FAKE_GH_CONFIG"]).read_text())
 state_path = Path(os.environ["FAKE_GH_STATE"])
-state = json.loads(state_path.read_text()) if state_path.exists() else {"pr": 0, "comments": 0}
+state = json.loads(state_path.read_text()) if state_path.exists() else {
+    "pr": 0,
+    "comments": 0,
+    "run_700": 0,
+}
 args = sys.argv[1:]
 raw_output = None
 with Path(os.environ["FAKE_GH_LOG"]).open("a") as stream:
@@ -269,7 +273,12 @@ elif "/actions/runs/501/attempts/1" in endpoint:
     }
     if config["scenario"] == "historical-run-head-mismatch":
         response["head_sha"] = "b" * 40
+    elif config["scenario"] == "historical-run-empty-pr-association":
+        response["pull_requests"] = []
+    elif config["scenario"] == "historical-run-old-pr-only-association":
+        response["pull_requests"] = [{"number": 41}]
 elif "/actions/runs/700/attempts/1" in endpoint:
+    state["run_700"] = state.get("run_700", 0) + 1
     fallback = config["scenario"].startswith("fallback-")
     override = config["scenario"].startswith("force-review-default-")
     response = {
@@ -309,6 +318,10 @@ elif "/actions/runs/700/attempts/1" in endpoint:
             "secret-value\nother/repo/.github/workflows/claude-code-review.yml@" + "d" * 40
         )
     elif config["scenario"] == "current-run-missing-pr":
+        response["pull_requests"] = []
+    elif config["scenario"] == "current-run-old-pr-only-association":
+        response["pull_requests"] = [{"number": 41}]
+    elif config["scenario"] == "current-run-empty-then-valid" and state["run_700"] == 1:
         response["pull_requests"] = []
     elif config["scenario"] == "current-run-payload-list":
         response = []
@@ -386,6 +399,7 @@ class FakeGitHub:
         if scenario in {
             "first-comment-create", "empty-cas-pages",
             "current-run-reference-omits-ref",
+            "current-run-empty-then-valid",
             "fallback-first-claim", "fallback-event-mismatch", "fallback-wrong-base",
             "fallback-base-changed-before-patch",
             "force-review-default-claim",
@@ -426,6 +440,8 @@ class FakeGitHub:
         log = self.tmp_path / "gh.log"
         state = self.tmp_path / "gh-state.json"
         argv_log = self.tmp_path / "python-argv"
+        for generated in (output, summary, checkpoint, log, argv_log):
+            generated.unlink(missing_ok=True)
         request_values = {
             "GH_TOKEN": "token",
             "BUDGET_MODE": mode,
@@ -835,6 +851,96 @@ def test_first_claim_rejects_malformed_reusable_workflow_provenance(
     diagnostic = json.dumps(expected, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     assert f"- Provenance diagnostic: `{diagnostic}`" in result.summary
     assert result.stdout.count(f"review-budget provenance diagnostic: {diagnostic}\n") == 1
+
+
+@pytest.mark.parametrize(
+    "scenario,scope,run_id",
+    [
+        ("historical-run-empty-pr-association", "historical", 501),
+        ("historical-run-old-pr-only-association", "historical", 501),
+        ("current-run-old-pr-only-association", "current", 700),
+    ],
+)
+def test_claim_rejects_run_metadata_not_associated_with_the_target_pr(
+    fake_github, scenario, scope, run_id,
+):
+    result = fake_github.run_action(mode="claim", scenario=scenario)
+    mutations = [
+        call for call in result.calls
+        if "--method" in call
+        and call[call.index("--method") + 1] in {"POST", "PATCH", "DELETE"}
+    ]
+    expected = {
+        "check": "pull_request_binding",
+        "fields": ["pull_requests"],
+        "run_attempt": 1,
+        "run_id": run_id,
+        "scope": scope,
+    }
+    diagnostic = json.dumps(expected, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+    assert result.outputs["decision"] == "state_invalid"
+    assert result.outputs["allow-invocation"] == "false"
+    assert result.checkpoint["handoff"]["stop_reason"] == "provenance_mismatch"
+    assert mutations == []
+    assert result.summary.count(f"- Provenance diagnostic: `{diagnostic}`") == 1
+    assert result.stdout.count(f"review-budget provenance diagnostic: {diagnostic}\n") == 1
+
+
+def test_valid_pr_metadata_requires_a_separately_invoked_fresh_claim_after_empty_metadata(
+    fake_github,
+):
+    empty_result = fake_github.run_action(
+        mode="claim", scenario="current-run-empty-then-valid",
+    )
+    empty_run_queries = [
+        call for call in empty_result.calls
+        if "/actions/runs/700/attempts/1" in " ".join(call)
+    ]
+    empty_mutations = [
+        call for call in empty_result.calls
+        if "--method" in call
+        and call[call.index("--method") + 1] in {"POST", "PATCH", "DELETE"}
+    ]
+    expected = {
+        "check": "pull_request_binding",
+        "fields": ["pull_requests"],
+        "run_attempt": 1,
+        "run_id": 700,
+        "scope": "current",
+    }
+    diagnostic = json.dumps(expected, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+    assert len(empty_run_queries) == 1
+    assert empty_result.outputs["decision"] == "state_invalid"
+    assert empty_result.outputs["allow-invocation"] == "false"
+    assert empty_result.checkpoint["handoff"]["stop_reason"] == "provenance_mismatch"
+    assert empty_mutations == []
+    assert empty_result.summary.count(f"- Provenance diagnostic: `{diagnostic}`") == 1
+    assert empty_result.stdout.count(
+        f"review-budget provenance diagnostic: {diagnostic}\n"
+    ) == 1
+
+    fresh_result = fake_github.run_action(
+        mode="claim", scenario="current-run-empty-then-valid",
+    )
+    fresh_run_queries = [
+        call for call in fresh_result.calls
+        if "/actions/runs/700/attempts/1" in " ".join(call)
+    ]
+    fresh_mutations = [
+        call for call in fresh_result.calls
+        if "--method" in call
+        and call[call.index("--method") + 1] in {"POST", "PATCH", "DELETE"}
+    ]
+
+    assert len(fresh_run_queries) == 1
+    assert fresh_result.outputs["decision"] == "claimed"
+    assert fresh_result.outputs["allow-invocation"] == "true"
+    assert [call[call.index("--method") + 1] for call in fresh_mutations] == ["POST"]
+    assert fresh_result.checkpoint["ledger"]["invocations"][0]["run_id"] == 700
+    assert "Provenance diagnostic" not in fresh_result.summary
+    assert "provenance diagnostic" not in fresh_result.stdout
 
 
 def test_provenance_diagnostic_never_echoes_hostile_api_values(fake_github):
