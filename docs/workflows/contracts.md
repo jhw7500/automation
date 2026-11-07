@@ -67,6 +67,28 @@ central implementation and consumer repository into separate paths with credenti
 disabled, and executes the shared checker from the central checkout. It does not copy
 or reimplement title or Change Evidence rules in the consumer repository.
 
+From v1.89, the report step also emits an encoded copy of the actual step-summary
+file to its job log, including on the setup-failure path. The transport preserves
+the Markdown bytes and uses these ASCII records:
+
+```text
+automation-commit-evidence-summary:v1:begin:<byte-count>:<sha256>
+automation-commit-evidence-summary:v1:data:<base64-chunk>
+automation-commit-evidence-summary:v1:end
+```
+
+Data records contain at most 76 Base64 characters each. Consumers require one
+complete envelope, concatenate its data records, decode them, and verify the
+positive byte count and SHA-256 before inspecting the summary's source identity
+and commit rows. The log must belong to the expected run, attempt and pinned
+implementation. Shell-like text and workflow-command syntax stay encoded.
+
+The log copy accepts a nonempty regular, non-symlink summary of at most 1 MiB.
+Unavailable, oversized or unsafe files produce no envelope; transport failure
+preserves the audit's exit status and non-blocking policy. A missing or incomplete
+envelope leaves the summary unverified even when the job succeeded. Earlier
+releases expose only the web step summary and warning annotations.
+
 Release verification reads the four runtime Python files from the authenticated
 candidate commit and requires regular blobs, Python 3.10 syntax that compiles, and
 unique required function and value declarations. It never imports or executes that

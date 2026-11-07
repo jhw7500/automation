@@ -153,6 +153,8 @@ V179_FILTERED_PRESERVATION_EDITS = {
 V185_REVIEW_OUTCOME_BOUNDARY_COMMIT = "b9c46ab8f3218a0e5cdc79715517f071f47979d2"
 V186_COMMIT_AUDIT_BOUNDARY_COMMIT = "345cc7916e051e19fcf1480ddd503cf45a6a5ee1"
 V187_REVIEW_DIAGNOSTICS_BOUNDARY_COMMIT = "17e7747b76c63b3ea25067c48654935eaf1274ba"
+V188_COMMIT_AUDIT_SUMMARY_BOUNDARY_COMMIT = "da4c242265a15a861751b8d725caed25a5adbeb3"
+V189_COMMIT_AUDIT_SUMMARY_PATH = ".github/workflows/commit-evidence-audit.yml"
 V188_REVIEW_DIAGNOSTIC_PATHS = (
     ".github/actions/review-invocation-budget/review_invocation_budget.py",
     ".github/workflows/opencode-auto-review.yml",
@@ -176,6 +178,22 @@ PRE_V186_FILES = (
 )
 
 
+def restore_pre_v189_commit_audit_summary(repo: Path) -> None:
+    """Restore the published v1.88 audit workflow over an exact current copy."""
+
+    path = repo / V189_COMMIT_AUDIT_SUMMARY_PATH
+    root = Path(__file__).resolve().parents[1]
+    if (
+        not path.is_file()
+        or path.read_bytes() != (root / V189_COMMIT_AUDIT_SUMMARY_PATH).read_bytes()
+    ):
+        return
+    from scripts.verify_workflow_release import VerifiedCommitTree
+
+    tree = VerifiedCommitTree.open(root, V188_COMMIT_AUDIT_SUMMARY_BOUNDARY_COMMIT)
+    path.write_bytes(tree.read_file(V189_COMMIT_AUDIT_SUMMARY_PATH))
+
+
 def restore_pre_v188_review_diagnostics(repo: Path) -> None:
     """Restore the published v1.87 review bytes over an exact current copy.
 
@@ -183,6 +201,8 @@ def restore_pre_v188_review_diagnostics(repo: Path) -> None:
     the source of historical bytes, so later v1.88 edits cannot rewrite the
     v1.87 fixture by changing this repository checkout.
     """
+    restore_pre_v189_commit_audit_summary(repo)
+
     from scripts.verify_workflow_release import VerifiedCommitTree
 
     root = Path(__file__).resolve().parents[1]
