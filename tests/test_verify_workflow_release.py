@@ -19,6 +19,7 @@ import zlib
 import pytest
 import yaml
 
+import release_fixture_helpers
 import scripts.verify_workflow_release as release_verifier
 import scripts.workflow_release_inventory as release_inventory
 from scripts.verify_workflow_release import ReleaseVerificationError, verify_release
@@ -63,6 +64,7 @@ V178_COMMIT = "a08141d644ab1036cadd8167d48158e827dcd978"
 V1781_COMMIT = "72e0cfad8020a1fe40352b70ddb6438791c58f00"
 V1782_COMMIT = "74afc0057c4732993ecd76601590b8856e2a3bb3"
 V187_COMMIT = "17e7747b76c63b3ea25067c48654935eaf1274ba"
+V188_COMMIT = "da4c242265a15a861751b8d725caed25a5adbeb3"
 CHECK_WORKFLOW_ENABLED_ACTION_PATH = (
     ".github/actions/check-workflow-enabled/action.yml"
 )
@@ -780,6 +782,15 @@ def test_review_diagnostics_release_boundary():
         assert supports(ref), ref
 
 
+def test_commit_audit_summary_release_boundary():
+    supports = release_inventory.release_supports_commit_audit_summary
+    assert release_inventory.COMMIT_AUDIT_SUMMARY_RELEASE == (1, 89)
+    for ref in ("v1.87", "v1.88", "v1.88.0", "v1.88.1", "v1.88.99"):
+        assert not supports(ref), ref
+    for ref in ("v1.89", "v1.89.0", "v1.89.1", "v1.90"):
+        assert supports(ref), ref
+
+
 def test_v187_immutable_candidate_remains_accepted_after_v188_diagnostics():
     assert release_verifier.verify_commit_content(ROOT, "v1.87", V187_COMMIT) == V187_COMMIT
 
@@ -809,6 +820,22 @@ def test_restore_pre_v188_uses_published_v187_bytes_and_preserves_mutations(tmp_
     assert mutated.read_bytes().endswith(b"# deliberate fixture mutation\n")
 
 
+def test_restore_pre_v189_uses_published_v188_bytes_and_preserves_mutations(tmp_path):
+    relative = ".github/workflows/commit-evidence-audit.yml"
+    repo = tmp_path / "audit-summary-release"
+    target = repo / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes((ROOT / relative).read_bytes())
+    published = release_verifier.VerifiedCommitTree.open(ROOT, V188_COMMIT)
+
+    release_fixture_helpers.restore_pre_v189_commit_audit_summary(repo)
+
+    assert target.read_bytes() == published.read_file(relative)
+    target.write_bytes((ROOT / relative).read_bytes() + b"\n# deliberate fixture mutation\n")
+    release_fixture_helpers.restore_pre_v189_commit_audit_summary(repo)
+    assert target.read_bytes().endswith(b"# deliberate fixture mutation\n")
+
+
 def test_fleet_ci_exercises_commit_audit_on_python_310():
     document = yaml.load(
         (ROOT / ".github/workflows/test-fleet-tools.yml").read_bytes(),
@@ -834,7 +861,7 @@ def test_fleet_ci_exercises_commit_audit_on_python_310():
 
 
 @pytest.fixture
-def commit_audit_workflow_repo(tmp_path):
+def current_commit_audit_workflow_repo(tmp_path):
     repo = tmp_path / "commit-audit-workflow"
     target = repo / ".github/workflows/commit-evidence-audit.yml"
     target.parent.mkdir(parents=True)
@@ -849,6 +876,13 @@ def commit_audit_workflow_repo(tmp_path):
     return repo, commit(repo, "commit audit workflow")
 
 
+@pytest.fixture
+def commit_audit_workflow_repo(current_commit_audit_workflow_repo):
+    repo, _ = current_commit_audit_workflow_repo
+    release_fixture_helpers.restore_pre_v189_commit_audit_summary(repo)
+    return repo, commit(repo, "restore v1.88 commit audit workflow")
+
+
 def test_v187_seals_commit_audit_workflow(commit_audit_workflow_repo):
     repo, candidate = commit_audit_workflow_repo
     tree = release_verifier.VerifiedCommitTree.open(repo, candidate)
@@ -858,6 +892,26 @@ def test_v187_seals_commit_audit_workflow(commit_audit_workflow_repo):
         match="predates its release line",
     ):
         release_verifier._verify_commit_audit_workflow(tree, "v1.86")
+
+
+def test_v189_seals_commit_audit_summary_workflow(current_commit_audit_workflow_repo):
+    repo, candidate = current_commit_audit_workflow_repo
+    tree = release_verifier.VerifiedCommitTree.open(repo, candidate)
+    release_verifier._verify_commit_audit_workflow(tree, "v1.89")
+
+
+def test_v188_and_v189_commit_audit_seals_are_mutually_exclusive(
+    current_commit_audit_workflow_repo,
+):
+    current_repo, current = current_commit_audit_workflow_repo
+    current_tree = release_verifier.VerifiedCommitTree.open(current_repo, current)
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier._verify_commit_audit_workflow(current_tree, "v1.88")
+
+    historical_tree = release_verifier.VerifiedCommitTree.open(ROOT, V188_COMMIT)
+    release_verifier._verify_commit_audit_workflow(historical_tree, "v1.88")
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier._verify_commit_audit_workflow(historical_tree, "v1.89")
 
 
 def test_v187_rejects_mutated_commit_audit_workflow(commit_audit_workflow_repo):
@@ -926,10 +980,49 @@ def review_diagnostics_release_repo(tmp_path):
         runtime = repo / relative
         runtime.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, runtime)
+    release_fixture_helpers.restore_pre_v189_commit_audit_summary(repo)
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.com")
     return repo, commit(repo, "v1.88 review diagnostics candidate")
+
+
+@pytest.fixture
+def commit_audit_summary_release_repo(tmp_path):
+    repo = tmp_path / "commit-audit-summary-release"
+    repo.mkdir()
+    for relative in RELEASE_PATHS:
+        source, target = ROOT / relative, repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            shutil.copy2(source, target)
+    for relative in COMMIT_AUDIT_RUNTIME_FUNCTIONS:
+        runtime = repo / relative
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, runtime)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    return repo, commit(repo, "v1.89 commit audit summary candidate")
+
+
+def test_v189_candidate_and_published_v188_bytes_are_mutually_exclusive(
+    commit_audit_summary_release_repo, review_diagnostics_release_repo,
+):
+    current_repo, current = commit_audit_summary_release_repo
+    assert release_verifier.verify_commit_content(current_repo, "v1.89", current) == current
+    assert release_verifier.verify_commit_content(current_repo, "v1.89.0", current) == current
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(current_repo, "v1.88", current)
+
+    historical_repo, historical = review_diagnostics_release_repo
+    assert release_verifier.verify_commit_content(
+        historical_repo, "v1.88", historical
+    ) == historical
+    with pytest.raises(ReleaseVerificationError):
+        release_verifier.verify_commit_content(historical_repo, "v1.89", historical)
 
 
 def test_v188_candidate_and_published_v187_bytes_are_mutually_exclusive(

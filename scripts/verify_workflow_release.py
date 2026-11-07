@@ -69,6 +69,7 @@ from scripts.workflow_release_inventory import (
     release_supports_opencode_dismissal_coverage,
     release_supports_claude_caller_pin_diagnostics,
     release_supports_commit_audit,
+    release_supports_commit_audit_summary,
     release_supports_gemini_fallback_quota_reason,
     release_supports_opencode_abandoned_check_cleanup,
     release_supports_review_outcome_annotation,
@@ -7880,11 +7881,17 @@ EXPECTED_CLAUDE_FALLBACK_PARSED_SHA256 = {
     ".github/workflows/opencode-auto-review.yml": "e1800dc0609696c2b62fa3c1862c75d92996c370a93265eb1a8d0e0d0cafadf1",
     ".github/actions/recover-opencode-review/evidence.py": "02753d28299ae71afe293c34be732ab9b6a691779154f3e39ebc2dc4d2cb9d34",
 }
-EXPECTED_COMMIT_AUDIT_SHA256 = (
+V188_COMMIT_AUDIT_SHA256 = (
     "fc6bdbec7a5857a34bd714d39d6f08b14fcedcb30ff6c66a5a033a7bdfd17af2"
 )
-EXPECTED_COMMIT_AUDIT_PARSED_SHA256 = (
+V188_COMMIT_AUDIT_PARSED_SHA256 = (
     "23a36f87d1ff0ed7e791fecb23d950466b38f7df5484e793c29d49e54e77e71a"
+)
+EXPECTED_COMMIT_AUDIT_SHA256 = (
+    "7108a022e373bdc95e782af7b4c584668a49069e2553f4524f5353adac52fe46"
+)
+EXPECTED_COMMIT_AUDIT_PARSED_SHA256 = (
+    "5180a8ff87702c08b4fb2008794203fc2edcca99ea3a53bff9a63486c4879de9"
 )
 CLAUDE_FALLBACK_HARDENING_RELEASE = (1, 78, 1)
 CLAUDE_REVIEW_PREADMISSION_HARDENING_RELEASE = (1, 78, 2)
@@ -8585,12 +8592,15 @@ def _verify_commit_audit_workflow(tree: VerifiedCommitTree, ref: str) -> None:
         raise ReleaseVerificationError(
             "commit-evidence audit workflow contract is invalid"
         ) from None
-    if hashlib.sha256(raw).hexdigest() != EXPECTED_COMMIT_AUDIT_SHA256:
+    if release_supports_commit_audit_summary(ref):
+        raw_seal = EXPECTED_COMMIT_AUDIT_SHA256
+        parsed_seal = EXPECTED_COMMIT_AUDIT_PARSED_SHA256
+    else:
+        raw_seal = V188_COMMIT_AUDIT_SHA256
+        parsed_seal = V188_COMMIT_AUDIT_PARSED_SHA256
+    if hashlib.sha256(raw).hexdigest() != raw_seal:
         raise ReleaseVerificationError("commit-evidence audit workflow bytes differ")
-    if (
-        hashlib.sha256(payload.encode()).hexdigest()
-        != EXPECTED_COMMIT_AUDIT_PARSED_SHA256
-    ):
+    if hashlib.sha256(payload.encode()).hexdigest() != parsed_seal:
         raise ReleaseVerificationError("commit-evidence audit parsed contract differs")
     _verify_commit_audit_runtime(tree)
 

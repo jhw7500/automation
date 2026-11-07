@@ -69,6 +69,36 @@ jobs:
           AUDIT_EVENT_NAME: ${{ github.event_name }}
         shell: bash
         run: |
+          emit_audit_summary() {
+            python3 -I - "${GITHUB_STEP_SUMMARY:-}" <<'PY'
+          import base64
+          import hashlib
+          import os
+          import stat
+          import sys
+
+          limit = 1024 * 1024
+          try:
+              descriptor = os.open(
+                  sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+              )
+              with os.fdopen(descriptor, "rb") as source:
+                  if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                      raise SystemExit(0)
+                  report = source.read(limit + 1)
+          except OSError:
+              raise SystemExit(0)
+          if not report or len(report) > limit:
+              raise SystemExit(0)
+          prefix = "automation-commit-evidence-summary:v1:"
+          digest = hashlib.sha256(report).hexdigest()
+          print(f"{prefix}begin:{len(report)}:{digest}")
+          for chunk in base64.encodebytes(report).decode("ascii").splitlines():
+              print(prefix + "data:" + chunk)
+          print(prefix + "end")
+          PY
+          }
+          trap 'emit_audit_summary || :' EXIT
           if [ "${AUDIT_CENTRAL_OUTCOME:-}" != success ] \
             || [ "${AUDIT_SOURCE_OUTCOME:-}" != success ] \
             || [ "${AUDIT_TARGET_OUTCOME:-}" != success ]; then
