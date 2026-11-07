@@ -1828,6 +1828,16 @@ the same reviewer with the same head SHA or full-diff hash is an absolute zero-c
 gate. Only the explicit force-review contract below may consume an override round
 to review that input again.
 
+A failed-job rerun using the CLI's `--failed` option is not proof of a fresh
+model invocation. A model job can finish successfully while exporting a provider
+failure, and rerunning canonicalization can reuse that saved failed candidate.
+Check the model job's executed attempt, authenticated review state and call
+accounting before counting another provider execution. A whole-run rerun with
+no failed-job or job-selection option remains subject to the head/full-diff
+budget gate above. A fresh ordinary invocation requires an eligible meaningful head
+and effective diff; OpenCode remains automatic-only. Empty commits do not
+provide a supported way to evade the duplicate-input gate.
+
 A round is one distinct effective diff claimed by one reviewer. The automatic-round default
 is five and `REVIEW_MAX_ROUNDS` may lower it to 1 through 5. Claude and Gemini may consume
 up to two additional rounds; each requires a different `review-budget-override` label
